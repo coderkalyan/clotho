@@ -203,10 +203,11 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
             fail("unpacked array with negative index bounds is not supported");
         }
         ir::Type t;
-        t.kind    = ir::Type::Kind::UnpackedArray;
-        t.element = lower_type(arr->elementType);
-        t.left    = static_cast<uint32_t>(r.left);
-        t.right   = static_cast<uint32_t>(r.right);
+        t.kind        = ir::Type::Kind::UnpackedArray;
+        t.element     = lower_type(arr->elementType);
+        t.elem_signed = arr->elementType.isSigned();
+        t.left        = static_cast<uint32_t>(r.left);
+        t.right       = static_cast<uint32_t>(r.right);
         return module_.pool.put(ir::Item{ t });
     }
     if (const auto* da = ct.as_if<slang::ast::DynamicArrayType>()) {
@@ -216,8 +217,9 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         const ir::Ref er = lower_type(da->elementType);
         guard_container_element(da->elementType.getCanonicalType(), er, "dynamic array");
         ir::Type t;
-        t.kind    = ir::Type::Kind::DynArray;
-        t.element = er;
+        t.kind        = ir::Type::Kind::DynArray;
+        t.element     = er;
+        t.elem_signed = da->elementType.isSigned();
 
         return module_.pool.put(ir::Item{ t });
     }
@@ -227,8 +229,9 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         const ir::Ref er = lower_type(qt->elementType);
         guard_container_element(qt->elementType.getCanonicalType(), er, "queue");
         ir::Type t;
-        t.kind    = ir::Type::Kind::Queue;
-        t.element = er;
+        t.kind        = ir::Type::Kind::Queue;
+        t.element     = er;
+        t.elem_signed = qt->elementType.isSigned();
         // maxBound is the `[$:N]` max index (0 == unbounded); stored in left.
         t.left = qt->maxBound;
 
@@ -261,8 +264,9 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
             // size, normalized to a fixed 64-bit form. `fields_id` names a
             // canonical unsigned placeholder; `right` flags wildcard.
             t.right     = 1;
-            t.fields_id = static_cast<uint32_t>(make_int_type(64, false, false));
+            t.fields_id = static_cast<uint32_t>(make_int_type(64, false));
         } else {
+            t.elem_signed              = aa->indexType->isSigned();
             const slang::ast::Type& kt = aa->indexType->getCanonicalType();
             const ir::Ref           kr = lower_type(*aa->indexType);
             // A class-handle key (LRM 7.8.3) is its handle word: identity
@@ -337,13 +341,14 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
             // Packed member: `bitOffset` is the field's bit position. Unpacked
             // member: addressed by declaration index (`fieldIndex`), no flat
             // offset — store the index so the field table is self-describing.
-            fields.push_back(
-              { f.name, lower_type(f.getType()), is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
+            fields.push_back({ f.name,
+                               lower_type(f.getType()),
+                               is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex,
+                               !is_packed && f.getType().isSigned() });
         }
 
         ir::Type t;
         t.kind      = ir::Type::Kind::Struct;
-        t.is_signed = is_packed && ct.isSigned();
         t.is_packed = is_packed;
         // Packed: the whole-value scalar domain / width (shares PackedArray
         // layout; a packed struct with any 4-state member is wholly 4-state
@@ -392,7 +397,6 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
 
         ir::Type t;
         t.kind      = ir::Type::Kind::Struct;
-        t.is_signed = ct.isSigned();
         t.is_packed = true;
         t.is_union  = true;
         t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
@@ -487,7 +491,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         // 2-state 64-bit value — the only legal operations are null /
         // assignment / equality (slang rejects arithmetic), all integer ops on
         // the handle bits. Enables DPI chandle args (marshaled to/from void*).
-        return make_int_type(64, false, false);
+        return make_int_type(64, false);
     }
     if (ct.isClass()) {
         return lower_class_type(ct.as<slang::ast::ClassType>());
@@ -516,7 +520,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         // be a collected object. Assignment, `== null`, and storing a handle in
         // a class property or a container all come out of the ordinary scalar
         // machinery. See docs/design/functional-coverage.md.
-        return make_int_type(64, false, false);
+        return make_int_type(64, false);
     }
     if (!ct.isIntegral()) {
         // TODO: any OTHER type kind reaching here is a genuine gap; every kind
@@ -525,7 +529,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         fail("unsupported non-integral type");
     }
 
-    return make_int_type(ct.getBitWidth(), ct.isFourState(), ct.isSigned());
+    return make_int_type(ct.getBitWidth(), ct.isFourState());
 }
 
 // Intern an integer literal, preserving x/z bits.
@@ -799,9 +803,7 @@ void Lowerer::emit_const_seed(ir::Index                   lhs,
             const int32_t coord =
               t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
             const ir::Index idx = b.constant(
-              module_.pool.put_int(make_int_type(32, false, true),
-                                   static_cast<uint64_t>(static_cast<int64_t>(coord))),
-              l);
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
             emit_const_seed(b.elem_select(lhs, idx, ty, l), t.element, et, cv.elements()[k], b, l);
         }
         return;
@@ -829,10 +831,10 @@ void Lowerer::emit_const_seed(ir::Index                   lhs,
         }
         const auto              n  = static_cast<uint32_t>(cv.elements().size());
         const slang::ast::Type& et = *ct.getArrayElementType();
-        const ir::Index         sz = b.constant(module_.pool.put_int(make_int_type(32, false, false), n), l);
+        const ir::Index         sz = b.constant(module_.pool.put_int(make_int_type(32, false), n), l);
         b.dyn_array_new(lhs, sz, lhs, /*has_init=*/false, ty, l);
         for (uint32_t k = 0; k < n; ++k) {
-            const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+            const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false), k), l);
             emit_const_seed(b.elem_select(lhs, idx, ty, l), t.element, et, cv.elements()[k], b, l);
         }
         return;
@@ -1611,7 +1613,7 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
         // before the first reader — including a declaration initializer that
         // reads it, whose own store is appended after these.
         if (!preinit_) {
-            preinit_.emplace(module_.pool);
+            preinit_.emplace(module_);
         }
         ir::Builder&        pb = *preinit_;
         const ir::SourceLoc pl = to_source_loc(vs.location);
@@ -1692,7 +1694,7 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
     // is not restricted to constant expressions.
     if (const Expression* init = prop.getInitializer()) {
         if (!preinit_) {
-            preinit_.emplace(module_.pool);
+            preinit_.emplace(module_);
         }
         ir::Builder&        pb = *preinit_;
         const ir::SourceLoc il = loc(*init);
@@ -1716,9 +1718,8 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
             // container's handle instead.
             emit_struct_store(pb.signal(sig, il), pty, *init, ir::Inst::Tag::Store, pb, il);
         } else if (prop.getType().getCanonicalType().isString()) {
-            // A string assigns as a whole handle, never through coerce: its
-            // Resize rejects a string value outright (Resize truncates/extends
-            // planes). Mirrors emit_class_property_inits' string case.
+            // A string assigns as a whole handle, never through coerce: an integer
+            // conversion rejects a string value outright. Mirrors emit_class_property_inits' string case.
             const ir::Index dst = pb.signal(sig, il);
             const ir::Index val = lower_expr(*init, pb);
             pb.binary(ir::Inst::Tag::Store, dst, val, il);

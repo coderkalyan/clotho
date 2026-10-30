@@ -38,9 +38,18 @@ ir::SourceLoc Lowerer::loc(const Statement& s) const {
 // rather than point at -- `--sanitize=bounds` highlights the whole index the
 // user wrote -- and the extent is sparse in the IR, so only these get one.
 ir::Index Lowerer::lower_index(const Expression& e, ir::Builder& b) {
-    const ir::Index i = lower_expr(e, b);
+    const ir::Index i = as_signed_number(lower_expr(e, b), *e.type, b, loc(e));
     b.set_end(i, to_source_loc(e.sourceRange.end()));
     return i;
+}
+
+ir::Index Lowerer::as_signed_number(ir::Index v, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l) {
+    if (t.isSigned()) {
+        return v;
+    }
+    const uint32_t width = std::max(64u, static_cast<uint32_t>(t.getBitWidth()) + 1);
+
+    return b.convert(v, make_int_type(width, t.isFourState()), false, l);
 }
 
 // Full source extent of a symbol's declaring syntax, or a degenerate span at
@@ -358,105 +367,70 @@ ir::Ref Lowerer::string_value_ref(std::string_view text) {
                                   { reinterpret_cast<const uint8_t*>(stripped.data()), stripped.size() });
 }
 
-// Intern a packed integer type of the given width / state / signedness.
-ir::Ref Lowerer::make_int_type(uint32_t width, bool is_four, bool is_signed) {
-    const ir::Ref element = is_four ? module_.pool.logic_type : module_.pool.bit_type;
-    if (width == 1 && !is_signed) {
-        return element;
-    }
-
-    ir::Type vec;
-    vec.kind      = ir::Type::Kind::PackedArray;
-    vec.is_signed = is_signed;
-    vec.element   = element;
-    vec.left      = width - 1;
-    vec.right     = 0;
-
-    return module_.pool.put(ir::Item{ vec });
+// Intern a packed integer type of the given width and domain. An integer type
+// carries no signedness: the opcode or the instruction data that reads a value
+// says how.
+ir::Ref Lowerer::make_int_type(uint32_t width, bool is_four) {
+    return module_.pool.int_type(width, is_four);
 }
 
-// Resize / convert an already-lowered rvalue of slang type `from` to the
-// interned target `to`. Integral-to-integral resizes; any real endpoint
-// picks the matching float conversion (assignment semantics: real ->
-// integral rounds half away from zero, LRM 6.12.1). Used where the
-// frontend coerces manually (port copies, call arguments, returns) rather
-// than through a slang-inserted Conversion. Every such site is
-// assignment-like, so `ext` defaults to the 11.8.3 rule.
+// Convert an already-lowered rvalue of slang type `from` to the interned target
+// `to`. Integral-to-integral converts; any real endpoint picks the matching float
+// conversion (assignment semantics: real -> integral rounds half away from zero,
+// LRM 6.12.1). Used where the frontend coerces manually (port copies, call
+// arguments, returns) rather than through a slang-inserted Conversion.
+//
+// An integral widening fills with the sign bit or with zeros, and the language
+// decides which: LRM 11.8.3 (assignment) "extend the size of the right-hand
+// side, performing sign extension if, and only if, the type of the right-hand
+// side is signed" -- the SOURCE decides, and LRM 6.24.1 puts a cast under the same
+// rule. LRM 11.8.2, last step, has a context-determined operand "converted to the
+// propagated type and size... sign-extended only if the propagated type is
+// signed" -- the TARGET decides. The two really do disagree, in both directions:
+// with `logic [7:0] u; logic signed [3:0] s = -1`, `u + s` zero-extends s (16),
+// while `u = s` sign-extends it (255). Both iverilog 13 and Verilator 5.050 agree
+// on both. Every caller is assignment-like (the default, the source's signedness)
+// except the propagated conversion, which passes the propagated type's.
 ir::Index Lowerer::coerce(ir::Index               v,
                           const slang::ast::Type& from,
                           ir::Ref                 to,
                           ir::Builder&            b,
                           ir::SourceLoc           l,
-                          Extend                  ext) {
+                          std::optional<bool>     sign_extend) {
     const bool from_f = from.isFloating();
     const bool to_f   = module_.pool.is_float(to);
     if (to_f && from_f) {
         return b.float_cvt(ir::Inst::Tag::FResize, v, to, l);
     }
     if (to_f) {
-        return b.float_cvt(ir::Inst::Tag::ItoF, v, to, l);
+        return b.float_cvt(from.isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF, v, to, l);
     }
     if (from_f) {
         return b.float_cvt(ir::Inst::Tag::FtoI, v, to, l);
     }
-    if (ext == Extend::Source) {
-        v = extend_by_source_sign(v, from, to, b, l);
-    }
-    return b.resize(v, to, l);
-}
 
-// The LRM 11.8.3 half of `coerce`: when the value widens into a target of
-// the OTHER signedness, do the extension first, at the target width but
-// under the source's own sign, so the following Resize is width-preserving
-// and only retags the value. Returns `v` untouched for a narrowing, an
-// equal-width retag, or a matching signedness, which is every case a design
-// that never mixes signedness hits. Non-integral endpoints (an unpacked
-// aggregate, a handle, a bit-stream target) have no sign to extend under and
-// pass straight through.
-ir::Index Lowerer::extend_by_source_sign(ir::Index               v,
-                                         const slang::ast::Type& from,
-                                         ir::Ref                 to,
-                                         ir::Builder&            b,
-                                         ir::SourceLoc           l) {
-    if (!from.isIntegral()) {
-        return v;
-    }
-    const auto& ty         = std::get<ir::Type>(module_.pool.get(to));
-    const bool  packed_int = ty.kind == ir::Type::Kind::Logic || ty.kind == ir::Type::Kind::Bit ||
-                             ty.kind == ir::Type::Kind::PackedArray ||
-                             (ty.kind == ir::Type::Kind::Struct && ty.is_packed);
-    if (!packed_int) {
-        return v;
-    }
-    const bool       src_signed = from.isSigned();
-    const ir::Layout lay        = module_.pool.layout(to);
-    if (lay.width <= from.getBitWidth() || ty.is_signed == src_signed) {
-        return v;
-    }
-
-    return b.resize(v, make_int_type(lay.width, lay.domain == ir::Domain::Four, src_signed), l);
+    return b.convert(v, to, sign_extend.value_or(from.isSigned()), l);
 }
 
 // Narrow/widen an already-loaded rvalue to its expression's own declared
 // type (LRM 6.3.1 domain conversion). A no-op for the ordinary
 // (domain-uniform) case; skipped for string/real, which have no domain
 // to narrow (a packed struct member is always integral, LRM 7.2.1) and
-// whose loaded value a plain Resize instruction rejects outright. Needed
-// because the backend's PartSelect/BitSelect type inference
-// (ir/llvm/Inst.cpp compute_type) inherits the base signal's domain
-// uniformly — correct for an ordinary vector/array, wrong when the base
+// which an integer conversion rejects outright. Needed because a
+// PartSelect/BitSelect's type (ir/Typing.cpp) inherits the base signal's
+// domain uniformly -- correct for an ordinary vector/array, wrong when the base
 // is a struct field whose own declared domain is narrower than its
 // struct's physical storage (LRM 6.11.2 forces the whole struct 4-state
-// if any member is).
+// if any member is). The width is the field's own, so only the domain changes.
 ir::Index Lowerer::narrow_to_declared(ir::Index v, const slang::ast::Type& declared, ir::Builder& b, ir::SourceLoc l) {
     if (declared.isString() || declared.isFloating()) {
         return v;
     }
-    return b.resize(v, lower_type(declared), l);
+    return b.convert(v, lower_type(declared), /*sign_extend=*/false, l);
 }
 
 ir::Ref Lowerer::mask_type(uint32_t width) {
-    return make_int_type(width, /*is_four=*/false, /*is_signed=*/false);
+    return make_int_type(width, /*is_four=*/false);
 }
 
 // `id` indexes the module's monitor table, so two assertions in one instance
@@ -525,9 +499,8 @@ Lowerer::MonitorState Lowerer::alloc_monitor_state(const ir::AssertionMonitor& m
         }
     }
     if (mon.kind == ir::AssertionKind::Cover) {
-        // Unsigned: a tally is never negative, and widening the 1-bit match
-        // flag into a signed target would sign-extend it to -1 (a Resize takes
-        // its signedness from the target type).
+        // Unsigned: a tally is never negative, and sign-extending the 1-bit match
+        // flag would make it -1.
         st.covered = new_monitor_state(base + "cov", mask_type(32), l);
     }
     if (mon.kind == ir::AssertionKind::Expect) {
@@ -716,7 +689,7 @@ ir::Index Lowerer::mask_popcount(ir::Index mask, uint32_t width, ir::Builder& b,
     ir::Index total = zero_mask(counter_bits, b, l);
     for (uint32_t i = 0; i < width; ++i) {
         total = b.binary(
-          ir::Inst::Tag::Add, total, b.resize(mask_bit(mask, i, width, b, l), mask_type(counter_bits), l), l);
+          ir::Inst::Tag::Add, total, b.convert(mask_bit(mask, i, width, b, l), mask_type(counter_bits), false, l), l);
     }
 
     return total;
@@ -742,7 +715,7 @@ ir::Index Lowerer::rotl1(ir::Index v, uint32_t width, ir::Builder& b, ir::Source
 // A definite 1-bit `1`, used as the predicate for an omitted for-condition
 // or a `forever` loop.
 ir::Index Lowerer::true_const(ir::Builder& b, ir::SourceLoc l) {
-    return b.constant(module_.pool.put_int(make_int_type(1, false, false), 1), l);
+    return b.constant(module_.pool.put_int(make_int_type(1, false), 1), l);
 }
 
 // Allocate one. Inside anything with a frame -- a task, a function, a fork

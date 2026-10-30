@@ -11,6 +11,7 @@
 // typically held behind a unique_ptr by the front-end.
 
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -913,14 +914,21 @@ public:
     // Reserve a function slot and return its id before the body is built, so a
     // recursive call can resolve the id while the body is still being lowered. The
     // slot must be filled with set_function before the module is used.
-    FunctionId reserve_function() {
+    //
+    // The return type is declared here, not with the body: a call's value is typed
+    // by the callee's return type, and a call to a function whose body is still
+    // being built (recursion, a forward reference) is typed before set_function.
+    FunctionId reserve_function(Ref return_type) {
         const auto index = static_cast<uint32_t>(functions_.size());
         functions_.emplace_back();
+        functions_.back().return_type = return_type;
         return static_cast<FunctionId>(index);
     }
 
-    // Fill a previously reserved slot with the built function.
+    // Fill a previously reserved slot with the built function, whose return type
+    // is the one reserved.
     void set_function(FunctionId id, Function fn) {
+        assert(functions_[static_cast<uint32_t>(id)].return_type == fn.return_type);
         functions_[static_cast<uint32_t>(id)] = std::move(fn);
     }
 

@@ -4,6 +4,7 @@
 
 #include <slang/diagnostics/AllDiags.h>
 
+#include "ir/Verify.h"
 namespace clotho {
 
 namespace {
@@ -1017,6 +1018,15 @@ void render_through_client(const Diagnostic&           d,
     }
 }
 
+// The lowered module satisfies the IR's typing rules (ir/Verify.h): the backend
+// asserts what these rules state and repairs none of it. A module the frontend
+// gave up on is half built, so only a usable one is checked.
+void assert_well_typed([[maybe_unused]] const LowerResult& result) {
+    if (result.ok && result.module != nullptr) {
+        ir::assert_well_typed(*result.module, loc_resolver(result));
+    }
+}
+
 LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               std::shared_ptr<SourceContext> ctx,
                               Timings*                       timings,
@@ -1026,8 +1036,11 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               bool                           allow_port_coercion = false) {
     const slang::SourceManager* const sm = comp.getSourceManager();
     if (sm == nullptr) {
-        return lower_design(
-          comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial, allow_port_coercion);
+        LowerResult bare =
+          lower_design(comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial, allow_port_coercion);
+        assert_well_typed(bare);
+
+        return bare;
     }
 
     slang::DiagnosticEngine engine(*sm);
@@ -1037,6 +1050,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     engine.addClient(style.client);
     LowerResult result =
       lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion);
+    assert_well_typed(result);
 
     // slang's own items arrive rendered (lower_design harvests them one by one).
     // What is left is Clotho's: lowering guards, post-lowering checks and the

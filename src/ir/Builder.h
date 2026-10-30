@@ -21,13 +21,25 @@
 
 #include "InternPool.h"
 #include "Ir.h"
+#include "Module.h"
+#include "Typing.h"
 
 namespace clotho::ir {
 
 class Builder {
 public:
-    explicit Builder(InternPool& pool)
-      : pool_(pool) {}
+    // A body of module `m`: its constants and types are interned in `m.pool`, and
+    // the signals and functions it names are `m`'s.
+    explicit Builder(Module& m)
+      : mod_(m)
+      , pool_(m.pool) {}
+
+    // The type of the value instruction `i` produces (Typing.h), so the frontend
+    // can see what it is about to combine rather than assume it. Derived from the
+    // instructions emitted so far and memoized; it is what the backend and the
+    // verifier will compute for `i` once the body is finished. A call to a
+    // function reserved but not yet built is typed by its declared return type.
+    ValueType type_of(Index i);
 
     // -- Leaves --
     Index constant(Ref value, SourceLoc loc);
@@ -87,8 +99,25 @@ public:
         return { static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) };
     }
 
+    // -- Conversions --
+    // Widen / narrow / change the domain of an integral value to `type` (see
+    // Inst::Tag::ZExt). Each is one instruction and the caller says which; most code
+    // wants convert().
+    Index zext(Index op, Ref type, SourceLoc loc);
+    Index sext(Index op, Ref type, SourceLoc loc);
+    Index trunc(Index op, Ref type, SourceLoc loc);
+    Index to_four(Index op, Ref type, SourceLoc loc);
+    Index to_two(Index op, Ref type, SourceLoc loc);
+    // Convert the integral value `op` to `type`: x/z bits first become 0 if the
+    // target is 2-state (LRM 6.3.1), then the width changes (a widening copies the
+    // top bit when `sign_extend`, else fills with zeros), then a 4-state target gains
+    // its x/z plane. Emits nothing for a value already of that width and domain.
+    // Whether to sign-extend is the language's call, not a property of the value:
+    // LRM 11.8.3 takes the SOURCE's signedness for an assignment or a cast,
+    // LRM 11.8.2 the propagated TARGET's for an operand.
+    Index convert(Index op, Ref type, bool sign_extend, SourceLoc loc);
+
     // -- Irregular shapes --
-    Index resize(Index op, Ref type, SourceLoc loc);
 
     // Emit a float conversion (ItoF / FtoI / FtoITrunc / FBitcast / FResize)
     // of `op` to `type`.
@@ -310,7 +339,7 @@ public:
     // `fmt_fallback` set, a value matching no member renders as a decimal leaf
     // instead of "" — LRM 21.2.1.6's rule for `%p` of an enum, as against LRM
     // 6.19.2's "" for `.name()`.
-    Index enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback, SourceLoc loc);
+    Index enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback, bool is_signed, SourceLoc loc);
     // Guard a tagged-union member access against the union's current tag (LRM
     // 11.9). `tag` is the extracted tag value, `expected` the accessed member's
     // fieldIndex, `is_write` true for an assignment, `member` the accessed
@@ -347,10 +376,19 @@ public:
     Index count_bits(Index op, uint32_t mask, SourceLoc loc);
 
     // `sel inside { ... }` (LRM 11.4.13): `values` are the singular members
-    // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs.
-    // All must already be resized to the selector type. Yields a 1-bit 4-state
-    // value.
-    Index inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges, SourceLoc loc);
+    // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs, which
+    // compare as signed numbers when `ranges_signed`. All must already be converted
+    // to the selector type. Yields a 1-bit value, 4-state when the selector is.
+    Index inside_set(Index                  sel,
+                     std::span<const Index> values,
+                     std::span<const Index> ranges,
+                     bool                   ranges_signed,
+                     SourceLoc              loc);
+
+    // `base ** exp` of integral operands (LRM 11.4.3). The base and the
+    // self-determined exponent are signed or unsigned as stated; Table 11-4's
+    // negative-operand corners depend on both.
+    Index pow(Index base, Index exp, bool base_signed, bool exp_signed, SourceLoc loc);
 
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
@@ -452,10 +490,10 @@ public:
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume. The
     // backend writes to standard output.
-    Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    Index display(std::string_view fmt, bool newline, std::span<const FmtArg> args, SourceLoc loc);
     // $fdisplay / $fwrite: like display, but `fd` selects the destination
     // descriptor (an MCD or FD value).
-    Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const FmtArg> args, SourceLoc loc);
     // $strobe / $strobeb / $strobeo / $strobeh (LRM 21.2.2): register the
     // zero-formal deferred-print task `func` to run once in the Postponed
     // region of the current time step. A statement, never a value.
@@ -479,7 +517,7 @@ public:
     Index monitor_set(FunctionId func, SourceLoc loc);
     // The change-detecting print inside a monitor body: render `fmt`+`args` and
     // emit to `fd` only if the rendered output changed since the last emit.
-    Index monitor_emit(Index fd, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    Index monitor_emit(Index fd, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // $monitoron (on=true) / $monitoroff (on=false): enable / disable the monitor.
     Index monitor_enable(bool on, SourceLoc loc);
     // Two-argument $fopen: open `name` with the C stdio mode string `mode`,
@@ -502,18 +540,17 @@ public:
     Index fgets(Index dst, Index fd, SourceLoc loc);
     // $sformat / $swrite: format `args` per `fmt` and store the result into the
     // string lvalue `dst`. No value.
-    Index sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    Index sformat(Index dst, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // $sformatf: format `args` per `fmt`. Yields a new string value.
-    Index sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    Index sformatf(std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // The two above with a format that only exists at run time: `fmt_value` is a
     // string value the runtime renderer parses, not text known here (LRM §21.3.3
     // exempts $sformat / $sformatf from the literal-format rule). `tick_scale` is
     // the calling module's ticks-per-time-unit, which a %t operand needs and the
     // frontend can no longer pre-apply because it does not know which argument
     // will meet a %t.
-    Index sformat_dyn(Index dst, Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
-                      SourceLoc loc);
-    Index sformatf_dyn(Index fmt_value, std::span<const Index> args, uint64_t tick_scale, SourceLoc loc);
+    Index sformat_dyn(Index dst, Index fmt_value, std::span<const FmtArg> args, uint64_t tick_scale, SourceLoc loc);
+    Index sformatf_dyn(Index fmt_value, std::span<const FmtArg> args, uint64_t tick_scale, SourceLoc loc);
     // %p of a queue / dynamic array: render `'{e0, e1, ...}` over the runtime
     // element count. `handle` is the container lvalue, `container_type` the
     // interned Queue / DynArray type. Yields a new string value.
@@ -550,12 +587,12 @@ public:
     // label; `banner` the compile-time prefix "<file>:<line>: "; `fmt` + `args`
     // the $display-style message (both empty for a bare `$error;`). Non-fatal,
     // renders and returns; $fatal's termination is a following finish().
-    Index severity(uint32_t               level,
-                   std::string_view       banner,
-                   std::string_view       fmt,
-                   std::span<const Index> args,
-                   SourceLoc              loc,
-                   uint32_t               defer = 0);
+    Index severity(uint32_t                level,
+                   std::string_view        banner,
+                   std::string_view        fmt,
+                   std::span<const FmtArg> args,
+                   SourceLoc               loc,
+                   uint32_t                defer = 0);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);
@@ -691,7 +728,11 @@ public:
 private:
     // Shared body of display / fdisplay: pack the format bytes, the value-arg
     // slice, and the DisplayInfo record into the extra buffer.
-    ExtraIndex display_info(std::string_view fmt, bool newline, std::span<const Index> args);
+    ExtraIndex display_info(std::string_view fmt, bool newline, std::span<const FmtArg> args);
+
+    // The operand slice of a format-family op, with one flag word per operand in
+    // `signs`.
+    ExtraSlice add_fmt_args(std::span<const FmtArg> args, ExtraSlice& signs);
 
     Index emit(const Inst& inst, SourceLoc loc) {
         const auto index = static_cast<uint32_t>(tags_.size());
@@ -752,6 +793,8 @@ private:
         return { static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) };
     }
 
+    // The module this body belongs to.
+    Module& mod_;
     // Intern pool backing constant / type references.
     InternPool& pool_;
     // Growable SoA instruction columns under construction.
@@ -766,6 +809,8 @@ private:
     std::vector<Index> scratch_;
     // Start offset into scratch_ of each open nested region.
     std::vector<size_t> region_starts_;
+    // type_of's memo: the type of instruction k for k < types_.size().
+    std::vector<ValueType> types_;
 };
 
 } // namespace clotho::ir

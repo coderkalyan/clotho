@@ -754,6 +754,34 @@ TEST_CASE("undriven elements of a partially-driven net array read z") {
                  "zzzzzz\n");
 }
 
+// A constant index pins the element it drives whatever its signedness: IR integer
+// types carry no sign, so the frontend widens an unsigned index by a zero bit
+// (Lowerer::as_signed_number) and the driver analysis looks through that
+// conversion to the constant. An index outside the array, signed or unsigned,
+// drives nothing, and the elements nothing reaches power on z.
+TEST_CASE("unsigned and signed constant indices pin the net array elements they drive") {
+    const std::string out = run_capture(R"(
+        module top;
+          localparam logic [1:0] I = 2'd1;
+          localparam byte        N = -1;
+          wire [3:0] u [0:2];
+          wire [3:0] n [0:2];
+          assign u[I]    = 4'h5;
+          assign u[2'd2] = 4'h6;
+          assign n[N]    = 4'h7;         // -1: outside [0:2]
+          assign n[8'hFF] = 4'h8;        // 255: outside [0:2]
+          assign n[1]    = 4'h9;
+          initial begin
+            #1;
+            $display("%b %b %b", u[0], u[1], u[2]);
+            $display("%b %b %b", n[0], n[1], n[2]);
+          end
+        endmodule
+    )");
+    CHECK(out == "zzzz 0101 0110\n"
+                 "zzzz 1001 zzzz\n");
+}
+
 // A driverless tri0 / tri1 / supply net array pulls EVERY element, not only the
 // first: the resolver stores the pulled value once per element. Metamorphic
 // oracle: each array reads the same as the scalar nets of its elements, which is

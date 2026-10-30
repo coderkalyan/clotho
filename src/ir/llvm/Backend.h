@@ -52,6 +52,7 @@
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
 #include "ir/TypeModel.h"
+#include "ir/Typing.h"
 #include "runtime/Gc.h"
 #include "runtime/Runtime.h"
 
@@ -86,9 +87,9 @@
 // reaches a field through constant-index GEPs, so LLVM computes and owns all
 // offsets/padding (the module carries the target's DataLayout).
 //
-// Inferred types. The IR stores no per-instruction result type, so the backend
-// recomputes width / domain / signedness for each value by walking operands
-// (the frontend already inserted Resize nodes to width-match binary operands).
+// Inferred types. The IR stores no per-instruction result type; the shared
+// typing (ir/Typing.h) derives width / domain / signedness for each value from
+// its operands and declared types, the same derivation the IR verifier checks.
 //
 // Scope (initial). Nonblocking assignment is lowered identically to blocking
 // (no two-phase next-state staging yet); event / sensitivity gating is left
@@ -97,25 +98,6 @@
 
 namespace clotho::ir::backend {
 
-// Inferred type of a lowered value: its packed width, whether it can carry X/Z
-// (a meaningful xz plane), and its signedness (drives sext-vs-zext and signed
-// compares).
-struct ValType {
-    uint32_t width      = 0;
-    bool     four_state = false;
-    bool     is_signed  = false;
-    // A string value: carried as an rt_string handle pointer (str_vals_), never
-    // as a Plane. width / four_state are meaningless when set.
-    bool is_string = false;
-    // Real / shortreal: the value is an IEEE-754 double (width 64) or float
-    // (width 32) riding Plane.fp; never four_state.
-    bool is_real = false;
-};
-
-// The type_of memo stores one ValType per instruction; keep it one dense
-// 8-byte word (validity lives in a parallel byte vector, not an optional).
-static_assert(sizeof(ValType) == 8);
-
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
 // = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
 // (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, select select)
@@ -123,10 +105,15 @@ static_assert(sizeof(ValType) == 8);
 struct Plane {
     llvm::Value* mm = nullptr; // 4-state: i(2W) [0,W) must, [W,2W) may. 2-state: iW value.
     llvm::Value* z  = nullptr; // 4-state z plane (iW), or null when never-z. Null for 2-state.
-    // A genuine 2-state value: `mm` is a single iW with no unknown/z plane. The
-    // accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
-    // 2-state value never carries the redundant may/z half. Domain is inferred
-    // per value, not per instruction; see the operator dispatch in lower_inst.
+    // The encoding of `mm`: a 2-state value is a single iW with no unknown/z plane,
+    // and the accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
+    // 2-state value never carries the redundant may/z half. For an instruction's
+    // value the encoding is its IR type's domain, the single source of truth:
+    // set_value asserts they agree and an operator never converts its operands.
+    // Where storage or an ABI decides the encoding the tag is not the domain: a
+    // 2-state signal is stored packed when a task's pointer ABI or the may-z
+    // analysis gives it a z word (StateLayout), so a plane read from storage or
+    // returned by a call crosses into the type's domain in in_type_domain.
     bool two = false;
     // Real / shortreal value (double / float). Exactly one of fp and mm is set:
     // a real SSA value carries fp only; its storage form is the raw bit pattern
@@ -614,7 +601,6 @@ struct SignalSlot {
     std::vector<uint32_t> path;
     uint32_t width      = 0;
     bool     four_state = false;
-    bool     is_signed  = false;
     // Whether the slot stores a z word: the signal may carry z (compute_may_z)
     // or is a task out/inout target (the task ABI stores z through a pointer to
     // it). A never-z slot is just `{ i(2W) }`.
@@ -2531,15 +2517,14 @@ private:
 
     void branch_to(llvm::BasicBlock* bb);
 
-    // -- Type inference (memoized) --
+    // -- Types --
 
-    ValType type_of(Index i);
-
-    ValType from_ref(Ref type) const;
+    // The type of the value instruction `i` of the current body produces.
+    ValueType type_of(Index i) const {
+        return types_[static_cast<uint32_t>(i)];
+    }
 
     Ref queue_elem_type(Index queue_lv);
-
-    ValType compute_type(Index i);
 
     // -- Value / lvalue access --
 
@@ -2731,11 +2716,12 @@ private:
                                 llvm::Value*     scratch,
                                 llvm::ArrayType* arr_ty,
                                 uint32_t         off,
-                                llvm::Value*&    any_x);
+                                llvm::Value*&    any_x,
+                                bool             is_signed);
 
     AssocKeySpan normalize_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
 
-    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot);
+    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot, bool is_signed);
 
     AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
 
@@ -2754,10 +2740,14 @@ private:
                                       bool         is_signed,
                                       uint32_t     store_width);
 
-    void denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off);
+    void denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off, bool is_signed);
 
-    void denormalize_variable_agg_key(Ref type, const LValue& lv, llvm::Value* kbase, llvm::Value*& off,
-                                      Index at);
+    void denormalize_variable_agg_key(Ref           type,
+                                      const LValue& lv,
+                                      llvm::Value*  kbase,
+                                      llvm::Value*& off,
+                                      Index         at,
+                                      bool          is_signed);
 
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write);
 
@@ -2896,7 +2886,7 @@ private:
 
     // A bit / part-select index operand as the i32 added to a bit offset; a value
     // an i32 cannot hold saturates, which lands out of range in any container.
-    llvm::Value* select_index(Plane idx, ValType t);
+    llvm::Value* select_index(Plane idx, ValueType t);
 
     // An unpacked-array element: `pos` is its 0-based position (meaningful only
     // when `in_range`), `in_range` the verdict without the x/z term.
@@ -2905,7 +2895,7 @@ private:
         llvm::Value* in_range = nullptr;
     };
 
-    ElemPos fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right);
+    ElemPos fixed_elem_pos(Plane idx, ValueType t, uint32_t left, uint32_t right);
 
     // A dynamic-array / queue index `idx < len`; `idx64` addresses the element
     // only when `below`.
@@ -2914,7 +2904,7 @@ private:
         llvm::Value* below = nullptr;
     };
 
-    ElemBelow elem_index_below(Plane idx, ValType t, llvm::Value* len);
+    ElemBelow elem_index_below(Plane idx, ValueType t, llvm::Value* len);
 
     llvm::Value* store_mask(const LValue& lv, uint32_t sw);
 
@@ -3306,7 +3296,7 @@ private:
 
     void lower_task_call_inst(Index i);
 
-    llvm::Value* build_rt_args(std::span<const Index> args, const char* /*who*/);
+    llvm::Value* build_rt_args(std::span<const Index> args, std::span<const uint32_t> signs);
 
     void lower_display(Index i);
 
@@ -3329,6 +3319,8 @@ private:
     llvm::Value* z_of(Plane a);
 
     Plane two_val(llvm::Value* v);
+    Plane known_plane(llvm::Value* v, bool four_state);
+    Plane in_type_domain(Plane p, ValueType t);
 
     Plane to_four(Plane a);
 
@@ -3340,7 +3332,7 @@ private:
 
     Plane cast_plane(Plane a, uint32_t to, bool sign);
 
-    Plane convert(Plane a, uint32_t to_width, bool four_state, bool sign);
+    Plane lower_conversion(Inst::Tag tag, Plane a, ValueType to);
 
     llvm::Value* xz_mask(Plane a, Plane b, uint32_t w);
 
@@ -3373,7 +3365,7 @@ private:
 
     Plane lower_real_compare(Inst::Tag tag, Plane a, Plane b);
 
-    Plane lower_ftoi(Inst::Tag tag, Plane v, ValType to);
+    Plane lower_ftoi(Inst::Tag tag, Plane v, ValueType to);
 
     Plane lower_real_mux(Plane cond, Plane a, Plane b);
 
@@ -3400,7 +3392,7 @@ private:
 
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b);
 
-    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign);
+    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b);
 
     Plane lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed);
 
@@ -3431,7 +3423,7 @@ private:
 
     // -- Shifts: X/Z in the count makes the whole result X; value planes shift. --
 
-    Plane lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign);
+    Plane lower_shift(Inst::Tag tag, Plane a, Plane amt);
 
     // -- Comparisons -> 1-bit. X rules differ per operator class (see
     // lower_compare): ==/!= are X only when genuinely ambiguous (LRM 11.4.5),
@@ -3479,7 +3471,7 @@ private:
 
     Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type);
 
-    Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign);
+    Plane lower_compare(Inst::Tag tag, Plane a, Plane b);
 
     Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b);
 
@@ -3496,6 +3488,9 @@ private:
         llvm::Value* f;
     };
     Truth truth_of(Plane a);
+
+    // i1: whether a 2-state value is nonzero, its truth in a logical operator.
+    llvm::Value* nonzero(Plane a);
 
     Plane lower_logical(Inst::Tag tag, Plane a, Plane b);
 
@@ -4359,12 +4354,9 @@ private:
 
     std::vector<Plane>                 values_;
     std::vector<std::optional<LValue>> lvals_;
-    // Per-instruction type_of memo. Validity lives in a parallel byte vector
-    // instead of std::optional<ValType> (12B/entry from the engaged flag +
-    // padding): entries stay 8B dense, and a body reset only clears the
-    // bitmap — stale types_ values are gated by types_valid_ == 0.
-    std::vector<ValType> types_;
-    std::vector<uint8_t> types_valid_;
+    // The type of every instruction of the current body (ir/Typing.h), computed
+    // when the body starts lowering.
+    std::vector<ValueType> types_;
     // rt_string handle pointers of string-valued instructions, parallel to
     // values_ (a string never flows as a Plane).
     std::vector<llvm::Value*> str_vals_;

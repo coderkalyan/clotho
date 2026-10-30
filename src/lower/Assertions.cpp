@@ -62,7 +62,7 @@ void Lowerer::emit_deferred_action(const Statement*      action,
              "' is not supported (only $error / $warning / $info) — Phase 1");
     }
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(call->arguments(), fmt, args, b);
     b.severity(static_cast<uint32_t>(sev), severity_banner(call->sourceRange.start()), fmt, args, loc(*call),
                defer_mode);
@@ -1502,7 +1502,7 @@ void Lowerer::require_finish_inlinable(const Statement& action) {
 // enclosing module's signals still resolve. It takes no formals because there
 // is nothing to pass -- the verdict that pends it is the whole input.
 ir::FunctionId Lowerer::build_action_body(const Statement& body, std::string_view name) {
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(module_.pool.void_type);
 
     FnCtx ctx;
     ctx.name_prefix = std::string(name) + ".";
@@ -1510,7 +1510,7 @@ ir::FunctionId Lowerer::build_action_body(const Statement& body, std::string_vie
     ctx.is_task     = true;
     const FnScope fn_scope(*this, &ctx);
 
-    ir::Builder                b(module_.pool);
+    ir::Builder                b(module_);
     const ir::Builder::Mark    body_mark = b.mark();
     std::optional<LowerError>  failure;
     try {
@@ -1550,10 +1550,10 @@ ir::FunctionId Lowerer::build_action_body(const Statement& body, std::string_vie
 // against, and a deferred report queued from Reactive would be flushing into
 // an Observed queue this slot has already drained.
 ir::FunctionId Lowerer::build_default_fail_body(const ir::AssertionMonitor& mon) {
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(module_.pool.void_type);
     const ir::SourceLoc  l  = mon.span.start;
 
-    ir::Builder b(module_.pool);
+    ir::Builder b(module_);
     b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
     b.ret_void(l);
 
@@ -1624,7 +1624,7 @@ void Lowerer::finalize_sva_history() {
         return;
     }
     if (!preinit_) {
-        preinit_.emplace(module_.pool);
+        preinit_.emplace(module_);
     }
     ir::Builder& b = *preinit_;
     for (const auto& [live, entry] : sva_history_seeds_) {
@@ -1809,7 +1809,7 @@ void Lowerer::finalize_preponed() {
     if (sva_shadow_pairs_.empty() && preponed_clears_.empty()) {
         return;
     }
-    ir::Builder b(module_.pool);
+    ir::Builder b(module_);
     for (const auto& [live, shadow] : sva_shadow_pairs_) {
         const ir::SourceLoc l   = module_.signal(shadow).loc;
         const ir::Index     dst = b.signal(shadow, l);

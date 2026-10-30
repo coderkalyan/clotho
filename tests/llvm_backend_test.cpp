@@ -963,11 +963,10 @@ TEST_CASE("a widening cast extends by the source's signedness, not the target's"
     // extension if, and only if, the type of the right-hand side is signed".
     // `bit` and `logic` are unsigned, so int'(1'b1) is 1.
     //
-    // Regression: the cast lowered to a single Resize, whose extension follows
-    // its TARGET type, so every unsigned source widened into a signed target
-    // sign-extended. slang splits an IMPLICIT assignment conversion into a
-    // widen-then-retag pair itself, which is why the plain assignments below
-    // were already right and only the cast was wrong. Every value here agrees
+    // Regression: the cast lowered to a single resize that took its extension from
+    // the TARGET type, so every unsigned source widened into a signed target
+    // sign-extended. The frontend now picks ZExt or SExt from the source (LRM 6.24.1,
+    // 11.8.3), and an IMPLICIT assignment conversion was already right. Every value here agrees
     // between iverilog 13 and Verilator 5.050.
     const std::string out = run_capture(R"(
         module m;
@@ -4301,25 +4300,26 @@ TEST_CASE("backend lowers string signals, constants, and string ops (hand-built 
     const Signal s =
       mod->add_signal({ .name = "s", .type = mod->pool.string_type, .dir = SignalInfo::Direction::Internal });
 
-    Builder         b(mod->pool);
+    Builder         b(*mod);
     const SourceLoc loc{ 1 };
     const auto      chars = std::string_view{ "Hello" };
     const Ref       lit   = mod->pool.put_value(
       mod->pool.string_type, { reinterpret_cast<const uint8_t*>(chars.data()), chars.size() });
     const Ref int_ty =
-      mod->pool.put(Type{ .kind = Type::Kind::PackedArray, .is_signed = true, .element = mod->pool.bit_type,
-                          .left = 31, .right = 0 });
+      mod->pool.put(Type{ .kind = Type::Kind::PackedArray, .element = mod->pool.bit_type, .left = 31, .right = 0 });
 
     const Index sig = b.signal(s, loc);
     const Index k   = b.constant(lit, loc);
     b.binary(Inst::Tag::Store, sig, k, loc);
     const Index v   = b.unary(Inst::Tag::Load, sig, loc);
     const Index len = b.unary(Inst::Tag::StrLen, v, loc);
-    b.display("%0d", true, std::span<const Index>{ &len, 1 }, loc);
+    const FmtArg len_arg{ len, /*is_signed=*/true };
+    b.display("%0d", true, std::span<const FmtArg>{ &len_arg, 1 }, loc);
     const Index up  = b.unary(Inst::Tag::StrUpper, v, loc);
     const Index idx = b.constant(mod->pool.put_int(int_ty, 4), loc);
     const Index ch  = b.binary(Inst::Tag::StrGetc, up, idx, loc);
-    b.display("%c", true, std::span<const Index>{ &ch, 1 }, loc);
+    const FmtArg ch_arg{ ch, /*is_signed=*/true };
+    b.display("%c", true, std::span<const FmtArg>{ &ch_arg, 1 }, loc);
 
     mod->add_process(Process{ .activation = Activation::Initial, .ir = b.finish() });
 
@@ -4512,15 +4512,14 @@ std::string run_module(ir::Module& m) {
 
 // A 32-bit signed two-state type (int).
 ir::Ref int_type(ir::InternPool& pool) {
-    return pool.put(
-      ir::Type{ .kind = ir::Type::Kind::PackedArray, .is_signed = true, .element = pool.bit_type, .left = 31, .right = 0 });
+    return pool.put(ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = pool.bit_type, .left = 31, .right = 0 });
 }
 
 constexpr auto kLoc = static_cast<ir::SourceLoc>(0);
 
 // Append an initial process that %0d-displays `v` (an int-typed value in `b`).
 void display_int(ir::Builder& b, ir::Index v) {
-    const std::array<ir::Index, 1> args{ v };
+    const std::array<ir::FmtArg, 1> args{ ir::FmtArg{ v, /*is_signed=*/true } };
     b.display("%0d", true, args, kLoc);
 }
 
@@ -4528,7 +4527,7 @@ void display_int(ir::Builder& b, ir::Index v) {
 
 TEST_CASE("real arithmetic, rounding, and truncation") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32  = int_type(m.pool);
     const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
     const auto    ftoi = [&](ir::Index v) { return b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc); };
@@ -4558,13 +4557,13 @@ TEST_CASE("real arithmetic, rounding, and truncation") {
 
 TEST_CASE("real compares are definite and NaN-correct") {
     ir::Module  m;
-    ir::Builder b(m.pool);
-    // Widen the 1-bit compare result through an unsigned type (a signed resize
-    // would sign-extend 1'b1 to -1).
+    ir::Builder b(m);
+    // Widen the 1-bit compare result with a zero extension (a sign extension
+    // would turn 1'b1 into -1).
     const ir::Ref u32 = m.pool.put(
       ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 31, .right = 0 });
     const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
-    const auto show = [&](ir::Index bit) { display_int(b, b.resize(bit, u32, kLoc)); };
+    const auto show = [&](ir::Index bit) { display_int(b, b.zext(bit, u32, kLoc)); };
 
     const double    qnan = std::numeric_limits<double>::quiet_NaN();
     const ir::Index nan  = b.constant(m.pool.put_real(m.pool.real_type, qnan), kLoc);
@@ -4581,7 +4580,7 @@ TEST_CASE("real compares are definite and NaN-correct") {
 
 TEST_CASE("real mux: definite select and the ambiguous-condition rule") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32  = int_type(m.pool);
     const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
     const auto    ftoi = [&](ir::Index v) { return b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc); };
@@ -4613,7 +4612,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
 
     // Watcher: @(r) $display("%0d", FtoI(r)).
     {
-        ir::Builder     b(m.pool);
+        ir::Builder     b(m);
         const ir::Index sig  = b.signal(r, kLoc);
         const ir::Index load = b.unary(ir::Inst::Tag::Load, sig, kLoc);
         display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, load, i32, kLoc));
@@ -4624,7 +4623,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
     // Driver: default is 0.0 (2-state zero pattern), then blocking-store 2.25,
     // then NBA-store 4.5 (commits after the active drain and wakes the watcher).
     {
-        ir::Builder     b(m.pool);
+        ir::Builder     b(m);
         const auto      real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
         const ir::Index sig  = b.signal(r, kLoc);
         const ir::Index ld0  = b.unary(ir::Inst::Tag::Load, sig, kLoc);
@@ -4639,7 +4638,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
 
 TEST_CASE("real bitcasts and integral conversions") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32 = int_type(m.pool);
     const ir::Ref u64 = m.pool.put(
       ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 63, .right = 0 });
@@ -4653,12 +4652,12 @@ TEST_CASE("real bitcasts and integral conversions") {
     const ir::Index back = b.float_cvt(ir::Inst::Tag::FBitcast, bits, m.pool.real_type, kLoc);
     display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, back, i32, kLoc)); // 1
 
-    // ItoF reads x/z bits as 0 (LRM 6.12.1): 8'b1x1x -> 8'b1010 -> 10.0.
+    // UItoF reads x/z bits as 0 (LRM 6.12.1): 8'b1x1x -> 8'b1010 -> 10.0.
     const ir::Ref                logic8 = m.pool.put(
       ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.logic_type, .left = 7, .right = 0 });
     const std::array<uint8_t, 2> vbytes{ 0b1111, 0b0101 }; // val, xz planes
     const ir::Index              vx = b.constant(m.pool.put_value(logic8, vbytes), kLoc);
-    const ir::Index              fv = b.float_cvt(ir::Inst::Tag::ItoF, vx, m.pool.real_type, kLoc);
+    const ir::Index              fv = b.float_cvt(ir::Inst::Tag::UItoF, vx, m.pool.real_type, kLoc);
     display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, fv, i32, kLoc)); // 10
 
     // real <-> shortreal: FResize keeps the value for exactly-representable
@@ -4673,7 +4672,7 @@ TEST_CASE("real bitcasts and integral conversions") {
 
 TEST_CASE("real math ops lower to intrinsics and libm calls") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32  = int_type(m.pool);
     const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
     const auto    show = [&](ir::Index v) { display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc)); };
@@ -4706,15 +4705,15 @@ TEST_CASE("real math ops lower to intrinsics and libm calls") {
 
 TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder b(m);
     const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
 
-    const std::array<ir::Index, 2> args{ real(3.6), real(0.25) };
+    const std::array<ir::FmtArg, 2> args{ ir::FmtArg{ real(3.6) }, ir::FmtArg{ real(0.25) } };
     b.display("%g %f", true, args, kLoc);
 
     // A shortreal marshals by widening to double.
     const ir::Index sr = b.float_cvt(ir::Inst::Tag::FResize, real(1.5), m.pool.shortreal_type, kLoc);
-    const std::array<ir::Index, 1> args2{ sr };
+    const std::array<ir::FmtArg, 1> args2{ ir::FmtArg{ sr } };
     b.display("%g", true, args2, kLoc);
 
     m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });

@@ -35,8 +35,10 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Add:
         case Inst::Tag::Sub:
         case Inst::Tag::Mul:
-        case Inst::Tag::Div:
-        case Inst::Tag::Mod:
+        case Inst::Tag::UDiv:
+        case Inst::Tag::SDiv:
+        case Inst::Tag::UMod:
+        case Inst::Tag::SMod:
         case Inst::Tag::Pow:
         case Inst::Tag::Band:
         case Inst::Tag::Bor:
@@ -59,10 +61,14 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Sra:
         case Inst::Tag::Eq:
         case Inst::Tag::Ne:
-        case Inst::Tag::Lt:
-        case Inst::Tag::Le:
-        case Inst::Tag::Gt:
-        case Inst::Tag::Ge:
+        case Inst::Tag::ULt:
+        case Inst::Tag::SLt:
+        case Inst::Tag::ULe:
+        case Inst::Tag::SLe:
+        case Inst::Tag::UGt:
+        case Inst::Tag::SGt:
+        case Inst::Tag::UGe:
+        case Inst::Tag::SGe:
         case Inst::Tag::CaseEq:
         case Inst::Tag::CasezEq:
         case Inst::Tag::CasexEq:
@@ -78,7 +84,11 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Concat:
         case Inst::Tag::Repl:
         case Inst::Tag::StreamReverse:
-        case Inst::Tag::Resize:
+        case Inst::Tag::ZExt:
+        case Inst::Tag::SExt:
+        case Inst::Tag::Trunc:
+        case Inst::Tag::ToFour:
+        case Inst::Tag::ToTwo:
         case Inst::Tag::Cond:
         case Inst::Tag::Switch:
         case Inst::Tag::Loop:
@@ -104,7 +114,8 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::FLe:
         case Inst::Tag::FGt:
         case Inst::Tag::FGe:
-        case Inst::Tag::ItoF:
+        case Inst::Tag::UItoF:
+        case Inst::Tag::SItoF:
         case Inst::Tag::FtoI:
         case Inst::Tag::FtoITrunc:
         case Inst::Tag::FBitcast:
@@ -441,36 +452,72 @@ std::optional<uint64_t> const_index(const Module& m, const Ir& ir, Index c) {
     return val;
 }
 
-// const_index in the constant's own signedness: an array index is a declared-
-// range coordinate and the backend sign-extends a signed one. nullopt as above,
-// and for a constant wider than 64 bits.
-std::optional<int64_t> const_signed_index(const Module& m, const Ir& ir, Index c) {
-    const std::optional<uint64_t> raw = const_index(m, ir, c);
-    if (!raw) {
+// An operand that is a definite constant, or conversions over one, as the bits it
+// holds and the width of its type. The frontend widens an unsigned array index by a
+// zero bit (Lowerer::as_signed_number), so a constant index reaches the IR as
+// ZExt(Constant) as often as a bare Constant, and no conversion changes which number
+// it denotes. nullopt for anything else, for a constant with an x or z bit
+// (const_index) or wider than 64 bits, and for a conversion to more than 128.
+struct ConstBits {
+    unsigned __int128 bits;
+    uint32_t          width;
+};
+
+std::optional<ConstBits> const_bits(const Module& m, const Ir& ir, Index c) {
+    const auto mask = [](uint32_t width) {
+        return width >= 128 ? ~static_cast<unsigned __int128>(0) : (static_cast<unsigned __int128>(1) << width) - 1;
+    };
+    if (ir.tag(c) == Inst::Tag::Constant) {
+        const uint32_t                w   = m.pool.layout(std::get<Value>(m.pool.get(ir.payload(c).ref)).type).width;
+        const std::optional<uint64_t> raw = const_index(m, ir, c);
+        if (!raw || w > 64) {
+            return std::nullopt;
+        }
+
+        return ConstBits{ *raw & mask(w), w };
+    }
+    if (!is_conversion(ir.tag(c))) {
         return std::nullopt;
     }
-    const Ref      ty = std::get<Value>(m.pool.get(ir.payload(c).ref)).type;
-    const uint32_t w  = m.pool.layout(ty).width;
-    if (w > 64) {
+    const std::optional<ConstBits> from = const_bits(m, ir, ir.payload(c).op_type.op);
+    const uint32_t                 w    = m.pool.layout(ir.payload(c).op_type.type).width;
+    if (!from || w > 128) {
         return std::nullopt;
     }
-    if (std::get<Type>(m.pool.get(ty)).is_signed && w < 64 && ((*raw >> (w - 1)) & 1) != 0) {
-        return static_cast<int64_t>(*raw | (~uint64_t{ 0 } << w));
+    unsigned __int128 bits = from->bits;
+    if (ir.tag(c) == Inst::Tag::SExt && ((bits >> (from->width - 1)) & 1) != 0) {
+        bits |= ~static_cast<unsigned __int128>(0) << from->width;
     }
 
-    return static_cast<int64_t>(*raw);
+    return ConstBits{ bits & mask(w), w };
+}
+
+// const_bits as the signed number the backend reads an array index as: a declared-
+// range coordinate, sign-extended from the operand's own width. A value no int64
+// holds saturates, which lies outside every array all the same.
+std::optional<int64_t> const_signed_index(const Module& m, const Ir& ir, Index c) {
+    const std::optional<ConstBits> k = const_bits(m, ir, c);
+    if (!k) {
+        return std::nullopt;
+    }
+    auto value = static_cast<__int128>(k->bits);
+    if (k->width < 128 && ((k->bits >> (k->width - 1)) & 1) != 0) {
+        value = static_cast<__int128>(k->bits | (~static_cast<unsigned __int128>(0) << k->width));
+    }
+
+    return static_cast<int64_t>(std::clamp(value, static_cast<__int128>(INT64_MIN), static_cast<__int128>(INT64_MAX)));
 }
 
 // The offset a packed select reads from a constant: the frontend folds a select
 // offset into a 32-bit value (lower_packed_offset), and the backend takes it as a
 // signed one, so a base below the vector (`x[-1+:4]`) arrives as 0xFFFFFFFF.
 std::optional<int64_t> const_offset(const Module& m, const Ir& ir, Index c) {
-    const std::optional<uint64_t> raw = const_index(m, ir, c);
-    if (!raw || m.pool.layout(std::get<Value>(m.pool.get(ir.payload(c).ref)).type).width > 32) {
+    const std::optional<ConstBits> k = const_bits(m, ir, c);
+    if (!k || k->width > 32) {
         return std::nullopt;
     }
 
-    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(*raw)));
+    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(k->bits)));
 }
 
 DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
@@ -1372,10 +1419,14 @@ struct ValueSweep {
                     val_z[raw] = z_of(p.op_imm.op);
                     val_x[raw] = operand_x(ir, i);
                     break;
-                case Inst::Tag::Resize:
+                case Inst::Tag::ZExt:
+                case Inst::Tag::SExt:
+                case Inst::Tag::Trunc:
+                case Inst::Tag::ToFour:
+                case Inst::Tag::ToTwo:
                     // Sign extension replicates a z MSB; truncation keeps low z
-                    // bits; a 4->2-state resize does NOT clear z (the backend casts
-                    // all planes).
+                    // bits. ToTwo is treated like the others: its z plane is
+                    // conservatively kept (the analysis is a may-z over-approximation).
                     val_z[raw] = z_of(p.op_type.op);
                     val_x[raw] = operand_x(ir, i);
                     break;
@@ -1411,10 +1462,14 @@ struct ValueSweep {
                 case Inst::Tag::RedXor:
                 case Inst::Tag::Eq:
                 case Inst::Tag::Ne:
-                case Inst::Tag::Lt:
-                case Inst::Tag::Le:
-                case Inst::Tag::Gt:
-                case Inst::Tag::Ge:
+                case Inst::Tag::ULt:
+                case Inst::Tag::SLt:
+                case Inst::Tag::ULe:
+                case Inst::Tag::SLe:
+                case Inst::Tag::UGt:
+                case Inst::Tag::SGt:
+                case Inst::Tag::UGe:
+                case Inst::Tag::SGe:
                 case Inst::Tag::CaseEq:
                 case Inst::Tag::CasezEq:
                 case Inst::Tag::CasexEq:
@@ -1430,8 +1485,10 @@ struct ValueSweep {
 
                 // Division-family x generators: a zero divisor yields x whatever
                 // the operands' own cleanliness (LRM 11.4.1).
-                case Inst::Tag::Div:
-                case Inst::Tag::Mod:
+                case Inst::Tag::UDiv:
+                case Inst::Tag::SDiv:
+                case Inst::Tag::UMod:
+                case Inst::Tag::SMod:
                 case Inst::Tag::Pow:
                     val_x[raw] = 1;
                     break;
@@ -1461,7 +1518,8 @@ struct ValueSweep {
                 case Inst::Tag::FLe:
                 case Inst::Tag::FGt:
                 case Inst::Tag::FGe:
-                case Inst::Tag::ItoF:
+                case Inst::Tag::UItoF:
+                case Inst::Tag::SItoF:
                 case Inst::Tag::FtoI:
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:

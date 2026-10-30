@@ -9,7 +9,7 @@ namespace clotho::ir::backend {
 // unsigned wrap to catch a negative index in one compare; a report that
 // reused that value would print 4294967295 where the design wrote -1.
 llvm::Value* Backend::bounds_index(Index idx_expr) {
-    return cast(must_of(value_of(idx_expr)), 64, type_of(idx_expr).is_signed);
+    return cast(must_of(value_of(idx_expr)), 64, true);
 }
 
 // One constant rt_bounds_site per instrumented access. Everything the report

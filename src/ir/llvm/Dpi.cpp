@@ -564,7 +564,7 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
         b_.CreateCall(dpi_str_out_fn(),
                       { str_of(i), r, alloc_site_global(loc_text(i), "string") });
     } else if (f.dpi_ret_ctype != DpiCType::Void) {
-        set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
+        set_value(i, in_type_domain(dpi_c_to_plane(f.dpi_ret_ctype, r), type_of(i)));
     }
     // An import task falls through both arms: dpi_ret_ctype is Void because the
     // SV task has no result, so its i32 C return -- 35.9's disable
@@ -777,7 +777,7 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
         }
         // Unpack the SV {mm, z} return struct into a Plane, then marshal to C.
         Plane         rp{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
-        const ValType t = from_ref(f.return_type);
+        const ValueType t = value_type_of(mod_.pool, f.return_type);
         if (t.is_real) {
             rp = real_plane(planes_to_real(rp, t.width));
         }

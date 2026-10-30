@@ -15,18 +15,32 @@ when it does.
   plane. AND, OR and NOT need no masking.
 - In SSA the two planes are one 2W-bit integer; the z plane is a separate W-bit
   value.
-- A 2-state value is a native W-bit integer. Its domain comes from its IR type,
-  the single source of truth. **Not yet:** each value also carries its own flag.
-- Domains, signedness and extension are decided by the language, through slang's
-  legalized AST. The IR carries them explicitly (signed and unsigned opcodes, the
-  extension kind); the backend does not re-derive them, and an operand pair that
-  disagrees is an IR error caught by an assertion. **Not yet:** the backend
-  promotes silently, reads signedness from the left operand and picks the
-  extension by the target's sign.
+- A 2-state value is a native W-bit integer, and its domain comes from its IR
+  type alone: one source of truth, no per-value flag to keep in agreement. A
+  2-state variable's storage, and the call ABI, use the native form too, so no
+  boundary ever holds a 2-state value in the packed form. **Not yet:** the code
+  generator tracks each value's encoding in a flag (`Plane::two`) that it asserts
+  against the type, because a 2-state variable is still stored packed when a
+  task's output argument or the may-z analysis gives it a z word (see the call
+  ABI and storage decisions below).
+- An IR integer type is a width and a domain; it has no sign. Domains, signedness
+  and extension are decided by the language, through slang's legalized AST, and the
+  IR carries them explicitly: signed and unsigned opcodes (`SDiv`/`UDiv`,
+  `SLt`/`ULt`, `Sra`/`Srl`, `SItoF`/`UItoF`), explicit flags on the instructions
+  that read a sign (`Pow`, inside ranges, format arguments), and the extension in
+  the opcode of a conversion (`ZExt`, `SExt`, `Trunc`, `ToFour`, `ToTwo`). A
+  same-width sign change emits nothing. The backend does not re-derive any of it,
+  and an operand pair that disagrees in width or domain is an IR error: the
+  verifier (`src/ir/Verify.h`) asserts it after lowering and before code
+  generation, and the backend asserts the same invariants instead of repairing
+  them. Operands the language leaves self-determined (logical operators, shift
+  amounts, the exponent of `**`) keep their own domain. A container's ordering,
+  which is not an operand, is part of its type (`Type::elem_signed`,
+  `Field::is_signed`).
 - A comparison, reduction or logical operator over 2-state operands has a 2-state
-  result and lowers to a native compare. **Not yet:** always 4-state.
-- Result width, domain and signedness are recomputed in the backend from operand
-  and declared types, not stored on instructions.
+  result and lowers to a native compare; a case-equality is always 2-state.
+- A value's width and domain come from one function (`ir::value_types`) shared by
+  the builder, the verifier and the backend, not stored on instructions.
 - Values of any width are LLVM integers of that width. If profiling shows compile
   time or code quality falling off, or a width exceeds LLVM's limit, a ceiling
   routes wider values to our own bigint. **Not yet:** no profiling, no ceiling.
@@ -86,8 +100,9 @@ when it does.
   yet:** one sequence for both, left to constant folding.
 - Constant selects touch only the 64-bit words they cover; part-select stores
   read and write only those words, plane by plane. **Not yet:** the whole slot.
-- Indices reach the backend as 64-bit offsets, extended by their own signedness;
-  wider indices are checked and treated as out of range. **Not yet:** packed
+- Indices reach the backend as signed numbers of at least 64 bits, which the
+  frontend extends by each index's own signedness; wider indices are checked and
+  treated as out of range. **Not yet:** packed
   offsets are 32-bit, with indices that do not fit saturated out of range.
 - A dynamic select branches to a plain fast path when its index is known and in
   range; the mask path runs only otherwise. **Not yet:** a storage-wide mask on

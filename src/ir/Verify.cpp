@@ -1,7 +1,9 @@
 #include "ir/Verify.h"
 
+#include <cassert>
 #include <format>
 #include <optional>
+#include <print>
 #include <variant>
 
 #include "ir/Printer.h"
@@ -64,31 +66,29 @@ private:
             case Tag::Add:
             case Tag::Sub:
             case Tag::Mul:
+            case Tag::UDiv:
+            case Tag::SDiv:
+            case Tag::UMod:
+            case Tag::SMod:
             case Tag::Band:
             case Tag::Bor:
             case Tag::Bxor:
             case Tag::Bxnor:
                 check_integer_pair(i, p.binary.l, p.binary.r);
-                check_result_sign(i, p.binary.l, p.binary.r);
                 return;
-            case Tag::Div:
-            case Tag::Mod:
-                check_integer_pair(i, p.binary.l, p.binary.r);
-                check_sign_pair(i, p.binary.l, p.binary.r);
-                check_forced_four_state(i, p.binary.l, p.binary.r);
-                return;
-            case Tag::Pow:
-                check_forced_four_state(i, p.binary.l, p.binary.r);
-                return;
-            case Tag::Lt:
-            case Tag::Le:
-            case Tag::Gt:
-            case Tag::Ge:
-                check_compare(i, p.binary.l, p.binary.r, /*ordered=*/true);
+            case Tag::ULt:
+            case Tag::SLt:
+            case Tag::ULe:
+            case Tag::SLe:
+            case Tag::UGt:
+            case Tag::SGt:
+            case Tag::UGe:
+            case Tag::SGe:
+                check_compare(i, p.binary.l, p.binary.r);
                 return;
             case Tag::Eq:
             case Tag::Ne:
-                check_compare(i, p.binary.l, p.binary.r, /*ordered=*/false);
+                check_compare(i, p.binary.l, p.binary.r);
                 return;
             case Tag::CaseEq:
             case Tag::CasezEq:
@@ -140,8 +140,12 @@ private:
             case Tag::StoreNbEvent:
                 check_store(i, p.op_extra.op, ir_.extra_data<StoreNbEventInfo>(p.op_extra.extra).value);
                 return;
-            case Tag::Resize:
-                check_resize(i);
+            case Tag::ZExt:
+            case Tag::SExt:
+            case Tag::Trunc:
+            case Tag::ToFour:
+            case Tag::ToTwo:
+                check_conversion(i);
                 return;
             case Tag::Call:
                 check_call(i, ir_.extra_data<CallInfo>(p.extra).func, ir_.extra_data<CallInfo>(p.extra).args);
@@ -183,32 +187,8 @@ private:
         }
     }
 
-    void check_sign_pair(Index i, Index l, Index r) {
-        const ValueType a = ty(l);
-        const ValueType b = ty(r);
-        if (is_scalar(a) && is_scalar(b) && a.is_signed != b.is_signed) {
-            report(Rule::OperandSign, i, a, b);
-        }
-    }
-
-    void check_result_sign(Index i, Index l, Index r) {
-        const ValueType a = ty(l);
-        const ValueType b = ty(r);
-        if (is_scalar(a) && is_scalar(b) && a.is_signed != b.is_signed) {
-            report(Rule::ResultSign, i, a, b);
-        }
-    }
-
-    // Div / Mod / Pow: the LRM result is 4-state because it can be x.
-    void check_forced_four_state(Index i, Index l, Index r) {
-        const ValueType a = ty(l);
-        if (is_scalar(a) && !a.four_state) {
-            report(Rule::ResultDomain, i, a, ty(r));
-        }
-    }
-
     // A comparison is either between two strings or between two integers.
-    void check_compare(Index i, Index l, Index r, bool ordered) {
+    void check_compare(Index i, Index l, Index r) {
         const ValueType a = ty(l);
         const ValueType b = ty(r);
         if (a.is_string || b.is_string) {
@@ -218,12 +198,9 @@ private:
             return;
         }
         check_integer_pair(i, l, r);
-        if (ordered) {
-            check_sign_pair(i, l, r);
-        }
     }
 
-    // The amount is self-determined and may differ in width, domain and sign
+    // The amount is self-determined and may differ in width and domain
     // from the shifted operand; the result is the shifted operand's type, so a
     // 4-state amount over a 2-state operand has no home.
     void check_shift(Index i, Index l, Index r) {
@@ -254,7 +231,6 @@ private:
         }
         for (const Index v : ir_.region(info.ranges)) {
             check_integer_pair(i, p.op_extra.op, v);
-            check_sign_pair(i, p.op_extra.op, v);
         }
     }
 
@@ -275,11 +251,6 @@ private:
         }
         if (a.four_state != b.four_state) {
             report(Rule::SelectArmDomain, i, a, b);
-        }
-        // A real is signed whatever its declared type says; the backend's signal
-        // slots do not record it, so comparing would flag a real signal read.
-        if (!a.is_real && a.is_signed != b.is_signed) {
-            report(Rule::SelectArmSign, i, a, b);
         }
     }
 
@@ -369,9 +340,10 @@ private:
         }
     }
 
-    // -- Resize --
+    // -- Conversions --
 
-    void check_resize(Index i) {
+    // The conversion has the shape its opcode names, between integers.
+    void check_conversion(Index i) {
         const Inst::Payload& p      = ir_.payload(i);
         const ValueType      source = ty(p.op_type.op);
         const ValueType      target = value_type_of(m_.pool, p.op_type.type);
@@ -379,15 +351,26 @@ private:
             report(Rule::OperandKind, i, source, target);
             return;
         }
-        if (source.is_signed == target.is_signed) {
-            return;
+        bool ok = false;
+        switch (ir_.tag(i)) {
+            case Tag::ZExt:
+            case Tag::SExt:
+                ok = target.width > source.width && target.four_state == source.four_state;
+                break;
+            case Tag::Trunc:
+                ok = target.width < source.width && target.four_state == source.four_state;
+                break;
+            case Tag::ToFour:
+                ok = target.width == source.width && !source.four_state && target.four_state;
+                break;
+            case Tag::ToTwo:
+                ok = target.width == source.width && source.four_state && !target.four_state;
+                break;
+            default:
+                break;
         }
-        if (target.width > source.width) {
-            report(Rule::ResizeSignWiden, i, source, target);
-        } else if (target.width == source.width) {
-            report(Rule::ResizeSignRetag, i, source, target);
-        } else {
-            report(Rule::ResizeSignNarrow, i, source, target);
+        if (!ok) {
+            report(Rule::ConvertShape, i, source, target);
         }
     }
 
@@ -472,7 +455,7 @@ std::string describe(ValueType t) {
     if (t.is_real) {
         return std::format("real{}", t.width);
     }
-    return std::format("{}{}[{}]", t.is_signed ? "signed " : "", t.four_state ? "logic" : "bit", t.width);
+    return std::format("{}[{}]", t.four_state ? "logic" : "bit", t.width);
 }
 
 } // namespace
@@ -485,32 +468,20 @@ const char* rule_name(Rule rule) {
             return "operand-width";
         case Rule::OperandDomain:
             return "operand-domain";
-        case Rule::OperandSign:
-            return "operand-sign";
-        case Rule::ResultSign:
-            return "result-sign";
-        case Rule::ResultDomain:
-            return "result-domain";
         case Rule::ShiftResult:
             return "shift-result";
         case Rule::SelectArmWidth:
             return "select-arm-width";
         case Rule::SelectArmDomain:
             return "select-arm-domain";
-        case Rule::SelectArmSign:
-            return "select-arm-sign";
         case Rule::PredicateWidth:
             return "predicate-width";
         case Rule::StoreWidth:
             return "store-width";
         case Rule::StoreDomain:
             return "store-domain";
-        case Rule::ResizeSignWiden:
-            return "resize-sign-widen";
-        case Rule::ResizeSignNarrow:
-            return "resize-sign-narrow";
-        case Rule::ResizeSignRetag:
-            return "resize-sign-retag";
+        case Rule::ConvertShape:
+            return "convert-shape";
         case Rule::CallArity:
             return "call-arity";
         case Rule::CallArgWidth:
@@ -540,6 +511,16 @@ std::vector<Violation> verify(const Module& m) {
         }
     }
     return out;
+}
+
+void assert_well_typed([[maybe_unused]] const Module& m, [[maybe_unused]] const LocResolver& resolve) {
+#ifndef NDEBUG
+    const std::vector<Violation> found = verify(m);
+    for (const Violation& v : found) {
+        std::println(stderr, "{}", format(m, v, resolve));
+    }
+    assert(found.empty() && "the lowered IR violates the typing rules of docs/design/kernel.md");
+#endif
 }
 
 std::string format(const Module& m, const Violation& v, const LocResolver& resolve) {

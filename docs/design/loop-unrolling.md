@@ -79,7 +79,7 @@ Three properties worth stating:
 ## 5. Prerequisite: `ir::Eval` must learn arithmetic
 
 Today `Eval` handles `Band Bnot Bor Bxor CaseEq Constant Eq Land Lnot Load Lor Ne
-RedAnd RedOr Resize Select SelectLazy` — enough for reset predicates, and **not
+RedAnd RedOr ZExt SExt Trunc ToFour ToTwo Select SelectLazy` — enough for reset predicates, and **not
 enough for a single loop bound**. Required additions:
 
 | opcode | needed for |

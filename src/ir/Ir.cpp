@@ -196,6 +196,14 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[2]   = d.p2;
                 return { scratch.data(), 3 };
             }
+            // pow exposes its base and the exponent value; the signedness flags
+            // are not operands.
+            if (tag == Inst::Tag::Pow) {
+                const auto pw = extra_data<PowInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = pw.exp;
+                return { scratch.data(), 2 };
+            }
             // real_math_binary exposes its two real operands; the routine
             // selector is not an operand.
             if (tag == Inst::Tag::RealMathBinary) {

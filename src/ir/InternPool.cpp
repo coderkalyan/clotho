@@ -36,6 +36,20 @@ Ref InternPool::put(const Item& item) {
     return static_cast<Ref>(index);
 }
 
+Ref InternPool::int_type(uint32_t width, bool four_state) {
+    const Ref element = four_state ? logic_type : bit_type;
+    if (width == 1) {
+        return element;
+    }
+    Type vec;
+    vec.kind    = Type::Kind::PackedArray;
+    vec.element = element;
+    vec.left    = width - 1;
+    vec.right   = 0;
+
+    return put(vec);
+}
+
 Ref InternPool::put_value(Ref type, std::span<const uint8_t> bytes) {
     // Every producer of a plane-sized value must lay its planes out the way
     // layout() does: a constant built at another stride is read back wrong by
@@ -243,7 +257,7 @@ void InternPool::set_struct_fields(uint32_t fields_id, std::vector<FieldRow> row
     for (const FieldRow& r : rows) {
         const auto name_at = static_cast<uint32_t>(field_names_.size());
         field_names_.insert(field_names_.end(), r.name.begin(), r.name.end());
-        struct_fields_.push_back({ name_at, static_cast<uint32_t>(r.name.size()), r.type, r.bit_offset });
+        struct_fields_.push_back({ name_at, static_cast<uint32_t>(r.name.size()), r.type, r.bit_offset, r.is_signed });
     }
     field_runs_[fields_id] = { start, static_cast<uint32_t>(rows.size()) };
 }
