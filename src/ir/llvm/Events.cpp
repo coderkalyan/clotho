@@ -1337,9 +1337,14 @@ llvm::StructType* Backend::event_timer_ty() {
 // on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the drain's
 // rt_wheel_advance ctx); it reads the handle out of the node, fires that event,
 // then frees the node the schedule site allocated.
+//
+// Defined in whichever module first needs it and reached from every other one
+// through sym(), like enqueue_trampoline: returning the bare definition to a
+// second module is a cross-module global reference, which LLVM rejects
+// (docs/design/module-split.md).
 llvm::Function* Backend::event_delay_thunk() {
     if (event_delay_thunk_ != nullptr) {
-        return event_delay_thunk_;
+        return sym(event_delay_thunk_);
     }
     auto*             ptr  = raw_ptr_ty();
     auto*             fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
@@ -1358,7 +1363,7 @@ llvm::Function* Backend::event_delay_thunk() {
     if (saved_bb != nullptr) {
         b_.SetInsertPoint(saved_bb, saved_pt);
     }
-    return event_delay_thunk_;
+    return sym(event_delay_thunk_);
 }
 
 // Link an event object onto the NBA pending chain (LRM 15.5.4), unless it is

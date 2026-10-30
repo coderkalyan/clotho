@@ -320,6 +320,31 @@ TEST_CASE("->> #d e schedules a detached trigger without blocking") {
     CHECK(out.find("fired=5") != std::string::npos);
 }
 
+// The `->> #d e` expiry thunk is one function shared by every delayed trigger in
+// the design, and the design is split into one LLVM module per definition plus a
+// root. A trigger in a fork child and another in a plain process reach it from two
+// modules, and LLVM's verifier rejected the second one's bare reference ("Global
+// is referenced in a different module!") for every delay. The waiters observe the
+// two triggers' own instants. iverilog implements no `->>`.
+TEST_CASE("->> #d e in a fork child and in a plain process shares one expiry thunk") {
+    const std::string out = run_capture(R"(
+        module top;
+          event e;
+          initial begin
+            fork
+              ->> #1 e;
+            join_none
+          end
+          initial ->> #2 e;
+          initial begin
+            @(e) $display("a t=%0t", $time);
+            @(e) $display("b t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "a t=1\nb t=2\n");
+}
+
 // `->> #0 e` (LRM 15.5.1): the delay control expires in the current time slot, so
 // the trigger is that slot's NBA-region event, exactly `->> e`. The delay used to
 // reach the wheel, which cannot hold a timer due now, so the waiter never woke and
