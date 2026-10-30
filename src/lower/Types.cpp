@@ -1374,6 +1374,18 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
     if (it != sigmap_.end()) {
         return it->second;
     }
+    if (globals_ != nullptr && this != globals_ && is_global_scope(prop.getParentScope())) {
+        // A property of a package / `$unit` class has no instance multiplicity
+        // (LRM 6.8): one slot for the design, owned by the shared globals
+        // Lowerer -- the same one that lowers the class's methods (function_id's
+        // delegation). Declaring it here as well would give this top's accesses
+        // (`obj.p`, `C::p`) a slot the methods never see. Cached locally so the
+        // lookup above hits next time.
+        const Restore<const Scope*> scope(globals_->scope_, prop.getParentScope());
+        const ir::Signal            sig = globals_->declare_static_prop(prop);
+        sigmap_.emplace(&prop, sig);
+        return sig;
+    }
     std::string cls;
     if (const slang::ast::Scope* sc = prop.getParentScope()) {
         cls = std::string(sc->asSymbol().name) + "::";

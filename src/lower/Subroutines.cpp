@@ -561,13 +561,11 @@ std::vector<const ValueSymbol*> Lowerer::body_automatics(const SubroutineSymbol&
     return std::move(sc.out);
 }
 
-// True for a subroutine declared directly in a package or `$unit` scope
-// (LRM 6.8's "no instance multiplicity" applies to these exactly as it
-// does to a variable): walks up from the subroutine's declaring scope,
-// stopping at the first Package/CompilationUnit (global) or InstanceBody
-// (module-scope, possibly through an intervening generate block).
-bool Lowerer::is_global_subroutine(const SubroutineSymbol& sub) {
-    const Scope* s = sub.getParentScope();
+// True for a scope inside a package or `$unit` (no instance multiplicity, LRM
+// 6.8): walks up from `s`, stopping at the first Package/CompilationUnit
+// (global) or InstanceBody (module-scope, possibly through an intervening
+// generate block or a class declared there).
+bool Lowerer::is_global_scope(const Scope* s) {
     while (s != nullptr) {
         switch (s->asSymbol().kind) {
             case SymbolKind::Package:
@@ -580,6 +578,13 @@ bool Lowerer::is_global_subroutine(const SubroutineSymbol& sub) {
         }
     }
     return false;
+}
+
+// True for a subroutine declared directly in a package or `$unit` scope, or in
+// a class declared there: LRM 6.8's "no instance multiplicity" applies to these
+// exactly as it does to a variable.
+bool Lowerer::is_global_subroutine(const SubroutineSymbol& sub) {
+    return is_global_scope(sub.getParentScope());
 }
 
 // Resolve a subroutine (function or task) to a FunctionId, lowering its body

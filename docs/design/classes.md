@@ -51,7 +51,12 @@ of no scope), sorted by rendered name, which is what catches a specialization
 named only in a typedef — UVM's `uvm_component_utils` registration shape, whose
 `local static bit m__initialized = __deferred_init()` has no reader at all.
 Access sites still call `declare_static_prop` and meet the pre-pass at one signal
-through `sigmap_`, so the initializer is queued exactly once. Order is
+through `sigmap_`, so the initializer is queued exactly once. The slot of a
+package/`$unit` class (any property, initialized or not) belongs to the globals
+Lowerer alone, the one that also lowers the class's methods: a top's
+`declare_static_prop` hands such a property to it (the `is_global_scope` test
+`function_id` uses too) and caches the result, so `obj.p`, `C::p` and the methods
+share one signal in every top. Order is
 implementation-defined (declaration order within and across classes;
 specializations of one generic by rendered name); an initializer reading another
 class's static forces that property's initialization ahead of the read. A class

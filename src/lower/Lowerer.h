@@ -4562,6 +4562,8 @@ private:
 
     static bool is_global_subroutine(const SubroutineSymbol& sub);
 
+    static bool is_global_scope(const Scope* scope);
+
     static std::optional<ir::DpiCType> dpi_ctype(const slang::ast::Type& type);
 
     void build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id);

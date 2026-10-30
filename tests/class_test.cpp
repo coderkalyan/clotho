@@ -3806,3 +3806,122 @@ TEST_CASE("a $finish reached through a virtual call stops every caller") {
         endmodule
     )") == "before\n");
 }
+
+// A static property (LRM 8.9) of a class declared in `$unit` or a package is one
+// slot for the design (LRM 6.8: no instance multiplicity there), whichever way it
+// is reached. The class's methods are lowered once on the shared globals
+// Lowerer while `obj.p` / `C::p` in a module lower on that module's, and an
+// uninitialized property -- not queued by the eager initializer pass -- was
+// declared on whichever side got there first, so the two sides read and wrote
+// different storage. Expectations are the LRM text (8.9, 6.21); Icarus Verilog 13
+// agrees on `obj.p` and on the two-top form but cannot parse `C::p`.
+TEST_CASE("static property of a $unit class is one slot for methods, obj.p and C::p") {
+    CHECK(run_capture(R"(
+        class C;
+            static int i;
+            static string name;
+            static int q[$];
+            function void set(int v); i = v; endfunction
+            function int get(); return i; endfunction
+            function void bump(); this.i = this.i + 1; endfunction
+            function void add(int v); q.push_back(v); endfunction
+            function void setn(string s); name = s; endfunction
+        endclass
+        class D extends C;
+            function int dget(); return i; endfunction
+        endclass
+        module m;
+            C c1 = new, c2 = new;
+            D d = new;
+            initial begin
+                c1.set(7);
+                $display("%0d %0d %0d %0d %0d", c1.i, c1.get(), c2.get(), C::i, d.dget());
+                c1.i = 3;
+                $display("%0d %0d %0d %0d %0d", c1.i, c1.get(), c2.get(), C::i, d.dget());
+                C::i = 10;
+                c1.bump();
+                c2.bump();
+                $display("%0d %0d %0d %0d %0d", c1.i, c1.get(), c2.get(), C::i, d.dget());
+                c1.add(1);
+                c2.add(2);
+                c1.setn("shared");
+                $display("%0d %0d %s %s", c1.q.size(), C::q.size(), c2.name, C::name);
+            end
+        endmodule
+    )") == "7 7 7 7 7\n"
+           "3 3 3 3 3\n"
+           "12 12 12 12 12\n"
+           "2 2 shared shared\n");
+}
+
+// The same for a package class, reached through its scope, an import and a handle.
+TEST_CASE("static property of a package class is one slot for methods, obj.p and P::C::p") {
+    CHECK(run_capture(R"(
+        package P;
+            class C;
+                static int j;
+                function void set(int v); j = v; endfunction
+                function int get(); return j; endfunction
+            endclass
+        endpackage
+        module m;
+            import P::*;
+            C c = new;
+            initial begin
+                c.set(8);
+                $display("%0d %0d %0d", c.j, c.get(), P::C::j);
+                P::C::j = 4;
+                $display("%0d %0d %0d", c.j, c.get(), P::C::j);
+            end
+        endmodule
+    )") == "8 8 8\n"
+           "4 4 4\n");
+}
+
+// Each specialization of a parameterized `$unit` class keeps its own slot, and
+// that slot is still the one its methods use.
+TEST_CASE("static property of a parameterized $unit class: one slot per specialization") {
+    CHECK(run_capture(R"(
+        class G #(int N = 1);
+            static int k;
+            function void set(int v); k = v + N; endfunction
+            function int get(); return k; endfunction
+        endclass
+        module m;
+            G#(1) a = new;
+            G#(2) b = new;
+            initial begin
+                a.set(10);
+                b.set(20);
+                $display("%0d %0d %0d %0d", a.k, a.get(), b.k, b.get());
+                G#(1)::k = 5;
+                $display("%0d %0d %0d %0d", a.k, a.get(), b.k, b.get());
+            end
+        endmodule
+    )") == "11 11 22 22\n"
+           "5 5 22 22\n");
+}
+
+// Two top-level modules see the one slot as well: each top's accesses used to
+// resolve against that top's own copy.
+TEST_CASE("static property of a $unit class is shared by every top") {
+    CHECK(run_capture(R"(
+        class C;
+            static int i;
+            function void set(int v); i = v; endfunction
+            function int get(); return i; endfunction
+        endclass
+        module top1;
+            C c = new;
+            initial begin
+                c.set(8);
+                #2 $display("top1 %0d %0d", c.i, c.get());
+            end
+        endmodule
+        module top2;
+            C c = new;
+            initial #1 $display("top2 %0d %0d", c.i, c.get());
+        endmodule
+    )") == "top2 8 8\n"
+           "top1 8 8\n");
+}
