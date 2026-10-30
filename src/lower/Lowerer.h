@@ -1687,6 +1687,8 @@ private:
 
     void emit_wire_resolvers();
 
+    void store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l);
+
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym);

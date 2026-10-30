@@ -640,6 +640,21 @@ void Lowerer::emit_resolved_driver(ir::Signal                  net,
     add_continuous_process(continuous_events(a), l, b);
 }
 
+// Store `val` into `lv` of type `ty`: one store for a packed value, one per leaf
+// element, in declared order, for a fixed unpacked array. `val` is the value of
+// one leaf element.
+void Lowerer::store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l) {
+    const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
+    if (t.kind != ir::Type::Kind::UnpackedArray) {
+        b.binary(ir::Inst::Tag::Store, lv, val, l);
+        return;
+    }
+    for (uint32_t pos = 0; pos < ir::types::array_dim(t); ++pos) {
+        const ir::Index el = b.elem_select(lv, elem_coord_const(t, pos, b, l), ty, l, /*for_write=*/true);
+        store_every_element(el, t.element, val, b, l);
+    }
+}
+
 // Fold every resolved net's driver slots through WireRes and store the
 // resolved value into the net. One self-starting process per net, sensitive
 // to all its slots; the net is written only here, so its readers wake on the
@@ -768,7 +783,10 @@ void Lowerer::emit_wire_resolvers() {
             const ir::Index ticks = scaled_delay(*nd_it->second, b);
             b.store_inertial_delay(dst, acc, ticks, l);
         } else {
-            b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+            // An unpacked array net reaches here only when nothing drives it (a
+            // driver's slot is refused for one), and the pull, or the z, of a
+            // driverless net lands in every element alike.
+            store_every_element(b.signal(net, l), module_.signal(net).type, acc, b, l);
         }
         for (const NetForceSite& site : sites) {
             const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)

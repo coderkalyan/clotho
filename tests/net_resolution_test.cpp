@@ -754,6 +754,33 @@ TEST_CASE("undriven elements of a partially-driven net array read z") {
                  "zzzzzz\n");
 }
 
+// A driverless tri0 / tri1 / supply net array pulls EVERY element, not only the
+// first: the resolver stores the pulled value once per element. Metamorphic
+// oracle: each array reads the same as the scalar nets of its elements, which is
+// LRM 6.6.5 / 6.6.6 ("when no driver drives a tri1 net, its value is 1"). iverilog
+// 13 cannot compile these arrays, so it is no oracle here.
+TEST_CASE("a driverless tri0 / tri1 / supply net array pulls every element") {
+    const std::string out = run_capture(R"(
+        module top;
+          tri1    [3:0] ta [0:1];
+          tri1    [3:0] sa, sb;
+          tri0    [3:0] tz [0:2];
+          tri0    [3:0] sz, sy, sx;
+          supply1 [3:0] ha [0:1][0:1];
+          supply1 [3:0] hs0, hs1, hs2, hs3;
+          initial begin
+            #1;
+            $display("%b %b | %b %b", ta[0], ta[1], sa, sb);
+            $display("%b %b %b | %b %b %b", tz[0], tz[1], tz[2], sz, sy, sx);
+            $display("%b %b %b %b | %b %b %b %b", ha[0][0], ha[0][1], ha[1][0], ha[1][1], hs0, hs1, hs2, hs3);
+          end
+        endmodule
+    )");
+    CHECK(out == "1111 1111 | 1111 1111\n"
+                 "0000 0000 0000 | 0000 0000 0000\n"
+                 "1111 1111 1111 1111 | 1111 1111 1111 1111\n");
+}
+
 // -- 2-state driver regions --
 //
 // A driver slot is cut from the NET's type, so it is always 4-state and always
