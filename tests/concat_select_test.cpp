@@ -362,3 +362,23 @@ TEST_CASE("a signed output port sign-extends onto a multiply driven net") {
     )");
     CHECK(out == "w=11111111 w2=11111111\n");
 }
+
+// The initializer of a select port whose variable is declared apart from the port
+// (`output x = 4'b1001;` then `reg [3:0] x;`) is on the port declaration, not on the
+// variable's own declarator, so it cannot be bound to the variable: refused rather
+// than applied with the select's width (docs/TODO.md).
+TEST_CASE("an initializer on a select port of a separately declared variable fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(x[3:2]);
+            output x = 4'b1001;
+            reg [3:0] x;
+        endmodule
+        module top;
+            wire [1:0] w;
+            m u(w);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("initializer on a select port of a variable declared apart from the port") !=
+          std::string::npos);
+}
