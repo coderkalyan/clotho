@@ -285,11 +285,12 @@ struct BoundsCheck {
 };
 
 // Storage width above which a runtime-offset bit / part select is done by the
-// runtime (word-indexed) instead of inline (whole-value variable shift). See
-// wide_dyn_storage for the measurements behind the number: the inline form is
-// linear-ish to a few thousand bits and then quadratic, so this sits an octave
-// inside the safe region.
-constexpr uint32_t wide_dyn_select_bits = 4096;
+// runtime (word-indexed) instead of inline (whole-value variable shift). The inline
+// form costs O(width) instructions and the helper a flat 182-311 (2-/4-state, read /
+// write); they cross between 190 and 290 bits, so 256 puts the helper where it wins at
+// every width above it (wide_dyn_storage has the measurements). A select with a
+// constant offset never reaches the helper's call.
+constexpr uint32_t wide_dyn_select_bits = 256;
 
 // Operand width above which multiply, divide and modulo are runtime calls
 // (rt_wide_mul, rt_wide_udiv, ...) instead of LLVM's own lowering; at or below it

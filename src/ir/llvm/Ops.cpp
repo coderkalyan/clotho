@@ -172,12 +172,22 @@ Backend::ElemBelow Backend::elem_index_below(Plane idx, ValueType t, llvm::Value
 // word-indexed path rather than shifting the whole value inline.
 //
 // The inline form asks LLVM for a variable shift on an i(2*sw) SSA value, which
-// legalizes into O(sw/64) selects per word: measured JIT time for one dynamic bit
-// select is 0.2 s at 4 Kbit, 1.1 s at 8 Kbit, 21 s at 12 Kbit and over half an
-// hour at 64 Kbit (ivtest pr722). Below the threshold the inline form is both
-// cheaper and better optimizable, so it stays; above it the cost is a call whose
-// work is O(selw) and independent of the vector's width. The selection's own
-// width is unrestricted: its planes travel as ceil(selw/64)-word buffers, so
+// legalizes into O(sw/64) selects per word, so its cost grows with the vector: user
+// instructions per bit-select (`perf stat -e instructions:u`, loop of N and 2N
+// iterations), inline against helper:
+//
+//                   128    256    384    512   1024
+//   2-state read    112/182  227/182  362/182  366/182  709/182
+//   2-state write   112/280  225/280  357/280  458/280  1040/280
+//   4-state read    136/211  254/211  403/211  406/211  814/211
+//   4-state write   120/311  252/311  437/311  532/311  1194/311
+//
+// The helper is flat, so the lines cross between 190 and 290 bits and 256 splits them.
+// Time agrees: the helper is 2-15x faster from 512 bits on. Compile time is the
+// other cost of the inline form: 0.2 s per dynamic select at 4 Kbit, 21 s at 12 Kbit
+// and over half an hour at 64 Kbit (ivtest pr722). Above the threshold the cost is a
+// call whose work is O(selw) and independent of the vector's width. The selection's
+// own width is unrestricted: its planes travel as ceil(selw/64)-word buffers, so
 // `[i +: 128]` of a 64 Kbit vector is as cheap as `[i]`.
 bool Backend::wide_dyn_storage(uint32_t sw) {
     return sw > wide_dyn_select_bits;
