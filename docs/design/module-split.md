@@ -19,8 +19,10 @@ with identical own-signal types share one module. The process-body hash set the
 twin detector computes (`--stat=dedup`) is not part of the key.
 
 - `M_def(key)`: the fusion groups whose members all belong to one scope of the
-  definition. Reused definitions address their storage through the instance
-  ctx; a `.ctx` global is created in whichever module first needs it.
+  definition, and the member functions of the groups that span instances
+  (below) whose process belongs to it. Every instance, singletons included,
+  addresses its storage through its instance ctx record; a `.ctx` global is
+  created in whichever module first needs it.
 - `M_root`: everything else -- state globals and power-on initializers, wait
   queues, every function and task, NBA commit functions, `main` / `sim_drain`
   / finals, the seed loop, DPI export thunks, package/`$unit` (`no_scope`)
@@ -29,14 +31,22 @@ twin detector computes (`--stat=dedup`) is not part of the key.
   lazily created
   singletons (`clotho.active`, `enqueue_timer`, `ev_delay`, `shadow_base`)
   land in the first module that needs them.
-  Cross-instance fusion groups of <= 16 members OUTLINE: one plain
-  function per member in the member's own unit + a root dispatcher (named
-  like the merged thunk; owns the sched-flag timeline) calling them in rank
-  order, so the member code is per-definition cacheable. Past the cap the
-  merged body stays in root: a cross-module member call cannot inline, and a
-  256-member comb group measured 3.7x sim outlined (combchain) while the
+  Fusion groups spanning instances DISPATCH, whatever their size, and with
+  `split` off in the one module just the same: one plain function per
+  member in the member's own unit, taking that member's instance record
+  (`@clotho.inst.<hier>.ctx`) as its first parameter, plus a root
+  dispatcher (named like the merged thunk; owns the sched-flag timeline,
+  the member guards and the re-arm) calling them in rank order with each
+  member's record. A member addresses its own instance through the record
+  exactly as a single-scope group does, and its NBA block ids are the
+  record's field for that member plus a member-local ordinal; signals of
+  other instances stay absolute. There is no member cap and no merged body
+  to fall back to: a cross-module member call cannot inline, and a
+  256-member comb group measured 3.7x sim this way (combchain) while the
   real core populations (2-7 member clocked groups, picorv32) are
-  wall-neutral. --no-outline for bisection.
+  wall-neutral. Only a thunk group can span instances: a coroutine group
+  is one function over one frame, so compute_fusion_groups keeps it inside
+  one instance.
 
 ## Context and types
 
@@ -246,5 +256,5 @@ re-decided on measurement before any merge to main.
   single-threaded optimize+codegen time is the entire parallel section's
   wall-clock floor, capping the win at ~1.5x on 12 cores despite 260
   independent modules. Raising this ceiling needs root itself split further
-  (more of `M_root`'s machinery outlined the way small cross-instance groups
-  already are), not more parallel-compile machinery.
+  (more of `M_root`'s machinery moved into the units the way the members of
+  cross-instance groups already are), not more parallel-compile machinery.

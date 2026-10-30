@@ -165,28 +165,27 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // CoroSplit). The sched-flag timeline matches the coroutine always-loop:
     // the flag is held set across the body and cleared at the end, so
     // same-instant re-triggers behave identically.
-    // Cross-instance fused thunk group under split emission: lower each
-    // member as its own plain function emitted into the member's OWN
-    // definition unit, plus a root-emitted dispatcher (named like the
-    // merged thunk, so seed/subscription/drain contracts are untouched)
-    // calling them in scheduled-rank order. The members become
-    // per-definition cacheable — the merged form parked the whole group's
-    // code in the always-recompiled root. Single-scope groups keep the
-    // merged body inside their unit (no call overhead). Only the population
-    // that cannot otherwise leave root pays the per-member call, not every comb
-    // group (docs/design/module-split.md, Partition).
     //
-    // A member takes its instance's record (@clotho.inst.<hier>.ctx) as its
-    // first parameter and addresses everything of its own instance through
-    // it, exactly as a single-scope group does through the record global
-    // (own_anchor_ / own_ctx_); the dispatcher passes each member's record.
-    // Signals of other instances a member reaches stay absolute.
-    // Member cap: a cross-module member call cannot be inlined, so the
-    // per-activation dispatch cost scales with member count — a 256-member
-    // comb group measured 3.7x sim outlined (combchain), while the real
-    // cross-instance populations on cores (2-7 member clocked groups) are
-    // wall-neutral. Groups past the cap keep the merged root body.
-    constexpr size_t outline_max_members = 16;
+    // A thunk group whose members are not all in one instance (compute_fusion_groups
+    // keeps every coroutine group inside one) takes the dispatch form, whatever
+    // its size and whether or not modules are split: one plain function per
+    // member, emitted into the member's OWN unit module, plus a root dispatcher
+    // named like the merged thunk (so seed/subscription/drain contracts are
+    // untouched) that owns the sched-flag timeline, the member guards and the
+    // re-arm, and calls the members in scheduled-rank order. A member takes its
+    // instance's record (@clotho.inst.<hier>.ctx) as its first parameter and
+    // addresses everything of its own instance through it, exactly as a
+    // single-scope group does through the record global (own_anchor_ /
+    // own_ctx_); the dispatcher passes each member's record. Signals of other
+    // instances a member reaches stay absolute. Single-scope groups keep the
+    // merged body inside their unit.
+    //
+    // A cross-module member call cannot be inlined, so a group's per-activation
+    // cost scales with its member count, and no member cap trades that away: a
+    // 256-member comb group measured 3.7x sim this way (combchain). Merged
+    // cross-instance bodies belong to a flattening -O mode, not to a threshold
+    // (docs/design/modular-compilation.md, "Code generation").
+
     // A thunk group is not a thread: no frame, no handle, no control block, and
     // proc_arg's own contract already says such a body passes null. Reset here,
     // ahead of both thunk paths, because they return before the coroutine path's
@@ -219,11 +218,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         silent_stores_ = false;
         hdl_           = nullptr;
     };
-    if (config_.split && config_.outline && thunk_group_[g_] &&
-        members.size() > 1 && members.size() <= outline_max_members &&
-        group_unit_anchor_[g_] == SignalSlot::no_anchor &&
-        std::any_of(members.begin(), members.end(),
-                    [&](uint32_t m) { return proc_sched_anchor_[m] != ~0u; })) {
+    if (thunk_group_[g_] && members.size() > 1 && group_unit_anchor_[g_] == SignalSlot::no_anchor) {
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
 
@@ -234,7 +229,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         member_fns.reserve(members.size());
         for (const uint32_t m : members) {
             const uint32_t aid = proc_sched_anchor_[m];
-            env_ = aid != ~0u ? &unit_env(anchors_[aid]) : root_env_.get();
+            env_ = config_.split && aid != ~0u ? &unit_env(anchors_[aid]) : root_env_.get();
             const std::string mname =
               aid != ~0u ? "clotho.inst." + anchors_[aid].name + ".p" +
                              std::to_string(proc_sched_ord_[m])

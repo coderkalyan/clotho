@@ -122,7 +122,7 @@ struct SimulationConfig {
     // (Analysis.h) proves never carry z. Semantics are identical either way.
     //
     // This and the feature gates below (`fuse`, `comb_fuse`, `thunk`, `dedup`,
-    // `outline`, `split`, `parallel_compile`) exist for differential testing:
+    // `split`, `parallel_compile`) exist for differential testing:
     // an as-if optimization must produce byte-identical output with the gate
     // off, which is what the tests A/B. They are deliberately NOT on the CLI —
     // an operator has no reason to reach for one.
@@ -173,20 +173,14 @@ struct SimulationConfig {
     // literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
-    // Under `split`: lower a cross-instance fused thunk group as per-member
-    // functions emitted into each member's own definition unit plus a root
-    // dispatcher calling them in rank order, so the member code is
-    // per-definition cacheable (the merged form lives in the always-
-    // recompiled root). Costs one call per member per activation. Disable
-    // for bisection; no effect with split off.
-    bool outline = true;
     // Emit one llvm::Module per elaborated definition (unit = the definition
-    // state-struct identity) holding its single-scope process groups, plus a
-    // root module with everything else (state globals, scheduler machinery,
-    // functions/tasks, cross-instance groups, main). Prep for per-definition
-    // object caching; the JIT links the set into one dylib, so semantics are
-    // identical either way. Disable for bisection / debugging (one module,
-    // exactly the pre-split emission).
+    // state-struct identity) holding its single-scope process groups and the
+    // member functions of the groups spanning instances that belong to it,
+    // plus a root module with everything else (state globals, scheduler
+    // machinery, functions/tasks, the dispatchers of groups spanning
+    // instances, main). Prep for per-definition object caching; the JIT links
+    // the set into one dylib, so semantics are identical either way. Disable
+    // for bisection / debugging (one module, the same functions).
     bool split = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a

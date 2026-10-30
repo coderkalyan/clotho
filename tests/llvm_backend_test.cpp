@@ -2241,6 +2241,36 @@ TEST_CASE("members of a group spanning instances address their own instance") {
     CHECK(run_capture(src, { .thunk = false }) == expected);
 }
 
+// Every group spanning instances dispatches: whatever its size (there is no
+// member cap) and whether or not emission is split into per-definition modules.
+// Twenty instances of one block sharing a clock make one twenty-member group,
+// run as twenty member functions behind one dispatcher; the schedule is
+// untouched, so fused, unfused and unsplit runs print the same lines.
+TEST_CASE("a group spanning instances dispatches whatever its size and layout") {
+    constexpr std::string_view src = R"(
+        interface bus_if; logic clk = 0; endinterface
+        module leaf(bus_if b, input int id);
+            always @(posedge b.clk) $display("%0d", id);
+        endmodule
+        module top;
+            bus_if bus();
+            for (genvar i = 0; i < 20; i++) begin : g
+                leaf u(bus, i);
+            end
+            initial begin #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1; end
+        endmodule
+    )";
+    const std::string out = run_capture(src);
+    CHECK(std::count(out.begin(), out.end(), '\n') == 40);
+    CHECK(run_capture(src, { .fuse = false }) == out);
+    CHECK(run_capture(src, { .split = false }) == out);
+    for (const bool split : { true, false }) {
+        const std::string ir = emit(src, { .split = split });
+        CHECK(count_substr(ir, ".f20.thunk(ptr noalias %state") == 1);
+        CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == 20);
+    }
+}
+
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
 // once shifted the accumulator by the full result width, which is poison in LLVM
 // (shift >= bitwidth). Replication wraps its operand in a single-element concat,
