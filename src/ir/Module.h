@@ -98,6 +98,16 @@ struct InstanceScope {
     std::vector<Signal> signals;
     // Child instances, in declaration order.
     std::vector<InstanceScope> children;
+
+    static constexpr uint32_t no_unit = UINT32_MAX;
+    // The Design unit this instance expands (flatten), or no_unit for a module
+    // built without one, whose every scope is a unit of its own.
+    uint32_t unit = no_unit;
+    // Every signal the instance defines, in its unit's signal order: `signals`
+    // and the storage the compiler adds to the unit without declaring it in the
+    // scope (driver slots, constant tables, assertion state). Empty when
+    // `unit` is no_unit; the scope then defines exactly `signals`.
+    std::vector<Signal> locals;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the

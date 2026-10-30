@@ -586,8 +586,13 @@ private:
             s.id       = fi.scope;
             s.name     = fi.name;
             s.def_name = u.def_name;
+            s.unit     = static_cast<uint32_t>(fi.unit);
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
-                if (u.signals[h].import == kLocal && u.signals[h].scoped) {
+                if (u.signals[h].import != kLocal) {
+                    continue;
+                }
+                s.locals.push_back(fi.signals[h]);
+                if (u.signals[h].scoped) {
                     s.signals.push_back(fi.signals[h]);
                 }
             }
