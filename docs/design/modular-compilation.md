@@ -352,21 +352,22 @@ Each of these makes lowered IR depend on something outside the unit:
 - An instance's name in `%m` strings, severity banners, `$printtimescale` and
   covergroup instance names is read through `inst_path` (flat bridge: resolved
   from `Process::scope` / `Function::scope`; a covergroup takes it as an operand
-  of `CoverOp::New`, so `CoverType` carries no scope; a declaration initializer
-  reads it like any other body), hidden temporaries are numbered per name
-  prefix, and assertion state is named by an instance-relative ordinal.
-  `inst_path` is a borrowed string, a read-only handle over constant bytes today
-  (a record field later), so evaluating it takes no temporary and no init or
-  release, and a severity report keeps it apart from the text around it
-  (`SeverityInfo`: banner, path, tail) for the runtime to join when the line is
-  issued, so a report that does not fire costs its body nothing. Still text:
-  virtual-interface bodies and `$printtimescale(inst)`. A covergroup type
-  belongs to the unit that declares it and instances build it through an
-  import, so a package's type built by two instances no longer aborts
-  partition. Still lowered once per Lowerer that reaches it (a second top gets
-  an ordinal in its import name, like a package class), and the coverage-event
-  process of a package type stays with the first instance that builds it,
-  which splits that specialization.
+  of `CoverOp::New` with the text after it on the op, so `CoverType` carries no
+  scope; a declaration initializer reads it like any other body), hidden
+  temporaries are numbered per name prefix, and assertion state is named by an
+  instance-relative ordinal. `inst_path` is a borrowed string, a read-only
+  handle over constant bytes today (a record field later), so evaluating it
+  takes no temporary and no init or release, and a severity report or a
+  covergroup name keeps it apart from the text around it (`SeverityInfo`:
+  banner, path, tail; `CoverInfo::text`) for the runtime to join when the line
+  is issued or the name is made, so a report that does not fire costs its body
+  nothing. Still text: virtual-interface bodies and `$printtimescale(inst)`. A
+  covergroup type belongs to the unit that declares it and instances build it
+  through an import, so a package's type built by two instances no longer
+  aborts partition. Still lowered once per Lowerer that reaches it (a second top
+  gets an ordinal in its import name, like a package class), and the
+  coverage-event process of a package type stays with the first instance that
+  builds it, which splits that specialization.
 - Whole-top facts that change other modules' IR: `forceable_`, resolved nets,
   `events_merge_`, `WaitedProps`, `assert_control_used_`, and which blocks are
   `disable` targets. The last is joined over the instances of a specialization

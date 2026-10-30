@@ -628,7 +628,7 @@ struct ProcCtlInfo {
 // requires a unique object representation.
 enum class CoverOp : uint32_t {
     // CoverQuery.
-    New,           // `cg_type ident = new` -> a covergroup handle; operands (ctx, scope)
+    New,           // `cg_type ident = new` -> a covergroup handle; operands (ctx[, path])
     Ctx,           // the enclosing object captured at construction (embedded groups)
     First,         // the first live instance of a covergroup type, or null
     Next,          // the next instance after this one, or null
@@ -653,12 +653,12 @@ struct CoverInfo {
     // SSA operands, in order: the covergroup handle (absent for the type-level and
     // design-level queries, which name a type index or nothing), then the op's
     // value arguments -- for Hit the sampled value and its unknown-bit mask, for
-    // Start the 1-bit enable, for SetName the string. New takes no handle: its two
+    // Start the 1-bit enable, for SetName the string. New takes no handle: its
     // operands are the enclosing object a class-embedded group captures (0
-    // otherwise) and the instance's name prefix as a string ("top.u1.", empty
-    // outside every instance), which the report names the new instance by. The
-    // prefix is an operand rather than part of the type, so the instances of one
-    // module share their covergroup types.
+    // otherwise) and, when the group is built inside an instance, that instance's
+    // path (an InstPath value, borrowed), which the report names the new instance
+    // by. The path is an operand rather than part of the type, so the instances of
+    // one module share their covergroup types.
     ExtraSlice args;
     // Result type, for CoverQuery only: the 64-bit handle type for New / Ctx /
     // First / Next, the real type for a coverage percentage, 32-bit signed for a
@@ -671,6 +671,14 @@ struct CoverInfo {
     // Which coverpoint of that type, for Hit and the coverpoint-level queries.
     uint32_t point = 0;
     CoverOp  op    = CoverOp::New;
+    // New only: the packed bytes of the instance's name prefix after its path -- the
+    // generate blocks and the closing dot (".g[0]."), or all of the prefix when there
+    // is no path operand (a package's, empty outside every scope). Kept apart from
+    // the path and joined by the runtime when it copies the prefix into the new
+    // instance's name, so nothing is built here to join them.
+    ExtraIndex text = {};
+    // Length of that text in bytes.
+    uint32_t text_len = 0;
 };
 
 // Whether `op` names its covergroup type through CoverInfo::type_idx. The other

@@ -1607,7 +1607,8 @@ llvm::FunctionCallee Backend::cover_init_fn() {
 }
 
 llvm::FunctionCallee Backend::cover_new_fn() {
-    return rt_fn("rt_cover_new", b_.getInt64Ty(), { b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    return rt_fn("rt_cover_new", b_.getInt64Ty(),
+                 { b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
 }
 
 llvm::FunctionCallee Backend::cover_ctx_fn() {

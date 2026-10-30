@@ -780,16 +780,22 @@ ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpressio
         }
         ctx = this_handle(b, l);
     }
-    const ScopeName scope = instance_scope();
-    ir::Index       prefix{};
+    // The name prefix the report names the instance by: the constructing instance's
+    // path, read from the instance, then the text after it (generate blocks and the
+    // closing dot). Inside an instance they travel apart, the path as an operand and
+    // the text on the op, and the runtime joins them as it copies them into the
+    // instance's name; a package's prefix is all text. Joining them here would make
+    // string temporaries of a body that only constructs the group.
+    const ScopeName        scope = instance_scope();
+    std::vector<ir::Index> args{ ctx };
+    std::string            text;
     if (scope.in_instance) {
-        const std::array<ir::Index, 2> parts{ b.inst_path(l), b.constant(string_value_ref(scope.text + "."), l) };
-        prefix = b.concat(parts, l);
-    } else {
-        prefix = b.constant(string_value_ref(scope.text.empty() ? "" : scope.text + "."), l);
+        args.push_back(b.inst_path(l));
+        text = scope.text + ".";
+    } else if (!scope.text.empty()) {
+        text = scope.text + ".";
     }
-    const std::array<ir::Index, 2> args{ ctx, prefix };
-    return b.cover_query(ir::CoverOp::New, args, word, idx, 0, l);
+    return b.cover_query(ir::CoverOp::New, args, word, idx, 0, l, text);
 }
 
 // Whether `sub` is one of a covergroup's, coverpoint's or cross's built-in

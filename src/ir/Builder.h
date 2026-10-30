@@ -462,19 +462,21 @@ public:
     // -- Functional coverage (LRM 19, docs/design/functional-coverage.md) --
     // `args` is the operand run CoverInfo carries: the covergroup handle first
     // (absent for the type-level and design-level queries, and for `new`, whose
-    // operands are the enclosing object and the instance's name prefix), then the
-    // op's value arguments. `type_idx` selects the covergroup type in
-    // Module::cover_types (an op that names no type, cover_op_names_type, records
-    // none) and `point` its coverpoint (0 for an op that addresses none).
+    // operands are the enclosing object and, inside an instance, the instance's
+    // path), then the op's value arguments. `type_idx` selects the covergroup type
+    // in Module::cover_types (an op that names no type, cover_op_names_type,
+    // records none) and `point` its coverpoint (0 for an op that addresses none).
     //
     // A value-producing query (`new`, the registry walk, a coverage number);
-    // `type` is its result type.
+    // `type` is its result type. `text` is `new`'s name-prefix text after the
+    // instance's path (CoverInfo::text), and empty for every other op.
     Index cover_query(CoverOp                op,
                       std::span<const Index> args,
                       Ref                    type,
                       uint32_t               type_idx,
                       uint32_t               point,
-                      SourceLoc              loc);
+                      SourceLoc              loc,
+                      std::string_view       text = {});
     // A zero-time statement (a coverpoint sample, `start`/`stop`,
     // `set_inst_name`).
     Index cover_ctl(CoverOp                op,

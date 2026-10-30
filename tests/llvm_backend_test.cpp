@@ -1837,6 +1837,28 @@ TEST_CASE("%m of an instance costs its body no string handle") {
     CHECK(ir.find("@rt_string_assign_bytes") == std::string::npos);
 }
 
+// The instance's name a covergroup is built under is read from the instance and handed
+// to the runtime apart from the text after it, so building one in an instance makes no
+// string temporary of the body either.
+TEST_CASE("a covergroup built in an instance costs its body no string handle") {
+    const std::string ir = emit(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c;
+          initial begin c = new; c.sample(); end
+        endmodule
+        module top;
+          leaf a();
+          leaf b();
+        endmodule
+    )");
+
+    CHECK(ir.find("@rt_cover_new(") != std::string::npos);
+    CHECK(ir.find("@rt_string_init") == std::string::npos);
+    CHECK(ir.find("@rt_string_deinit") == std::string::npos);
+}
+
 TEST_CASE("%t formats time per $timeformat units, precision, suffix, and width") {
     // Verified against iverilog. $time is 100 ns; changing only the units reprints
     // the same instant in ns then ps, and width right-justifies number + suffix.

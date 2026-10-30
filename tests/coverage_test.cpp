@@ -854,6 +854,25 @@ TEST_CASE("the report names each covergroup instance by its module instance's pa
     CHECK(report.find("instance top.u2.cg ") != std::string::npos);
 }
 
+// The instance's path is copied into the name as it is, so neither a length past what
+// a string holds inline (30 bytes) nor a `%` in an escaped name takes any care.
+TEST_CASE("the report names a covergroup by an instance path of any shape") {
+    const std::string report = report_of(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c = new;
+          initial c.sample();
+        endmodule
+        module top;
+          leaf an_instance_name_well_past_thirty_bytes_long ();
+          leaf \c%d ();
+        endmodule
+    )");
+    CHECK(report.find("instance top.an_instance_name_well_past_thirty_bytes_long.cg ") != std::string::npos);
+    CHECK(report.find("instance top.c%d.cg ") != std::string::npos);
+}
+
 // A declaration initializer builds the covergroup from the module's own
 // elaboration, before any process runs, and builds one per instance: the report
 // names each by the instance that holds it and keeps its bin counts apart.

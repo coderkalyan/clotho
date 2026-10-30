@@ -331,25 +331,36 @@ uint64_t handle_of(const Inst* inst) {
 
 // The instance name the report shows and set_inst_name replaces: the hierarchical
 // scope prefix of the instance that constructed it and the type's name, plus the
-// creation ordinal from the SECOND instance of the type on. LRM 19.8 leaves
+// creation ordinal from the SECOND instance of the type on. The prefix is the
+// constructing instance's path, if any, then the text after it. LRM 19.8 leaves
 // instance naming to the tool; what a report needs is that two instances of one
 // type are distinguishable and that one design names them the same way on every
 // run. The first instance keeps the bare name rather than every instance gaining a
 // `_0`, because renaming it once a second instance appears would mutate a name
 // set_inst_name may already have replaced.
-char* default_name(const char* scope, uint64_t scope_len, const rt_cover_type& ty, uint32_t ordinal) {
-    const char* name = or_else(ty.name, "<covergroup>");
-    char        ord[24];
+char* default_name(const rt_string* path, const char* text, uint64_t text_len, const rt_cover_type& ty,
+                   uint32_t ordinal) {
+    const char*    name     = or_else(ty.name, "<covergroup>");
+    const uint64_t path_len = path != nullptr ? rt_string_len(path) : 0;
+    char           ord[24];
     ord[0] = '\0';
     if (ordinal != 0) {
         std::snprintf(ord, sizeof(ord), "_%u", ordinal);
     }
-    const size_t n   = static_cast<size_t>(scope_len) + std::strlen(name) + std::strlen(ord) + 1;
+    const size_t n   = static_cast<size_t>(path_len + text_len) + std::strlen(name) + std::strlen(ord) + 1;
     char*        out = static_cast<char*>(std::malloc(n));
     if (out == nullptr) {
         cover_fatal(ty.banner, "out of memory for a covergroup instance name", nullptr);
     }
-    std::snprintf(out, n, "%.*s%s%s", static_cast<int>(scope_len), scope != nullptr ? scope : "", name, ord);
+    std::snprintf(out,
+                  n,
+                  "%.*s%.*s%s%s",
+                  static_cast<int>(path_len),
+                  path != nullptr ? rt_string_data(path) : "",
+                  static_cast<int>(text_len),
+                  text != nullptr ? text : "",
+                  name,
+                  ord);
     return out;
 }
 
@@ -756,7 +767,8 @@ extern "C" void rt_cover_shutdown(void) {
 
 // -- Instances ----------------------------------------------------------------
 
-extern "C" uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const char* scope, uint64_t scope_len) {
+extern "C" uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const rt_string* path, const char* text,
+                                 uint64_t text_len) {
     // This one never degrades gracefully. The `new` site elides the null guard on
     // a fresh handle exactly like ClassNew does, so returning 0 would be a silent
     // wrong-code bug rather than a diagnosable one.
@@ -824,7 +836,7 @@ extern "C" uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const char* sc
     }
     assert(at == inst->ncounts && "the base offsets do not span the counter array");
 
-    inst->name = default_name(scope, scope_len, ty, inst->ordinal);
+    inst->name = default_name(path, text, text_len, ty, inst->ordinal);
 
     // Append, so the list is in creation order for the report and for 19.11.3's
     // instance walk.

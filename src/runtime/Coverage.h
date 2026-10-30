@@ -131,13 +131,17 @@ void rt_cover_shutdown(void);
 
 // `covergroup_type ident = new;` (LRM 19.3). `ctx` is the enclosing object's
 // handle for a class-embedded covergroup, so the generated sample body can read
-// the class properties its coverpoints name, and 0 otherwise. `scope` is the
-// hierarchical prefix of the module instance constructing the group ("top.u1.",
-// empty outside every instance), which the instance's default name starts with,
-// so one covergroup type declared in a module instantiated twice reports two
-// distinguishable instances; the bytes are copied. Returns the covergroup handle.
-// Never returns null: an allocation failure is fatal.
-uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const char* scope, uint64_t scope_len);
+// the class properties its coverpoints name, and 0 otherwise. The instance's
+// default name starts with the hierarchical prefix of the module instance
+// constructing the group ("top.u1.", empty outside every instance), so one
+// covergroup type declared in a module instantiated twice reports two
+// distinguishable instances. The prefix arrives in two pieces, copied and joined
+// here: `path`, the instance's path (a borrowed rt_string, null when there is
+// no instance), and the `text_len` bytes of `text` after it (".g[0]." for a
+// generate block, "." for none). Returns the covergroup handle. Never returns
+// null: an allocation failure is fatal.
+uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const struct rt_string* path, const char* text,
+                      uint64_t text_len);
 
 // The captured `ctx`, read by the generated sample body.
 uint64_t rt_cover_ctx(uint64_t h);

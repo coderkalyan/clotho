@@ -564,18 +564,24 @@ void Backend::lower_cover_query(Index i) {
         case CoverOp::New: {
             // `ctx` is the enclosing object for a class-embedded covergroup, so
             // the generated sample body can reach the class properties its
-            // coverpoints name, and null otherwise. `scope` is the constructing
-            // instance's name prefix, which the runtime copies into the new
-            // instance's name.
-            if (args.size() != 2) {
-                throw BackendError{ "internal: cover_query new takes a context and a scope" };
+            // coverpoints name, and null otherwise. The constructing instance's
+            // name prefix arrives in two pieces the runtime joins when it copies
+            // them into the new instance's name: the instance's path (the
+            // borrowed handle of an InstPath, null outside every instance) and
+            // the text after it.
+            if (args.empty() || args.size() > 2) {
+                throw BackendError{ "internal: cover_query new takes a context and at most an instance path" };
             }
-            const AsciiArg scope = spill_ascii_arg(args[1], "cover.scope");
+            const std::string text = ir_->extra_bytes(info.text, info.text_len);
+            llvm::Value* path = args.size() == 2 ? str_of(args[1])
+                                                 : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(
+                                                     llvm::PointerType::getUnqual(ctx_)));
             hval(b_.CreateCall(cover_new_fn(),
                                { b_.getInt32(info.type_idx),
                                  cast(must_of(args[0]), 64, false),
-                                 scope.ptr,
-                                 b_.CreateZExt(scope.len, b_.getInt64Ty()) }));
+                                 path,
+                                 b_.CreateGlobalString(text),
+                                 b_.getInt64(text.size()) }));
             return;
         }
         case CoverOp::Ctx:

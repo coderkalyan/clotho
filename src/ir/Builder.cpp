@@ -825,9 +825,16 @@ Index Builder::cover_query(CoverOp                op,
                            Ref                    type,
                            uint32_t               type_idx,
                            uint32_t               point,
-                           SourceLoc              loc) {
-    const ExtraIndex extra =
-      add_extra(CoverInfo{ add_slice(args), type, cover_op_names_type(op) ? type_idx : 0, point, op });
+                           SourceLoc              loc,
+                           std::string_view       text) {
+    const ExtraIndex text_at = text.empty() ? ExtraIndex{} : add_bytes(text);
+    const ExtraIndex extra   = add_extra(CoverInfo{ add_slice(args),
+                                                    type,
+                                                    cover_op_names_type(op) ? type_idx : 0,
+                                                    point,
+                                                    op,
+                                                    text_at,
+                                                    static_cast<uint32_t>(text.size()) });
     return emit({ Inst::Tag::CoverQuery, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
