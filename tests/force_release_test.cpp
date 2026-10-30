@@ -982,3 +982,98 @@ TEST_CASE("force of a whole unpacked net array is rejected") {
         endmodule)");
     CHECK(err.find("force is only supported on a whole variable/net") != std::string::npos);
 }
+
+// A `force` by hierarchical name is registered when the block that holds it is scanned. The
+// scan ran in Collect, which meets a block before the instances declared after it, so
+// `force s.v` ahead of `sub s(a);` named a signal that was not registered yet, and the
+// legal design was refused ("declare the instance before the forcing block"). The scan now
+// runs once every signal of the top exists, so the order of the block and the instance does
+// not matter, and every writer of the target is gated: this design's continuous assignment
+// and the nested port copy below. Oracle: iverilog 13, byte-identical.
+TEST_CASE("force: a hierarchical force ahead of the instance it names") {
+    constexpr std::string_view var_target = R"(
+        module sub(input logic a);
+            logic v;
+            assign v = a;
+        endmodule
+        module tb;
+            logic a = 1;
+            initial begin
+                #1 force s.v = 1'b0;
+                #1 $display("forced %b", s.v);
+                release s.v;
+                #1 $display("released %b", s.v);
+                $finish;
+            end
+            sub s(a);
+        endmodule)";
+    CHECK(run_capture_finish(var_target) == "forced 0\nreleased 1\n");
+
+    constexpr std::string_view net_target = R"(
+        module sub(input logic a);
+            wire w;
+            assign w = a;
+        endmodule
+        module tb;
+            logic a = 1;
+            initial begin
+                #1 force s.w = 1'b0;
+                #1 $display("forced %b", s.w);
+                release s.w;
+                #1 $display("released %b", s.w);
+                $finish;
+            end
+            sub s(a);
+        endmodule)";
+    CHECK(run_capture_finish(net_target) == "forced 0\nreleased 1\n");
+
+    // The target's writer is a port copy two instances down.
+    constexpr std::string_view port_copy = R"(
+        module leaf(input logic a, output logic y);
+            assign y = a;
+        endmodule
+        module mid(input logic a);
+            logic v;
+            leaf l(.a(a), .y(v));
+        endmodule
+        module tb;
+            logic a;
+            initial begin
+                a = 0;
+                #12 force m.v = 1'bz;
+                #2 a = 1;
+                #4 $strobe("%0t s v=%b", $time, m.v);
+                #2 release m.v;
+                #1 $strobe("%0t s v=%b", $time, m.v);
+                #1 $finish;
+            end
+            mid m(a);
+        endmodule)";
+    CHECK(run_capture_finish(port_copy) == "18 s v=z\n21 s v=1\n");
+}
+
+// The refusals that rest on knowing every force site, reached through a force ahead of the
+// instance: a delayed continuous assignment and a gate output on the forced variable.
+TEST_CASE("force: a hierarchical force ahead of its instance still refuses a delayed assign or a gate") {
+    const std::string delayed = lower_error(R"(
+        module sub(input logic a); logic v; assign #5 v = a; endmodule
+        module tb; initial force s.v = 1'b0; sub s(1'b1); endmodule)");
+    CHECK(delayed.find("continuous assignment delay on a force-target variable") != std::string::npos);
+
+    const std::string gate = lower_error(R"(
+        module sub(input logic a, b); logic y; and g (y, a, b); endmodule
+        module tb; initial force s.y = 1'b0; sub s(1'b1, 1'b1); endmodule)");
+    CHECK(gate.find("a gate or switch output on a force-target variable") != std::string::npos);
+}
+
+// A force into another top-level module is a cross-top hierarchical reference, which each top
+// lowering its own signals cannot resolve (docs/TODO.md): refused, saying so, never lost.
+TEST_CASE("force: a target in another top-level module is rejected") {
+    for (const std::string_view order : { "module t1; logic a = 1; logic v; assign v = a; endmodule\n"
+                                          "module t2; initial begin #1 force t1.v = 1'b0; release t1.v; end endmodule",
+                                          "module t2; initial begin #1 force t1.v = 1'b0; release t1.v; end endmodule\n"
+                                          "module t1; logic a = 1; logic v; assign v = a; endmodule" }) {
+        const std::string err = lower_error(order);
+        CHECK_MESSAGE(err.find("cross-top hierarchical reference") != std::string::npos, err);
+    }
+}

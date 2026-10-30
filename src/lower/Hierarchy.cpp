@@ -691,18 +691,26 @@ void Lowerer::lower_members(const Scope&       scope,
                     recover([&] { lower_continuous_assign(m.as<ContinuousAssignSymbol>()); });
                 break;
             case SymbolKind::ProceduralBlock:
-                // Collect: register a hidden force_site signal per whole-var
-                // `force` target so writers gate in Emit (LRM 10.6.2),
-                // enumerate the concurrent assertions / control tasks the
-                // block holds (LRM 20.12, see scan_assert_control), and label
-                // the named blocks a `disable` targets (LRM 9.6.2, see
+                // Collect: enumerate the concurrent assertions / control tasks the
+                // block holds (LRM 20.12, see scan_assert_control), and label the
+                // named blocks a `disable` targets (LRM 9.6.2, see
                 // scan_disable_targets).
+                //
+                // Classify: register a hidden force_site signal per `force` target so
+                // writers gate in Emit (LRM 10.6.2). Not in Collect, which meets a
+                // block before the instances declared after it: a `force u.v` ahead of
+                // `sub u();` named a signal Collect had not registered yet, so the
+                // force was lost and refused. Every signal of the top exists by
+                // Classify, and every force site is known before the first Emit
+                // decides whether a writer of its target is gated.
                 if (pass == Pass::Collect) {
-                    scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
                     scan_assert_control(m.as<ProceduralBlockSymbol>());
                     scan_disable_targets(m.as<ProceduralBlockSymbol>());
-                } else if (emit)
+                } else if (pass == Pass::Classify) {
+                    scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
+                } else if (emit) {
                     recover([&] { lower_procedural_block(m.as<ProceduralBlockSymbol>()); });
+                }
                 break;
             case SymbolKind::Variable:
                 // Storage was registered by collect_signals; here only a

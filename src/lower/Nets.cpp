@@ -1148,9 +1148,11 @@ Lowerer::ForceInfo* Lowerer::force_info_of(const ValueSymbol& sym) {
     return fit == forceable_.end() ? nullptr : &fit->second;
 }
 
-// Collect-pass scan: register the hidden per-target state for every `force` /
+// Classify-pass scan: register the hidden per-target state for every `force` /
 // `assign` site in a procedural block, so writers/resolvers lowered later in
-// Emit see the target as forceable.
+// Emit see the target as forceable. Run in Classify, once Collect has registered
+// every signal of the top, so a target named by hierarchy resolves whatever the
+// order of the instances and the block (see lower_members).
 void Lowerer::scan_force_targets(const Statement& body) {
     struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
         Lowerer* self;
@@ -1431,6 +1433,17 @@ const ValueSymbol* Lowerer::pca_target_var(const Expression& lhs, const char* ve
     return sym;
 }
 
+namespace {
+// What a force whose target the Classify scan never met is refused with. The scan sees
+// every `force` in an initial / always / final block of the top, whatever the order of
+// the instances it names; a target it cannot meet is one in another top (each top lowers
+// with its own signals, docs/TODO.md "Cross-top hierarchical reference") or one that only
+// a force inside a subroutine names.
+constexpr const char* kUnregisteredForce =
+  "force on a target that no force statement of this top's procedural blocks registered is not "
+  "supported: a cross-top hierarchical reference, or a force that only a subroutine holds";
+} // namespace
+
 void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder& b) {
     if (s.assignment.kind != ExpressionKind::Assignment) {
         fail("malformed force/assign statement");
@@ -1453,6 +1466,10 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
             // (emit_wire_resolvers). Track the RHS into `val` while active.
             const auto it = stmt_force_site_.find(&s);
             if (it == stmt_force_site_.end()) {
+                if (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue ||
+                    packed_bit_range(a.left())) {
+                    fail(kUnregisteredForce);
+                }
                 fail("force on a dynamic or non-constant net bit/part-select is not "
                      "supported (only a constant select, LRM 10.6.2)");
             }
@@ -1477,11 +1494,9 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
         }
         ForceInfo* fip = force_info_of(*sym);
         if (fip == nullptr) {
-            // The Collect scan registers every in-scope target; a cross-scope
-            // (hierarchical) target works when its instance was elaborated before
-            // the force was scanned, else it is not yet in sigmap here.
-            fail("force on a target not elaborated before the force statement is "
-                 "not supported (declare the instance before the forcing block)");
+            // The Classify scan registers every target of a force statement in this
+            // top's procedural blocks. What is left is a target that scan never met.
+            fail(kUnregisteredForce);
         }
         if (is_externally_driven_port(*sym)) {
             fail("force on an input or inout port variable is not supported");
