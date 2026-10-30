@@ -1294,6 +1294,11 @@ private:
     struct IntraNbTiming {
         // `<= #d` form: the scaled delay in wheel ticks.
         ir::Index delay{};
+        // `<= #d` form with a delay that may be zero at run time: the `delay == 0`
+        // predicate that routes the store to the current instant's NBA region as a
+        // plain `<=` instead (LRM 10.4.2, 4.9.4). Empty when the delay is a known
+        // nonzero constant.
+        std::optional<ir::Index> zero{};
         // `<= @e` / `<= repeat(N) @e` form: the countdown, sampled now.
         ir::Index count{};
         // `repeat(N) @e` with a runtime SIGNED or real count: the `N <= 0`
@@ -3603,6 +3608,8 @@ private:
     std::optional<IntraNbTiming> lower_intra_nb_timing(const AssignmentExpression& a, ir::Builder& b);
 
     bool intra_nb_delay_is_const_zero(const Expression& delay_expr);
+
+    IntraNbTiming lower_intra_nb_delay(const Expression& delay_expr, ir::Builder& b);
 
     void check_subroutine_nba_target(const Expression& lhs);
 

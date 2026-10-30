@@ -18,7 +18,25 @@ void Lowerer::store_leaf(ir::Inst::Tag        tag,
         return;
     }
     if (!t->is_event) {
+        if (!t->zero) {
+            b.store_nb_delay(lv, v, t->delay, l);
+            return;
+        }
+        // A delay that is zero at run time lands in the current instant's NBA
+        // region, ordered with the other `<=` by execution order (LRM 10.4.2,
+        // 4.9.4), so it takes the plain `<=` path exactly as a compile-time `#0`
+        // does (intra_nb_delay_is_const_zero). The deferred record's commit order
+        // is fixed instead, which put it after a later `<=` to the same signal.
+        // Per leaf, like the repeat count below: the delay is evaluated once.
+        b.open_region();
+        b.binary(ir::Inst::Tag::StoreNb, lv, v, l);
+        const ir::ExtraSlice now_r = b.close_region();
+
+        b.open_region();
         b.store_nb_delay(lv, v, t->delay, l);
+        const ir::ExtraSlice later_r = b.close_region();
+
+        b.cond(*t->zero, now_r, later_r, l);
         return;
     }
     if (!t->nonpos) {
@@ -1648,8 +1666,27 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_timing(const Assig
     if (intra_nb_delay_is_const_zero(delay_expr)) {
         return std::nullopt;
     }
+    return lower_intra_nb_delay(delay_expr, b);
+}
+
+// Lower an intra-assignment `#d` that is not a compile-time zero into its
+// timing. `zero` is set unless `d` is an integer constant known to be nonzero:
+// anything else (a variable, a real that may round to zero ticks) can be zero at
+// run time, and then the store is a plain `<=` (store_leaf). A known nonzero
+// constant, the usual `<= #5`, adds nothing to the IR.
+Lowerer::IntraNbTiming Lowerer::lower_intra_nb_delay(const Expression& delay_expr, ir::Builder& b) {
     IntraNbTiming t;
     t.delay = scaled_delay(delay_expr, b);
+    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+    slang::ast::EvalContext    ev(ectx);
+    const slang::ConstantValue cv = delay_expr.eval(ev);
+    const bool                 nonzero_const =
+      cv.isInteger() && !cv.integer().hasUnknown() && cv.integer().as<uint64_t>().value_or(0) != 0;
+    if (!nonzero_const) {
+        const ir::SourceLoc l = loc(delay_expr);
+        t.zero                = b.binary(
+          ir::Inst::Tag::Eq, t.delay, b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l), l);
+    }
     return t;
 }
 
@@ -1923,9 +1960,9 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
                 // suspend between them, and 9.4.5's "the right-hand expression
                 // shall be evaluated before the delay" is about the delay ELAPSING
                 // ("instead of after the delay"), not about the delay expression.
-                const ir::Index val   = lower_expr(a.right(), b);
-                const ir::Index delay = scaled_delay(delay_expr, b);
-                b.store_nb_delay(lower_lvalue(a.left(), b, /*is_write=*/true), val, delay, loc(a));
+                const ir::Index     val = lower_expr(a.right(), b);
+                const IntraNbTiming t   = lower_intra_nb_delay(delay_expr, b);
+                store_leaf(ir::Inst::Tag::StoreNb, &t, lower_lvalue(a.left(), b, /*is_write=*/true), val, b, loc(a));
                 return val;
             }
             // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
