@@ -1862,6 +1862,7 @@ private:
                                llvm::Value*  new_z);
 
     void fire_event_trigger(Signal sig, uint32_t edge);
+    void emit_trigger_fire(llvm::Value* trig_id);
 
     llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig);
 
@@ -2327,6 +2328,7 @@ private:
     llvm::FunctionCallee event_detach_ready_fn();
     llvm::FunctionCallee event_new_fn();
     llvm::FunctionCallee event_ptr_fn();
+    llvm::FunctionCallee event_trig_id_fn();
     llvm::FunctionCallee run_init_fn();
 
     llvm::FunctionCallee proc_alloc_fn();
@@ -4218,6 +4220,10 @@ private:
     // True when the design contains any `->> @(x) e`, so a signal wake also drains
     // the detached-subscription list for its (signal, edge).
     bool                                               design_uses_detached_events_ = false;
+    // True when some `x <= @e v` or `->> @(e) f` names a declared event as its
+    // control. An event wakes through its object, not a signal edge, so every event
+    // fire then also counts down the records registered on that object's trigger id.
+    bool design_uses_event_triggers_ = false;
     // Head of the NBA pending chain (clotho.event_pend_head).
     llvm::GlobalVariable*                              event_pend_head_gv_ = nullptr;
     // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).

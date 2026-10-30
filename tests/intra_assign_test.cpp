@@ -1196,6 +1196,121 @@ TEST_CASE("intra-assignment timing on a whole dynamic-array target is rejected")
     CHECK(!lower_error(src).empty());
 }
 
+// LRM 9.4.5 with a NAMED EVENT as the control: `x <= @e v` samples v now and updates
+// x in the NBA region of the instant `e` is triggered. An event wakes through its
+// object, not a signal edge, so the record has to be counted down by `-> e` itself;
+// it used to be registered on a signal trigger nothing ever fired, and the update was
+// silently lost (the posedge, `#d` and blocking `= @e` forms all worked). Checks are
+// made a time step after the trigger. Oracle: iverilog 13 on each design, except the
+// last subcase, whose oracle is LRM 4.9.4 (and Verilator): iverilog applies the update
+// in the active region, contrary to the clause.
+TEST_CASE("nonblocking intra-assignment on a named event updates when it is triggered") {
+    SUBCASE("whole variable, @e and @(e)") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x, y; event e;
+                initial begin
+                    x <= @e 4'd1;
+                    y <= @(e) 4'd2;
+                    #1 -> e;
+                    #1 $display("x=%0d y=%0d", x, y);
+                    $finish;
+                end
+            endmodule)") == "x=1 y=2\n");
+    }
+    SUBCASE("triggered from another process later") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e;
+                initial x <= @e 4'd6;
+                initial begin #3 -> e; #1 $display("x=%0d", x); $finish; end
+            endmodule)") == "x=6\n");
+    }
+    SUBCASE("concatenation, part select and array element targets") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] a, b; bit [7:0] v; bit [7:0] mem [0:1]; event e;
+                initial begin
+                    {a, b} <= @e 8'hc5;
+                    v[5:2] <= @e 4'hf;
+                    mem[1] <= @(e) 8'h77;
+                    #1 -> e;
+                    #1 $display("a=%h b=%h v=%h m1=%h", a, b, v, mem[1]);
+                    $finish;
+                end
+            endmodule)") == "a=c b=5 v=3c m1=77\n");
+    }
+    SUBCASE("each execution arms its own record") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                int n = 0; event e;
+                initial begin
+                    n <= @e 5;
+                    #1 -> e;
+                    #1 n <= @e 7;
+                    #1 -> e;
+                    #1 $display("n=%0d", n);
+                    $finish;
+                end
+            endmodule)") == "n=7\n");
+    }
+    SUBCASE("repeat(n) counts occurrences of the event") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e;
+                initial begin
+                    x <= repeat (3) @e 4'd8;
+                    #1 -> e; #1 -> e;
+                    #1 $display("x=%0d", x);
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=0\nx=8\n");
+    }
+    SUBCASE("an event list matures on the first listed event, once") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e, f;
+                initial begin
+                    x <= @(e or f) 4'd9;
+                    #1 -> f;
+                    #1 $display("x=%0d", x);
+                    x <= @(e or f) 4'd4;
+                    #1 -> e; -> f;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=9\nx=4\n");
+    }
+    SUBCASE("an event mixed with a signal edge in one list") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e; bit s;
+                initial begin
+                    x <= @(posedge s or e) 4'd5;
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=5\n");
+    }
+    SUBCASE("the update lands in the NBA region, after the active region reads") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e;
+                initial begin
+                    x <= @e 4'd3;
+                    #1;
+                    -> e;
+                    $display("same step x=%0d", x);
+                    #1 $display("next step x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "same step x=0\nnext step x=3\n");
+    }
+}
+
 // LRM 9.4.2.3 makes `iff` part of the EVENT, so the guard has to be evaluated at
 // fire time and only enabled occurrences may count down; the deferred record has
 // no guard hook (R5).
