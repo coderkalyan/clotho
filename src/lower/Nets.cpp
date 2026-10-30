@@ -686,19 +686,41 @@ void Lowerer::emit_resolved_driver(ir::Signal                  net,
     add_continuous_process(continuous_events(a), l, b);
 }
 
-// Store `val` into `lv` of type `ty`: one store for a packed value, one per leaf
-// element, in declared order, for a fixed unpacked array. `val` is the value of
-// one leaf element.
+// Store `val` into `lv` of type `ty`: one store for a packed value, and for a fixed
+// unpacked array a loop per dimension over its declared range (ascending or
+// descending as declared) that stores into every leaf element. `val` is the value
+// of one leaf element. A loop, not a store per element, so the code does not grow
+// with the array: a 64K-element array took seconds to lower unrolled.
 void Lowerer::store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l) {
     const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
     if (t.kind != ir::Type::Kind::UnpackedArray) {
         b.binary(ir::Inst::Tag::Store, lv, val, l);
         return;
     }
-    for (uint32_t pos = 0; pos < ir::types::array_dim(t); ++pos) {
-        const ir::Index el = b.elem_select(lv, elem_coord_const(t, pos, b, l), ty, l, /*for_write=*/true);
-        store_every_element(el, t.element, val, b, l);
-    }
+    const ir::Ref  i32       = make_int_type(32, false, true);
+    const bool     ascending = t.left <= t.right;
+    const TempCell iter      = make_temp_cell(i32, "net_fill");
+    b.binary(ir::Inst::Tag::Store, iter.lv(b, l), iconst(i32, t.left, b, l), l);
+
+    b.open_region();
+    const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter.lv(b, l), l);
+    const ir::Index pred =
+      b.binary(ascending ? ir::Inst::Tag::Le : ir::Inst::Tag::Ge, cur, iconst(i32, t.right, b, l), l);
+    const ir::ExtraSlice cond = b.close_region();
+
+    b.open_region();
+    const ir::Index el = b.elem_select(lv, b.unary(ir::Inst::Tag::Load, iter.lv(b, l), l), ty, l, /*for_write=*/true);
+    store_every_element(el, t.element, val, b, l);
+    const ir::ExtraSlice body = b.close_region();
+
+    b.open_region();
+    const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter.lv(b, l), l);
+    const ir::Index next =
+      b.binary(ascending ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, step_cur, iconst(i32, 1, b, l), l);
+    b.binary(ir::Inst::Tag::Store, iter.lv(b, l), next, l);
+    const ir::ExtraSlice step = b.close_region();
+
+    b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
 }
 
 // Fold every resolved net's driver slots through WireRes and store the

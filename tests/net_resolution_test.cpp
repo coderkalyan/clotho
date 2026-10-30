@@ -781,6 +781,29 @@ TEST_CASE("a driverless tri0 / tri1 / supply net array pulls every element") {
                  "1111 1111 1111 1111 | 1111 1111 1111 1111\n");
 }
 
+// The pull of a driverless net array is stored with a loop over its elements, so
+// the code does not grow with the array: a 64K-element array lowered one store per
+// element (about 200K instructions, 4 s of lowering; 18 s at 256K). The pull still
+// reaches the last element.
+TEST_CASE("the pull of a large driverless net array is a loop, not a store per element") {
+    constexpr std::string_view src   = R"(
+        module top;
+          tri1 [7:0] m [0:65535];
+          tri0 [3:0] n [0:3][0:1023];
+          initial #1 $display("%b %b %b", m[0], m[65535], n[3][1023]);
+        endmodule)";
+    const LowerResult          r     = lower_ok(src);
+    size_t                     insts = 0;
+    for (const ir::Process& p : r.module->processes()) {
+        insts += p.ir.inst_count();
+    }
+    for (size_t f = 0; f < r.module->function_count(); ++f) {
+        insts += r.module->function(static_cast<ir::FunctionId>(f)).ir.inst_count();
+    }
+    CHECK(insts < 2000);
+    CHECK(run_capture(src) == "11111111 11111111 0000\n");
+}
+
 // An indexed part-select with a constant base is a constant part-select (LRM
 // 11.5.1), so a net it drives powers its other bits on z, not x: `+:` and `-:`,
 // a multi-dim packed array (elements scaled by their width), and a reader of the
