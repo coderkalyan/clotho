@@ -1371,3 +1371,64 @@ TEST_CASE("intra-assignment timing on a class property is rejected") {
         endmodule)";
     CHECK(lower_error(src).find("class property") != std::string::npos);
 }
+
+// LRM 15.5.5.1: merged events are ONE object, and 15.5.3's own idiom `event done_too =
+// done;` names it twice. A control that lists both, `@(done or done_too)`, got its
+// record registered on that object twice: one occurrence matured it, and the second
+// entry wrapped its countdown below zero and stayed behind. When the record was reused
+// by the next `<=` to the same target it matured that one early, on an event it was
+// not waiting for. No oracle: iverilog 13 implements neither merge form.
+TEST_CASE("a control that lists two names of one event counts it once") {
+    SUBCASE("declared alias") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                int x;
+                event done;
+                event done_too = done;
+                event c;
+                initial begin
+                    x <= @(done or done_too) 1;
+                    #1 -> done;
+                    #1 $display("x=%0d", x);
+                    x <= @(c) 5;
+                    #1 -> done;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\nx=1\n");
+    }
+    SUBCASE("merged by assignment") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                int x;
+                event a, b, c;
+                initial begin
+                    a = b;
+                    x <= @(a or b) 1;
+                    #1 -> b;
+                    #1 $display("x=%0d", x);
+                    x <= @(c) 5;
+                    #1 -> b;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\nx=1\n");
+    }
+}
+
+// `-> ev` through a task's event formal names the object by a runtime handle; the
+// record was registered on the same object by its slot, so the two have to agree.
+TEST_CASE("an event triggered through a handle matures an event-controlled update") {
+    CHECK(run_capture_finish(R"(
+        module m;
+            event e;
+            bit [3:0] x;
+            task automatic trig(event ev); -> ev; endtask
+            initial begin
+                x <= @e 4'd7;
+                #1 trig(e);
+                #1 $display("x=%0d", x);
+                $finish;
+            end
+        endmodule)") == "x=7\n");
+}

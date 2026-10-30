@@ -345,7 +345,17 @@ extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
 
 extern "C" void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, void* rec) {
     for (uint32_t k = 0; k < n; ++k) {
-        intra_list_get(ids[k]).push_back(IntraPending{ rec, ids, n });
+        // Two listed events can be the SAME object (LRM 15.5.5.1: `event b = a;`, or
+        // `b = a`), and one occurrence must count the record down once, not once per
+        // name. The second entry would wrap its countdown below zero and later mature a
+        // reused record of the same target early.
+        bool seen = false;
+        for (uint32_t j = 0; j < k; ++j) {
+            seen = seen || ids[j] == ids[k];
+        }
+        if (!seen) {
+            intra_list_get(ids[k]).push_back(IntraPending{ rec, ids, n });
+        }
     }
 }
 

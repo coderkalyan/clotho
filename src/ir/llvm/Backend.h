@@ -1880,7 +1880,7 @@ private:
 
     void emit_event_pend_drain(llvm::Value* wheel);
 
-    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel);
+    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel, llvm::Value* trig_id = nullptr);
 
     void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel);
 
