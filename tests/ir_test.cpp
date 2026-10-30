@@ -2,6 +2,7 @@
 
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -826,6 +827,29 @@ endmodule
     // package's is.
     CHECK(ir.find("\n  class outer {i:class inner}\n") != std::string::npos);
     CHECK(ir.find("\n  class inner {y:bit[31:0]}\n") != std::string::npos);
+}
+
+// `$monitor` lowers to a monitor_set whose payload is a StrobePendInfo (the
+// synthesized body's function id), not an operand run. The printer once decoded it
+// as a concat's operand slice and read garbage indices: `--emit ir` segfaulted on
+// every design that calls `$monitor`. Oracle: none; the expected text follows from
+// the printer's rendering of its sibling strobe_pend (`fn<id>`).
+TEST_CASE("--emit ir prints $monitor and $strobe by the body they register") {
+    const std::string ir = emit_ir(R"(
+module top;
+  int a = 0;
+  initial begin
+    $monitor("a=%0d", a);
+    $strobe("s=%0d", a);
+    #1 a = 1;
+  end
+endmodule
+)");
+
+    const size_t at = ir.find("monitor_set(fn");
+    REQUIRE(at != std::string::npos);
+    CHECK(std::isdigit(static_cast<unsigned char>(ir[at + sizeof("monitor_set(fn") - 1])));
+    CHECK(ir.find("strobe_pend(fn") != std::string::npos);
 }
 
 TEST_CASE("a format-family op carries one sign flag per argument") {

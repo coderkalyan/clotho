@@ -764,7 +764,9 @@ TEST_CASE("wide ^~ lowers as xnor over the xor path") {
         endmodule
     )");
     CHECK(ir.find("-526254045") == std::string::npos); // not the 1-bit LUT
-    CHECK(ir.find("fshl") != std::string::npos);        // bnot's plane swap
+    // bnot's plane swap. Asserted on the call: this used to match `fshl` in a
+    // `declare` nothing called, which linking the unit modules into one drops.
+    CHECK(ir.find("call i16 @llvm.bswap.i16") != std::string::npos);
 }
 
 TEST_CASE("single-bit &&, ||, !, ~ agree with LRM Kleene semantics") {
@@ -5112,3 +5114,37 @@ TEST_CASE("--stop-time stops before a timer at the last instant") {
     CHECK(out == "final at 100\n");
 }
 
+
+// `build --emit llvm` writes one file, so it must be one module: each distinct
+// module definition gets its own llvm::Module, and printing them back to back
+// gave a file llvm-as rejects at the second `; ModuleID` ("expected top-level
+// entity"). emit_object already links them; the text path now does too. Oracle:
+// none; `; ModuleID` opens exactly one module in textual IR.
+TEST_CASE("--emit llvm of a design with several definitions is one module") {
+    for (const bool lower_coro : { true, false }) {
+        CAPTURE(lower_coro);
+        ir::SimulationConfig config;
+        config.lower_coro = lower_coro;
+        const std::string text = emit(R"(
+            module leaf_a(input logic [3:0] x, output logic [3:0] y);
+              assign y = x + 1;
+            endmodule
+            module leaf_b(input logic [3:0] x, output logic [3:0] y);
+              assign y = x ^ 4'hf;
+            endmodule
+            module top;
+              logic [3:0] a, b;
+              leaf_a ua(.x(4'd2), .y(a));
+              leaf_b ub(.x(4'd5), .y(b));
+              initial #1 $display("%0d %0d", a, b);
+            endmodule
+        )", config);
+
+        size_t ids = 0;
+        for (size_t at = text.find("; ModuleID"); at != std::string::npos; at = text.find("; ModuleID", at + 1)) {
+            ++ids;
+        }
+        CHECK(ids == 1);
+        CHECK(text.find("\nsource_filename") == text.rfind("\nsource_filename"));
+    }
+}

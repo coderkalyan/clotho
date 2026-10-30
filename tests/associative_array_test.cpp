@@ -181,6 +181,38 @@ TEST_CASE("assoc wildcard cross-width equality") {
     CHECK(run_capture(src) == "num=2 w5=99 w300=7 ex5=1 ex6=0\nafterdel num=1 ex5=0\n");
 }
 
+// LRM 7.8.1 keeps two different values two entries. A wildcard key is normalized
+// to 64 bits, so a 65-bit index whose value differs only above bit 63 aliased the
+// value below it (`a[65'h1_0000_0000_0000_0001]` overwrote `a[1]`). Clotho refuses
+// an index wider than 64 bits, at the index (docs/TODO.md); a 64-bit index keeps
+// every value distinct, including the top bit. Oracle: none; iverilog cannot
+// parse an associative array, and the expected values follow from the LRM text.
+TEST_CASE("assoc wildcard index: 64 bits stay distinct, wider is refused") {
+    CHECK(run_capture(R"(
+        module m;
+            int a[*];
+            initial begin
+                a[64'h8000_0000_0000_0001] = 1;
+                a[64'h0000_0000_0000_0001] = 2;
+                a[64'h8000_0000_0000_0000] = 3;
+                $display("num=%0d %0d %0d %0d", a.num(),
+                         a[64'h8000_0000_0000_0001], a[1], a[64'h8000_0000_0000_0000]);
+            end
+        endmodule
+    )") == "num=3 1 2 3\n");
+
+    for (const std::string_view stmt : { "a[65'h1_0000_0000_0000_0001] = 1;",
+                                         "$display(a.exists(65'h1_0000_0000_0000_0001));",
+                                         "a.delete(65'h1_0000_0000_0000_0001);",
+                                         "a[\"abcdefghi\"] = 1;" }) {
+        CAPTURE(stmt);
+        const std::string src = "module m; int a[*]; initial begin " + std::string(stmt) + " end endmodule";
+        const LowerResult r   = lower_text(src);
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("a wildcard [*] index of") != std::string::npos);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unpacked-struct keys (LRM 7.8.5 "other user-defined types") and class-handle
 // keys (LRM 7.8.3). Both fold into the same normalized byte span the integral

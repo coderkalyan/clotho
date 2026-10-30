@@ -1234,9 +1234,7 @@ std::vector<uint8_t> Backend::compute_may_finish(std::vector<uint8_t>* direct_ou
             }
         }
     }
-    // Memoized DFS, the same shape as the per-function write-set closure. A
-    // cycle contributes what the in-progress callee has so far; a recursive
-    // subroutine that finishes is still caught by its own seed.
+    // Seeds first, then the closure below.
     std::vector<uint8_t> may(direct);
     // Seeded before the closure so a virtual call's may-finish reaches every
     // caller up the chain. Without it the call site tested rt_finishing and left,
@@ -1253,22 +1251,35 @@ std::vector<uint8_t> Backend::compute_may_finish(std::vector<uint8_t>* direct_ou
             }
         }
     }
-    std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
-    const auto           close = [&](this const auto& self, uint32_t f) -> void {
-        if (state[f] != 0) {
-            return;
-        }
-        state[f] = 1;
-        for (const FunctionId c : callees[f]) {
-            const auto ci = static_cast<uint32_t>(c);
-            self(ci);
-            may[f] = static_cast<uint8_t>(may[f] | may[ci]);
-        }
-        state[f] = 2;
-    };
+    // Close over the call graph backwards from the may-finish bodies: a caller of
+    // a may-finish body is may-finish. A worklist fixpoint, not a memoized DFS --
+    // a DFS that meets a cycle gives the in-progress callee only what it has so
+    // far and then freezes it, so with f -> {g, h}, g -> f and h finishing, g was
+    // finished before f learned about h and stayed clean, and the code after a call
+    // to g ran on past a $finish. Each body enters the list at most once (when it
+    // first becomes may-finish), so the loop is bounded by nf pops.
+    std::vector<std::vector<uint32_t>> callers(nf);
     for (uint32_t f = 0; f < nf; ++f) {
-        close(f);
+        for (const FunctionId c : callees[f]) {
+            callers[static_cast<uint32_t>(c)].push_back(f);
+        }
     }
+    std::vector<uint32_t> work;
+    work.reserve(nf);
+    for (uint32_t f = 0; f < nf; ++f) {
+        if (may[f] != 0) {
+            work.push_back(f);
+        }
+    }
+    for (size_t next = 0; next < work.size(); ++next) {
+        for (const uint32_t caller : callers[work[next]]) {
+            if (may[caller] == 0) {
+                may[caller] = 1;
+                work.push_back(caller);
+            }
+        }
+    }
+    assert(work.size() <= nf && "each body is queued at most once");
     if (direct_out != nullptr) {
         *direct_out = std::move(direct);
     }

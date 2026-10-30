@@ -530,39 +530,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         return -1;
     }
 
-#if defined(_WIN32)
-    // Resolve C library names against the C runtime clotho itself links. The
-    // process-wide search below walks every loaded module, and msvcrt.dll, which
-    // system DLLs load, exports the same names with its own stdio buffers and
-    // heap: a DPI import of `puts` bound there printed out of order with
-    // $display, and memory allocated by one runtime and freed by the other would
-    // corrupt a heap. Which runtime that is is fixed at compile time; mingw-w64
-    // defines _UCRT when it targets the Universal CRT.
-#if defined(_UCRT)
-    constexpr const char* crt_module = "ucrtbase.dll";
-#else
-    constexpr const char* crt_module = "msvcrt.dll";
-#endif
-    auto crt_gen = llvm::orc::DynamicLibrarySearchGenerator::Load(crt_module, (*jit)->getDataLayout().getGlobalPrefix());
-    if (!crt_gen) {
-        llvm::errs() << "jit: " << llvm::toString(crt_gen.takeError()) << "\n";
-        return -1;
-    }
-    jd.addGenerator(std::move(*crt_gen));
-#endif
-
-    // Resolve the compiler-rt/libgcc builtins the backend emits for wide
-    // (>64-bit) arithmetic: __multi3 for multiply, __udivti3 / __umodti3 and
-    // their signed siblings for divide/modulo. They are linked into this process
-    // (libgcc_s), so expose the process symbol table to the JIT for the libcalls.
-    auto builtins = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-      (*jit)->getDataLayout().getGlobalPrefix());
-    if (!builtins) {
-        llvm::errs() << "jit: " << llvm::toString(builtins.takeError()) << "\n";
-        return -1;
-    }
-    jd.addGenerator(std::move(*builtins));
-
     // Load each --dpi-lib for DPI-C (LRM 35), dispatched by file format — the two
     // ORC loaders differ in linking model, not in import-vs-export:
     //   * .o / .a (relocatable object): LLJIT::addObjectFile links it INTO the
@@ -608,6 +575,44 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
             jd.addGenerator(std::move(*gen));
         }
     }
+
+    // The DPI .so generators above are searched before the process symbol table
+    // below, so a --dpi-lib definition wins over a same-named libc or libgcc symbol
+    // (a process generator added first answers `getpid` itself and the library's
+    // never runs). A .o / .a is linked into the JITDylib and wins outright. The
+    // runtime's own rt_* names are absolute symbols, defined before any generator.
+#if defined(_WIN32)
+    // Resolve C library names against the C runtime clotho itself links. The
+    // process-wide search below walks every loaded module, and msvcrt.dll, which
+    // system DLLs load, exports the same names with its own stdio buffers and
+    // heap: a DPI import of `puts` bound there printed out of order with
+    // $display, and memory allocated by one runtime and freed by the other would
+    // corrupt a heap. Which runtime that is is fixed at compile time; mingw-w64
+    // defines _UCRT when it targets the Universal CRT.
+#if defined(_UCRT)
+    constexpr const char* crt_module = "ucrtbase.dll";
+#else
+    constexpr const char* crt_module = "msvcrt.dll";
+#endif
+    auto crt_gen = llvm::orc::DynamicLibrarySearchGenerator::Load(crt_module, (*jit)->getDataLayout().getGlobalPrefix());
+    if (!crt_gen) {
+        llvm::errs() << "jit: " << llvm::toString(crt_gen.takeError()) << "\n";
+        return -1;
+    }
+    jd.addGenerator(std::move(*crt_gen));
+#endif
+
+    // Resolve the compiler-rt/libgcc builtins the backend emits for wide
+    // (>64-bit) arithmetic: __multi3 for multiply, __udivti3 / __umodti3 and
+    // their signed siblings for divide/modulo. They are linked into this process
+    // (libgcc_s), so expose the process symbol table to the JIT for the libcalls.
+    auto builtins = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+      (*jit)->getDataLayout().getGlobalPrefix());
+    if (!builtins) {
+        llvm::errs() << "jit: " << llvm::toString(builtins.takeError()) << "\n";
+        return -1;
+    }
+    jd.addGenerator(std::move(*builtins));
 
     if (parallel) {
         // Serialize every module to bitcode while they still share `ctx` — a
