@@ -143,9 +143,7 @@ std::optional<ir::Index> Lowerer::try_lower_constant_select(const Expression& ex
     if (root == nullptr || !is_elaboration_constant(*root)) {
         return std::nullopt;
     }
-    slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ectx(actx);
-    const slang::ConstantValue cv = expr.eval(ectx);
+    const slang::ConstantValue cv = fold_const(expr, Fold::Runtime);
     if (cv.bad()) {
         return std::nullopt;
     }
@@ -163,9 +161,7 @@ std::optional<ir::Index> Lowerer::try_lower_constant_select(const Expression& ex
 ir::Index Lowerer::select_base_lvalue(const Expression& base, ir::Builder& b, ir::SourceLoc l) {
     const ValueSymbol* root = lvalue_root(base);
     if (root != nullptr && is_elaboration_constant(*root) && base.type->getCanonicalType().isIntegral()) {
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = base.eval(ectx);
+        const slang::ConstantValue cv = fold_const(base, Fold::Runtime);
         if (!cv.bad()) {
             const ir::Index tmp = make_arg_temp(lower_type(*base.type), b, l);
             b.binary(ir::Inst::Tag::Store, tmp, b.constant(lower_constant(cv, *base.type), l), l);
@@ -269,7 +265,8 @@ Lowerer::NetRegion Lowerer::net_region_of(const Expression& lhs, const ValueSymb
             if (step->kind != ExpressionKind::ElementSelect) {
                 return kWholeNet;
             }
-            const std::optional<int32_t> c = try_const_int(step->as<ElementSelectExpression>().selector());
+            const std::optional<int32_t> c =
+              try_const_int(step->as<ElementSelectExpression>().selector(), Fold::Required);
             if (!c) {
                 return kWholeNet;
             }
@@ -312,7 +309,7 @@ std::optional<std::pair<uint32_t, uint32_t>> Lowerer::packed_bit_range(const Exp
             if (!es.value().type->isIntegral()) {
                 return std::nullopt;
             }
-            if (const std::optional<int32_t> c = try_const_int(es.selector())) {
+            if (const std::optional<int32_t> c = try_const_int(es.selector(), Fold::Required)) {
                 const auto w   = static_cast<uint32_t>(es.type->getBitWidth());
                 const auto ord = static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
                 return std::make_pair(ord * w, ord * w + w - 1);
@@ -331,8 +328,8 @@ std::optional<std::pair<uint32_t, uint32_t>> Lowerer::packed_bit_range(const Exp
             const uint32_t w  = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
             const slang::ConstantRange range = packed_range_of(rs.value());
             if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-                const std::optional<int32_t> left  = try_const_int(rs.left());
-                const std::optional<int32_t> right = try_const_int(rs.right());
+                const std::optional<int32_t> left  = try_const_int(rs.left(), Fold::Required);
+                const std::optional<int32_t> right = try_const_int(rs.right(), Fold::Required);
                 if (!left || !right) {
                     return std::nullopt;
                 }
@@ -344,7 +341,7 @@ std::optional<std::pair<uint32_t, uint32_t>> Lowerer::packed_bit_range(const Exp
             // base is a static bit range: the base element's offset (biased by
             // count-1 when the window extends away from the LSB end) scaled by
             // W, spanning count*W bits. A non-constant base is not slot-able.
-            const std::optional<int32_t> base = try_const_int(rs.left());
+            const std::optional<int32_t> base = try_const_int(rs.left(), Fold::Required);
             if (!base) {
                 return std::nullopt;
             }
@@ -1636,8 +1633,8 @@ std::optional<ir::Signal> Lowerer::gate_select_base(const Expression& value) {
 // bit position (translateIndex maps both descending and ascending ranges to
 // distance from the LSB end), so non-zero-based and ascending ranges resolve
 // correctly.
-std::optional<uint32_t> Lowerer::gate_select_bit(const Expression& value, const Expression& index) {
-    const std::optional<int32_t> idx = try_const_int(index);
+std::optional<uint32_t> Lowerer::gate_select_bit(const Expression& value, const Expression& index, Fold mode) {
+    const std::optional<int32_t> idx = try_const_int(index, mode);
     if (!idx) {
         return std::nullopt;
     }
@@ -1652,7 +1649,7 @@ std::optional<uint32_t> Lowerer::gate_select_bit(const Expression& value, const 
 // Resolve a terminal expression to a static (signal, bit) location if it is a
 // plain scalar reference, a constant bit-select, or a constant 1-bit
 // part-select of a packed signal (gate instance arrays produce the latter).
-std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e) {
+std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e, Fold mode) {
     const Expression& base = unwrap_conversions(e);
     if (base.kind == ExpressionKind::NamedValue) {
         const ValueSymbol& sym = base.as<NamedValueExpression>().symbol;
@@ -1671,7 +1668,7 @@ std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e) 
             return std::nullopt;
         }
         const auto sig = gate_select_base(es.value());
-        const auto bit = sig ? gate_select_bit(es.value(), es.selector()) : std::nullopt;
+        const auto bit = sig ? gate_select_bit(es.value(), es.selector(), mode) : std::nullopt;
         if (!bit) {
             return std::nullopt;
         }
@@ -1685,7 +1682,7 @@ std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e) 
             return std::nullopt;
         }
         const auto sig = gate_select_base(rs.value());
-        const auto bit = sig ? gate_select_bit(rs.value(), rs.right()) : std::nullopt;
+        const auto bit = sig ? gate_select_bit(rs.value(), rs.right(), Fold::Required) : std::nullopt;
         if (!bit) {
             return std::nullopt;
         }
@@ -1707,9 +1704,7 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
     // 28-3), while a MOS pass switch propagates it as z (LRM Table 28-6), so
     // gate_input_value resolves the code per caller.
     {
-        slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    evalCtx(astCtx);
-        const slang::ConstantValue cv = e.eval(evalCtx);
+        const slang::ConstantValue cv = fold_const(e, Fold::Runtime);
         if (cv.isInteger()) {
             const slang::logic_t bit = cv.integer()[0];
             // logic_t::operator== is a 4-state compare (x == z yields x), so
@@ -1723,7 +1718,7 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
         }
     }
 
-    if (const auto term = gate_static_term(e)) {
+    if (const auto term = gate_static_term(e, Fold::Runtime)) {
         return GateInput{ .sig = term->sig, .bit = term->bit };
     }
 
@@ -1778,7 +1773,7 @@ Lowerer::GateTerm Lowerer::lower_gate_output(const Expression& conn) {
         fail("malformed gate output terminal");
     }
     const Expression& lhs  = conn.as<AssignmentExpression>().left();
-    const auto        term = gate_static_term(lhs);
+    const auto        term = gate_static_term(lhs, Fold::Required);
     if (!term) {
         // TODO: concatenation / part-select / unpacked-element gate output
         // lvalues (rare in netlists).

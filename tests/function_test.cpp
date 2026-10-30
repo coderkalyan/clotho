@@ -1089,3 +1089,109 @@ TEST_CASE("aggregate returns Clotho still refuses loudly") {
         CHECK(d.find("return of an unpacked-array slice is not supported") != std::string::npos);
     }
 }
+
+// A call to a user function in a run-time expression runs every time the
+// expression is evaluated; it is never folded to the value slang's constant
+// evaluator computes. That evaluator gives each call fresh variables (LRM
+// 13.4.3, for a constant function call) and accepts any function whose only
+// state is its own static locals, so a call to one used to be folded where the
+// lowering tried to specialize a case label, a select index, a system function
+// argument or a one-hot selector, and the function's state never advanced.
+// Expectations are the LRM text (13.4.2: a static function's variables are
+// statically allocated, so `tick()` counts 1, 2, 3 ...); Icarus Verilog 13
+// agrees on every design below.
+TEST_CASE("a call to a stateful function in a case label runs at each comparison") {
+    CHECK(run_capture(R"(
+        module m;
+            function int tick(); static int n = 0; n = n + 1; return n; endfunction
+            int sel = 3;
+            initial begin
+                case (sel) tick(): $display("first"); tick(): $display("second");
+                           tick(): $display("third"); default: $display("none"); endcase
+                unique case (sel) 9: $display("nine"); tick(): $display("fourth");
+                                  default: $display("none"); endcase
+            end
+        endmodule
+    )") == "third\nnone\n");
+}
+
+TEST_CASE("a call to a stateful function as a select index runs at each evaluation") {
+    CHECK(run_capture(R"(
+        module m;
+            function int tick(); static int n = 0; n = n + 1; return n; endfunction
+            logic [7:0] v = 8'b0000_0110;
+            logic [7:0] w = 0;
+            int a [0:7];
+            initial begin
+                $display("%b %b %b", v[tick()], v[tick()], v[tick()]);
+                for (int i = 0; i < 3; i++) begin
+                    w[tick()] = 1'b1;
+                    a[tick()] = 10;
+                end
+                $display("%b", w);
+                $display("%0d %0d %0d %0d", a[4], a[6], a[8 - 1], a[10 - 7]);
+            end
+        endmodule
+    )") == "1 1 0\n"
+           "01010000\n"
+           "0 0 10 0\n");
+}
+
+// The bit queries read their operand's value, so a call in it runs each time;
+// $bits does not evaluate its operand (LRM 20.6.2), so a call in it still folds.
+TEST_CASE("a call in the operand of a value-reading system function runs each time") {
+    CHECK(run_capture(R"(
+        module m;
+            function int tick(); static int n = 0; n = n + 1; return n; endfunction
+            initial begin
+                $display("%0d %0d %0d", $clog2(tick()), $clog2(tick()), $clog2(tick()));
+                $display("%0d %0d %0d", $countones(tick()), $countones(tick()), $countones(tick()));
+                $display("%0d", $bits(tick()));
+                $display("%0d", tick());
+            end
+        endmodule
+    )") == "0 1 2\n"
+           "1 2 2\n"
+           "32\n"
+           "7\n");
+}
+
+// The one-hot reverse case, `case (1'b1)` over single-bit selects, is chosen at
+// lowering time when its selector folds to 1. A selector that calls a function
+// is evaluated at run time: 1'(1) is 1 and selects the set bit, 1'(2) is 0 and
+// selects the first clear one.
+TEST_CASE("a call in a case selector keeps the one-hot form from being chosen") {
+    CHECK(run_capture(R"(
+        module m;
+            function int tick(); static int n = 0; n = n + 1; return n; endfunction
+            logic [3:0] v = 4'b0100;
+            initial begin
+                repeat (2) begin
+                    case (1'(tick()))
+                        v[0]: $write("A ");
+                        v[1]: $write("B ");
+                        v[2]: $write("C ");
+                        v[3]: $write("D ");
+                    endcase
+                end
+                $display("");
+            end
+        endmodule
+    )") == "C A \n");
+}
+
+// Where the grammar demands a constant -- a part-select bound, a replication
+// count, a net lvalue's select -- a constant function call is legal and still
+// folds.
+TEST_CASE("a constant function call still folds where a constant is required") {
+    CHECK(run_capture(R"(
+        module m;
+            function automatic int w(int a); return a * 2; endfunction
+            logic [7:0] v = 8'hA5;
+            wire [3:0] o;
+            assign o[w(1)] = 1'b1;
+            and g (o[w(1) + 1], 1'b1, 1'b1);
+            initial #1 $display("%b %b %b %b", v[w(2) - 1:0], o[w(1)], o[w(1) + 1], {w(1){1'b1}});
+        endmodule
+    )") == "0101 1 1 11\n");
+}

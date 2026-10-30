@@ -31,9 +31,7 @@ ir::Index Lowerer::lower_system_call(const CallExpression& call, ir::Builder& b)
     }
     const Expression& cmd = *args[0];
     if (allow_system_ == ir::SystemAccess::Const) {
-        slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext ectx(actx);
-        if (cmd.eval(ectx).bad()) {
+        if (fold_const(cmd, Fold::Runtime).bad()) {
             fail("$system with --allow-system=const requires a constant command "
                  "string; use --allow-system=full for a runtime-computed command");
         }
@@ -554,9 +552,7 @@ ir::Index Lowerer::lower_enum_method(std::string_view            name,
     if (name == "next" || name == "prev") {
         int64_t step = 1;
         if (call.arguments().size() >= 2) {
-            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-            slang::ast::EvalContext    ectx(actx);
-            const slang::ConstantValue cv = call.arguments()[1]->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*call.arguments()[1], Fold::Runtime);
             if (!cv.isInteger()) {
                 // TODO: a runtime (non-constant) step needs value->index lookup
                 // plus modular index arithmetic; rare, so reject for now.
@@ -622,9 +618,7 @@ std::string Lowerer::format_typename(const slang::ast::Type& type) {
 // value naming which 4-state value that control tallies. A non-constant
 // control is rejected (it would need a runtime class-mask select).
 uint32_t Lowerer::count_control_class(const Expression& ctrl) {
-    slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ectx(actx);
-    const slang::ConstantValue cv = ctrl.eval(ectx);
+    const slang::ConstantValue cv = fold_const(ctrl, Fold::Runtime);
     if (!cv.isInteger()) {
         fail("$countbits control bit must be a constant 0/1/x/z");
     }
@@ -1023,9 +1017,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         if (call.arguments().size() != 1) {
             fail("$clog2 expects exactly one argument");
         }
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = call.eval(ectx);
+        const slang::ConstantValue cv = fold_const(call, Fold::Runtime);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
         }
@@ -1044,22 +1036,26 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // argument reaches the IR lowering.
     if (name == "$bits" || name == "$countones" || name == "$countbits" || name == "$onehot" ||
         name == "$onehot0" || name == "$isunknown") {
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = call.eval(ectx);
+        // $bits is "determined without actual evaluation of the expression it
+        // encloses" (LRM 20.6.2), so a call inside it never runs and still folds.
+        // The others read the operand's value, and a call in it has to run.
+        const slang::ConstantValue cv = fold_const(call, name == "$bits" ? Fold::Required : Fold::Runtime);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
         }
         return lower_bit_query(name, call, b, l);
     }
 
+    // An array query inspects its operand for the type only, but its dimension
+    // argument (LRM 20.7) is a value, so only a call in that one has to run.
+    const Fold array_query_fold =
+      call.arguments().size() > 1 && has_user_call(*call.arguments()[1]) ? Fold::Runtime : Fold::Required;
+
     // $size (LRM 20.7): const-folds in slang for a fixed-size array; a runtime
     // queue / dynamic array cannot fold and reaches here — it is exactly the
     // collection's .size() (the sole/first dimension is 0..len-1).
     if (name == "$size" && !call.arguments().empty()) {
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = call.eval(ectx);
+        const slang::ConstantValue cv = fold_const(call, array_query_fold);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
         }
@@ -1106,9 +1102,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // 'x if the map is empty).
     if (name == "$dimensions" || name == "$unpacked_dimensions" || name == "$left" || name == "$right" ||
         name == "$low" || name == "$high" || name == "$increment") {
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = call.eval(ectx);
+        const slang::ConstantValue cv = fold_const(call, array_query_fold);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
         }
@@ -1121,9 +1115,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         // shape here is "absent, or the constant 1", selecting the operand's
         // own dynamic (or associative) dimension.
         if (call.arguments().size() > 1) {
-            slang::ast::ASTContext       dactx(*scope_, slang::ast::LookupLocation::max);
-            slang::ast::EvalContext      dectx(dactx);
-            const slang::ConstantValue   dim_cv = call.arguments()[1]->eval(dectx);
+            const slang::ConstantValue   dim_cv = fold_const(*call.arguments()[1], Fold::Runtime);
             const std::optional<int32_t> dim_ix =
               dim_cv.isInteger() ? dim_cv.integer().as<int32_t>() : std::nullopt;
             if (dim_ix != 1) {
@@ -1212,9 +1204,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // The sole non-integer result is a hierarchical operand, which slang
     // refuses to constant-evaluate.
     if (name == "$isunbounded") {
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = call.eval(ectx);
+        const slang::ConstantValue cv = fold_const(call, Fold::Required);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
         }
@@ -2608,9 +2598,7 @@ void Lowerer::lower_severity_task(const CallExpression& call, std::string_view n
         uint32_t                           level = 1;
         std::span<const Expression* const> msg   = args;
         if (!args.empty()) {
-            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-            slang::ast::EvalContext    ectx(actx);
-            const slang::ConstantValue cv = args[0]->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*args[0], Fold::Required);
             if (cv.isInteger()) {
                 level = cv.integer().as<uint32_t>().value_or(1);
             }
@@ -2704,9 +2692,7 @@ void Lowerer::lower_fdisplay(const CallExpression& call, bool newline, ir::Build
 // agree. It also answers the leading/trailing NUL question outright: a NUL
 // byte is not part of the string, so `{"ab", 8'h00, "cd"}` folds to "abcd".
 std::optional<std::string> Lowerer::const_format_text(const Expression& e) {
-    slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ectx(actx);
-    const slang::ConstantValue cv = e.eval(ectx).convertToStr();
+    const slang::ConstantValue cv = fold_const(e, Fold::Runtime).convertToStr();
     if (!cv) {
         return std::nullopt;
     }

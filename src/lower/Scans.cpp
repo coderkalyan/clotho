@@ -910,6 +910,12 @@ bool is_speculation_safe(const slang::ast::Expression& e) {
     return !s.unsafe;
 }
 
+bool has_user_call(const slang::ast::Expression& e) {
+    UserCallScan s;
+    e.visit(s);
+    return s.found;
+}
+
 void LocalRefDetector::check(const slang::ast::ValueSymbol& sym) {
     if (locals->contains(&sym)) {
         found = true;

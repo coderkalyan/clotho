@@ -109,9 +109,7 @@ void Lowerer::lower_call(const CallExpression& call, ir::Builder& b) {
         // level >= 1.
         uint32_t level = 1;
         if (!call.arguments().empty()) {
-            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-            slang::ast::EvalContext    ectx(actx);
-            const slang::ConstantValue cv = call.arguments()[0]->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*call.arguments()[0], Fold::Required);
             if (cv.isInteger()) {
                 level = cv.integer().as<uint32_t>().value_or(1);
             }

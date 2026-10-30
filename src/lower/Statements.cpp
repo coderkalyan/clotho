@@ -1518,12 +1518,11 @@ void Lowerer::check_case_pragmas(const CaseStatement& c) {
     // Per value: how many items match it. Saturated at 2 -- the only
     // questions are "none" (not full) and "more than one" (not parallel).
     std::vector<uint8_t>    hits(space, 0);
-    slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext ectx(actx);
+    const slang::ast::ASTContext actx(*scope_, slang::ast::LookupLocation::max);
 
     for (const CaseStatement::ItemGroup& item : c.items) {
         for (const Expression* e : item.expressions) {
-            const slang::ConstantValue cv = e->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*e, Fold::Runtime, actx);
             if (cv.bad() || !cv.isInteger()) {
                 return; // Not decidable; say nothing.
             }
@@ -2167,8 +2166,7 @@ std::vector<std::vector<char>> Lowerer::case_dedup(const CaseStatement&         
             if (e.kind == ExpressionKind::ValueRange) {
                 continue;
             }
-            slang::ast::EvalContext    ev(astCtx);
-            const slang::ConstantValue cv = e.eval(ev);
+            const slang::ConstantValue cv = fold_const(e, Fold::Runtime, astCtx);
             if (!cv.isInteger()) {
                 continue;
             }
@@ -2269,8 +2267,7 @@ std::optional<Lowerer::SwitchRun> Lowerer::find_switch_run(const CaseStatement& 
             if (keep != nullptr && !(*keep)[i][j]) {
                 continue; // already proven dead by the whole-statement case_dedup.
             }
-            slang::ast::EvalContext    ev(astCtx);
-            const slang::ConstantValue cv = e->eval(ev);
+            const slang::ConstantValue cv = fold_const(*e, Fold::Runtime, astCtx);
             if (!cv.isInteger() || cv.integer().hasUnknown()) {
                 eligible = false;
                 break;
@@ -2347,9 +2344,7 @@ std::optional<Lowerer::OneHotPlan> Lowerer::build_onehot_plan(const CaseStatemen
     }
     // Selector must be exactly the 1-bit constant 1.
     {
-        slang::ast::ASTContext     ctx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ev(ctx);
-        const slang::ConstantValue cv = c.expr.eval(ev);
+        const slang::ConstantValue cv = fold_const(c.expr, Fold::Runtime);
         if (!cv.isInteger() || cv.integer().getBitWidth() != 1 || cv.integer().hasUnknown() ||
             cv.integer().as<uint64_t>().value_or(0) != 1) {
             return std::nullopt;

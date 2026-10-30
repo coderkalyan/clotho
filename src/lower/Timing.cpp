@@ -918,9 +918,7 @@ ir::Index Lowerer::event_handle(const Expression& e, ir::Builder& b) {
 // record could hold -- but LRM 15.5.1's form is a fixed repetition in every
 // real use, and a constant keeps the record a plain integer.
 uint32_t Lowerer::repeat_count_const(const Expression& e) {
-    slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ectx(actx);
-    const slang::ConstantValue cv = e.eval(ectx);
+    const slang::ConstantValue cv = fold_const(e, Fold::Runtime);
     if (!cv.isInteger()) {
         // TODO: a runtime repeat count on `->> repeat(n) @(x) e`.
         fail("a non-constant repeat count on an event-controlled nonblocking "

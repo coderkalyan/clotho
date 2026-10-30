@@ -438,6 +438,23 @@ struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
 
 bool is_speculation_safe(const slang::ast::Expression& e);
 
+// Whether an expression calls a user subroutine -- a function, a task or a class
+// method, anything but a system function -- anywhere in its tree. The call's
+// callee body is not part of the expression, so it is not walked.
+struct UserCallScan : ASTVisitor<UserCallScan, VisitFlags::Expressions> {
+    bool found = false;
+
+    void handle(const CallExpression& call) {
+        if (!call.isSystemCall()) {
+            found = true;
+            return;
+        }
+        visitDefault(call);
+    }
+};
+
+bool has_user_call(const slang::ast::Expression& e);
+
 // Detects whether an expression reads any symbol in a given set (used to find
 // frame-local / formal-argument references in an event operand).
 struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
@@ -1497,6 +1514,27 @@ private:
 
     ir::Ref make_int_type(uint32_t width, bool is_four, bool is_signed);
 
+    // Whether an expression slang can fold is allowed to be folded, which depends
+    // on what the site does with it.
+    //
+    // Required: the grammar demands a constant expression here (a part-select
+    // bound, a replication count, a bin bound, a `$past` tick count, ...), so
+    // slang has already diagnosed anything else, and a constant function call is
+    // legal in it. LRM 13.4.3: "The execution of a constant function call has no
+    // effect on the initial values of the variables used either at simulation
+    // time or among multiple invocations of a function at elaboration time", so
+    // slang's evaluation, every call on fresh variables, is the right one.
+    //
+    // Runtime: an ordinary run-time expression the lowering tries to specialize
+    // when it happens to fold (a case label, a delay, a selector, a gate input).
+    // A call to a user subroutine in it has to run each time the expression is
+    // evaluated: it may read and write static variables, including its own
+    // implicit return variable (LRM 13.4.2), and write module state. slang's
+    // evaluator gives every call fresh variables and ignores the side effects,
+    // so such an expression is never folded, and the site takes its run-time
+    // path.
+    enum class Fold : uint8_t { Required, Runtime };
+
     // Which operand's signedness picks the fill bits of an integral WIDENING.
     // The LRM gives two different answers and the IR's Resize instruction
     // implements the second one: it extends according to the signedness of its
@@ -1857,9 +1895,12 @@ private:
 
     std::optional<ir::Signal> gate_select_base(const Expression& value);
 
-    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index);
+    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index, Fold mode);
 
-    std::optional<GateTerm> gate_static_term(const Expression& e);
+    // `mode` is how a bit-select index is folded: Required for an output terminal
+    // (a net_lvalue takes a constant_select, LRM A.8.5), Runtime for an input,
+    // which is any expression. A part-select bound is always Required.
+    std::optional<GateTerm> gate_static_term(const Expression& e, Fold mode);
 
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index);
 
@@ -4314,7 +4355,15 @@ private:
 
     uint64_t const_uint(const Expression& e, std::string_view what);
 
-    std::optional<int32_t> try_const_int(const Expression& e);
+    // The one place Clotho asks slang to evaluate an expression. A bad value when
+    // `e` is not constant, or when `mode` forbids folding it. The overload without
+    // a context evaluates against the current scope; a caller folding many
+    // expressions in one scope passes its own.
+    slang::ConstantValue fold_const(const Expression& e, Fold mode);
+
+    slang::ConstantValue fold_const(const Expression& e, Fold mode, const slang::ast::ASTContext& astCtx);
+
+    std::optional<int32_t> try_const_int(const Expression& e, Fold mode = Fold::Runtime);
 
     // -- Packed-select index normalization --
     //
