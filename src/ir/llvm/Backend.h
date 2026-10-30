@@ -52,6 +52,7 @@
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
 #include "ir/TypeModel.h"
+#include "ir/Typing.h"
 #include "runtime/Gc.h"
 #include "runtime/Runtime.h"
 
@@ -86,9 +87,9 @@
 // reaches a field through constant-index GEPs, so LLVM computes and owns all
 // offsets/padding (the module carries the target's DataLayout).
 //
-// Inferred types. The IR stores no per-instruction result type, so the backend
-// recomputes width / domain / signedness for each value by walking operands
-// (the frontend already inserted Resize nodes to width-match binary operands).
+// Inferred types. The IR stores no per-instruction result type; the shared
+// typing (ir/Typing.h) derives width / domain / signedness for each value from
+// its operands and declared types, the same derivation the IR verifier checks.
 //
 // Scope (initial). Nonblocking assignment is lowered identically to blocking
 // (no two-phase next-state staging yet); event / sensitivity gating is left
@@ -96,25 +97,6 @@
 // and memories are unsupported and rejected.
 
 namespace clotho::ir::backend {
-
-// Inferred type of a lowered value: its packed width, whether it can carry X/Z
-// (a meaningful xz plane), and its signedness (drives sext-vs-zext and signed
-// compares).
-struct ValType {
-    uint32_t width      = 0;
-    bool     four_state = false;
-    bool     is_signed  = false;
-    // A string value: carried as an rt_string handle pointer (str_vals_), never
-    // as a Plane. width / four_state are meaningless when set.
-    bool is_string = false;
-    // Real / shortreal: the value is an IEEE-754 double (width 64) or float
-    // (width 32) riding Plane.fp; never four_state.
-    bool is_real = false;
-};
-
-// The type_of memo stores one ValType per instruction; keep it one dense
-// 8-byte word (validity lives in a parallel byte vector, not an optional).
-static_assert(sizeof(ValType) == 8);
 
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
 // = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
@@ -2528,15 +2510,14 @@ private:
 
     void branch_to(llvm::BasicBlock* bb);
 
-    // -- Type inference (memoized) --
+    // -- Types --
 
-    ValType type_of(Index i);
-
-    ValType from_ref(Ref type) const;
+    // The type of the value instruction `i` of the current body produces.
+    ValueType type_of(Index i) const {
+        return types_[static_cast<uint32_t>(i)];
+    }
 
     Ref queue_elem_type(Index queue_lv);
-
-    ValType compute_type(Index i);
 
     // -- Value / lvalue access --
 
@@ -2893,7 +2874,7 @@ private:
 
     // A bit / part-select index operand as the i32 added to a bit offset; a value
     // an i32 cannot hold saturates, which lands out of range in any container.
-    llvm::Value* select_index(Plane idx, ValType t);
+    llvm::Value* select_index(Plane idx, ValueType t);
 
     // An unpacked-array element: `pos` is its 0-based position (meaningful only
     // when `in_range`), `in_range` the verdict without the x/z term.
@@ -2902,7 +2883,7 @@ private:
         llvm::Value* in_range = nullptr;
     };
 
-    ElemPos fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right);
+    ElemPos fixed_elem_pos(Plane idx, ValueType t, uint32_t left, uint32_t right);
 
     // A dynamic-array / queue index `idx < len`; `idx64` addresses the element
     // only when `below`.
@@ -2911,7 +2892,7 @@ private:
         llvm::Value* below = nullptr;
     };
 
-    ElemBelow elem_index_below(Plane idx, ValType t, llvm::Value* len);
+    ElemBelow elem_index_below(Plane idx, ValueType t, llvm::Value* len);
 
     llvm::Value* store_mask(const LValue& lv, uint32_t sw);
 
@@ -3370,7 +3351,7 @@ private:
 
     Plane lower_real_compare(Inst::Tag tag, Plane a, Plane b);
 
-    Plane lower_ftoi(Inst::Tag tag, Plane v, ValType to);
+    Plane lower_ftoi(Inst::Tag tag, Plane v, ValueType to);
 
     Plane lower_real_mux(Plane cond, Plane a, Plane b);
 
@@ -4329,12 +4310,9 @@ private:
 
     std::vector<Plane>                 values_;
     std::vector<std::optional<LValue>> lvals_;
-    // Per-instruction type_of memo. Validity lives in a parallel byte vector
-    // instead of std::optional<ValType> (12B/entry from the engaged flag +
-    // padding): entries stay 8B dense, and a body reset only clears the
-    // bitmap — stale types_ values are gated by types_valid_ == 0.
-    std::vector<ValType> types_;
-    std::vector<uint8_t> types_valid_;
+    // The type of every instruction of the current body (ir/Typing.h), computed
+    // when the body starts lowering.
+    std::vector<ValueType> types_;
     // rt_string handle pointers of string-valued instructions, parallel to
     // values_ (a string never flows as a Plane).
     std::vector<llvm::Value*> str_vals_;

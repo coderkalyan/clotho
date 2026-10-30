@@ -128,7 +128,7 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
 // bits would turn into bit 1) becomes INT32_MAX or INT32_MIN, which no container
 // reaches. The frontend hands over an operand wider than 32 bits only when a
 // 32-bit offset could not hold its arithmetic.
-llvm::Value* Backend::select_index(Plane idx, ValType t) {
+llvm::Value* Backend::select_index(Plane idx, ValueType t) {
     llvm::Value* m = must_of(idx);
     if (t.width <= 32) {
         return cast(m, 32, t.is_signed);
@@ -145,7 +145,7 @@ llvm::Value* Backend::select_index(Plane idx, ValType t) {
 // type wide enough that neither its extension nor the subtraction of a bound can
 // wrap, so an index of 2**32 + 1 or a signed -1 is out of range instead of
 // aliasing a low element; LLVM narrows it again for the usual `int` index.
-Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right) {
+Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValueType t, uint32_t left, uint32_t right) {
     const bool     ascending = left <= right;
     const uint32_t count     = (ascending ? right - left : left - right) + 1;
     const uint32_t ew        = std::max(64u, t.width + 2);
@@ -159,7 +159,7 @@ Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValType t, uint32_t left, ui
 // `idx < len` for a dynamic array or queue (LRM 7.4.5), the index compared at its
 // own width and signedness. A negative index is a huge unsigned one, so a single
 // compare covers both ends.
-Backend::ElemBelow Backend::elem_index_below(Plane idx, ValType t, llvm::Value* len) {
+Backend::ElemBelow Backend::elem_index_below(Plane idx, ValueType t, llvm::Value* len) {
     llvm::Value* m = must_of(idx);
     if (t.width <= 64) {
         llvm::Value* idx64 = cast(m, 64, t.is_signed);
@@ -460,7 +460,7 @@ Plane Backend::lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
 // saturating i64 answer) goes through fptosi.sat, which avoids poison on
 // out-of-range / NaN input; only a finite larger magnitude takes the cold block
 // below, which shifts the 53-bit mantissa by the exponent in the target's width.
-Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValType to) {
+Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValueType to) {
     llvm::Value* f = fp_of(v);
     if (tag == Inst::Tag::FtoI) {
         f = b_.CreateUnaryIntrinsic(llvm::Intrinsic::round, f);
@@ -1401,7 +1401,7 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         llvm::Value* bit = b_.CreateICmpNE(eqb, b_.getInt8(0));
         return bit_plane(bit, bit);
     }
-    const ValType vt = from_ref(type);
+    const ValueType vt = value_type_of(mod_.pool, type);
     // A leaf reached through a deferred associative-array element (`a[k] == x`
     // over an aggregate value) resolves its map slot here -- lower_agg_eq
     // reads leaves inline, bypassing the Load dispatch. An absent key reads

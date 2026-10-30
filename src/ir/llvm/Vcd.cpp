@@ -251,7 +251,7 @@ void Backend::vcd_touch_event_unused(Signal sig) {
 // (forward=0), the same split as $readmem's filename.
 void Backend::lower_dump_file(Index i) {
     const Index   fname = ir_->payload(i).unary;
-    const ValType fty   = type_of(fname);
+    const ValueType fty   = type_of(fname);
     llvm::Value*  path  = nullptr;
     llvm::Value*  len   = nullptr;
     uint32_t      fwd   = 0;

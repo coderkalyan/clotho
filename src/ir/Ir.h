@@ -175,6 +175,36 @@ struct ExtraSlice {
     ExtraIndex end;
 };
 
+// Decode a record written to an extra side-table by Builder::add_extra. Shared by
+// every reader of the table: a finished `Ir`, a `Builder` still growing one, and
+// the `IrView` that value typing reads either through.
+template<ExtraPayload T>
+T decode_extra(std::span<const uint32_t> extra, ExtraIndex at) {
+    constexpr size_t        n    = sizeof(T) / sizeof(uint32_t);
+    const auto              base = static_cast<uint32_t>(at);
+    std::array<uint32_t, n> words{};
+    for (size_t i = 0; i < n; ++i) {
+        words[i] = extra[base + i];
+    }
+
+    return std::bit_cast<T>(words);
+}
+
+// A slice of the extra table reinterpreted as a run of instruction indices.
+//
+// NOTE: viewing u32 extra words as enum-class handles (here and in
+// wait_edges) is formally an aliasing violation — an enum is not
+// aliasing-compatible with its underlying type ([basic.lval]). Accepted
+// deliberately: the representation is identical, every compiler this
+// builds on reads it as intended, and the alternative (per-element
+// copies) costs the zero-copy view this layout exists for.
+inline std::span<const Index> decode_slice(std::span<const uint32_t> extra, ExtraSlice s) {
+    const auto a = static_cast<uint32_t>(s.start);
+    const auto b = static_cast<uint32_t>(s.end);
+
+    return { reinterpret_cast<const Index*>(extra.data() + a), b - a };
+}
+
 // Extra payload for `strength_res`: the driver slot values and a parallel run
 // of packed per-driver (strength0<<8 | strength1) constants (one u32 word per
 // driver, low 16 bits used). `values` are the SSA operands; `strengths` are
@@ -2980,6 +3010,33 @@ static_assert(extra_operand_tails_total(),
               "a tag on PayloadKind::FDisplay / Sformat / Sformatf / Scanf needs its "
               "extra_operand_tail() case");
 
+// A read-only window onto the columns of a body, finished or still growing:
+// what value typing (Typing.h) reads, so an `Ir` and a `Builder` are typed by
+// the same function. Views do not own; they are valid until the body they
+// look at changes.
+struct IrView {
+    std::span<const Inst::Tag>     tags;
+    std::span<const Inst::Payload> payloads;
+    std::span<const uint32_t>      extra;
+
+    Inst::Tag tag(Index i) const {
+        return tags[static_cast<uint32_t>(i)];
+    }
+
+    const Inst::Payload& payload(Index i) const {
+        return payloads[static_cast<uint32_t>(i)];
+    }
+
+    template<ExtraPayload T>
+    T extra_data(ExtraIndex at) const {
+        return decode_extra<T>(extra, at);
+    }
+
+    std::span<const Index> region(ExtraSlice r) const {
+        return decode_slice(extra, r);
+    }
+};
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -2988,6 +3045,11 @@ static_assert(extra_operand_tails_total(),
 class Ir {
 public:
     Ir() = default;
+
+    // The columns value typing reads.
+    IrView view() const {
+        return { { tags_.data(), tags_.size() }, { payloads_.data(), payloads_.size() }, extra_raw() };
+    }
 
     // Intern pool backing this IR's constant / type handles. Valid only on a
     // built Ir (Builder::finish()), never on a default-constructed one.
@@ -3044,14 +3106,7 @@ public:
     // Decode a struct previously written with Builder::add_extra.
     template<ExtraPayload T>
     T extra_data(ExtraIndex at) const {
-        constexpr size_t        n    = sizeof(T) / sizeof(uint32_t);
-        const auto              base = static_cast<uint32_t>(at);
-        std::array<uint32_t, n> words{};
-        for (size_t i = 0; i < n; ++i) {
-            words[i] = extra_[base + i];
-        }
-
-        return std::bit_cast<T>(words);
+        return decode_extra<T>(extra_raw(), at);
     }
 
     // Decode `len` raw bytes previously packed at `at` by Builder (little-endian,
@@ -3178,18 +3233,8 @@ private:
     friend class Builder;
 
     // A slice reinterpreted as a run of instruction indices.
-    //
-    // NOTE: viewing u32 extra words as enum-class handles (here and in
-    // wait_edges) is formally an aliasing violation — an enum is not
-    // aliasing-compatible with its underlying type ([basic.lval]). Accepted
-    // deliberately: the representation is identical, every compiler this
-    // builds on reads it as intended, and the alternative (per-element
-    // copies) costs the zero-copy view this layout exists for.
     std::span<const Index> index_slice(ExtraSlice s) const {
-        const auto a = static_cast<uint32_t>(s.start);
-        const auto b = static_cast<uint32_t>(s.end);
-
-        return { reinterpret_cast<const Index*>(extra_.data() + a), b - a };
+        return decode_slice(extra_raw(), s);
     }
 
     // Constructed atomically by Builder::finish().

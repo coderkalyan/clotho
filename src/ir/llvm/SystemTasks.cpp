@@ -1082,7 +1082,7 @@ void Backend::lower_readmem(Index i) {
     // Otherwise spill the filename's must-bits to a byte buffer: the value is
     // a packed-ASCII vector (string literal or reg), so its low bytes are the
     // path.
-    const ValType fty          = type_of(fname);
+    const ValueType fty          = type_of(fname);
     llvm::Value*  path         = nullptr;
     llvm::Value*  path_len     = nullptr;
     const bool    fname_is_str = fty.is_string;

@@ -1,6 +1,5 @@
 #include "ir/Typing.h"
 
-#include <array>
 #include <variant>
 
 #include "ir/TypeModel.h"
@@ -37,11 +36,11 @@ ValueType signal_type(const Module& m, Signal sig) {
     };
 }
 
-ValueType compute_type(const Module& m, const Ir& ir, Index i, const std::vector<ValueType>& done) {
+} // namespace
+
+ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<const ValueType> done) {
     const InternPool& pool = m.pool;
-    // An operand that does not precede its user is malformed IR; the verifier
-    // reports that, and here it types as a void placeholder.
-    const auto ty = [&](Index x) {
+    const auto        ty   = [&](Index x) {
         const auto k = static_cast<uint32_t>(x);
         return k < done.size() ? done[k] : ValueType{};
     };
@@ -361,10 +360,9 @@ ValueType compute_type(const Module& m, const Ir& ir, Index i, const std::vector
             return { 1, false, false };
 
         case Inst::Tag::Concat: {
-            std::array<Index, 4> scratch;
-            uint32_t             width = 0;
-            bool                 four  = false;
-            for (Index part : ir.operands(i, scratch)) {
+            uint32_t width = 0;
+            bool     four  = false;
+            for (Index part : ir.region(ir.extra_data<ExtraSlice>(p.extra))) {
                 const ValueType t = ty(part);
                 if (t.is_string) { // string concat (all parts are strings)
                     return { 0, false, false, true };
@@ -485,13 +483,12 @@ ValueType compute_type(const Module& m, const Ir& ir, Index i, const std::vector
     return { 0, false, false };
 }
 
-} // namespace
-
 std::vector<ValueType> value_types(const Module& m, const Ir& ir) {
     std::vector<ValueType> done;
     done.reserve(ir.inst_count());
+    const IrView view = ir.view();
     for (size_t k = 0; k < ir.inst_count(); ++k) {
-        done.push_back(compute_type(m, ir, static_cast<Index>(k), done));
+        done.push_back(compute_type(m, view, static_cast<Index>(k), done));
     }
     return done;
 }

@@ -36,8 +36,8 @@ violating LRM 6.3.1 (x/z → 0 on assignment to a 2-state target).
 ## Representation
 
 A 2-state value is a single `iW` LLVM value. Reuse `Plane` with a narrowed
-contract, disambiguated by the value's `ValType.four_state` (already recomputed
-per-instruction by walking operands, `ir/llvm/Backend.h, ValType`):
+contract, disambiguated by the value's `ValueType.four_state` (derived
+per-instruction from its operands, `ir/Typing.h, ValueType`):
 
 | domain | `Plane.mm` | `Plane.z` |
 |--------|-----------|-----------|
@@ -79,7 +79,7 @@ just narrows from `zero(2*width)` to `zero(width)`.
 
 ## Conversions (the `Resize` op)
 
-`Resize` carries the target `ValType` (width + domain + sign). Extend its lowering
+`Resize` carries the target `ValueType` (width + domain + sign). Extend its lowering
 to project the domain, then width-cast:
 
 ### 4-state → 2-state (LRM 6.3.1: x/z → 0)

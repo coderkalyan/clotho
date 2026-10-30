@@ -126,7 +126,7 @@ Small, because the 2-state machinery already exists:
   applies the must-plane projection; never-x guarantees must == may, so it is
   exact. Frame locals / NBA targets mirror.
 - **Value** (loads, `type_of`): a load of a narrowed signal must produce a
-  `two_val` (`Plane.two = true`) and report `ValType.four_state = false`. The
+  `two_val` (`Plane.two = true`) and report `ValueType.four_state = false`. The
   existing per-instruction `four_state` recompute + operator `two`-propagation
   then carry it downstream natively with no further change — the same dispatch
   that makes `bit` fast.

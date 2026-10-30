@@ -291,7 +291,7 @@ llvm::Constant* Backend::elem_ops_global(Ref container_type) {
 
 Backend::SortDesc Backend::dynarr_sort_desc(Ref array_type) const {
     const Ref     elem = std::get<Type>(mod_.pool.get(array_type)).element;
-    const ValType vt   = from_ref(elem);
+    const ValueType vt   = value_type_of(mod_.pool, elem);
     if (vt.is_real) {
         return { 2u, vt.width };
     }
@@ -968,7 +968,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
     b_.CreateStore(elem_default_const(e), scratch);
     b_.CreateCall(queue_pop_fn(front), { handle, ops, scratch });
     Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
-    const ValType t = type_of(i);
+    const ValueType t = type_of(i);
     if (t.is_real) {
         v = real_plane(planes_to_real(v, t.width));
     }

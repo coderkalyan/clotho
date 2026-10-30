@@ -58,479 +58,12 @@ void Backend::branch_to(llvm::BasicBlock* bb) {
     }
 }
 
-ValType Backend::type_of(Index i) {
-    const auto slot = static_cast<uint32_t>(i);
-    if (types_valid_[slot] != 0) {
-        return types_[slot];
-    }
-    const ValType t    = compute_type(i);
-    types_[slot]       = t;
-    types_valid_[slot] = 1;
-    return t;
-}
-
-ValType Backend::from_ref(Ref type) const {
-    const Type& ty = std::get<Type>(mod_.pool.get(type));
-    if (ty.kind == Type::Kind::String) {
-        return { 0, false, false, true };
-    }
-    const Layout lay = mod_.pool.layout(type);
-    const bool fl = mod_.pool.is_float(type);
-    // Reals are signed quantities (LRM 11.8.1).
-    return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed || fl, false, fl };
-}
-
 // The element type Ref of the queue whose handle lvalue is `queue_lv`. The
 // lvalue is a plain Signal (queue-of-queue is rejected at the frontend), so
 // the queue type comes straight from the signal table.
 Ref Backend::queue_elem_type(Index queue_lv) {
     const Signal sig = ir_->payload(queue_lv).signal;
     return std::get<Type>(mod_.pool.get(mod_.signal(sig).type)).element;
-}
-
-ValType Backend::compute_type(Index i) {
-    const Inst::Payload& p = ir_->payload(i);
-    switch (ir_->tag(i)) {
-        case Inst::Tag::Constant:
-            return from_ref(std::get<Value>(mod_.pool.get(p.ref)).type);
-        case Inst::Tag::Arg:
-            return from_ref(p.arg.type);
-        case Inst::Tag::Local:
-            return from_ref(p.local.type);
-        case Inst::Tag::Call:
-            return from_ref(mod_.function(ir_->extra_data<CallInfo>(p.extra).func).return_type);
-        case Inst::Tag::CallVirtual:
-            // All overrides share the statically-resolved method's return type.
-            return from_ref(mod_.function(ir_->extra_data<VirtualCallInfo>(p.extra).func).return_type);
-        case Inst::Tag::Resize:
-            return from_ref(p.op_type.type);
-        case Inst::Tag::Signal: {
-            const SignalSlot& s = slot_of(p.signal);
-            return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array,
-                     s.is_real && !s.is_array };
-        }
-        case Inst::Tag::BitSelect: {
-            const ValType base = type_of(p.binary.l);
-            return { 1, base.four_state, false };
-        }
-        case Inst::Tag::PartSelect: {
-            const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
-            return { ps.msb - ps.lsb + 1, type_of(p.op_extra.op).four_state, false };
-        }
-        case Inst::Tag::DynPartSelect: {
-            const auto dps = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
-            return { dps.width, type_of(p.op_extra.op).four_state, false };
-        }
-        case Inst::Tag::ElemSelect: {
-            // The result is one element of the indexed array.
-            const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
-            const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
-            return from_ref(at.element);
-        }
-        case Inst::Tag::ArrSlice: {
-            // An array lvalue, never a scalar value; report the element leaf
-            // type for exhaustiveness (the slice is only ever consumed as an
-            // aggregate, so this is not used on a value path).
-            const auto  as = ir_->extra_data<ArrSlice>(p.op_extra.extra);
-            const Type& st = std::get<Type>(mod_.pool.get(as.slice_type));
-            return from_ref(st.element);
-        }
-        case Inst::Tag::MemberSelect: {
-            // The result is the selected member's own type.
-            const auto   ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
-            const Type&  st     = std::get<Type>(mod_.pool.get(ms.struct_type));
-            const auto   fields = mod_.pool.struct_fields(st.fields_id);
-            return from_ref(fields[ms.field_index].type);
-        }
-        case Inst::Tag::ClassNew:
-            // The object handle (a 2-state 64-bit value, per layout(Class)).
-            return from_ref(p.ref);
-        case Inst::Tag::IfaceRef:
-            // The instance-context address, as a 2-state 64-bit handle.
-            return { 64, false, false };
-        case Inst::Tag::IfaceSignal: {
-            // An lvalue producer (the named member of the handle's instance);
-            // its shape is the representative signal's, which every instance of
-            // the definition shares.
-            const SignalSlot& s = slot_of(ir_->extra_data<IfaceMember>(p.op_extra.extra).signal);
-            return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array,
-                     s.is_real && !s.is_array };
-        }
-        case Inst::Tag::Load:
-            return type_of(p.unary);
-        case Inst::Tag::SimTime:
-            return { 64, false, false };
-        case Inst::Tag::EventNew:
-            // An event handle: a 2-state 64-bit word.
-            return { 64, false, false };
-        case Inst::Tag::ProcQuery:
-            // `self` is a class handle, `status` the 32-bit state enum,
-            // `get_randstate` a string -- the frontend recorded which on the op.
-            return from_ref(ir_->extra_data<ProcCtlInfo>(p.extra).type);
-        case Inst::Tag::ProcCtl:
-        case Inst::Tag::ProcWait:
-            // Statements, never values.
-            return { 1, false, false };
-        case Inst::Tag::SyncWait:
-            // 1 when the park resumed as its queue's head: a definite 2-state
-            // bit the frontend ANDs with its own resource test.
-            return { 1, false, false };
-        case Inst::Tag::SyncCtl:
-            // A statement, never a value.
-            return { 1, false, false };
-        case Inst::Tag::CoverQuery:
-            // A covergroup handle, a coverage percentage, or a bin count -- the
-            // frontend recorded which on the op.
-            return from_ref(ir_->extra_data<CoverInfo>(p.extra).type);
-        case Inst::Tag::CoverCtl:
-            // A statement, never a value.
-            return { 1, false, false };
-        case Inst::Tag::EventTriggered:
-            // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
-            return { 1, false, false };
-        case Inst::Tag::Random:
-            return { 32, false, true };
-        case Inst::Tag::Clog2:
-            // $clog2 returns a 32-bit signed `integer` (4-state: the result
-            // is X when the operand carries x/z).
-            return { 32, true, true };
-        case Inst::Tag::Ctz:
-        case Inst::Tag::Clz:
-            // A definite 2-state 32-bit bit index (counts of the must plane).
-            return { 32, false, false };
-        case Inst::Tag::CountBits:
-            // $countbits family: a definite 2-state 32-bit signed `int`
-            // (LRM 20.9 return type). Never X — it counts, it does not
-            // propagate.
-            return { 32, false, true };
-        case Inst::Tag::OneHot:
-        case Inst::Tag::OneHot0:
-        case Inst::Tag::IsUnknown:
-            // Definite 1-bit qualifier results (LRM 20.9); never X.
-            return { 1, false, false };
-        case Inst::Tag::FopenFd:
-        case Inst::Tag::FopenMcd:
-            // $fopen returns a 32-bit descriptor integer.
-            return { 32, false, true };
-        case Inst::Tag::Fgetc:
-        case Inst::Tag::Ungetc:
-        case Inst::Tag::Feof:
-        case Inst::Tag::Ftell:
-        case Inst::Tag::Fseek:
-        case Inst::Tag::Rewind:
-        case Inst::Tag::Fgets:
-        case Inst::Tag::Ferror:
-        case Inst::Tag::Fscanf:
-        case Inst::Tag::Sscanf:
-        case Inst::Tag::FreadWord:
-        case Inst::Tag::FreadMem:
-            // The file read / positioning / error / scan functions return i32.
-            return { 32, false, true };
-        case Inst::Tag::System:
-            // $system returns the raw system() int (a POSIX wait-status).
-            return { 32, false, true };
-        case Inst::Tag::TestPlusArgs:
-        case Inst::Tag::ValuePlusArgs:
-            // LRM §21.6: an always-known (never x/z) boolean 'int'.
-            return { 32, false, true };
-        case Inst::Tag::DynArrayNew:
-        case Inst::Tag::DynArrayNewInit:
-        case Inst::Tag::DynArraySize:
-        case Inst::Tag::DynArrayDelete:
-        case Inst::Tag::DynArrayCopy:
-        case Inst::Tag::DynArrayCopyQueue:
-            // Only size() is a value (a definite 2-state int); new / delete /
-            // copy are statements whose type is never queried.
-            return { 32, false, true };
-        case Inst::Tag::QueuePopBack:
-        case Inst::Tag::QueuePopFront:
-            // One element of the queue's element type, straight off the
-            // payload's Queue type.
-            return from_ref(std::get<Type>(mod_.pool.get(p.op_type.type)).element);
-        case Inst::Tag::QueueSize:
-        case Inst::Tag::QueuePushBack:
-        case Inst::Tag::QueuePushFront:
-        case Inst::Tag::QueueInsert:
-        case Inst::Tag::QueueDeleteIdx:
-        case Inst::Tag::QueueDeleteAll:
-        case Inst::Tag::QueueCopy:
-        case Inst::Tag::HandleCopyNb:
-        case Inst::Tag::QueueCopyDyn:
-        case Inst::Tag::QueueAppendRange:
-            // size() is a definite 2-state int; the rest are statements
-            // whose type is never queried.
-            return { 32, false, true };
-        case Inst::Tag::DynArrayReverse:
-        case Inst::Tag::DynArraySort:
-        case Inst::Tag::DynArrayRsort:
-        case Inst::Tag::DynArrayShuffle:
-        case Inst::Tag::QueueReverse:
-        case Inst::Tag::QueueSort:
-        case Inst::Tag::QueueRsort:
-        case Inst::Tag::QueueShuffle:
-            // Ordering methods (LRM 7.12.2) are void statements; their type
-            // is never queried.
-            return { 32, false, true };
-        case Inst::Tag::AssocSelect:
-            // One entry of the associative array's value element type.
-            return from_ref(std::get<Type>(mod_.pool.get(
-              ir_->extra_data<AssocArg>(p.op_extra.extra).assoc_type)).element);
-        case Inst::Tag::AssocDefault:
-            // The `'{default: v}` slot carries the same value element type.
-            return from_ref(std::get<Type>(mod_.pool.get(p.op_type.type)).element);
-        case Inst::Tag::AssocNum:
-        case Inst::Tag::AssocExists:
-        case Inst::Tag::AssocFirst:
-        case Inst::Tag::AssocLast:
-        case Inst::Tag::AssocNext:
-        case Inst::Tag::AssocPrev:
-        case Inst::Tag::AssocDeleteKey:
-        case Inst::Tag::AssocDeleteAll:
-        case Inst::Tag::AssocReset:
-        case Inst::Tag::AssocCopy:
-            // num()/exists() and the traversal status are definite 2-state
-            // ints; delete/copy are statements whose type is never queried.
-            return { 32, false, true };
-
-        case Inst::Tag::Add:
-        case Inst::Tag::Sub:
-        case Inst::Tag::Mul:
-        case Inst::Tag::Div:
-        case Inst::Tag::Mod:
-        // Power's result shares the left operand's type; the exponent is
-        // self-determined and does not widen the result.
-        case Inst::Tag::Pow:
-        case Inst::Tag::Band:
-        case Inst::Tag::Bor:
-        case Inst::Tag::Bxor:
-        case Inst::Tag::Bxnor:
-        case Inst::Tag::Sll:
-        case Inst::Tag::Srl:
-        case Inst::Tag::Sra:
-            return type_of(p.binary.l);
-        case Inst::Tag::WireRes:
-        case Inst::Tag::WandRes:
-        case Inst::Tag::WorRes: {
-            // Net resolution always yields a 4-state result at the operand
-            // (net) width — a driver conflict is X, an all-high-Z net is Z —
-            // even when the driver slots feeding it are 2-state.
-            const ValType lt = type_of(p.binary.l);
-            return { lt.width, true, false };
-        }
-        case Inst::Tag::StrengthRes: {
-            // Strength resolution yields a 4-state net-width result, like
-            // WireRes; the width is the first driver slot's width.
-            const auto    info = ir_->extra_data<StrengthResInfo>(p.extra);
-            const ValType lt   = type_of(ir_->region(info.values)[0]);
-            return { lt.width, true, false };
-        }
-        case Inst::Tag::Bnot:
-            return type_of(p.unary);
-        case Inst::Tag::StreamReverse:
-            // A bit permutation: the operand's width and domain.
-            return type_of(p.op_imm.op);
-        case Inst::Tag::NetPull:
-            // A pulled net is 4-state (a driver conflict is still X) but
-            // never Z, at the resolved value's width.
-            return { type_of(p.op_imm.op).width, true, false };
-        case Inst::Tag::Select:
-            return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
-        case Inst::Tag::SelectLazy:
-            return type_of(ir_->extra_data<SelectLazy>(p.op_extra.extra).then_val);
-
-        case Inst::Tag::FAdd:
-        case Inst::Tag::FSub:
-        case Inst::Tag::FMul:
-        case Inst::Tag::FDiv:
-        case Inst::Tag::FPow:
-            return type_of(p.binary.l);
-        case Inst::Tag::FNeg:
-            return type_of(p.unary);
-        // Real compares are definite (reals carry no x/z): 1-bit two-state.
-        case Inst::Tag::FEq:
-        case Inst::Tag::FNe:
-        case Inst::Tag::FLt:
-        case Inst::Tag::FLe:
-        case Inst::Tag::FGt:
-        case Inst::Tag::FGe:
-            return { 1, false, false };
-        case Inst::Tag::ItoF:
-        case Inst::Tag::FtoI:
-        case Inst::Tag::FtoITrunc:
-        case Inst::Tag::FBitcast:
-        case Inst::Tag::FResize:
-            return from_ref(p.op_type.type);
-        // Every LRM 20.8.2 routine returns a real.
-        case Inst::Tag::RealMathUnary:
-        case Inst::Tag::RealMathBinary:
-            return { 64, false, true, false, true };
-
-        // $dist_* / seeded $random: a packed i64 {seed:32, draw:32}, sliced
-        // by the frontend. A definite 2-state word (never x/z).
-        case Inst::Tag::DistUnary:
-        case Inst::Tag::DistBinary:
-            return { 64, false, false };
-        // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state). An
-        // object's own draw (LRM §18.14.2) and a randc draw (LRM §18.6) have
-        // the same result type; only the state they advance differs.
-        case Inst::Tag::Urandom:
-        case Inst::Tag::UrandomSeeded:
-        case Inst::Tag::UrandomRange:
-        case Inst::Tag::ObjRandom:
-        case Inst::Tag::RandcNext:
-            return { 32, false, false };
-
-        case Inst::Tag::RedAnd:
-        case Inst::Tag::RedOr:
-        case Inst::Tag::RedXor:
-        case Inst::Tag::Eq:
-        case Inst::Tag::Ne:
-        case Inst::Tag::Lt:
-        case Inst::Tag::Le:
-        case Inst::Tag::Gt:
-        case Inst::Tag::Ge:
-        case Inst::Tag::CaseEq:
-        case Inst::Tag::CasezEq:
-        case Inst::Tag::CasexEq:
-        case Inst::Tag::WildEq:
-        case Inst::Tag::Land:
-        case Inst::Tag::Lor:
-        case Inst::Tag::Lnot:
-        case Inst::Tag::AggEq:
-        case Inst::Tag::InsideSet:
-        case Inst::Tag::Limplies:
-        case Inst::Tag::Lequiv:
-            return { 1, true, false };
-
-        case Inst::Tag::ClassIsA:
-        case Inst::Tag::ClassImplements:
-            // A definite bit: the display entry or the interface bit either
-            // matches or it does not.
-            return { 1, false, false };
-
-        case Inst::Tag::Concat: {
-            std::array<Index, 4> scratch;
-            uint32_t             width = 0;
-            bool                 four  = false;
-            for (Index part : ir_->operands(i, scratch)) {
-                const ValType t = type_of(part);
-                if (t.is_string) { // string concat (all parts are strings)
-                    return { 0, false, false, true };
-                }
-                width += t.width;
-                four = four || t.four_state;
-            }
-            return { width, four, false };
-        }
-        case Inst::Tag::Repl: {
-            // Packed only: a string replication is StrRepl (runtime count).
-            const ValType v = type_of(p.repl.value);
-            return { v.width * p.repl.count, v.four_state, false };
-        }
-        case Inst::Tag::StrRepl:
-            return { 0, false, false, true };
-
-        case Inst::Tag::StrLen:
-        case Inst::Tag::StrCmp:
-        case Inst::Tag::StrICmp:
-            return { 32, false, true };
-        case Inst::Tag::StrGetc:
-            // getc / s[i] return `byte`, which is signed (LRM 6.16.3 and
-            // Table 6-8), so 0xff displays as -1 under %d.
-            return { 8, false, true };
-        case Inst::Tag::StrUpper:
-        case Inst::Tag::StrLower:
-        case Inst::Tag::StrSubstr:
-        case Inst::Tag::StrFromPacked:
-        case Inst::Tag::Sformatf:
-        case Inst::Tag::EnumName:
-        case Inst::Tag::ContainerFmtP:
-        case Inst::Tag::TaggedFmtP:
-            return { 0, false, false, true };
-        case Inst::Tag::StrToPacked:
-            return from_ref(p.op_type.type);
-        case Inst::Tag::StrPutc:
-            return { 0, false, false };
-        case Inst::Tag::StrAtoi:
-        case Inst::Tag::StrAtohex:
-        case Inst::Tag::StrAtooct:
-        case Inst::Tag::StrAtobin:
-            // LRM 6.16.9: declared return type `integer` (4-state), though
-            // the conversion itself is always definite — no x/z is
-            // reachable from a string's bytes.
-            return { 32, true, true };
-        case Inst::Tag::StrAtoreal:
-            return { 64, false, true, false, true };
-        case Inst::Tag::StrItoa:
-        case Inst::Tag::StrHextoa:
-        case Inst::Tag::StrOctoa:
-        case Inst::Tag::StrBintoa:
-        case Inst::Tag::StrRealtoa:
-        case Inst::Tag::StrAppendPacked:
-            return { 0, false, false };
-
-        case Inst::Tag::Store:
-        case Inst::Tag::StoreNb:
-        case Inst::Tag::StoreNbDelay:
-        case Inst::Tag::StoreInertialDelay:
-        case Inst::Tag::StoreNbEvent:
-        case Inst::Tag::AggCopy:
-        case Inst::Tag::Cond:
-        case Inst::Tag::Switch:
-        case Inst::Tag::Loop:
-        case Inst::Tag::Break:
-        case Inst::Tag::Continue:
-        case Inst::Tag::NamedBlock:
-        case Inst::Tag::Disable:
-        case Inst::Tag::DisableRemote:
-        case Inst::Tag::DisableAbort:
-        case Inst::Tag::DeferFlush:
-        case Inst::Tag::HandleDeref:
-            // An lvalue producer (rooted at the object body); no value type.
-        case Inst::Tag::Ret:
-        case Inst::Tag::RetVoid:
-        case Inst::Tag::Delay:
-        case Inst::Tag::Wait:
-        case Inst::Tag::Fork:
-        case Inst::Tag::Display:
-        case Inst::Tag::FDisplay:
-        case Inst::Tag::StrobePend:
-        case Inst::Tag::ReactivePend:
-        case Inst::Tag::ExpectWait:
-        case Inst::Tag::ExpectWake:
-        case Inst::Tag::MonitorSet:
-        case Inst::Tag::MonitorEmit:
-        case Inst::Tag::MonitorOn:
-        case Inst::Tag::MonitorOff:
-        case Inst::Tag::TimeFormat:
-        case Inst::Tag::Finish:
-        case Inst::Tag::ProgramExit:
-        case Inst::Tag::CaseViol:
-        case Inst::Tag::TaggedCheck:
-        case Inst::Tag::Severity:
-        case Inst::Tag::Fflush:
-        case Inst::Tag::Fclose:
-        case Inst::Tag::Sformat:
-        case Inst::Tag::ReadMem:
-        case Inst::Tag::TaskCall:
-        case Inst::Tag::TaskCallVirtual:
-        case Inst::Tag::DumpFile:
-        case Inst::Tag::DumpVars:
-        case Inst::Tag::DumpLimit:
-        case Inst::Tag::DumpOff:
-        case Inst::Tag::DumpOn:
-        case Inst::Tag::DumpAll:
-        case Inst::Tag::DumpFlush:
-        case Inst::Tag::EventTrigger:
-        case Inst::Tag::EventTriggerNb:
-        case Inst::Tag::EventTriggerNbDelayed:
-        case Inst::Tag::EventTriggerNbEvent:
-            // Reseeding an object's RNG state yields nothing, like the
-            // per-process $urandom(seed) reseed that precedes a draw.
-        case Inst::Tag::ObjRandSeed:
-            return { 0, false, false };
-    }
-    return { 0, false, false };
 }
 
 Plane Backend::value_of(Index i) const {
@@ -545,7 +78,7 @@ void Backend::set_value(Index i, Plane p) {
     // always emit the packed form (Arg, Call, SimTime, string ops, ...) are
     // projected to a single iW here when their type is 2-state; the projection
     // is lossless because such a value has must == may and no z.
-    const ValType t = type_of(i);
+    const ValueType t = type_of(i);
     // A real value stays fp-only; pack/unpack happens at the storage / ABI
     // boundaries (see the real helpers).
     if (!t.is_string && !t.is_real) {
@@ -1438,7 +971,7 @@ void Backend::lower_inst(Index i) {
                 set_str(i, lv_string_ptr(lv, StringUse::Read));
                 return;
             }
-            const ValType t = type_of(i);
+            const ValueType t = type_of(i);
             // A gated place (an out-of-range element index, or an absent assoc
             // key) reads the element default rather than its storage.
             Plane v = lv.dyn_inrange != nullptr ? dyn_elem_load(lv) : lower_load(lv);
@@ -1829,7 +1362,7 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::Div:
         case Inst::Tag::Mod: {
-            const ValType lt = type_of(p.binary.l);
+            const ValueType lt = type_of(p.binary.l);
             // Wide operands legalize to the 128-bit __udivti3 / __umodti3 (and signed
             // siblings) libcalls, resolved from compiler-rt/libgcc in the JIT (see run_jit).
             set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), lt.is_signed));
@@ -1839,8 +1372,8 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::Pow: {
             // Result signedness follows the base (op1); the exponent (op2) is
             // self-determined. Both flags feed Table 11-4's signed corners.
-            const ValType lt = type_of(p.binary.l);
-            const ValType rt = type_of(p.binary.r);
+            const ValueType lt = type_of(p.binary.l);
+            const ValueType rt = type_of(p.binary.r);
             set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r), lt.is_signed, rt.is_signed));
             return;
         }
@@ -1961,8 +1494,8 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::ItoF: {
             // The must half reads x/z bits as 0 (LRM 6.12.1); signedness
             // comes from the source operand type.
-            const ValType st = type_of(p.op_type.op);
-            const ValType dt = from_ref(p.op_type.type);
+            const ValueType st = type_of(p.op_type.op);
+            const ValueType dt = value_type_of(mod_.pool, p.op_type.type);
             llvm::Value*  iv = must_of(value_of(p.op_type.op));
             llvm::Value*  fv =
               st.is_signed ? b_.CreateSIToFP(iv, fp_ty(dt.width)) : b_.CreateUIToFP(iv, fp_ty(dt.width));
@@ -1971,11 +1504,11 @@ void Backend::lower_inst(Index i) {
         }
         case Inst::Tag::FtoI:
         case Inst::Tag::FtoITrunc:
-            set_value(i, lower_ftoi(ir_->tag(i), value_of(p.op_type.op), from_ref(p.op_type.type)));
+            set_value(i, lower_ftoi(ir_->tag(i), value_of(p.op_type.op), value_type_of(mod_.pool, p.op_type.type)));
             return;
         case Inst::Tag::FBitcast: {
-            const ValType st = type_of(p.op_type.op);
-            const ValType dt = from_ref(p.op_type.type);
+            const ValueType st = type_of(p.op_type.op);
+            const ValueType dt = value_type_of(mod_.pool, p.op_type.type);
             if (dt.is_real) {
                 // $bitstoreal / $bitstoshortreal: integral pattern -> float.
                 llvm::Value* pat = cast(must_of(value_of(p.op_type.op)), dt.width, false);
@@ -1989,8 +1522,8 @@ void Backend::lower_inst(Index i) {
             return;
         }
         case Inst::Tag::FResize: {
-            const ValType st = type_of(p.op_type.op);
-            const ValType dt = from_ref(p.op_type.type);
+            const ValueType st = type_of(p.op_type.op);
+            const ValueType dt = value_type_of(mod_.pool, p.op_type.type);
             llvm::Value*  v  = fp_of(value_of(p.op_type.op));
             if (st.width < dt.width) {
                 v = b_.CreateFPExt(v, fp_ty(dt.width));
@@ -2090,7 +1623,7 @@ void Backend::lower_inst(Index i) {
             if (type_of(p.op_type.op).is_string) {
                 throw BackendError{ "internal: string value in resize" };
             }
-            const ValType to = from_ref(p.op_type.type);
+            const ValueType to = value_type_of(mod_.pool, p.op_type.type);
             // Depth guard: an integer resize would silently zext / trunc a
             // float bit pattern. The frontend must emit ItoF / FtoI /
             // FResize instead.
@@ -2315,7 +1848,7 @@ void Backend::lower_inst(Index i) {
             // Spill the operand's val plane to a stack buffer (X bits read as
             // 0 — the runtime consumes must-bits only, a documented
             // simplification of the LRM cast).
-            const ValType  t   = type_of(p.unary);
+            const ValueType t   = type_of(p.unary);
             const uint32_t pb  = plane_bytes(t.width);
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.pack");
             b_.CreateAlignedStore(must_of(value_of(p.unary)), buf, llvm::Align(1));
@@ -2324,7 +1857,7 @@ void Backend::lower_inst(Index i) {
             return;
         }
         case Inst::Tag::StrToPacked: {
-            const ValType  to  = from_ref(p.op_type.type);
+            const ValueType to  = value_type_of(mod_.pool, p.op_type.type);
             const uint32_t pb  = plane_bytes(to.width);
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.unpack");
             b_.CreateCall(str_to_packed_fn(), { str_of(p.op_type.op), buf, b_.getInt32(to.width) });
@@ -2335,7 +1868,7 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::StrAppendPacked: {
             // Same must-plane spill as StrFromPacked above; the runtime keeps
             // 0x00 bytes here because a stream has a known bit count.
-            const ValType  t   = type_of(p.binary.r);
+            const ValueType t   = type_of(p.binary.r);
             const uint32_t pb  = plane_bytes(t.width);
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.append");
             b_.CreateAlignedStore(must_of(value_of(p.binary.r)), buf, llvm::Align(1));
@@ -2796,7 +2329,7 @@ void Backend::lower_inst(Index i) {
                 set_str(i, fn_->getArg(base));
                 return;
             }
-            const ValType t = from_ref(p.arg.type);
+            const ValueType t = value_type_of(mod_.pool, p.arg.type);
             Plane         v{ fn_->getArg(base), fn_->getArg(base + 1) };
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
