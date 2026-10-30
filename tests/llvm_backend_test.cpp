@@ -3905,7 +3905,7 @@ TEST_CASE("backend lowers string signals, constants, and string ops (hand-built 
     const Signal s =
       mod->add_signal({ .name = "s", .type = mod->pool.string_type, .dir = SignalInfo::Direction::Internal });
 
-    Builder         b(mod->pool);
+    Builder         b(*mod);
     const SourceLoc loc{ 1 };
     const auto      chars = std::string_view{ "Hello" };
     const Ref       lit   = mod->pool.put_value(
@@ -4132,7 +4132,7 @@ void display_int(ir::Builder& b, ir::Index v) {
 
 TEST_CASE("real arithmetic, rounding, and truncation") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32  = int_type(m.pool);
     const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
     const auto    ftoi = [&](ir::Index v) { return b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc); };
@@ -4162,7 +4162,7 @@ TEST_CASE("real arithmetic, rounding, and truncation") {
 
 TEST_CASE("real compares are definite and NaN-correct") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder b(m);
     // Widen the 1-bit compare result through an unsigned type (a signed resize
     // would sign-extend 1'b1 to -1).
     const ir::Ref u32 = m.pool.put(
@@ -4185,7 +4185,7 @@ TEST_CASE("real compares are definite and NaN-correct") {
 
 TEST_CASE("real mux: definite select and the ambiguous-condition rule") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32  = int_type(m.pool);
     const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
     const auto    ftoi = [&](ir::Index v) { return b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc); };
@@ -4217,7 +4217,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
 
     // Watcher: @(r) $display("%0d", FtoI(r)).
     {
-        ir::Builder     b(m.pool);
+        ir::Builder     b(m);
         const ir::Index sig  = b.signal(r, kLoc);
         const ir::Index load = b.unary(ir::Inst::Tag::Load, sig, kLoc);
         display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, load, i32, kLoc));
@@ -4228,7 +4228,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
     // Driver: default is 0.0 (2-state zero pattern), then blocking-store 2.25,
     // then NBA-store 4.5 (commits after the active drain and wakes the watcher).
     {
-        ir::Builder     b(m.pool);
+        ir::Builder     b(m);
         const auto      real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
         const ir::Index sig  = b.signal(r, kLoc);
         const ir::Index ld0  = b.unary(ir::Inst::Tag::Load, sig, kLoc);
@@ -4243,7 +4243,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
 
 TEST_CASE("real bitcasts and integral conversions") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32 = int_type(m.pool);
     const ir::Ref u64 = m.pool.put(
       ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 63, .right = 0 });
@@ -4277,7 +4277,7 @@ TEST_CASE("real bitcasts and integral conversions") {
 
 TEST_CASE("real math ops lower to intrinsics and libm calls") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder   b(m);
     const ir::Ref i32  = int_type(m.pool);
     const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
     const auto    show = [&](ir::Index v) { display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc)); };
@@ -4310,7 +4310,7 @@ TEST_CASE("real math ops lower to intrinsics and libm calls") {
 
 TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder b(m);
     const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
 
     const std::array<ir::Index, 2> args{ real(3.6), real(0.25) };

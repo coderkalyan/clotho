@@ -34,7 +34,7 @@ Ref vec(InternPool& pool, bool four, uint32_t width, bool is_signed) {
 // A module with one initial process under construction.
 struct Body {
     Module  m;
-    Builder b{ m.pool };
+    Builder b{ m };
 
     Ref bits(uint32_t width, bool is_signed = false) {
         return vec(m.pool, false, width, is_signed);
@@ -72,8 +72,8 @@ void only(const std::vector<Violation>& v, Rule rule) {
 // A function `f(formal) -> ret` whose body is built by `fill` over its own builder.
 template<typename Fill>
 FunctionId add_function(Module& m, Ref ret, std::vector<Ref> formals, Fill fill) {
-    const FunctionId id = m.reserve_function();
-    Builder          fb(m.pool);
+    const FunctionId id = m.reserve_function(ret);
+    Builder          fb(m);
     Function         f;
     f.name        = "f";
     f.return_type = ret;
@@ -368,7 +368,7 @@ TEST_CASE("verify: a select over real arms is not an arm-sign violation") {
 TEST_CASE("verify: a DPI open-array formal is a phantom slot, not a value to compare") {
     Body             t;
     const Ref        i32 = t.bits(32, true);
-    const FunctionId f   = t.m.reserve_function();
+    const FunctionId f   = t.m.reserve_function(i32);
     Function         g;
     g.name           = "oa";
     g.return_type    = i32;
@@ -381,4 +381,52 @@ TEST_CASE("verify: a DPI open-array formal is a phantom slot, not a value to com
     const std::array<Index, 1> args{ t.signal(dyn) };
     t.b.call(f, args, kLoc);
     CHECK(t.verified().empty());
+}
+
+// A body still being built is typed by the function that types a finished one,
+// instruction by instruction, so the frontend sees the types the backend will.
+TEST_CASE("typing: Builder::type_of is value_types of the body so far") {
+    Body        t;
+    const Ref   u8   = t.bits(8);
+    const Ref   l4   = t.logic(4);
+    const Index a    = t.konst(u8, 3);
+    const Index sum  = t.b.binary(Inst::Tag::Add, a, a, kLoc);
+    const Index four = t.konst(l4, 2);
+    // A concat decodes its operand run from the extra table the builder is still
+    // appending to.
+    const std::array<Index, 2> parts{ sum, four };
+    const Index                cat = t.b.concat(parts, kLoc);
+
+    CHECK(t.b.type_of(a) == ValueType{ 8, false, false });
+    CHECK(t.b.type_of(sum) == ValueType{ 8, false, false });
+    CHECK(t.b.type_of(cat) == ValueType{ 12, true, false });
+
+    // What the builder said is what the finished body is typed as.
+    const std::vector<ValueType> seen{ t.b.type_of(a), t.b.type_of(sum), t.b.type_of(four), t.b.type_of(cat) };
+    const Ir                     ir    = t.b.finish();
+    const std::vector<ValueType> after = value_types(t.m, ir);
+    REQUIRE(after.size() == seen.size());
+    for (size_t k = 0; k < seen.size(); ++k) {
+        CHECK(after[k] == seen[k]);
+    }
+}
+
+TEST_CASE("typing: a call to a function reserved but not yet built has its declared return type") {
+    Body             t;
+    const Ref        i16 = t.bits(16, true);
+    const FunctionId f   = t.m.reserve_function(i16);
+    const Index      c   = t.b.call(f, {}, kLoc);
+    CHECK(t.b.type_of(c) == ValueType{ 16, false, true });
+}
+
+TEST_CASE("typing: rolling back the builder drops the types of the discarded instructions") {
+    Body                t;
+    const Builder::Mark mark = t.b.mark();
+    const Index         c1   = t.konst(t.bits(8), 1);
+    CHECK(t.b.type_of(c1) == ValueType{ 8, false, false });
+    t.b.rollback(mark);
+    // The next instruction reuses c1's index with a different type.
+    const Index c2 = t.konst(t.logic(8), 1);
+    CHECK(c2 == c1);
+    CHECK(t.b.type_of(c2) == ValueType{ 8, true, false });
 }

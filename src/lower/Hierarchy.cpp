@@ -1054,7 +1054,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
 
         const ir::Signal           child_sig = signal_of(p.internalSymbol->as<ValueSymbol>());
         const ir::SourceLoc        l         = to_source_loc(p.location);
-        ir::Builder                b(module_.pool);
+        ir::Builder                b(module_);
         std::vector<ir::WaitEvent> sens;
         // A connected container port. The port copy is a continuous assignment,
         // so it would have to deep-copy the handle whenever the source changes

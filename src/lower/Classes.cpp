@@ -651,9 +651,9 @@ void Lowerer::compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref
     // class still laying itself out below this frame).
     const uint32_t randomize_slot = slots.at(kRandomizeSlot);
     const uint32_t randops_slot   = slots.at(kRandOpsSlot);
-    table[randomize_slot]         = rand_body_id(clt, class_ref, randomize_fn_);
+    table[randomize_slot]         = rand_body_id(clt, class_ref, make_int_type(32, false, true), randomize_fn_);
     filled[randomize_slot]        = true;
-    table[randops_slot]           = rand_body_id(clt, class_ref, randops_fn_);
+    table[randops_slot]           = rand_body_id(clt, class_ref, make_int_type(64, false, false), randops_fn_);
     filled[randops_slot]          = true;
     // Un-overridden slots: a pure virtual in an abstract class. Fill with a
     // prototype-built stub (the slot's signature source).
@@ -751,9 +751,9 @@ ir::FunctionId Lowerer::iface_unreachable_id() {
     if (module_.iface_unreachable.has_value()) {
         return *module_.iface_unreachable;
     }
-    const ir::FunctionId id   = module_.reserve_function();
+    const ir::FunctionId id   = module_.reserve_function(module_.pool.void_type);
     module_.iface_unreachable = id;
-    ir::Builder b(module_.pool);
+    ir::Builder b(module_);
     b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
                "",
                "internal: interface method dispatched on a class that does not implement it",
@@ -775,7 +775,9 @@ ir::FunctionId Lowerer::pure_stub_id(const slang::ast::MethodPrototypeSymbol& pr
     if (it != pure_stub_.end()) {
         return it->second;
     }
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::Ref return_type =
+      proto.getReturnType().isVoid() ? module_.pool.void_type : lower_type(proto.getReturnType());
+    const ir::FunctionId id = module_.reserve_function(return_type);
     pure_stub_[&proto]      = id;
     build_pure_stub(proto, id);
     return id;
@@ -816,7 +818,7 @@ void Lowerer::build_pure_stub(const slang::ast::MethodPrototypeSymbol& proto, ir
     const bool          is_task     = proto.subroutineKind == slang::ast::SubroutineKind::Task;
     const bool          is_void     = proto.getReturnType().isVoid();
     const ir::Ref       return_type = is_void ? module_.pool.void_type : lower_type(proto.getReturnType());
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc el = to_source_loc(proto.location);
     if (is_void) {
         b.ret_void(el);
@@ -1128,7 +1130,7 @@ ir::FunctionId Lowerer::copy_thunk_id(const slang::ast::ClassType& clt, ir::Ref 
     if (it != copy_thunk_.end()) {
         return it->second;
     }
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(class_ref);
     copy_thunk_[&clt]       = id;
     build_copy_thunk(clt, class_ref, id);
     return id;
@@ -1145,7 +1147,7 @@ void Lowerer::build_copy_thunk(const slang::ast::ClassType& clt, ir::Ref class_r
     std::vector<ir::Ref>    param_types{ class_ref };
     std::vector<ir::ArgDir> arg_dirs{ ir::ArgDir::In };
     std::vector<ir::Ref>    local_types{ class_ref };
-    ir::Builder             b(module_.pool);
+    ir::Builder             b(module_);
     const ir::SourceLoc     el  = to_source_loc(clt.location);
     const ir::Index         src = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, el), el);
     const ir::Index         dst = b.class_new(class_ref, el);

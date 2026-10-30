@@ -1285,7 +1285,7 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
         // before the first reader — including a declaration initializer that
         // reads it, whose own store is appended after these.
         if (!preinit_) {
-            preinit_.emplace(module_.pool);
+            preinit_.emplace(module_);
         }
         ir::Builder&        pb = *preinit_;
         const ir::SourceLoc pl = to_source_loc(vs.location);
@@ -1352,7 +1352,7 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
     // is not restricted to constant expressions.
     if (const Expression* init = prop.getInitializer()) {
         if (!preinit_) {
-            preinit_.emplace(module_.pool);
+            preinit_.emplace(module_);
         }
         ir::Builder&        pb = *preinit_;
         const ir::SourceLoc il = loc(*init);

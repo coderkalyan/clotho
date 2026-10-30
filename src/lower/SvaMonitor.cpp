@@ -847,7 +847,7 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
 
     const MonitorState  st = alloc_monitor_state(mon, id, ctl);
     const ir::SourceLoc l  = mon.span.start;
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
 
     // The action blocks, as zero-formal tasks the verdicts below pend into the
     // Reactive region. A cover has only a match action (LRM 16.12.6, and slang
@@ -2264,7 +2264,7 @@ void Lowerer::emit_monitor_finish(const ir::AssertionMonitor& mon,
                                   const MonitorState&         st,
                                   const AssertionActions&     act) {
     const ir::SourceLoc l = mon.span.start;
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
 
     if (act.fail != nullptr) {
         require_finish_inlinable(*act.fail);

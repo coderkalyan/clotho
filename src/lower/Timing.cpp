@@ -490,7 +490,7 @@ ir::Signal Lowerer::synth_event_net(const Expression& e) {
     const ir::Signal    tmp = declare_temp(ty, "event");
     const ir::SourceLoc l   = loc(e);
 
-    ir::Builder     b(module_.pool);
+    ir::Builder     b(module_);
     const ir::Index dst = b.signal(tmp, l);
     const ir::Index rhs = b.resize(lower_expr(e, b), ty, l);
     b.binary(ir::Inst::Tag::Store, dst, rhs, l);
@@ -1329,7 +1329,7 @@ void Lowerer::lower_clocking_block(const ClockingBlockSymbol& cb) {
     const ir::Signal           clock = event_signal(ev.expr);
     const ir::Edge             edge  = to_edge(ev.edge);
 
-    ir::Builder b(module_.pool);
+    ir::Builder b(module_);
     // This slot's clocking signal against the value it held at the previous
     // slot's Observed point -- the detection a monitor uses, for the same
     // reason. Taking it at the settled point is what makes the block step once
@@ -1408,7 +1408,7 @@ void Lowerer::lower_clocking_drives(const ClockingBlockSymbol& cb) {
     const ClockingBlockState& st = it->second;
     const ir::SourceLoc       l  = to_source_loc(cb.location);
 
-    ir::Builder     b(module_.pool);
+    ir::Builder     b(module_);
     const ir::Index fired = load_signal(st.fired, b, l);
     b.open_region();
     for (const ClockVarState& cv : st.vars) {

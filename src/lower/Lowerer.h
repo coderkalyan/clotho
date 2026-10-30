@@ -1776,7 +1776,7 @@ private:
                         ir::SourceLoc               l,
                         std::vector<ir::WaitEvent>  extra,
                         PredFn                      pred_fn) {
-        ir::Builder     rb(module_.pool);
+        ir::Builder     rb(module_);
         const ir::Index pred = pred_fn(rb);
         rb.open_region();
         const ir::Index dst = rb.signal(v, l);
@@ -4589,6 +4589,10 @@ private:
 
     ir::FunctionId function_id(const SubroutineSymbol& sub);
 
+    // The return type `sub`'s function is reserved with: void for a task and a void
+    // function, else its lowered return type.
+    ir::Ref subroutine_return_type(const SubroutineSymbol& sub);
+
     void build_reserved_body(const SubroutineSymbol& sub, ir::FunctionId id);
 
     bool has_pending_bodies() const;
@@ -4660,8 +4664,9 @@ private:
 
     // -- Constrained randomization, step 1 (docs/design/constrained-randomization.md) --
 
-    ir::FunctionId rand_body_id(const slang::ast::ClassType&                                              clt,
-                                ir::Ref                                                                   class_ref,
+    ir::FunctionId rand_body_id(const slang::ast::ClassType&                                                clt,
+                                ir::Ref                                                                     class_ref,
+                                ir::Ref                                                                     return_type,
                                 ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId>& map);
 
     void drain_rand_bodies();

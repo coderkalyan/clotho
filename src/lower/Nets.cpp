@@ -709,7 +709,7 @@ void Lowerer::emit_wire_resolvers() {
 
         const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
 
-        ir::Builder b(module_.pool);
+        ir::Builder b(module_);
         // Fold the driver slots (a driverless tri0/tri1 net seeds all-Z, so
         // the pull sees only Z and fills the whole net with its pull value).
         ir::Index acc;
@@ -852,7 +852,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
         return;
     }
 
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc l = to_source_loc(sym.location);
     if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
         // Multiply-driven net: this driver stages its value into its own
@@ -1459,7 +1459,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
         // A whole unpacked-struct / aggregate net initializer is a whole-object
         // continuous copy (one process on the source's sensitivity), the same
         // as a bare `assign n = ...` on a struct.
-        ir::Builder         ab(module_.pool);
+        ir::Builder         ab(module_);
         const ir::SourceLoc al = loc(*init);
         emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init, ir::Inst::Tag::Store, ab, al);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
@@ -1478,7 +1478,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
         fail("net declaration assignment rise/fall/turn-off delays (wire #(a,b,c) w = ...) "
              "are not supported");
     }
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc l = loc(*init);
     if (resolved) {
         // A net-declaration assignment is a whole-net driver: stage the
@@ -1736,7 +1736,7 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
     info.type            = module_.pool.logic_type;
     const ir::Signal tmp = module_.add_signal(std::move(info));
 
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc l   = loc(e);
     const ir::Index     dst = b.signal(tmp, l);
     const ir::Index     rhs = b.resize(lower_expr(e, b), module_.pool.logic_type, l);
@@ -1828,7 +1828,7 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
       up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
     const uint16_t   strength = up ? static_cast<uint16_t>(driven)       // (highz0, drivenN)
                                    : static_cast<uint16_t>(driven << 8); // (drivenN, highz1)
-    ir::Builder      b(module_.pool);
+    ir::Builder      b(module_);
     const ir::Signal slot = alloc_driver_slot(net, l, strength);
     const ir::Index  dst  = b.signal(slot, l);
     const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
@@ -1893,7 +1893,7 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
     // device (confirmed against iverilog 13: `cmos #5` and `nmos #5` + `pmos #5`
     // produce identical waveforms).
     const auto emit_half = [&](TriGate tg, const GateInput& ctrl) {
-        ir::Builder                b(module_.pool);
+        ir::Builder                b(module_);
         std::vector<ir::WaitEvent> wait_events;
         const ir::Index            folded = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
         const ir::Index            val    = gate_output_value(left, folded, b, l);
@@ -1988,7 +1988,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         // Fold the gate value into this output's own builder / process (a
         // tri-state gate drives Z, so it never forces z to x like the
         // combinational fold does).
-        ir::Builder                b(module_.pool);
+        ir::Builder                b(module_);
         std::vector<ir::WaitEvent> wait_events;
         const ir::Index            folded =
           mos   ? gate_tristate_value(*mos, inputs[0], inputs[1], wait_events, b, loc, /*pass_z=*/true)

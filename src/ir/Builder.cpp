@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 
 #include "Builder.h"
@@ -20,6 +21,19 @@ Inst::Payload pay(M Inst::Payload::* member, M value) {
 }
 
 } // namespace
+
+ValueType Builder::type_of(Index i) {
+    const auto k = static_cast<uint32_t>(i);
+    assert(k < tags_.size());
+    // Type the instructions in order, up to and including `i`: an operand always
+    // precedes its user, so each sees its operands' types already memoized.
+    const IrView view{ tags_, payloads_, extra_ };
+    while (types_.size() <= k) {
+        types_.push_back(compute_type(mod_, view, static_cast<Index>(types_.size()), types_));
+    }
+
+    return types_[k];
+}
 
 Ir Builder::finish() {
     // Whatever remains in scratch_ is the root region.
@@ -66,6 +80,8 @@ void Builder::rollback(Mark m) {
     std::erase_if(ends_, [&](const auto& kv) { return kv.first >= m.insts; });
     extra_.resize(m.extra);
     scratch_.resize(m.scratch);
+    // The memo covers instructions that no longer exist past the mark.
+    types_.resize(std::min<size_t>(types_.size(), m.insts));
 }
 
 Index Builder::constant(Ref value, SourceLoc loc) {

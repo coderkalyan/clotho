@@ -80,7 +80,7 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
             // trusted, because the cost of being wrong is silence.
             fail("internal: an `expect` as a module item");
         }
-        ir::Builder b(module_.pool);
+        ir::Builder b(module_);
         // `ap: assert property (...)` is the statement wrapped in a block named
         // for its label, which unwrap_blocks stepped through, so lower_stmt never
         // opened it. Open it here: the label is part of the scope the assertion's
@@ -167,7 +167,7 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     // we lower it faithfully rather than reject it.
     const bool looping = activation == ir::Activation::Always && !infer && wait_events.empty();
 
-    ir::Builder b(module_.pool);
+    ir::Builder b(module_);
     if (looping) {
         lower_forever(*body, b);
     } else if (iff_guard != nullptr) {
@@ -992,7 +992,7 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
     if (init == nullptr) {
         if (aggregate_has_field_defaults(vs.getType())) {
             if (!preinit_) {
-                preinit_.emplace(module_.pool);
+                preinit_.emplace(module_);
             }
             ir::Builder&        b = *preinit_;
             const ir::SourceLoc l = to_source_loc(vs.location);
@@ -1001,7 +1001,7 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
         return;
     }
     if (!preinit_) {
-        preinit_.emplace(module_.pool);
+        preinit_.emplace(module_);
     }
     ir::Builder&        b = *preinit_;
     const ir::SourceLoc l = loc(*init);

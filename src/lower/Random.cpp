@@ -302,7 +302,7 @@ const Lowerer::RandSeqCtx& Lowerer::randseq_block(const RandSequenceStatement& r
     }
 
     for (const RsProd* p : rs.productions) {
-        ctx.ids[p] = module_.reserve_function();
+        ctx.ids[p] = module_.reserve_function(module_.pool.void_type);
     }
     // A `rand join` operand needs its own plan / step pair. Collected across
     // the whole block first, because the operand may be declared after the rule
@@ -320,7 +320,8 @@ const Lowerer::RandSeqCtx& Lowerer::randseq_block(const RandSequenceStatement& r
                     continue;
                 }
                 check_rand_join_operand(*target);
-                ctx.steps[target] = { module_.reserve_function(), module_.reserve_function() };
+                ctx.steps[target] = { module_.reserve_function(module_.pool.void_type),
+                                      module_.reserve_function(module_.pool.void_type) };
             }
         }
     }
@@ -399,7 +400,7 @@ void Lowerer::build_production(const RsProd& p, const RandSeqCtx& rs, ir::Functi
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
     const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
     const FnScope                          fn_scope(*this, &ctx);
-    ir::Builder                            b(module_.pool);
+    ir::Builder                            b(module_);
     std::vector<ir::Ref>                   param_types;
     std::vector<ir::ArgDir>                arg_dirs;
 
@@ -480,7 +481,7 @@ void Lowerer::build_production_plan(const RsProd& p, const RandSeqCtx& rs, ir::F
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
     const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
     const FnScope                          fn_scope(*this, &ctx);
-    ir::Builder                            b(module_.pool);
+    ir::Builder                            b(module_);
     std::vector<ir::Ref>                   param_types;
     std::vector<ir::ArgDir>                arg_dirs;
 
@@ -569,7 +570,7 @@ void Lowerer::build_production_step(const RsProd& p, const RandSeqCtx& rs, ir::F
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
     const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
     const FnScope                          fn_scope(*this, &ctx);
-    ir::Builder                            b(module_.pool);
+    ir::Builder                            b(module_);
     std::vector<ir::Ref>                   param_types;
     std::vector<ir::ArgDir>                arg_dirs;
 
@@ -1411,12 +1412,13 @@ ir::Index Lowerer::result_slot(const RsProdItem&      item,
 // (see rand_pending_).
 ir::FunctionId Lowerer::rand_body_id(const slang::ast::ClassType& clt,
                                      ir::Ref                      class_ref,
+                                     ir::Ref                      return_type,
                                      ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId>& map) {
     const auto it = map.find(&clt);
     if (it != map.end()) {
         return it->second;
     }
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(return_type);
     map[&clt]               = id;
     if (randomize_fn_.contains(&clt) && randops_fn_.contains(&clt)) {
         rand_pending_.emplace_back(&clt, class_ref);
@@ -1480,7 +1482,7 @@ void Lowerer::build_randomize_body(const slang::ast::ClassType& clt, ir::Ref cla
     const ir::SourceLoc l   = to_source_loc(clt.location);
     const ir::Ref       u64 = make_int_type(64, false, false);
     const ir::Ref       i32 = make_int_type(32, false, true);
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ClassRand&    rd   = class_rand_.at(&clt);
     if (!rd.unsupported.empty()) {
         // The chain carries a randomization surface step 1 cannot honour (see
@@ -1682,7 +1684,7 @@ ir::Index Lowerer::emit_rand_enum(const slang::ast::EnumType& et,
 void Lowerer::build_randops_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
     const ir::SourceLoc l   = to_source_loc(clt.location);
     const ir::Ref       u64 = make_int_type(64, false, false);
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ClassRand&    rd = class_rand_.at(&clt);
     if (rd.present) {
         const ir::Index self = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, l), l);
@@ -1925,9 +1927,9 @@ ir::FunctionId Lowerer::iface_rand_sig(ir::Ref iface_ref, bool ops) {
       ops ? std::vector<ir::Ref>{ iface_ref, u64, u64 } : std::vector<ir::Ref>{ iface_ref, u64 };
     std::vector<ir::ArgDir> dirs(params.size(), ir::ArgDir::In);
     std::vector<ir::Ref>    locals = params;
-    ir::Builder             b(module_.pool);
+    ir::Builder             b(module_);
     b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(ret, 0), ir::SourceLoc{}), ir::SourceLoc{});
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(ret);
     module_.set_function(id,
                          ir::Function{ .name        = ops ? "$iface.randops" : "$iface.randomize",
                                        .return_type = ret,

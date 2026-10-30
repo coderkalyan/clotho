@@ -576,7 +576,7 @@ std::string Lowerer::cover_group_name(const slang::ast::CovergroupType& cgt) {
 ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&                       cgt,
                                            uint32_t                                                type_idx,
                                            const std::vector<const slang::ast::CoverpointSymbol*>& points) {
-    const ir::FunctionId id   = module_.reserve_function();
+    const ir::FunctionId id   = module_.reserve_function(module_.pool.void_type);
     const ir::Ref        word = make_int_type(64, false, false);
     const ir::SourceLoc  l    = to_source_loc(cgt.location);
 
@@ -600,7 +600,7 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
     }
     const FnScope fn_scope(*this, &ctx);
 
-    ir::Builder               b(module_.pool);
+    ir::Builder               b(module_);
     std::optional<LowerError> failure;
     try {
         const ir::Index handle = b.local(0, word, l);
@@ -698,7 +698,7 @@ void Lowerer::cover_event_process(const slang::ast::CovergroupType& cgt, uint32_
     const ir::Signal prev = declare_temp(mask_type(1), "cover_clk");
     const TempCell   cur  = make_temp_cell(word, "cover_inst");
 
-    ir::Builder     b(module_.pool);
+    ir::Builder     b(module_);
     const ir::Index clk_now = b.resize(load_signal(clock, b, l), module_.pool.bit_type, l);
     const ir::Index clk_was = load_signal(prev, b, l);
     ir::Index       fired   = ir::Index{};

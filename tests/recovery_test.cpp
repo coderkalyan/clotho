@@ -182,7 +182,7 @@ TEST_CASE("a structural failure still aborts with no module") {
 // body. Rollback has to restore the region depth, not just the instruction count.
 TEST_CASE("Builder::rollback discards a partial emission including open regions") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder b(m);
 
     const ir::Ref   i4 = ir::Ref{};
     const ir::Index k0 = b.constant(i4, ir::SourceLoc{});
@@ -211,7 +211,7 @@ TEST_CASE("Builder::rollback discards a partial emission including open regions"
 // common case: most guards fire before touching the shared builder at all.
 TEST_CASE("Builder::rollback to the current position changes nothing") {
     ir::Module  m;
-    ir::Builder b(m.pool);
+    ir::Builder b(m);
 
     b.constant(ir::Ref{}, ir::SourceLoc{});
     const ir::Builder::Mark mark = b.mark();

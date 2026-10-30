@@ -197,8 +197,9 @@ TEST_CASE("put_int on a >64-bit type zero-extends both planes") {
 
 // Combinational body:  y = a & b;
 TEST_CASE("build a combinational process and query it") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          m;
+    InternPool&     pool = m.pool;
+    Builder         b(m);
     const SourceLoc loc{ 1 };
 
     const Index a  = b.signal(Signal{ 0 }, loc);
@@ -232,8 +233,9 @@ TEST_CASE("build a combinational process and query it") {
 
 // Sequential body:  if (c) q <= 1; else q <= 0;
 TEST_CASE("structured cond carries then/else regions") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          m;
+    InternPool&     pool = m.pool;
+    Builder         b(m);
     const SourceLoc loc{ 1 };
 
     const Index c  = b.signal(Signal{ 0 }, loc);
@@ -268,8 +270,9 @@ TEST_CASE("structured cond carries then/else regions") {
 }
 
 TEST_CASE("case-equality comparisons are binary ops over two operands") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          m;
+    InternPool&     pool = m.pool;
+    Builder         b(m);
     const SourceLoc loc{ 1 };
 
     const Index sel = b.unary(Inst::Tag::Load, b.signal(Signal{ 0 }, loc), loc);
@@ -287,8 +290,9 @@ TEST_CASE("case-equality comparisons are binary ops over two operands") {
 }
 
 TEST_CASE("select and concat expose their operands") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          mod;
+    InternPool&     pool = mod.pool;
+    Builder         b(mod);
     const SourceLoc loc{ 1 };
 
     const Index c = b.constant(konst(pool, 1), loc);
@@ -315,8 +319,9 @@ TEST_CASE("select and concat expose their operands") {
 }
 
 TEST_CASE("printer renders a flat combinational body") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          m;
+    InternPool&     pool = m.pool;
+    Builder         b(m);
     const SourceLoc loc{ 1 };
 
     const Index a  = b.signal(Signal{ 0 }, loc);
@@ -340,8 +345,9 @@ TEST_CASE("printer renders a flat combinational body") {
 }
 
 TEST_CASE("printer indents cond regions and decodes constants") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          m;
+    InternPool&     pool = m.pool;
+    Builder         b(m);
     const SourceLoc loc{ 1 };
 
     const Index c  = b.signal(Signal{ 0 }, loc);
@@ -398,8 +404,9 @@ TEST_CASE("string type interns once and string constants dedup on content") {
 }
 
 TEST_CASE("string instructions carry their operands and print") {
-    InternPool      pool;
-    Builder         b(pool);
+    Module          m;
+    InternPool&     pool = m.pool;
+    Builder         b(m);
     const SourceLoc loc{ 1 };
 
     const auto      chars = std::string_view{ "hi" };
@@ -499,8 +506,9 @@ TEST_CASE("shortreal values round to nearest float on interning") {
 }
 
 TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
-    InternPool pool;
-    Builder    b(pool);
+    Module      m;
+    InternPool& pool = m.pool;
+    Builder     b(m);
     const auto l = static_cast<SourceLoc>(0);
 
     const Index x = b.constant(pool.put_real(pool.real_type, 1.5), l);
@@ -533,8 +541,9 @@ TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
 }
 
 TEST_CASE("one-operand real math rides the op_imm payload") {
-    InternPool pool;
-    Builder    b(pool);
+    Module      m;
+    InternPool& pool = m.pool;
+    Builder     b(m);
     const auto l = static_cast<SourceLoc>(0);
 
     const Index                x = b.constant(pool.put_real(pool.real_type, 1.5), l);

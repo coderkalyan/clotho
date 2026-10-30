@@ -21,13 +21,25 @@
 
 #include "InternPool.h"
 #include "Ir.h"
+#include "Module.h"
+#include "Typing.h"
 
 namespace clotho::ir {
 
 class Builder {
 public:
-    explicit Builder(InternPool& pool)
-      : pool_(pool) {}
+    // A body of module `m`: its constants and types are interned in `m.pool`, and
+    // the signals and functions it names are `m`'s.
+    explicit Builder(Module& m)
+      : mod_(m)
+      , pool_(m.pool) {}
+
+    // The type of the value instruction `i` produces (Typing.h), so the frontend
+    // can see what it is about to combine rather than assume it. Derived from the
+    // instructions emitted so far and memoized; it is what the backend and the
+    // verifier will compute for `i` once the body is finished. A call to a
+    // function reserved but not yet built is typed by its declared return type.
+    ValueType type_of(Index i);
 
     // -- Leaves --
     Index constant(Ref value, SourceLoc loc);
@@ -752,6 +764,8 @@ private:
         return { static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) };
     }
 
+    // The module this body belongs to.
+    Module& mod_;
     // Intern pool backing constant / type references.
     InternPool& pool_;
     // Growable SoA instruction columns under construction.
@@ -766,6 +780,8 @@ private:
     std::vector<Index> scratch_;
     // Start offset into scratch_ of each open nested region.
     std::vector<size_t> region_starts_;
+    // type_of's memo: the type of instruction k for k < types_.size().
+    std::vector<ValueType> types_;
 };
 
 } // namespace clotho::ir
