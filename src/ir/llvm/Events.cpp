@@ -276,11 +276,13 @@ Backend::WaitCounts Backend::wait_counts() const {
     WaitCounts c{ std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }),
                   std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }) };
     // Static capacities count what the seed loop will actually subscribe:
-    // one entry per group (signal, edge) — a fused group subscribes its
-    // canonical set once, not once per member. The scan reads every slot
-    // up to the capacity, so over-allocation would read a null flag ptr.
-    for (const std::vector<WaitEvent>& evs : group_events_) {
-        for (const WaitEvent& w : evs) {
+    // one entry per schedule group (signal, edge) — a fused group subscribes
+    // its canonical set once, not once per member, and the groups of several
+    // instances that share a wake set subscribe once between them. The scan
+    // reads every slot up to the capacity, so over-allocation would read a
+    // null flag ptr.
+    for (const SchedGroup& sg : sched_) {
+        for (const WaitEvent& w : sg.events) {
             c.sta[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)]++;
         }
     }

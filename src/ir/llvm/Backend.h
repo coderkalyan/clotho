@@ -969,18 +969,16 @@ struct Anchor {
 
     // Instance context: ONE per-instance record (@clotho.inst.<hier>.ctx)
     // holding every base a def-relative body needs, laid out per definition so
-    // twin instances load identical field constants. It is the record a member
-    // function of a group spanning instances takes as its first parameter (and
-    // the single symbol a shared body swaps for one). Filled by main at startup.
+    // twin instances load identical field constants. It is the record a thunk
+    // group's function takes as its first parameter. Filled by main at startup.
     // Layout:
     //   0             ptr  state base (the scope's storage)
     //   1             ptr  shadow sub-struct base (null when no NBA shadows)
     //   2             ptr  the scope's sched-flag array base (Anchor::sched_gv)
     //   3             i32  first_vcd
     //   ctx_blk_base  i32  first NBA block id, one per process the instance
-    //                      owns, at its def-local process ordinal: the field
-    //                      of a single-scope group is its front process's, of
-    //                      a member of a group spanning instances its own
+    //                      owns, at its def-local process ordinal: a group's
+    //                      field is its front process's
     //                      (0 when the function registers none)
     //   ctx_wait_base ptr  wait bucket bases (sta / dyn / dyn-len), def-local
     //                      slot order from the bucket walk
@@ -1975,23 +1973,16 @@ private:
 
     void report_dedup_stat();
 
-    static std::string normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst = nullptr);
+    static std::string normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst = nullptr,
+                                       bool number_inst_symbols = true);
 
     void report_dedup_shapes(const std::vector<llvm::Function*>& group_fns);
 
     void report_unit_code(const std::vector<llvm::Function*>& group_fns);
 
-    // -- Module-instance body sharing (dedup V1) --
+    // -- Twin bodies --
 
-    static llvm::GlobalVariable* only_inst_global(llvm::Function* fn);
-
-    static bool constant_uses(const llvm::Constant* c, const llvm::GlobalVariable* gv);
-
-    llvm::Function* clone_with_ctx_param(llvm::Function* rep, llvm::GlobalVariable* ctx_gv);
-
-    void rewrite_to_stub(llvm::Function* fn, llvm::Function* shared, llvm::GlobalVariable* ctx_gv);
-
-    void share_twin_groups(const std::vector<llvm::Function*>& group_fns);
+    void merge_twin_bodies(std::vector<llvm::Function*>& group_fns);
 
     static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out);
 
@@ -2002,6 +1993,12 @@ private:
     void report_comb_fuse_stat() const;
 
     void compute_fusion_groups();
+
+    void build_sched_groups(const std::vector<uint32_t>& pos);
+
+    std::vector<llvm::Function*> emit_sched_entries(const std::vector<llvm::Function*>& group_fns);
+
+    void emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask);
 
     void compute_trigger_masks();
 
@@ -4285,19 +4282,14 @@ private:
     // Twin sets (process indices) recorded by report_dedup_stat under
     // `--stat=dedup-sets`, compared post-lowering by report_dedup_shapes.
     std::vector<std::vector<uint32_t>> shape_sets_;
-    // Per fusion group: owning scope anchor (single-scope groups only, else
-    // no_anchor). Built by build_instance_ctx_layout; the shareable-group
-    // identity.
-    std::vector<uint32_t> group_anchor_of_;
-    // The member function of every group spanning instances with the process
-    // it runs, in lowering order (report_unit_code compares them across the
-    // instances of a unit).
-    std::vector<std::pair<uint32_t, llvm::Function*>> member_fns_;
-    // Owning scope anchor of ANY single-scope group, no_anchor for
-    // cross-instance / unscoped groups, and the group's dense def-local
-    // ordinal among them: the split-emission unit assignment (see unit_env /
-    // the lower_group loop in run()) and the unit-code statistic's key.
+    // Per fusion group (compute_fusion_groups): the scope anchor of its
+    // instance (no_anchor for a group of no instance), the unit it was formed
+    // in (an index private to that pass) and its position among that unit's
+    // groups. The anchor assigns the group to its unit's module (see unit_env /
+    // the lower_group loop in run()); (unit, ordinal) is the unit-code
+    // statistic's key, and the same in every instance of the unit.
     std::vector<uint32_t> group_unit_anchor_;
+    std::vector<uint32_t> group_unit_;
     std::vector<uint32_t> group_unit_ordinal_;
     // Def-local signal table per anchor (slot.path's last element), kept from
     // build_wait_queues for the ctx layout and block-signal translation.
@@ -4692,11 +4684,11 @@ private:
     // Sizes of the groups the comb-fusion pass formed (measurement only, for
     // the `--stat=comb-fuse` probe).
     std::vector<uint32_t>               comb_group_sizes_;
-    // Fusion groups (compute_fusion_groups): each group lowers to one
-    // coroutine. groups_[g] lists member process indices in scheduled-rank
-    // order; group_of_ maps a process to its group; group_events_[g] is the
-    // (signal, edge) set the group subscribes (canonical deduped for fused
-    // groups, the member's raw list for singletons).
+    // Fusion groups (compute_fusion_groups): each is ONE function lowered from a
+    // unit's code, never mixing instances. groups_[g] lists the member process
+    // indices in the unit's order; group_of_ maps a process to its group;
+    // group_events_[g] is the (signal, edge) set the group waits on (canonical
+    // deduped for fused groups, the member's raw list for singletons).
     std::vector<std::vector<uint32_t>>  groups_;
     std::vector<uint32_t>               group_of_;
     std::vector<std::vector<WaitEvent>> group_events_;
@@ -4704,6 +4696,23 @@ private:
     // group is suspension-free), not a coroutine. Drives lower_group's emission
     // and the seed/drain dispatch, kept as one table so all three agree.
     std::vector<bool>                   thunk_group_;
+    // Per-group: formed by comb fusion (members of different sensitivities
+    // ordered for each other). Such a group is always a schedule group of its
+    // own, never one of several rows (build_sched_groups).
+    std::vector<bool>                   group_comb_;
+    // Schedule groups (build_sched_groups): what the seed loop creates one handle
+    // for and subscribes once. A coroutine group is its own; the thunk groups
+    // that wait on the same events are the rows of one, which runs them in rank
+    // order behind one scheduled flag (emit_sched_entries). `front` is the
+    // first process of its first row: the one whose flag it owns.
+    struct SchedGroup {
+        std::vector<uint32_t>  rows;
+        std::vector<WaitEvent> events;
+        uint32_t               front = 0;
+        bool                   thunk = false;
+    };
+    std::vector<SchedGroup>             sched_;
+    std::vector<uint32_t>               sched_of_;
     // Per-(signal, edge) trigger colour: the wake word bit a wake of that pair
     // sets, or 0 for "no guarded group waits on it". Design-global, so it is
     // data wherever unit code needs it (the owner's record, a bucket's trigger

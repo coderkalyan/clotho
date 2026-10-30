@@ -286,10 +286,12 @@ unit, which is also what the no-IR-rewriting rule asks
   unit's code does not change when it gains a second instance. The
   constant-anchor form measured faster under FastISel on picorv32
   (module-split.md); recovering that belongs to a later whole-design `-O` tier.
-- No inlining across units. Processes fuse within a unit; a group spanning
-  instances is a link-time table of (unit function, instance record) rows run
-  by one dispatcher, with no member-count caps. Merged cross-instance bodies
-  can return in a flattening, LTO-style `-O` mode without changing units.
+- No inlining across units. Processes fuse within a unit, and a unit's group is
+  one function taking the instance's record; the groups of several instances
+  that wait on the same events are the rows -- (unit function, instance
+  record) pairs -- of one schedule group, run by one dispatcher, with no
+  member-count caps. Merged cross-instance bodies can return in a flattening,
+  LTO-style `-O` mode without changing units.
 - Function and task signatures are uniform: the process-control and home
   parameters are always present and `ref` epoch handling never depends on
   callers, so no other unit's code changes a unit's signatures.
@@ -367,22 +369,31 @@ code go.
    - **3b, instance records.** Every unit instance gets a record; unit code
      addresses its own storage, ids and name through it and other units'
      storage and instances through its bindings. Landed so far: every
-     instance scope has a record, and a single-scope group and each member of
-     a group spanning instances address their own storage, shadow, sched
-     flags, wait buckets, dump-var index and NBA block ids through it (block
-     ids at the record's field for the function's def-local process ordinal).
-     Other instances' signals stay absolute, and array, trigger and name ids
-     are not in the record yet.
+     instance scope has a record, and a fusion group addresses its own
+     storage, shadow, sched flags, wait buckets, dump-var index and NBA block
+     ids through it (block ids at the record's field for the function's
+     def-local process ordinal). Other instances' signals stay absolute, and
+     array, trigger and name ids are not in the record yet.
    - **3c, code once per unit.** Each unit's processes and functions are
      lowered once from the unit's IR, taking the record, into the unit's module.
      Fusion runs within a unit; groups spanning instances become dispatch
      table rows. `share_twin_groups` and outlining go. Landed ahead of
-     code-once: a group spanning instances is always the dispatch form (a
-     root dispatcher over one member function per member taking its instance
-     record; no member cap; with or without split emission), a coroutine
-     group fuses only within one instance, and `SimulationConfig::outline` is
-     gone. Members are still emitted once per instance; `--stat=unit-code`
-     compares them across the instances of a unit.
+     code-once: fusion groups are formed per unit (`compute_fusion_groups`,
+     ir/llvm/Groups.cpp). A group is a list of def-local process ordinals,
+     the same in every instance and never mixing instances, decided on the
+     unit's processes and facts joined over its instances, never on an
+     instance's context. A thunk group is a function taking its instance's
+     record, a row; the rows of the groups that wait on the same (signal,
+     edge) set, in any instances, share one subscription as a schedule group,
+     whose entry (a dispatcher in root, or in the unit module for one row)
+     owns the flag, runs the rows and re-arms. Twin rows whose functions
+     print identically are merged (`merge_twin_bodies`); `share_twin_groups`
+     and `SimulationConfig::outline` are gone. Comb fusion therefore stays
+     within one instance (combchain, a chain of one-process instances,
+     regresses; accepted until fusion across instances is revisited).
+     Functions are still emitted once per instance; `--stat=unit-code`
+     compares every group across the instances of a unit (rocket-chip: all
+     1021 compared groups identical up to design symbols).
    - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
      capacity from the record, a subscription carries its trigger bits, the
      ring mask is a root global, NBA and trigger ids are record base plus

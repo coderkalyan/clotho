@@ -586,10 +586,11 @@ TEST_CASE("cli: build and run accept the code-generation options") {
     }
 }
 
-TEST_CASE("cli: --stat=unit-code compares the members of a group spanning instances") {
-    // Three instances of one block wait on the clock of one interface, so their
-    // processes are one group spanning instances: one function per member, the
-    // same function in every instance up to the design symbols it names.
+TEST_CASE("cli: --stat=unit-code compares the groups of the instances of a unit") {
+    // Three instances of one block wait on the clock of one interface: their
+    // groups are rows of one schedule group sharing one subscription, and each
+    // of the unit's groups (that one and the instance's own PreInit) is the
+    // same in every instance up to the design symbols it names.
     const Scratch  s;
     const fs::path design = s.write("design.sv", R"(
         interface bus_if; logic clk = 0; endinterface
@@ -607,8 +608,8 @@ TEST_CASE("cli: --stat=unit-code compares the members of a group spanning instan
     )");
     const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
     CHECK(r.code == 0);
-    CHECK(contains(r.err, "1 groups span instances (3 members)"));
-    CHECK(contains(r.err, "1 identical up to design symbols; 3 members in all"));
+    CHECK(contains(r.err, "2 groups of multi-instance units compared, 2 identical up to design symbols"));
+    CHECK(contains(r.err, "1 schedule groups run several groups (3 rows)"));
 }
 
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {

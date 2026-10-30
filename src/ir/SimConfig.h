@@ -32,7 +32,7 @@ enum class SystemAccess : uint8_t {
 // and changes nothing about the emitted code.
 enum class Stat : uint32_t {
     // Twin-group dedup: how many groups collapsed onto a shared body, and the
-    // time the comparison took (see share_twin_groups).
+    // time the comparison took (see merge_twin_bodies).
     Dedup = 1u << 0,
     // Dedup, plus the member sets behind each identity key.
     DedupSets = 1u << 1,
@@ -46,8 +46,8 @@ enum class Stat : uint32_t {
     // Frontend units: how many instances each specialization has, and which
     // specializations' instances do not yet lower to identical unit IR.
     Units = 1u << 5,
-    // Backend units: which single-scope groups of multi-instance units still
-    // lower to different code per instance (report_unit_code).
+    // Backend units: which fusion groups of multi-instance units still lower to
+    // different code per instance (report_unit_code).
     UnitCode = 1u << 6,
 };
 
@@ -166,21 +166,20 @@ struct SimulationConfig {
     // unguarded ones. Disable for bisection / differential testing.
     bool regions = true;
     // Share one compiled body across twin instances of a reused module
-    // definition: thunk groups whose lowered functions are identical modulo
-    // their instance-context symbol collapse to ONE shared body (ctx passed
-    // as a parameter) plus a two-instruction musttail stub per instance
-    // (see share_twin_groups in ir/llvm/Dedup.cpp). Sharing is gated on
-    // literal post-lowering IR identity, so semantics are byte-identical
+    // definition: thunk groups of one unit whose lowered functions print
+    // identically, symbols included, collapse onto ONE function (each instance
+    // passes its own record), see merge_twin_bodies in ir/llvm/Dedup.cpp. The
+    // gate is literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
     // Emit one llvm::Module per elaborated definition (unit = the definition
-    // state-struct identity) holding its single-scope process groups and the
-    // member functions of the groups spanning instances that belong to it,
-    // plus a root module with everything else (state globals, scheduler
-    // machinery, functions/tasks, the dispatchers of groups spanning
-    // instances, main). Prep for per-definition object caching; the JIT links
-    // the set into one dylib, so semantics are identical either way. Disable
-    // for bisection / debugging (one module, the same functions).
+    // state-struct identity) holding its instances' process groups and the entry
+    // of a schedule group that runs just one of them, plus a root module with
+    // everything else (state globals, scheduler machinery, functions/tasks, the
+    // dispatchers of schedule groups that run the groups of several instances,
+    // main). Prep for per-definition object caching; the JIT links the set into
+    // one dylib, so semantics are identical either way. Disable for bisection /
+    // debugging (one module, the same functions).
     bool split = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a

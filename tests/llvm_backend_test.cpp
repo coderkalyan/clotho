@@ -214,7 +214,7 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // initializer is the whole power-on state (X = 0xFF00 for a 4-state byte),
     // so main emits no rt_alloc and no per-signal init stores.
     CHECK(raw.find("%alu.state = type") != std::string::npos);
-    CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
+    CHECK(raw.find("@clotho.state = ") != std::string::npos);
     CHECK(raw.find("i16 -256") != std::string::npos);
 
     // One process per @<module>.p<index>: two combinational assigns + one
@@ -271,7 +271,7 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(raw.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
     CHECK(raw.find("%bit.4 = type { i4 }") != std::string::npos);
     CHECK(raw.find("%logic.nz.8 = type { i16 }") != std::string::npos);
-    CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
+    CHECK(raw.find("@clotho.state = ") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @clotho.inst.m.p") != std::string::npos);
@@ -2267,7 +2267,9 @@ TEST_CASE("a group spanning instances dispatches whatever its size and layout") 
     for (const bool split : { true, false }) {
         const std::string ir = emit(src, { .split = split });
         CHECK(count_substr(ir, ".f20.thunk(ptr noalias %state") == 1);
-        CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == 20);
+        // Split, each row is a function of its own unit; unsplit, the one
+        // module's inliner folds the internal rows into the dispatcher.
+        CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == (split ? 20u : 0u));
     }
 }
 

@@ -189,7 +189,7 @@ void Backend::emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std:
     auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
     const auto all  = mod_.processes();
     for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::Final) {
+        if (all[sched_[g].front].activation != Activation::Final) {
             continue;
         }
         llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -221,7 +221,7 @@ void Backend::emit_preponed_run(llvm::Value* state, llvm::Value* wheel, const st
     auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
     const auto all  = mod_.processes();
     for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::Preponed) {
+        if (all[sched_[g].front].activation != Activation::Preponed) {
             continue;
         }
         llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -305,7 +305,7 @@ void Backend::emit_observed_run(llvm::Value* state, llvm::Value* wheel, const st
     auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
     const auto all  = mod_.processes();
     for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::Observed) {
+        if (all[sched_[g].front].activation != Activation::Observed) {
             continue;
         }
         llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -338,7 +338,7 @@ void Backend::emit_renba_run(llvm::Value* state, llvm::Value* wheel, const std::
     auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
     const auto all  = mod_.processes();
     for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::ReNba) {
+        if (all[sched_[g].front].activation != Activation::ReNba) {
             continue;
         }
         llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -389,7 +389,7 @@ llvm::Constant* Backend::program_live_ptr() {
 //
 // The instance index is folded into each body as a COMPILE-TIME constant. That
 // is sound because a program `initial` body is never shared between instances:
-// the only body sharing in the backend is share_twin_groups, which takes only
+// the only body sharing in the backend is merge_twin_bodies, which takes only
 // thunk groups, and thunk eligibility is is_simple_always, which requires
 // Activation::Always (src/ir/Analysis.cpp) -- so an Activation::Reactive
 // process is always a coroutine of its own, one per instance, exactly as
@@ -880,10 +880,10 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     // group spanning instances is guarded by its root-side dispatcher, which
     // bakes them.
     for (uint32_t g = 0; g < groups_.size(); ++g) {
-        if (!group_guarded_[g] || group_anchor_of_[g] == SignalSlot::no_anchor) {
+        if (!group_guarded_[g] || group_unit_anchor_[g] == SignalSlot::no_anchor) {
             continue;
         }
-        Anchor& a = anchors_[group_anchor_of_[g]];
+        Anchor& a = anchors_[group_unit_anchor_[g]];
         b_.CreateStore(b_.getInt64(group_trig_mask_[g]),
                        ctx_ptr(a, a.ctx_gmask_base + proc_sched_ord_[groups_[g].front()]));
         for (size_t i = 0; i < groups_[g].size(); ++i) {
@@ -1594,7 +1594,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // below subscribe to already-settled values. Run before the seed loop so no
     // wait queue is scanned before priming.
     for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::PreInit) {
+        if (all[sched_[g].front].activation != Activation::PreInit) {
             continue;
         }
         llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -1610,20 +1610,25 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // clocking event.
     emit_preponed_run(state, wheel, procs);
 
-    // One handle per fusion group; a group's activation facts come from its
-    // first member (identical across fused members by the group key).
+    // One handle per schedule group; its activation facts come from the first
+    // process of its first row (identical across the rows by the group key).
     std::vector<llvm::Value*> hdls(procs.size(), nullptr);
-    // Groups with an always_comb / always_latch member, seeded after every other body
-    // (below). A fused group is ONE body, so a continuous assignment fused with such a
-    // procedure starts with it: 4.9.1 and 4.7 leave the order of its time-zero
-    // evaluation open, and keeping the fusion is what the procedure's cone is worth.
+    // Schedule groups with an always_comb / always_latch member, seeded after every other
+    // body (below). A fused group is ONE body, so a continuous assignment fused with such a
+    // procedure starts with it: 4.9.1 and 4.7 leave the order of its time-zero evaluation
+    // open, and keeping the fusion is what the procedure's cone is worth. `g` numbers
+    // SCHEDULE groups, whose rows are fusion groups, so the members are those of the
+    // group's rows, never `groups_[g]`. The rows of a schedule group share one handle and
+    // one seed decision, so one late row starts them all late.
     std::vector<uint32_t> deferred_comb;
     const auto            starts_late = [&](uint32_t g) {
-        return std::any_of(
-          groups_[g].begin(), groups_[g].end(), [&](uint32_t m) { return all[m].starts_after_procedures; });
+        return std::any_of(sched_[g].rows.begin(), sched_[g].rows.end(), [&](uint32_t row) {
+            return std::any_of(groups_[row].begin(), groups_[row].end(),
+                               [&](uint32_t m) { return all[m].starts_after_procedures; });
+        });
     };
     for (uint32_t g = 0; g < procs.size(); ++g) {
-        const uint32_t k = groups_[g].front();
+        const uint32_t k = sched_[g].front;
         const Process& p = all[k];
         if (p.activation == Activation::PreInit) {
             continue; // already run above
@@ -1646,7 +1651,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         // aligned, so bit 0 is a free tag; coro handles (rt_alloc) leave it
         // clear. The tagged pointer flows through subscription / self_start
         // push unchanged.
-        llvm::Value* hdl = thunk_group_[g]
+        llvm::Value* hdl = sched_[g].thunk
           ? b_.CreateIntToPtr(
               b_.CreateOr(b_.CreatePtrToInt(sym(procs[g]), b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
           : b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -1727,7 +1732,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // these after every other body makes each of them run after those have started.
     // A continuous assignment is not a procedure and keeps its source position above.
     for (const uint32_t g : deferred_comb) {
-        if (all[groups_[g].front()].reactive_home) {
+        if (all[sched_[g].front].reactive_home) {
             emit_reactive_cont_push(b_, hdls[g]);
         } else {
             emit_active_push(b_, hdls[g]);
@@ -1741,12 +1746,12 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // wave. A separate pass so only wake order changes — creation and
     // enqueue order above stay declaration order. All subscriptions still
     // land before the drain, so no scan reads an empty slot.
-    // A fused group subscribes once, at its earliest member's rank, with the
-    // group's canonical event set and the group's flag/handle.
+    // A schedule group subscribes once, at its earliest member's rank, with its
+    // canonical event set and its flag/handle.
     std::vector<bool> subscribed(procs.size(), false);
     for (const uint32_t k : sub_order_) {
-        const uint32_t g = group_of_[k];
-        const uint32_t f = groups_[g].front();
+        const uint32_t g = sched_of_[group_of_[k]];
+        const uint32_t f = sched_[g].front;
         if (subscribed[g] || all[f].activation != Activation::Always || all[f].wait_events.empty()) {
             continue;
         }
@@ -1764,7 +1769,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         // push it onto the active ring, which is the bug this phase fixes. The tag is
         // the CONTINUOUS one, so the wake lands on the reactive continuous ring.
         llvm::Value* sub_hdl = tag_reactive_home(b_, hdls[g], all[f].reactive_home, /*continuous=*/true);
-        for (const WaitEvent& w : group_events_[g]) {
+        for (const WaitEvent& w : sched_[g].events) {
             emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), sub_hdl, flag);
         }
     }
@@ -1780,8 +1785,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // Any thunk group present means the active queue can carry tagged thunk
     // pointers, so the drain must discriminate; a coro-only design keeps the
     // straight resume path (no per-pop tag test).
-    const bool has_thunk = std::any_of(thunk_group_.begin(), thunk_group_.end(),
-                                        [](bool t) { return t; });
+    const bool has_thunk = std::any_of(sched_.begin(), sched_.end(),
+                                        [](const SchedGroup& sg) { return sg.thunk; });
     auto* thunk_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
     // NBA region: only when the design has nonblocking assignments. Entered when
     // the active queue drains; if any update is staged it commits them all and

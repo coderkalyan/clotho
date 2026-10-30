@@ -18,35 +18,38 @@ plus the slot types of the definition's own signals), so two parameterizations
 with identical own-signal types share one module. The process-body hash set the
 twin detector computes (`--stat=dedup`) is not part of the key.
 
-- `M_def(key)`: the fusion groups whose members all belong to one scope of the
-  definition, and the member functions of the groups that span instances
-  (below) whose process belongs to it. Every instance, singletons included,
-  addresses its storage through its instance ctx record; a `.ctx` global is
-  created in whichever module first needs it.
+- `M_def(key)`: the fusion groups of the definition's instances (a group
+  never mixes instances, so each belongs to one scope), plus the entry of a
+  schedule group that runs exactly one such group. Every instance,
+  singletons included, addresses its storage through its instance ctx record;
+  a `.ctx` global is created in whichever module first needs it.
 - `M_root`: everything else -- state globals and power-on initializers, wait
   queues, every function and task, NBA commit functions, `main` / `sim_drain`
   / finals, the seed loop, DPI export thunks, package/`$unit` (`no_scope`)
-  processes and the dispatchers of groups spanning instances. `$dumpvars` emits
-  its whole-tree registration inline in the calling process's module, and the
-  lazily created
+  processes and the dispatchers of schedule groups that run the groups of
+  several instances. `$dumpvars` emits its whole-tree registration inline in the
+  calling process's module, and the lazily created
   singletons (`clotho.active`, `enqueue_timer`, `ev_delay`, `shadow_base`)
   land in the first module that needs them.
-  Fusion groups spanning instances DISPATCH, whatever their size, and with
-  `split` off in the one module just the same: one plain function per
-  member in the member's own unit, taking that member's instance record
-  (`@clotho.inst.<hier>.ctx`) as its first parameter, plus a root
-  dispatcher (named like the merged thunk; owns the sched-flag timeline,
-  the member guards and the re-arm) calling them in rank order with each
-  member's record. A member addresses its own instance through the record
-  exactly as a single-scope group does, and its NBA block ids are the
-  record's field for that member plus a member-local ordinal; signals of
-  other instances stay absolute. There is no member cap and no merged body
-  to fall back to: a cross-module member call cannot inline, and a
-  256-member comb group measured 3.7x sim this way (combchain) while the
-  real core populations (2-7 member clocked groups, picorv32) are
-  wall-neutral. Only a thunk group can span instances: a coroutine group
-  is one function over one frame, so compute_fusion_groups keeps it inside
-  one instance.
+
+A thunk group is a function taking its instance's record
+(`@clotho.inst.<hier>.ctx`) as its first parameter (and, when it guards its
+members, the wake word whose trigger bits the guards test): a ROW. It runs its
+members inline and addresses its own instance through the record, its NBA block
+ids at the record's field for its front process; signals of other instances stay
+absolute. What the scheduler holds is the entry of a SCHEDULE GROUP: the rows
+that wait on the very same (signal, edge) set, whichever instances and units
+they belong to, share one subscription and one scheduled flag. The entry owns
+the flag timeline (held across every row), re-arms it, and calls each row with
+its record in rank order. A schedule group of one row puts its entry in the
+row's own unit module, where the inliner can fold the body into it; a schedule
+group of several rows spans units, so its dispatcher is root glue, with no
+member cap and calls that cannot inline (a 256-member comb group measured 3.7x
+sim this way on combchain before comb fusion went per instance, while the real
+core populations -- 2-7 member clocked groups, picorv32 -- are wall-neutral).
+Identical row bodies of one unit's twins are merged by their printed text, so
+twins compile once. A coroutine group is one function over one frame, so it is
+its own schedule group, as before.
 
 ## Context and types
 
@@ -164,8 +167,9 @@ then externalizes real symbols instead of interior GEPs.
    wideff resync signature; pico -O spot check (constant-anchor shape must
    survive).
 3. **Split emission**: one env per unit + root, `lower_group` looped by owning
-   unit (single-scope groups → their def's unit; cross-instance groups,
-   functions/tasks, commit fns, all machinery → root, V1), per-module
+   unit (a fusion group → its instance's unit; the dispatcher of a schedule
+   group over several instances, functions/tasks, commit fns, all machinery →
+   root, V1), per-module
    `lower_coroutines` + verify, one `addIRModule` per unit, `--no-split`
    escape hatch. Gate: `--no-split` byte-identical to pre-split; split mode
    sim-output identical; compile time neutral or better.
@@ -239,9 +243,9 @@ re-decided on measurement before any merge to main.
 
 ## Known landmines
 
-- `share_twin_groups` compares/rewrites symbol operands by pointer identity —
-  runs within one def module in phase 2 (its groups are same-def by
-  construction), keep it env-local.
+- Twin merging (`merge_twin_bodies`) compares printed function text, symbols
+  included, and runs within one def module (its groups are same-def by
+  construction); keep it env-local.
 - `wait_base` / seed loop / NBA meta initializer assume queue globals resolve
   as constants — in split form these are root-defined, def-declared; the meta
   table itself stays root-side.
@@ -256,5 +260,5 @@ re-decided on measurement before any merge to main.
   single-threaded optimize+codegen time is the entire parallel section's
   wall-clock floor, capping the win at ~1.5x on 12 cores despite 260
   independent modules. Raising this ceiling needs root itself split further
-  (more of `M_root`'s machinery moved into the units the way the members of
-  cross-instance groups already are), not more parallel-compile machinery.
+  (more of `M_root`'s machinery moved into the units the way the rows of
+  schedule groups already are), not more parallel-compile machinery.

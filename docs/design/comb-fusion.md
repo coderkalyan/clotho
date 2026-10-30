@@ -11,7 +11,10 @@ phase 1 (grouping + lowering, `--no-comb-fuse` to disable) landed. Measured
 (dev box, 2026-07-08, `--time` sim split, min of 5): combchain 552 -> 203 ms
 (2.7x) with llvm compile 412 -> 242 ms; picorv32 within noise both ways
 (VERBOSE trace byte-identical); thunk_comb untouched by construction
-(independent cones stay singleton).
+(independent cones stay singleton). Groups are formed per unit since the
+modular backend (see "Scope" at the end): a component never spans instances, so
+combchain's chain of 512 one-process instances is 512 singleton groups again,
+a regression accepted until fusion across instances is revisited.
 
 ## Why this is LRM-legal (the whole derisk argument)
 
@@ -93,10 +96,10 @@ is not overfit to the target benchmark.
 ## Phase 1: grouping + lowering (landed)
 
 - Group = connected component of the writer→reader wake graph restricted to
-  eligible singleton processes (`wake_adj_` retained from
+  eligible singleton processes of one instance (`wake_adj_` retained from
   `compute_subscription_order`, union-find, equal `self_start` **and equal
-  `reactive_home`** required); components > 256 chunk into rank-contiguous
-  segments (a leftover chunk of one stays a singleton).
+  `reactive_home`** required); components > 256 chunk into topologically
+  contiguous segments (a leftover chunk of one stays a singleton).
 - Home-homogeneous because a group is one function pushed onto one ring: a
   program's continuous assign is reactive-home (LRM 24.3.1,
   docs/design/program-blocks.md §3) and fusing it with an Active-home process
@@ -105,8 +108,9 @@ is not overfit to the target benchmark.
   is also kept off the thunk path: the thunk tag is pointer bit 0 and the
   reactive-home tag is bit 1, and the scheduler's reactive test requires bit 0
   clear, so a pointer carrying both reads as neither.
-- Members ordered by existing `sub_order_` rank (DAG by construction —
-  nontrivial SCCs excluded via `scc_nontrivial_`).
+- Members run producer before consumer: ascending longest-path level in the
+  unit's wake graph, ties by ordinal (a DAG by construction — nontrivial SCCs
+  excluded via `scc_nontrivial_` and the cycles of the unit's own graph).
 - **Interior guard**: only candidates whose entire sensitivity is
   candidate-written may merge; the rest stay singletons (still contributing
   component edges and wakes). Without it, a member with a private external
@@ -151,3 +155,37 @@ cycles), picorv32 default and VERBOSE traces, tri networks across 4
 declaration orders, regs/chain/bigcase/onehot/wheel/timers generators, both
 thunk and coroutine lowerings; phase-0 iverilog pins pass under the fused
 default config.
+
+## Scope: a group belongs to a unit
+
+A group is one function lowered from a unit's code and run with an instance's
+record, so every decision above is made on the unit and never on one
+instance's context (`compute_fusion_groups`, ir/llvm/Groups.cpp): a process is
+named by its def-local ordinal, and every instance of a unit gets the same
+groups, in the same order, from the same ordinals. A group never mixes
+instances. What differs between instances enters as a fact joined over them:
+
+- V1 buckets key on the canonical events of EVERY instance, so two ports bound
+  to one signal in one instance and to two in another (an interface member, say)
+  are one sensitivity in the first and two in the second, and fuse only if they
+  are one in all. Eligibility is the AND over instances, membership in a
+  nontrivial SCC the OR, and the interior guard needs a candidate-written
+  sensitivity in every instance.
+- The wake graph of a unit is the union, over its instances, of the edges
+  between two processes of ONE instance (a wake to another instance's process
+  is an ordinary wake, so a component never needs one). A cycle only the union
+  closes leaves no order that works for all instances, so those processes stay
+  on the re-wake path; otherwise the member order above is topological in every
+  instance, which is what the held flag needs (a store to an earlier member
+  would be a lost wake).
+- A component spanning instances therefore splits into one group per
+  instance, scheduled normally. That is the cost of grouping on the unit: a
+  chain whose every stage is its own instance (combchain) gets no fusion at all.
+
+The groups of different instances that wait on the very same (signal, edge)
+set then share ONE subscription: they are the rows of a schedule group, run by
+one entry that owns the flag (module-split.md, Partition). Only V1 groups
+(identical sensitivity, singletons included) share. Their members never write
+a signal of the shared set, so no row can wake another's; the members of a comb
+group wake each other by design and are ordered for it within their instance
+only, so each comb group is a schedule group of its own.

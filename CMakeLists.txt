@@ -544,6 +544,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/ElemKernels.cpp
   src/ir/llvm/Events.cpp
   src/ir/llvm/GcEmit.cpp
+  src/ir/llvm/Groups.cpp
   src/ir/llvm/Inst.cpp
   src/ir/llvm/LlvmBackend.cpp
   src/ir/llvm/Ops.cpp

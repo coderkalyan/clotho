@@ -24,8 +24,9 @@ void Backend::run() {
         report_dedup_stat();
     }
     build_rng_fns();         // before compute_fusion_groups: gates thunk eligibility
+    build_sched_flags();     // before compute_fusion_groups: a group is a list of def-local process ordinals
     compute_subscription_order();
-    compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
+    compute_fusion_groups(); // before build_wait_queues: bucket capacities count schedule-group subscriptions
     compute_trigger_masks(); // after fusion: colours come from the group event unions
     if (stat_on(config_.stats, Stat::CombFuse)) {
         report_comb_fuse_stat();
@@ -81,7 +82,6 @@ void Backend::run() {
     }
     build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
     build_wait_queues();
-    build_sched_flags();         // before the record layout: one block-id field per process ordinal
     build_instance_ctx_layout(); // after build_wait_queues (ctx sizes need wait slots) and build_sched_flags
     build_nba_state();
 
@@ -130,8 +130,11 @@ void Backend::run() {
         report_unit_code(group_fns);
     }
     if (config_.dedup && config_.thunk) {
-        share_twin_groups(group_fns);
+        merge_twin_bodies(group_fns);
     }
+    // What the scheduler holds: each coroutine group's ramp, and for every
+    // thunk schedule group the entry that runs its rows.
+    const std::vector<llvm::Function*> sched_fns = emit_sched_entries(group_fns);
     // Every interface instance a virtual interface can name needs its context
     // record to exist before main fills it, whether or not any body happened
     // to address that instance def-relatively: the handle IS the context
@@ -145,7 +148,7 @@ void Backend::run() {
     // globals and emit the commit / enqueue functions now, before emit_main
     // wires the NBA-region drain that references them.
     finalize_block_nba();
-    emit_main(group_fns);
+    emit_main(sched_fns);
     // Export thunks come last: they reference @clotho.state (created in
     // emit_main) and every SV function's declaration.
     emit_dpi_exports();

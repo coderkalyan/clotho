@@ -4,12 +4,14 @@
 
 namespace clotho::ir::backend {
 
-// Lower one fusion group (usually a singleton) to one coroutine. Members of
-// a fused group share one frame, one sched flag (the first member's slot),
-// and one wait suspend; their bodies run back-to-back per wake, in
-// scheduled-rank order (see compute_fusion_groups for the legality
-// argument). The per-member value tables are swapped in around each
-// member's body.
+// Lower one fusion group (usually a singleton). A coroutine group lowers to one
+// coroutine: the members of a fused one share one frame, one sched flag (the
+// first member's slot) and one wait suspend, and run back-to-back per wake. A
+// thunk group lowers to one plain function, a ROW of a schedule group
+// (emit_sched_entries), that runs its members back-to-back for the instance
+// whose record it is handed. Either way the members run in the order
+// compute_fusion_groups gave them (see there for the legality argument), and
+// the per-member value tables are swapped in around each member's body.
 llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const auto     all        = mod_.processes();
     const uint32_t proc_index = members.front();
@@ -17,20 +19,16 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     ir_                       = &proc.ir;
     frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
-    // This group's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
-    // constant GEP so it is valid in any block of the function. A group fully
-    // inside one instance instead loads the instance record's sched base and
-    // indexes the def-local ordinal — the same slot, materialized at function
-    // entry (materialize_group_ctx), and addresses everything else of its
-    // instance through the record too. An unscoped group, and a group spanning
-    // instances (whose dispatcher owns the flag and whose members take their
-    // own records), keep the folded constant.
+    // A group of an instance addresses everything of that instance through its
+    // record. A coroutine group's flag is its own slot in the instance's sched
+    // array -- the record's sched base plus the def-local ordinal, the same slot
+    // as &clotho.inst.<hier>.sched[ordinal] (materialize_group_ctx) -- while a
+    // thunk row touches no flag but the wake word it is handed. An unscoped
+    // group has no record and keeps the folded constant.
     const uint32_t g_ = group_of_[proc_index];
-    own_anchor_       = SignalSlot::no_anchor;
+    own_anchor_       = group_unit_anchor_[g_];
     own_ctx_          = nullptr;
-    const uint32_t gaid = group_anchor_of_[g_];
-    if (gaid != SignalSlot::no_anchor) {
-        own_anchor_  = gaid;
+    if (own_anchor_ != SignalSlot::no_anchor) {
         own_ordinal_ = proc_sched_ord_[proc_index];
     }
     sched_ptr_ = own_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
@@ -108,30 +106,15 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         Anchor& a = anchors_[own_anchor_];
         return ctx_field(a, a.*field + proc_sched_ord_[m], b_.getInt64Ty());
     };
-    // Open the guarded region of a group: returns true when its members are
-    // guarded, having ensured the wake word carries at least one of the
-    // group's bits.
-    //
-    // That store is the fail-safe. If the word carries none of this group's
-    // bits, some wake path pushed the group without naming a trigger, so set
-    // them all and let every member run -- which makes a missed bit a lost
-    // optimization rather than a lost execution, in a wake path this wide.
-    // It also means each member's guard is a plain test with no fallback of
-    // its own.
+    // Open the guarded region of a coroutine group: returns true when its
+    // members are guarded, having ensured the wake word carries at least one of
+    // the group's bits (emit_trigger_failsafe). A thunk row's fail-safe is its
+    // entry's.
     auto open_group = [&](uint32_t g) -> bool {
         if (!group_guarded_[g]) {
             return false;
         }
-        auto* mask = mask_value(group_trig_mask_[g], &Anchor::ctx_gmask_base, members.front());
-        auto* w    = b_.CreateLoad(sched_word_ty(), sched_ptr_);
-        auto* none = b_.CreateICmpEQ(b_.CreateAnd(w, mask), b_.getInt64(0));
-        auto* set  = llvm::BasicBlock::Create(ctx_, "trig.all", fn_);
-        auto* go   = llvm::BasicBlock::Create(ctx_, "trig.go", fn_);
-        b_.CreateCondBr(none, set, go);
-        b_.SetInsertPoint(set);
-        b_.CreateStore(b_.CreateOr(w, mask), sched_ptr_);
-        b_.CreateBr(go);
-        b_.SetInsertPoint(go);
+        emit_trigger_failsafe(sched_ptr_, mask_value(group_trig_mask_[g], &Anchor::ctx_gmask_base, members.front()));
         return true;
     };
     // Open member `i`'s guard: run it only if one of ITS OWN events has
@@ -174,32 +157,19 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
 
     // Coroutine elision: a suspension-free always-with-sensitivity group (see
     // is_simple_always) carries no state across activations, so instead of a
-    // coroutine it lowers to a plain thunk — void @<name>.thunk(state, wheel)
-    // — run once per activation. The seed subscribes a tagged pointer to it
-    // and the drain calls it directly (no frame, no suspend switch, no
-    // CoroSplit). The sched-flag timeline matches the coroutine always-loop:
-    // the flag is held set across the body and cleared at the end, so
-    // same-instant re-triggers behave identically.
+    // coroutine it lowers to a plain function run once per activation. The
+    // scheduler holds the ENTRY of its schedule group (emit_sched_entries), a
+    // tagged pointer the drain calls directly (no frame, no suspend switch, no
+    // CoroSplit), and the entry owns the sched-flag timeline: the flag is held
+    // set across every row and cleared at the end, so same-instant re-triggers
+    // behave as they do for a coroutine always-loop.
     //
-    // A thunk group whose members are not all in one instance (compute_fusion_groups
-    // keeps every coroutine group inside one) takes the dispatch form, whatever
-    // its size and whether or not modules are split: one plain function per
-    // member, emitted into the member's OWN unit module, plus a root dispatcher
-    // named like the merged thunk (so seed/subscription/drain contracts are
-    // untouched) that owns the sched-flag timeline, the member guards and the
-    // re-arm, and calls the members in scheduled-rank order. A member takes its
-    // instance's record (@clotho.inst.<hier>.ctx) as its first parameter and
-    // addresses everything of its own instance through it, exactly as a
-    // single-scope group does through the record global (own_anchor_ /
-    // own_ctx_); the dispatcher passes each member's record. Signals of other
-    // instances a member reaches stay absolute. Single-scope groups keep the
-    // merged body inside their unit.
-    //
-    // A cross-module member call cannot be inlined, so a group's per-activation
-    // cost scales with its member count, and no member cap trades that away: a
-    // 256-member comb group measured 3.7x sim this way (combchain). Merged
-    // cross-instance bodies belong to a flattening -O mode, not to a threshold
-    // (docs/design/modular-compilation.md, "Code generation").
+    // The function is a ROW, `void(ptr ctx, ptr wheel [, ptr flag])`: it takes
+    // the record of the instance it runs for (@clotho.inst.<hier>.ctx) and
+    // addresses everything of that instance through it and, when its members are
+    // guarded, the wake word whose trigger bits those guards test. It is code of
+    // its unit, so one function serves every instance whose code is the same;
+    // signals of other instances it reaches stay absolute.
 
     // A thunk group is not a thread: no frame, no handle, no control block, and
     // proc_arg's own contract already says such a body passes null. Reset here,
@@ -233,119 +203,55 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         silent_stores_ = false;
         hdl_           = nullptr;
     };
-    if (thunk_group_[g_] && members.size() > 1 && group_unit_anchor_[g_] == SignalSlot::no_anchor) {
-        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
-
-        // The dispatcher's flag: members never touch it, and a constant naming
-        // root's array must not leak into a unit module's function.
-        llvm::Value* const group_sched = sched_ptr_;
-        std::vector<llvm::Function*> member_fns;
-        member_fns.reserve(members.size());
-        for (const uint32_t m : members) {
-            const uint32_t aid = proc_sched_anchor_[m];
-            env_ = config_.split && aid != ~0u ? &unit_env(anchors_[aid]) : root_env_.get();
-            const std::string mname =
-              aid != ~0u ? "clotho.inst." + anchors_[aid].name + ".p" +
-                             std::to_string(proc_sched_ord_[m])
-                         : mod_.name + ".p" + std::to_string(m);
-            fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, mname, env_->llmod);
-            fn_->getArg(0)->setName("ctx");
-            wheel_ = fn_->getArg(1);
-            wheel_->setName("wheel");
-            if (aid != ~0u) {
-                fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-            }
-            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-            reset_thunk_state();
-            // The `state` argument callees still take is the root state.
-            state_    = sym(state_global_);
-            rng_slot_ = sym(rng_global_);
-            // The record the member was handed stands for its instance; a
-            // member that belongs to no instance has none. Member bodies
-            // never touch the sched flag (the dispatcher owns the timeline),
-            // and their NBA block ids are the record's field for the member's
-            // process plus a member-local ordinal, block ids member-contiguous
-            // (group_first_block_ reset per member).
-            own_anchor_        = aid;
-            own_ctx_           = aid != ~0u ? fn_->getArg(0) : nullptr;
-            own_ordinal_       = proc_sched_ord_[m];
-            sched_ptr_         = nullptr;
-            group_first_block_ = -1;
-            select_member(m);
-            str_vals_.assign(ir_->inst_count(), nullptr);
-            build_str_temps();
-            build_dynarr_temps();
-            build_agg_elem_temps();
-            lower_member_body(m);
-            deinit_body_strings();
-            b_.CreateRetVoid();
-            member_fns.push_back(fn_);
-            member_fns_.emplace_back(m, fn_);
-        }
-        own_anchor_        = SignalSlot::no_anchor;
-        own_ctx_           = nullptr;
-        sched_ptr_         = group_sched;
-        group_first_block_ = -1;
-
-        env_ = root_env_.get();
-        fn_  = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
-        state_ = fn_->getArg(0);
-        state_->setName("state");
-        wheel_ = fn_->getArg(1);
-        wheel_->setName("wheel");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-        rng_slot_ = sym(rng_global_);
-        const bool guarded = open_group(g_);
-        for (size_t i = 0; i < member_fns.size(); ++i) {
-            const uint32_t    aid = proc_sched_anchor_[members[i]];
-            llvm::Value*      rec = aid != ~0u ? static_cast<llvm::Value*>(ensure_ctx(anchors_[aid]))
-                                               : llvm::ConstantPointerNull::get(ptr_ty);
-            llvm::BasicBlock* join = open_guard(guarded, g_, i);
-            b_.CreateCall(fnty, sym(member_fns[i]), { rec, wheel_ });
-            close_guard(join);
-        }
-        b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
-        b_.CreateRetVoid();
-        return fn_;
-    }
-
     if (thunk_group_[g_]) {
-        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
-        fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
-        state_ = fn_->getArg(0);
-        state_->setName("state");
+        auto*                    ptr_ty    = llvm::PointerType::getUnqual(ctx_);
+        const bool               takes_flag = group_guarded_[g_];
+        std::vector<llvm::Type*> params{ ptr_ty, ptr_ty };
+        if (takes_flag) {
+            params.push_back(ptr_ty);
+        }
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), params, false);
+        // Internal: its callers are the entry of its schedule group, in this
+        // module when the group has no other row (where the inliner may fold the
+        // body in), or a dispatcher in root, which promotes it through sym().
+        fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
+        fn_->getArg(0)->setName("ctx");
         wheel_ = fn_->getArg(1);
         wheel_->setName("wheel");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+        if (takes_flag) {
+            fn_->getArg(2)->setName("flag");
+        }
+        if (own_anchor_ != SignalSlot::no_anchor) {
+            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+        }
         reset_thunk_state();
-        auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
-        b_.SetInsertPoint(entry_bb);
-        // A thunk group cannot reach a draw (compute_fusion_groups excludes one
-        // that can), so this pointer only ever travels as a callee's ABI
-        // argument and is never dereferenced.
-        rng_slot_ = sym(rng_global_);
-        materialize_group_ctx();
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+        // The `state` callees still take is the root's. A thunk group cannot
+        // reach a draw (compute_fusion_groups excludes one that can), so the RNG
+        // pointer only ever travels as a callee's ABI argument and is never
+        // dereferenced.
+        state_     = sym(state_global_);
+        rng_slot_  = sym(rng_global_);
+        own_ctx_   = own_anchor_ != SignalSlot::no_anchor ? fn_->getArg(0) : nullptr;
+        sched_ptr_ = takes_flag ? fn_->getArg(2) : nullptr;
         // Run each member body per activation, freeing its string temporaries
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
         // process, so deinit_body_strings frees exactly this member's temps.
-        const bool guarded = open_group(g_);
         for (size_t i = 0; i < members.size(); ++i) {
             select_member(members[i]);
             str_vals_.assign(ir_->inst_count(), nullptr);
             build_str_temps();
             build_dynarr_temps();
             build_agg_elem_temps();
-            llvm::BasicBlock* join = open_guard(guarded, g_, i);
+            llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
         }
-        b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
         b_.CreateRetVoid();
+        own_ctx_   = nullptr;
+        sched_ptr_ = nullptr;
         return fn_;
     }
 

@@ -980,43 +980,14 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
 // owned process, and when some group is guarded two trigger-mask fields
 // each) and wait-bucket slots. Runs after fusion grouping, trigger colouring,
 // wait-queue sizing and build_sched_flags (the process ordinals), before
-// lowering. Also attributes each fusion group to its scope anchor and, for a
-// single-scope group, to its unit's dense group ordinal.
+// lowering.
 //
-// The block-id field of a function (a single-scope group, or a member of a
-// group spanning instances) is indexed by the def-local ordinal of its process
-// (its front process, for a group), the same ordinal that names the function
-// and indexes its flag in the sched array. The function's NBA blocks are
-// contiguous, so one field holds their first id, and the field is the same in
-// every instance of a unit whichever fusion group its process fell into in
-// that instance: a counter over groups would number the same process
-// differently in twins whose fusion contexts differ.
+// The block-id field of a group function is indexed by the def-local ordinal of
+// its front process, the same ordinal that names the function and indexes its
+// flag in the sched array. The function's NBA blocks are contiguous, so one
+// field holds their first id, and the field is the same in every instance of a
+// unit because every instance has the same groups.
 void Backend::build_instance_ctx_layout() {
-    const auto all = mod_.processes();
-    group_anchor_of_.assign(groups_.size(), SignalSlot::no_anchor);
-    group_unit_anchor_.assign(groups_.size(), SignalSlot::no_anchor);
-    group_unit_ordinal_.assign(groups_.size(), ~0u);
-    std::vector<uint32_t> unit_counter(anchors_.size(), 0);
-    for (uint32_t g = 0; g < groups_.size(); ++g) {
-        const uint32_t sc   = all[groups_[g].front()].scope;
-        bool           same = sc != Process::no_scope;
-        for (const uint32_t m : groups_[g]) {
-            same = same && all[m].scope == sc;
-        }
-        if (!same || sc >= anchor_of_scope_.size() ||
-            anchor_of_scope_[sc] == SignalSlot::no_anchor) {
-            continue;
-        }
-        const uint32_t aid = anchor_of_scope_[sc];
-        // Any single-scope group belongs to its definition's emission unit
-        // and addresses its instance through the instance context.
-        group_unit_anchor_[g]  = aid;
-        group_unit_ordinal_[g] = unit_counter[aid]++;
-        if (anchors_[aid].first_proc == ~0u) {
-            continue;
-        }
-        group_anchor_of_[g] = aid;
-    }
     // Twin instances own the same number of processes; size blk fields by the
     // definition-wide maximum so layouts agree even if one of them degenerated
     // (they should be equal by construction).

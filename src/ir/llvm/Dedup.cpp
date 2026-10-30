@@ -170,7 +170,11 @@ void Backend::report_dedup_stat() {
 // per-instance bake the def-relative families missed; sharing must not
 // proceed past a DIFF. Only singleton fusion groups compare — a fused
 // function mixes members, so per-process comparison is meaningless there.
-std::string Backend::normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst) {
+//
+// With `number_inst_symbols` off only the function's own name is normalized:
+// two functions that print the same then name the very same symbols, which is
+// what merging them into one function needs.
+std::string Backend::normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst, bool number_inst_symbols) {
     std::string raw;
     {
         llvm::raw_string_ostream os(raw);
@@ -199,12 +203,12 @@ std::string Backend::normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker
             ++j;
         }
         const std::string tok = raw.substr(i, j - i);
-        if (tok.starts_with("@clotho.inst.")) {
+        if (tok == "@" + fn->getName().str()) {
+            out += "@FN";
+        } else if (number_inst_symbols && tok.starts_with("@clotho.inst.")) {
             const auto [it, fresh] =
               inst_ids.try_emplace(tok, static_cast<uint32_t>(inst_ids.size()));
             out += "@INST" + std::to_string(it->second);
-        } else if (tok == "@" + fn->getName().str()) {
-            out += "@FN";
         } else {
             out += tok;
         }
@@ -254,14 +258,15 @@ void Backend::report_dedup_shapes(const std::vector<llvm::Function*>& group_fns)
 
 // `--stat=unit-code`: how far the backend is from compiling each unit once
 // (docs/design/modular-compilation.md, step 3). For every unit with several
-// instances, compares each of its single-scope groups, and each member
-// function of a group spanning instances (keyed by the unit and the member's
-// def-local process ordinal), across the instances after numbering every
-// design symbol (`@clotho.*`) by first occurrence: what such a symbol names an
-// instance record binding could supply, so a mismatch left is an immediate or
-// a code shape baked per instance. The dispatcher of a group spanning
-// instances is root glue with no unit to compare in, and processes outside any
-// instance have none either; both are counted apart.
+// instances, compares each of its fusion groups, keyed by the unit and the
+// group's position among the unit's groups, across the instances after
+// numbering every design symbol (`@clotho.*`) by first occurrence: what such a
+// symbol names an instance record binding could supply, so a mismatch left is
+// an immediate or a code shape baked per instance. A thunk group's function is
+// its row (what a schedule group calls with the instance's record), a coroutine
+// group's its ramp. The entry or dispatcher of a schedule group is link glue
+// with no unit to compare in, and a group of no instance has no twin; both are
+// counted apart.
 void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
     const auto normalize = [](llvm::Function* fn) {
         std::string raw;
@@ -299,302 +304,140 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
         return out;
     };
 
-    // (unit, unit-local ordinal) -> the function in each instance: a
-    // single-scope group by its group ordinal, a member function by its
-    // process ordinal.
-    using Slots = ankerl::unordered_dense::map<uint64_t, std::vector<llvm::Function*>>;
-    Slots                                            group_slots;
-    Slots                                            member_slots;
-    ankerl::unordered_dense::map<uint32_t, uint32_t> instances;
+    // (unit, position in the unit) -> the group's function in each instance.
+    ankerl::unordered_dense::map<uint64_t, std::vector<llvm::Function*>> slots;
+    ankerl::unordered_dense::map<uint32_t, uint32_t>                     instances;
     for (const Anchor& a : anchors_) {
         if (a.unit != InstanceScope::no_unit) {
             ++instances[a.unit];
         }
     }
-    uint64_t cross = 0, cross_members = 0, unanchored = 0;
+    uint64_t unanchored = 0;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t aid = group_unit_anchor_[g];
         if (aid == SignalSlot::no_anchor) {
-            const uint32_t sc = mod_.processes()[groups_[g].front()].scope;
-            if (sc == Process::no_scope) {
-                ++unanchored;
-            } else {
-                ++cross;
-                cross_members += groups_[g].size();
-            }
+            ++unanchored;
             continue;
         }
         const uint32_t unit = anchors_[aid].unit;
         if (unit == InstanceScope::no_unit || instances[unit] < 2) {
             continue;
         }
-        group_slots[(static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]].push_back(group_fns[g]);
-    }
-    for (const auto& [m, fn] : member_fns_) {
-        const uint32_t aid = proc_sched_anchor_[m];
-        if (aid == SignalSlot::no_anchor) {
-            continue;
-        }
-        const uint32_t unit = anchors_[aid].unit;
-        if (unit == InstanceScope::no_unit || instances[unit] < 2) {
-            continue;
-        }
-        member_slots[(static_cast<uint64_t>(unit) << 32) | proc_sched_ord_[m]].push_back(fn);
+        slots[(static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]].push_back(group_fns[g]);
     }
 
-    // Compare each slot's functions pairwise against the first; returns the
-    // slots compared (two or more instances) and how many were identical, and
-    // appends the first few mismatches to `samples`.
-    const auto compare = [&](const Slots& slots, std::string& samples) {
-        uint64_t compared = 0, same = 0;
-        unsigned shown = 0;
-        for (const auto& [key, fns] : slots) {
-            if (fns.size() < 2) {
+    // Compare each slot's functions against the first: the slots compared (two
+    // or more instances), how many were identical, and the first few mismatches.
+    uint64_t    compared = 0, same = 0;
+    unsigned    shown = 0;
+    std::string samples;
+    for (const auto& [key, fns] : slots) {
+        if (fns.size() < 2) {
+            continue;
+        }
+        ++compared;
+        const std::string first = normalize(fns.front());
+        bool              equal = true;
+        for (size_t i = 1; i < fns.size() && equal; ++i) {
+            const std::string other = normalize(fns[i]);
+            if (other == first) {
                 continue;
             }
-            ++compared;
-            const std::string first = normalize(fns.front());
-            bool              equal = true;
-            for (size_t i = 1; i < fns.size() && equal; ++i) {
-                const std::string other = normalize(fns[i]);
-                if (other == first) {
-                    continue;
+            equal = false;
+            if (shown++ < 8) {
+                std::istringstream a(first), b(other);
+                std::string        la, lb;
+                while (std::getline(a, la) && std::getline(b, lb) && la == lb) {
                 }
-                equal = false;
-                if (shown++ < 8) {
-                    std::istringstream a(first), b(other);
-                    std::string        la, lb;
-                    while (std::getline(a, la) && std::getline(b, lb) && la == lb) {
-                    }
-                    samples += "  " + fns.front()->getName().str() + " vs " + fns[i]->getName().str() + ":\n    " +
-                               la + "\n    " + lb + "\n";
-                }
+                samples += "  " + fns.front()->getName().str() + " vs " + fns[i]->getName().str() + ":\n    " +
+                           la + "\n    " + lb + "\n";
             }
-            same += equal ? 1 : 0;
         }
-        return std::pair{ compared, same };
-    };
-    std::string       group_samples, member_samples;
-    const auto [compared, same]                 = compare(group_slots, group_samples);
-    const auto [members_compared, members_same] = compare(member_slots, member_samples);
+        same += equal ? 1 : 0;
+    }
+    uint64_t shared = 0, rows = 0;
+    for (const SchedGroup& sg : sched_) {
+        if (sg.rows.size() > 1) {
+            ++shared;
+            rows += sg.rows.size();
+        }
+    }
     std::fprintf(stderr,
                  "unit-code: %llu groups of multi-instance units compared, %llu identical up to design "
-                 "symbols; %llu groups span instances (%llu members), %llu belong to no instance\n"
-                 "unit-code: %llu member functions (by unit and process) of groups spanning instances "
-                 "compared across instances, %llu identical up to design symbols; %llu members in all\n%s%s",
-                 (unsigned long long)compared,
-                 (unsigned long long)same,
-                 (unsigned long long)cross,
-                 (unsigned long long)cross_members,
-                 (unsigned long long)unanchored,
-                 (unsigned long long)members_compared,
-                 (unsigned long long)members_same,
-                 (unsigned long long)member_fns_.size(),
-                 group_samples.c_str(),
-                 member_samples.c_str());
+                 "symbols; %llu schedule groups run several groups (%llu rows), %llu groups belong to no "
+                 "instance\n%s",
+                 (unsigned long long)compared, (unsigned long long)same, (unsigned long long)shared,
+                 (unsigned long long)rows, (unsigned long long)unanchored, samples.c_str());
 }
 
-// The single @clotho.inst.* global a function references, or null when it
-// references none, more than one, or one from a PHI operand (a shape the
-// ctx-to-parameter rewrite below does not handle). Eligible bodies
-// reference exactly their own instance context: every def-relative site
-// routes through ctx_field and def_relative_for restricts that to the
-// group's own anchor.
-llvm::GlobalVariable* Backend::only_inst_global(llvm::Function* fn) {
-    llvm::GlobalVariable* found = nullptr;
-    bool                  bad   = false;
-    auto scan = [&](auto&& self, llvm::Constant* c) -> void {
-        if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(c)) {
-            if (gv->getName().starts_with("clotho.inst.")) {
-                bad   = bad || (found != nullptr && found != gv);
-                found = gv;
-            }
-            return;
-        }
-        if (llvm::isa<llvm::GlobalValue>(c)) {
-            return;
-        }
-        for (const llvm::Use& op : c->operands()) {
-            if (auto* oc = llvm::dyn_cast<llvm::Constant>(op)) {
-                self(self, oc);
-            }
-        }
-    };
-    for (llvm::BasicBlock& bb : *fn) {
-        for (llvm::Instruction& in : bb) {
-            for (const llvm::Use& op : in.operands()) {
-                auto* c = llvm::dyn_cast<llvm::Constant>(op);
-                if (c == nullptr) {
-                    continue;
-                }
-                llvm::GlobalVariable* before = found;
-                scan(scan, c);
-                bad = bad || (llvm::isa<llvm::PHINode>(in) && found != before);
-            }
-        }
-    }
-    return bad ? nullptr : found;
-}
-
-bool Backend::constant_uses(const llvm::Constant* c, const llvm::GlobalVariable* gv) {
-    if (c == gv) {
-        return true;
-    }
-    if (llvm::isa<llvm::GlobalValue>(c)) {
-        return false;
-    }
-    for (const llvm::Use& op : c->operands()) {
-        if (auto* oc = llvm::dyn_cast<llvm::Constant>(op); oc != nullptr && constant_uses(oc, gv)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Clone `rep` into the definition's shared body: same (ptr, ptr) -> void
-// signature, with every constant reference to the rep instance's ctx
-// global rewritten to the first parameter. noinline keeps ONE compiled
-// copy — the inliner would otherwise re-expand the body into every stub,
-// undoing the compile-time win.
-llvm::Function* Backend::clone_with_ctx_param(llvm::Function* rep, llvm::GlobalVariable* ctx_gv) {
-    auto* shared = llvm::Function::Create(rep->getFunctionType(), llvm::Function::InternalLinkage,
-                                          rep->getName() + ".shared", *rep->getParent());
-    llvm::ValueToValueMapTy vmap;
-    auto                    ni = shared->arg_begin();
-    for (llvm::Argument& a : rep->args()) {
-        vmap[&a] = &*ni;
-        ++ni;
-    }
-    llvm::SmallVector<llvm::ReturnInst*, 4> rets;
-    llvm::CloneFunctionInto(shared, rep, vmap, llvm::CloneFunctionChangeType::LocalChangesOnly, rets);
-    // After the clone: CloneFunctionInto copies the rep's attributes,
-    // which would reset these.
-    shared->setDSOLocal(true);
-    shared->addFnAttr(llvm::Attribute::NoInline);
-    llvm::Argument* ctx_arg = shared->getArg(0);
-    ctx_arg->setName("ictx");
-    for (llvm::BasicBlock& bb : *shared) {
-        for (llvm::Instruction& in : bb) {
-            for (unsigned i = 0; i < in.getNumOperands(); ++i) {
-                llvm::Value* op = in.getOperand(i);
-                if (op == ctx_gv) {
-                    in.setOperand(i, ctx_arg);
-                    continue;
-                }
-                auto* ce = llvm::dyn_cast<llvm::ConstantExpr>(op);
-                if (ce == nullptr || !constant_uses(ce, ctx_gv)) {
-                    continue;
-                }
-                llvm::Instruction* repl = ce->getAsInstruction();
-                repl->insertBefore(in.getIterator());
-                for (unsigned k = 0; k < repl->getNumOperands(); ++k) {
-                    if (repl->getOperand(k) == ctx_gv) {
-                        repl->setOperand(k, ctx_arg);
-                    }
-                }
-                in.setOperand(i, repl);
-            }
-        }
-    }
-    return shared;
-}
-
-// Replace `fn`'s body with a musttail stub into the shared body, passing
-// this instance's ctx global as the first argument (identical (ptr, ptr)
-// prototypes, so the subscription/dispatch ABI is untouched).
-void Backend::rewrite_to_stub(llvm::Function* fn, llvm::Function* shared, llvm::GlobalVariable* ctx_gv) {
-    fn->deleteBody();
-    llvm::IRBuilderBase::InsertPoint saved = b_.saveIP();
-    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
-    auto* call = b_.CreateCall(shared->getFunctionType(), shared, { ctx_gv, fn->getArg(1) });
-    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-    b_.CreateRetVoid();
-    b_.restoreIP(saved);
-}
-
-// Share one compiled body across twin instances of a reused definition.
-// Candidates: thunk groups attributed to a reused-definition instance
-// (group_anchor_of_) whose lowered function leaves the state argument
-// unused (thunk bodies address storage through the anchors) and
-// references exactly its own instance-context global. Groups bucket by
-// normalize_shape — literal IR identity modulo the function's own name
-// and that one symbol — so the transformation applies only where it is
-// provably exact; the canonical-hash detector (report_dedup_stat) is a
-// statistic, not the gate. Each bucket of >= 2 keeps one shared body (a
-// clone of the first member with the ctx global replaced by a parameter)
-// and every member becomes a two-instruction musttail stub passing its
-// own ctx. Per-member NBA blocks / commit functions / ctx fills, VCD
-// indices, and wait machinery are untouched — members registered their
-// own during lowering; only body code is shared. Runs before
-// finalize_block_nba / emit_main (nothing reads group function bodies,
-// only their addresses). Disabled by --no-dedup.
-void Backend::share_twin_groups(const std::vector<llvm::Function*>& group_fns) {
+// Twin groups of a unit whose functions print the very same text run ONE
+// function. A thunk group's function takes its instance's record and addresses
+// the instance through it, so two instances' that are identical -- the same code
+// down to every symbol it names -- need only be compiled once: each row passes
+// its own record. The gate is the text itself, symbols included: unlike the
+// comparison up to design symbols (report_unit_code), identical text cannot name
+// two instances' storage. The shared function is noinline, or the inliner would
+// expand it into every entry and undo the compile-time win. Runs before the
+// entries exist, so nothing references a row yet. Disabled by --no-dedup.
+void Backend::merge_twin_bodies(std::vector<llvm::Function*>& group_fns) {
     const auto t0 = std::chrono::steady_clock::now();
-    uint64_t   eligible = 0;
-    struct Cand {
-        uint32_t              g;
-        llvm::GlobalVariable* ctx;
-    };
-    // Cheap structural pre-key: definition identity (ctx type) and size
-    // counts — NOT the def-local ordinal: twins whose ordinal never
-    // reaches the IR (no NBA block, sched constant equal by shape) may
-    // share across ordinals, and shape equality is the actual gate. Only
-    // pre-buckets of >= 2 pay the IR print — a singleton can share with
-    // nothing.
+    // Cheap structural pre-key: the module and size counts. Only pre-buckets of
+    // >= 2 pay the IR print -- a lone function can merge with nothing.
     struct PreKey {
-        const void* ctx_ty;
-        uint64_t    sizes;
-        bool        operator==(const PreKey&) const = default;
+        const llvm::Module* mod;
+        uint64_t            sizes;
+        bool                operator==(const PreKey&) const = default;
     };
     struct PreKeyHash {
         uint64_t operator()(const PreKey& k) const {
-            return ankerl::unordered_dense::detail::wyhash::hash(
-              reinterpret_cast<uintptr_t>(k.ctx_ty) ^ k.sizes);
+            return ankerl::unordered_dense::detail::wyhash::hash(reinterpret_cast<uintptr_t>(k.mod) ^ k.sizes);
         }
     };
-    ankerl::unordered_dense::map<PreKey, std::vector<Cand>, PreKeyHash> pre;
+    ankerl::unordered_dense::map<PreKey, std::vector<uint32_t>, PreKeyHash> pre;
+    uint64_t                                                                eligible = 0;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
-        if (!thunk_group_[g] || group_anchor_of_[g] == SignalSlot::no_anchor) {
-            continue;
-        }
-        llvm::Function* fn = group_fns[g];
-        if (!fn->getArg(0)->use_empty()) {
-            continue;
-        }
-        llvm::GlobalVariable* ctx = only_inst_global(fn);
-        if (ctx == nullptr || ctx != anchors_[group_anchor_of_[g]].ctx_gv) {
+        if (!thunk_group_[g] || group_unit_anchor_[g] == SignalSlot::no_anchor) {
             continue;
         }
         ++eligible;
         uint64_t insts = 0, bbs = 0;
-        for (const llvm::BasicBlock& bb : *fn) {
+        for (const llvm::BasicBlock& bb : *group_fns[g]) {
             ++bbs;
             insts += bb.size();
         }
-        const Anchor& a = anchors_[group_anchor_of_[g]];
-        pre[PreKey{ a.ctx_ty, bbs << 24 | insts << 40 }].push_back({ g, ctx });
+        pre[PreKey{ group_fns[g]->getParent(), bbs << 24 | insts << 40 }].push_back(g);
     }
-    llvm::ModuleSlotTracker mst(&env_->llmod, /*ShouldInitializeAllMetadata=*/false);
-    ankerl::unordered_dense::map<std::string, std::vector<Cand>> buckets;
-    for (auto& [pk, cs] : pre) {
-        if (cs.size() < 2) {
+    ankerl::unordered_dense::map<const llvm::Module*, std::unique_ptr<llvm::ModuleSlotTracker>> trackers;
+    std::vector<std::vector<uint32_t>>                                                         twins;
+    for (const auto& [key, gs] : pre) {
+        if (gs.size() < 2) {
             continue;
         }
-        for (const Cand& c : cs) {
-            buckets[normalize_shape(group_fns[c.g], &mst)].push_back(c);
+        auto& mst = trackers[key.mod];
+        if (mst == nullptr) {
+            mst = std::make_unique<llvm::ModuleSlotTracker>(key.mod, /*ShouldInitializeAllMetadata=*/false);
+        }
+        ankerl::unordered_dense::map<std::string, std::vector<uint32_t>> by_text;
+        for (const uint32_t g : gs) {
+            by_text[normalize_shape(group_fns[g], mst.get(), /*number_inst_symbols=*/false)].push_back(g);
+        }
+        for (auto& [text, same] : by_text) {
+            if (same.size() >= 2) {
+                twins.push_back(std::move(same));
+            }
         }
     }
     const auto t1 = std::chrono::steady_clock::now();
-    uint64_t sets = 0, members = 0;
-    for (auto& [shape, cs] : buckets) {
-        if (cs.size() < 2) {
-            continue;
-        }
+    uint64_t   sets = 0, members = 0;
+    for (std::vector<uint32_t>& twin : twins) {
+        std::sort(twin.begin(), twin.end());
         ++sets;
-        members += cs.size();
-        llvm::Function* shared = clone_with_ctx_param(group_fns[cs.front().g], cs.front().ctx);
-        for (const Cand& c : cs) {
-            rewrite_to_stub(group_fns[c.g], shared, c.ctx);
+        members += twin.size();
+        llvm::Function* shared = group_fns[twin.front()];
+        shared->addFnAttr(llvm::Attribute::NoInline);
+        for (size_t i = 1; i < twin.size(); ++i) {
+            group_fns[twin[i]]->eraseFromParent();
+            group_fns[twin[i]] = shared;
         }
     }
     if (stat_on(config_.stats, Stat::Dedup)) {
@@ -604,7 +447,7 @@ void Backend::share_twin_groups(const std::vector<llvm::Function*>& group_fns) {
         };
         std::fprintf(stderr,
                      "dedup-share: %llu bodies -> %llu shared (%llu eligible; bucket %lld ms, "
-                     "rewrite %lld ms)\n",
+                     "merge %lld ms)\n",
                      (unsigned long long)members, (unsigned long long)sets,
                      (unsigned long long)eligible, (long long)ms(t1 - t0), (long long)ms(t2 - t1));
     }
