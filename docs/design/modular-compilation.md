@@ -130,7 +130,8 @@ Unit
   children   vector<ChildSlot>     the instances this body declares
   bound_ports                      ports the instantiating parent binds
   disable_targets                  UnitDisableTarget{is_task, flush_proc, name, import}
-  monitors, cover_types, class descriptors, DPI exports
+  cover_types                      UnitCoverType{CoverType, name, import}
+  monitors, class descriptors, DPI exports
 ```
 
 ### Handles
@@ -143,7 +144,7 @@ lives. Instruction bodies therefore keep their shape; only the table behind the
 handle changes.
 
 Every other cross-table id in a body is unit-local too: assertion monitors,
-covergroup types, `disable` targets (importable, because a remote `disable` can
+covergroup types (importable: an instance builds a package's type), `disable` targets (importable, because a remote `disable` can
 name a block in another instance), and the interface instances `IfaceRef` names
 (an index into `inst_refs` instead of a global scope id). `Ir::rebased` moves a
 body between handle spaces through a `HandleMapper`, one entry point per
@@ -166,7 +167,7 @@ not members. A name two members share cannot be imported.
 | Import | Target |
 |---|---|
 | `Port(k)` | Whatever the instantiating parent binds to this unit's bound port `k`: a signal for an inout, ref or merged-nettype port, or for a contribution to one (below). |
-| `Member(ref, name)` | The member `name` of the instance `ref` reaches: a child's port read by a port copy, a downward or upward hierarchical reference, a package item, a hierarchical task call. |
+| `Member(ref, name)` | The member `name` of the instance `ref` reaches: a child's port read by a port copy, a downward or upward hierarchical reference, a package item, a package's covergroup type, a hierarchical task call. |
 | `Representative(unit, name)` | The member `name` of any instance of `unit`. Supplies layout only, for a member reached through a virtual interface handle. |
 
 An `InstanceRef` is a base followed by a path of child slots. The base is the
@@ -354,9 +355,13 @@ Each of these makes lowered IR depend on something outside the unit:
   of `CoverOp::New`, so `CoverType` carries no scope; a declaration initializer
   reads it like any other body), hidden temporaries are numbered per name
   prefix, and assertion state is named by an instance-relative ordinal. Still
-  text: virtual-interface bodies and `$printtimescale(inst)`. A package
-  covergroup type built by two instances is still lowered once per top and
-  aborts partition, like a package class.
+  text: virtual-interface bodies and `$printtimescale(inst)`. A covergroup type
+  belongs to the unit that declares it and instances build it through an
+  import, so a package's type built by two instances no longer aborts partition.
+  Still lowered once per Lowerer that reaches it (a second top gets an ordinal in
+  its import name, like a package class), and the coverage-event process of a
+  package type stays with the first instance that builds it, which splits that
+  specialization.
 - Whole-top facts that change other modules' IR: `forceable_`, resolved nets,
   `events_merge_`, `WaitedProps`, `assert_control_used_`, and which blocks are
   `disable` targets. The last is joined over the instances of a specialization

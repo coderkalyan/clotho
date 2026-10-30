@@ -57,6 +57,12 @@ struct Attribution {
     // that refers to it, or to the glue unit when none does.
     std::vector<Owner>       functions;
     std::vector<std::string> function_names;
+    // Owner and import name (UnitCoverType::name) of each flat covergroup type,
+    // indexed like Module::cover_types: the unit that declares the group. An
+    // Unknown type belongs to the unit of the first body that names it, or to the
+    // glue unit when none does.
+    std::vector<Owner>       cover_types;
+    std::vector<std::string> cover_type_names;
     // Import name of each flat `disable` target, indexed by target id: the
     // path of the named block or task relative to its unit.
     std::vector<std::string> disable_target_names;

@@ -449,6 +449,7 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
 
     const uint32_t idx = static_cast<uint32_t>(module_.cover_types.size());
     module_.cover_types.push_back(std::move(ct));
+    own_cover_type(idx, cgt);
     // Insert BEFORE building the sample body: a coverpoint expression cannot
     // reach this covergroup, but the body build reads cover_decls_ for the
     // index, and an exception from it must not leave a half-built entry that a

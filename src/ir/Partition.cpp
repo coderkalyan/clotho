@@ -326,6 +326,11 @@ private:
         }
         mon_unit_.assign(m_.monitors.size(), kNone);
         cover_unit_.assign(m_.cover_types.size(), kNone);
+        for (uint32_t t = 0; t < cover_unit_.size(); ++t) {
+            if (t < a_.cover_types.size() && a_.cover_types[t].kind != Owner::Kind::Unknown) {
+                cover_unit_[t] = unit_of(a_.cover_types[t]);
+            }
+        }
         target_unit_.assign(m_.disable_targets, kNone);
         // Where each target's forked children run, for the targets no block
         // declares (below).
@@ -484,7 +489,9 @@ private:
         for (uint32_t i = 0; i < cover_.size(); ++i) {
             const uint32_t u = cover_unit_[i] == kNone ? glue_ : cover_unit_[i];
             cover_[i]        = Slot{ .unit = u, .local = static_cast<uint32_t>(d_.units[u].cover_types.size()) };
-            d_.units[u].cover_types.push_back(m_.cover_types[i]);
+            d_.units[u].cover_types.push_back(
+              UnitCoverType{ .type = m_.cover_types[i],
+                             .name = i < a_.cover_type_names.size() ? a_.cover_type_names[i] : std::string() });
         }
         target_.assign(m_.disable_targets, Slot{});
         for (uint32_t t = 0; t < target_.size(); ++t) {
@@ -528,7 +535,7 @@ private:
                 case HandleFamily::Monitor:
                     return local_of(p_.mon_, h, "an assertion monitor another unit owns");
                 case HandleFamily::CoverType:
-                    return local_of(p_.cover_, h, "a covergroup type another unit owns");
+                    return p_.cover_in(u_, h);
                 case HandleFamily::DisableTarget:
                     return p_.target_in(u_, h);
             }
@@ -644,6 +651,31 @@ private:
               Import{ .kind = Import::Kind::Member, .inst = instance_ref(u, s.unit), .member = target.name });
             it->second = static_cast<uint32_t>(unit.disable_targets.size());
             unit.disable_targets.push_back(UnitDisableTarget{ .is_task = target.is_task, .import = imp });
+        }
+        return it->second;
+    }
+
+    // A covergroup type another unit declares (a package's, built by an instance):
+    // an extern declaration of the declaring unit's entry, named relative to it.
+    uint32_t cover_in(uint32_t u, uint32_t t) {
+        assert(t < cover_.size());
+        const Slot& s = cover_[t];
+        if (s.unit == u) {
+            return s.local;
+        }
+        auto [it, inserted] = memo_[u].cover_types.try_emplace(t, 0);
+        if (inserted) {
+            Unit&             unit = d_.units[u];
+            const std::string name = d_.units[s.unit].cover_types[s.local].name;
+            if (name.empty()) {
+                broken("a covergroup type another unit names has no import name",
+                       std::to_string(t) + " from unit '" + unit.def_name + "'");
+            }
+            const auto imp = static_cast<uint32_t>(unit.imports.size());
+            unit.imports.push_back(
+              Import{ .kind = Import::Kind::Member, .inst = instance_ref(u, s.unit), .member = name });
+            it->second = static_cast<uint32_t>(unit.cover_types.size());
+            unit.cover_types.push_back(UnitCoverType{ .import = imp });
         }
         return it->second;
     }
@@ -933,6 +965,7 @@ private:
         ankerl::unordered_dense::map<uint32_t, uint32_t> functions;
         ankerl::unordered_dense::map<uint32_t, uint32_t> iface;
         ankerl::unordered_dense::map<uint32_t, uint32_t> targets;
+        ankerl::unordered_dense::map<uint32_t, uint32_t> cover_types;
         ankerl::unordered_dense::map<uint32_t, uint32_t> layouts;
     };
 

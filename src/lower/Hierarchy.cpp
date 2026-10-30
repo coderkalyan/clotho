@@ -226,22 +226,36 @@ std::string Lowerer::import_name(const Symbol& decl) const {
     return name;
 }
 
-void Lowerer::own_function(ir::FunctionId id, const Symbol& decl, std::string_view suffix) {
-    const UnitOwners::Entry& e    = owner_in(decl.getParentScope());
-    std::string              name = import_name(decl);
-    name += suffix;
-    // TODO: a class declared in a package or `$unit` is lowered once per
-    // Lowerer that reaches it (its Refs are nominal per Lowerer), so its copy
-    // thunk and randomize bodies exist once per top. Until classes lower once,
-    // in their declaring unit, the later copies take an ordinal so every import
-    // name stays unique within its unit.
-    const std::string key =
-      std::to_string(static_cast<uint32_t>(e.owner.kind)) + ":" + std::to_string(e.owner.index) + ":" + name;
-    const uint32_t seen = owners_->names[key]++;
+// `name` as an import name unique within its table of the unit `e` owns.
+// TODO: a class (or covergroup type) declared in a package or `$unit` is lowered
+// once per Lowerer that reaches it (its Refs are nominal per Lowerer), so its copy
+// thunk, randomize and sample bodies exist once per top. Until those lower once, in
+// their declaring unit, the later copies take an ordinal so every import name stays
+// unique within its unit.
+std::string Lowerer::unique_import_name(const UnitOwners::Entry& e, std::string name, std::string_view table) {
+    const std::string key = std::string(table) + std::to_string(static_cast<uint32_t>(e.owner.kind)) + ":" +
+                            std::to_string(e.owner.index) + ":" + name;
+    const uint32_t    seen = owners_->names[key]++;
     if (seen != 0) {
         name += "#" + std::to_string(seen + 1);
     }
-    record_function(id, e.owner, std::move(name));
+    return name;
+}
+
+void Lowerer::own_function(ir::FunctionId id, const Symbol& decl, std::string_view suffix) {
+    const UnitOwners::Entry& e = owner_in(decl.getParentScope());
+    record_function(id, e.owner, unique_import_name(e, import_name(decl) + std::string(suffix), ""));
+}
+
+void Lowerer::own_cover_type(uint32_t idx, const Symbol& decl) {
+    const UnitOwners::Entry& e = owner_in(decl.getParentScope());
+    ir::Attribution&         a = owners_->attribution;
+    if (a.cover_types.size() <= idx) {
+        a.cover_types.resize(idx + 1);
+        a.cover_type_names.resize(idx + 1);
+    }
+    a.cover_types[idx]      = e.owner;
+    a.cover_type_names[idx] = unique_import_name(e, import_name(decl), "cover:");
 }
 
 void Lowerer::record_function(ir::FunctionId id, ir::Owner owner, std::string name) {

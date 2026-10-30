@@ -1415,7 +1415,15 @@ void print_unit(const Design& d, UnitId id, std::ostream& os) {
            << u.monitors[i].banner << "\n";
     }
     for (size_t i = 0; i < u.cover_types.size(); ++i) {
-        os << "  covergroup " << i << ": " << u.cover_types[i].name << "\n";
+        const UnitCoverType& t = u.cover_types[i];
+        os << "  covergroup " << i << ": " << t.type.name;
+        if (!t.name.empty()) {
+            os << " '" << t.name << "'";
+        }
+        if (t.import != kLocal) {
+            os << " extern i" << t.import;
+        }
+        os << "\n";
     }
     for (size_t i = 0; i < u.functions.size(); ++i) {
         const UnitFunction& f = u.functions[i];

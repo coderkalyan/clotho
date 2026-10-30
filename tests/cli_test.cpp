@@ -1116,6 +1116,35 @@ TEST_CASE("cli: declaration initializers run in elaboration order across instanc
                    "init top.t1 n=5\ninit mid.x n=6\ninit top.m2.l1 n=7\ninit mid.y n=8\ninit top.m2.l2 n=9\n"
                    "early=103 late=110\n");
 }
+
+// A covergroup type a package declares belongs to no instance: every instance that
+// builds it refers to the package's type, so the instances of a module that does
+// still share one unit, and the report names each by the instance that built it.
+TEST_CASE("cli: instances of one module share a unit when each builds a package's covergroup") {
+    const Scratch  s;
+    const fs::path report = s.path("coverage.txt");
+    const fs::path design = s.write("design.sv", R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+        endpackage
+        module leaf(input bit [1:0] hit);
+          import p::*;
+          pcg lc = new;
+          initial begin #1 pv = hit; lc.sample(); end
+        endmodule
+        module top;
+          leaf u1(2'd1);
+          leaf u2(2'd2);
+        endmodule
+    )");
+    const Result   r = s.run(std::format("run --stat=units --coverage \"{}\" \"{}\"", report.string(), design.string()));
+    CHECK(r.code == 0);
+    CHECK(split_specializations(r.err) == 0);
+    const std::string cov = clotho::test::detail::read_file(report);
+    CHECK(contains(cov, "instance top.u1.pcg "));
+    CHECK(contains(cov, "instance top.u2.pcg_1 "));
+}
 #endif // !defined(_WIN32)
 
 TEST_CASE("cli: --sanitize=divzero reports a 2-state divide by zero and leaves the result alone") {

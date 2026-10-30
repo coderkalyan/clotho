@@ -954,8 +954,7 @@ TEST_CASE("the report names a covergroup in a generate block by the block too") 
 
 // A covergroup type declared in a package belongs to no instance: built by the
 // package it is named by its type alone, and built by a module instance it is
-// named by that instance. (A package type built by two instances still aborts in
-// partition: the type is lowered once per top, like a package class.)
+// named by that instance.
 TEST_CASE("a package covergroup is named by the instance that builds it, if any") {
     const std::string report = report_of(R"(
         package p;
@@ -974,4 +973,63 @@ TEST_CASE("a package covergroup is named by the instance that builds it, if any"
     )");
     CHECK(report.find("instance pcg ") != std::string::npos);
     CHECK(report.find("instance top.u1.pcg ") != std::string::npos);
+}
+
+// A package's covergroup type is one type however many instances build it. Each
+// instance is named by the instance that built it (the second of a type takes the
+// creation ordinal, `_1`), keeps its own bin counts, and the type's coverage
+// aggregates them (LRM 19.11.3). Main names the second one `top.u1.pcg_1`.
+TEST_CASE("a package covergroup built by two instances is one type named by each") {
+    const std::string report = report_of(R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+        endpackage
+        module leaf(input bit [1:0] hit);
+          import p::*;
+          pcg lc = new;
+          initial begin #1 pv = hit; lc.sample(); end
+        endmodule
+        module top;
+          leaf u1(2'd1);
+          leaf u2(2'd2);
+        endmodule
+    )");
+    const std::string u1 = instance_block(report, "top.u1.pcg");
+    const std::string u2 = instance_block(report, "top.u2.pcg_1");
+    CAPTURE(report);
+    REQUIRE_FALSE(u1.empty());
+    REQUIRE_FALSE(u2.empty());
+    for (uint32_t bin = 0; bin < 4; ++bin) {
+        CAPTURE(bin);
+        CHECK(bin_count(u1, "auto[" + std::to_string(bin) + "]") == (bin == 1 ? 1 : 0));
+        CHECK(bin_count(u2, "auto[" + std::to_string(bin) + "]") == (bin == 2 ? 1 : 0));
+    }
+    CHECK(report.find("  type pcg  coverage  25.00%  bins 2/8  instances 2") != std::string::npos);
+}
+
+// The same type built at package level and by two instances of a module: the
+// package's own group is named by the type alone, each module instance by its
+// path. (The package and the top that builds it each lower the type, and both
+// copies are the package unit's.)
+TEST_CASE("a package covergroup built by the package and by two instances") {
+    const std::string report = report_of(R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+          pcg pc = new;
+        endpackage
+        module leaf;
+          import p::*;
+          pcg lc;
+          initial begin lc = new; lc.sample(); pc.sample(); end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    CHECK(report.find("instance pcg ") != std::string::npos);
+    CHECK(report.find("instance top.u1.pcg ") != std::string::npos);
+    CHECK(report.find("instance top.u2.pcg") != std::string::npos);
 }

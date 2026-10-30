@@ -4999,6 +4999,12 @@ private:
     void own_function(ir::FunctionId id, const slang::ast::Symbol& decl, std::string_view suffix = {});
     // Attribute function `id` to `owner`, importable as `name`.
     void record_function(ir::FunctionId id, ir::Owner owner, std::string name);
+    // Attribute covergroup type `idx` (Module::cover_types) to the unit declaring
+    // `decl`, importable as `decl`'s path relative to that unit.
+    void own_cover_type(uint32_t idx, const slang::ast::Symbol& decl);
+    // `name` as an import name no other of its table (`table` tags it: "" for
+    // functions) names in the unit `e` owns: the nth repeat takes `#n`.
+    std::string unique_import_name(const UnitOwners::Entry& e, std::string name, std::string_view table);
     // Attribute an unscoped signal to a unit (UnitOwners).
     void own_signal(ir::Signal sig, ir::Owner owner);
 

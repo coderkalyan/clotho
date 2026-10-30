@@ -41,6 +41,8 @@ struct FlatInstance {
     std::vector<uint32_t> processes;
     // Unit-local `disable` target -> flat target id.
     std::vector<uint32_t> targets;
+    // Unit-local covergroup type -> flat index into Module::cover_types.
+    std::vector<uint32_t> cover_types;
 };
 
 class Flattener {
@@ -109,8 +111,8 @@ private:
         return ii;
     }
 
-    // Give every locally defined signal and function of every instance its
-    // flat handle, in instance order then unit order.
+    // Give every locally defined signal, function, `disable` target and covergroup
+    // type of every instance its flat handle, in instance order then unit order.
     void allocate() {
         for (FlatInstance& fi : insts_) {
             const Unit& u = d_.unit(fi.unit);
@@ -134,6 +136,13 @@ private:
                 if (u.disable_targets[h].import == kLocal) {
                     fi.targets[h] = m_.disable_targets++;
                     m_.disable_target_is_task.push_back(u.disable_targets[h].is_task ? 1 : 0);
+                }
+            }
+            fi.cover_types.assign(u.cover_types.size(), kNone);
+            for (uint32_t h = 0; h < u.cover_types.size(); ++h) {
+                if (u.cover_types[h].import == kLocal) {
+                    fi.cover_types[h] = static_cast<uint32_t>(m_.cover_types.size());
+                    m_.cover_types.push_back(u.cover_types[h].type);
                 }
             }
             signal_entries_ += fi.signals.size();
@@ -167,6 +176,17 @@ private:
                 const uint32_t t      = walk(ii, i.inst);
                 const uint32_t local  = target_named(insts_[t].unit, i.member);
                 insts_[ii].targets[h] = insts_[t].targets[local];
+            }
+            for (uint32_t h = 0; h < u.cover_types.size(); ++h) {
+                const uint32_t imp = u.cover_types[h].import;
+                if (imp == kLocal) {
+                    continue;
+                }
+                const Import& i = u.imports[imp];
+                assert(i.kind == Import::Kind::Member && "a covergroup type is imported by member");
+                const uint32_t t          = walk(ii, i.inst);
+                const uint32_t local      = cover_type_named(insts_[t].unit, i.member);
+                insts_[ii].cover_types[h] = insts_[t].cover_types[local];
             }
         }
     }
@@ -331,6 +351,17 @@ private:
         return lookup(names, unit, name);
     }
 
+    uint32_t cover_type_named(UnitId unit, const std::string& name) {
+        auto& names = names_of(cover_type_names_, unit, [&](const Unit& u, NameMap& out) {
+            for (uint32_t h = 0; h < u.cover_types.size(); ++h) {
+                if (u.cover_types[h].import == kLocal && !u.cover_types[h].name.empty()) {
+                    note_name(out, u.cover_types[h].name, h);
+                }
+            }
+        });
+        return lookup(names, unit, name);
+    }
+
     // The member `name` of `unit`. A miss or an ambiguity is a frontend bug;
     // name it before stopping.
     uint32_t lookup(const auto& names, UnitId unit, const std::string& name) const {
@@ -367,14 +398,13 @@ private:
         }
     }
 
-    // Maps one instance's unit-local handles onto the flat module: signals and
-    // functions through the instance's tables, the per-unit id spaces by the
-    // instance's base in each.
+    // Maps one instance's unit-local handles onto the flat module: signals,
+    // functions, covergroup types and `disable` targets through the instance's
+    // tables, the per-unit monitor ids by the instance's base.
     struct FlatMapper final : HandleMapper {
         const FlatInstance*   fi = nullptr;
         std::vector<uint32_t> iface_scopes;
-        uint32_t              monitor_base    = 0;
-        uint32_t              cover_type_base = 0;
+        uint32_t              monitor_base = 0;
 
         uint32_t map(HandleFamily family, uint32_t h) override {
             switch (family) {
@@ -391,7 +421,8 @@ private:
                 case HandleFamily::Monitor:
                     return monitor_base + h;
                 case HandleFamily::CoverType:
-                    return cover_type_base + h;
+                    assert(h < fi->cover_types.size());
+                    return fi->cover_types[h];
                 case HandleFamily::DisableTarget:
                     assert(h < fi->targets.size());
                     return fi->targets[h];
@@ -421,8 +452,7 @@ private:
                 assert(insts_[target].scope != Process::no_scope && "an interface reference names a static unit");
                 mapper.iface_scopes.push_back(insts_[target].scope);
             }
-            mapper.monitor_base    = static_cast<uint32_t>(m_.monitors.size());
-            mapper.cover_type_base = static_cast<uint32_t>(m_.cover_types.size());
+            mapper.monitor_base = static_cast<uint32_t>(m_.monitors.size());
 
             for (uint32_t h = 0; h < u.functions.size(); ++h) {
                 if (u.functions[h].import != kLocal) {
@@ -450,10 +480,6 @@ private:
                 AssertionMonitor copy = mon;
                 copy.clock = static_cast<Signal>(mapper.map(HandleFamily::Signal, static_cast<uint32_t>(mon.clock)));
                 m_.monitors.push_back(std::move(copy));
-            }
-
-            for (const CoverType& ct : u.cover_types) {
-                m_.cover_types.push_back(ct);
             }
 
             for (const ClassDesc& cd : u.class_descs) {
@@ -619,6 +645,7 @@ private:
     std::vector<std::optional<NameMap>> signal_names_;
     std::vector<std::optional<NameMap>> function_names_;
     std::vector<std::optional<NameMap>> target_names_;
+    std::vector<std::optional<NameMap>> cover_type_names_;
     // Total unit-local signal / function entries over every instance: the
     // longest acyclic extern-declaration chain.
     size_t signal_entries_   = 0;

@@ -80,7 +80,7 @@ struct Import {
         Port,
         // The member named `member` of the instance `inst` reaches: a child's
         // port a port copy reads or writes, a hierarchical reference, a package
-        // item, a hierarchical task call.
+        // item, a covergroup type, a hierarchical task call.
         Member,
         // The member named `member` of any instance of `unit`. Supplies layout
         // only: a member reached through a virtual interface handle takes its
@@ -96,7 +96,8 @@ struct Import {
     // Kind::Representative.
     UnitId unit{};
     // Kind::Member and Kind::Representative: the target's unit-relative name,
-    // as the target unit's SignalInfo::name / UnitFunction::name spell it.
+    // as the target unit's SignalInfo::name / UnitFunction::name / UnitCoverType::name
+    // spell it.
     std::string member;
 
     bool operator==(const Import&) const = default;
@@ -189,6 +190,22 @@ struct UnitDisableTarget {
     bool operator==(const UnitDisableTarget&) const = default;
 };
 
+// A unit's covergroup type table entry: a type the unit declares, or an extern
+// declaration of another unit's (a package's covergroup an instance constructs).
+struct UnitCoverType {
+    // The model. A type carries nothing of the instance that constructs it. Unset
+    // for an extern declaration: the definition's entry is the model.
+    CoverType type;
+    // The name other units import the type by: its declaration's path relative to
+    // the unit.
+    std::string name;
+    // kLocal for a type the unit declares; else the Unit::imports index of the
+    // declaration.
+    uint32_t import = kLocal;
+
+    bool operator==(const UnitCoverType&) const = default;
+};
+
 struct Unit {
     UnitKind kind = UnitKind::Module;
     // Definition name (InstanceScope::def_name of every instance).
@@ -208,9 +225,8 @@ struct Unit {
     std::vector<BoundPort>   bound_ports;
     // Indexed by the unit-local monitor id (ExpectInfo, ExpectWake).
     std::vector<AssertionMonitor> monitors;
-    // Indexed by the unit-local covergroup type index (CoverInfo::type_idx). A type
-    // carries nothing of the instance that constructs it.
-    std::vector<CoverType> cover_types;
+    // Indexed by the unit-local covergroup type index (CoverInfo::type_idx).
+    std::vector<UnitCoverType> cover_types;
     // Indexed by the unit-local `disable` target id (LRM 9.6.2).
     std::vector<UnitDisableTarget> disable_targets;
     // Class descriptors, FunctionIds unit-local.
