@@ -308,7 +308,7 @@ A thunk-elided group links nothing: it has no handle, and having no suspend it c
 be inside the target while any other process runs — so the list stays empty and the
 `disable` is the no-op the LRM already prescribes. A group holding either half of the
 remote form is nevertheless forced to a real coroutine (`is_simple_always`), because
-the disabler's baked target id is per-instance and only a thunk group is ever shared
+the disabler's baked target id is per-instance, so a group that names one taints its lowering and every instance lowers its own (groups are otherwise lowered once per unit)
 across instances.
 
 ### Aborting: force-wake exactly once, then a structured exit — LANDED
