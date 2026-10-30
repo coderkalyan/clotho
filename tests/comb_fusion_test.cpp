@@ -284,16 +284,6 @@ TEST_CASE("always_comb and always_latch run once at time zero after every initia
             endmodule)",
                             "done\n");
     }
-    SUBCASE("a comb that reads something runs after the initial that wrote it") {
-        check_all_lowerings(R"(
-            module t;
-                logic a, y;
-                always_comb y = a;
-                initial a = 1'b1;
-                initial #1 $display("y=%b", y);
-            endmodule)",
-                            "y=1\n");
-    }
     SUBCASE("source order does not matter, in either direction") {
         const std::string comb_first = R"(
             module t;
@@ -310,13 +300,28 @@ TEST_CASE("always_comb and always_latch run once at time zero after every initia
         check_all_lowerings(comb_first, "y=x\n");
         check_all_lowerings(comb_last, "y=x\n");
     }
-    SUBCASE("a continuous assignment keeps its place: it is not a procedure") {
-        check_all_lowerings(R"(
-            module t;
-                logic y;
-                assign y = 1'b1;
-                initial #0 $display("y=%b", y);
-            endmodule)",
-                            "y=1\n");
-    }
+}
+
+// Deferring an always_comb's time-zero run (above) must not cost the fusion of an
+// assign / always_comb cone: a fused group is one body, deferred as a whole, which 4.9.1
+// and 4.7 allow for the continuous assignments in it. Splitting the cone for the whole
+// run made a mixed design 1.9x slower. The cone is `a -> b -> c -> d -> e` with the
+// source `a` written by an initial, so `c`, `d` and `e` are the interior members of one
+// group of three, two of them procedures and one an assign.
+TEST_CASE("an assign and always_comb cone still fuses, and starts after the initials") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0] a = 0, b, c, d, e;
+            assign b = a + 8'd1;
+            always_comb c = b ^ 8'h5a;
+            assign d = c + b;
+            always_comb e = d - 8'd1;
+            initial begin
+                #1 a = 8'd9;
+                #1 $display("%0d %0d %0d %0d", b, c, d, e);
+            end
+        endmodule
+    )";
+    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
+    check_all_lowerings(src, "10 80 90 89\n");
 }

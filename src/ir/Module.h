@@ -225,8 +225,10 @@ struct Process {
     // happens "after all initial and always procedures have been started", so that its
     // outputs are consistent with their effects on its inputs. The seed loop enqueues
     // such a process behind every other body instead of in source order. A continuous
-    // assignment is also `self_start` but is not a procedure, so it keeps its place
-    // (LRM 4.9.1 leaves its time-zero order open). Meaningful only with `self_start`.
+    // assignment is also `self_start` but is not a procedure, so alone it keeps its place
+    // (LRM 4.9.1 leaves its time-zero order open); fused into one group with such a
+    // procedure it starts with it, a group being one body. Meaningful only with
+    // `self_start`.
     bool starts_after_procedures = false;
     // A continuously-active process whose home region is the reactive region set
     // rather than the active one: a continuous construct declared inside a

@@ -420,6 +420,10 @@ of a later `initial` finds the block started and parked, so it ends it (9.6.2).
 iverilog does the same.
 
 A continuous assignment also evaluates once at time zero but is not a procedure,
-so it is not deferred; 4.9.1 leaves its order against the procedures open.
+so alone it is not deferred; 4.9.1 leaves its order against the procedures open. One
+that comb fusion puts in the same group as an `always_comb` starts with it, because a
+group is one body: that is inside the same freedom (4.7 lets active events run in any
+order), and splitting every `assign` / `always_comb` cone to avoid it cost 1.9x on a
+mixed design.
 
 Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `deferred_comb`), `src/ir/Module.h` (`Process::starts_after_procedures`), `src/lower/Statements.cpp` (`lower_procedural_block`). Tests: `tests/comb_fusion_test.cpp` ("always_comb and always_latch run once at time zero after every initial has started").
