@@ -1445,14 +1445,58 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
     }
     const ir::Index over = b.binary(ir::Inst::Tag::Gt, wide, limit, l);
     const ir::Index top  = b.constant(module_.pool.put_int(ty, INT64_MAX), l);
+    ir::Index       known;
     if (!is_signed) {
-        return b.select(over, top, ticks, l);
+        known = b.select(over, top, ticks, l);
+    } else {
+        const ir::Index neg_limit =
+          b.binary(ir::Inst::Tag::Sub, b.constant(module_.pool.put_int(wide_ty, 0), l), limit, l);
+        const ir::Index under = b.binary(ir::Inst::Tag::Lt, wide, neg_limit, l);
+        const ir::Index bottom =
+          b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(-static_cast<int64_t>(INT64_MAX))), l);
+        known = b.select(over, top, b.select(under, bottom, ticks, l), l);
     }
-    const ir::Index neg_limit = b.binary(ir::Inst::Tag::Sub, b.constant(module_.pool.put_int(wide_ty, 0), l), limit, l);
-    const ir::Index under     = b.binary(ir::Inst::Tag::Lt, wide, neg_limit, l);
-    const ir::Index bottom =
-      b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(-static_cast<int64_t>(INT64_MAX))), l);
-    return b.select(over, top, b.select(under, bottom, ticks, l), l);
+    // $time and $stime read the simulation clock, which is never unknown, though
+    // their `time` type is 4-state: the commonest %t operand pays nothing extra.
+    const auto* call = arg.as_if<CallExpression>();
+    if (!arg.type->isFourState() || (call != nullptr && call->isSystemCall() &&
+                                     (call->getSubroutineName() == "$time" || call->getSubroutineName() == "$stime"))) {
+        return known;
+    }
+
+    // An operand with an x or z bit is not a time, so no tick count stands for it:
+    // the argument becomes a 64-bit 4-state word the renderer classifies with the
+    // %d rule (LRM 21.2.1.3, docs/LRM_NOTES.md note 41): all bits x is all x, all z
+    // is all z, otherwise one x bit when any bit is x, else one z bit. The counts
+    // are the operand's own, at its own width, which the 64-bit word could not
+    // carry.
+    const ir::Ref  ty4   = make_int_type(64, true, is_signed);
+    const ir::Ref  cnt_t = make_int_type(32, false, true);
+    const uint32_t w     = arg.type->getBitWidth();
+    const auto     fill  = [&](bool is_z) {
+        slang::SVInt k = is_z ? slang::SVInt::createFillZ(64, is_signed) : slang::SVInt::createFillX(64, is_signed);
+        return b.constant(svint_to_ref(k, ty4), l);
+    };
+    // One x (z) bit and the rest zero: fromDigits takes the digits most significant first.
+    const auto one_bit = [&](bool is_z) {
+        std::vector<slang::logic_t> digits(64, slang::logic_t(0));
+        digits.back() = is_z ? slang::logic_t::z : slang::logic_t::x;
+        return b.constant(svint_to_ref(slang::SVInt::fromDigits(64,
+                                                                slang::LiteralBase::Binary,
+                                                                is_signed,
+                                                                /*anyUnknown=*/true,
+                                                                digits),
+                                       ty4),
+                          l);
+    };
+    const ir::Index nx    = b.count_bits(v, ir::CountX, l);
+    const ir::Index nz    = b.count_bits(v, ir::CountZ, l);
+    const ir::Index width = b.constant(module_.pool.put_int(cnt_t, w), l);
+    const ir::Index zero  = b.constant(module_.pool.put_int(cnt_t, 0), l);
+    ir::Index       cls   = b.select(b.binary(ir::Inst::Tag::Ne, nx, zero, l), one_bit(false), one_bit(true), l);
+    cls                   = b.select(b.binary(ir::Inst::Tag::Eq, nz, width, l), fill(true), cls, l);
+    cls                   = b.select(b.binary(ir::Inst::Tag::Eq, nx, width, l), fill(false), cls, l);
+    return b.select(b.unary(ir::Inst::Tag::IsUnknown, v, l), cls, b.resize(known, ty4, l), l);
 }
 
 // Whether a nonblocking intra-assignment target's select chain resolves
