@@ -325,3 +325,61 @@ TEST_CASE("a bind-inserted assign and an output port both driving a logic interf
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("multiple continuous assignments") != std::string::npos);
 }
+
+// defparam (LRM 23.10.1). An implicitly typed parameter takes the type of its
+// final value (LRM 6.20.2), and slang keeps a defparam'd one at its original
+// initializer's type, so a defparam that changes that type is refused.
+
+TEST_CASE("defparam: a same-typed value and an explicitly typed target simulate") {
+    // Icarus Verilog 13 prints "7 7": q's declared int converts 6.5 to 7.
+    CHECK(run_capture(R"(
+        module lower;
+          parameter p = 4;
+          parameter int q = 1;
+          initial $display("%0d %0d", p, q);
+        endmodule
+        module top;
+          defparam dut.p = 7;
+          defparam dut.q = 6.5;
+          lower dut();
+        endmodule
+    )") == "7 7\n");
+}
+
+TEST_CASE("defparam: a real value onto an implicitly typed integer parameter is refused") {
+    // ivtest pr1907192: aborted on an assertion; built without assertions it
+    // compared the real held in an int-typed constant.
+    const LowerResult r = lower_text(R"(
+        module lower;
+          parameter lwrval = 4;
+          initial if (lwrval != 6.0) $display("FAILED"); else $display("PASSED");
+        endmodule
+        module top;
+          defparam dut.lwrval = 6.5;
+          lower dut();
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.diagnostic_text().find("parameter 'lwrval' is given a value of a different type") !=
+                    std::string::npos,
+                  r.diagnostic_text());
+}
+
+TEST_CASE("defparam: a narrower value is refused even where only a width reads it") {
+    // By LRM 6.20.2 `w` becomes a 3-bit unsigned value; slang keeps it a 32-bit
+    // int. No expression references `w` at run time, only a declaration's range.
+    const LowerResult r = lower_text(R"(
+        module lower;
+          parameter w = 4;
+          wire [w-1:0] x = '1;
+          initial #1 $display("%b", x);
+        endmodule
+        module top;
+          defparam dut.w = 3'b101;
+          lower dut();
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.diagnostic_text().find("parameter 'w' is given a value of a different type") != std::string::npos,
+                  r.diagnostic_text());
+}

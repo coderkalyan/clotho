@@ -600,6 +600,41 @@ ir::Ref Lowerer::lower_constant(const slang::ConstantValue& cv, const slang::ast
     return svint_to_ref(cv.integer(), lower_type(type));
 }
 
+// NOTE: An implicitly typed parameter takes the type of its final value, after
+// every override (LRM 6.20.2). slang retypes it for an instance override but not
+// for a defparam: the parameter keeps its original initializer's type and holds
+// the defparam's value unconverted, so every reference is typed by the old
+// initializer (`defparam u.p = 6.5` onto `parameter p = 4` leaves `p` an int
+// holding a real). Simulating that would be wrong wherever the type matters --
+// widths, signedness, real arithmetic -- so a value that is not of the
+// parameter's own type is refused.
+void Lowerer::check_param_value_type(const slang::ast::ParameterSymbol& p) {
+    const slang::ConstantValue& cv      = p.getValue();
+    const slang::ast::Type&     own     = p.getType();
+    bool                        matches = true;
+    if (cv.isReal()) {
+        matches = own.isFloating() && own.getBitWidth() == 64;
+    } else if (cv.isShortReal()) {
+        matches = own.isFloating() && own.getBitWidth() == 32;
+    } else if (cv.isInteger()) {
+        const slang::SVInt& v = cv.integer();
+        matches = own.isIntegral() && v.getBitWidth() == own.getBitWidth() && v.isSigned() == own.isSigned() &&
+                  (!v.hasUnknown() || own.isFourState());
+    }
+    if (!matches) {
+        // TODO: give an implicitly typed parameter the type of its defparam value
+        // (LRM 6.20.2); slang types every reference by the original initializer.
+        fail(std::format("parameter '{}' is given a value of a different type by a defparam; an implicitly "
+                         "typed parameter taking its final value's type (LRM 6.20.2) is not supported",
+                         p.name));
+    }
+}
+
+ir::Ref Lowerer::lower_param_constant(const slang::ast::ParameterSymbol& p, const slang::ast::Type& type) {
+    check_param_value_type(p);
+    return lower_constant(p.getValue(), type);
+}
+
 // Append one integral constant's canonical plane bytes to `out`: the val
 // plane, then the xz plane for a 4-state type. Same VPI convention and same
 // packing as svint_to_ref, but writing into a larger image instead of

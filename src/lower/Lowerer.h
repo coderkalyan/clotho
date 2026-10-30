@@ -1533,6 +1533,14 @@ private:
 
     ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type);
 
+    // Refuses a parameter whose value is not of its own type: a defparam onto an
+    // implicitly typed parameter (see the NOTE at the definition).
+    void check_param_value_type(const slang::ast::ParameterSymbol& p);
+
+    // A parameter's value as a constant of `type`, the type slang gave the
+    // reference, after check_param_value_type.
+    ir::Ref lower_param_constant(const slang::ast::ParameterSymbol& p, const slang::ast::Type& type);
+
     void append_svint_bytes(const slang::SVInt& src, ir::Ref ty, std::vector<uint8_t>& out);
 
     void append_const_image(const slang::ConstantValue& cv, ir::Ref ty, std::vector<uint8_t>& out);
