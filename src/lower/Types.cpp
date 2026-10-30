@@ -1085,13 +1085,13 @@ void Lowerer::collect_scope_signals(
                             fail("net delay rise/fall/turn-off triples (wire #(a,b,c)) are "
                                  "not supported");
                         }
-                        if (is_aggregate(vs.getType())) {
-                            // TODO: net delay on an unpacked-aggregate net —
-                            // needs a leaf-wise inertial replay (like the
+                        if (is_aggregate(vs.getType()) || vs.getType().getCanonicalType().isUnpackedArray()) {
+                            // TODO: net delay on an unpacked array or aggregate
+                            // net — needs a leaf-wise inertial replay (like the
                             // intra-assignment aggregate commit), not the
                             // flat packed-plane resolver fold this forces
                             // every other net delay through.
-                            fail("net delay on an unpacked-aggregate net is not supported");
+                            fail("net delay on an unpacked-array or unpacked-aggregate net is not supported");
                         }
                     }
                     info.is_net = true;

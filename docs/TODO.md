@@ -166,8 +166,8 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Net delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
     declaration assignment `wire #(r, f) w = e;` (10.3.3).
-  - [ ] **Net delay on an unpacked-aggregate net** — resolution folds packed planes only;
-    needs a leaf-wise inertial replay.
+  - [ ] **Net delay on an unpacked array or aggregate net** — resolution folds packed planes
+    only; needs a leaf-wise inertial replay.
   - [ ] **Net delay on a user-defined-nettype net** — needs nettype resolution functions.
 
 ### Procedural continuous assignment & force

@@ -272,6 +272,18 @@ TEST_CASE("net delay: an unpacked-aggregate net is rejected") {
     CHECK(err.find("unpacked-aggregate") != std::string::npos);
 }
 
+// The same for a plain unpacked ARRAY of nets, driven or not: a driverless
+// `tri1 [3:0] #5 t [0:1]` took the delayed resolver store, which wrote element 0
+// only, so t[1] read x where LRM 6.6.5 gives the pull (1111). A driven one already
+// failed at its driver; the declaration is what is refused now.
+TEST_CASE("net delay: an unpacked array of nets is rejected") {
+    for (const std::string_view decl :
+         { "tri1 [3:0] #5 t [0:1];", "wire [3:0] #3 w [0:1];", "wire [3:0] #3 w [0:1][0:1];", "wand #2 w [0:2];" }) {
+        const std::string err = lower_error("module m;\n " + std::string(decl) + "\nendmodule");
+        CHECK_MESSAGE(err.find("unpacked-array or unpacked-aggregate net") != std::string::npos, err, " for ", decl);
+    }
+}
+
 // Guard: same gap for a delay embedded in an aggregate net's own declaration
 // assignment.
 TEST_CASE("net delay: a delay on an aggregate net declaration assignment is rejected") {
