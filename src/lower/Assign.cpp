@@ -1388,6 +1388,11 @@ bool Lowerer::assoc_value_may_carry_xz(ir::Ref type) const {
 // operand's signedness, not its top bit, so an unsigned all-ones operand stays
 // positive. The run-time-format path reaches the same count in
 // coerce_dyn_arg (docs/LRM_NOTES.md, note 40).
+//
+// A count that does not fit 64 bits saturates at +-INT64_MAX ticks instead of
+// wrapping, as a real operand's does (saturating_ticks): `longint unsigned u =
+// 2**61` in a 1ns module over a 1ps tick is 2**61 * 1000 ticks, whose low 64 bits
+// are 0, and a 128-bit operand must not be cut to its low word first.
 ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
     const ir::SourceLoc l = loc(arg);
     if (arg.type->isFloating()) {
@@ -1406,15 +1411,30 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
         }
         return saturating_ticks(scaled, 1, b, l, /*is_signed=*/true);
     }
-    // A 64-bit type of the operand's own signedness: the resize sign-extends a
-    // signed operand, zero-extends an unsigned one and truncates a wider one.
-    const ir::Ref   ty = make_int_type(64, false, arg.type->isSigned());
-    const ir::Index w  = b.resize(v, ty, l);
-    if (time_mul_ <= 1) {
-        return w;
+    // The test is on the operand, at its own width or at 64 bits if narrower,
+    // against the largest one whose product with the multiplier stays within the
+    // ceiling, so the multiply cannot wrap either. Each sign saturates at the
+    // ceiling of its own sign.
+    const bool      is_signed = arg.type->isSigned();
+    const ir::Ref   ty        = make_int_type(64, false, is_signed);
+    const ir::Ref   wide_ty   = make_int_type(std::max<uint32_t>(64, arg.type->getBitWidth()), false, is_signed);
+    const ir::Index wide      = b.resize(v, wide_ty, l);
+    const uint64_t  mul       = std::max<uint64_t>(time_mul_, 1);
+    const ir::Index limit     = b.constant(module_.pool.put_int(wide_ty, INT64_MAX / mul), l);
+    ir::Index       ticks     = b.resize(wide, ty, l);
+    if (mul > 1) {
+        ticks = b.binary(ir::Inst::Tag::Mul, ticks, b.constant(module_.pool.put_int(ty, mul), l), l);
     }
-    const ir::Index mul = b.constant(module_.pool.put_int(ty, time_mul_), l);
-    return b.binary(ir::Inst::Tag::Mul, w, mul, l);
+    const ir::Index over = b.binary(ir::Inst::Tag::Gt, wide, limit, l);
+    const ir::Index top  = b.constant(module_.pool.put_int(ty, INT64_MAX), l);
+    if (!is_signed) {
+        return b.select(over, top, ticks, l);
+    }
+    const ir::Index neg_limit = b.binary(ir::Inst::Tag::Sub, b.constant(module_.pool.put_int(wide_ty, 0), l), limit, l);
+    const ir::Index under     = b.binary(ir::Inst::Tag::Lt, wide, neg_limit, l);
+    const ir::Index bottom =
+      b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(-static_cast<int64_t>(INT64_MAX))), l);
+    return b.select(over, top, b.select(under, bottom, ticks, l), l);
 }
 
 // Whether a nonblocking intra-assignment target's select chain resolves

@@ -1790,6 +1790,66 @@ TEST_CASE("%t of a negative operand prints its sign in a constant and in a runti
                  "[ -1.000 ns]\n");
 }
 
+// A %t time whose tick count does not fit 64 bits cannot be shown exactly, and the
+// LRM does not say what it means (docs/LRM_NOTES.md, note 40). A constant-format
+// real saturated (26cd52aa), but an integral operand wrapped: 2**61 ns over a 1ps
+// tick is 2**61 * 1000 ticks, whose low 64 bits are 0, so it printed 0, as did
+// every 128-bit operand whose low word is 0, and a runtime format wrapped a huge
+// real into a meaningless count where the constant one saturated. Every kind now
+// prints the largest count of its sign, 2**63 - 1 ticks, which the renderer shows
+// as 9223372036854775808 (the nearest double), and a count in range is exact.
+// Oracle: the in-range lines are iverilog 13's text; for the saturated ones it
+// prints the exact, unbounded count, so those expectations are the decision.
+// `fine` pins the design tick to 1ps under m's 1ns unit.
+TEST_CASE("%t of a time beyond 2**63 ticks saturates in a constant and in a runtime format") {
+    const std::string out = run_capture(R"(
+        `timescale 1ps/1ps
+        module fine;
+          initial #1 ;
+        endmodule
+        `timescale 1ns/1ns
+        module m;
+          fine u();
+          string f;
+          longint unsigned big_u, in_u;
+          longint big_s;
+          logic [127:0] w_u, w_in;
+          logic signed [127:0] w_s, w_neg;
+          int imax;
+          real r;
+          initial begin
+            f = "%0t";
+            big_u = 64'd1 << 61;  big_s = -(64'sd1 << 61);
+            w_u = 128'd1 << 64;   w_s = -(128'sd1 << 100);
+            w_in = 128'd5;        w_neg = -128'sd5;
+            in_u = 64'd9000000000000;  imax = 2147483647;
+            $display("2**61 unsigned   [%0t] [%s]", big_u, $sformatf(f, big_u));
+            $display("-2**61 signed    [%0t] [%s]", big_s, $sformatf(f, big_s));
+            $display("2**64 wide       [%0t] [%s]", w_u,   $sformatf(f, w_u));
+            $display("-2**100 wide     [%0t] [%s]", w_s,   $sformatf(f, w_s));
+            $display("5 wide           [%0t] [%s]", w_in,  $sformatf(f, w_in));
+            $display("-5 wide          [%0t] [%s]", w_neg, $sformatf(f, w_neg));
+            $display("9e12 unsigned    [%0t] [%s]", in_u,  $sformatf(f, in_u));
+            $display("int max          [%0t] [%s]", imax,  $sformatf(f, imax));
+            r = 1.0e30;
+            $display("real 1e30        [%0t] [%s]", r,     $sformatf(f, r));
+            r = -1.0e30;
+            $display("real -1e30       [%0t] [%s]", r,     $sformatf(f, r));
+          end
+        endmodule
+    )");
+    CHECK(out == "2**61 unsigned   [9223372036854775808] [9223372036854775808]\n"
+                 "-2**61 signed    [-9223372036854775808] [-9223372036854775808]\n"
+                 "2**64 wide       [9223372036854775808] [9223372036854775808]\n"
+                 "-2**100 wide     [-9223372036854775808] [-9223372036854775808]\n"
+                 "5 wide           [5000] [5000]\n"
+                 "-5 wide          [-5000] [-5000]\n"
+                 "9e12 unsigned    [9000000000000000] [9000000000000000]\n"
+                 "int max          [2147483647000] [2147483647000]\n"
+                 "real 1e30        [9223372036854775808] [9223372036854775808]\n"
+                 "real -1e30       [-9223372036854775808] [-9223372036854775808]\n");
+}
+
 TEST_CASE("a later $timeformat changes the format mid-simulation") {
     const std::string out = run_capture(R"(`timescale 1ns/1ns
         module m;

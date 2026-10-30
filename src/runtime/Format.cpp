@@ -426,6 +426,66 @@ int64_t sat_round_i64(double v) {
     return static_cast<int64_t>(r < 0 ? uint64_t{ 0 } - low : low);
 }
 
+// The tick count of an integral %t operand under a RUNTIME format: what
+// scale_to_ticks puts in the IR for a constant one. The operand's value times the
+// unit multiplier `mul` (at least 1), saturating at +-INT64_MAX ticks instead of
+// wrapping, the rule a real operand follows (docs/LRM_NOTES.md, note 40).
+//
+// The sign is the operand's own, read from its top bit at its own width when it is
+// signed. The magnitude is taken across every word, so a wide operand is not cut
+// to its low one: -2**100 is far beyond the ceiling, not 0.
+int64_t integral_time_ticks(const rt_arg& a, uint64_t mul) {
+    assert(mul != 0);
+    const uint32_t w        = a.width != 0 ? a.width : 1;
+    const uint32_t words    = plane_words(w);
+    const uint32_t top      = w - 1;
+    const bool     negative = (a.flags & 1u) != 0 && ((a.val[top / 64] >> (top % 64)) & 1u) != 0;
+
+    // The magnitude: the planes as they are, or their two's-complement negation
+    // over `w` bits (invert, add one, clip the top word to the width).
+    uint64_t low   = 0;
+    bool     wide  = false;
+    uint64_t carry = 1;
+    for (uint32_t k = 0; k < words; ++k) {
+        uint64_t word = a.val[k];
+        if (negative) {
+            word  = ~word + carry;
+            carry = carry != 0 && word == 0 ? 1 : 0;
+            if (k + 1 == words) {
+                word &= width_mask(w - 64 * k);
+            }
+        }
+        if (k == 0) {
+            low = word;
+        } else if (word != 0) {
+            wide = true;
+        }
+    }
+    const uint64_t limit = static_cast<uint64_t>(INT64_MAX) / mul;
+    if (wide || low > limit) {
+        return negative ? -INT64_MAX : INT64_MAX;
+    }
+    const auto ticks = static_cast<int64_t>(low * mul);
+    return negative ? -ticks : ticks;
+}
+
+// The same for a real %t operand: rounded half away from zero after the multiply
+// (scale_to_ticks scales in the real domain first, so a fraction of a unit
+// survives), saturating at +-INT64_MAX. Infinity saturates and NaN is 0, as in the
+// frontend. The bound is INT64_MAX as a double, 2**63, the constant
+// saturating_ticks tests against.
+int64_t real_time_ticks(double v, uint64_t mul) {
+    const double     scaled = v * static_cast<double>(mul);
+    constexpr double bound  = 9223372036854775808.0;
+    if (scaled >= bound) {
+        return INT64_MAX;
+    }
+    if (scaled <= -bound) {
+        return -INT64_MAX;
+    }
+    return sat_round_i64(scaled);
+}
+
 // Reconcile one descriptor with the conversion a RUNTIME format asked for.
 //
 // With a compile-time format lower/SystemTasks.cpp's build_format has the specifier in hand
@@ -473,8 +533,7 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
             // rounds afterwards, so rounding first would quantize to whole time
             // units before the multiply and report the wrong tick. Signed, as a
             // real is: a negative one is a negative time.
-            scratch.val = static_cast<uint64_t>(sat_round_i64(
-              std::bit_cast<double>(a.val[0]) * static_cast<double>(dyn->time_mul)));
+            scratch.val = static_cast<uint64_t>(real_time_ticks(std::bit_cast<double>(a.val[0]), dyn->time_mul));
             return synth(/*is_signed=*/true);
         }
         if (int_conv) {
@@ -518,18 +577,10 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
         return scratch.arg;
     }
     if (lc == 't') {
-        // scale_to_ticks's count: the operand extended to 64 bits by its own
-        // signedness, times the multiplier. A narrower signed operand sign-extends
-        // here by hand, and the descriptor goes on signed or not as the operand
-        // was, so a negative count renders with its sign
-        // (docs/LRM_NOTES.md, note 40).
-        const bool is_signed = (a.flags & 1u) != 0;
-        uint64_t   ticks     = a.val[0];
-        if (is_signed && a.width < 64 && ((ticks >> (a.width - 1)) & 1u) != 0) {
-            ticks |= ~width_mask(a.width);
-        }
-        scratch.val = ticks * dyn->time_mul;
-        return synth(is_signed);
+        // scale_to_ticks's count: the operand's value times the unit multiplier,
+        // saturating, signed as the operand is (docs/LRM_NOTES.md, note 40).
+        scratch.val = static_cast<uint64_t>(integral_time_ticks(a, dyn->time_mul));
+        return synth(/*is_signed=*/true);
     }
     return a;
 }

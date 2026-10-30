@@ -173,6 +173,10 @@ struct CoercedArg {
 
 int64_t sat_round_i64(double v);
 
+int64_t integral_time_ticks(const rt_arg& a, uint64_t mul);
+
+int64_t real_time_ticks(double v, uint64_t mul);
+
 const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, const rt_fmt_dyn* dyn);
 
 void render_p_scalar(std::string& out, const rt_arg& a);
