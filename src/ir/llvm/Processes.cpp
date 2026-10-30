@@ -238,6 +238,16 @@ void Backend::lower_fork_inst(Index i) {
             ramped.push_back(ramp(kid));
         }
     }
+    // The children below that RUN INLINE (`join`, and `join_any` up to its first
+    // completion) execute while this body is on the stack with its scheduled flag clear.
+    // A child's `disable` of a block this body is an occupant of, or a `kill` of this
+    // thread, would then force-wake it -- push its handle while it is running -- and the
+    // drain would resume it a second time. Hold the flag set, as the join park below
+    // does: the wake stands down, only the mark lands, and the polls after the Fork take
+    // the exit. Every later park re-arms it before suspending.
+    if (!none && park_claim_wanted() && sched_ptr_ != nullptr) {
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
+    }
     uint32_t next_child = 0;
     for (const Index kid : kids) {
         llvm::Value* hdl = ramp_first ? ramped[next_child++] : ramp(kid);

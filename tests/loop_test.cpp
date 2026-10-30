@@ -1337,6 +1337,117 @@ TEST_CASE("disable of a block with forked children that park in a call is refuse
     CHECK(via_call.diagnostic_text().find("calls a subroutine that forks") != std::string::npos);
 }
 
+// A `join` / `join_any` child runs INLINE at the spawn, with the parent on the stack and
+// not yet parked. If that child disables a block the parent is an occupant of, the
+// force-wake used to push the parent's handle while it was running, and the drain
+// resumed it a second time (a crash, or a hang). The parent now holds its scheduled
+// flag across the inline run, so the wake stands down, only the mark lands, and the
+// parent leaves the block at the poll after the fork. Oracle: iverilog 13 on each.
+TEST_CASE("a fork child that disables its parent's block before it suspends") {
+    SUBCASE("join, the parent in a begin block") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                begin : B
+                  fork
+                    disable B;
+                    #5 $display("FAILED: sibling alive");
+                  join
+                  $display("FAILED: not reached");
+                end
+                $display("after B %0t", $time);
+              end
+              initial #10 $display("end %0t", $time);
+            endmodule
+        )") == "after B 0\nend 10\n");
+    }
+    SUBCASE("join_any") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                begin : B
+                  fork
+                    #5 $display("FAILED: sibling alive");
+                    disable B;
+                  join_any
+                  $display("FAILED: not reached");
+                end
+                $display("after B %0t", $time);
+              end
+              initial #10 $display("end %0t", $time);
+            endmodule
+        )") == "after B 0\nend 10\n");
+    }
+    SUBCASE("the parent is a task activation") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              task automatic run();
+                begin : B
+                  fork
+                    disable B;
+                    #5 $display("FAILED: sibling alive");
+                  join
+                  $display("FAILED: not reached");
+                end
+                $display("after B %0t", $time);
+              endtask
+              initial run();
+              initial #10 $display("end %0t", $time);
+            endmodule
+        )") == "after B 0\nend 10\n");
+    }
+    SUBCASE("the block is the procedure's outermost block") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin : P
+                fork
+                  disable P;
+                join
+                $display("FAILED: not reached");
+              end
+              initial #10 $display("end %0t", $time);
+            endmodule
+        )") == "end 10\n");
+    }
+    SUBCASE("a grandchild, run inline inside a child that is itself running inline") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                fork : F
+                  begin
+                    fork
+                      disable F;
+                    join
+                    $display("FAILED: child continued");
+                  end
+                  #5 $display("FAILED: sibling alive");
+                join
+                $display("after F %0t", $time);
+              end
+              initial #10 $display("end %0t", $time);
+            endmodule
+        )") == "after F 0\nend 10\n");
+    }
+    SUBCASE("the parent had waited before it forked") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                #1;
+                begin : B
+                  fork
+                    disable B;
+                    #5 $display("FAILED: sibling alive");
+                  join
+                  $display("FAILED: not reached");
+                end
+                $display("after B %0t", $time);
+              end
+              initial #10 $display("end %0t", $time);
+            endmodule
+        )") == "after B 1\nend 10\n");
+    }
+}
+
 // An assertion action block is an ordinary body to the remote form: it marks the
 // target's activations and pushes their handles, which needs no coroutine of its
 // own and no region correction. The failing attempt at the first posedge ends the
