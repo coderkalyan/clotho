@@ -807,6 +807,54 @@ TEST_CASE("a constant-base indexed part-select drives only its own bits") {
     CHECK(out == "zz1111zz zzzz00110010zzzz zz1010zz zz1111zz 11zzzzzz zzzzzzzz\n");
 }
 
+// A constant select that reaches outside what it selects from only affects the
+// bits in range (LRM 11.5.1; an element index outside an array writes nothing,
+// LRM 7.4.5), and the bits no driver reaches stay z. The window is clamped to the
+// select it sits in, not to the whole net, so an out-of-range part- or bit-select
+// inside an array element or a packed element does not spill into its neighbour;
+// a slice of a net array drives only its own elements; a base below the vector
+// (`x[-1+:4]`) writes the bits that are inside. Oracle: the LRM text for each
+// line (iverilog 13 asserts on, rejects or does not implement every one of these).
+TEST_CASE("constant selects reaching outside their base drive only the bits in range") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] ea [0:1];
+          assign ea[0][6+:4] = 4'hf;     // ea[0][7:6] only
+          wire [1:0][7:0] ep;
+          assign ep[0][6+:4] = 4'hf;     // ep[0][7:6] only
+          wire [7:0] eb [0:1];
+          assign eb[0][9+:2] = 2'b11;    // wholly outside eb[0]
+          wire [7:0] ec [0:1];
+          assign ec[0][9] = 1'b1;        // outside ec[0]
+          wire [3:0] sl [0:3];
+          wire [3:0] src [0:1];
+          assign src[0] = 4'h1;
+          assign src[1] = 4'h2;
+          assign sl[0:1] = src;          // sl[2], sl[3] undriven
+          wire [3:0] oe [0:2];
+          assign oe[0] = 4'h5;
+          assign oe[3] = 4'h7;           // outside the array
+          wire [7:0] nx;
+          assign nx[-1+:4] = 4'hf;       // nx[2:0]
+          wire [7:0] ny;
+          assign ny[1-:4] = 4'hf;        // ny[1:0]
+          initial begin
+            #1;
+            $display("%b %b %b", ea[0], ea[1], ep);
+            $display("%b %b %b %b", eb[0], eb[1], ec[0], ec[1]);
+            $display("%b %b %b %b", sl[0], sl[1], sl[2], sl[3]);
+            $display("%b %b %b", oe[0], oe[1], oe[2]);
+            $display("%b %b", nx, ny);
+          end
+        endmodule
+    )");
+    CHECK(out == "11zzzzzz zzzzzzzz zzzzzzzz11zzzzzz\n"
+                 "zzzzzzzz zzzzzzzz zzzzzzzz zzzzzzzz\n"
+                 "0001 0010 zzzz zzzz\n"
+                 "0101 zzzz zzzz\n"
+                 "zzzzz111 zzzzzz11\n");
+}
+
 // -- 2-state driver regions --
 //
 // A driver slot is cut from the NET's type, so it is always 4-state and always

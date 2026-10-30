@@ -393,15 +393,23 @@ namespace {
 // coordinates of the root's storage: for a packed net, the bit within the
 // vector; for a fixed unpacked array of packed elements, `leaf ordinal * element
 // width + bit within the element`, leaves in row-major order (the backend's flat
-// array storage model). `whole` marks a dynamic / unresolvable / whole-storage
-// store whose driven bits cannot be pinned (the caller then marks every bit
-// driven). Composes nested constant selects: each PartSelect adds its `lsb` to
-// the accumulated window, a constant BitSelect pins one bit, a constant element
-// select of a fixed array shifts by the elements before it. Mirrors the
-// frontend's net_region_of.
+// array storage model). Mirrors the frontend's net_region_of.
+//
+// `whole` marks a store whose bits cannot be pinned (a run-time index, an
+// unpacked-struct member): the caller then marks every bit driven. `empty` marks
+// a pinned store that addresses no storage at all, a constant select wholly
+// outside its base: a write to one is a no-op (LRM 11.5.1, 7.4.5), so it drives
+// nothing. Otherwise [lo, hi] are the bits written, inside the root.
+//
+// Every select of the chain is a window on its base, and a select that reaches
+// past its base only affects the bits that are in range (LRM 11.5.1). So the
+// chain is composed from the root outward, each select intersected with the
+// window its base has left, never against the whole root: an out-of-range window
+// nested in an element must not spill into the element beside it.
 struct DriveRange {
     Index    root;
     bool     whole = true;
+    bool     empty = false;
     uint32_t lo    = 0;
     uint32_t hi    = 0;
 };
@@ -453,100 +461,125 @@ std::optional<int64_t> const_signed_index(const Module& m, const Ir& ir, Index c
     return static_cast<int64_t>(*raw);
 }
 
+// The offset a packed select reads from a constant: the frontend folds a select
+// offset into a 32-bit value (lower_packed_offset), and the backend takes it as a
+// signed one, so a base below the vector (`x[-1+:4]`) arrives as 0xFFFFFFFF.
+std::optional<int64_t> const_offset(const Module& m, const Ir& ir, Index c) {
+    const std::optional<uint64_t> raw = const_index(m, ir, c);
+    if (!raw || m.pool.layout(std::get<Value>(m.pool.get(ir.payload(c).ref)).type).width > 32) {
+        return std::nullopt;
+    }
+
+    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(*raw)));
+}
+
 DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
-    uint32_t lo = 0, hi = 0;
-    bool     have = false, dyn = false;
+    // One select of the chain: the bits it addresses, as [lo, lo + width) in the
+    // coordinates of its base. Outermost first.
+    struct Step {
+        int64_t lo;
+        int64_t width;
+    };
+    std::vector<Step> steps;
+    bool              dyn = false, outside = false;
     for (;;) {
         switch (ir.tag(lv)) {
             case Inst::Tag::PartSelect: {
                 const PartSelect ps = ir.extra_data<PartSelect>(ir.payload(lv).op_extra.extra);
-                if (!have) {
-                    lo   = ps.lsb;
-                    hi   = ps.msb;
-                    have = true;
-                } else {
-                    lo += ps.lsb;
-                    hi += ps.lsb;
-                }
+                const auto       lsb = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
+                const auto       msb = static_cast<int64_t>(static_cast<int32_t>(ps.msb));
+                steps.push_back({ lsb, msb - lsb + 1 });
                 lv = ir.payload(lv).op_extra.op;
                 break;
             }
             case Inst::Tag::BitSelect: {
-                const std::optional<uint64_t> b = const_index(m, ir, ir.payload(lv).binary.r);
-                if (!b) {
-                    dyn = true;
-                } else if (!have) {
-                    lo   = static_cast<uint32_t>(*b);
-                    hi   = lo;
-                    have = true;
+                if (const std::optional<int64_t> b = const_offset(m, ir, ir.payload(lv).binary.r)) {
+                    steps.push_back({ *b, 1 });
                 } else {
-                    lo += static_cast<uint32_t>(*b);
-                    hi += static_cast<uint32_t>(*b);
+                    dyn = true;
                 }
                 lv = ir.payload(lv).binary.l;
+                break;
+            }
+            case Inst::Tag::DynPartSelect: {
+                const auto dps = ir.extra_data<DynPartSelect>(ir.payload(lv).op_extra.extra);
+                if (const std::optional<int64_t> off = const_offset(m, ir, dps.offset)) {
+                    steps.push_back({ *off, dps.width });
+                } else {
+                    dyn = true;
+                }
+                lv = ir.payload(lv).op_extra.op;
                 break;
             }
             case Inst::Tag::ElemSelect: {
                 // One dimension of a fixed unpacked array: the selected element
                 // spans `stride` leaves of `leaf_w` bits, starting at leaf
-                // `pos * stride`. A run-time or out-of-range index (a write to
-                // it is a no-op, LRM 7.4.5), or a dynamic array / queue element
-                // in a heap buffer, cannot be pinned in the flat plane.
-                const auto              es = ir.extra_data<ElemSelect>(ir.payload(lv).op_extra.extra);
-                const Type&             at = std::get<Type>(m.pool.get(es.array_type));
-                std::optional<uint32_t> pos;
-                if (at.kind == Type::Kind::UnpackedArray) {
-                    if (const std::optional<int64_t> idx = const_signed_index(m, ir, es.index)) {
-                        pos = types::elem_position(at, *idx);
-                    }
-                }
-                if (!pos) {
+                // `pos * stride`. A run-time index, or a dynamic array / queue
+                // element in a heap buffer, cannot be pinned in the flat plane; a
+                // constant index outside the array addresses nothing (LRM 7.4.5).
+                const auto  es = ir.extra_data<ElemSelect>(ir.payload(lv).op_extra.extra);
+                const Type& at = std::get<Type>(m.pool.get(es.array_type));
+                if (at.kind != Type::Kind::UnpackedArray) {
                     dyn = true;
-                } else {
-                    const uint32_t stride = types::array_leaf_count(m.pool, at.element);
-                    const uint32_t leaf_w = m.pool.layout(types::leaf_type(m.pool, es.array_type)).width;
-                    if (!have) {
-                        lo   = 0;
-                        hi   = stride * leaf_w - 1;
-                        have = true;
+                } else if (const std::optional<int64_t> idx = const_signed_index(m, ir, es.index)) {
+                    if (const std::optional<uint32_t> pos = types::elem_position(at, *idx)) {
+                        const int64_t elem_w = int64_t{ types::array_leaf_count(m.pool, at.element) } *
+                                               m.pool.layout(types::leaf_type(m.pool, es.array_type)).width;
+                        steps.push_back({ int64_t{ *pos } * elem_w, elem_w });
+                    } else {
+                        outside = true;
                     }
-                    lo += *pos * stride * leaf_w;
-                    hi += *pos * stride * leaf_w;
+                } else {
+                    dyn = true;
                 }
                 lv = ir.payload(lv).op_extra.op;
                 break;
             }
-            case Inst::Tag::DynPartSelect: {
-                // A constant offset is a pinned window even though the frontend
-                // could not fold it into a PartSelect because it reaches past the
-                // vector: a write only affects the bits in range (LRM 11.5.1),
-                // and set_range clamps to the storage the same way. A wrapped
-                // negative offset stays unpinned.
-                const auto                    dps = ir.extra_data<DynPartSelect>(ir.payload(lv).op_extra.extra);
-                const std::optional<uint64_t> off = const_index(m, ir, dps.offset);
-                if (!off || *off > INT32_MAX) {
-                    dyn = true;
-                } else if (!have) {
-                    lo   = static_cast<uint32_t>(*off);
-                    hi   = lo + dps.width - 1;
-                    have = true;
-                } else {
-                    lo += static_cast<uint32_t>(*off);
-                    hi += static_cast<uint32_t>(*off);
-                }
+            case Inst::Tag::ArrSlice: {
+                // A constant-bounds slice of a fixed array: `count` elements from
+                // the 0-based position `first_pos` (see ArrSlice).
+                const auto    as     = ir.extra_data<ArrSlice>(ir.payload(lv).op_extra.extra);
+                const Type&   st     = std::get<Type>(m.pool.get(as.slice_type));
+                const int64_t elem_w = int64_t{ types::array_leaf_count(m.pool, st.element) } *
+                                       m.pool.layout(types::leaf_type(m.pool, as.slice_type)).width;
+                steps.push_back({ int64_t{ as.first_pos } * elem_w, int64_t{ types::array_dim(st) } * elem_w });
                 lv = ir.payload(lv).op_extra.op;
                 break;
             }
-            case Inst::Tag::ArrSlice:
             case Inst::Tag::MemberSelect:
-                // Runtime-offset packed slice, a slice of an unpacked array, or an
-                // unpacked-struct member: the driven bits cannot be pinned in the
-                // flat plane.
+                // An unpacked-struct member: not a bit range of the flat plane.
                 dyn = true;
                 lv  = ir.payload(lv).op_extra.op;
                 break;
-            default:
-                return { lv, dyn || !have, lo, hi };
+            default: {
+                if (dyn || ir.tag(lv) != Inst::Tag::Signal) {
+                    return { lv, true, false, 0, 0 };
+                }
+                if (outside) {
+                    return { lv, false, true, 0, 0 };
+                }
+                if (steps.empty()) {
+                    return { lv, true, false, 0, 0 }; // no select: the whole storage
+                }
+                // Compose from the root outward: each select's bits, placed at its
+                // base's offset, intersected with the part of its base still in range.
+                const Signal sig = ir.payload(lv).signal;
+                const Layout lay =
+                  m.pool.layout(types::leaf_type(m.pool, m.signals()[static_cast<uint32_t>(sig)].type));
+                const int64_t root_w =
+                  int64_t{ lay.width } * types::array_leaf_count(m.pool, m.signals()[static_cast<uint32_t>(sig)].type);
+                int64_t base_lo = 0, lo = 0, hi = root_w - 1;
+                for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
+                    const int64_t at_lo = base_lo + it->lo;
+                    lo                  = std::max(lo, at_lo);
+                    hi                  = std::min(hi, at_lo + it->width - 1);
+                    base_lo             = at_lo;
+                }
+                if (lo > hi) {
+                    return { lv, false, true, 0, 0 };
+                }
+                return { lv, false, false, static_cast<uint32_t>(lo), static_cast<uint32_t>(hi) };
+            }
         }
     }
 }
@@ -606,15 +639,16 @@ struct Structural {
         }
     }
 
-    void set_range(uint32_t sig, uint32_t a, uint32_t b) {
+    // Mark the bits [lo, hi] of `sig` driven. An empty range (hi < lo) still
+    // records that the net was stored to with a pinned range, so its bits power on
+    // z with a mask of their own rather than x.
+    void set_range(uint32_t sig, uint32_t lo, int64_t hi) {
         const uint32_t words = (partial_width[sig] + 63) / 64;
         if (partial_driven[sig].empty()) {
             partial_driven[sig].assign(words, 0);
         }
-        const uint32_t lo = std::min(a, b);
-        const uint32_t hi = std::min(std::max(a, b), partial_width[sig] - 1);
-        for (uint32_t bit = lo; bit <= hi; ++bit) {
-            partial_driven[sig][bit / 64] |= 1ull << (bit % 64);
+        for (int64_t bit = lo; bit <= hi; ++bit) {
+            partial_driven[sig][static_cast<size_t>(bit) / 64] |= 1ull << (static_cast<size_t>(bit) % 64);
         }
     }
 
@@ -632,6 +666,8 @@ struct Structural {
         partial_touched[sig] = true;
         if (dr.whole) {
             partial_whole[sig] = true;
+        } else if (dr.empty) {
+            set_range(sig, 0, -1);
         } else {
             set_range(sig, dr.lo, dr.hi);
         }
