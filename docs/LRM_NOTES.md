@@ -343,11 +343,23 @@ switch still passes a z data bit through as z.
 
 Code: `src/lower/Nets.cpp` (`gate_tristate_value`). Tests: `tests/gate_test.cpp` ("three-state gate truth tables match LRM table 28-5, including X/Z", "MOS switch truth tables match LRM table 28-6, including the z pass-through").
 
-## 38. Resistive switches (28.14)
+## 38. MOS switch strength (28.13, 28.14)
 
-Deviation: with no strength model there is nothing for the strength reduction of
-28.14 to act on, so `rnmos`, `rpmos` and `rcmos` behave exactly as `nmos`, `pmos`
-and `cmos`. Not gated.
+Deviation: Clotho has no strength on a net's value, so a MOS switch drives strong
+whatever its data input carries (28.13), and `rnmos`, `rpmos` and `rcmos` do not
+reduce it (28.14, Table 28-8). That is exact when nothing the strength could be
+compared with is there, so it is gated: `check_mos_switch_strength` propagates the
+strength levels a switch can output (a net's levels are any level when a driver of
+it has an explicit weak or pull strength, it is a pullup / pulldown target or a
+tri0 / tri1 net, otherwise strong plus what the switches driving it output) and
+refuses a switch whose output net is resolved against another driver or a weak pull
+unless the strengths order as strong does: every switch on the net outputs exactly
+strong, or the switches are the net's only drivers and output one single level, or
+the switch is its net's only driver. A data input that is not a net, or a net
+reached through an input or output port, is strong: Clotho models those port
+connections as continuous assignments (4.9.6, 23.3.3), which reset the strength;
+a simulator that collapses the nets (23.3.3.7) keeps it, and so can differ. An
+inout port aliases the net, so its strength is kept.
 
 Code: `src/lower/Nets.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").
 

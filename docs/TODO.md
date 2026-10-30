@@ -168,18 +168,22 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Net delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
     declaration assignment `wire #(r, f) w = e;` (10.3.3).
-  - [ ] **Net delay on an unpacked-aggregate net** — resolution folds packed planes only;
-    needs a leaf-wise inertial replay.
+  - [ ] **Net delay on an unpacked array or aggregate net** — resolution folds packed planes
+    only; needs a leaf-wise inertial replay.
   - [ ] **Net delay on a user-defined-nettype net** — needs nettype resolution functions.
 
 ### Procedural continuous assignment & force
 
+- [ ] **`release` of part of a wider net force** (10.6.2) — `force n = v; release n[0];`
+  should free only bit 0; a force site is released as a unit, so executing the release
+  while that force is active stops the run with a fatal error.
 - [ ] **`force` of an input or inout port target** (10.6.2) — the port-copy driver does not
   honour the force.
 - [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must
   be decided when the deferred update commits, but the deferred record carries no gate.
 - [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
   bit/part-selects as the target.
+- [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
 
 ### Real numbers
 
@@ -278,8 +282,9 @@ Milestones, in order; lower ones unblock higher ones:
     definite value where the range model yields x.
   - [ ] **Drive strength on `wand` / `wor` nets**.
   - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
-  - [ ] **Strength reduction through gates** — including the r-variants (`rnmos`, `rpmos`,
-    `rcmos`), which behave as their nonresistive forms (28.14).
+  - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the
+    r-variants do not reduce it; refused when the output net is resolved against a
+    driver or weak pull and the strengths do not order as strong (LRM_NOTES note 38).
 
 ### Hierarchy reach
 

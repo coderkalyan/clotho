@@ -338,6 +338,53 @@ TEST_CASE("a partial driver on a tri0 vector pulls the undriven bits") {
     CHECK(out == "0000\n0011\n");
 }
 
+// The Z background of a partial driver and the tri0/tri1 pull are pooled
+// 4-state constants, and a pooled constant's planes are `ir::plane_bytes(w)`
+// apart (1, 2, 4, 8 bytes, then whole 64-bit words), not `(w + 7) / 8`. The two
+// differ for w = 17..24, 33..56 and every w above 64 that is not a multiple of
+// 64, where a misplaced xz plane turned the high bits of the constant into a
+// definite 0 (or the pull value). Each net below has a Z or pull segment of such
+// a width. Oracle: iverilog 13 prints these lines for this source.
+TEST_CASE("Z and pull constants of every plane stride keep their z bits") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [31:0] w;
+          assign w      = 32'hffffffff;
+          assign w[20]  = 1'b0;          // only bit 20 conflicts: 1 vs 0
+          tri1 [19:0] p;                 // driverless: all pulled up
+          tri0 [39:0] q;                 // driverless: all pulled down
+          tri1 [23:0] c;
+          assign c[3:0] = 4'b0;          // [23:4] pulled up
+          wire [17:0] d;
+          assign d[0]   = 1'b1;
+          assign d[0]   = 1'b1;          // two drivers on bit 0, the rest z
+          wire [71:0] e;
+          assign e      = 72'bz;
+          assign e[40]  = 1'b1;          // z segments of 40 and 31 bits
+          wand [23:0] a;
+          assign a      = 24'hffffff;
+          assign a[3:0] = 4'h0;          // 1 & 0 in [3:0], 1 & z above
+          initial begin
+            #1;
+            $display("%b", w);
+            $display("%b", p);
+            $display("%b", q);
+            $display("%b", c);
+            $display("%b", d);
+            $display("%b", e);
+            $display("%h", a);
+          end
+        endmodule
+    )");
+    CHECK(out == "11111111111x11111111111111111111\n"
+                 "11111111111111111111\n"
+                 "0000000000000000000000000000000000000000\n"
+                 "111111111111111111110000\n"
+                 "zzzzzzzzzzzzzzzzz1\n"
+                 "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n"
+                 "fffff0\n");
+}
+
 // A gate primitive driving a multiply-driven net stages into a per-driver slot
 // and folds through the wire resolver, like a continuous assign (ivtest
 // many_drivers). A buf treats a z input as x (LRM Table 28-3), so an all-z input
@@ -604,6 +651,231 @@ TEST_CASE("undriven bits of a partially-driven net power on z, not x") {
         endmodule
     )");
     CHECK(out == "zz10zz11 zzzz1zz1 zzzzzzzz\n");
+}
+
+// The undriven bits of a partially driven net read as z, whatever reads them.
+// The may-z analysis has to know the net can hold z, or a reader proven never-z
+// drops its z word and stores x: a continuous, delayed, concatenating,
+// replicating, sign-casting, blocking, nonblocking or resolving reader is checked
+// below (ivtest br_gh99m..w, pr2837451). Oracle: iverilog 13 prints these lines
+// for this source.
+TEST_CASE("readers of a partially-driven net keep its undriven bits at z") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] a;
+          assign a[3:0] = 4'd2;          // a[7:4] undriven -> z
+          wire [7:0]  cont = a;
+          wire [7:0]  dly;
+          assign #1 dly = a;
+          wire [9:0]  cat = {1'b0, a, 1'b1};
+          wire [15:0] rep = {2{a}};
+          wire [9:0]  sgn = $signed(a);
+          logic [7:0] blk, nba;
+          wire [1:0]  c;
+          assign c[1] = 1'b1;            // c[0] undriven -> z
+          wire e;
+          assign e = c[0];               // z resolved with 0 -> 0
+          assign e = 1'b0;
+          initial begin
+            #2;
+            blk = a;
+            nba <= a;
+            #1;
+            $display("%b %b %b", a, cont, dly);
+            $display("%b %b %b", cat, rep, sgn);
+            $display("%b %b", blk, nba);
+            $display("%b %b", c, e);
+          end
+        endmodule
+    )");
+    CHECK(out == "zzzz0010 zzzz0010 zzzz0010\n"
+                 "0zzzz00101 zzzz0010zzzz0010 zzzzzz0010\n"
+                 "zzzz0010 zzzz0010\n"
+                 "1z 0\n");
+}
+
+// Every element of an unpacked net array is a net of its own, so an element no
+// driver reaches reads z (LRM 6.6, 6.7.1) even when another element is driven.
+// The undriven mask spans the array: one bit per element bit, leaves in row-major
+// order. Covers a driver through a module port (ivtest pr1695322), a 2-D array, a
+// partial driver inside one element, ascending and descending ranges, a reader
+// through a continuous assign and through a run-time index, and an array with
+// every element driven. Oracle: iverilog 13 prints these lines for this source.
+TEST_CASE("undriven elements of a partially-driven net array read z") {
+    const std::string out = run_capture(R"(
+        module drv(output wire [5:0] o);
+          assign o = 5;
+        endmodule
+        module top;
+          wire [5:0] a [0:2];            // a[1], a[2] undriven
+          drv d(.o(a[0]));
+          wire [3:0] m [0:1][0:2];       // row-major: m[0][1] and m[1][2] driven
+          assign m[1][2] = 4'h3;
+          assign m[0][1] = 4'h9;
+          wire [3:0] p [0:1];
+          assign p[0][1:0] = 2'b10;      // p[0][3] driven too; p[0][2] and p[1] z
+          assign p[0][3]   = 1'b1;
+          wire [3:0] f [0:1];
+          assign f[0] = 4'h1;            // every element driven: nothing at z
+          assign f[1] = 4'h2;
+          wire [5:0] u [0:1];            // no driver at all
+          wire [11:0] up [1:2];          // ascending range
+          assign up[2] = 12'hABC;
+          wire [3:0] dn [3:1];           // descending range
+          assign dn[3] = 4'h7;
+          assign dn[1] = 4'h8;
+          wire [5:0] c0 = a[0];
+          wire [5:0] c1 = a[1];          // a copy of an undriven element is z
+          logic [5:0] r;
+          integer i;
+          initial begin
+            #1;
+            $display("%h %b %b", a[0], a[1], a[2]);
+            $display("%b %b %b | %b %b %b", m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2]);
+            $display("%b %b", p[0], p[1]);
+            $display("%b %b", f[0], f[1]);
+            $display("%b %b", u[0], u[1]);
+            $display("%b %b", up[1], up[2]);
+            $display("%b %b %b", dn[3], dn[2], dn[1]);
+            $display("%b %b", c0, c1);
+            i = 2; r = a[i];
+            $display("%b", r);
+          end
+        endmodule
+    )");
+    CHECK(out == "05 zzzzzz zzzzzz\n"
+                 "zzzz 1001 zzzz | zzzz zzzz 0011\n"
+                 "1z10 zzzz\n"
+                 "0001 0010\n"
+                 "zzzzzz zzzzzz\n"
+                 "zzzzzzzzzzzz 101010111100\n"
+                 "0111 zzzz 1000\n"
+                 "000101 zzzzzz\n"
+                 "zzzzzz\n");
+}
+
+// A driverless tri0 / tri1 / supply net array pulls EVERY element, not only the
+// first: the resolver stores the pulled value once per element. Metamorphic
+// oracle: each array reads the same as the scalar nets of its elements, which is
+// LRM 6.6.5 / 6.6.6 ("when no driver drives a tri1 net, its value is 1"). iverilog
+// 13 cannot compile these arrays, so it is no oracle here.
+TEST_CASE("a driverless tri0 / tri1 / supply net array pulls every element") {
+    const std::string out = run_capture(R"(
+        module top;
+          tri1    [3:0] ta [0:1];
+          tri1    [3:0] sa, sb;
+          tri0    [3:0] tz [0:2];
+          tri0    [3:0] sz, sy, sx;
+          supply1 [3:0] ha [0:1][0:1];
+          supply1 [3:0] hs0, hs1, hs2, hs3;
+          initial begin
+            #1;
+            $display("%b %b | %b %b", ta[0], ta[1], sa, sb);
+            $display("%b %b %b | %b %b %b", tz[0], tz[1], tz[2], sz, sy, sx);
+            $display("%b %b %b %b | %b %b %b %b", ha[0][0], ha[0][1], ha[1][0], ha[1][1], hs0, hs1, hs2, hs3);
+          end
+        endmodule
+    )");
+    CHECK(out == "1111 1111 | 1111 1111\n"
+                 "0000 0000 0000 | 0000 0000 0000\n"
+                 "1111 1111 1111 1111 | 1111 1111 1111 1111\n");
+}
+
+// The pull of a driverless net array is stored with a loop over its elements, so
+// the code does not grow with the array: a 64K-element array lowered one store per
+// element (about 200K instructions, 4 s of lowering; 18 s at 256K). The pull still
+// reaches the last element.
+TEST_CASE("the pull of a large driverless net array is a loop, not a store per element") {
+    constexpr std::string_view src   = R"(
+        module top;
+          tri1 [7:0] m [0:65535];
+          tri0 [3:0] n [0:3][0:1023];
+          initial #1 $display("%b %b %b", m[0], m[65535], n[3][1023]);
+        endmodule)";
+    const LowerResult          r     = lower_ok(src);
+    size_t                     insts = 0;
+    for (const ir::Process& p : r.module->processes()) {
+        insts += p.ir.inst_count();
+    }
+    for (size_t f = 0; f < r.module->function_count(); ++f) {
+        insts += r.module->function(static_cast<ir::FunctionId>(f)).ir.inst_count();
+    }
+    CHECK(insts < 2000);
+    CHECK(run_capture(src) == "11111111 11111111 0000\n");
+}
+
+// An indexed part-select with a constant base is a constant part-select (LRM
+// 11.5.1), so a net it drives powers its other bits on z, not x: `+:` and `-:`,
+// a multi-dim packed array (elements scaled by their width), and a reader of the
+// result. A window reaching past the vector only affects the bits in range, and
+// one wholly outside drives nothing (LRM text; iverilog 13 asserts on those two).
+// Oracle for the in-range lines: iverilog 13.
+TEST_CASE("a constant-base indexed part-select drives only its own bits") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] v;
+          assign v[2+:4] = 4'hf;
+          wire [3:0][3:0] a;
+          assign a[1+:2] = 8'h32;
+          wire [7:0] u;
+          assign u[5-:4] = 4'ha;
+          wire [7:0] cp = v;
+          wire [7:0] o;
+          assign o[6+:4] = 4'hf;         // bits 9:8 are out of range
+          wire [7:0] n;
+          assign n[9+:2] = 2'b11;        // wholly out of range: no driver effect
+          initial #1 $display("%b %b %b %b %b %b", v, a, u, cp, o, n);
+        endmodule
+    )");
+    CHECK(out == "zz1111zz zzzz00110010zzzz zz1010zz zz1111zz 11zzzzzz zzzzzzzz\n");
+}
+
+// A constant select that reaches outside what it selects from only affects the
+// bits in range (LRM 11.5.1; an element index outside an array writes nothing,
+// LRM 7.4.5), and the bits no driver reaches stay z. The window is clamped to the
+// select it sits in, not to the whole net, so an out-of-range part- or bit-select
+// inside an array element or a packed element does not spill into its neighbour;
+// a slice of a net array drives only its own elements; a base below the vector
+// (`x[-1+:4]`) writes the bits that are inside. Oracle: the LRM text for each
+// line (iverilog 13 asserts on, rejects or does not implement every one of these).
+TEST_CASE("constant selects reaching outside their base drive only the bits in range") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] ea [0:1];
+          assign ea[0][6+:4] = 4'hf;     // ea[0][7:6] only
+          wire [1:0][7:0] ep;
+          assign ep[0][6+:4] = 4'hf;     // ep[0][7:6] only
+          wire [7:0] eb [0:1];
+          assign eb[0][9+:2] = 2'b11;    // wholly outside eb[0]
+          wire [7:0] ec [0:1];
+          assign ec[0][9] = 1'b1;        // outside ec[0]
+          wire [3:0] sl [0:3];
+          wire [3:0] src [0:1];
+          assign src[0] = 4'h1;
+          assign src[1] = 4'h2;
+          assign sl[0:1] = src;          // sl[2], sl[3] undriven
+          wire [3:0] oe [0:2];
+          assign oe[0] = 4'h5;
+          assign oe[3] = 4'h7;           // outside the array
+          wire [7:0] nx;
+          assign nx[-1+:4] = 4'hf;       // nx[2:0]
+          wire [7:0] ny;
+          assign ny[1-:4] = 4'hf;        // ny[1:0]
+          initial begin
+            #1;
+            $display("%b %b %b", ea[0], ea[1], ep);
+            $display("%b %b %b %b", eb[0], eb[1], ec[0], ec[1]);
+            $display("%b %b %b %b", sl[0], sl[1], sl[2], sl[3]);
+            $display("%b %b %b", oe[0], oe[1], oe[2]);
+            $display("%b %b", nx, ny);
+          end
+        endmodule
+    )");
+    CHECK(out == "11zzzzzz zzzzzzzz zzzzzzzz11zzzzzz\n"
+                 "zzzzzzzz zzzzzzzz zzzzzzzz zzzzzzzz\n"
+                 "0001 0010 zzzz zzzz\n"
+                 "0101 zzzz zzzz\n"
+                 "zzzzz111 zzzzzz11\n");
 }
 
 // -- 2-state driver regions --

@@ -362,11 +362,12 @@ void Backend::build_state_types() {
         // below (pool layout gives Domain::Two for floats).
         slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
         slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
-        // A partially-driven packed net: its undriven bits power on z. Only set
-        // for a 4-state, non-array net (the analysis's candidate set matches).
-        // Fully-undriven takes init_z; fully-driven has no mask.
+        // A partially-driven net: its undriven bits power on z. Only set for a
+        // 4-state net of packed elements (the analysis's candidate set matches);
+        // an unpacked array's mask spans every element. Fully-undriven takes
+        // init_z; fully-driven has no mask.
         const std::span<const uint64_t> pmask = facts_.undriven_mask(static_cast<Signal>(i));
-        if (!slot.init_z && slot.four_state && !slot.is_array && !pmask.empty()) {
+        if (!slot.init_z && slot.four_state && !pmask.empty()) {
             slot.undriven_mask.assign(pmask.begin(), pmask.end());
         }
         // A materialized constant table has no store anywhere, so the may-z

@@ -528,12 +528,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
     return make_int_type(ct.getBitWidth(), ct.isFourState(), ct.isSigned());
 }
 
-// Intern an integer literal, preserving x/z bits. Slang stores a 4-state
-// SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
-// the opposite val convention from the pool's VPI planes (X=(val1,xz1),
-// Z=(val0,xz1)). The unknown word IS the xz plane; the val plane is
-// value^unknown so the per-bit codes line up. 2-state literals take the fast
-// uint64 path.
+// Intern an integer literal, preserving x/z bits.
 ir::Ref Lowerer::lower_int_literal(const IntegerLiteral& lit) {
     return svint_to_ref(lit.getValue(), lower_type(*lit.type));
 }
@@ -546,24 +541,12 @@ ir::Ref Lowerer::svint_to_ref(const slang::SVInt& v, ir::Ref ty) {
         return module_.pool.put_int(ty, v.as<uint64_t>().value_or(0));
     }
 
-    // General path: pack the raw words into val / xz planes. A wide (>64-bit)
-    // value heap-allocates even when fully known (e.g. a packed string literal
-    // like a 96-bit "hello world!"), so the fast path above must not swallow it
-    // via a 64-bit truncation. getRawPtr lays out value words, followed by the
-    // unknown words only when hasUnknown.
-    const uint32_t        words = (width + 63) / 64;
-    const uint64_t*       raw   = v.getRawPtr();
-    const bool            unk   = v.hasUnknown();
-    std::vector<uint64_t> planes(static_cast<size_t>(words) * 2, 0);
-    for (uint32_t i = 0; i < words; ++i) {
-        planes[i]         = unk ? (raw[i] ^ raw[words + i]) : raw[i]; // val plane (VPI)
-        planes[words + i] = unk ? raw[words + i] : 0;                 // xz plane (unknown)
-    }
-
-    const uint32_t       pb = ir::plane_bytes(width);
-    std::vector<uint8_t> bytes(static_cast<size_t>(pb) * 2, 0);
-    std::memcpy(bytes.data(), planes.data(), pb);
-    std::memcpy(bytes.data() + pb, planes.data() + words, pb);
+    // General path: a wide (>64-bit) value heap-allocates even when fully known
+    // (e.g. a packed string literal like a 96-bit "hello world!"), so the fast
+    // path above must not swallow it via a 64-bit truncation. The planes come
+    // from append_svint_bytes, the one lowering-side producer of plane bytes.
+    std::vector<uint8_t> bytes;
+    append_svint_bytes(v, ty, bytes);
 
     return module_.pool.put_value(ty, bytes);
 }
@@ -642,9 +625,12 @@ void Lowerer::check_defparam_type(const slang::ast::DefParamSymbol& d) {
 }
 
 // Append one integral constant's canonical plane bytes to `out`: the val
-// plane, then the xz plane for a 4-state type. Same VPI convention and same
-// packing as svint_to_ref, but writing into a larger image instead of
-// interning a value of its own.
+// plane, then the xz plane for a 4-state type, each ir::plane_bytes(width)
+// long, so the image is exactly the layout of `ty`. Slang stores a 4-state
+// SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
+// the opposite val convention from the pool's VPI planes (X=(val1,xz1),
+// Z=(val0,xz1)). The unknown word IS the xz plane; the val plane is
+// value^unknown so the per-bit codes line up.
 void Lowerer::append_svint_bytes(const slang::SVInt& src, ir::Ref ty, std::vector<uint8_t>& out) {
     const ir::Layout   lay = module_.pool.layout(ty);
     const slang::SVInt v   = src.getBitWidth() == lay.width ? src : src.resize(lay.width);
@@ -1443,13 +1429,13 @@ void Lowerer::collect_scope_signals(
                             fail("net delay rise/fall/turn-off triples (wire #(a,b,c)) are "
                                  "not supported");
                         }
-                        if (is_aggregate(vs.getType())) {
-                            // TODO: net delay on an unpacked-aggregate net —
-                            // needs a leaf-wise inertial replay (like the
+                        if (is_aggregate(vs.getType()) || vs.getType().getCanonicalType().isUnpackedArray()) {
+                            // TODO: net delay on an unpacked array or aggregate
+                            // net — needs a leaf-wise inertial replay (like the
                             // intra-assignment aggregate commit), not the
                             // flat packed-plane resolver fold this forces
                             // every other net delay through.
-                            fail("net delay on an unpacked-aggregate net is not supported");
+                            fail("net delay on an unpacked-array or unpacked-aggregate net is not supported");
                         }
                     }
                     info.is_net = true;

@@ -3,6 +3,7 @@
 #include "InternPool.h"
 
 #include <cstdint>
+#include <optional>
 
 // The single type-classification vocabulary shared by the frontend lowerer
 // (src/lower/) and the LLVM backend (src/ir/llvm/).
@@ -98,6 +99,21 @@ inline bool is_container(const InternPool& pool, Ref ref) {
 // Element count of one unpacked-array dimension.
 inline uint32_t array_dim(const Type& t) {
     return (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+}
+
+// Zero-based storage position along one unpacked-array dimension of the
+// declared-range index `index`, normalized the way the backend's fixed_elem_pos
+// does for a run-time index: an ascending `[l:r]` counts up from `l`, a
+// descending one down from it. nullopt when the index misses the dimension
+// (LRM 7.4.5: a read yields the element default, a write is a no-op).
+inline std::optional<uint32_t> elem_position(const Type& t, int64_t index) {
+    const int64_t left = t.left;
+    const int64_t pos  = t.left <= t.right ? index - left : left - index;
+    if (pos < 0 || pos >= static_cast<int64_t>(array_dim(t))) {
+        return std::nullopt;
+    }
+
+    return static_cast<uint32_t>(pos);
 }
 
 // The non-array leaf type of a (possibly multidimensional) unpacked array;

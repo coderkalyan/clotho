@@ -677,14 +677,28 @@ void Backend::emit_array_init(const SignalSlot& s) {
     b_.CreateStore(evt ? b_.CreateCall(event_new_fn()) : mm,
                    b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
     if (s.has_z) {
-        // An undriven net array's elements default to z like any net.
-        b_.CreateStore(s.init_z ? ones(w) : zero(w),
+        // An undriven net array's elements default to z like any net, and so do
+        // the elements (or bits) of a partially driven one that no driver reaches:
+        // the loop starts every element all-z and the stores below give each
+        // element a driver reaches its own mask.
+        b_.CreateStore((s.init_z || !s.undriven_mask.empty()) ? ones(w) : zero(w),
                        b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
     }
     idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
     b_.CreateBr(head);
 
     b_.SetInsertPoint(done);
+    if (s.undriven_mask.empty()) {
+        return;
+    }
+    const llvm::APInt mask(s.elem_count * w, s.undriven_mask);
+    for (uint32_t e = 0; e < s.elem_count; ++e) {
+        const llvm::APInt zbits = mask.extractBits(w, e * w);
+        if (!zbits.isAllOnes()) {
+            b_.CreateStore(llvm::ConstantInt::get(ctx_, zbits),
+                           b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(e), b_.getInt32(1) }));
+        }
+    }
 }
 
 // `&array[elem_idx]` for a flat (non-aggregate) unpacked-array element
