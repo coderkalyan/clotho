@@ -139,7 +139,7 @@ This is where these live:
 - Constant folding; identity/absorption/annihilator laws; strength reduction.
 - CSE / GVN, from hash-consing `emit()` on (tag, payload, operands).
 - `Select`/`Cond` collapse on a constant or identical-arm predicate.
-- Redundant `Resize` elision; width narrowing against known operand widths.
+- Redundant conversion (`ZExt`/`SExt`/`Trunc`/`ToFour`/`ToTwo`) elision; width narrowing against known operand widths.
 - Load-after-Store forwarding within a straight-line region.
 
 **One real hazard.** CSE of anything reading state is illegal across a `Store`,
@@ -505,7 +505,7 @@ A signal is a re-encodable state register iff all of:
 3. **Every use is encoding-opaque.** This is the crux. Permitted uses: equality
    compare against a member of the constant set, use as a `Switch` selector whose
    keys are all in the set, and assignment of a set member. *Everything else*
-   poisons it — `>`/`<`, arithmetic, `Concat`, part-select, `Resize` to a different
+   poisons it — `>`/`<`, arithmetic, `Concat`, part-select, a width conversion to a different
    width, assignment to an output port, `$display`, VCD dump, DPI argument,
    hierarchical read from outside.
 

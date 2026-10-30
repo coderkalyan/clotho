@@ -79,8 +79,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
-        types_.resize(n);
-        types_valid_.assign(n, 0);
+        types_ = value_types(mod_, *ir_);
     };
     // Open the guarded region of a group: returns true when its members are
     // guarded, having ensured the wake word carries at least one of the
@@ -1228,8 +1227,7 @@ void Backend::lower_function(FunctionId id) {
     const size_t n = ir_->inst_count();
     values_.assign(n, Plane{});
     lvals_.assign(n, std::optional<LValue>{});
-    types_.resize(n);
-    types_valid_.assign(n, 0);
+    types_ = value_types(mod_, *ir_);
     str_vals_.assign(n, nullptr);
 
     auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
@@ -1365,8 +1363,7 @@ void Backend::lower_task(FunctionId id) {
     const size_t n = ir_->inst_count();
     values_.assign(n, Plane{});
     lvals_.assign(n, std::optional<LValue>{});
-    types_.resize(n);
-    types_valid_.assign(n, 0);
+    types_ = value_types(mod_, *ir_);
     str_vals_.assign(n, nullptr);
 
     auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
@@ -2107,11 +2104,11 @@ void Backend::lower_call_common(Index               i,
     }
     if (f.return_type != mod_.pool.void_type) {
         Plane         pl{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
-        const ValType t = from_ref(f.return_type);
+        const ValueType t = value_type_of(mod_.pool, f.return_type);
         if (t.is_real) {
             pl = real_plane(planes_to_real(pl, t.width));
         }
-        set_value(i, pl);
+        set_value(i, in_type_domain(pl, t));
     }
 }
 
@@ -2330,8 +2327,9 @@ void Backend::lower_task_call_inst(Index i) {
 // fields point into that buffer, so an operand of any width is passed in full.
 // Returns the descriptor array pointer (null when there are no operands).
 // `who` is unused now that no width is rejected; kept for call-site clarity.
-llvm::Value* Backend::build_rt_args(std::span<const Index> args, const char* /*who*/) {
+llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const uint32_t> signs) {
     const auto n = static_cast<uint32_t>(args.size());
+    assert(signs.size() == args.size());
     if (n == 0) {
         return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     }
@@ -2341,7 +2339,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, const char* /*w
     std::vector<uint32_t> words(n, 0);
     uint32_t              total = 0;
     for (uint32_t k = 0; k < n; ++k) {
-        const ValType t = type_of(args[k]);
+        const ValueType t = type_of(args[k]);
         if (t.is_string) {
             continue;
         }
@@ -2372,7 +2370,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, const char* /*w
 
     for (uint32_t k = 0; k < n; ++k) {
         const Plane   p    = value_of(args[k]);
-        const ValType t    = type_of(args[k]);
+        const ValueType t    = type_of(args[k]);
         llvm::Value*  elt  = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
         if (t.is_string) {
             // A string-object argument (%s): flag bit 1, val = the rt_string
@@ -2404,7 +2402,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, const char* /*w
         llvm::Value* must = must_of(p);
         llvm::Value* xz   = b_.CreateXor(must, may_of(p));
         store_field(sty, elt, 0, b_.getInt32(t.width));
-        store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
+        store_field(sty, elt, 1, b_.getInt32(signs[k] != 0 ? 1u : 0u));
         store_field(sty, elt, 2, put(must, words[k]));
         store_field(sty, elt, 3, put(xz, words[k]));
         store_field(sty, elt, 4, put(z_of(p), words[k]));

@@ -34,8 +34,10 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Add:
         case Inst::Tag::Sub:
         case Inst::Tag::Mul:
-        case Inst::Tag::Div:
-        case Inst::Tag::Mod:
+        case Inst::Tag::UDiv:
+        case Inst::Tag::SDiv:
+        case Inst::Tag::UMod:
+        case Inst::Tag::SMod:
         case Inst::Tag::Pow:
         case Inst::Tag::Band:
         case Inst::Tag::Bor:
@@ -58,10 +60,14 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Sra:
         case Inst::Tag::Eq:
         case Inst::Tag::Ne:
-        case Inst::Tag::Lt:
-        case Inst::Tag::Le:
-        case Inst::Tag::Gt:
-        case Inst::Tag::Ge:
+        case Inst::Tag::ULt:
+        case Inst::Tag::SLt:
+        case Inst::Tag::ULe:
+        case Inst::Tag::SLe:
+        case Inst::Tag::UGt:
+        case Inst::Tag::SGt:
+        case Inst::Tag::UGe:
+        case Inst::Tag::SGe:
         case Inst::Tag::CaseEq:
         case Inst::Tag::CasezEq:
         case Inst::Tag::CasexEq:
@@ -77,7 +83,11 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Concat:
         case Inst::Tag::Repl:
         case Inst::Tag::StreamReverse:
-        case Inst::Tag::Resize:
+        case Inst::Tag::ZExt:
+        case Inst::Tag::SExt:
+        case Inst::Tag::Trunc:
+        case Inst::Tag::ToFour:
+        case Inst::Tag::ToTwo:
         case Inst::Tag::Cond:
         case Inst::Tag::Switch:
         case Inst::Tag::Loop:
@@ -103,7 +113,8 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::FLe:
         case Inst::Tag::FGt:
         case Inst::Tag::FGe:
-        case Inst::Tag::ItoF:
+        case Inst::Tag::UItoF:
+        case Inst::Tag::SItoF:
         case Inst::Tag::FtoI:
         case Inst::Tag::FtoITrunc:
         case Inst::Tag::FBitcast:
@@ -1260,10 +1271,14 @@ struct ValueSweep {
                     val_z[raw] = z_of(p.op_imm.op);
                     val_x[raw] = operand_x(ir, i);
                     break;
-                case Inst::Tag::Resize:
+                case Inst::Tag::ZExt:
+                case Inst::Tag::SExt:
+                case Inst::Tag::Trunc:
+                case Inst::Tag::ToFour:
+                case Inst::Tag::ToTwo:
                     // Sign extension replicates a z MSB; truncation keeps low z
-                    // bits; a 4->2-state resize does NOT clear z (the backend casts
-                    // all planes).
+                    // bits. ToTwo is treated like the others: its z plane is
+                    // conservatively kept (the analysis is a may-z over-approximation).
                     val_z[raw] = z_of(p.op_type.op);
                     val_x[raw] = operand_x(ir, i);
                     break;
@@ -1299,10 +1314,14 @@ struct ValueSweep {
                 case Inst::Tag::RedXor:
                 case Inst::Tag::Eq:
                 case Inst::Tag::Ne:
-                case Inst::Tag::Lt:
-                case Inst::Tag::Le:
-                case Inst::Tag::Gt:
-                case Inst::Tag::Ge:
+                case Inst::Tag::ULt:
+                case Inst::Tag::SLt:
+                case Inst::Tag::ULe:
+                case Inst::Tag::SLe:
+                case Inst::Tag::UGt:
+                case Inst::Tag::SGt:
+                case Inst::Tag::UGe:
+                case Inst::Tag::SGe:
                 case Inst::Tag::CaseEq:
                 case Inst::Tag::CasezEq:
                 case Inst::Tag::CasexEq:
@@ -1318,8 +1337,10 @@ struct ValueSweep {
 
                 // Division-family x generators: a zero divisor yields x whatever
                 // the operands' own cleanliness (LRM 11.4.1).
-                case Inst::Tag::Div:
-                case Inst::Tag::Mod:
+                case Inst::Tag::UDiv:
+                case Inst::Tag::SDiv:
+                case Inst::Tag::UMod:
+                case Inst::Tag::SMod:
                 case Inst::Tag::Pow:
                     val_x[raw] = 1;
                     break;
@@ -1349,7 +1370,8 @@ struct ValueSweep {
                 case Inst::Tag::FLe:
                 case Inst::Tag::FGt:
                 case Inst::Tag::FGe:
-                case Inst::Tag::ItoF:
+                case Inst::Tag::UItoF:
+                case Inst::Tag::SItoF:
                 case Inst::Tag::FtoI:
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:

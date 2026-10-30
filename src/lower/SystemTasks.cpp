@@ -26,7 +26,7 @@ ir::Index Lowerer::lower_system_call(const CallExpression& call, ir::Builder& b)
         // No-arg $system(): exec system(NULL). The command operand is an
         // unused empty-byte constant (has_arg = 0 tells the runtime to pass
         // NULL).
-        const ir::Index empty = b.constant(module_.pool.put_int(make_int_type(8, false, false), 0), l);
+        const ir::Index empty = b.constant(module_.pool.put_int(make_int_type(8, false), 0), l);
         return b.system(empty, /*has_arg=*/0, l);
     }
     const Expression& cmd = *args[0];
@@ -247,7 +247,7 @@ ir::Index Lowerer::saturating_ticks(ir::Index     scaled,
                                     ir::SourceLoc l,
                                     bool          is_signed) {
     using T                    = ir::Inst::Tag;
-    const ir::Ref      ty      = make_int_type(64, false, is_signed);
+    const ir::Ref      ty      = make_int_type(64, false);
     constexpr uint64_t ceiling = INT64_MAX;
     const uint64_t     mul     = std::max<uint64_t>(tick_mul, 1);
     const double       bound   = static_cast<double>(ceiling / mul);
@@ -277,7 +277,7 @@ ir::Index Lowerer::saturating_ticks(ir::Index     scaled,
 // and 0 for one with an unknown bit (LRM 9.4.1, below).
 ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     const ir::SourceLoc l   = loc(amount);
-    const ir::Ref       u64 = make_int_type(64, false, false);
+    const ir::Ref       u64 = make_int_type(64, false);
 
     // Real (fractional) delay (LRM 3.14 / 22.7): round to this module's time
     // precision, then scale to ticks. The wheel tick is the design-wide GCD of
@@ -339,7 +339,7 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     // module is 2**61 * 1000 ticks, whose low 64 bits are 0, and a negative amount
     // is 2**64 - 1 units. Neither may fire early. A constant amount folds away.
     const ir::Index limit = b.constant(module_.pool.put_int(u64, UINT64_MAX / time_mul_), l);
-    const ir::Index huge  = b.binary(ir::Inst::Tag::Gt, ticks, limit, l);
+    const ir::Index huge  = b.binary(ir::Inst::Tag::UGt, ticks, limit, l);
     return b.select(huge, b.constant(module_.pool.put_int(u64, UINT64_MAX), l),
                     b.binary(ir::Inst::Tag::Mul, ticks, mul, l), l);
 }
@@ -542,8 +542,11 @@ ir::Index Lowerer::lower_enum_method(std::string_view            name,
         // `.name()` yields "" for a non-member value (LRM 6.19.2), so no
         // format fallback — that is `%p`'s rule, not this method's.
         const EnumNameTable tbl = enum_name_table(et);
-        return b.enum_name(lower_expr(*call.arguments()[0], b), tbl.rows,
-                           /*fmt_fallback=*/false, l);
+        return b.enum_name(lower_expr(*call.arguments()[0], b),
+                           tbl.rows,
+                           /*fmt_fallback=*/false,
+                           call.arguments()[0]->type->isSigned(),
+                           l);
     }
 
     // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
@@ -646,7 +649,7 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
                                    ir::Builder&          b,
                                    const ir::SourceLoc   l) {
     const auto    args = call.arguments();
-    const ir::Ref i32  = make_int_type(32, false, true);
+    const ir::Ref i32  = make_int_type(32, false);
 
     // $bits: the only non-constant operand Clotho stores is a dynamic
     // string, whose bit count is 8 per current character (LRM 6.16, 20.6.2).
@@ -658,7 +661,7 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
         }
         const ir::Index len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(*args[0], b), l);
         const ir::Index eight = b.constant(module_.pool.put_int(i32, 8), l);
-        return b.resize(b.binary(ir::Inst::Tag::Mul, len, eight, l), lower_type(*call.type), l);
+        return b.convert(b.binary(ir::Inst::Tag::Mul, len, eight, l), lower_type(*call.type), call.type->isSigned(), l);
     }
 
     // The 20.9 counting family. The first argument is the counted value;
@@ -668,13 +671,13 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
 
     // $onehot / $onehot0 / $isunknown carry their qualifier in the tag.
     if (name == "$onehot") {
-        return b.resize(b.unary(ir::Inst::Tag::OneHot, val, l), lower_type(*call.type), l);
+        return b.convert(b.unary(ir::Inst::Tag::OneHot, val, l), lower_type(*call.type), call.type->isSigned(), l);
     }
     if (name == "$onehot0") {
-        return b.resize(b.unary(ir::Inst::Tag::OneHot0, val, l), lower_type(*call.type), l);
+        return b.convert(b.unary(ir::Inst::Tag::OneHot0, val, l), lower_type(*call.type), call.type->isSigned(), l);
     }
     if (name == "$isunknown") {
-        return b.resize(b.unary(ir::Inst::Tag::IsUnknown, val, l), lower_type(*call.type), l);
+        return b.convert(b.unary(ir::Inst::Tag::IsUnknown, val, l), lower_type(*call.type), call.type->isSigned(), l);
     }
 
     uint32_t mask = ir::CountOne; // $countones counts definite-1 bits
@@ -684,7 +687,7 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
             mask |= count_control_class(*args[k]);
         }
     }
-    return b.resize(b.count_bits(val, mask, l), lower_type(*call.type), l);
+    return b.convert(b.count_bits(val, mask, l), lower_type(*call.type), call.type->isSigned(), l);
 }
 
 // A failed $cast called as a task is a run-time error (LRM 6.24.2), reported
@@ -793,7 +796,7 @@ ir::Index Lowerer::lower_cast(const CallExpression& call, ir::Builder& b, bool t
         return b.select(valid, int1, int0, l);
     }
     const ir::Index conv = coerce(lower_expr(src_expr, b), *src_expr.type, dest_ty, b, l);
-    const ir::Ref   bit1 = make_int_type(1, false, false);
+    const ir::Ref   bit1 = make_int_type(1, false);
     if (const auto* et = dt.as_if<slang::ast::EnumType>()) {
         // Enum destination (LRM 6.19.3): succeed only if the value is a legal
         // member. valid = OR over members of (conv === member).
@@ -906,7 +909,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         return b.sim_time(time_mul_, l);
     }
     if (name == "$stime") {
-        return b.resize(b.sim_time(time_mul_, l), lower_type(*call.type), l);
+        return b.convert(b.sim_time(time_mul_, l), lower_type(*call.type), call.type->isSigned(), l);
     }
 
     // The seed operand of a $dist_* (an output arg, slang §hasOutputArgs) is
@@ -922,12 +925,12 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // Store the updated seed back to the inout `seed` lvalue and yield the
     // signed draw. Shared by $random(seed) and every $dist_* (LRM §20.15).
     const auto seed_writeback = [&](const Expression& seed_arg, ir::Index packed) -> ir::Index {
-        const ir::Ref   i32s    = make_int_type(32, false, true);
-        const ir::Index sh32    = b.constant(module_.pool.put_int(make_int_type(64, false, false), 32u), l);
+        const ir::Ref   i32s    = make_int_type(32, false);
+        const ir::Index sh32    = b.constant(module_.pool.put_int(make_int_type(64, false), 32u), l);
         const ir::Index seed_lv = lower_lvalue(seed_lvalue_expr(seed_arg), b);
-        b.binary(
-          ir::Inst::Tag::Store, seed_lv, b.resize(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, l), l);
-        return b.resize(packed, i32s, l);
+        const ir::Index seed    = b.convert(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, true, l);
+        b.binary(ir::Inst::Tag::Store, seed_lv, in_lvalue_domain(seed_lv, seed, b, l), l);
+        return b.convert(packed, i32s, true, l);
     };
 
     // $random (LRM §20.15.1): a 32-bit signed PRNG draw. The plain form
@@ -940,7 +943,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             return b.random(l);
         }
         const Expression&              seed_arg = *call.arguments()[0];
-        const ir::Ref                  i32s     = make_int_type(32, false, true);
+        const ir::Ref                  i32s     = make_int_type(32, false);
         const ir::Index                lo       = b.constant(module_.pool.put_int(i32s, 0x80000000ull), l);
         const ir::Index                hi       = b.constant(module_.pool.put_int(i32s, 0x7fffffffull), l);
         const std::array<ir::Index, 3> args{ lower_expr(seed_lvalue_expr(seed_arg), b), lo, hi };
@@ -997,9 +1000,8 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             fail("$urandom_range requires one or two arguments (maxval [, minval])");
         }
         const ir::Index maxv = lower_expr(*argv[0], b);
-        const ir::Index minv = argv.size() == 2
-                                 ? lower_expr(*argv[1], b)
-                                 : b.constant(module_.pool.put_int(make_int_type(32, false, false), 0), l);
+        const ir::Index minv =
+          argv.size() == 2 ? lower_expr(*argv[1], b) : b.constant(module_.pool.put_int(make_int_type(32, false), 0), l);
         return b.urandom_range(maxv, minv, l);
     }
 
@@ -1012,7 +1014,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         if (call.arguments().size() != 1) {
             fail("$signed / $unsigned expects exactly one argument");
         }
-        return b.resize(lower_expr(*call.arguments()[0], b), lower_type(*call.type), l);
+        return b.convert(lower_expr(*call.arguments()[0], b), lower_type(*call.type), call.type->isSigned(), l);
     }
 
     // $clog2 (LRM §20.8.1): ceil(log2(arg)) with the argument treated as
@@ -1065,16 +1067,22 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         }
         const Expression& arr = *call.arguments()[0];
         if (is_dyn_array(arr)) {
-            return b.resize(
-              b.dyn_array_size(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
+            return b.convert(b.dyn_array_size(lower_lvalue(arr, b), lower_type(*arr.type), l),
+                             lower_type(*call.type),
+                             call.type->isSigned(),
+                             l);
         }
         if (is_queue(arr)) {
-            return b.resize(
-              b.queue_size(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
+            return b.convert(b.queue_size(lower_lvalue(arr, b), lower_type(*arr.type), l),
+                             lower_type(*call.type),
+                             call.type->isSigned(),
+                             l);
         }
         if (is_assoc(arr)) {
-            return b.resize(
-              b.assoc_num(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
+            return b.convert(b.assoc_num(lower_lvalue(arr, b), lower_type(*arr.type), l),
+                             lower_type(*call.type),
+                             call.type->isSigned(),
+                             l);
         }
         // TODO: $size(coll, dim) on a multidimensional dynamic collection.
         fail("$size of this operand is not supported");
@@ -1154,7 +1162,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             const ir::Index arr_lv = lower_lvalue(arr, b);
             const ir::Index size = is_da ? b.dyn_array_size(arr_lv, arr_ty, l) : b.queue_size(arr_lv, arr_ty, l);
             const ir::Index one   = b.constant(svint_to_ref(slang::SVInt(32, 1, true), result_ty), l);
-            return b.binary(ir::Inst::Tag::Sub, b.resize(size, result_ty, l), one, l);
+            return b.binary(ir::Inst::Tag::Sub, b.convert(size, result_ty, call.type->isSigned(), l), one, l);
         }
         if (is_assoc(arr)) {
             // A non-integral key would already have failed the semantic check
@@ -1186,10 +1194,10 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             const ir::Ref    aty  = lower_type(*arr.type);
             const ir::Index  a_lv = lower_lvalue(arr, b);
             const TempCell   key  = make_temp_cell(result_ty, "arrq_key");
-            const ir::Ref    bit1 = make_int_type(1, false, false);
+            const ir::Ref    bit1 = make_int_type(1, false);
             using Step           = ir::Builder::AssocStep;
-            const ir::Index found = b.resize(
-              b.assoc_traverse(a_lv, key.lv(b, l), name == "$low" ? Step::First : Step::Last, aty, l), bit1, l);
+            const ir::Index found = b.convert(
+              b.assoc_traverse(a_lv, key.lv(b, l), name == "$low" ? Step::First : Step::Last, aty, l), bit1, false, l);
             const ir::Layout lay = module_.pool.layout(result_ty);
             const uint32_t   w   = lay.width == 0 ? 1 : lay.width;
             const ir::Index  x_const =
@@ -1487,7 +1495,10 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             return b.float_cvt(ir::Inst::Tag::FtoITrunc, v, lower_type(*call.type), l);
         }
         if (name == "$itor") {
-            return b.float_cvt(ir::Inst::Tag::ItoF, v, lower_type(*call.type), l);
+            return b.float_cvt(call.arguments()[0]->type->isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF,
+                               v,
+                               lower_type(*call.type),
+                               l);
         }
         // The four bit-pattern reinterpretations.
         return b.float_cvt(ir::Inst::Tag::FBitcast, v, lower_type(*call.type), l);
@@ -1532,7 +1543,8 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // by the unit multiplier so the fractional part below the module time
     // unit survives ($time's round-to-unit does not apply).
     if (name == "$realtime") {
-        const ir::Index ticks = b.float_cvt(ir::Inst::Tag::ItoF, b.sim_time(1, l), module_.pool.real_type, l);
+        // The tick count is an unsigned 64-bit value.
+        const ir::Index ticks = b.float_cvt(ir::Inst::Tag::UItoF, b.sim_time(1, l), module_.pool.real_type, l);
         if (time_mul_ <= 1) {
             return ticks;
         }
@@ -1835,7 +1847,7 @@ void Lowerer::append_format_literal(std::string& fmt, std::string_view text, std
 // lowered one because taggedness, member names, and enum membership live only in
 // the AST — `ir::Type` keeps a tagged union indistinguishable from a plain packed
 // union by design (docs/design/tagged-unions.md).
-void Lowerer::expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b) {
+void Lowerer::expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::FmtArg>& args, ir::Builder& b) {
     if (const Expression& src = unwrap_conversion(arg); src.kind == ExpressionKind::StringLiteral) {
         // "A string data type or string literal shall print its value as a string
         // enclosed in quotes." A bare literal is an integral packed value (LRM
@@ -1887,21 +1899,21 @@ const Scope& Lowerer::union_scope(const slang::ast::Type& ct) {
 ir::Index Lowerer::packed_slice(ir::Index v, uint32_t lsb, ir::Ref fty, ir::Builder& b, ir::SourceLoc l) {
     ir::Index x = v;
     if (lsb != 0) {
-        const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+        const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), lsb), l);
         x                  = b.binary(ir::Inst::Tag::Srl, v, sh, l);
     }
-    return b.resize(x, fty, l);
+    return b.convert(x, fty, false, l);
 }
 
 // Render a singular (packed) operand under `%p` from its rvalue, for the four
 // cases LRM 21.2.1.6 names explicitly. Returns false for anything else, which
 // the caller renders as an ordinary integral / real leaf.
-bool Lowerer::expand_p_packed(ir::Index               v,
-                              const slang::ast::Type& sty,
-                              std::string&            frag,
-                              std::vector<ir::Index>& args,
-                              ir::Builder&            b,
-                              ir::SourceLoc           l) {
+bool Lowerer::expand_p_packed(ir::Index                v,
+                              const slang::ast::Type&  sty,
+                              std::string&             frag,
+                              std::vector<ir::FmtArg>& args,
+                              ir::Builder&             b,
+                              ir::SourceLoc            l) {
     const slang::ast::Type& ct = sty.getCanonicalType();
     if (ct.isTaggedUnion()) {
         // "In the case of a tagged union, it shall print "tag:value" along with
@@ -1917,8 +1929,8 @@ bool Lowerer::expand_p_packed(ir::Index               v,
             rows.push_back({ f.name, mt.isVoid() ? 0u : static_cast<uint32_t>(mt.getBitWidth()), mt.isSigned() });
         }
         frag += "'{%s}";
-        args.push_back(b.tagged_fmt_p(v, module_.pool.layout(lower_type(sty)).width,
-                                      union_tag_bits(ct), rows, l));
+        args.push_back(
+          { b.tagged_fmt_p(v, module_.pool.layout(lower_type(sty)).width, union_tag_bits(ct), rows, l), false });
         return true;
     }
     if (ct.isPackedUnion() || ct.isUnpackedUnion()) {
@@ -1967,7 +1979,7 @@ bool Lowerer::expand_p_packed(ir::Index               v,
         // runtime applies when no member matches.
         frag += "%s";
         const EnumNameTable tbl = enum_name_table(ct.as<slang::ast::EnumType>());
-        args.push_back(b.enum_name(v, tbl.rows, /*fmt_fallback=*/true, l));
+        args.push_back({ b.enum_name(v, tbl.rows, /*fmt_fallback=*/true, sty.isSigned(), l), false });
         return true;
     }
     return false;
@@ -2018,7 +2030,7 @@ std::optional<std::string_view> Lowerer::handle_p_name(const slang::ast::Type& c
 // the reserved null object, a virtual interface because the handle is the address
 // of an instance's context record.
 ir::Index Lowerer::handle_p_render(ir::Index v, std::string_view name, ir::Builder& b, ir::SourceLoc l) {
-    const ir::Ref   u64       = make_int_type(64, false, false);
+    const ir::Ref   u64       = make_int_type(64, false);
     const ir::Index null      = b.constant(module_.pool.put_int(u64, 0), l);
     const ir::Index is_null   = b.binary(ir::Inst::Tag::Eq, v, null, l);
     const ir::Index null_text = b.constant(string_value_ref("null"), l);
@@ -2031,12 +2043,12 @@ ir::Index Lowerer::handle_p_render(ir::Index v, std::string_view name, ir::Build
 // integral leaf prints "as [it] would unformatted", i.e. minimal decimal signed
 // with the operand's own signedness (21.2.1.1); a real the same way (%g, note
 // 26); a string "as a string enclosed in quotes".
-void Lowerer::expand_p_scalar(ir::Index               v,
-                              const slang::ast::Type& sty,
-                              std::string&            frag,
-                              std::vector<ir::Index>& args,
-                              ir::Builder&            b,
-                              ir::SourceLoc           l) {
+void Lowerer::expand_p_scalar(ir::Index                v,
+                              const slang::ast::Type&  sty,
+                              std::string&             frag,
+                              std::vector<ir::FmtArg>& args,
+                              ir::Builder&             b,
+                              ir::SourceLoc            l) {
     if (expand_p_packed(v, sty, frag, args, b, l)) {
         return;
     }
@@ -2087,7 +2099,7 @@ void Lowerer::expand_p_scalar(ir::Index               v,
             // one depth where a cycle cannot be reached in one step), leaving
             // nested handles as names.
             frag += "%s";
-            args.push_back(handle_p_render(v, *hn, b, l));
+            args.push_back({ handle_p_render(v, *hn, b, l), false });
             return;
         }
         if (is_handle_ref(cl) || is_agg_abi_ref(cl)) {
@@ -2107,7 +2119,7 @@ void Lowerer::expand_p_scalar(ir::Index               v,
     } else {
         frag += "%0d";
     }
-    args.push_back(v);
+    args.push_back({ v, sty.isSigned() });
 }
 
 // `sty`, when non-null, is the slang type matching `ty`; it is threaded down so
@@ -2115,13 +2127,13 @@ void Lowerer::expand_p_scalar(ir::Index               v,
 // rendered per LRM 21.2.1.6 (none of which `ir::Type` can distinguish). Null
 // only where the slang type is genuinely unavailable, which falls back to the
 // plain integral leaf.
-void Lowerer::expand_p_lvalue(ir::Index               lv,
-                              ir::Ref                 ty,
-                              const slang::ast::Type* sty,
-                              std::string&            frag,
-                              std::vector<ir::Index>& args,
-                              ir::Builder&            b,
-                              ir::SourceLoc           l) {
+void Lowerer::expand_p_lvalue(ir::Index                lv,
+                              ir::Ref                  ty,
+                              const slang::ast::Type*  sty,
+                              std::string&             frag,
+                              std::vector<ir::FmtArg>& args,
+                              ir::Builder&             b,
+                              ir::SourceLoc            l) {
     const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
     if (t.kind == ir::Type::Kind::UnpackedArray) {
         const slang::ast::Type* est =
@@ -2135,10 +2147,8 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
             }
             const int32_t coord =
               t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
-            const ir::Index idx =
-              b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                              static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                         l);
+            const ir::Index idx = b.constant(
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
             expand_p_lvalue(b.elem_select(lv, idx, ty, l), t.element, est, frag, args, b, l);
         }
         frag += "}";
@@ -2198,12 +2208,12 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
                                               elem_is_handle ||
                                               (est != nullptr && est->isTaggedUnion());
         if (loop_render && value_cat(t.element) != ValueCat::string) {
-            args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
+            args.push_back({ build_container_p_string(lv, ty, t, sty, b, l), false });
             return;
         }
         // What is left is exactly what the flat descriptor describes: a scalar
         // of one word or less, a real, or a string.
-        args.push_back(b.container_fmt_p(lv, ty, l));
+        args.push_back({ b.container_fmt_p(lv, ty, l), false });
         return;
     }
     if (t.kind == ir::Type::Kind::Assoc) {
@@ -2215,7 +2225,7 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
         // So it takes the same IR-loop render a container with a non-flat element
         // already takes -- see build_assoc_p_string.
         frag += "%s";
-        args.push_back(build_assoc_p_string(lv, ty, t, sty, b, l));
+        args.push_back({ build_assoc_p_string(lv, ty, t, sty, b, l), false });
         return;
     }
     if (value_cat(ty) != ValueCat::scalar && value_cat(ty) != ValueCat::string) {
@@ -2232,7 +2242,8 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
         return;
     }
     frag += module_.pool.is_float(ty) ? "%g" : value_cat(ty) == ValueCat::string ? "\"%s\"" : "%0d";
-    args.push_back(v);
+    // No slang type: a leaf the walk could not name, which prints as an unsigned number.
+    args.push_back({ v, false });
 }
 
 // `%p` of a container whose element is an aggregate or a nested container, as a
@@ -2253,7 +2264,7 @@ ir::Index Lowerer::build_container_p_string(ir::Index               lv,
                                             ir::SourceLoc           l) {
     using T                           = ir::Inst::Tag;
     const slang::ast::Type* est       = sty != nullptr ? sty->getCanonicalType().getArrayElementType() : nullptr;
-    const ir::Ref           i32       = make_int_type(32, false, true);
+    const ir::Ref           i32       = make_int_type(32, false);
     const TempCell          out       = make_temp_cell(module_.pool.string_type, "pstr");
     const TempCell          idx       = make_temp_cell(i32, "pstr_idx");
     const TempCell          bound     = make_temp_cell(i32, "pstr_n");
@@ -2270,7 +2281,7 @@ ir::Index Lowerer::build_container_p_string(ir::Index               lv,
     const ir::Index open   = str_const("'{");
     b.binary(T::Store, out_lv, open, l);
     const ir::Index bound_lv = bound.lv(b, l);
-    const ir::Index count    = b.resize(is_q ? b.queue_size(lv, ty, l) : b.dyn_array_size(lv, ty, l), i32, l);
+    const ir::Index count    = b.convert(is_q ? b.queue_size(lv, ty, l) : b.dyn_array_size(lv, ty, l), i32, true, l);
     b.binary(T::Store, bound_lv, count, l);
     const ir::Index idx_lv   = idx.lv(b, l);
     const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -2279,7 +2290,7 @@ ir::Index Lowerer::build_container_p_string(ir::Index               lv,
     b.open_region();
     const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
     const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-    const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+    const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
     const ir::ExtraSlice cond = b.close_region();
 
     b.open_region();
@@ -2291,7 +2302,7 @@ ir::Index Lowerer::build_container_p_string(ir::Index               lv,
     const ir::ExtraSlice nosep_r = b.close_region();
     b.cond(b.binary(T::Ne, k, b.constant(module_.pool.put_int(i32, 0), l), l), sep_r, nosep_r, l);
     std::string            efrag;
-    std::vector<ir::Index> eargs;
+    std::vector<ir::FmtArg> eargs;
     expand_p_lvalue(b.elem_select(lv, k, ty, l), t.element, est, efrag, eargs, b, l);
     append(b.sformatf(efrag, eargs, l));
     const ir::ExtraSlice body = b.close_region();
@@ -2336,8 +2347,8 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
     // A wildcard `[*]` index has no slang index type, and its lowered key is a
     // synthetic u64 placeholder, so it renders as a plain integral key.
     const slang::ast::Type* kst = ast != nullptr ? ast->indexType : nullptr;
-    const ir::Ref kr = t.right != 0 ? make_int_type(64, false, false) : static_cast<ir::Ref>(t.fields_id);
-    const ir::Ref  bit1 = make_int_type(1, false, false);
+    const ir::Ref           kr        = t.right != 0 ? make_int_type(64, false) : static_cast<ir::Ref>(t.fields_id);
+    const ir::Ref           bit1      = make_int_type(1, false);
     const TempCell out  = make_temp_cell(module_.pool.string_type, "pstr");
     const TempCell key  = make_temp_cell(kr, "pkey");
     const TempCell ok   = make_temp_cell(bit1, "pstr_ok");
@@ -2364,7 +2375,7 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
     const ir::Index more_zero = b.constant(module_.pool.put_int(bit1, 0), l);
     b.binary(T::Store, more_lv, more_zero, l);
     const ir::Index ok_lv    = ok.lv(b, l);
-    const ir::Index ok_first = b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::First, ty, l), bit1, l);
+    const ir::Index ok_first = b.convert(b.assoc_traverse(lv, key.lv(b, l), Step::First, ty, l), bit1, false, l);
     b.binary(T::Store, ok_lv, ok_first, l);
 
     b.open_region();
@@ -2382,7 +2393,7 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
     const ir::Index more_one    = b.constant(module_.pool.put_int(bit1, 1), l);
     b.binary(T::Store, more_set_lv, more_one, l);
     std::string            efrag;
-    std::vector<ir::Index> eargs;
+    std::vector<ir::FmtArg> eargs;
     // The key prints by the same leaf rules as any other %p element, so an enum
     // key prints its name and a string key prints quoted. An unpacked struct /
     // fixed array key has no plane value to Load -- same split key_operand()
@@ -2397,7 +2408,8 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
     // which types are legal KEYS.
     if (kst == nullptr) {
         efrag += "%0d";
-        eargs.push_back(b.unary(T::Load, key.lv(b, l), l));
+        // A wildcard index (`[*]`) has no slang type; its keys are unsigned.
+        eargs.push_back({ b.unary(T::Load, key.lv(b, l), l), false });
     } else if (is_agg_abi_ref(kr)) {
         expand_p_lvalue(key.lv(b, l), kr, kst, efrag, eargs, b, l);
     } else {
@@ -2410,7 +2422,7 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
 
     b.open_region();
     const ir::Index ok_step_lv = ok.lv(b, l);
-    const ir::Index ok_next    = b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::Next, ty, l), bit1, l);
+    const ir::Index ok_next    = b.convert(b.assoc_traverse(lv, key.lv(b, l), Step::Next, ty, l), bit1, false, l);
     b.binary(T::Store, ok_step_lv, ok_next, l);
     const ir::ExtraSlice step = b.close_region();
 
@@ -2453,7 +2465,7 @@ std::pair<size_t, size_t> Lowerer::find_p_spec(std::string_view fmt) {
 // expansion, and queues its specifiers for the value args that follow.
 void Lowerer::build_format(std::span<const Expression* const> format_args,
                            std::string&                       fmt,
-                           std::vector<ir::Index>&            args,
+                           std::vector<ir::FmtArg>&           args,
                            ir::Builder&                       b,
                            char                               default_conv,
                            std::string_view                   lead_text) {
@@ -2522,6 +2534,9 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             const bool          real_conv =
               conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G';
             ir::Index v = lower_expr(*arg, b);
+            // Whether the decimal conversions print `v` as a signed number: the
+            // argument's own signedness, unless it is converted below.
+            bool v_signed = arg->type->isSigned();
             if (fl && !real_conv) {
                 switch (conv) {
                     case 'd':
@@ -2539,7 +2554,8 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                         // shared integer path below. Signed 64-bit keeps
                         // negatives printing as two's complement (matches
                         // iverilog: -3.7 under %h is fffffffffffffffc).
-                        v = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false, true), al);
+                        v        = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false), al);
+                        v_signed = true;
                         break;
                     case 't':
                         break; // scale_to_ticks below has the real path
@@ -2552,12 +2568,16 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             } else if (!fl && real_conv) {
                 // An integral argument under %e/%f/%g converts to real
                 // (LRM 6.12.1) so the runtime formats one representation.
-                v = b.float_cvt(ir::Inst::Tag::ItoF, v, module_.pool.real_type, al);
+                v = b.float_cvt(
+                  arg->type->isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF, v, module_.pool.real_type, al);
             }
             if (conv == 't') {
-                v = scale_to_ticks(*arg, v, b);
+                // The scaled tick count is a 64-bit value with the operand's own sign
+                // (scale_to_ticks); a real operand's count is signed.
+                v        = scale_to_ticks(*arg, v, b);
+                v_signed = fl || arg->type->isSigned();
             }
-            args.push_back(v);
+            args.push_back({ v, v_signed });
         }
     }
     if (next < pending.size()) {
@@ -2592,7 +2612,7 @@ void Lowerer::emit_severity(ir::Severity                       level,
                             const CallExpression&              call,
                             ir::Builder&                       b) {
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(msg_args, fmt, args, b);
     b.severity(static_cast<uint32_t>(level), banner, fmt, args, loc(call));
 }
@@ -2628,7 +2648,7 @@ void Lowerer::lower_severity_task(const CallExpression& call, std::string_view n
 
 void Lowerer::lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(call.arguments(), fmt, args, b, default_conv);
     b.display(fmt, newline, args, loc(call));
 }
@@ -2679,7 +2699,7 @@ void Lowerer::lower_fdisplay(const CallExpression& call, bool newline, ir::Build
     }
     const ir::Index        fd = lower_expr(*args_in[0], b);
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(args_in.subspan(1), fmt, args, b, default_conv);
     b.fdisplay(fd, fmt, newline, args, loc(call));
 }
@@ -2766,7 +2786,7 @@ std::string_view Lowerer::value_type_noun(const slang::ast::Type& t) {
 ir::Index Lowerer::lower_dynamic_format(const Expression&                  fmt_expr,
                                         std::span<const Expression* const> value_args,
                                         size_t                             first_pos,
-                                        std::vector<ir::Index>&            args,
+                                        std::vector<ir::FmtArg>&           args,
                                         ir::Builder&                       b,
                                         std::string_view                   who) {
     if (!is_string_expr(fmt_expr) && !fmt_expr.type->isIntegral()) {
@@ -2821,7 +2841,7 @@ ir::Index Lowerer::lower_dynamic_format(const Expression&                  fmt_e
                  "which specifier the argument will meet, so it cannot expand %p "
                  "either (LRM 21.2.1.6)");
         }
-        args.push_back(lower_expr(arg, b));
+        args.push_back({ lower_expr(arg, b), arg.type->isSigned() });
     }
     return fv;
 }
@@ -2840,7 +2860,7 @@ void Lowerer::lower_sformat(const CallExpression& call, bool is_sformat, ir::Bui
         fail("$sformat / $swrite requires a destination string argument");
     }
     std::string            fmt;
-    std::vector<ir::Index> values;
+    std::vector<ir::FmtArg> values;
     if (!is_sformat) {
         const ir::Index dst = lower_lvalue(*args[0], b);
         build_format(args.subspan(1), fmt, values, b, default_conv);
@@ -2882,7 +2902,7 @@ ir::Index Lowerer::lower_sformatf(const CallExpression& call, ir::Builder& b) {
         lit = &lit->as<ConversionExpression>().operand();
     }
     std::string            fmt;
-    std::vector<ir::Index> values;
+    std::vector<ir::FmtArg> values;
     if (lit->kind == ExpressionKind::StringLiteral) {
         build_format(args, fmt, values, b);
         return b.sformatf(fmt, values, loc(call));

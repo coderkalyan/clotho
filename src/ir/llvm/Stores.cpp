@@ -1100,7 +1100,7 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     rhs = to_four(rhs);
 
     // Whole-storage store: the frontend context-sizes the RHS to the lvalue
-    // width (via an inserted Resize), so rhs already matches the storage width
+    // width (via an inserted conversion), so rhs already matches the storage width
     // and the planes store directly. A never-z slot drops the RHS z plane —
     // the may-z analysis proved it zero here.
     if (selects_whole(lv)) {
@@ -1136,7 +1136,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
 
     // Aggregate static-path leaf: stage the whole leaf into its shadow slot
     // and register its leaf-set bit. The value is leaf-width (frontend
-    // Resize), so no bit merge. (Runtime-path aggregate NBA is rejected in
+    // conversion), so no bit merge. (Runtime-path aggregate NBA is rejected in
     // nba_classify, so the path is static here.)
     if (lv.is_agg) {
         const int      k = agg_static_leaf_index(s, lv.agg_field_path);
@@ -1189,7 +1189,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
     llvm::Value* zp = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
 
     if (!s.nba_partial) {
-        // Whole-signal target: the RHS is already signal-width (frontend Resize),
+        // Whole-signal target: the RHS is already signal-width (frontend conversion),
         // so the shadow planes store directly — no mask, no read-modify-write.
         b_.CreateStore(rhs.mm, mp);
         if (s.has_z) {

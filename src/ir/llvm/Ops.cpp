@@ -128,15 +128,14 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
 // bits would turn into bit 1) becomes INT32_MAX or INT32_MIN, which no container
 // reaches. The frontend hands over an operand wider than 32 bits only when a
 // 32-bit offset could not hold its arithmetic.
-llvm::Value* Backend::select_index(Plane idx, ValType t) {
+llvm::Value* Backend::select_index(Plane idx, ValueType t) {
+    // An offset is a signed number: the frontend zero-extends an unsigned index
+    // past its top bit, and builds a wide offset in a signed type.
     llvm::Value* m = must_of(idx);
     if (t.width <= 32) {
-        return cast(m, 32, t.is_signed);
+        return cast(m, 32, true);
     }
     llvm::Value* hi = llvm::ConstantInt::get(m->getType(), INT32_MAX);
-    if (!t.is_signed) {
-        return cast(b_.CreateSelect(b_.CreateICmpULT(m, hi), m, hi), 32, false);
-    }
     return cast(smax(smin(m, hi), llvm::ConstantInt::getSigned(m->getType(), INT32_MIN)), 32, false);
 }
 
@@ -145,11 +144,11 @@ llvm::Value* Backend::select_index(Plane idx, ValType t) {
 // type wide enough that neither its extension nor the subtraction of a bound can
 // wrap, so an index of 2**32 + 1 or a signed -1 is out of range instead of
 // aliasing a low element; LLVM narrows it again for the usual `int` index.
-Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right) {
+Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValueType t, uint32_t left, uint32_t right) {
     const bool     ascending = left <= right;
     const uint32_t count     = (ascending ? right - left : left - right) + 1;
     const uint32_t ew        = std::max(64u, t.width + 2);
-    llvm::Value*   v         = cast(must_of(idx), ew, t.is_signed);
+    llvm::Value*   v         = cast(must_of(idx), ew, true);
     llvm::Value*   bound     = llvm::ConstantInt::getSigned(int_ty(ew), static_cast<int32_t>(left));
     llvm::Value*   norm      = ascending ? b_.CreateSub(v, bound) : b_.CreateSub(bound, v);
     // An unsigned compare also rejects a normalized index that went negative.
@@ -159,10 +158,10 @@ Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValType t, uint32_t left, ui
 // `idx < len` for a dynamic array or queue (LRM 7.4.5), the index compared at its
 // own width and signedness. A negative index is a huge unsigned one, so a single
 // compare covers both ends.
-Backend::ElemBelow Backend::elem_index_below(Plane idx, ValType t, llvm::Value* len) {
+Backend::ElemBelow Backend::elem_index_below(Plane idx, ValueType t, llvm::Value* len) {
     llvm::Value* m = must_of(idx);
     if (t.width <= 64) {
-        llvm::Value* idx64 = cast(m, 64, t.is_signed);
+        llvm::Value* idx64 = cast(m, 64, true);
         return { idx64, b_.CreateICmpULT(idx64, len) };
     }
     // Wider than the length: compare there, so the dropped high bits count.
@@ -446,7 +445,7 @@ Plane Backend::lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
             c = b_.CreateFCmpOGE(x, y);
             break;
     }
-    return bit_plane(c, c);
+    return two_val(c);
 }
 
 // Float -> integral. FtoI rounds half away from zero (LRM 6.12.1, the
@@ -460,7 +459,7 @@ Plane Backend::lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
 // saturating i64 answer) goes through fptosi.sat, which avoids poison on
 // out-of-range / NaN input; only a finite larger magnitude takes the cold block
 // below, which shifts the 53-bit mantissa by the exponent in the target's width.
-Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValType to) {
+Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValueType to) {
     llvm::Value* f = fp_of(v);
     if (tag == Inst::Tag::FtoI) {
         f = b_.CreateUnaryIntrinsic(llvm::Intrinsic::round, f);
@@ -500,7 +499,7 @@ Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValType to) {
     auto* phi = b_.CreatePHI(int_ty(to.width), 2);
     phi->addIncoming(fast, entry);
     phi->addIncoming(bigv, bigbb);
-    return packed(phi, phi, zero(to.width));
+    return known_plane(phi, to.four_state);
 }
 
 // Mux with real alternatives. Definite condition selects normally; an
@@ -676,18 +675,12 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w    = width_of(a);
 
     // 2-state: a single native op on the value; no X rule, no plane duplication.
-    // Both operands must be 2-state for this -- a 4-state/2-state mix (LRM
-    // 5.7: any 4-state operand makes the result 4-state) still needs the
-    // packed-plane path below, which assumes both operands already arrived
-    // as i(2W) (xz_mask reads a.mm/b.mm raw, not through must_of/may_of).
-    // Promote the narrower side instead of trusting the dispatch on `a`
-    // alone -- a mismatched-domain pair here is malformed LLVM IR (an i(2W)
-    // vs iW operand pair), not just a wrong answer.
-    if (a.two && !b.two) {
-        a = to_four(a);
-    } else if (!a.two && b.two) {
-        b = to_four(b);
-    } else if (a.two) {
+    // The IR has one domain for both operands (LRM 5.7: any 4-state operand makes
+    // the result 4-state, and the frontend converts the other side), so the planes
+    // agree and the packed-plane path below sees both as i(2W). A mismatched pair
+    // would be malformed LLVM IR, so it is an assertion, not a repair.
+    assert(a.two == b.two && "arithmetic operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         switch (tag) {
             case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
             case Inst::Tag::Sub: return two_val(b_.CreateSub(a.mm, b.mm));
@@ -754,9 +747,10 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
 // Divide and modulo. LRM 1800-2023 §11.4.3: integer division truncates toward
 // zero, modulo takes the sign of the dividend, and a zero divisor or any X/Z
 // bit in either operand makes the whole result X.
-Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
+Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w      = width_of(a);
-    const bool     is_div = tag == Inst::Tag::Div;
+    const bool     is_div = tag == Inst::Tag::UDiv || tag == Inst::Tag::SDiv;
+    const bool     sign   = tag == Inst::Tag::SDiv || tag == Inst::Tag::SMod;
 
     // 2-state: divide/modulo by zero is x, which collapses to 0 in a 2-state
     // result (verified against iverilog: `int`/`bit` div/mod by 0 -> 0). Guard
@@ -764,19 +758,11 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
     // INT_MIN / -1 is also poison, patched to the wrapped value like the
     // 4-state path.
     //
-    // Both operands must be 2-state for this fast path -- a 4-state/2-state
-    // mix (LRM 5.7: any 4-state operand makes the result 4-state) still
-    // needs the packed-plane path below, which assumes both operands
-    // already arrived as i(2W) (xz_mask reads a.mm/b.mm raw). Promote the
-    // narrower side instead of trusting the dispatch on `a` alone -- a
-    // mismatched-domain pair here is malformed LLVM IR (an i(2W) vs iW
-    // operand to the same icmp/select), observed to crash inside LLVM's
-    // constant folder rather than just miscompile.
-    if (a.two && !b.two) {
-        a = to_four(a);
-    } else if (!a.two && b.two) {
-        b = to_four(b);
-    } else if (a.two) {
+    // The IR has one domain for both operands; a mismatched pair is malformed LLVM
+    // IR (an i(2W) vs iW operand to the same icmp/select) that crashes inside LLVM's
+    // constant folder, so it is an assertion, not a repair.
+    assert(a.two == b.two && "divide / modulo operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
         llvm::Value* r;
         if (!sign) {
@@ -1007,18 +993,11 @@ Plane Backend::single_bit_lut(uint32_t lut, Plane a, Plane b) {
 Plane Backend::lower_bitwise(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w = width_of(a);
 
-    // 2-state: one native bitwise op; xnor is ~(xor). Both operands must be
-    // 2-state for this -- a 4-state/2-state mix (LRM 5.7: any 4-state
-    // operand makes the result 4-state) still needs the packed-plane path
-    // below, which assumes both operands already arrived as i(2W). Promote
-    // the narrower side instead of trusting the dispatch on `a` alone -- a
-    // mismatched-domain pair here is malformed LLVM IR, not just a wrong
-    // answer.
-    if (a.two && !b.two) {
-        a = to_four(a);
-    } else if (!a.two && b.two) {
-        b = to_four(b);
-    } else if (a.two) {
+    // 2-state: one native bitwise op; xnor is ~(xor). The IR has one domain for
+    // both operands (LRM 5.7), so a mismatched pair is malformed LLVM IR and an
+    // assertion, not a repair.
+    assert(a.two == b.two && "bitwise operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         switch (tag) {
             case Inst::Tag::Band:  return two_val(b_.CreateAnd(a.mm, b.mm));
             case Inst::Tag::Bor:   return two_val(b_.CreateOr(a.mm, b.mm));
@@ -1097,12 +1076,21 @@ Plane Backend::lower_bnot(Plane a) {
 }
 
 Plane Backend::lower_reduce(Inst::Tag tag, Plane a) {
-    // Definite 4-state 1-bit result (compute_type); a 2-state operand lifts and
-    // the any_unknown terms fold away, leaving the native reduction.
-    a = to_four(a);
-    const uint32_t w  = width_of(a);
-    llvm::Value*   am = must_of(a);
-    llvm::Value*   aM = may_of(a);
+    const uint32_t w = width_of(a);
+    // 2-state operand: the result is a definite bit, one native reduction of the
+    // value.
+    if (a.two) {
+        switch (tag) {
+            case Inst::Tag::RedXor:
+                return two_val(b_.CreateTrunc(b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, a.mm), int_ty(1)));
+            case Inst::Tag::RedAnd:
+                return two_val(b_.CreateICmpEQ(a.mm, ones(w)));
+            default: // RedOr
+                return two_val(b_.CreateICmpNE(a.mm, zero(w)));
+        }
+    }
+    llvm::Value* am = must_of(a);
+    llvm::Value* aM = may_of(a);
     if (tag == Inst::Tag::RedXor) {
         llvm::Value* unknown = any_unknown(a);
         llvm::Value* pop     = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, am);
@@ -1219,7 +1207,7 @@ Plane Backend::lower_clog2(Plane a) {
     return packed(must, may, zero(32));
 }
 
-Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
+Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt) {
     const uint32_t w  = width_of(a);
     const uint32_t aw = width_of(amt);
 
@@ -1227,7 +1215,7 @@ Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
     // x/z in the (self-determined) amount makes the result x, which collapses
     // to 0 in a 2-state result.
     if (a.two) {
-        const bool     arith = tag == Inst::Tag::Sra && sign;
+        const bool     arith = tag == Inst::Tag::Sra;
         const uint32_t cw    = std::max(aw, w);
         llvm::Value*   av    = must_of(amt);
         llvm::Value*   oob   = b_.CreateICmpUGE(cast(av, cw, false), llvm::ConstantInt::get(int_ty(cw), w));
@@ -1265,7 +1253,7 @@ Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
     llvm::Value* sh   = cast(must_of(amt), w, false);
     llvm::Value* safe = b_.CreateSelect(oob, llvm::ConstantInt::get(int_ty(w), w == 0 ? 0 : w - 1), sh);
 
-    const bool   arith = tag == Inst::Tag::Sra && sign;
+    const bool   arith = tag == Inst::Tag::Sra;
     llvm::Value* must;
     llvm::Value* may;
     llvm::Value* z;
@@ -1385,9 +1373,9 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         llvm::Value* mark0     = b_.CreateCall(keybuf_begin_fn(), {});
         llvm::Value* xz_slot   = entry_alloca(b_.getInt1Ty(), "aeq.anyx");
         b_.CreateStore(b_.getInt1(false), xz_slot);
-        emit_variable_agg_key_bytes(type, lhs, xz_slot);
+        emit_variable_agg_key_bytes(type, lhs, xz_slot, /*is_signed=*/false);
         llvm::Value* mid = b_.CreateCall(keybuf_begin_fn(), {});
-        emit_variable_agg_key_bytes(type, rhs, xz_slot);
+        emit_variable_agg_key_bytes(type, rhs, xz_slot, /*is_signed=*/false);
         llvm::Value* end = b_.CreateCall(keybuf_begin_fn(), {});
         llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "aeq.ptr");
         llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "aeq.len");
@@ -1401,7 +1389,7 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         llvm::Value* bit = b_.CreateICmpNE(eqb, b_.getInt8(0));
         return bit_plane(bit, bit);
     }
-    const ValType vt = from_ref(type);
+    const ValueType vt = value_type_of(mod_.pool, type);
     // A leaf reached through a deferred associative-array element (`a[k] == x`
     // over an aggregate value) resolves its map slot here -- lower_agg_eq
     // reads leaves inline, bypassing the Load dispatch. An absent key reads
@@ -1421,15 +1409,44 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
                                   real_plane(planes_to_real(pb, vt.width)));
     }
-    return lower_compare(Inst::Tag::Eq, pa, pb, vt.is_signed);
+    // Each leaf was read from its own storage, whose encoding is the signal's
+    // (a 2-state leaf of an aggregate written from a z-capable source is stored
+    // packed); the leaf's type says what its value is.
+    return lower_compare(Inst::Tag::Eq, in_type_domain(pa, vt), in_type_domain(pb, vt));
 }
 
-Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
-    // The result is always a definite 4-state bit (compute_type), so lift a
-    // 2-state operand into the packed encoding; with no x/z the any_unknown
-    // guards below fold to a single native icmp.
-    a = to_four(a);
-    b = to_four(b);
+Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {
+    const auto predicate = [&] {
+        switch (tag) {
+            case Inst::Tag::Eq:
+                return llvm::CmpInst::ICMP_EQ;
+            case Inst::Tag::Ne:
+                return llvm::CmpInst::ICMP_NE;
+            case Inst::Tag::ULt:
+                return llvm::CmpInst::ICMP_ULT;
+            case Inst::Tag::ULe:
+                return llvm::CmpInst::ICMP_ULE;
+            case Inst::Tag::UGt:
+                return llvm::CmpInst::ICMP_UGT;
+            case Inst::Tag::UGe:
+                return llvm::CmpInst::ICMP_UGE;
+            case Inst::Tag::SLt:
+                return llvm::CmpInst::ICMP_SLT;
+            case Inst::Tag::SLe:
+                return llvm::CmpInst::ICMP_SLE;
+            case Inst::Tag::SGt:
+                return llvm::CmpInst::ICMP_SGT;
+            default:
+                return llvm::CmpInst::ICMP_SGE;
+        }
+    };
+    // 2-state operands carry no x or z, so the result is a definite bit from one
+    // native compare. The IR has one domain for both operands, and a 4-state pair
+    // is the packed encoding below; a mismatched pair is malformed LLVM IR.
+    assert(a.two == b.two && "compare operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
+        return two_val(b_.CreateICmp(predicate(), a.mm, b.mm));
+    }
 
     // Equality keeps a branchless mask form (and a width-1 LUT). LRM 11.4.5:
     // the result is X only if unknown bits make the relation AMBIGUOUS. A bit
@@ -1468,21 +1485,7 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
     // unknown (x) or high-impedance (z) value, then the result shall be
     // 1'bx" — even when known high bits alone would decide the relation
     // (iverilog agrees). Do not "sharpen" this path.
-    llvm::CmpInst::Predicate pred;
-    switch (tag) {
-        case Inst::Tag::Lt:
-            pred = sign ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_ULT;
-            break;
-        case Inst::Tag::Le:
-            pred = sign ? llvm::CmpInst::ICMP_SLE : llvm::CmpInst::ICMP_ULE;
-            break;
-        case Inst::Tag::Gt:
-            pred = sign ? llvm::CmpInst::ICMP_SGT : llvm::CmpInst::ICMP_UGT;
-            break;
-        default:
-            pred = sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
-            break;
-    }
+    const llvm::CmpInst::Predicate pred = predicate();
     llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
     return branchy_bit(
       unknown, [&] { return llvm::ConstantInt::get(int_ty(2), 0b10); },
@@ -1498,12 +1501,12 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
 //   CasexEq:  x and z bits in either operand are don't-care
 //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
 Plane Backend::lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
-    const uint32_t w = std::max(width_of(a), width_of(b));
-    // The result is a definite 4-state bit; lift operands to the packed form the
-    // masking below needs (z / may planes materialized). 2-state operands carry
-    // no x/z, so the case forms collapse to a plain == after folding.
-    a = cast_plane(to_four(a), w, false);
-    b = cast_plane(to_four(b), w, false);
+    assert(a.two == b.two && "case-compare operands share a domain (ir::verify: operand-domain)");
+    assert(width_of(a) == width_of(b) && "case-compare operands share a width (ir::verify: operand-width)");
+    // 2-state operands carry no x or z, so every case form is a plain ==.
+    if (a.two) {
+        return two_val(b_.CreateICmpEQ(a.mm, b.mm));
+    }
 
     llvm::Value* eq;
     if (tag == Inst::Tag::CaseEq) {
@@ -1525,7 +1528,7 @@ Plane Backend::lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
           b_.CreateICmpEQ(b_.CreateAnd(am, keep), b_.CreateAnd(bm, keep)),
           b_.CreateICmpEQ(b_.CreateAnd(aM, keep), b_.CreateAnd(bM, keep)));
     }
-    return bit_plane(eq, eq);
+    return two_val(eq);
 }
 
 // Wildcard equality `==?`. LRM 1800-2023 §11.4.6: x/z in the RIGHT operand are
@@ -1542,7 +1545,7 @@ Plane Backend::lower_inside_set(Index i) {
     const auto& p    = ir_->payload(i).op_extra;
     const auto  info = ir_->extra_data<InsideSetInfo>(p.extra);
     const Plane sel  = value_of(p.op);
-    const bool  sign = type_of(p.op).is_signed;
+    const bool  sign = info.ranges_signed != 0;
 
     std::optional<Plane> acc;
     const auto add = [&](Plane pred) {
@@ -1553,19 +1556,21 @@ Plane Backend::lower_inside_set(Index i) {
     }
     const std::span<const Index> rngs = ir_->region(info.ranges);
     for (size_t k = 0; k + 1 < rngs.size(); k += 2) {
-        const Plane ge = lower_compare(Inst::Tag::Ge, sel, value_of(rngs[k]), sign);
-        const Plane le = lower_compare(Inst::Tag::Le, sel, value_of(rngs[k + 1]), sign);
+        const Plane ge = lower_compare(sign ? Inst::Tag::SGe : Inst::Tag::UGe, sel, value_of(rngs[k]));
+        const Plane le = lower_compare(sign ? Inst::Tag::SLe : Inst::Tag::ULe, sel, value_of(rngs[k + 1]));
         add(lower_logical(Inst::Tag::Land, ge, le));
     }
     return *acc;
 }
 
 Plane Backend::lower_wildeq(Plane a, Plane b) {
-    const uint32_t w     = std::max(width_of(a), width_of(b));
-    // Definite 4-state bit result; lift operands. 2-state operands have no
-    // wildcard (x/z) bits, so ==? folds to a plain ==.
-    a                    = cast_plane(to_four(a), w, false);
-    b                    = cast_plane(to_four(b), w, false);
+    assert(a.two == b.two && "wildcard-equality operands share a domain (ir::verify: operand-domain)");
+    assert(width_of(a) == width_of(b) && "wildcard-equality operands share a width (ir::verify: operand-width)");
+    const uint32_t w = width_of(a);
+    // 2-state operands have no wildcard (x/z) bits, so ==? is a plain ==.
+    if (a.two) {
+        return two_val(b_.CreateICmpEQ(a.mm, b.mm));
+    }
     auto*          wide  = int_ty(2 * w);
     llvm::Value*   unkb  = b_.CreateXor(must_of(b), may_of(b)); // x/z bits of b
     llvm::Value*   keep  = b_.CreateNot(unkb);
@@ -1573,7 +1578,7 @@ Plane Backend::lower_wildeq(Plane a, Plane b) {
                                        b_.CreateShl(b_.CreateZExt(keep, wide), w));
     Plane ma = { b_.CreateAnd(a.mm, keepW), b_.CreateAnd(a.z, keep) };
     Plane mb = { b_.CreateAnd(b.mm, keepW), b_.CreateAnd(b.z, keep) };
-    return lower_compare(Inst::Tag::Eq, ma, mb, false);
+    return lower_compare(Inst::Tag::Eq, ma, mb);
 }
 
 Backend::Truth Backend::truth_of(Plane a) {
@@ -1583,10 +1588,20 @@ Backend::Truth Backend::truth_of(Plane a) {
     return { t, f };
 }
 
+llvm::Value* Backend::nonzero(Plane a) {
+    return width_of(a) == 1 ? a.mm : b_.CreateICmpNE(a.mm, zero(width_of(a)));
+}
+
 Plane Backend::lower_logical(Inst::Tag tag, Plane a, Plane b) {
-    // Definite 4-state 1-bit result; lift operands (self-determined, so either
-    // may be 2-state) into the packed encoding. With no x/z the truth of each
-    // operand is just "nonzero" and the body folds to a native boolean op.
+    // 2-state operands carry no x or z: each truth is "nonzero" and the result is
+    // a definite bit.
+    if (a.two && b.two) {
+        llvm::Value* at = nonzero(a);
+        llvm::Value* bt = nonzero(b);
+        return two_val(tag == Inst::Tag::Land ? b_.CreateAnd(at, bt) : b_.CreateOr(at, bt));
+    }
+    // A 4-state result. The operands are self-determined, so one can be 2-state
+    // next to a 4-state one; lift it into the packed encoding.
     a = to_four(a);
     b = to_four(b);
 
@@ -1622,8 +1637,10 @@ Plane Backend::lower_logical(Inst::Tag tag, Plane a, Plane b) {
 }
 
 Plane Backend::lower_lnot(Plane a) {
-    // Definite 4-state 1-bit result; lift a 2-state operand (!a folds to a==0).
-    a = to_four(a);
+    // 2-state operand: !a is a == 0, a definite bit.
+    if (a.two) {
+        return two_val(b_.CreateNot(nonzero(a)));
+    }
     // At width 1, !a is the same operation as ~a (negate the single truth bit),
     // so reuse the bnot plane swap+complement — cheaper than a truth pair, and
     // already optimal (one not + one rotate), so no LUT is warranted.
@@ -1644,6 +1661,9 @@ Plane Backend::lower_lnot(Plane a) {
 // (either half of the OR is settled); definitely false only when a is
 // definitely true AND b is definitely false; x otherwise.
 Plane Backend::lower_limplies(Plane a, Plane b) {
+    if (a.two && b.two) {
+        return two_val(b_.CreateOr(b_.CreateNot(nonzero(a)), nonzero(b)));
+    }
     a = to_four(a);
     b = to_four(b);
     const Truth ta = truth_of(a);
@@ -1661,6 +1681,9 @@ Plane Backend::lower_limplies(Plane a, Plane b) {
 // differ, x whenever either operand is itself ambiguous (an ambiguous
 // operand's two possible resolutions give different equivalence answers).
 Plane Backend::lower_lequiv(Plane a, Plane b) {
+    if (a.two && b.two) {
+        return two_val(b_.CreateICmpEQ(nonzero(a), nonzero(b)));
+    }
     a = to_four(a);
     b = to_four(b);
     const Truth ta = truth_of(a);
@@ -1671,11 +1694,13 @@ Plane Backend::lower_lequiv(Plane a, Plane b) {
 }
 
 Plane Backend::lower_select(Plane cond, Plane a, Plane b) {
-    // 2-state arms: a native select. slang unifies the two arms to a common
-    // type, so both are 2-state here. A 4-state condition may be x (LRM
+    // The arms share one domain: the frontend converts both to the conditional's
+    // type (LRM 11.4.11), and a mismatched pair would be malformed LLVM IR.
+    assert(a.two == b.two && "select arms share a domain (ir::verify: select-arm-domain)");
+    // 2-state arms: a native select. A 4-state condition may be x (LRM
     // 1800-2023 11.4.11: bitwise merge, x where the arms disagree); in a
     // 2-state result that x collapses to 0, which is exactly `a & b`.
-    if (a.two && b.two) {
+    if (a.two) {
         llvm::Value* ct  = b_.CreateICmpNE(must_of(cond), zero(1));
         llvm::Value* sel = b_.CreateSelect(ct, a.mm, b.mm);
         if (cond.two) {
@@ -1684,11 +1709,6 @@ Plane Backend::lower_select(Plane cond, Plane a, Plane b) {
         llvm::Value* known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
         return two_val(b_.CreateSelect(known, sel, b_.CreateAnd(a.mm, b.mm)));
     }
-    // Defensive: a lone 2-state arm is lifted so the packed body's direct plane
-    // access is uniform.
-    a = to_four(a);
-    b = to_four(b);
-
     const uint32_t w          = width_of(a);
     llvm::Value*   cond_known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
     llvm::Value*   cond_true  = b_.CreateICmpNE(must_of(cond), zero(1));

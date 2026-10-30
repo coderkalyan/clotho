@@ -505,7 +505,7 @@ ir::Ref Lowerer::def_constant_ref(uint32_t width, bool one) {
             bytes[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // val plane = 1
         }
     }
-    return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false), bytes);
+    return module_.pool.put_value(make_int_type(width, /*is_four=*/true), bytes);
 }
 
 ir::Ref Lowerer::z_constant_ref(uint32_t width) {
@@ -514,7 +514,7 @@ ir::Ref Lowerer::z_constant_ref(uint32_t width) {
     for (uint32_t bit = 0; bit < width; ++bit) {
         bytes[pb + bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // xz plane = 1 (Z)
     }
-    return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false), bytes);
+    return module_.pool.put_value(make_int_type(width, /*is_four=*/true), bytes);
 }
 
 // The full-width value one driver stages into its slot: for a whole-net
@@ -539,7 +539,7 @@ ir::Index Lowerer::build_driver_slot_value(ir::Signal        net,
     const ir::Ref  net_ty = module_.signal(net).type;
     const uint32_t net_w  = module_.pool.layout(net_ty).width;
     if (is_whole_net_lvalue(left)) {
-        return b.resize(driven, net_ty, l);
+        return b.convert(driven, net_ty, root != nullptr && root->getType().isSigned(), l);
     }
     const NetRegion reg = root != nullptr ? net_region_of(left, *root) : kWholeNet;
     // A constant packed sub-range: one element band [0,0], a bounded bit
@@ -565,7 +565,7 @@ ir::Index Lowerer::build_driver_slot_value(ir::Signal        net,
         fail("internal: resolved net storage is not 4-state");
     }
     const uint32_t  region_w = reg.bit_hi - reg.bit_lo + 1;
-    const ir::Index rhs      = b.resize(driven, make_int_type(region_w, true, false), l);
+    const ir::Index rhs      = b.convert(driven, make_int_type(region_w, true), false, l);
     // Concatenation is MSB-first: { Z above the range, the value, Z below }.
     std::vector<ir::Index> parts;
     if (reg.bit_hi < net_w - 1) {
@@ -709,7 +709,7 @@ void Lowerer::emit_wire_resolvers() {
 
         const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
 
-        ir::Builder b(module_.pool);
+        ir::Builder b(module_);
         // Fold the driver slots (a driverless tri0/tri1 net seeds all-Z, so
         // the pull sees only Z and fills the whole net with its pull value).
         ir::Index acc;
@@ -852,7 +852,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
         return;
     }
 
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc l = to_source_loc(sym.location);
     if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
         // Multiply-driven net: this driver stages its value into its own
@@ -1018,7 +1018,7 @@ void Lowerer::scan_force_targets(const Statement& body) {
 ir::Signal Lowerer::new_pca_state(const char* tag, const ValueSymbol& sym) {
     ir::SignalInfo info;
     info.name = prefix_ + tag + "." + std::string(sym.name) + "." + std::to_string(temp_id_++);
-    info.type = make_int_type(32, false, false);
+    info.type = make_int_type(32, false);
     return register_signal(std::move(info));
 }
 
@@ -1065,7 +1065,7 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     site.hi     = hi;
     ir::SignalInfo vinfo;
     vinfo.name = prefix_ + "$force_val." + std::string(root.name) + "." + std::to_string(temp_id_++);
-    vinfo.type = make_int_type(hi - lo + 1, /*four_state=*/true, /*is_signed=*/false);
+    vinfo.type = make_int_type(hi - lo + 1, /*four_state=*/true);
     site.val   = register_signal(std::move(vinfo));
 
     auto&          sites = net_force_sites_[net_u];
@@ -1127,7 +1127,7 @@ std::vector<ir::WaitEvent> Lowerer::with_force_wake(std::vector<ir::WaitEvent> e
 
 // Constant of the force_site signal's type (2-state i32).
 ir::Index Lowerer::site_const(uint32_t id, ir::Builder& b, ir::SourceLoc l) {
-    return b.constant(module_.pool.put_int(make_int_type(32, false, false), id), l);
+    return b.constant(module_.pool.put_int(make_int_type(32, false), id), l);
 }
 
 // `force_site === id` (CaseEq never yields x; the site is 2-state anyway).
@@ -1459,7 +1459,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
         // A whole unpacked-struct / aggregate net initializer is a whole-object
         // continuous copy (one process on the source's sensitivity), the same
         // as a bare `assign n = ...` on a struct.
-        ir::Builder         ab(module_.pool);
+        ir::Builder         ab(module_);
         const ir::SourceLoc al = loc(*init);
         emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init, ir::Inst::Tag::Store, ab, al);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
@@ -1478,13 +1478,13 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
         fail("net declaration assignment rise/fall/turn-off delays (wire #(a,b,c) w = ...) "
              "are not supported");
     }
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc l = loc(*init);
     if (resolved) {
         // A net-declaration assignment is a whole-net driver: stage the
         // initializer into this driver's slot (emit_wire_resolvers folds it).
         const ir::Signal slot = alloc_driver_slot(signal_of(ns), l, pack_strength(ns.getDriveStrength()));
-        const ir::Index  val  = b.resize(lower_expr(*init, b), lower_type(ns.getType()), l);
+        const ir::Index  val  = b.convert(lower_expr(*init, b), lower_type(ns.getType()), ns.getType().isSigned(), l);
         if (delay != nullptr) {
             const ir::Index dst   = b.signal(slot, l);
             const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
@@ -1736,10 +1736,10 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
     info.type            = module_.pool.logic_type;
     const ir::Signal tmp = module_.add_signal(std::move(info));
 
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc l   = loc(e);
     const ir::Index     dst = b.signal(tmp, l);
-    const ir::Index     rhs = b.resize(lower_expr(e, b), module_.pool.logic_type, l);
+    const ir::Index     rhs = b.convert(lower_expr(e, b), module_.pool.logic_type, false, l);
     b.binary(ir::Inst::Tag::Store, dst, rhs, l);
 
     std::vector<ir::WaitEvent> wait_events;
@@ -1828,7 +1828,7 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
       up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
     const uint16_t   strength = up ? static_cast<uint16_t>(driven)       // (highz0, drivenN)
                                    : static_cast<uint16_t>(driven << 8); // (drivenN, highz1)
-    ir::Builder      b(module_.pool);
+    ir::Builder      b(module_);
     const ir::Signal slot = alloc_driver_slot(net, l, strength);
     const ir::Index  dst  = b.signal(slot, l);
     const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
@@ -1893,7 +1893,7 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
     // device (confirmed against iverilog 13: `cmos #5` and `nmos #5` + `pmos #5`
     // produce identical waveforms).
     const auto emit_half = [&](TriGate tg, const GateInput& ctrl) {
-        ir::Builder                b(module_.pool);
+        ir::Builder                b(module_);
         std::vector<ir::WaitEvent> wait_events;
         const ir::Index            folded = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
         const ir::Index            val    = gate_output_value(left, folded, b, l);
@@ -1988,7 +1988,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         // Fold the gate value into this output's own builder / process (a
         // tri-state gate drives Z, so it never forces z to x like the
         // combinational fold does).
-        ir::Builder                b(module_.pool);
+        ir::Builder                b(module_);
         std::vector<ir::WaitEvent> wait_events;
         const ir::Index            folded =
           mos   ? gate_tristate_value(*mos, inputs[0], inputs[1], wait_events, b, loc, /*pass_z=*/true)
@@ -2034,7 +2034,7 @@ ir::Index Lowerer::gate_bit_lvalue(ir::Signal sig, uint32_t bit, ir::Builder& b,
     if (module_.pool.layout(module_.signal(sig).type).width == 1) {
         return s;
     }
-    const ir::Ref u32 = make_int_type(32, false, false);
+    const ir::Ref u32 = make_int_type(32, false);
     return b.binary(ir::Inst::Tag::BitSelect, s, b.constant(module_.pool.put_int(u32, bit), l), l);
 }
 
@@ -2053,7 +2053,7 @@ ir::Index Lowerer::gate_output_value(const Expression& left, ir::Index val, ir::
     if (left.type->isFourState()) {
         return val;
     }
-    return b.resize(val, make_int_type(1, /*is_four=*/false, /*is_signed=*/false), l);
+    return b.convert(val, make_int_type(1, /*is_four=*/false), false, l);
 }
 
 // Materialize one gate input terminal as its 1-bit logic value: a load of the
@@ -2132,7 +2132,7 @@ ir::Index Lowerer::gate_folded_value(GateOp                      op,
     }
 
     collect_gate_sensitivity(inputs, wait_events);
-    return b.resize(*acc, logic1, l);
+    return b.convert(*acc, logic1, false, l);
 }
 
 // Lower a three-state gate (bufif/notif, LRM 28.6, Table 28-5) or a MOS pass
@@ -2186,7 +2186,7 @@ ir::Index Lowerer::gate_tristate_value(TriGate                     tg,
     }
 
     collect_gate_sensitivity(std::array<GateInput, 2>{ data, ctrl }, wait_events);
-    return b.resize(result, logic1, l);
+    return b.convert(result, logic1, false, l);
 }
 
 // Lower one gate output as a continuous-assign process: store the pre-folded

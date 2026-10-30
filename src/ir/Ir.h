@@ -175,6 +175,36 @@ struct ExtraSlice {
     ExtraIndex end;
 };
 
+// Decode a record written to an extra side-table by Builder::add_extra. Shared by
+// every reader of the table: a finished `Ir`, a `Builder` still growing one, and
+// the `IrView` that value typing reads either through.
+template<ExtraPayload T>
+T decode_extra(std::span<const uint32_t> extra, ExtraIndex at) {
+    constexpr size_t        n    = sizeof(T) / sizeof(uint32_t);
+    const auto              base = static_cast<uint32_t>(at);
+    std::array<uint32_t, n> words{};
+    for (size_t i = 0; i < n; ++i) {
+        words[i] = extra[base + i];
+    }
+
+    return std::bit_cast<T>(words);
+}
+
+// A slice of the extra table reinterpreted as a run of instruction indices.
+//
+// NOTE: viewing u32 extra words as enum-class handles (here and in
+// wait_edges) is formally an aliasing violation — an enum is not
+// aliasing-compatible with its underlying type ([basic.lval]). Accepted
+// deliberately: the representation is identical, every compiler this
+// builds on reads it as intended, and the alternative (per-element
+// copies) costs the zero-copy view this layout exists for.
+inline std::span<const Index> decode_slice(std::span<const uint32_t> extra, ExtraSlice s) {
+    const auto a = static_cast<uint32_t>(s.start);
+    const auto b = static_cast<uint32_t>(s.end);
+
+    return { reinterpret_cast<const Index*>(extra.data() + a), b - a };
+}
+
 // Extra payload for `strength_res`: the driver slot values and a parallel run
 // of packed per-driver (strength0<<8 | strength1) constants (one u32 word per
 // driver, low 16 bits used). `values` are the SSA operands; `strengths` are
@@ -309,6 +339,22 @@ struct InsideSetInfo {
     ExtraSlice values;
     // [lo, hi] range operand pairs, two indices per range.
     ExtraSlice ranges;
+    // Nonzero when the ranges compare as signed numbers: the selector's type decides
+    // (LRM 11.4.13 tests `sel >= lo && sel <= hi`, LRM 11.8.1). Chosen by the
+    // frontend; equality against the singular members does not depend on it.
+    uint32_t ranges_signed;
+};
+
+// Extra payload for `pow`: the exponent and the signedness of both operands, which
+// decide Table 11-4's negative-operand corners. The base is the instruction's op;
+// the exponent is self-determined and may differ in width and domain.
+struct PowInfo {
+    // The exponent value.
+    Index exp;
+    // Nonzero when the base is signed.
+    uint32_t base_signed;
+    // Nonzero when the exponent is signed.
+    uint32_t exp_signed;
 };
 
 // Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
@@ -773,6 +819,16 @@ struct SwitchInfo {
     uint32_t pragmas;
 };
 
+// One value operand of a format-family op ($display, $sformat, $sformatf, the
+// severity tasks, ...): the value, and whether the decimal conversions print it as
+// a signed number (LRM 21.2.1.2). Signedness is the language's, not a property of
+// the value's bits, so the frontend says it here rather than the backend guessing it
+// from a type.
+struct FmtArg {
+    Index value;
+    bool  is_signed = false;
+};
+
 // Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
 // $fwrite system task. The format-string bytes live packed little-endian
 // (4 chars per u32 word) at `fmt` for `fmt_len` bytes; `args` is the slice of
@@ -789,6 +845,8 @@ struct DisplayInfo {
     uint32_t newline;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // One word per operand of `args`: 1 when it prints as a signed number.
+    ExtraSlice signs;
 };
 
 // Extra payload for `finish`: a $finish / $stop. `arg` is the diagnostic level
@@ -892,6 +950,8 @@ struct SeverityInfo {
     uint32_t defer;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As DisplayInfo::signs.
+    ExtraSlice signs;
 };
 
 // Extra payload for `fseek`: $fseek(fd, offset, operation) — the descriptor is
@@ -970,6 +1030,8 @@ struct SformatInfo {
     uint32_t fmt_len;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As DisplayInfo::signs.
+    ExtraSlice signs;
     // The format as a runtime STRING VALUE, for the $sformat form LRM §21.3.3
     // exempts from the literal-format rule; kNoFormatValue on the ordinary path,
     // where `fmt` / `fmt_len` carry the text instead. Never both.
@@ -989,6 +1051,8 @@ struct SformatfInfo {
     uint32_t fmt_len;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As DisplayInfo::signs.
+    ExtraSlice signs;
     // As SformatInfo::fmt_value.
     Index fmt_value;
     // As SformatInfo::tick_scale.
@@ -1110,6 +1174,9 @@ struct EnumNameInfo {
     // — LRM 21.2.1.6's rule for `%p` of an enum, against LRM 6.19.2's "" for
     // `.name()`.
     uint32_t fmt_fallback;
+    // Nonzero when the enum's base type is signed, so the decimal fallback prints
+    // a negative value with its sign.
+    uint32_t is_signed;
 };
 
 // One member of a tagged union's name table, in tag order (its slang
@@ -1533,12 +1600,19 @@ struct Inst {
         AssocNext,
         AssocPrev,
 
-        // -- Arithmetic (payload: binary) --
+        // -- Arithmetic (payload: binary, except Pow) --
+        // Add / Sub / Mul are the same bits whatever the operands' signedness.
         Add,
         Sub,
         Mul,
-        Div,
-        Mod,
+        // Division and remainder of unsigned / signed operands (LRM 11.4.3). The
+        // frontend picks the opcode from the operation's signedness (LRM 11.8.1).
+        UDiv,
+        SDiv,
+        UMod,
+        SMod,
+        // Power (payload: op_extra -> PowInfo; op is the base). The base's and the
+        // self-determined exponent's signedness are instruction data.
         Pow,
 
         // -- Bitwise (payload: binary, except Bnot) --
@@ -1604,16 +1678,24 @@ struct Inst {
         Sll,
         // Shift right logical.
         Srl,
-        // Shift right arithmetic.
+        // Shift right arithmetic: replicates the sign bit. The frontend emits it
+        // only for `>>>` of a signed operand (LRM 11.4.10); an unsigned `>>>` is Srl.
         Sra,
 
         // -- Comparisons, -> 1-bit (payload: binary) --
+        // Equality does not depend on signedness; the ordered compares come in an
+        // unsigned and a signed form, picked by the frontend from the operands'
+        // common type (LRM 11.4.4, 11.8.1).
         Eq,
         Ne,
-        Lt,
-        Le,
-        Gt,
-        Ge,
+        ULt,
+        ULe,
+        UGt,
+        UGe,
+        SLt,
+        SLe,
+        SGt,
+        SGe,
 
         // -- Case-equality, -> definite 1-bit (payload: binary) --
         // Unlike Eq, these never yield X: they compare the 4-state planes
@@ -1658,9 +1740,10 @@ struct Inst {
         FGt,
         FGe,
         // Conversions (payload: op_type = operand + target type).
-        // Integral -> float. Source signedness comes from the operand type;
-        // x/z bits read as 0 (LRM 6.12.1).
-        ItoF,
+        // Integral -> float, of an unsigned / signed operand; x/z bits read as 0
+        // (LRM 6.12.1).
+        UItoF,
+        SItoF,
         // Float -> integral, rounding half away from zero (LRM 6.12.1) — the
         // assignment / cast conversion.
         FtoI,
@@ -1722,9 +1805,23 @@ struct Inst {
         // op_imm — op is the built stream value, imm the slice size S).
         StreamReverse,
 
-        // -- Width --
-        // Resize (zero/sign extend or truncate) to a target type (payload: op_type).
-        Resize,
+        // -- Width and domain --
+        // Conversions of an integral value to a target type (payload: op_type: the
+        // operand and the type of the result, whose width and domain are the
+        // target's). The extension is in the opcode: the language, not the value's
+        // bits, decides whether a widening fills with zeros or with a copy of the
+        // top bit (LRM 11.8.2, 11.8.3, 6.24.1), and the frontend chooses.
+        // Widening, in the operand's domain: fill the new high bits with zeros / with
+        // the top bit.
+        ZExt,
+        SExt,
+        // Narrowing, in the operand's domain: keep the low bits.
+        Trunc,
+        // The domain alone, at the operand's width: a 2-state value gains an x/z
+        // plane that is zero, and the x and z bits of a 4-state value become 0
+        // (LRM 6.3.1).
+        ToFour,
+        ToTwo,
 
         // -- Control flow --
         // If / else; condition + then/else regions (payload: op_extra -> Regions).
@@ -2123,7 +2220,7 @@ struct Inst {
         // rounds the tick count down by `scale` (the calling module's unit / the
         // smallest unit) to the module time unit (LRM §20.3.1). `scale` is 1 when
         // unitless or the module owns the smallest unit. $stime truncates the
-        // result to 32 bits via a Resize.
+        // result to 32 bits via a Trunc.
         SimTime,
         // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
@@ -2521,9 +2618,10 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Add:
         case T::Sub:
         case T::Mul:
-        case T::Div:
-        case T::Mod:
-        case T::Pow:
+        case T::UDiv:
+        case T::SDiv:
+        case T::UMod:
+        case T::SMod:
         case T::Band:
         case T::Bor:
         case T::Bxor:
@@ -2536,10 +2634,14 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Sra:
         case T::Eq:
         case T::Ne:
-        case T::Lt:
-        case T::Le:
-        case T::Gt:
-        case T::Ge:
+        case T::ULt:
+        case T::ULe:
+        case T::UGt:
+        case T::UGe:
+        case T::SLt:
+        case T::SLe:
+        case T::SGt:
+        case T::SGe:
         case T::CaseEq:
         case T::CasezEq:
         case T::CasexEq:
@@ -2585,9 +2687,14 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ObjRandSeed:
             return K::Binary;
 
-        case T::Resize:
+        case T::ZExt:
+        case T::SExt:
+        case T::Trunc:
+        case T::ToFour:
+        case T::ToTwo:
         case T::StrToPacked:
-        case T::ItoF:
+        case T::UItoF:
+        case T::SItoF:
         case T::FtoI:
         case T::FtoITrunc:
         case T::FBitcast:
@@ -2754,6 +2861,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DistUnary:
         case T::DistBinary:
         case T::InsideSet:
+        case T::Pow:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:
@@ -2980,6 +3088,40 @@ static_assert(extra_operand_tails_total(),
               "a tag on PayloadKind::FDisplay / Sformat / Sformatf / Scanf needs its "
               "extra_operand_tail() case");
 
+// Whether `tag` converts an integral value to another width or domain without
+// otherwise changing it: the instructions a pass looks through to find the value.
+constexpr bool is_conversion(Inst::Tag tag) {
+    return tag == Inst::Tag::ZExt || tag == Inst::Tag::SExt || tag == Inst::Tag::Trunc || tag == Inst::Tag::ToFour ||
+           tag == Inst::Tag::ToTwo;
+}
+
+// A read-only window onto the columns of a body, finished or still growing:
+// what value typing (Typing.h) reads, so an `Ir` and a `Builder` are typed by
+// the same function. Views do not own; they are valid until the body they
+// look at changes.
+struct IrView {
+    std::span<const Inst::Tag>     tags;
+    std::span<const Inst::Payload> payloads;
+    std::span<const uint32_t>      extra;
+
+    Inst::Tag tag(Index i) const {
+        return tags[static_cast<uint32_t>(i)];
+    }
+
+    const Inst::Payload& payload(Index i) const {
+        return payloads[static_cast<uint32_t>(i)];
+    }
+
+    template<ExtraPayload T>
+    T extra_data(ExtraIndex at) const {
+        return decode_extra<T>(extra, at);
+    }
+
+    std::span<const Index> region(ExtraSlice r) const {
+        return decode_slice(extra, r);
+    }
+};
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -2988,6 +3130,11 @@ static_assert(extra_operand_tails_total(),
 class Ir {
 public:
     Ir() = default;
+
+    // The columns value typing reads.
+    IrView view() const {
+        return { { tags_.data(), tags_.size() }, { payloads_.data(), payloads_.size() }, extra_raw() };
+    }
 
     // Intern pool backing this IR's constant / type handles. Valid only on a
     // built Ir (Builder::finish()), never on a default-constructed one.
@@ -3041,17 +3188,17 @@ public:
         return index_slice(r);
     }
 
+    // A slice of the extra table holding plain words rather than operands (the
+    // per-operand flags of a format-family op).
+    std::span<const uint32_t> words(ExtraSlice r) const {
+        const auto a = static_cast<uint32_t>(r.start);
+        return { extra_.data() + a, static_cast<uint32_t>(r.end) - a };
+    }
+
     // Decode a struct previously written with Builder::add_extra.
     template<ExtraPayload T>
     T extra_data(ExtraIndex at) const {
-        constexpr size_t        n    = sizeof(T) / sizeof(uint32_t);
-        const auto              base = static_cast<uint32_t>(at);
-        std::array<uint32_t, n> words{};
-        for (size_t i = 0; i < n; ++i) {
-            words[i] = extra_[base + i];
-        }
-
-        return std::bit_cast<T>(words);
+        return decode_extra<T>(extra_raw(), at);
     }
 
     // Decode `len` raw bytes previously packed at `at` by Builder (little-endian,
@@ -3178,18 +3325,8 @@ private:
     friend class Builder;
 
     // A slice reinterpreted as a run of instruction indices.
-    //
-    // NOTE: viewing u32 extra words as enum-class handles (here and in
-    // wait_edges) is formally an aliasing violation — an enum is not
-    // aliasing-compatible with its underlying type ([basic.lval]). Accepted
-    // deliberately: the representation is identical, every compiler this
-    // builds on reads it as intended, and the alternative (per-element
-    // copies) costs the zero-copy view this layout exists for.
     std::span<const Index> index_slice(ExtraSlice s) const {
-        const auto a = static_cast<uint32_t>(s.start);
-        const auto b = static_cast<uint32_t>(s.end);
-
-        return { reinterpret_cast<const Index*>(extra_.data() + a), b - a };
+        return decode_slice(extra_raw(), s);
     }
 
     // Constructed atomically by Builder::finish().

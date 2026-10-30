@@ -1133,6 +1133,13 @@ private:
 
     ir::Index lower_index(const Expression& e, ir::Builder& b);
 
+    // An operand the backend reads as a SIGNED number -- an index, a size, a count.
+    // A signed value passes through, and the backend sign-extends it; an unsigned
+    // one is zero-extended one bit past its width (at least to 64 bits first), so
+    // that reading is exact and the top bit of an unsigned value is never taken for
+    // a sign.
+    ir::Index as_signed_number(ir::Index v, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l);
+
     static ir::SourceSpan span_of(const Symbol& sym);
 
     std::string finish_banner(const Expression& call, std::string_view task) const;
@@ -1314,6 +1321,8 @@ private:
         bool           is_event = false;
     };
 
+    ir::Index bit_like(ir::Index like, uint64_t value, ir::Builder& b, ir::SourceLoc l);
+    ir::Index in_lvalue_domain(ir::Index lv, ir::Index v, ir::Builder& b, ir::SourceLoc l);
     void store_leaf(ir::Inst::Tag        tag,
                     const IntraNbTiming* t,
                     ir::Index            lv,
@@ -1495,40 +1504,14 @@ private:
 
     ir::Ref string_value_ref(std::string_view text);
 
-    ir::Ref make_int_type(uint32_t width, bool is_four, bool is_signed);
-
-    // Which operand's signedness picks the fill bits of an integral WIDENING.
-    // The LRM gives two different answers and the IR's Resize instruction
-    // implements the second one: it extends according to the signedness of its
-    // TARGET type.
-    enum class Extend : uint8_t {
-        // LRM 11.8.3 (assignment): "extend the size of the right-hand side,
-        // performing sign extension if, and only if, the type of the right-hand
-        // side is signed" — the SOURCE decides. LRM 6.24.1 puts a cast under the
-        // same rule: a cast "shall return the value that a variable of the
-        // casting type would hold after being assigned the expression".
-        Source,
-        // LRM 11.8.2, last step: a context-determined operand "shall be
-        // converted to the propagated type and size... sign-extended only if the
-        // propagated type is signed" — the TARGET decides. The two rules really
-        // do disagree, in both directions: with `logic [7:0] u; logic signed
-        // [3:0] s = -1`, `u + s` zero-extends s (16), while `u = s` sign-extends
-        // it (255). Both iverilog 13 and Verilator 5.050 agree on both.
-        Target,
-    };
+    ir::Ref make_int_type(uint32_t width, bool is_four);
 
     ir::Index coerce(ir::Index               v,
                      const slang::ast::Type& from,
                      ir::Ref                 to,
                      ir::Builder&            b,
                      ir::SourceLoc           l,
-                     Extend                  ext = Extend::Source);
-
-    ir::Index extend_by_source_sign(ir::Index               v,
-                                    const slang::ast::Type& from,
-                                    ir::Ref                 to,
-                                    ir::Builder&            b,
-                                    ir::SourceLoc           l);
+                     std::optional<bool>     sign_extend = std::nullopt);
 
     ir::Index narrow_to_declared(ir::Index v, const slang::ast::Type& declared, ir::Builder& b, ir::SourceLoc l);
 
@@ -1788,7 +1771,7 @@ private:
                         ir::SourceLoc               l,
                         std::vector<ir::WaitEvent>  extra,
                         PredFn                      pred_fn) {
-        ir::Builder     rb(module_.pool);
+        ir::Builder     rb(module_);
         const ir::Index pred = pred_fn(rb);
         rb.open_region();
         const ir::Index dst = rb.signal(v, l);
@@ -2891,6 +2874,7 @@ private:
         ir::Ref  ty;
         uint32_t width;
         bool     four;
+        bool     is_signed;
     };
 
     uint32_t case_pragma_bits(const CaseStatement& c) const;
@@ -2903,14 +2887,23 @@ private:
 
     CaseCompareType common_inside_type(const CaseStatement& c);
 
-    ir::Index lower_inside_label_pred(const Expression& label, ir::Index sel, ir::Ref ty, ir::Builder& b);
+    ir::Index lower_inside_label_pred(const Expression& label,
+                                      ir::Index         sel,
+                                      ir::Ref           ty,
+                                      bool              is_signed,
+                                      ir::Builder&      b);
 
-    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Ref ty, ir::Builder& b);
+    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item,
+                                     ir::Index                       sel,
+                                     ir::Ref                         ty,
+                                     bool                            is_signed,
+                                     ir::Builder&                    b);
 
     void lower_case_inside_item(const CaseStatement&                  c,
                                 size_t                                k,
                                 ir::Index                             sel,
                                 ir::Ref                               ty,
+                                bool                                  is_signed,
                                 uint32_t                              width,
                                 uint32_t                              key_width,
                                 const std::vector<std::vector<char>>& keep,
@@ -2921,6 +2914,7 @@ private:
     void lower_case_inside_unique(const CaseStatement&          c,
                                   ir::Index                     sel,
                                   ir::Ref                       ty,
+                                  bool                          is_signed,
                                   uint32_t                      width,
                                   uint32_t                      key_width,
                                   const slang::ast::ASTContext& astCtx,
@@ -3002,6 +2996,7 @@ private:
                            ir::Index                     sel,
                            ir::Inst::Tag                 cmp,
                            ir::Ref                       ty,
+                           bool                          is_signed,
                            uint32_t                      width,
                            uint32_t                      key_width,
                            const slang::ast::ASTContext& astCtx,
@@ -3029,6 +3024,7 @@ private:
                          ir::Index                             sel,
                          ir::Inst::Tag                         cmp,
                          ir::Ref                               ty,
+                         bool                                  is_signed,
                          uint32_t                              width,
                          uint32_t                              key_width,
                          const std::vector<std::vector<char>>& keep,
@@ -3232,25 +3228,26 @@ private:
             // change, both sites, one recorded stream shift.
             fail("randsequence production weight wider than 32 bits is not supported");
         }
-        const ir::Ref          wty = make_int_type(width, false, false);
+        const ir::Ref          wty = make_int_type(width, false);
         std::vector<ir::Index> weights;
         weights.reserve(rules.size());
         for (const RsProd::Rule& r : rules) {
             // "If no weight is specified, a production shall use a weight of 1"
             // (18.17.1). A written weight is evaluated on every activation, in rule
             // order, which is what lets it track design state.
-            weights.push_back(r.weightExpr != nullptr ? b.resize(lower_expr(*r.weightExpr, b), wty, loc(*r.weightExpr))
-                                                      : b.constant(module_.pool.put_int(wty, 1), l));
+            weights.push_back(r.weightExpr != nullptr
+                                ? b.convert(lower_expr(*r.weightExpr, b), wty, false, loc(*r.weightExpr))
+                                : b.constant(module_.pool.put_int(wty, 1), l));
         }
         ir::Index sum = weights[0];
         for (size_t k = 1; k < weights.size(); k++) {
             sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
         }
 
-        const ir::Ref   u32  = make_int_type(32, false, false);
+        const ir::Ref   u32  = make_int_type(32, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index wide = b.resize(sum, u32, l);
+        const ir::Index wide = b.convert(sum, u32, false, l);
         const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
         const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
         const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
@@ -3277,7 +3274,7 @@ private:
         }
         const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
         const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::Lt, draw, b.resize(next, u32, l), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
 
         b.open_region();
         emit(k, b);
@@ -3326,7 +3323,7 @@ private:
             return;
         }
         const ir::Index next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index pred = b.binary(ir::Inst::Tag::Lt, draw, next, l);
+        const ir::Index pred = b.binary(ir::Inst::Tag::ULt, draw, next, l);
 
         b.open_region();
         gen_rand_join_step(ops[k], rs, vars, b, l);
@@ -3345,7 +3342,7 @@ private:
                             const RandSeqRuleVars& vars,
                             ir::Builder&           b,
                             ir::SourceLoc          l) {
-        const ir::Ref i32    = make_int_type(32, false, true);
+        const ir::Ref i32    = make_int_type(32, false);
         const auto    kconst = [&](int64_t v) { return b.constant(module_.pool.put_int(i32, v), l); };
 
         const RandSeqCtx::Steps& st = rs.steps.at(op.prod);
@@ -3414,6 +3411,7 @@ private:
                       size_t                  k,
                       ir::Index               sel,
                       ir::Ref                 ty,
+                      bool                    signd,
                       const RandSeqCtx&       rs,
                       const RandSeqRuleVars&  vars,
                       ir::Builder&            b);
@@ -3514,37 +3512,37 @@ private:
 
     void append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending);
 
-    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b);
+    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::FmtArg>& args, ir::Builder& b);
 
     static const Scope& union_scope(const slang::ast::Type& ct);
 
     ir::Index packed_slice(ir::Index v, uint32_t lsb, ir::Ref fty, ir::Builder& b, ir::SourceLoc l);
 
-    bool expand_p_packed(ir::Index               v,
-                         const slang::ast::Type& sty,
-                         std::string&            frag,
-                         std::vector<ir::Index>& args,
-                         ir::Builder&            b,
-                         ir::SourceLoc           l);
+    bool expand_p_packed(ir::Index                v,
+                         const slang::ast::Type&  sty,
+                         std::string&             frag,
+                         std::vector<ir::FmtArg>& args,
+                         ir::Builder&             b,
+                         ir::SourceLoc            l);
 
     static std::optional<std::string_view> handle_p_name(const slang::ast::Type& ct);
 
     ir::Index handle_p_render(ir::Index v, std::string_view name, ir::Builder& b, ir::SourceLoc l);
 
-    void expand_p_scalar(ir::Index               v,
-                         const slang::ast::Type& sty,
-                         std::string&            frag,
-                         std::vector<ir::Index>& args,
-                         ir::Builder&            b,
-                         ir::SourceLoc           l);
+    void expand_p_scalar(ir::Index                v,
+                         const slang::ast::Type&  sty,
+                         std::string&             frag,
+                         std::vector<ir::FmtArg>& args,
+                         ir::Builder&             b,
+                         ir::SourceLoc            l);
 
-    void expand_p_lvalue(ir::Index               lv,
-                         ir::Ref                 ty,
-                         const slang::ast::Type* sty,
-                         std::string&            frag,
-                         std::vector<ir::Index>& args,
-                         ir::Builder&            b,
-                         ir::SourceLoc           l);
+    void expand_p_lvalue(ir::Index                lv,
+                         ir::Ref                  ty,
+                         const slang::ast::Type*  sty,
+                         std::string&             frag,
+                         std::vector<ir::FmtArg>& args,
+                         ir::Builder&             b,
+                         ir::SourceLoc            l);
 
     ir::Index build_container_p_string(ir::Index               lv,
                                        ir::Ref                 ty,
@@ -3564,7 +3562,7 @@ private:
 
     void build_format(std::span<const Expression* const> format_args,
                       std::string&                       fmt,
-                      std::vector<ir::Index>&            args,
+                      std::vector<ir::FmtArg>&           args,
                       ir::Builder&                       b,
                       char                               default_conv = 'd',
                       std::string_view                   lead_text    = {});
@@ -3594,7 +3592,7 @@ private:
     ir::Index lower_dynamic_format(const Expression&                  fmt_expr,
                                    std::span<const Expression* const> value_args,
                                    size_t                             first_pos,
-                                   std::vector<ir::Index>&            args,
+                                   std::vector<ir::FmtArg>&           args,
                                    ir::Builder&                       b,
                                    std::string_view                   who);
 
@@ -3687,6 +3685,8 @@ private:
         const slang::ast::ValueSymbol* iter_var  = nullptr;
         bool                           agg_elem  = false;
         bool                           key_real  = false;
+        // An integral key compares as a signed number.
+        bool key_signed = false;
         // A 4-state key, hence one that can be unknown and needs the total order
         // sort_right_wins defines. Decided at lower time, so a 2-state key emits
         // exactly the compare it did before.
@@ -3932,12 +3932,12 @@ private:
     template<typename Body>
     void emit_stream_elem_loop(const StreamChunk& c, ir::Builder& b, ir::SourceLoc l, Body body) {
         using T                   = ir::Inst::Tag;
-        const ir::Ref   i32       = make_int_type(32, false, true);
+        const ir::Ref   i32       = make_int_type(32, false);
         const TempCell  idx       = make_temp_cell(i32, "stream_i");
         const TempCell  bound     = make_temp_cell(i32, "stream_n");
         const ir::Index size      = c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
         const ir::Index bound_lv  = bound.lv(b, l);
-        const ir::Index bound_val = b.resize(size, i32, l);
+        const ir::Index bound_val = b.convert(size, i32, true, l);
         b.binary(T::Store, bound_lv, bound_val, l);
         const ir::Index idx_lv   = idx.lv(b, l);
         const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -3946,7 +3946,7 @@ private:
         b.open_region();
         const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
         const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+        const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -3970,12 +3970,12 @@ private:
     template<typename Body>
     void emit_stream_byte_loop(ir::Index str, ir::Builder& b, ir::SourceLoc l, Body body) {
         using T                   = ir::Inst::Tag;
-        const ir::Ref   i32       = make_int_type(32, false, true);
-        const ir::Ref   byte_ty   = make_int_type(8, false, false);
+        const ir::Ref   i32       = make_int_type(32, false);
+        const ir::Ref   byte_ty   = make_int_type(8, false);
         const TempCell  idx       = make_temp_cell(i32, "stream_bi");
         const TempCell  bound     = make_temp_cell(i32, "stream_bn");
         const ir::Index bound_lv  = bound.lv(b, l);
-        const ir::Index bound_val = b.resize(b.unary(T::StrLen, str, l), i32, l);
+        const ir::Index bound_val = b.convert(b.unary(T::StrLen, str, l), i32, true, l);
         b.binary(T::Store, bound_lv, bound_val, l);
         const ir::Index idx_lv   = idx.lv(b, l);
         const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -3984,11 +3984,11 @@ private:
         b.open_region();
         const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
         const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+        const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
-        body(b.resize(b.binary(T::StrGetc, str, b.unary(T::Load, idx.lv(b, l), l), l), byte_ty, l));
+        body(b.convert(b.binary(T::StrGetc, str, b.unary(T::Load, idx.lv(b, l), l), l), byte_ty, false, l));
         const ir::ExtraSlice body_r = b.close_region();
 
         b.open_region();
@@ -4029,11 +4029,10 @@ private:
                 const uint32_t lsb  = w - (k + 1) * g;
                 ir::Index      part = v;
                 if (lsb != 0) {
-                    const ir::Index sh =
-                      b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+                    const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), lsb), l);
                     part = b.binary(T::Srl, v, sh, l);
                 }
-                emit(b.resize(part, gty, l));
+                emit(b.convert(part, gty, false, l));
             }
         };
         for (const StreamChunk& c : chunks) {
@@ -4155,7 +4154,11 @@ private:
                              ir::SourceLoc                           l,
                              const IntraNbTiming*                    nbt = nullptr);
 
+    // The value of `expr`. An integral expression is in the domain of its slang
+    // type (LRM 6.3.1), whichever domain its lowering found it in: a system
+    // function's result or a builtin method's return value is the usual case.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b);
+    ir::Index lower_expr_value(const Expression& expr, ir::Builder& b);
 
     ir::Index lower_unary(const UnaryExpression& u, ir::Builder& b);
 
@@ -4613,6 +4616,10 @@ private:
 
     ir::FunctionId function_id(const SubroutineSymbol& sub);
 
+    // The return type `sub`'s function is reserved with: void for a task and a void
+    // function, else its lowered return type.
+    ir::Ref subroutine_return_type(const SubroutineSymbol& sub);
+
     void build_reserved_body(const SubroutineSymbol& sub, ir::FunctionId id);
 
     bool has_pending_bodies() const;
@@ -4684,8 +4691,9 @@ private:
 
     // -- Constrained randomization, step 1 (docs/design/constrained-randomization.md) --
 
-    ir::FunctionId rand_body_id(const slang::ast::ClassType&                                              clt,
-                                ir::Ref                                                                   class_ref,
+    ir::FunctionId rand_body_id(const slang::ast::ClassType&                                                clt,
+                                ir::Ref                                                                     class_ref,
+                                ir::Ref                                                                     return_type,
                                 ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId>& map);
 
     void drain_rand_bodies();

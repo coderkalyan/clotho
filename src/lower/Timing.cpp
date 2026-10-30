@@ -490,9 +490,9 @@ ir::Signal Lowerer::synth_event_net(const Expression& e) {
     const ir::Signal    tmp = declare_temp(ty, "event");
     const ir::SourceLoc l   = loc(e);
 
-    ir::Builder     b(module_.pool);
+    ir::Builder     b(module_);
     const ir::Index dst = b.signal(tmp, l);
-    const ir::Index rhs = b.resize(lower_expr(e, b), ty, l);
+    const ir::Index rhs = b.convert(lower_expr(e, b), ty, e.type->isSigned(), l);
     b.binary(ir::Inst::Tag::Store, dst, rhs, l);
     add_continuous_process(continuous_events(e), l, b);
     return tmp;
@@ -538,7 +538,7 @@ void Lowerer::lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, 
         return in_frame ? bb.local(slot, ty, l) : bb.signal(tmp, l);
     };
     const ir::Index dst = place(b);
-    const ir::Index rhs = b.resize(lower_expr(ev.expr, b), ty, l);
+    const ir::Index rhs = b.convert(lower_expr(ev.expr, b), ty, ev.expr.type->isSigned(), l);
     b.binary(ir::Inst::Tag::Store, dst, rhs, l);
 
     b.open_region();
@@ -564,7 +564,7 @@ void Lowerer::lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, 
             edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
         }
         b.wait(edges, l);
-        const ir::Index cur     = b.resize(lower_expr(ev.expr, b), ty, l);
+        const ir::Index cur     = b.convert(lower_expr(ev.expr, b), ty, ev.expr.type->isSigned(), l);
         const ir::Index sampled = b.unary(ir::Inst::Tag::Load, place(b), l);
         const ir::Index same    = b.binary(ir::Inst::Tag::CaseEq, cur, sampled, l);
         b.open_region();
@@ -612,8 +612,10 @@ void Lowerer::lower_vif_clocking_drive(const MemberAccessExpression& ma,
     }
     const ir::Index handle = lower_expr(ma.value(), b);
     const ir::Index val    = b.iface_signal(handle, rec->drive_val, l);
-    b.binary(ir::Inst::Tag::Store, val,
-             b.resize(lower_expr(a.right(), b), module_.signal(rec->drive_val).type, l), l);
+    b.binary(ir::Inst::Tag::Store,
+             val,
+             b.convert(lower_expr(a.right(), b), module_.signal(rec->drive_val).type, a.right().type->isSigned(), l),
+             l);
     const ir::Index pend = b.iface_signal(handle, rec->drive_pend, l);
     const ir::Index yes  = true_const(b, l);
     b.binary(ir::Inst::Tag::Store, pend, yes, l);
@@ -692,8 +694,8 @@ void Lowerer::lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Buil
     const ir::SourceLoc l = loc(s);
     const auto          n = s.events.size();
 
-    const TempCell    failed = make_temp_cell(module_.pool.logic_type, "wait_order");
-    const ir::Index   zero   = b.constant(module_.pool.put_int(module_.pool.logic_type, 0), l);
+    const TempCell  failed = make_temp_cell(module_.pool.bit_type, "wait_order");
+    const ir::Index zero   = b.constant(module_.pool.put_int(module_.pool.bit_type, 0), l);
     b.binary(ir::Inst::Tag::Store, failed.lv(b, l), zero, l);
 
     for (size_t k = 0; k < n; ++k) {
@@ -840,8 +842,7 @@ void Lowerer::lower_intra_timing(const TimingControl& tc, ir::Builder& b, ir::So
             // as if there is no repeat construct" for a count <= 0 then falls out
             // of the Lt below unchanged: a negative bound waits zero times, so
             // the caller's store happens immediately.
-            const ir::Ref ty =
-              rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
+            const ir::Ref   ty = rec.expr.type->isFloating() ? make_int_type(64, false) : lower_type(*rec.expr.type);
             const TempCell  bound     = make_temp_cell(ty, "repeat_bound");
             const TempCell  counter   = make_temp_cell(ty, "repeat_count");
             const ir::Index bound_lv  = bound.lv(b, l);
@@ -854,7 +855,11 @@ void Lowerer::lower_intra_timing(const TimingControl& tc, ir::Builder& b, ir::So
             b.open_region();
             const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
             const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
-            const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+            const ir::Index      pred = b.binary(
+              rec.expr.type->isFloating() || rec.expr.type->isSigned() ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt,
+              cur,
+              lim,
+              l);
             const ir::ExtraSlice cond = b.close_region();
 
             b.open_region();
@@ -1329,12 +1334,12 @@ void Lowerer::lower_clocking_block(const ClockingBlockSymbol& cb) {
     const ir::Signal           clock = event_signal(ev.expr);
     const ir::Edge             edge  = to_edge(ev.edge);
 
-    ir::Builder b(module_.pool);
+    ir::Builder b(module_);
     // This slot's clocking signal against the value it held at the previous
     // slot's Observed point -- the detection a monitor uses, for the same
     // reason. Taking it at the settled point is what makes the block step once
     // per cycle however many deltas the clock's own driver needed.
-    const ir::Index clk_now = b.resize(load_signal(clock, b, l), module_.pool.bit_type, l);
+    const ir::Index clk_now = b.convert(load_signal(clock, b, l), module_.pool.bit_type, false, l);
     const ir::Index clk_was = load_signal(st.clkprev, b, l);
     const ir::Index fired   = edge == ir::Edge::Positive
                                 ? b.binary(ir::Inst::Tag::Band, clk_now, bit_not(clk_was, b, l), l)
@@ -1408,7 +1413,7 @@ void Lowerer::lower_clocking_drives(const ClockingBlockSymbol& cb) {
     const ClockingBlockState& st = it->second;
     const ir::SourceLoc       l  = to_source_loc(cb.location);
 
-    ir::Builder     b(module_.pool);
+    ir::Builder     b(module_);
     const ir::Index fired = load_signal(st.fired, b, l);
     b.open_region();
     for (const ClockVarState& cv : st.vars) {
@@ -1487,7 +1492,7 @@ void Lowerer::lower_cycle_delay(const CycleDelayControl& cd, ir::Builder& b, ir:
     const TempCell                  bound      = make_temp_cell(ty, "cycle_bound");
     const TempCell                  counter    = make_temp_cell(ty, "cycle_count");
     const ir::Index                 bound_lv   = bound.lv(b, l);
-    const ir::Index                 bound_init = b.resize(lower_expr(cd.expr, b), ty, l);
+    const ir::Index                 bound_init = b.convert(lower_expr(cd.expr, b), ty, cd.expr.type->isSigned(), l);
     b.binary(ir::Inst::Tag::Store, bound_lv, bound_init, l);
     const ir::Index counter_lv   = counter.lv(b, l);
     const ir::Index counter_init = b.constant(module_.pool.put_int(ty, 0), l);
@@ -1517,7 +1522,8 @@ void Lowerer::lower_cycle_delay(const CycleDelayControl& cd, ir::Builder& b, ir:
         b.open_region();
         const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
         const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
-        const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::Index      pred =
+          b.binary(cd.expr.type->isSigned() ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -1620,7 +1626,8 @@ void Lowerer::lower_clocking_drive(const ClockVarSymbol& cv, const AssignmentExp
     }
     const ir::SourceLoc l        = loc(a);
     const ir::Index     drive_lv = b.signal(var->drive_val, l);
-    const ir::Index     drive    = b.resize(lower_expr(a.right(), b), module_.signal(var->drive_val).type, l);
+    const ir::Index     drive =
+      b.convert(lower_expr(a.right(), b), module_.signal(var->drive_val).type, a.right().type->isSigned(), l);
     b.binary(ir::Inst::Tag::Store, drive_lv, drive, l);
     const ir::Index pend_lv = b.signal(var->drive_pend, l);
     const ir::Index yes     = true_const(b, l);

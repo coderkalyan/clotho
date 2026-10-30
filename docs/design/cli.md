@@ -94,7 +94,6 @@ see "One parser".
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`. `parallel` reports only under `run` |
-| `--verify-ir` | both | check the lowered design against the IR typing rules (`src/ir/Verify.h`) and print one `ir-verify:` line per finding, then a count, to stderr. Never fails the run: the exit status is the design's own. Findings of the record rules (a signedness-changing `Resize`, a store that changes domain) are not errors, only places the backend decides implicitly |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
 | `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled in -- the emitted coverage model names its own -- so an executable writes its report to the file `build` was given |
 | `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so an executable keeps the setting `build` was given |
@@ -178,7 +177,7 @@ a `+` command slang gained through `--cmd-rename`.
   `+define` / `+libext` spellings included.
 
 Options for working on Clotho or tuning its internals rather than for simulating
-a design -- `--stat`, `--verify-ir`, `--gc-stress`, `--gc-nursery`, `--gc-heap-max`,
+a design -- `--stat`, `--gc-stress`, `--gc-nursery`, `--gc-heap-max`,
 `--gc-full-every`, `--loose-stale-ref` and `--perf-jitdump` -- are registered with
 `Registry::add_developer`. They parse and are scope-checked like any other
 option, but only `--help-all` lists them, under "Developer options (for working on

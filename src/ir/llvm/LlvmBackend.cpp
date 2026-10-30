@@ -2,6 +2,8 @@
 
 #include "ir/llvm/Backend.h"
 
+#include "ir/Verify.h"
+
 namespace clotho::ir {
 
 namespace {
@@ -176,6 +178,11 @@ llvm::Expected<llvm::orc::JITTargetMachineBuilder> host_target() {
 BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
                                       const llvm::TargetMachine& target, const SimulationConfig& config,
                                       const LocResolver& resolve) {
+    // Every route to code generation passes here, the hand-built modules of the
+    // backend tests included: the backend asserts the invariants the verifier's rules
+    // state and repairs none of them.
+    assert_well_typed(m, resolve);
+
     auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     // Pin the modules to the target's triple and DataLayout before any IR is

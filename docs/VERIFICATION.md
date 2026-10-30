@@ -45,9 +45,10 @@ VCD, not only what a test prints.
   build, shipped ones included. Checks too slow to ship, such as whole-structure
   verifiers, are behind `CLOTHO_EXTRA_ASSERTS`, which Debug and CI turn on.
 - **Verifiers.** The LLVM verifier runs on every module before and after
-  optimization. An IR verifier (`src/ir/Verify.h`) runs after lowering as an extra assert.
-  Until the frontend's output is clean under it, it is opt-in and report-only
-  (`clotho build --verify-ir`).
+  optimization. An IR verifier (`src/ir/Verify.h`) asserts the typing rules of
+  `docs/design/kernel.md` on every lowered design and again before code generation
+  (so on the backend tests' hand-built IR too), in every build type that keeps
+  `assert()`. The backend asserts what the rules state; it repairs none of it.
 - **Internal errors.** A crash or failed assertion reports itself as a bug in
   Clotho and says where to report it, never as a bare abort.
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.

@@ -177,6 +177,36 @@ inline bool has_heap_leaf(const InternPool& pool, Ref ref) {
     }
 }
 
+// Whether a leaf under `ref` is 4-state, at any struct / array / container
+// nesting depth: a 4-state integral. A string, a real, a handle and a 2-state
+// integral carry no x or z. Decides the domain of a whole-aggregate compare.
+inline bool has_four_state_leaf(const InternPool& pool, Ref ref) {
+    const Type& t = type_of(pool, ref);
+    switch (t.kind) {
+        case Type::Kind::UnpackedArray:
+        case Type::Kind::DynArray:
+        case Type::Kind::Queue:
+        case Type::Kind::Assoc:
+            return has_four_state_leaf(pool, t.element);
+        case Type::Kind::Struct: {
+            if (!t.is_packed) {
+                for (const Field& f : pool.struct_fields(t.fields_id)) {
+                    if (has_four_state_leaf(pool, f.type)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return pool.layout(ref).domain == Domain::Four;
+        }
+        case Type::Kind::String:
+        case Type::Kind::Void:
+            return false;
+        default:
+            return pool.layout(ref).domain == Domain::Four;
+    }
+}
+
 // Whether a type has a leaf that must be CONSTRUCTED per storage location rather
 // than copied from a constant power-on image: an event leaf binds a NEW event
 // object (LRM Table 6-7), which no fixed byte pattern can express.

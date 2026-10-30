@@ -129,7 +129,7 @@ void Lowerer::lower_call(const CallExpression& call, ir::Builder& b) {
         // flushes one MCD / FD.
         ir::Index handle;
         if (call.arguments().empty()) {
-            const ir::Ref u32 = make_int_type(32, false, false);
+            const ir::Ref u32 = make_int_type(32, false);
             handle            = b.constant(module_.pool.put_int(u32, 0), loc(call));
         } else {
             handle = lower_expr(*call.arguments()[0], b);
@@ -737,7 +737,7 @@ void Lowerer::build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
 
     // Emit a trivial void Ret so the (never-lowered) Ir is well-formed for the
     // whole-function scans in the backend (nba shadow, ptr-arg signals).
-    ir::Builder         b(module_.pool);
+    ir::Builder         b(module_);
     const ir::SourceLoc el = to_source_loc(sub.location);
     b.ret_void(el);
 
@@ -952,11 +952,11 @@ ir::FunctionId Lowerer::vif_function_id(const SubroutineSymbol& ph_sub) {
         for (const auto& [sym, sig] : inst.syms) {
             sigmap_.emplace(sym, sig);
         }
-        const ir::FunctionId id = module_.reserve_function();
-        vif_fnmap_[&ph_sub]     = id;
         const Restore<std::optional<ir::Signal>> ctx(vif_build_ctx_, inst.syms.begin()->second);
         const Restore<const Scope*> scope(scope_, inst.body);
         const auto&                 rep = rep_sym->as<SubroutineSymbol>();
+        const ir::FunctionId                     id  = module_.reserve_function(subroutine_return_type(rep));
+        vif_fnmap_[&ph_sub]                          = id;
         if (rep.subroutineKind == SubroutineKind::Task) {
             build_task(rep, id);
         } else {
@@ -966,6 +966,18 @@ ir::FunctionId Lowerer::vif_function_id(const SubroutineSymbol& ph_sub) {
     }
     fail("a subroutine call through a virtual interface is not supported: no elaborated "
          "instance of interface '" + std::string(placeholder.getDefinition().name) + "' exists");
+}
+
+// The return type a subroutine's function is reserved with, which is the one its
+// body declares: the lowered type of its return variable, void when it has none (a
+// task, a void function, a constructor). A DPI import has no return variable, so
+// its declared return type decides.
+ir::Ref Lowerer::subroutine_return_type(const SubroutineSymbol& sub) {
+    if (sub.flags.has(MethodFlags::DPIImport)) {
+        return sub.getReturnType().isVoid() ? module_.pool.void_type : lower_type(sub.getReturnType());
+    }
+
+    return sub.returnValVar == nullptr ? module_.pool.void_type : lower_type(sub.returnValVar->getType());
 }
 
 ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
@@ -979,7 +991,7 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
         return cached->second;
     }
     if (sub.flags.has(MethodFlags::DPIImport)) {
-        const ir::FunctionId id = module_.reserve_function();
+        const ir::FunctionId id = module_.reserve_function(subroutine_return_type(sub));
         fnmap_[&sub]            = id;
         build_dpi_import(sub, id);
         return id;
@@ -992,7 +1004,7 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
     // The residual restrictions are per-ACTUAL and live at the call site
     // (build_call_args) or on the formal's own type in build_function.
 
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(subroutine_return_type(sub));
     fnmap_[&sub]            = id;
     if (defer_bodies_) {
         // Reserved, not built: we are inside lowering a TYPE (compute_vtable), and
@@ -1242,7 +1254,7 @@ void Lowerer::build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
     const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
     const FnScope fn_scope(*this, &ctx);
-    ir::Builder             b(module_.pool);
+    ir::Builder                            b(module_);
     std::vector<ir::Ref>    param_types;
     std::vector<ir::ArgDir> arg_dirs;
 
@@ -1317,7 +1329,7 @@ void Lowerer::build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
 ir::FunctionId Lowerer::build_fork_child(const Statement&                    body,
                                          std::span<const ValueSymbol* const> captures,
                                          ir::ForkKind                        kind) {
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(module_.pool.void_type);
 
     FnCtx ctx;
     ctx.name_prefix = "fork.child.";
@@ -1355,7 +1367,7 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
         }
     }
 
-    ir::Builder                b(module_.pool);
+    ir::Builder                b(module_);
     const ir::Builder::Mark    body_mark = b.mark();
     std::optional<LowerError>  failure;
     try {
@@ -1419,7 +1431,7 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
                                             ir::SourceLoc                      l,
                                             bool                               fd_arg,
                                             bool                               monitor) {
-    const ir::FunctionId id = module_.reserve_function();
+    const ir::FunctionId id = module_.reserve_function(module_.pool.void_type);
 
     FnCtx ctx;
     ctx.name_prefix = monitor ? "monitor." : "strobe.";
@@ -1427,14 +1439,13 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
     ctx.is_task     = true;
     const FnScope fn_scope(*this, &ctx);
 
-    ir::Builder                b(module_.pool);
+    ir::Builder                b(module_);
     const ir::Builder::Mark    body_mark = b.mark();
     std::optional<LowerError>  failure;
     try {
         // $display / $strobe target the standard-output MCD (descriptor 1); the
         // $f* forms carry an explicit descriptor as the first argument.
-        ir::Index desc =
-          b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false, true)), l);
+        ir::Index desc = b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false)), l);
         if (fd_arg) {
             if (args.empty()) {
                 fail("$fstrobe / $fmonitor requires a file-descriptor argument");
@@ -1443,7 +1454,7 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
             args = args.subspan(1);
         }
         std::string            fmt;
-        std::vector<ir::Index> fargs;
+        std::vector<ir::FmtArg> fargs;
         build_format(args, fmt, fargs, b, default_conv);
         if (monitor) {
             b.monitor_emit(desc, fmt, fargs, l);
@@ -1496,7 +1507,7 @@ void Lowerer::build_function(const SubroutineSymbol& sub, ir::FunctionId id) {
     // another builder's Index; this body's own `this` formal is the right one).
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
     const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
-    ir::Builder             b(module_.pool);
+    ir::Builder                            b(module_);
     std::vector<ir::Ref>    param_types;
     std::vector<ir::ArgDir> arg_dirs;
 

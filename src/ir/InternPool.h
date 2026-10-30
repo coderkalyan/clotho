@@ -159,8 +159,13 @@ struct Type {
 
     // Discriminant for this type.
     Kind kind = Kind::Void;
-    // Signedness, for Logic / Bit / PackedArray, and packed Struct.
-    bool is_signed = false;
+    // Kind::Queue / DynArray / UnpackedArray: the element is a signed integral. The
+    // runtime sorts and prints (`%p`) a container's elements as signed numbers, and
+    // an associative array keyed by the container orders them so. Kind::Assoc: the
+    // KEY is a signed integral, which fixes the order the map keeps its entries in
+    // (LRM 7.8.4). A container's ordering belongs to its type; an integer type
+    // carries only width and domain, and an opcode says how to read a value's sign.
+    bool elem_signed = false;
     // Kind::Struct only: true for a packed struct/union (bit-vector value
     // semantics), false for unpacked (aggregate storage).
     bool is_packed = false;
@@ -202,6 +207,9 @@ struct Field {
     // the most-significant) or the declaration index (unpacked members are
     // addressed by position, not a flat bit offset).
     uint32_t bit_offset = 0;
+    // The member is a signed integral: an associative array keyed by the unpacked
+    // struct orders this member as a signed number (see Type::elem_signed).
+    bool is_signed = false;
 };
 
 // Build-time form of one Field row handed to intern_struct_fields; the pool
@@ -210,6 +218,7 @@ struct FieldRow {
     std::string_view name;
     Ref              type       = Ref::Invalid;
     uint32_t         bit_offset = 0;
+    bool             is_signed  = false;
 };
 
 // An interned value, in the canonical plane-packed format shared with runtime
@@ -336,6 +345,11 @@ public:
 
     // Intern an item (used for types). Returns a stable deduplicated handle.
     Ref put(const Item& item);
+
+    // The packed integer type of `width` bits in the given domain: `bit` / `logic`
+    // for one bit, else the packed array of them [width-1:0]. A type carries width
+    // and domain only.
+    Ref int_type(uint32_t width, bool four_state);
 
     // Intern a value from its canonical plane bytes (length must match the
     // type's layout).

@@ -273,7 +273,9 @@ converters are branch-free straight-line code, not a runtime dispatch. `next`/
 aggregate is a bare `alloca` whose padding is never written (`emit_agg_init` touches
 leaves only). Two structs with equal members can therefore differ byte for byte —
 fatal for both the hash and the ordering. Walking leaves also gets the per-leaf
-signedness right (`{int hi; byte lo}` orders by `hi` *signed* first) and is where the
+signedness right (`{int hi; byte lo}` orders by `hi` *signed* first; an integer IR
+type has no sign, so the unpacked struct's `Field::is_signed` and an array's
+`Type::elem_signed` carry it) and is where the
 x/z check falls out. `agg_key_bytes` is a pure type walk, so the length stays a
 compile-time constant and the runtime comparator's shorter-is-less tiebreak never
 fires within one array.

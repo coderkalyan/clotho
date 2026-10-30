@@ -678,14 +678,14 @@ namespace {
 // Is `value` a constant this legalizer can see? Reset classification turns on it:
 // a constant residue is a reset, a non-constant one is an async load.
 //
-// Sees through Resize because a sized literal lowers as Resize(Constant) -- the
+// Sees through a conversion because a sized literal lowers as a conversion of a Constant -- the
 // width cast is not a computation. It does NOT constant-fold arithmetic: a reset
 // value of `8'h0F + 1` reads as non-constant and reports as an async load, which
 // is a conservative misclassification rather than a wrong one. Folding it needs a
 // full constant evaluator (ir::Eval answers 1-bit questions only).
 bool is_constant(const ir::Ir& ir, ir::Index value) {
     ir::Index v = value;
-    while (ir.tag(v) == ir::Inst::Tag::Resize) {
+    while (ir::is_conversion(ir.tag(v))) {
         v = ir.payload(v).unary;
     }
     // A concatenation of constants is a constant: `{4'ha, 4'h5}` is an ordinary
@@ -706,7 +706,7 @@ bool is_constant(const ir::Ir& ir, ir::Index value) {
 // be true and useless.
 bool is_self(const ir::Ir& ir, ir::Index value, ir::Signal target) {
     ir::Index v = value;
-    while (ir.tag(v) == ir::Inst::Tag::Resize) {
+    while (ir::is_conversion(ir.tag(v))) {
         v = ir.payload(v).unary;
     }
     if (ir.tag(v) != ir::Inst::Tag::Load) {
