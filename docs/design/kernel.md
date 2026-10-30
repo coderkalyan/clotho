@@ -18,8 +18,11 @@ when it does.
 - A 2-state value is a native W-bit integer. Its domain comes from its IR type,
   the single source of truth; the backend asserts at every instruction that the
   value's plane encoding agrees. A producer that reads storage or an ABI converts
-  at that boundary (`in_type_domain`). **Not yet:** each value also carries its own
-  flag (`Plane::two`), which operators still read instead of the type.
+  at that boundary (`in_type_domain`), because the encoding there is the
+  storage's choice, not the type's: a 2-state signal is stored packed when a
+  task's pointer ABI or the may-z analysis gives it a z word. **Not yet:** each
+  value also carries its own encoding tag (`Plane::two`), which operators read
+  instead of the type.
 - An IR integer type is a width and a domain; it has no sign. Domains, signedness
   and extension are decided by the language, through slang's legalized AST, and the
   IR carries them explicitly: signed and unsigned opcodes (`SDiv`/`UDiv`,

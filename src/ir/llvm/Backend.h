@@ -105,10 +105,15 @@ namespace clotho::ir::backend {
 struct Plane {
     llvm::Value* mm = nullptr; // 4-state: i(2W) [0,W) must, [W,2W) may. 2-state: iW value.
     llvm::Value* z  = nullptr; // 4-state z plane (iW), or null when never-z. Null for 2-state.
-    // A genuine 2-state value: `mm` is a single iW with no unknown/z plane. The
-    // accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
-    // 2-state value never carries the redundant may/z half. Domain is inferred
-    // per value, not per instruction; see the operator dispatch in lower_inst.
+    // The encoding of `mm`: a 2-state value is a single iW with no unknown/z plane,
+    // and the accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
+    // 2-state value never carries the redundant may/z half. For an instruction's
+    // value the encoding is its IR type's domain, the single source of truth:
+    // set_value asserts they agree and an operator never converts its operands.
+    // Where storage or an ABI decides the encoding the tag is not the domain: a
+    // 2-state signal is stored packed when a task's pointer ABI or the may-z
+    // analysis gives it a z word (StateLayout), so a plane read from storage or
+    // returned by a call crosses into the type's domain in in_type_domain.
     bool two = false;
     // Real / shortreal value (double / float). Exactly one of fp and mm is set:
     // a real SSA value carries fp only; its storage form is the raw bit pattern

@@ -467,7 +467,6 @@ llvm::Value* Backend::z_of(Plane a) {
     return a.two ? zero(width_of(a)) : a.z;
 }
 
-// Wrap a single iW value as a 2-state Plane.
 // A plane from storage, an ABI return, a runtime helper or an aggregate walk, in
 // the encoding of the value an instruction of IR type `t` is. Those producers see
 // the representation they read: a 2-state signal is stored packed when a
@@ -493,6 +492,7 @@ Plane Backend::known_plane(llvm::Value* v, bool four_state) {
     return four_state ? packed(v, v, zero(v->getType()->getIntegerBitWidth())) : two_val(v);
 }
 
+// Wrap a single iW value as a 2-state Plane.
 Plane Backend::two_val(llvm::Value* v) {
     return { v, nullptr, true };
 }
