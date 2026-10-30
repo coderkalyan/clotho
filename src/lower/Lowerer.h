@@ -3807,15 +3807,57 @@ private:
 
     ir::Index lower_string_method(std::string_view name, const CallExpression& call, ir::Builder& b);
 
+    // How the hierarchical name of the scope being lowered (LRM 21.2.1.3) is spelled.
+    // Code that belongs to one instance starts the name with that instance's path and
+    // reads it at run time (Inst::Tag::InstPath), so the code is the same in every
+    // instance of its specialization; `text` is then what follows the path. Anywhere
+    // else the whole name is static text: package and `$unit` code, which sits under
+    // no instance, and code the instance cannot claim -- a declaration initializer,
+    // which shares the top's one PreInit process, and a subroutine reached through a
+    // virtual interface, which serves every instance.
+    struct ScopeName {
+        bool        in_instance = false;
+        std::string text;
+    };
+
+    // A conversion of a display format that has not met its value argument yet
+    // (build_format). `%m` of code in an instance brings its argument with it, the
+    // instance path, so `bound` holds that operand and the call's own arguments skip it.
+    struct PendingSpec {
+        char      conv;
+        ir::Index bound = ir::kNoIndex;
+    };
+
     std::string instance_path() const;
 
-    std::string hier_name() const;
+    bool inside_instance() const;
+
+    static std::string generate_path(const Scope* scope);
+
+    ScopeName instance_scope() const;
+
+    ScopeName instance_scope(const ir::Builder& b) const;
+
+    ScopeName hier_name() const;
+
+    ScopeName hier_name(const ir::Builder& b) const;
+
+    bool in_shared_preinit(const ir::Builder& b) const;
+
+    ScopeName as_text(ScopeName name) const;
+
+    std::string static_hier_name() const;
 
     std::string lib_cell_name() const;
 
+    static void append_escaped(std::string& fmt, std::string_view text);
+
     char check_specifier(const clotho::FormatSpec& spec);
 
-    void append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending);
+    void append_format_literal(std::string&              fmt,
+                               std::string_view          text,
+                               std::vector<PendingSpec>& pending,
+                               ir::Builder&              b);
 
     void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::FmtArg>& args, ir::Builder& b);
 
@@ -4695,8 +4737,9 @@ private:
         // $strobe or $monitor print, an assertion action block, a randsequence
         // production -- is that of the statement that created it (LRM 21.2.1.5:
         // the scope that invokes the task). Unset for a subroutine, whose own
-        // name is part of its %m.
-        std::optional<std::string> invoking_scope;
+        // name is part of its %m. Kept in the form hier_name gives, so the body
+        // reads the creating instance's path at run time like the statement did.
+        std::optional<ScopeName> invoking_scope;
         // True while lowering a task body (a coroutine): unlike a function, timing
         // controls and $time are allowed.
         bool is_task = false;

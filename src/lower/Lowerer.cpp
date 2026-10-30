@@ -109,7 +109,7 @@ std::string Lowerer::banner_at(slang::SourceLocation sl) const {
 // call -- and it is as static as `%m` is, so no scope is looked up at run
 // time.
 std::string Lowerer::severity_banner(slang::SourceLocation sl) const {
-    const std::string scope  = hier_name();
+    const std::string scope  = static_hier_name();
     std::string       banner = banner_at(sl);
     if (scope.empty()) {
         banner.pop_back(); // a scope-less call keeps no dangling space
