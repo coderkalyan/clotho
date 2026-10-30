@@ -1,0 +1,27 @@
+diff --git a/source/ast/statements/MiscStatements.cpp b/source/ast/statements/MiscStatements.cpp
+index a53c6c2..3388258 100644
+--- a/source/ast/statements/MiscStatements.cpp
++++ b/source/ast/statements/MiscStatements.cpp
+@@ -68,16 +68,12 @@ ER VariableDeclStatement::evalImpl(EvalContext& context) const {
+     // Figure out the initial value for the variable.
+     ConstantValue initial;
+     if (auto initializer = symbol.getInitializer()) {
+-        // Initialization of static variables is skipped in constant functions.
+-        // This is confusing so issue a warning.
+-        if (symbol.lifetime == VariableLifetime::Static && !initializer->bad()) {
+-            context.addDiag(diag::ConstEvalStaticSkipped, initializer->sourceRange);
+-        }
+-        else {
+-            initial = initializer->eval(context);
+-            if (!initial)
+-                return ER::Fail;
+-        }
++        // LRM 13.4.3: a constant function call's variables "are initialized as
++        // they would be for normal simulation", static ones included. Every call
++        // gets fresh storage, so no value carries over between invocations.
++        initial = initializer->eval(context);
++        if (!initial)
++            return ER::Fail;
+     }
+ 
+     if (!initial)
