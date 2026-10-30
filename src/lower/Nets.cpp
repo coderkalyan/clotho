@@ -1010,6 +1010,18 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
             fail("continuous assignment delay is only supported for a whole integral "
                  "scalar target");
         }
+        if (const ValueSymbol* root = lvalue_root(left); root != nullptr && force_info_of(*root) != nullptr) {
+            // TODO: a delayed continuous assignment onto a force-target variable. The
+            // delayed store commits from the timing wheel with no force gate, so it
+            // lands over an active force (LRM 10.6.2: the force overrides a continuous
+            // assignment until released), and what a release does with the delay is
+            // not settled: 10.6.2 has it "reestablish that assignment and schedule a
+            // reevaluation in the continuous assignment's scheduling region", 10.3.3
+            // delays every update of the assignment, and iverilog 13 takes the driver's
+            // value at once. A net with a delayed driver is unaffected: its driver
+            // stores into a slot the resolver folds under the force.
+            fail("continuous assignment delay on a force-target variable is not supported");
+        }
         const ir::Index rhs   = lower_expr(a.right(), b);
         const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
         b.store_inertial_delay(lower_lvalue(left, b), rhs, ticks, l);

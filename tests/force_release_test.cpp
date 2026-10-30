@@ -603,6 +603,26 @@ TEST_CASE("intra-assignment timing on a write to a forced variable is rejected")
     CHECK(lower_error(src).find("intra-assignment timing on a write to a force-target") != std::string::npos);
 }
 
+// A delayed continuous assignment (`assign #5 v = a`) commits its value from the
+// timing wheel straight into the variable, and the commit carries no force gate, so
+// the value landed over an active force: v=1 at 15 where the force taken at 12 holds
+// z until the release at 20 (LRM 10.6.2; iverilog 13 holds z). What the release then
+// does is not settled either: 10.6.2 says it "shall reestablish that assignment and
+// schedule a reevaluation in the continuous assignment's scheduling region", and
+// 10.3.3 delays an assignment's update by its delay. Refused rather than guessed.
+// A net with a delayed driver is unaffected: its driver stores into a slot that the
+// resolver folds under the force, as the test above ("a delayed driver landing")
+// shows.
+TEST_CASE("a delayed continuous assignment to a forced variable is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, v;
+            assign #5 v = a;
+            initial begin force v = 1'bz; release v; end
+        endmodule)";
+    CHECK(lower_error(src).find("continuous assignment delay on a force-target variable") != std::string::npos);
+}
+
 // A partial force of a VARIABLE stays rejected — the site state is per whole
 // variable, and LRM 10.6.2 permits a partial force only on a net. slang flags
 // the lvalue (-Wbad-procedural-force) and leaves the statement unbound, so the
