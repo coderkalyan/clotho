@@ -282,23 +282,46 @@ unit, which is also what the no-IR-rewriting rule asks
 ## Code generation
 
 - Unit code is instance-relative: it addresses storage as instance base plus
-  offset, never through per-instance symbols. The constant-anchor form measured
-  faster under FastISel on picorv32 (module-split.md), so the cost is measured
-  before anything is keyed on instance count.
-- No inlining across units. Comb fusion across instances composes through a
-  dispatcher calling each unit's member functions, which generalizes today's
-  outlining. A flattening, LTO-style `-O` mode can come later without changing
-  units.
-- Root holds link glue only: instance storage, binding tables, the scheduling
-  plan and global numbering as tables.
+  offset, never through per-instance symbols, singleton units included, so a
+  unit's code does not change when it gains a second instance. The
+  constant-anchor form measured faster under FastISel on picorv32
+  (module-split.md); recovering that belongs to a later whole-design `-O` tier.
+- No inlining across units. Processes fuse within a unit; a group spanning
+  instances is a link-time table of (unit function, instance record) rows run
+  by one dispatcher, with no member-count caps. Merged cross-instance bodies
+  can return in a flattening, LTO-style `-O` mode without changing units.
+- Function and task signatures are uniform: the process-control and home
+  parameters are always present and `ref` epoch handling never depends on
+  callers, so no other unit's code changes a unit's signatures.
+- Root holds link glue only: instance storage and records, binding tables, the
+  scheduling plan and global numbering as tables.
+
+### The instance record
+
+Every instance of a unit, a static unit's single instance included, has a
+record the unit's code receives as its first argument. It holds what differs
+between instances:
+
+- bases of the instance's state, NBA shadow and scheduling flags;
+- bases of its ids in design-wide spaces (VCD variables, NBA blocks and
+  buffers, triggers, RNG seeds), so code adds a unit-local ordinal;
+- its hierarchical name (`%m`, banners, covergroup scope);
+- one binding per extern declaration: the address of an imported signal, the
+  record of an imported function's instance, the record of an instance an
+  interface port or `inst_refs` entry names;
+- descriptors of wake buckets the instance's signals own (base and capacity).
+
+Today's per-definition `@clotho.inst.<hier>.ctx` (StateLayout.cpp) is the
+seed of it; the `abs_id` / `idval` relocations and constant anchors in unit
+code go.
 
 ## Staging
 
 1. **IR containers and the flatten adapter.** `Design`, `Unit`, imports and
    child slots, plus `flatten(Design) -> Module`, which expands units into
    instances and reproduces the flat module the backend consumes today. The
-   adapter is per-instance only on the backend side, as the backend already is,
-   and it is deleted in step 3.
+   adapter is per-instance only on the backend side, as the backend already is;
+   in step 3 it stops copying bodies and keeps only the instance expansion.
 2. **Lowering per specialization**, in four sub-steps that each keep the suite
    and the perf corpus simulating identically:
    - **2a, partition (landed).** The Lowerer records which unit owns what
@@ -328,10 +351,35 @@ unit, which is also what the no-IR-rewriting rule asks
      have to agree on layout and on start values (`declare_interface_statics`).
    - **2d, lower once.** The Lowerer lowers each specialization's canonical
      body only; per-instance lowering and the comparison go.
-3. **Backend per unit** (not on this branch; it is on `modular-ir`). Code is a function of (unit, inbound facts, config);
-   functions, commit functions and initializers move into units; root becomes
-   link glue; the adapter goes. Gate: an edit to one definition changes only
-   that unit's object bytes and root's.
+3. **Backend per unit.** Code is a function of (unit, inbound facts, config);
+   root becomes link glue. Gate: an edit to one definition changes only that
+   unit's object bytes and root's, checked by compiling a design twice with one
+   definition edited and comparing per-module bitcode. Sub-steps, each keeping
+   the suite and corpus simulating identically and measured for speed:
+   - **3a, one layout per unit.** flatten records which unit instance every
+     flat signal, process and function came from (`Module::unit_instances`).
+     Slot facts (may-z and the other z-storage causes, NBA staging flags) are
+     joined over a unit's instances, so all of them share one state and shadow
+     type; power-on values stay per instance. A unit's storage the scope does
+     not list (driver slots, constant tables, assertion state) moves from the
+     root struct into the instance's.
+   - **3b, instance records.** Every unit instance gets a record; unit code
+     addresses its own storage, ids and name through it and other units'
+     storage and instances through its bindings.
+   - **3c, code once per unit.** Each unit's processes and functions are
+     lowered once from the unit's IR, taking the record, into the unit's module.
+     Fusion runs within a unit; groups spanning instances become dispatch
+     table rows. `share_twin_groups` and outlining go.
+   - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
+     capacity from the record, a subscription carries its trigger bits, the
+     ring mask is a root global, NBA and trigger ids are record base plus
+     unit-local ordinal, and block commit functions live in the writer's unit.
+     Facts other units impose (a signal is waited on, forced, may carry z)
+     stay joined per unit and part of its codegen key until step 4.
+   - **3e, root as link glue.** Instance records, the scheduling plan, the
+     seed loop, NBA, VCD and covergroup tables are built from the instance
+     table; flatten stops copying bodies and becomes the link step's instance
+     expansion.
 4. **Summaries and the link step** replace the whole-design `analyze()`.
 5. **Caches and parallelism.** Per-unit intern pools (cross-unit types match by
    structure, nominal types by unit and name), content keys, an object cache,
