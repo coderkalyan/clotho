@@ -1994,11 +1994,12 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
         if (site.lo <= rhi && rlo <= site.hi && !(site.lo >= rlo && site.hi <= rhi)) {
             const std::string banner = banner_at(lv.sourceRange.start());
             b.open_region();
-            b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-                       severity_banner(lv.sourceRange.start()),
-                       "release of part of an active force is not supported (LRM 10.6.2)",
-                       {},
-                       l);
+            emit_report(b,
+                        static_cast<uint32_t>(ir::Severity::Fatal),
+                        banner,
+                        "release of part of an active force is not supported (LRM 10.6.2)",
+                        {},
+                        l);
             b.finish(banner + "release", 1, l);
             const ir::ExtraSlice then_r = b.close_region();
             b.open_region();

@@ -263,7 +263,7 @@ with exit status 1, after its `final` blocks, whatever its finish number.
 `$finish` of any level, `$error`, `$warning` and a failed assertion leave the
 status 0.
 
-Code: `src/runtime/Reports.cpp` (`severity_line`, `rt_severity`), `src/lower/Lowerer.cpp` (`severity_banner`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
+Code: `src/runtime/Reports.cpp` (`severity_line`, `rt_severity`), `src/lower/Lowerer.cpp` (`emit_report`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
 
 ## 29. `$system` (20.17.1)
 

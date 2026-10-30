@@ -29,8 +29,9 @@ void Lowerer::emit_deferred_action(const Statement*      action,
         // Only the fail branch of assert/assume has a default report; a
         // missing pass action (or cover) emits nothing.
         if (is_fail) {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                       severity_banner(site),
+            emit_report(b,
+                        static_cast<uint32_t>(ir::Severity::Error),
+                        banner_at(site),
                        "assertion failed",
                        {},
                        to_source_loc(site),
@@ -64,7 +65,7 @@ void Lowerer::emit_deferred_action(const Statement*      action,
     std::string            fmt;
     std::vector<ir::FmtArg> args;
     build_format(call->arguments(), fmt, args, b);
-    b.severity(static_cast<uint32_t>(sev), severity_banner(call->sourceRange.start()), fmt, args, loc(*call),
+    emit_report(b, static_cast<uint32_t>(sev), banner_at(call->sourceRange.start()), fmt, args, loc(*call),
                defer_mode);
 }
 
@@ -1375,7 +1376,7 @@ void Lowerer::lower_concurrent_assertion(const slang::ast::ConcurrentAssertionSt
     monitor.span   = to_source_span(a.sourceRange);
     // A labelled assertion (`ap: assert property ...`) is lowered inside the
     // block slang makes of its label, so its report names the label as well.
-    monitor.banner = severity_banner(a.sourceRange.start());
+    monitor.banner = banner_at(a.sourceRange.start());
     // Not round-tripped through libsva, which has one cover kind: the tally
     // is clotho's own choice and this is where the choice is recorded.
     monitor.cover_matches = cover_matches;
@@ -1483,8 +1484,9 @@ void Lowerer::emit_expect_wait(uint32_t                                        i
     // reaching one statement is not a static property of the source.
     b.open_region();
     const std::string banner = banner_at(a.sourceRange.start());
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-               severity_banner(a.sourceRange.start()),
+    emit_report(b,
+                static_cast<uint32_t>(ir::Severity::Fatal),
+                banner_at(a.sourceRange.start()),
                "an `expect` whose previous attempt is still in flight is not supported",
                {},
                l);
@@ -1612,7 +1614,7 @@ ir::FunctionId Lowerer::build_default_fail_body(const ir::AssertionMonitor& mon)
     const ir::SourceLoc  l  = mon.span.start;
 
     ir::Builder b(module_);
-    b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+    emit_report(b, static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
     b.ret_void(l);
 
     module_.set_function(id,
@@ -1653,8 +1655,9 @@ void Lowerer::lower_immediate_assertion(const ImmediateAssertionStatement& a, ir
         if (a.ifFalse != nullptr) {
             lower_stmt(*a.ifFalse, b);
         } else {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                       severity_banner(a.sourceRange.start()),
+            emit_report(b,
+                        static_cast<uint32_t>(ir::Severity::Error),
+                        banner_at(a.sourceRange.start()),
                        "assertion failed",
                        {},
                        loc(a));

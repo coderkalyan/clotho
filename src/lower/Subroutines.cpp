@@ -1228,7 +1228,7 @@ void Lowerer::emit_unsupported_body_stub(const SubroutineSymbol& sub,
            e.span);
     const ir::SourceLoc el     = to_source_loc(sub.location);
     const std::string   banner = banner_at(sub.location);
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(sub.location), e.message, {}, el);
+    emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(sub.location), e.message, {}, el);
     b.finish(banner + "$fatal", 1, el);
 }
 

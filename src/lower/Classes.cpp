@@ -997,7 +997,7 @@ ir::Index Lowerer::lower_new_class(const slang::ast::NewClassExpression& nc, ir:
             b.open_region();
             {
                 const std::string banner = banner_at(nc.sourceRange.start());
-                b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(nc.sourceRange.start()),
+                emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(nc.sourceRange.start()),
                            "mailbox bound is negative (LRM 15.4.1)", {}, l);
                 b.finish(banner + "mailbox", 1, l);
             }

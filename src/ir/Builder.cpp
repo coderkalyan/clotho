@@ -1028,7 +1028,8 @@ Index Builder::severity(uint32_t                level,
                         std::string_view        fmt,
                         std::span<const FmtArg> args,
                         SourceLoc               loc,
-                        uint32_t                defer) {
+                        uint32_t                defer,
+                        Index                   banner_value) {
     // Order in the extra buffer: banner bytes, format bytes, then the arg-index
     // slice and its flags, then the SeverityInfo record pointing at all of them.
     const ExtraIndex banner_at = add_bytes(banner);
@@ -1042,7 +1043,8 @@ Index Builder::severity(uint32_t                level,
                                                      level,
                                                      defer,
                                                      slice,
-                                                     signs });
+                                                     signs,
+                                                     banner_value });
     return emit({ Inst::Tag::Severity, pay(&Inst::Payload::extra, extra) }, loc);
 }
 

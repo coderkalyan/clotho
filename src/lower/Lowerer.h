@@ -1252,7 +1252,13 @@ private:
 
     std::string banner_at(slang::SourceLocation sl) const;
 
-    std::string severity_banner(slang::SourceLocation sl) const;
+    void emit_report(ir::Builder&                b,
+                     uint32_t                    level,
+                     const std::string&          where,
+                     std::string_view            fmt,
+                     std::span<const ir::FmtArg> args,
+                     ir::SourceLoc               l,
+                     uint32_t                    defer = 0);
 
     std::string case_banner(const CaseStatement& c) const;
 
@@ -3845,8 +3851,6 @@ private:
     bool in_shared_preinit(const ir::Builder& b) const;
 
     ScopeName as_text(ScopeName name) const;
-
-    std::string static_hier_name() const;
 
     std::string lib_cell_name() const;
 

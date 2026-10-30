@@ -598,7 +598,8 @@ public:
                    std::string_view        fmt,
                    std::span<const FmtArg> args,
                    SourceLoc               loc,
-                   uint32_t                defer = 0);
+                   uint32_t                defer        = 0,
+                   Index                   banner_value = kNoIndex);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);

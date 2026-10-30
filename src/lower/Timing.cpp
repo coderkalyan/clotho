@@ -758,8 +758,8 @@ void Lowerer::lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Buil
         // LRM 15.5.4: "If the fail statement is not specified, a failure
         // generates a run-time error." $error is the located, non-fatal
         // severity the LRM's wording matches.
-        b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                   severity_banner(s.sourceRange.start()),
+        emit_report(b, static_cast<uint32_t>(ir::Severity::Error),
+                    banner_at(s.sourceRange.start()),
                    "wait_order: events triggered out of order", {}, l);
     }
     const ir::ExtraSlice on_fail = b.close_region();

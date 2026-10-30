@@ -2084,7 +2084,7 @@ void Lowerer::emit_counted_finish(const ir::AssertionMonitor& mon,
           if (act.fail != nullptr) {
               lower_stmt(*act.fail, b);
           } else {
-              b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+              emit_report(b, static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
           }
       },
       b,
@@ -2321,7 +2321,7 @@ void Lowerer::emit_monitor_finish(const ir::AssertionMonitor& mon,
         if (act.fail != nullptr) {
             lower_stmt(*act.fail, b);
         } else {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+            emit_report(b, static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
         }
         const ir::ExtraSlice then_region = b.close_region();
 

@@ -95,26 +95,40 @@ std::string Lowerer::finish_banner(const Expression& call, std::string_view task
 // Compile-time "<file>:<line>: " banner prefix at a source location. The
 // runtime appends the descriptive message and the simulation time (e.g.
 // rt_finish, the Observed-region case-violation report). A severity report
-// takes severity_banner instead, which also names the scope.
+// takes emit_report instead, which also names the scope.
 std::string Lowerer::banner_at(slang::SourceLocation sl) const {
     const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
     return sources_.shown_file(sl) + ":" + std::to_string(sm->getLineNumber(sl)) + ": ";
 }
 
-// Compile-time "<file>:<line>: <scope>" banner of a severity report. LRM 20.10
-// makes the report name where the call is and the hierarchical name of the
-// scope it is made in; the runtime adds " at <time>: <message>" (rt_severity).
-// The scope is what `%m` prints at the same place -- the instance, the
-// enclosing subroutine, and every named block or assertion label around the
-// call -- and it is as static as `%m` is, so no scope is looked up at run
-// time.
-std::string Lowerer::severity_banner(slang::SourceLocation sl) const {
-    const std::string scope  = static_hier_name();
-    std::string       banner = banner_at(sl);
-    if (scope.empty()) {
-        banner.pop_back(); // a scope-less call keeps no dangling space
+// A severity report (LRM 20.10, 16.3) with the banner "<file>:<line>: <scope>"; the
+// runtime adds " at <time>: <message>" (rt_severity). `where` is the
+// "<file>:<line>: " prefix. The scope is what `%m` prints at the same place -- the
+// instance, the enclosing subroutine, and every named block or assertion label
+// around the call. Inside an instance the banner is a string built at run time
+// from the instance's path, so it is the same in every instance of the
+// specialization; elsewhere it is text.
+void Lowerer::emit_report(ir::Builder&                b,
+                          uint32_t                    level,
+                          const std::string&          where,
+                          std::string_view            fmt,
+                          std::span<const ir::FmtArg> args,
+                          ir::SourceLoc               l,
+                          uint32_t                    defer) {
+    const ScopeName scope = hier_name(b);
+    if (!scope.in_instance) {
+        std::string banner = where;
+        if (scope.text.empty()) {
+            banner.pop_back(); // a scope-less call keeps no dangling space
+        }
+        b.severity(level, banner + scope.text, fmt, args, l, defer);
+        return;
     }
-    return banner + scope;
+    std::vector<ir::Index> parts{ b.constant(string_value_ref(where), l), b.inst_path(l) };
+    if (!scope.text.empty()) {
+        parts.push_back(b.constant(string_value_ref(scope.text), l));
+    }
+    b.severity(level, {}, fmt, args, l, defer, b.concat(parts, l));
 }
 
 // Banner for a unique/priority case or if violation, located at the statement.

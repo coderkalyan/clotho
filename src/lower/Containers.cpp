@@ -1836,7 +1836,7 @@ void Lowerer::check_stream_fits_fixed(ir::Index                               w,
     b.open_region();
     {
         const std::string banner = banner_at(sc.sourceRange.start());
-        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(sc.sourceRange.start()),
+        emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(sc.sourceRange.start()),
                    "streaming concatenation source is wider than its fixed-size target (LRM 11.4.14)", {},
                    l);
         b.finish(banner + "stream", 1, l);

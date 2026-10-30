@@ -458,11 +458,17 @@ void Backend::lower_severity(Index i) {
     const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
     const std::string fmt    = ir_->extra_bytes(info.fmt, info.fmt_len);
 
+    // A banner that names the instance is a string value built at run time; the
+    // runtime reads it as a C string (a string handle keeps its NUL terminator) and
+    // has finished with it by the time the report call returns.
+    llvm::Value* banner_ptr = info.banner_value != kNoIndex
+                                ? static_cast<llvm::Value*>(b_.CreateCall(str_data_fn(), { str_of(info.banner_value) }))
+                                : static_cast<llvm::Value*>(b_.CreateGlobalString(banner));
     const std::span<const Index> args = ir_->region(info.args);
     llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     if (info.defer == 0) {
         b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
-                                       b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                                       banner_ptr, b_.CreateGlobalString(fmt),
                                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
         return;
     }
@@ -484,7 +490,7 @@ void Backend::lower_severity(Index i) {
     b_.CreateCall(defer_report_fn(),
                   { b_.getInt32(static_cast<int32_t>(info.level)),
                     b_.getInt64(info.defer == 2 ? 1 : 0), gen_arg, gen_val,
-                    b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                    banner_ptr, b_.CreateGlobalString(fmt),
                     b_.getInt32(static_cast<uint32_t>(args.size())), arr });
 }
 

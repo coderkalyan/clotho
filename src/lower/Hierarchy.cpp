@@ -424,8 +424,9 @@ std::optional<VifClockVar> Lowerer::vif_clockvar(const slang::ast::ClockVarSymbo
 // well-formed target on the unreachable path after it.
 ir::Index Lowerer::vif_null_place(const slang::ast::Type& type, ir::Builder& b, ir::SourceLoc l) {
     const std::string banner = banner_at(cur_range_.start());
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-               severity_banner(cur_range_.start()),
+    emit_report(b,
+               static_cast<uint32_t>(ir::Severity::Fatal),
+               banner_at(cur_range_.start()),
                "use of a null virtual interface",
                {},
                l);

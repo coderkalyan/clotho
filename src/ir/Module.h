@@ -528,9 +528,9 @@ struct AssertionMonitor {
 
     // Full extent of the assert/cover statement, for the failure report.
     SourceSpan span;
-    // Precomputed "<file>:<line>: <scope>" prefix of the failure report, the
-    // scope being the assertion's own (its instance and label), so the backend
-    // stays slang-free.
+    // Precomputed "<file>:<line>: " prefix of the failure report, so the backend stays
+    // slang-free. The scope after it (the instance, which differs between instances,
+    // and the assertion's label) is added where the report is emitted.
     std::string banner;
 };
 

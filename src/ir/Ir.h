@@ -983,6 +983,10 @@ struct SeverityInfo {
     ExtraSlice args;
     // As DisplayInfo::signs.
     ExtraSlice signs;
+    // The banner as a runtime STRING VALUE, for a report whose scope begins with the
+    // path of the instance it is in: that path is read at run time, so the banner is
+    // built from it. kNoIndex when `banner` / `banner_len` carry the text instead.
+    Index banner_value;
 };
 
 // Extra payload for `fseek`: $fseek(fd, offset, operation) — the descriptor is
@@ -3071,6 +3075,9 @@ enum class ExtraOperandTail : uint8_t {
     // handles are strided three words apart inside the packed WaitEdge run, so
     // they are not a slice and cannot be a span.
     WaitHandles,
+    // + SeverityInfo::banner_value, when the report's banner is a runtime string
+    // value (it names the instance, which is read at run time).
+    SeverityBanner,
 };
 
 // Constexpr for the same reason as extra_operand_shape(): operand walks inline
@@ -3094,6 +3101,8 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
             return E::InsideSetMembers;
         case T::Wait:
             return E::WaitHandles;
+        case T::Severity:
+            return E::SeverityBanner;
         default:
             return E::None;
     }
@@ -3121,6 +3130,9 @@ constexpr bool extra_operand_tails_total() {
             return false;
         }
         if ((kind == Inst::PayloadKind::Sformatf) != (tail == ExtraOperandTail::SformatfFmt)) {
+            return false;
+        }
+        if ((kind == Inst::PayloadKind::Severity) != (tail == ExtraOperandTail::SeverityBanner)) {
             return false;
         }
         if (tail == ExtraOperandTail::InsideSetMembers && tag != Inst::Tag::InsideSet) {
@@ -3397,6 +3409,13 @@ public:
                 }
                 for (const Index op : index_slice(info.ranges)) {
                     fn(op);
+                }
+                return;
+            }
+            case ExtraOperandTail::SeverityBanner: {
+                const auto info = extra_data<SeverityInfo>(p.extra);
+                if (info.banner_value != kNoIndex) {
+                    fn(info.banner_value);
                 }
                 return;
             }

@@ -1502,7 +1502,7 @@ void Lowerer::build_randomize_body(const slang::ast::ClassType& clt, ir::Ref cla
         // such a class (all of UVM's register layer). Loud per PRINCIPLES.md:
         // report + terminate, never a silent unconstrained draw.
         const std::string banner = banner_at(clt.location);
-        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(clt.location), rd.unsupported, {},
+        emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(clt.location), rd.unsupported, {},
                    l);
         b.finish(banner + "$fatal", 1, l);
         b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(i32, 0), l), l);
@@ -1850,8 +1850,8 @@ ir::Index Lowerer::lower_rand_mode_call(const CallExpression& call, ir::Builder&
                 if (const auto rit = class_rand_.find(declaring);
                     rit != class_rand_.end() && !rit->second.unsupported.empty()) {
                     const std::string banner = banner_at(target.sourceRange.start());
-                    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-                               severity_banner(target.sourceRange.start()), rit->second.unsupported, {}, l);
+                    emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal),
+                                banner_at(target.sourceRange.start()), rit->second.unsupported, {}, l);
                     b.finish(banner + "$fatal", 1, l);
                     return b.constant(module_.pool.put_int(lower_type(*call.type), 0), l);
                 }

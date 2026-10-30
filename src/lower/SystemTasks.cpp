@@ -697,8 +697,9 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
 // function form never reports: it answers 0.
 void Lowerer::emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
     const std::string banner = banner_at(call.sourceRange.start());
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-               severity_banner(call.sourceRange.start()),
+    emit_report(b,
+                static_cast<uint32_t>(ir::Severity::Fatal),
+                banner_at(call.sourceRange.start()),
                "$cast: the source is not assignment compatible with the destination",
                {},
                l);
@@ -1665,14 +1666,6 @@ std::string Lowerer::instance_path() const {
         path.append(prefix_, 0, prefix_.size() - 1);
     }
     return path;
-}
-
-// Hierarchical name of the scope invoking the statement currently being
-// lowered (LRM §21.2.1.5 %m), as one piece of text: hier_name with the
-// instance's path spelled out. What a severity report still bakes into its
-// banner; hier_name is the form that leaves the instance's path to run time.
-std::string Lowerer::static_hier_name() const {
-    return as_text(hier_name()).text;
 }
 
 // `name` with the path of the instance being lowered spelled out in front of its
@@ -2744,7 +2737,7 @@ void Lowerer::emit_severity(ir::Severity                       level,
     std::string            fmt;
     std::vector<ir::FmtArg> args;
     build_format(msg_args, fmt, args, b);
-    b.severity(static_cast<uint32_t>(level), banner, fmt, args, loc(call));
+    emit_report(b, static_cast<uint32_t>(level), banner, fmt, args, loc(call));
 }
 
 // Lower a severity system task: $info / $warning / $error / $fatal (LRM
@@ -2752,7 +2745,7 @@ void Lowerer::emit_severity(ir::Severity                       level,
 // argument is the $finish verbosity level (a constant 0/1/2), the rest the
 // message; it reports, then terminates via $finish(level).
 void Lowerer::lower_severity_task(const CallExpression& call, std::string_view name, ir::Builder& b) {
-    const std::string banner = severity_banner(call.sourceRange.start());
+    const std::string banner = banner_at(call.sourceRange.start());
     const auto        args   = call.arguments();
     if (name == "$fatal") {
         uint32_t                           level = 1;
