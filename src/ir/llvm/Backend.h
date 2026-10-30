@@ -2351,11 +2351,13 @@ private:
     llvm::FunctionCallee wheel_advance_fn();
 
     llvm::FunctionCallee intra_alloc_fn();
+    llvm::FunctionCallee intra_alloc_rooted_fn();
     llvm::FunctionCallee intra_cb_fn();
     llvm::FunctionCallee intra_ready_base_fn();
     llvm::FunctionCallee intra_ready_count_fn();
     llvm::FunctionCallee intra_any_fn();
     llvm::FunctionCallee intra_release_fn();
+    llvm::FunctionCallee intra_release_rooted_fn();
     llvm::FunctionCallee intra_reset_fn();
 
     llvm::FunctionCallee inertial_buf_fn();
@@ -2453,6 +2455,8 @@ private:
     uint32_t intra_rec_z_ptr(const SignalSlot& s) const;
     uint32_t intra_rec_ctx(const SignalSlot& s) const;
     uint32_t intra_rec_trigs(const SignalSlot& s) const;
+    bool intra_rec_rooted(const SignalSlot& s);
+    uint32_t intra_agg_payload(const SignalSlot& s);
 
     uint32_t arr_idx(Signal sig) const;
     llvm::StructType* arr_rec_ty(const SignalSlot& s);

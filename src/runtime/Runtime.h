@@ -2025,6 +2025,12 @@ uint32_t rt_intra_any(void);
 // (called by the backend after the site's commit loop).
 void rt_intra_release(uint32_t idx);
 
+// The same pair for a site whose records stage a class handle (LRM 9.4.5 on an aggregate
+// or an array with a handle leaf). Between alloc and release the record is a conservative
+// GC root: until the delay elapses it may hold the only reference to the object it carries.
+void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride);
+void  rt_intra_release_rooted(uint32_t idx);
+
 // Reclaim every record (including any left scheduled by a $finish mid-flight)
 // into its freelist and clear all ready lists. Called once at simulation start.
 void rt_intra_reset(void);

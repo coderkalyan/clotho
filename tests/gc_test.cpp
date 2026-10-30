@@ -3634,3 +3634,113 @@ TEST_CASE("gc: the control blocks of fork children are released with their proce
     CHECK(stress.finalized >= 11000u);
     CHECK(rt_proc_pool_blocks() <= 512u);
 }
+
+// -- 9. Staging images are roots --------------------------------------------------
+//
+// `s <= #5 t` samples the right-hand side now and commits `s` five time units later
+// (LRM 9.4.5). Between the two, the pending record is native memory that no root table
+// describes, and the program is free to drop every other reference to what it carries:
+// here `t.h = null` leaves the staged handle as the ONLY reference to its object. Each
+// design lets collections run while the record is in flight and then reads the object
+// back through the committed destination; the `Junk` filler recycles and poisons every
+// line a wrong collection frees, and `conservative_pins` proves the record's range is
+// what held the object, not a frame word.
+
+// A struct with a handle field: one record per leaf, the handle leaf's byte image in the
+// record's payload.
+TEST_CASE("gc: a handle staged by a delayed nonblocking struct assignment survives") {
+    constexpr std::string_view src = R"(
+        module top;
+            class H; int x; static function H make(); H h = new; h.x = 42; return h; endfunction endclass
+            class Junk; int x; endclass
+            typedef struct { int a; H h; } S_t;
+            S_t s, t;
+            Junk keep;
+            initial begin
+                t.a = 7;
+                t.h = H::make();
+                s <= #5 t;
+                t.h = null;
+                repeat (4) begin
+                    for (int i = 0; i < 300; i++) begin keep = new; keep.x = 32'h5A5A5A5A; end
+                    #1;
+                end
+                #3;
+                $display("a=%0d h.x=%0d", s.a, s.h.x);
+            end
+        endmodule
+    )";
+    check_both_cadences(src, "a=7 h.x=42\n");
+    const rt_gc_stats st = run_stats(src, "a=7 h.x=42\n", cadence_stress);
+    CHECK(st.collections > 0);
+    CHECK(st.conservative_pins > 0);
+}
+
+// An unpacked array of handles: one record per element, the handle in the record's value
+// word.
+TEST_CASE("gc: handles staged by a delayed nonblocking array assignment survive") {
+    constexpr std::string_view src = R"(
+        module top;
+            class H; int x; static function H make(); H h = new; h.x = 42; return h; endfunction endclass
+            class Junk; int x; endclass
+            H arr[2], src[2];
+            Junk keep;
+            initial begin
+                src[0] = H::make();
+                src[1] = H::make();
+                src[1].x = 43;
+                arr <= #5 src;
+                src[0] = null;
+                src[1] = null;
+                repeat (4) begin
+                    for (int i = 0; i < 300; i++) begin keep = new; keep.x = 32'h5A5A5A5A; end
+                    #1;
+                end
+                #3;
+                $display("%0d %0d", arr[0].x, arr[1].x);
+            end
+        endmodule
+    )";
+    check_both_cadences(src, "42 43\n");
+    const rt_gc_stats st = run_stats(src, "42 43\n", cadence_stress);
+    CHECK(st.collections > 0);
+    CHECK(st.conservative_pins > 0);
+}
+
+// The event-controlled form parks the record on a trigger list instead of the wheel; the
+// trigger is not met until after the collections, so the record is in flight throughout.
+TEST_CASE("gc: handles staged by an event-controlled nonblocking assignment survive") {
+    constexpr std::string_view src = R"(
+        module top;
+            class H; int x; static function H make(); H h = new; h.x = 42; return h; endfunction endclass
+            class Junk; int x; endclass
+            typedef struct { int a; H h; } S_t;
+            S_t s, t;
+            H arr[2], src[2];
+            Junk keep;
+            bit clk;
+            initial begin
+                clk = 0;
+                t.a = 9;
+                t.h = H::make();
+                src[1] = H::make();
+                src[1].x = 44;
+                s   <= @(posedge clk) t;
+                arr <= @(posedge clk) src;
+                t.h = null;
+                src[1] = null;
+                repeat (4) begin
+                    for (int i = 0; i < 300; i++) begin keep = new; keep.x = 32'h5A5A5A5A; end
+                    #1;
+                end
+                clk = 1;
+                #1;
+                $display("a=%0d h.x=%0d arr1.x=%0d", s.a, s.h.x, arr[1].x);
+            end
+        endmodule
+    )";
+    check_both_cadences(src, "a=9 h.x=42 arr1.x=44\n");
+    const rt_gc_stats st = run_stats(src, "a=9 h.x=42 arr1.x=44\n", cadence_stress);
+    CHECK(st.collections > 0);
+    CHECK(st.conservative_pins > 0);
+}

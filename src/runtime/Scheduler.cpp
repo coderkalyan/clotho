@@ -6,6 +6,7 @@
 
 // Simulation kernel: time wheel, run loop, processes, NBA and intra-assignment staging, finish.
 
+#include "Gc.h"
 #include "RuntimeInternal.h"
 
 using namespace rt_internal;
@@ -409,6 +410,29 @@ extern "C" void rt_intra_release(uint32_t idx) {
         site.freelist.push_back(p);
     }
     site.ready.clear();
+}
+
+// The pair for a site whose records stage a class handle (an aggregate or an array with a
+// handle leaf, LRM 9.4.5). Until its delay elapses a record may hold the ONLY reference to
+// the object it carries -- the program can drop every other one in between -- and a record
+// is native memory no root table describes, so from alloc to release it is a conservative
+// GC root. Everything else is rt_intra_alloc / rt_intra_release.
+//
+// A record still in flight when the run ends is never released here; its range goes with
+// the rest of the heap's registrations at rt_gc_shutdown (Gc.cpp, release_heap).
+extern "C" void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride) {
+    void* rec = rt_intra_alloc(idx, stride);
+    rt_gc_range_add(rec, stride);
+    return rec;
+}
+
+extern "C" void rt_intra_release_rooted(uint32_t idx) {
+    if (idx < intra_sites.size()) {
+        for (void* rec : intra_sites[idx].ready) {
+            rt_gc_range_remove(rec);
+        }
+    }
+    rt_intra_release(idx);
 }
 
 extern "C" void rt_intra_reset(void) {
@@ -1360,10 +1384,21 @@ extern "C" void rt_proc_obj_retain(void* pcb) {
 // pool when that was the last reference, i.e. the thread has completed too.
 extern "C" void rt_proc_obj_release(void* pcb, [[maybe_unused]] void* obj) {
     auto* p = static_cast<rt_proc*>(pcb);
+    // emit_proc_object mints an object only while the memo is null, so the memo names
+    // the finalizing object from its creation until here.
+    assert(p->obj == obj && "a process object finalizes while it is its block's memo");
+    p->obj = nullptr;
     if (p->refs != 0) {
         p->refs -= 1;
     }
     proc_maybe_free(p);
+}
+
+extern "C" uint32_t rt_proc_pool_blocks(void) {
+    if (g_proc_chunks.empty()) {
+        return 0;
+    }
+    return static_cast<uint32_t>((g_proc_chunks.size() - 1) * kProcChunk + g_proc_used);
 }
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -1384,23 +1419,12 @@ extern "C" void* rt_alloc(uint64_t size) {
     return base + kFrameAlign;
 }
 
-    // emit_proc_object mints an object only while the memo is null, so the memo names
-    // the finalizing object from its creation until here.
-    assert(p->obj == obj && "a process object finalizes while it is its block's memo");
-    p->obj = nullptr;
 extern "C" void rt_free(void* p) {
     if (p == nullptr) {
         return;
     }
     uint8_t* base = static_cast<uint8_t*>(p) - kFrameAlign;
     uint64_t size = 0;
-extern "C" uint32_t rt_proc_pool_blocks(void) {
-    if (g_proc_chunks.empty()) {
-        return 0;
-    }
-    return static_cast<uint32_t>((g_proc_chunks.size() - 1) * kProcChunk + g_proc_used);
-}
-
     std::memcpy(&size, base, sizeof size);
     std::memset(p, kFreedFrame, static_cast<size_t>(size));
     clotho::rt::os_aligned_free(base);
