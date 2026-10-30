@@ -1,10 +1,13 @@
 #include "Analysis.h"
 
 #include <algorithm>
+#include <cassert>
 #include <optional>
+#include <span>
 #include <variant>
 
 #include "Module.h"
+#include "TypeModel.h"
 
 namespace clotho::ir {
 
@@ -866,8 +869,19 @@ struct Structural {
 //      Table 21-7).
 //   5. Wire / wand / wor / strength resolution results (all drivers high-Z).
 //   6. DPI imports with a 4-state return or output (opaque C body).
+//   7. A materialized constant table whose image holds a z bit
+//      (SignalInfo::const_data): the image is the signal's initializer, so no
+//      store ever shows it to the fixpoint.
+//   8. The input and inout formals of an exported DPI subroutine with a 4-state
+//      type: native C passes any aval / bval pair (svLogicVecVal).
 // Not seeds: gate primitives and force/release are lowered through the stores
 // and resolvers above, so they need no separate entry.
+//
+// Transfers follow the planes the backend really emits. A 2-state value has no z
+// or x plane, so ToTwo clears both (LRM 6.3.1). An element of a container, an
+// associative-array entry or an unpacked-struct member is 4-state when any leaf
+// under its type is (types::has_four_state_leaf): an unpacked aggregate has no
+// plane layout of its own, so its Layout domain says nothing about its leaves.
 //
 // may-x is deliberately COARSER: "x if any operand is x OR z", plus an explicit
 // generator set. Treating a z operand as producing x over-approximates for the
@@ -935,16 +949,16 @@ struct ValueSweep {
         return false;
     }
 
-    // Whether the storage behind an lvalue is 4-state (can hold x/z at all).
-    // Unknown leaves are conservatively 4-state.
+    // Whether the storage behind an lvalue can hold x/z at all: any 4-state leaf
+    // under its type. Unknown leaves are conservatively 4-state.
     bool storage_four_state(const Ir& ir, const FnState* fn, Index lv) const {
         const Index root = lvalue_root(ir, lv).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
-                return m.pool.layout(m.signal(ir.payload(root).signal).type).domain == Domain::Four;
+                return types::has_four_state_leaf(m.pool, m.signal(ir.payload(root).signal).type);
             case Inst::Tag::Local:
                 return fn == nullptr ||
-                       m.pool.layout(fn->func->local_types[ir.payload(root).local.index]).domain == Domain::Four;
+                       types::has_four_state_leaf(m.pool, fn->func->local_types[ir.payload(root).local.index]);
             default:
                 return true;
         }
@@ -1086,7 +1100,7 @@ struct ValueSweep {
                     const auto  es = ir.extra_data<ElemSelect>(p.op_extra.extra);
                     const Type& at = std::get<Type>(m.pool.get(es.array_type));
                     if (at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue) {
-                        val_z[raw] = m.pool.layout(at.element).domain == Domain::Four ? 1 : 0;
+                        val_z[raw] = types::has_four_state_leaf(m.pool, at.element) ? 1 : 0;
                     } else {
                         val_z[raw] = z_of(p.op_extra.op);
                     }
@@ -1100,7 +1114,7 @@ struct ValueSweep {
                     // regardless of the handle; report conservatively.
                     const auto  aa   = ir.extra_data<AssocArg>(p.op_extra.extra);
                     const Type& at   = std::get<Type>(m.pool.get(aa.assoc_type));
-                    const bool  four = m.pool.layout(at.element).domain == Domain::Four;
+                    const bool  four = types::has_four_state_leaf(m.pool, at.element);
                     val_z[raw]       = four ? 1 : 0;
                     val_x[raw]       = four ? 1 : 0;
                     break;
@@ -1109,7 +1123,7 @@ struct ValueSweep {
                     // The pattern default slot is an element slot like any other,
                     // so a 4-state value element may carry x/z.
                     const Type& dt   = std::get<Type>(m.pool.get(p.op_type.type));
-                    const bool  four = m.pool.layout(dt.element).domain == Domain::Four;
+                    const bool  four = types::has_four_state_leaf(m.pool, dt.element);
                     val_z[raw]       = four ? 1 : 0;
                     val_x[raw]       = four ? 1 : 0;
                     break;
@@ -1204,7 +1218,7 @@ struct ValueSweep {
                     // pop* yields an element; each element keeps its own planes in
                     // the heap buffer, so report conservatively by element domain.
                     const bool four =
-                      m.pool.layout(std::get<Type>(m.pool.get(p.op_type.type)).element).domain == Domain::Four;
+                      types::has_four_state_leaf(m.pool, std::get<Type>(m.pool.get(p.op_type.type)).element);
                     val_z[raw] = four ? 1 : 0;
                     val_x[raw] = four ? 1 : 0;
                     break;
@@ -1773,6 +1787,49 @@ CombFuse comb_fuse_verdict(const Process& p, const ProcessFacts& pf, CombFuse bo
     return CombFuse::Eligible;
 }
 
+// The x / z content of a materialized constant table's image
+// (SignalInfo::const_data). The image is leaf-major, as the lowerer wrote it: an
+// unpacked array is its elements back to back, an unpacked struct its fields in
+// declaration order, and a leaf its canonical planes, [val][xz] for a 4-state leaf
+// and [val] alone for a 2-state one. The walk follows the type, not the byte
+// count. A bit is z when xz & ~val and x when xz & val.
+struct ImageUnknown {
+    bool z = false;
+    bool x = false;
+};
+
+void scan_image(const Module& m, Ref type, std::span<const uint8_t>& cursor, ImageUnknown& out) {
+    if (types::contains_struct(m.pool, type)) {
+        const Type& t = std::get<Type>(m.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            for (uint32_t k = 0; k < types::array_dim(t); ++k) {
+                scan_image(m, t.element, cursor, out);
+            }
+        } else {
+            for (const Field& f : m.pool.struct_fields(t.fields_id)) {
+                scan_image(m, f.type, cursor, out);
+            }
+        }
+        return;
+    }
+    // A leaf, or arrays of leaves: the layout of an unpacked array is its leaf's,
+    // with the whole element count in byte_count.
+    const Layout lay = m.pool.layout(type);
+    assert(cursor.size() >= lay.byte_count && "a constant table's image matches its type");
+    if (lay.domain == Domain::Four) {
+        const uint32_t pb = plane_bytes(lay.width);
+        for (uint32_t el = 0; el + 2 * pb <= lay.byte_count; el += 2 * pb) {
+            for (uint32_t k = 0; k < pb; ++k) {
+                const uint8_t val = cursor[el + k];
+                const uint8_t xz  = cursor[el + pb + k];
+                out.z             = out.z || (xz & static_cast<uint8_t>(~val)) != 0;
+                out.x             = out.x || (xz & val) != 0;
+            }
+        }
+    }
+    cursor = cursor.subspan(lay.byte_count);
+}
+
 } // namespace
 
 DesignFacts analyze(const Module& m) {
@@ -1948,11 +2005,43 @@ DesignFacts analyze(const Module& m) {
         }
     }
 
+    // Seed 8: native C calls an exported subroutine with any aval / bval pair, so a
+    // 4-state input or inout formal may arrive carrying x and z. An output formal is
+    // written by the body, which the sweep already follows.
+    for (const DpiExport& ex : m.dpi_exports) {
+        ValueSweep::FnState& fs = vs.fns[static_cast<uint32_t>(ex.func)];
+        assert(ex.arg_dirs.size() == fs.func->param_types.size());
+        for (size_t k = 0; k < ex.arg_dirs.size(); ++k) {
+            if (ex.arg_dirs[k] != ArgDir::Out && types::has_four_state_leaf(m.pool, fs.func->param_types[k])) {
+                fs.param_z[k] = 1;
+                fs.param_x[k] = 1;
+            }
+        }
+    }
+
     // Seed 1: an undriven 4-state net holds its default value z (LRM 6.6). The
     // backend initializes exactly these to z.
     for (uint32_t i = 0; i < nsig; ++i) {
         if (facts.undriven[i] && m.signals()[i].is_net && m.pool.layout(m.signals()[i].type).domain == Domain::Four) {
             vs.sig_z[i] = 1;
+        }
+    }
+
+    // Seed 7: a materialized constant table holds its image as the signal's
+    // initializer, so no store ever shows the fixpoint what is in it.
+    for (uint32_t i = 0; i < nsig; ++i) {
+        const SignalInfo& s = m.signals()[i];
+        if (s.const_data == Ref::Invalid) {
+            continue;
+        }
+        std::span<const uint8_t> image = m.pool.bytes(s.const_data);
+        ImageUnknown             bits;
+        scan_image(m, s.type, image, bits);
+        if (bits.z) {
+            vs.sig_z[i] = 1;
+        }
+        if (bits.x) {
+            vs.sig_x[i] = 1;
         }
     }
 
@@ -1972,7 +2061,7 @@ DesignFacts analyze(const Module& m) {
         }
     }
     for (uint32_t i = 0; i < nsig; ++i) {
-        if (!preinit_written[i] && m.pool.layout(m.signals()[i].type).domain == Domain::Four) {
+        if (!preinit_written[i] && types::has_four_state_leaf(m.pool, m.signals()[i].type)) {
             vs.sig_x[i] = 1;
         }
     }

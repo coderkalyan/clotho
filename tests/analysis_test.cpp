@@ -173,6 +173,21 @@ TEST_CASE("a 2-state conversion clears x as well as z") {
     CHECK_FALSE(a.facts.may_x[a.sig("b")]);
 }
 
+TEST_CASE("may_x seeds an unpacked struct by its leaves, not by its Layout") {
+    const Analyzed a = run(R"(
+        typedef struct { logic [3:0] f; } four_t;
+        typedef struct { int n; }         two_t;
+        module top;
+            four_t four;
+            two_t  two;
+        endmodule
+    )");
+    // An unpowered 4-state member powers on x; an unpacked struct reports no plane
+    // layout of its own.
+    CHECK(a.facts.may_x[a.sig("four")]);
+    CHECK_FALSE(a.facts.may_x[a.sig("two")]);
+}
+
 TEST_CASE("design-wide use flags gate scheduler machinery") {
     const Analyzed plain = run("module top; initial $finish; endmodule");
     CHECK_FALSE(plain.facts.uses.strobe);

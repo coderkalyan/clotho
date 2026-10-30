@@ -222,29 +222,6 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     anchors_[aid].ty = ty;
 }
 
-// Does a materialized constant table's image carry a z bit? The pool stores
-// canonical val / xz planes per element, where z is (xz & ~val); a table with
-// none can drop its z word like any never-z signal.
-bool Backend::const_image_has_z(const SignalInfo& info) const {
-    if (info.const_data == Ref::Invalid) {
-        return false;
-    }
-    const Layout lay = mod_.pool.layout(info.type);
-    if (lay.domain != Domain::Four || lay.width == 0) {
-        return false;
-    }
-    const std::span<const uint8_t> img = mod_.pool.bytes(info.const_data);
-    const uint32_t                 pb  = plane_bytes(lay.width);
-    for (size_t off = 0; off + 2 * pb <= img.size(); off += 2 * pb) {
-        for (uint32_t k = 0; k < pb; ++k) {
-            if ((img[off + pb + k] & ~img[off + k]) != 0) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 // Build the design's state types: per-signal slot / storage types, one
 // struct per module definition (own signals only — every instance scope
 // owns a separate state global, children own theirs), and the root
@@ -268,9 +245,8 @@ void Backend::build_state_types() {
     nba_classify();
 
     // A slot keeps its z word when the may-z analysis cannot prove it z-free
-    // or the task ABI needs z storage behind it. A conversion to 2-state drops
-    // x and z (LRM 6.3.1), so a 2-state signal written from a z-capable source
-    // needs no z word of its own.
+    // or the task ABI needs z storage behind it. The analysis owns every source
+    // of z, a constant table's image included (ir/Analysis.cpp).
     const std::vector<bool> may_z =
       config_.z_elision ? facts_.may_z : std::vector<bool>(sigs.size(), true);
     const std::vector<bool>& ptr_arg = facts_.ptr_arg;
@@ -366,12 +342,7 @@ void Backend::build_state_types() {
         if (!slot.init_z && slot.four_state && !slot.is_array && !pmask.empty()) {
             slot.undriven_mask.assign(pmask.begin(), pmask.end());
         }
-        // A materialized constant table has no store anywhere, so the may-z
-        // analysis proves it never-z from an empty seed set — but a parameter
-        // may itself hold z (`localparam logic [3:0] P[0:1] = '{4'bzzzz, 0}`).
-        // Its own image is the authority.
-        slot.has_z = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty() ||
-                     const_image_has_z(sigs[i]);
+        slot.has_z = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty();
         // A 2-state signal drops the packed must|may word for a genuine iW slot
         // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
         // value carries no z, and has_z is forced only by a task out/inout target

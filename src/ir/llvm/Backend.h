@@ -1269,8 +1269,6 @@ private:
 
     void scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier);
 
-    bool const_image_has_z(const SignalInfo& info) const;
-
     void compute_vif_reachable();
 
     void collect_vif_nba();
