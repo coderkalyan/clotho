@@ -796,8 +796,10 @@ void Backend::build_wait_queues() {
     wait_slot_sta_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
     wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
     wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
+    wait_sta_ord_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
     for (uint32_t a = 0; a < anchors_.size(); ++a) {
         uint32_t next = 0;
+        uint32_t sta  = 0;
         for (const Signal sj : by_anchor[a]) {
             if (sj == Signal{ ~0u }) {
                 continue;
@@ -806,6 +808,7 @@ void Backend::build_wait_queues() {
             for (uint32_t e = 0; e < 3; ++e) {
                 if (wait_sta_gv_[si][e] != nullptr) {
                     wait_slot_sta_[si][e] = next++;
+                    wait_sta_ord_[si][e]  = sta++;
                 }
                 if (wait_dyn_gv_[si][e] != nullptr) {
                     wait_slot_dyn_[si][e] = next++;
@@ -1368,11 +1371,24 @@ llvm::Value* Backend::wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig)
     return ctx_field(a, a.ctx_wait_base + slot, llvm::PointerType::getUnqual(ctx_));
 }
 
+// A static bucket scan. The owner's own code reads the bucket's subscriber
+// count and trigger bits from its instance record, the exact count of that
+// instance, so the scan needs no padding; any other writer bakes the
+// per-definition maximum (null-checked when twins differ) and the bits.
 void Backend::service_static_queue(Signal sig, uint32_t edge) {
-    const auto i = static_cast<uint32_t>(sig);
-    emit_static_scan_rt(wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i),
-                        b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
-                        trig_bits(sig, edge));
+    const auto     i    = static_cast<uint32_t>(sig);
+    const uint32_t ord  = wait_sta_ord_[i][edge];
+    llvm::Value*   base = wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i);
+    if (ord != no_wait_slot && def_relative_for(slots_[i])) {
+        Anchor& a = anchors_[slots_[i].anchor];
+        emit_static_scan_rt(base,
+                            ctx_field(a, a.ctx_cap_base + ord, b_.getInt32Ty()),
+                            false,
+                            ctx_field(a, a.ctx_trig_base + ord, b_.getInt64Ty()));
+        return;
+    }
+    emit_static_scan_rt(
+      base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0, b_.getInt64(trig_bits(sig, edge)));
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -1827,12 +1843,12 @@ llvm::Value* Backend::meta_at(llvm::Value* meta, unsigned field, uint32_t e, llv
 // pointer instead of dereferencing it. Exact buckets keep the check-free
 // scan.
 // `trig`: trigger bits this (signal, edge) contributes to the wake word
-// (compute_trigger_masks), or 0 when no guarded group waits on it. Note the
-// already-queued path: it must still OR the bits in, or a group woken by two
-// of its events in one instant loses the second one's bit and skips the
-// members that were waiting for it. With `trig` 0 that path is empty and the
-// emission is exactly the unguarded scan.
-void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, uint64_t trig) {
+// (compute_trigger_masks): a constant, or a value read from the owner's
+// instance record. Note the already-queued path: it must still OR the bits
+// in, or a group woken by two of its events in one instant loses the second
+// one's bit and skips the members that were waiting for it. With a constant 0
+// that path is empty and the emission is exactly the unguarded scan.
+void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* word = sched_word_ty();
@@ -1860,13 +1876,14 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
         b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
         b_.SetInsertPoint(live);
     }
-    llvm::Value* old   = b_.CreateLoad(word, fptr);
+    llvm::Value* old    = b_.CreateLoad(word, fptr);
     auto*        queued = b_.CreateICmpNE(old, b_.getInt64(0));
-    if (trig != 0) {
+    auto*        none   = llvm::dyn_cast<llvm::ConstantInt>(trig);
+    if (none == nullptr || !none->isZero()) {
         auto* arm = llvm::BasicBlock::Create(ctx_, "nsta.arm", fn);
         b_.CreateCondBr(queued, arm, wake);
         b_.SetInsertPoint(arm);
-        b_.CreateStore(b_.CreateOr(old, b_.getInt64(trig)), fptr);
+        b_.CreateStore(b_.CreateOr(old, trig), fptr);
         b_.CreateBr(cont);
     } else {
         b_.CreateCondBr(queued, cont, wake);
@@ -1874,7 +1891,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
 
     b_.SetInsertPoint(wake);
     emit_wake_push(b_, h);
-    b_.CreateStore(b_.getInt64(1 | trig), fptr);
+    b_.CreateStore(b_.CreateOr(trig, b_.getInt64(1)), fptr);
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(cont);

@@ -845,8 +845,7 @@ void Backend::emit_nba_service(Signal       sig,
         b_.SetInsertPoint(body);
         auto* ptr = raw_ptr_ty();
         auto* i32 = b_.getInt32Ty();
-        emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32), false,
-                            trig_bits(sig, e));
+        emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32), false, b_.getInt64(trig_bits(sig, e)));
         emit_dynamic_scan_rt(meta_at(meta, 2, e, ptr), meta_at(meta, 3, e, ptr));
         if (vif_wait_[static_cast<uint32_t>(sig)][e]) {
             // Waiters that reached this member through a virtual interface. The

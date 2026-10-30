@@ -1029,6 +1029,7 @@ void Backend::build_instance_ctx_layout() {
         a.n_blk        = def_blk[a.ty];
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;
+        uint32_t nsta  = 0;
         for (const Signal sj : anchor_signals_[&a - anchors_.data()]) {
             if (sj == Signal{ ~0u }) {
                 continue;
@@ -1037,14 +1038,19 @@ void Backend::build_instance_ctx_layout() {
             for (uint32_t e = 0; e < 3; ++e) {
                 nwait += wait_slot_sta_[si][e] != no_wait_slot ? 1 : 0;
                 nwait += wait_slot_dyn_[si][e] != no_wait_slot ? 2 : 0;
+                nsta += wait_slot_sta_[si][e] != no_wait_slot ? 1 : 0;
             }
         }
         a.ctx_wait_base = a.ctx_blk_base + a.n_blk;
+        a.ctx_cap_base         = a.ctx_wait_base + nwait;
+        a.ctx_trig_base        = a.ctx_cap_base + nsta;
         const auto [it, fresh] = def_ctx.try_emplace(a.ty, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
             f.insert(f.end(), a.n_blk, i32);
             f.insert(f.end(), nwait, ptr);
+            f.insert(f.end(), nsta, i32);
+            f.insert(f.end(), nsta, b_.getInt64Ty());
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }

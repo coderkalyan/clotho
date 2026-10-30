@@ -857,6 +857,11 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
                 if (wait_slot_sta_[si][e] != no_wait_slot) {
                     b_.CreateStore(sym(wait_sta_gv_[si][e]),
                                    ctx_ptr(a, a.ctx_wait_base + wait_slot_sta_[si][e]));
+                    // This instance's exact subscriber count: its slots are
+                    // filled densely from 0, so its own scan needs no padding.
+                    b_.CreateStore(b_.getInt32(wait_sta_true_[si][e]),
+                                   ctx_ptr(a, a.ctx_cap_base + wait_sta_ord_[si][e]));
+                    b_.CreateStore(b_.getInt64(trig_bits(sj, e)), ctx_ptr(a, a.ctx_trig_base + wait_sta_ord_[si][e]));
                 }
                 if (wait_slot_dyn_[si][e] != no_wait_slot) {
                     b_.CreateStore(sym(wait_dyn_gv_[si][e]),

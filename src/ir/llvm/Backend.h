@@ -984,12 +984,20 @@ struct Anchor {
     //                      (0 when the function registers none)
     //   ctx_wait_base ptr  wait bucket bases (sta / dyn / dyn-len), def-local
     //                      slot order from the bucket walk
+    //   ctx_cap_base  i32  each static bucket's subscriber count, in the
+    //                      instance's static-bucket order (wait_sta_ord_)
+    //   ctx_trig_base i64  each static bucket's trigger bits, same order
+    // A writer in the instance's own code reads a bucket's base, count and
+    // trigger bits here, so none of them is baked into unit code: they depend
+    // on who subscribes, which is other units' business.
     // ctx_ty is shared across instances of one definition; the global is
     // created lazily by the first def-relative use.
     llvm::StructType*     ctx_ty        = nullptr;
     llvm::GlobalVariable* ctx_gv        = nullptr;
     uint32_t              ctx_blk_base  = 0;
     uint32_t              ctx_wait_base = 0;
+    uint32_t              ctx_cap_base  = 0;
+    uint32_t              ctx_trig_base = 0;
     // Def-local count of owned processes (sizes the blk fields).
     uint32_t n_blk = 0;
     // The Design unit the scope expands (InstanceScope::unit).
@@ -2373,7 +2381,7 @@ private:
 
     llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty);
 
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded = false, uint64_t trig = 0);
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig);
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
 
@@ -4720,6 +4728,9 @@ private:
     std::vector<std::array<uint32_t, 3>> wait_slot_sta_;
     std::vector<std::array<uint32_t, 3>> wait_slot_dyn_;
     std::vector<std::array<uint32_t, 3>> wait_slot_len_;
+    // Ordinal of a (signal, edge)'s static bucket among its owning instance's
+    // static buckets (the cap and trig record fields), or no_wait_slot.
+    std::vector<std::array<uint32_t, 3>> wait_sta_ord_;
 
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
