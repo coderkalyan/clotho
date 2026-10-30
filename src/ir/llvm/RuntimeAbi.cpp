@@ -1149,12 +1149,6 @@ llvm::FunctionCallee Backend::wheel_now_fn() {
     return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
 }
 
-// void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
-llvm::FunctionCallee Backend::wheel_schedule_fn() {
-    return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-}
-
 // void rt_wheel_schedule_rel(rt_wheel*, rt_timer*, i64 delay, rt_timer_fn)
 llvm::FunctionCallee Backend::wheel_schedule_rel_fn() {
     return rt_fn("rt_wheel_schedule_rel", b_.getVoidTy(),

@@ -222,10 +222,13 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
 // What a count that does not fit a 64-bit time means is not defined by the LRM.
 // Converting it as an integer would keep its low 64 bits, and a delay of 2**64
 // ticks would become 0 and fire at once, so it saturates instead: a huge delay
-// never wraps into an early event. The ceiling is INT64_MAX, the largest signed
-// count, because the wheel adds a delay to the current time in 64 bits
-// (rt_wheel_schedule_rel), and a delay below 2**63 cannot wrap that sum before
-// the simulation itself has run past 2**63 ticks.
+// never wraps into an early event. The ceiling is INT64_MAX rather than
+// UINT64_MAX for headroom, not for the wheel (which saturates its own
+// `now + delay`, rt_wheel_schedule_rel): the bound below is a double, and the
+// largest count whose product with `tick_mul` fits UINT64_MAX would have to be
+// rounded down to keep that product from wrapping, whereas the 2**63 slack above
+// INT64_MAX absorbs the rounding. A delay between the two is 2**63 ticks or more,
+// which no run reaches.
 //
 // The test is on the real, against the largest value whose product with
 // `tick_mul` stays within the ceiling, so the multiply cannot wrap either. Both
@@ -299,8 +302,14 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
         return ticks;
     }
     const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
-
-    return b.binary(ir::Inst::Tag::Mul, ticks, mul, l);
+    // The product saturates at the largest count instead of wrapping, like a real
+    // delay's (saturating_ticks): `longint unsigned d = 2**61; #(d)` in a 1ns/1ps
+    // module is 2**61 * 1000 ticks, whose low 64 bits are 0, and a negative amount
+    // is 2**64 - 1 units. Neither may fire early. A constant amount folds away.
+    const ir::Index limit = b.constant(module_.pool.put_int(u64, UINT64_MAX / time_mul_), l);
+    const ir::Index huge  = b.binary(ir::Inst::Tag::Gt, ticks, limit, l);
+    return b.select(huge, b.constant(module_.pool.put_int(u64, UINT64_MAX), l),
+                    b.binary(ir::Inst::Tag::Mul, ticks, mul, l), l);
 }
 
 // Lower a string-valued system-task argument (a $fopen filename / mode, a

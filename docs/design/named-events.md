@@ -194,8 +194,9 @@ the LRM.
 
 The fixed-delay form schedules a **detached wheel timer** — no hosting
 coroutine. `EventTriggerNbDelayed` (op = delay in ticks, extra = the event)
-lowers in a process body to: `deadline = now + d; node = rt_alloc(16);
-rt_wheel_schedule(wheel, node, deadline, ev_delay_thunk_<e>)`, then falls
+lowers in a process body to: `node = rt_alloc(16);
+rt_wheel_schedule_rel(wheel, node, d, ev_delay_thunk_<e>)` (the runtime adds `d`
+to the current time, saturating at the last instant), then falls
 through (nonblocking). One `ev_delay.<e>(rt_timer* t, void* ctx)` thunk is
 generated per delay-targeted event (`build_delay_event_thunks`, after
 `build_wait_queues` so the event globals exist): it stamps the trigger time and

@@ -1904,6 +1904,8 @@ void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_t
 // Like rt_wheel_schedule but the deadline is `rt_wheel_now + delay`, computed
 // runtime-side so a #delay crosses the C ABI once instead of twice. `delay`
 // must be > 0 (a #0 never reaches the wheel — it parks in the inactive queue).
+// The sum saturates at the last instant, 2**64 - 1, so a delay past the end of
+// time is never wrapped into the past; at the last instant itself it arms nothing.
 void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_timer_fn on_expire);
 
 // Jump to the next non-empty tick and fire its timers in list order, passing

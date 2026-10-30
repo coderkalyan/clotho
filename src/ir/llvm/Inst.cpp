@@ -2459,14 +2459,14 @@ void Backend::lower_inst(Index i) {
             // the event `d` ticks from now. The process does not block. The timer
             // node carries the handle, so ONE thunk serves the whole design (the
             // target may be any event expression, not a fixed declared one).
-            llvm::Value* handle   = must_of(value_of(p.binary.r));
-            llvm::Value* ticks    = cast(must_of(value_of(p.binary.l)), 64, false);
-            llvm::Value* deadline = b_.CreateAdd(b_.CreateCall(wheel_now_fn(), { wheel_ }), ticks);
-            auto*        nty      = event_timer_ty();
-            llvm::Value* node     = b_.CreateCall(
+            llvm::Value* handle = must_of(value_of(p.binary.r));
+            llvm::Value* ticks  = cast(must_of(value_of(p.binary.l)), 64, false);
+            auto*        nty    = event_timer_ty();
+            llvm::Value* node   = b_.CreateCall(
               alloc_fn(), { b_.getInt64(env_->llmod.getDataLayout().getTypeAllocSize(nty)) });
             b_.CreateStore(handle, b_.CreateStructGEP(nty, node, 2));
-            b_.CreateCall(wheel_schedule_fn(), { wheel_, node, deadline, event_delay_thunk() });
+            // Relative, so the runtime's saturating `now + ticks` applies.
+            b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, node, ticks, event_delay_thunk() });
             return;
         }
 

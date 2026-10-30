@@ -2300,7 +2300,6 @@ private:
     llvm::FunctionCallee dpi_export_task_suspended_fn();
     llvm::FunctionCallee dpi_export_task_no_task_frame_fn();
     llvm::FunctionCallee wheel_now_fn();
-    llvm::FunctionCallee wheel_schedule_fn();
     llvm::FunctionCallee wheel_schedule_rel_fn();
     llvm::FunctionCallee wheel_advance_fn();
 

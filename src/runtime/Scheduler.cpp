@@ -418,8 +418,23 @@ extern "C" void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t
     // now + delay computed runtime-side so a #delay crosses the ABI once, not
     // twice (rt_wheel_now then rt_wheel_schedule). See rt_wheel_schedule for the
     // callback-cast rationale.
-    RuntimeWheel& w = *unwrap(wheel);
-    w.schedule(unwrap(timer), w.now() + delay, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
+    //
+    // The sum saturates at the last instant, 2**64 - 1: a delay that would land past
+    // the end of time is never reached, and wrapping it would fire it in the past
+    // (a delay of 2**64 - 1 at time 5 would fire at 4). A saturated timer fires at
+    // the last instant, after everything else. At the last instant itself nothing
+    // lies ahead, so the timer is not armed and its waiter stays parked. Only the
+    // overflow test is on the hot path: it is the carry of the add.
+    RuntimeWheel&  w        = *unwrap(wheel);
+    const uint64_t now      = w.now();
+    uint64_t       deadline = now + delay;
+    if (deadline < now) [[unlikely]] {
+        if (now == UINT64_MAX) {
+            return;
+        }
+        deadline = UINT64_MAX;
+    }
+    w.schedule(unwrap(timer), deadline, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
 }
 
 extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
@@ -433,7 +448,10 @@ enum class Halt : uint8_t { None, StopTime, Interrupt };
 
 Halt g_halt = Halt::None;
 
-// The stop tick of "no stop time armed": a tick no time step can reach.
+// The stop tick of "no stop time armed". An armed stop tick is clamped below it
+// (rt_run), so it is never confused with one. The last instant is a time a step can
+// reach (a delay past the end of time saturates there, rt_wheel_schedule_rel), so
+// "no tick can reach it" is not what makes it a sentinel.
 constexpr uint64_t kNoStopTick = RuntimeWheel::never;
 
 // The last tick that runs once `--stop-time` has armed one (rt_run).
@@ -462,9 +480,11 @@ extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
         // it, the run ends at the stop tick itself rather than at the last step
         // that ran, so the finals and the report read the time the user asked for.
         // An idle wheel has no next step: the design ended first, and that is
-        // not a stop.
+        // not a stop. `never` is what next_tick reports for an idle wheel but also
+        // the tick of a timer at the last instant, so idleness is asked of empty().
+        // That runs only when the next step is past the stop tick.
         const uint64_t next = w.next_tick();
-        if (next != RuntimeWheel::never && next > g_stop_tick) {
+        if (next > g_stop_tick && !w.empty()) {
             w.skip_to(g_stop_tick);
             g_halt = Halt::StopTime;
             return 0;
