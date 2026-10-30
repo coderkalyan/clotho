@@ -446,8 +446,9 @@ TEST_CASE("rebased maps every cross-table handle and leaves the rest alone") {
     // A wait site is an identity within its body, not a handle.
     CHECK(out.extra_data<SyncInfo>(out.payload(sw).extra).site == 3);
     CHECK(out.extra_data<CoverInfo>(out.payload(ct).extra).type_idx == 202);
-    // An instance op takes its type from the handle; its index is not one.
-    CHECK(out.extra_data<CoverInfo>(out.payload(cc).extra).type_idx == 2);
+    // An instance op takes its type from the handle, so the body records no index
+    // for it, and rebasing has none to map.
+    CHECK(out.extra_data<CoverInfo>(out.payload(cc).extra).type_idx == 0);
     CHECK(out.extra_data<IfaceInst>(out.payload(ir_).extra).scope == 30);
     // A virtual interface member names a layout, not storage.
     CHECK(out.extra_data<IfaceMember>(out.payload(is).op_extra.extra).signal == Signal{ 41 });

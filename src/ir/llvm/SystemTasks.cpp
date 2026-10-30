@@ -81,8 +81,7 @@ llvm::Constant* Backend::cover_config_global() {
                                                     cover_array(cover_point_ty(), points, tn + ".points"),
                                                     b_.getInt32(ct.weight),
                                                     b_.getInt32(ct.goal),
-                                                    b_.getInt32(ct.per_instance ? 1u : 0u),
-                                                    b_.CreateGlobalString(ct.scope) }));
+                                                    b_.getInt32(ct.per_instance ? 1u : 0u) }));
     }
     llvm::Constant* path = config_.coverage_report.empty()
                              ? llvm::Constant::getNullValue(raw_ptr_ty())
@@ -558,14 +557,23 @@ void Backend::lower_cover_query(Index i) {
     const auto ival = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     const auto hval = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     switch (info.op) {
-        case CoverOp::New:
+        case CoverOp::New: {
             // `ctx` is the enclosing object for a class-embedded covergroup, so
             // the generated sample body can reach the class properties its
-            // coverpoints name, and null otherwise.
+            // coverpoints name, and null otherwise. `scope` is the constructing
+            // instance's name prefix, which the runtime copies into the new
+            // instance's name.
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_query new takes a context and a scope" };
+            }
+            const AsciiArg scope = spill_ascii_arg(args[1], "cover.scope");
             hval(b_.CreateCall(cover_new_fn(),
                                { b_.getInt32(info.type_idx),
-                                 args.empty() ? b_.getInt64(0) : cast(must_of(args[0]), 64, false) }));
+                                 cast(must_of(args[0]), 64, false),
+                                 scope.ptr,
+                                 b_.CreateZExt(scope.len, b_.getInt64Ty()) }));
             return;
+        }
         case CoverOp::Ctx:
             hval(b_.CreateCall(cover_ctx_fn(), { handle() }));
             return;

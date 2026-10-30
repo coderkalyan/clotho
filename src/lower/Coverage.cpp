@@ -409,10 +409,6 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
     ir::CoverType ct;
     ct.name   = cover_group_name(cgt);
     ct.banner = banner_at(cgt.location);
-    ct.scope  = instance_path();
-    if (!ct.scope.empty()) {
-        ct.scope += '.';
-    }
     CoverOpts gopts;
     for (const slang::ast::CoverageOptionSetter& set : body.options) {
         cover_apply_option(set, gopts);
@@ -637,7 +633,7 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
     }
     b.ret_void(l);
     module_.set_function(id,
-                         ir::Function{ .name        = "cover.sample." + std::to_string(type_idx),
+                         ir::Function{ .name        = "cover.sample." + cover_group_name(cgt),
                                        .return_type = module_.pool.void_type,
                                        .param_types = { word },
                                        .arg_dirs    = { ir::ArgDir::In },
@@ -751,7 +747,13 @@ void Lowerer::cover_event_process(const slang::ast::CovergroupType& cgt, uint32_
                              .scope       = cur_scope_id() });
 }
 
-// `covergroup_type ident = new;` (LRM 19.3).
+// `covergroup_type ident = new;` (LRM 19.3). The new instance is named after the
+// module instance that constructs it ("top.u1.cg"), so the report tells the
+// instances of one module apart. The prefix is an operand, read when the group is
+// built, rather than a field of the covergroup type: the type is then the same in
+// every instance of the module, and so is this body. Outside every instance (a
+// package or `$unit` constructs it) the prefix is empty, and what the type's own
+// name makes of it is the whole name.
 ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpression& nc, ir::Builder& b) {
     const slang::ast::Type& t = nc.type->getCanonicalType();
     if (!t.isCovergroup()) {
@@ -770,13 +772,22 @@ ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpressio
     // class's constructor, which is what makes `this` available here).
     const bool embedded =
       cgt.getParentScope() != nullptr && cgt.getParentScope()->asSymbol().kind == SymbolKind::ClassType;
-    std::vector<ir::Index> args;
+    ir::Index ctx = int_const(0, 64, b, l);
     if (embedded) {
         if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
             fail("an embedded covergroup must be constructed from a method of its class");
         }
-        args.push_back(this_handle(b, l));
+        ctx = this_handle(b, l);
     }
+    const ScopeName scope = instance_scope(b);
+    ir::Index       prefix{};
+    if (scope.in_instance) {
+        const std::array<ir::Index, 2> parts{ b.inst_path(l), b.constant(string_value_ref(scope.text + "."), l) };
+        prefix = b.concat(parts, l);
+    } else {
+        prefix = b.constant(string_value_ref(scope.text.empty() ? "" : scope.text + "."), l);
+    }
+    const std::array<ir::Index, 2> args{ ctx, prefix };
     return b.cover_query(ir::CoverOp::New, args, word, idx, 0, l);
 }
 

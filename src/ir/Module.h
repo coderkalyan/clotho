@@ -811,11 +811,9 @@ struct CoverType {
     // covergroup, whose type is anonymous in slang.
     std::string name;
     std::string banner;
-    // The instance path of the scope that declared it ("top.u1."), so one
-    // covergroup type in a module instantiated twice reports two distinguishable
-    // instances. A covergroup declaration is lowered once per instance, so this is
-    // fixed per entry.
-    std::string             scope;
+    // The type says nothing of where it is instantiated: the instance path a report
+    // names an instance by ("top.u1.") is read when the covergroup is constructed
+    // (CoverOp::New), so the instances of one module share the one type.
     std::vector<CoverPoint> points;
     uint32_t                weight       = 1;
     uint32_t                goal         = 100;

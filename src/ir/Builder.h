@@ -461,9 +461,11 @@ public:
 
     // -- Functional coverage (LRM 19, docs/design/functional-coverage.md) --
     // `args` is the operand run CoverInfo carries: the covergroup handle first
-    // (absent for the type-level and design-level queries), then the op's value
-    // arguments. `type_idx` selects the covergroup type in Module::cover_types and
-    // `point` its coverpoint, both ignored by ops that address neither.
+    // (absent for the type-level and design-level queries, and for `new`, whose
+    // operands are the enclosing object and the instance's name prefix), then the
+    // op's value arguments. `type_idx` selects the covergroup type in
+    // Module::cover_types (an op that names no type, cover_op_names_type, records
+    // none) and `point` its coverpoint (0 for an op that addresses none).
     //
     // A value-producing query (`new`, the registry walk, a coverage number);
     // `type` is its result type.

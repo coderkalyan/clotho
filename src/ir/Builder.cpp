@@ -817,18 +817,23 @@ Index Builder::proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc) 
     return emit({ Inst::Tag::ProcWait, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+// An op that reaches its covergroup type through the instance handle names no type
+// index, so none is recorded: a design-wide index in the body would make the body
+// differ from the same body in the next instance of its module.
 Index Builder::cover_query(CoverOp                op,
                            std::span<const Index> args,
                            Ref                    type,
                            uint32_t               type_idx,
                            uint32_t               point,
                            SourceLoc              loc) {
-    const ExtraIndex extra = add_extra(CoverInfo{ add_slice(args), type, type_idx, point, op });
+    const ExtraIndex extra =
+      add_extra(CoverInfo{ add_slice(args), type, cover_op_names_type(op) ? type_idx : 0, point, op });
     return emit({ Inst::Tag::CoverQuery, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::cover_ctl(CoverOp op, std::span<const Index> args, uint32_t type_idx, uint32_t point, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(CoverInfo{ add_slice(args), Ref::Invalid, type_idx, point, op });
+    const ExtraIndex extra =
+      add_extra(CoverInfo{ add_slice(args), Ref::Invalid, cover_op_names_type(op) ? type_idx : 0, point, op });
     return emit({ Inst::Tag::CoverCtl, pay(&Inst::Payload::extra, extra) }, loc);
 }
 

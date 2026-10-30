@@ -338,13 +338,15 @@ Each of these makes lowered IR depend on something outside the unit:
   scopes other than through inout ports (hierarchical drivers, interface nets).
 - Function static locals and static class properties placed in the first
   caller's scope.
-- Covergroup scope baked into `CoverType::scope`, and hidden temporaries
-  (`__cover_clk<N>`, task and force temps) named by the per-top counter
-  `temp_id_`. An instance's name in `%m` strings, severity banners and
-  `$printtimescale` is read through `inst_path` (flat bridge: resolved from
-  `Process::scope` / `Function::scope`), and assertion state is named by an
-  instance-relative ordinal. Still text: declaration initializers (they share the
-  top's PreInit process), virtual-interface bodies and `$printtimescale(inst)`.
+- An instance's name in `%m` strings, severity banners, `$printtimescale` and
+  covergroup instance names is read through `inst_path` (flat bridge: resolved
+  from `Process::scope` / `Function::scope`; a covergroup takes it as an operand
+  of `CoverOp::New`, so `CoverType` carries no scope), hidden temporaries are
+  numbered per name prefix, and assertion state is named by an instance-relative
+  ordinal. Still text: declaration initializers (they share the top's PreInit
+  process), virtual-interface bodies and `$printtimescale(inst)`. A package
+  covergroup type built by two instances is still lowered once per top and
+  aborts partition, like a package class.
 - Whole-top facts that change other modules' IR: `forceable_`, resolved nets,
   `events_merge_`, `WaitedProps`, `assert_control_used_`, and which blocks are
   `disable` targets. The last is joined over the instances of a specialization

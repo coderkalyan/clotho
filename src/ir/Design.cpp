@@ -453,19 +453,7 @@ private:
             }
 
             for (const CoverType& ct : u.cover_types) {
-                CoverType copy = ct;
-                if (u.kind == UnitKind::Module) {
-                    // The instance's hierarchical path, top name included
-                    // (the signal prefix elides a single top's name).
-                    // TODO: instance data read through inst_path at
-                    // construction, so the cover type stays unit data.
-                    std::string path;
-                    for (uint32_t at = ii; at != kNone; at = insts_[at].parent) {
-                        path = insts_[at].name + "." + path;
-                    }
-                    copy.scope = std::move(path);
-                }
-                m_.cover_types.push_back(std::move(copy));
+                m_.cover_types.push_back(ct);
             }
 
             for (const ClassDesc& cd : u.class_descs) {

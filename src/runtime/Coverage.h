@@ -93,10 +93,6 @@ typedef struct rt_cover_type {
     uint32_t              weight;
     uint32_t              goal;
     uint32_t              per_instance;
-    // A hierarchical prefix for instances created in this scope ("top.u1."), so
-    // one covergroup type declared in a module instantiated twice reports two
-    // distinguishable instances.
-    const char* scope;
 } rt_cover_type;
 
 // Emitted once per design as `clotho.cover.config` and handed to rt_cover_init.
@@ -135,9 +131,13 @@ void rt_cover_shutdown(void);
 
 // `covergroup_type ident = new;` (LRM 19.3). `ctx` is the enclosing object's
 // handle for a class-embedded covergroup, so the generated sample body can read
-// the class properties its coverpoints name, and 0 otherwise. Returns the
-// covergroup handle. Never returns null: an allocation failure is fatal.
-uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx);
+// the class properties its coverpoints name, and 0 otherwise. `scope` is the
+// hierarchical prefix of the module instance constructing the group ("top.u1.",
+// empty outside every instance), which the instance's default name starts with,
+// so one covergroup type declared in a module instantiated twice reports two
+// distinguishable instances; the bytes are copied. Returns the covergroup handle.
+// Never returns null: an allocation failure is fatal.
+uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const char* scope, uint64_t scope_len);
 
 // The captured `ctx`, read by the generated sample body.
 uint64_t rt_cover_ctx(uint64_t h);

@@ -1009,6 +1009,46 @@ TEST_CASE("cli: instances of one module share a unit whatever hidden temporaries
     CHECK(r.out == "top.u1 n=3 r=4\ntop.u2 n=3 r=4\n");
     CHECK(split_specializations(r.err) == 0);
 }
+
+// A covergroup is built per instance, but its type says nothing of the instance:
+// the prefix the report names the instance by is read when the group is built, so
+// the instances of a module that builds one still share a unit.
+TEST_CASE("cli: instances of one module share a unit when each builds a covergroup") {
+    const Scratch  s;
+    const fs::path report = s.path("coverage.txt");
+    const auto     run    = [&](std::string_view module_body) {
+        const fs::path design = s.write("design.sv", std::format(R"(
+            module leaf;
+              bit [1:0] v = 0;
+              covergroup cg; coverpoint v; endgroup
+              {}
+            endmodule
+            module top;
+              leaf u1();
+              leaf u2();
+            endmodule
+        )",
+                                                                 module_body));
+        return s.run(std::format("run --stat=units --coverage \"{}\" \"{}\"", report.string(), design.string()));
+    };
+    const auto named = [&](std::string_view instance) {
+        return contains(clotho::test::detail::read_file(report), std::format("instance {} ", instance));
+    };
+    SUBCASE("built by a procedure") {
+        const Result r = run("cg c; initial begin c = new; c.sample(); end");
+        CHECK(r.code == 0);
+        CHECK(split_specializations(r.err) == 0);
+        CHECK(named("top.u1.cg"));
+        CHECK(named("top.u2.cg"));
+    }
+    SUBCASE("built by a declaration initializer") {
+        const Result r = run("cg c = new; initial c.sample();");
+        CHECK(r.code == 0);
+        CHECK(split_specializations(r.err) == 0);
+        CHECK(named("top.u1.cg"));
+        CHECK(named("top.u2.cg"));
+    }
+}
 #endif // !defined(_WIN32)
 
 TEST_CASE("cli: --sanitize=divzero reports a 2-state divide by zero and leaves the result alone") {

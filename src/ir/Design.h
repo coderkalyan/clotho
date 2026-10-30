@@ -208,8 +208,8 @@ struct Unit {
     std::vector<BoundPort>   bound_ports;
     // Indexed by the unit-local monitor id (ExpectInfo, ExpectWake).
     std::vector<AssertionMonitor> monitors;
-    // Indexed by the unit-local covergroup type index (CoverInfo::type_idx).
-    // CoverType::scope is instance data: flatten sets it.
+    // Indexed by the unit-local covergroup type index (CoverInfo::type_idx). A type
+    // carries nothing of the instance that constructs it.
     std::vector<CoverType> cover_types;
     // Indexed by the unit-local `disable` target id (LRM 9.6.2).
     std::vector<UnitDisableTarget> disable_targets;
