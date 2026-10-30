@@ -506,10 +506,10 @@ they are `0011`, `0111`, `0111`. An uninitialised `logic` reads `x` under the
 same rule, since its time-zero value is `x` — which is why leaving the ring at
 its power-up state *looks* right and is wrong for any initialized variable.
 
-So each entry is seeded by appending a copy to the **PreInit** process, after the
-declaration initializers and therefore before `emit_main`'s initial Preponed
-sample (§3.3) — the ordering that makes the seed equal to what that first sample
-will capture.
+So each entry is seeded by appending a copy to the top's last **PreInit** process,
+which follows every instance's declaration initializers and therefore comes
+before `emit_main`'s initial Preponed sample (§3.3) — the ordering that makes the
+seed equal to what that first sample will capture.
 
 #### Refused, loudly
 

@@ -911,7 +911,7 @@ globals queue — with `lower_compilation` draining any remainder after every to
 so the wait binds the instance the top elaborates. A body drained at a top can
 append function-static initializers to the already-finalized globals PreInit
 builder; they flush into a PreInit process of their own, still ahead of that
-top's own preinit process.
+top's own initializers.
 
 A wait on a member of a GENUINELY never-bound virtual interface is now the
 located LRM 25.9 run-time fatal the access paths already emit ("use of a null

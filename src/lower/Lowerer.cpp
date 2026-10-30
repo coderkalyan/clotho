@@ -115,7 +115,7 @@ void Lowerer::emit_report(ir::Builder&                b,
                           std::span<const ir::FmtArg> args,
                           ir::SourceLoc               l,
                           uint32_t                    defer) {
-    const ScopeName scope = hier_name(b);
+    const ScopeName scope = hier_name();
     if (!scope.in_instance) {
         std::string banner = where;
         if (scope.text.empty()) {

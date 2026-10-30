@@ -103,6 +103,12 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
             self = &scope_stack_.back()->children.back();
         }
     }
+    // The initializers of the instance being left, so far, run before this child's
+    // and the ones it declares after the child run after them: a parent's open
+    // segment closes here, in the parent's own scope (a no-op for the top).
+    if (pass == Pass::Emit) {
+        finalize_preinit(cur_scope_id());
+    }
     scope_stack_.push_back(self);
     // This instance's own members are named relative to it, so the
     // generate-path accumulator resets here and is restored after the walk.
@@ -155,6 +161,9 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
     }
 
     node_rel_ = saved_node_rel;
+    if (pass == Pass::Emit) {
+        finalize_preinit(self->id);
+    }
     scope_stack_.pop_back();
 }
 
@@ -568,11 +577,12 @@ std::optional<ir::Signal> Lowerer::vif_member_signal(const slang::ast::Symbol&  
     return std::nullopt;
 }
 
-// Lower one top instance and its whole hierarchy, then emit the accumulated
-// declaration initializers as this Lowerer's pre-init process. finalize_preinit
-// runs here, per top, rather than inside lower_instance: a multi-top design
-// gives every top a "<name>." prefix, so gating on an empty prefix would drop
-// all initializers (each top gets its own Lowerer, so this covers each one).
+// Lower one top instance and its whole hierarchy. Declaration initializers become
+// run-once PreInit processes owned by the instance that declares them: lower_instance
+// closes the open one at every child boundary, so the processes keep the order of the
+// elaboration walk, and at the end of the instance; this function closes the top's
+// head (what Collect and Classify appended) and its last (what follows the walk).
+// Each top gets its own Lowerer, so a multi-top design is covered too.
 void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     top_elided_    = prefix.empty();
     top_inst_      = &top;
@@ -605,6 +615,11 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // Classify reuses the scope tree Collect built (Emit has not yet moved
     // it out); it only reads node pointers to walk children in order.
     lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
+    // Whatever Collect and Classify appended (a constant table seeded or a function
+    // static first reached from a continuous driver) is the top's own head process,
+    // ahead of every process the Emit walk creates, as it was ahead of every
+    // initializer when one process held them all.
+    finalize_preinit(top_scope_.id);
     lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
     emit_wire_resolvers();
     // Static class property initializers of classes declared under this top; a
@@ -632,13 +647,14 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // access inside a class task resolves instead of warning never-bound. A
     // body drained here may append function-static initializers to the
     // globals PreInit builder, which lower_globals already finalized; flush
-    // them into a process of their own, still ahead of this top's preinit.
+    // them into a process of their own, still ahead of this top's initializers.
     if (globals_ != nullptr && globals_ != this) {
-        globals_->finalize_preinit();
+        globals_->finalize_preinit(ir::Process::no_scope);
     }
-    // Before finalize_preinit, which closes the process the seeds go into.
+    // Before finalize_preinit, which closes the process the seeds go into: the
+    // top's last one, after every instance's own initializers.
     finalize_sva_history();
-    finalize_preinit();
+    finalize_preinit(top_scope_.id);
     finalize_preponed();
     module_.add_top(std::move(top_scope_));
 }
@@ -710,7 +726,7 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
     for (const CompilationUnitSymbol* unit : root.compilationUnits) {
         init_static_class_props(*unit);
     }
-    finalize_preinit();
+    finalize_preinit(ir::Process::no_scope);
 }
 
 // The globals Lowerer's last phase, run by lower_compilation once every top
@@ -722,7 +738,7 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
 // of their own.
 void Lowerer::finalize_globals() {
     drain_pending_bodies();
-    finalize_preinit();
+    finalize_preinit(ir::Process::no_scope);
 }
 
 // Force declaration -- and thereby time-zero initialization -- of every static

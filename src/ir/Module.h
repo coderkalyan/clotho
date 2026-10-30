@@ -291,7 +291,8 @@ struct Process {
     Ir ir;
     // Scope id (InstanceScope::id) of the instance whose definition declared
     // this process, or no_scope for a process that belongs to no single
-    // instance (a per-top PreInit pass, package/$unit lowering).
+    // instance (package/$unit lowering, a resolver of a net driven from several
+    // scopes).
     static constexpr uint32_t no_scope = ~0u;
     uint32_t scope = no_scope;
 

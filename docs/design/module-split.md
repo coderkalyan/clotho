@@ -24,8 +24,9 @@ twin detector computes (`--stat=dedup`) is not part of the key.
 - `M_root`: everything else -- state globals and power-on initializers, wait
   queues, every function and task, NBA commit functions, `main` / `sim_drain`
   / finals, the seed loop, DPI export thunks, package/`$unit` (`no_scope`)
-  processes and the per-top PreInit process. `$dumpvars` emits its whole-tree
-  registration inline in the calling process's module, and the lazily created
+  processes and the dispatchers of groups spanning instances. `$dumpvars` emits
+  its whole-tree registration inline in the calling process's module, and the
+  lazily created
   singletons (`clotho.active`, `enqueue_timer`, `ev_delay`, `shadow_base`)
   land in the first module that needs them.
   Cross-instance fusion groups of <= 16 members OUTLINE: one plain

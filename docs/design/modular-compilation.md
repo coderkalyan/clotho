@@ -333,18 +333,26 @@ Each of these makes lowered IR depend on something outside the unit:
 - A package or `$unit` class lowered once per Lowerer that reaches it, so its
   synthesized functions exist once per top and take an ordinal in their import
   name (`own_function`).
-- One PreInit process holding every instance's initializers, one Preponed
-  process per top, and resolvers with no scope for nets driven from several
-  scopes other than through inout ports (hierarchical drivers, interface nets).
+- One Preponed process per top, and resolvers with no scope for nets driven from
+  several scopes other than through inout ports (hierarchical drivers, interface
+  nets).
+- A top's own PreInit processes hold what is no child's: what Collect and
+  Classify append (constant-table seeds, a function static a continuous driver
+  reaches first) and what follows the walk (class statics, `$past` seeds). They
+  store into children's state by import; a root is never shared, so no
+  specialization splits on it, but the top's unit depends on its children's
+  internals. Every other declaration initializer is a PreInit process of the
+  instance that declares it, closed at each child boundary so the processes
+  run in elaboration order.
 - Function static locals and static class properties placed in the first
   caller's scope.
 - An instance's name in `%m` strings, severity banners, `$printtimescale` and
   covergroup instance names is read through `inst_path` (flat bridge: resolved
   from `Process::scope` / `Function::scope`; a covergroup takes it as an operand
-  of `CoverOp::New`, so `CoverType` carries no scope), hidden temporaries are
-  numbered per name prefix, and assertion state is named by an instance-relative
-  ordinal. Still text: declaration initializers (they share the top's PreInit
-  process), virtual-interface bodies and `$printtimescale(inst)`. A package
+  of `CoverOp::New`, so `CoverType` carries no scope; a declaration initializer
+  reads it like any other body), hidden temporaries are numbered per name
+  prefix, and assertion state is named by an instance-relative ordinal. Still
+  text: virtual-interface bodies and `$printtimescale(inst)`. A package
   covergroup type built by two instances is still lowered once per top and
   aborts partition, like a package class.
 - Whole-top facts that change other modules' IR: `forceable_`, resolved nets,

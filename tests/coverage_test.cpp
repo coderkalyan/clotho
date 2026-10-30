@@ -883,6 +883,44 @@ TEST_CASE("a covergroup built by a declaration initializer is named and counted 
     }
 }
 
+// The same with a coverage event (LRM 19.3): the process that samples the group
+// belongs to the module too, and each instance's group is sampled by its own
+// clock. Fast clocks the first instance through three samples (bins 0, 1 and 2)
+// and slow the second through one.
+TEST_CASE("a covergroup with a coverage event, built by a declaration initializer, samples per instance") {
+    const std::string report = report_of(R"(
+        module leaf(input bit clk);
+          bit [1:0] v = 0;
+          covergroup cg @(posedge clk); coverpoint v; endgroup
+          cg c = new;
+          always @(negedge clk) v <= v + 1;
+        endmodule
+        module top;
+          bit fast = 0, slow = 0;
+          leaf u1(fast);
+          leaf u2(slow);
+          initial begin
+            #1 fast = 1; slow = 1;
+            #1 fast = 0; slow = 0;
+            #1 fast = 1;
+            #1 fast = 0;
+            #1 fast = 1;
+            #1 $finish;
+          end
+        endmodule
+    )");
+    const std::string u1 = instance_block(report, "top.u1.cg");
+    const std::string u2 = instance_block(report, "top.u2.cg");
+    CAPTURE(report);
+    REQUIRE_FALSE(u1.empty());
+    REQUIRE_FALSE(u2.empty());
+    for (uint32_t bin = 0; bin < 4; ++bin) {
+        CAPTURE(bin);
+        CHECK(bin_count(u1, "auto[" + std::to_string(bin) + "]") == (bin < 3 ? 1 : 0));
+        CHECK(bin_count(u2, "auto[" + std::to_string(bin) + "]") == (bin == 0 ? 1 : 0));
+    }
+}
+
 // The generate blocks between an instance and its covergroup are part of the name,
 // whether the group is built by a procedure or by a declaration initializer.
 TEST_CASE("the report names a covergroup in a generate block by the block too") {

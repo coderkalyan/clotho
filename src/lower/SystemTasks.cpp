@@ -168,7 +168,7 @@ void Lowerer::lower_timeformat(const CallExpression& call, ir::Builder& b) {
 // module, whose path is read at run time like %m's; the timescale is a
 // compile-time constant, and so is the path of a scope the argument names.
 void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
-    ScopeName                       path = instance_scope(b);
+    ScopeName                       path = instance_scope();
     std::optional<slang::TimeScale> ts   = scope_->getTimeScale();
     if (!call.arguments().empty()) {
         // The argument names another scope. That scope's timescale is one
@@ -1668,31 +1668,6 @@ std::string Lowerer::instance_path() const {
     return path;
 }
 
-// `name` with the path of the instance being lowered spelled out in front of its
-// text: the names of the scopes from the top down, which is what inst_path reads at
-// run time (the backend names the instance's anchor by them).
-Lowerer::ScopeName Lowerer::as_text(ScopeName name) const {
-    if (!name.in_instance) {
-        return name;
-    }
-    std::string path;
-    for (const ir::InstanceScope* s : scope_stack_) {
-        if (!path.empty()) {
-            path += '.';
-        }
-        path += s->name;
-    }
-    name.in_instance = false;
-    name.text.insert(0, path);
-    return name;
-}
-
-// Whether `b` is the builder of the PreInit process all of a top's instances share
-// (see finalize_preinit): the code lowered into it belongs to no one instance.
-bool Lowerer::in_shared_preinit(const ir::Builder& b) const {
-    return preinit_.has_value() && &b == &*preinit_;
-}
-
 // Whether the scope being lowered sits inside an instance body rather than in a
 // package or `$unit`. The DECLARING scope decides, not whoever happens to be
 // lowering it: a package class's method is built by the first top that reaches
@@ -1737,9 +1712,10 @@ std::string Lowerer::generate_path(const Scope* scope) {
 
 // The scope name up to the end of the instance's own scopes: the path of the
 // instance the code belongs to, then its generate blocks. Empty text outside every
-// instance. Code in an instance reads the path at run time, except a subroutine
-// reached through a virtual interface, which serves every instance and keeps the
-// path as text.
+// instance. Code in an instance reads the path at run time (a declaration
+// initializer included: each instance's initializers are a process of its own),
+// except a subroutine reached through a virtual interface, which serves every
+// instance and keeps the path as text.
 Lowerer::ScopeName Lowerer::instance_scope() const {
     if (!inside_instance()) {
         return {};
@@ -1748,14 +1724,6 @@ Lowerer::ScopeName Lowerer::instance_scope() const {
         return ScopeName{ .in_instance = false, .text = instance_path() };
     }
     return ScopeName{ .in_instance = true, .text = generate_path(scope_) };
-}
-
-// instance_scope for code lowered into `b`. A declaration initializer lowers into
-// the PreInit builder all of a top's instances share, so it belongs to no one
-// instance and keeps the path as text, which only the top's and the glue unit's own
-// bodies hold.
-Lowerer::ScopeName Lowerer::instance_scope(const ir::Builder& b) const {
-    return in_shared_preinit(b) ? as_text(instance_scope()) : instance_scope();
 }
 
 // Hierarchical name of the scope invoking the statement currently being lowered
@@ -1802,11 +1770,6 @@ Lowerer::ScopeName Lowerer::hier_name() const {
         name.text += nb.sym->name;
     }
     return name;
-}
-
-// hier_name for code lowered into `b`; see instance_scope.
-Lowerer::ScopeName Lowerer::hier_name(const ir::Builder& b) const {
-    return in_shared_preinit(b) ? as_text(hier_name()) : hier_name();
 }
 
 // `text` as literal format text: a `%` in it (an escaped identifier may hold one)
@@ -1936,7 +1899,7 @@ void Lowerer::append_format_literal(std::string&              fmt,
         }
         const char conv = check_specifier(spec);
         if (conv == 'm') {
-            const ScopeName name = hier_name(b);
+            const ScopeName name = hier_name();
             if (name.in_instance) {
                 fmt += "%s";
                 pending.push_back(

@@ -709,7 +709,7 @@ ir::Signal Lowerer::alloc_slot_in(uint32_t scope, ir::Signal net, ir::SourceLoc 
     // process (the thing that reads every slot and writes the net) should be
     // attributed to, once its slots belong to more than one scope: no_scope
     // is the existing, already-supported answer for exactly this shape (a
-    // process belonging to no single instance, like a per-top PreInit pass)
+    // process belonging to no single instance, like a package's initializers)
     // rather than an arbitrary pick of one driver's scope. A net whose slots
     // all belong to one instance -- every contribution through an aliasing
     // port is in its owner's -- resolves in that instance.

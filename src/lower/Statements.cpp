@@ -1097,14 +1097,14 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
     }
 }
 
-// Emit the accumulated declaration initializers as one run-once PreInit
-// process. Called once after the top instance and all its children are lowered;
-// a no-op when the design has no variable initializers.
-void Lowerer::finalize_preinit() {
+// Close the open declaration initializers into a run-once PreInit process of
+// `scope` (Process::no_scope for the package / `$unit` Lowerer, whose process
+// belongs to no instance); a no-op when none is open.
+void Lowerer::finalize_preinit(uint32_t scope) {
     if (!preinit_) {
         return;
     }
-    add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
+    add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish(), .scope = scope });
     preinit_.reset();
 }
 

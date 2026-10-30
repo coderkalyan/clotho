@@ -779,7 +779,7 @@ ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpressio
         }
         ctx = this_handle(b, l);
     }
-    const ScopeName scope = instance_scope(b);
+    const ScopeName scope = instance_scope();
     ir::Index       prefix{};
     if (scope.in_instance) {
         const std::array<ir::Index, 2> parts{ b.inst_path(l), b.constant(string_value_ref(scope.text + "."), l) };

@@ -2989,7 +2989,7 @@ private:
 
     const Expression* declaration_initializer(const VariableSymbol& vs);
 
-    void finalize_preinit();
+    void finalize_preinit(uint32_t scope);
 
     void finalize_sva_history();
 
@@ -3820,9 +3820,8 @@ private:
     // reads it at run time (Inst::Tag::InstPath), so the code is the same in every
     // instance of its specialization; `text` is then what follows the path. Anywhere
     // else the whole name is static text: package and `$unit` code, which sits under
-    // no instance, and code the instance cannot claim -- a declaration initializer,
-    // which shares the top's one PreInit process, and a subroutine reached through a
-    // virtual interface, which serves every instance.
+    // no instance, and a subroutine reached through a virtual interface, which serves
+    // every instance.
     struct ScopeName {
         bool        in_instance = false;
         std::string text;
@@ -3844,15 +3843,7 @@ private:
 
     ScopeName instance_scope() const;
 
-    ScopeName instance_scope(const ir::Builder& b) const;
-
     ScopeName hier_name() const;
-
-    ScopeName hier_name(const ir::Builder& b) const;
-
-    bool in_shared_preinit(const ir::Builder& b) const;
-
-    ScopeName as_text(ScopeName name) const;
 
     std::string lib_cell_name() const;
 
@@ -5913,9 +5904,12 @@ private:
     // default is the innermost context, and the object under construction is a
     // different object whenever the receiver was spelled out.
     std::optional<CtorThis> default_arg_this_;
-    // Accumulates static variable declaration initializers (LRM 6.8) across the
-    // whole instance hierarchy into one run-once pre-init process, finalized at the
-    // end of the top instance. Lazily engaged: absent when no initializer exists.
+    // Accumulates the declaration initializers (LRM 6.8) of the instance being lowered
+    // into a run-once pre-init process owned by that instance. lower_instance closes
+    // it (finalize_preinit) before descending into a child and at the end of the
+    // instance, so the flat process order keeps today's interleaving of a parent's
+    // initializers with its children's. Whatever Collect / Classify and the code after
+    // the walk append goes to the top's own processes. Lazily engaged.
     std::optional<ir::Builder> preinit_;
     // Live signal -> its Preponed shadow. LRM 16.5: assertion expressions read
     // sampled values, and what is sampled is the VARIABLE, not the expression.
