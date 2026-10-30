@@ -627,11 +627,12 @@ struct SignalSlot {
     // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
     // has_z (undriven nets are a may-z seed).
     bool init_z = false;
-    // Per-bit power-on z mask for a PARTIALLY-driven packed 4-state net: bit set
+    // Per-bit power-on z mask for a PARTIALLY-driven 4-state net: bit set
     // == undriven == powers on z (its driven bits keep the x default, overwritten
     // by their self-start driver at t0). Empty unless the net is partially driven
     // (compute_partial_undriven); the z-plane initializer uses it in place of the
-    // whole-signal init_z / zero. Implies has_z.
+    // whole-signal init_z / zero. Implies has_z. For an unpacked array the mask
+    // spans every leaf, bit `leaf ordinal * width + bit` (emit_array_init).
     std::vector<uint64_t> undriven_mask;
     // Leaf element is real / shortreal: the slot stores the IEEE-754 bit
     // pattern in a 2-state word (has_z is false, four_state is false).

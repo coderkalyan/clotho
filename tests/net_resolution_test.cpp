@@ -694,6 +694,66 @@ TEST_CASE("readers of a partially-driven net keep its undriven bits at z") {
                  "1z 0\n");
 }
 
+// Every element of an unpacked net array is a net of its own, so an element no
+// driver reaches reads z (LRM 6.6, 6.7.1) even when another element is driven.
+// The undriven mask spans the array: one bit per element bit, leaves in row-major
+// order. Covers a driver through a module port (ivtest pr1695322), a 2-D array, a
+// partial driver inside one element, ascending and descending ranges, a reader
+// through a continuous assign and through a run-time index, and an array with
+// every element driven. Oracle: iverilog 13 prints these lines for this source.
+TEST_CASE("undriven elements of a partially-driven net array read z") {
+    const std::string out = run_capture(R"(
+        module drv(output wire [5:0] o);
+          assign o = 5;
+        endmodule
+        module top;
+          wire [5:0] a [0:2];            // a[1], a[2] undriven
+          drv d(.o(a[0]));
+          wire [3:0] m [0:1][0:2];       // row-major: m[0][1] and m[1][2] driven
+          assign m[1][2] = 4'h3;
+          assign m[0][1] = 4'h9;
+          wire [3:0] p [0:1];
+          assign p[0][1:0] = 2'b10;      // p[0][3] driven too; p[0][2] and p[1] z
+          assign p[0][3]   = 1'b1;
+          wire [3:0] f [0:1];
+          assign f[0] = 4'h1;            // every element driven: nothing at z
+          assign f[1] = 4'h2;
+          wire [5:0] u [0:1];            // no driver at all
+          wire [11:0] up [1:2];          // ascending range
+          assign up[2] = 12'hABC;
+          wire [3:0] dn [3:1];           // descending range
+          assign dn[3] = 4'h7;
+          assign dn[1] = 4'h8;
+          wire [5:0] c0 = a[0];
+          wire [5:0] c1 = a[1];          // a copy of an undriven element is z
+          logic [5:0] r;
+          integer i;
+          initial begin
+            #1;
+            $display("%h %b %b", a[0], a[1], a[2]);
+            $display("%b %b %b | %b %b %b", m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2]);
+            $display("%b %b", p[0], p[1]);
+            $display("%b %b", f[0], f[1]);
+            $display("%b %b", u[0], u[1]);
+            $display("%b %b", up[1], up[2]);
+            $display("%b %b %b", dn[3], dn[2], dn[1]);
+            $display("%b %b", c0, c1);
+            i = 2; r = a[i];
+            $display("%b", r);
+          end
+        endmodule
+    )");
+    CHECK(out == "05 zzzzzz zzzzzz\n"
+                 "zzzz 1001 zzzz | zzzz zzzz 0011\n"
+                 "1z10 zzzz\n"
+                 "0001 0010\n"
+                 "zzzzzz zzzzzz\n"
+                 "zzzzzzzzzzzz 101010111100\n"
+                 "0111 zzzz 1000\n"
+                 "000101 zzzzzz\n"
+                 "zzzzzz\n");
+}
+
 // -- 2-state driver regions --
 //
 // A driver slot is cut from the NET's type, so it is always 4-state and always

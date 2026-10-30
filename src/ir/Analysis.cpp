@@ -5,6 +5,7 @@
 #include <variant>
 
 #include "Module.h"
+#include "TypeModel.h"
 
 namespace clotho::ir {
 
@@ -388,11 +389,16 @@ namespace {
 // subscription-order write scan, and five design_uses_* scans).
 // ---------------------------------------------------------------------------
 
-// The constant driven bit range of a packed lvalue select chain. `whole` marks a
-// dynamic / unpacked / whole-storage store whose driven bits cannot be pinned
-// (the caller then marks every bit driven). Composes nested constant packed
-// selects: each PartSelect adds its `lsb` to the accumulated window, a constant
-// BitSelect pins one bit. Mirrors the frontend's net_region_of.
+// The constant driven bit range of an lvalue select chain, in the flat bit
+// coordinates of the root's storage: for a packed net, the bit within the
+// vector; for a fixed unpacked array of packed elements, `leaf ordinal * element
+// width + bit within the element`, leaves in row-major order (the backend's flat
+// array storage model). `whole` marks a dynamic / unresolvable / whole-storage
+// store whose driven bits cannot be pinned (the caller then marks every bit
+// driven). Composes nested constant selects: each PartSelect adds its `lsb` to
+// the accumulated window, a constant BitSelect pins one bit, a constant element
+// select of a fixed array shifts by the elements before it. Mirrors the
+// frontend's net_region_of.
 struct DriveRange {
     Index    root;
     bool     whole = true;
@@ -425,6 +431,26 @@ std::optional<uint64_t> const_index(const Module& m, const Ir& ir, Index c) {
     }
 
     return val;
+}
+
+// const_index in the constant's own signedness: an array index is a declared-
+// range coordinate and the backend sign-extends a signed one. nullopt as above,
+// and for a constant wider than 64 bits.
+std::optional<int64_t> const_signed_index(const Module& m, const Ir& ir, Index c) {
+    const std::optional<uint64_t> raw = const_index(m, ir, c);
+    if (!raw) {
+        return std::nullopt;
+    }
+    const Ref      ty = std::get<Value>(m.pool.get(ir.payload(c).ref)).type;
+    const uint32_t w  = m.pool.layout(ty).width;
+    if (w > 64) {
+        return std::nullopt;
+    }
+    if (std::get<Type>(m.pool.get(ty)).is_signed && w < 64 && ((*raw >> (w - 1)) & 1) != 0) {
+        return static_cast<int64_t>(*raw | (~uint64_t{ 0 } << w));
+    }
+
+    return static_cast<int64_t>(*raw);
 }
 
 DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
@@ -460,12 +486,42 @@ DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
                 lv = ir.payload(lv).binary.l;
                 break;
             }
+            case Inst::Tag::ElemSelect: {
+                // One dimension of a fixed unpacked array: the selected element
+                // spans `stride` leaves of `leaf_w` bits, starting at leaf
+                // `pos * stride`. A run-time or out-of-range index (a write to
+                // it is a no-op, LRM 7.4.5), or a dynamic array / queue element
+                // in a heap buffer, cannot be pinned in the flat plane.
+                const auto              es = ir.extra_data<ElemSelect>(ir.payload(lv).op_extra.extra);
+                const Type&             at = std::get<Type>(m.pool.get(es.array_type));
+                std::optional<uint32_t> pos;
+                if (at.kind == Type::Kind::UnpackedArray) {
+                    if (const std::optional<int64_t> idx = const_signed_index(m, ir, es.index)) {
+                        pos = types::elem_position(at, *idx);
+                    }
+                }
+                if (!pos) {
+                    dyn = true;
+                } else {
+                    const uint32_t stride = types::array_leaf_count(m.pool, at.element);
+                    const uint32_t leaf_w = m.pool.layout(types::leaf_type(m.pool, es.array_type)).width;
+                    if (!have) {
+                        lo   = 0;
+                        hi   = stride * leaf_w - 1;
+                        have = true;
+                    }
+                    lo += *pos * stride * leaf_w;
+                    hi += *pos * stride * leaf_w;
+                }
+                lv = ir.payload(lv).op_extra.op;
+                break;
+            }
             case Inst::Tag::DynPartSelect:
-            case Inst::Tag::ElemSelect:
             case Inst::Tag::ArrSlice:
             case Inst::Tag::MemberSelect:
-                // Runtime-offset packed slice, or an unpacked-array/struct element:
-                // the driven bits cannot be pinned in the flat plane.
+                // Runtime-offset packed slice, a slice of an unpacked array, or an
+                // unpacked-struct member: the driven bits cannot be pinned in the
+                // flat plane.
                 dyn = true;
                 lv  = ir.payload(lv).op_extra.op;
                 break;
@@ -1769,23 +1825,23 @@ DesignFacts analyze(const Module& m) {
     st.partial_whole.assign(nsig, false);
     st.partial_driven.resize(nsig);
 
-    // A partial-undriven mask is only meaningful for a packed 4-state net: a
-    // 2-state signal has no z plane, an unpacked array has per-element storage
-    // (whole-signal power-on, a follow-up), and a variable powers on x not z.
+    // A partial-undriven mask is only meaningful for a 4-state net of packed
+    // elements: a 2-state signal has no z plane, a variable powers on x not z,
+    // and an aggregate (an unpacked struct, or an array over a container) takes
+    // the recursive storage mirror with its own power-on walk. A fixed unpacked
+    // array of packed elements is flat storage, and its mask spans every leaf:
+    // bit `leaf ordinal * element width + bit` (see DriveRange).
     for (uint32_t i = 0; i < nsig; ++i) {
         const SignalInfo& s = m.signals()[i];
-        if (!s.is_net || s.force_agg) {
+        if (!s.is_net || s.force_agg || types::needs_agg_storage(m.pool, s.type)) {
             continue;
         }
-        if (std::get<Type>(m.pool.get(s.type)).kind == Type::Kind::UnpackedArray) {
-            continue;
-        }
-        const Layout lay = m.pool.layout(s.type);
+        const Layout lay = m.pool.layout(types::leaf_type(m.pool, s.type));
         if (lay.domain != Domain::Four || lay.width == 0) {
             continue;
         }
         st.partial_candidate[i] = true;
-        st.partial_width[i]     = lay.width;
+        st.partial_width[i]     = lay.width * types::array_leaf_count(m.pool, s.type);
     }
 
     std::vector<CombFuse> body_verdict(nproc, CombFuse::Eligible);

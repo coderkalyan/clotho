@@ -105,6 +105,28 @@ TEST_CASE("a partially-driven net holds z in its undriven bits and seeds the ana
     CHECK(!a.z("covered_copy"));
 }
 
+// The same for an unpacked net array: an element no driver reaches holds z, so
+// the array and everything that copies an element may hold z; an array whose
+// every element is driven holds none.
+TEST_CASE("an unpacked net array with an undriven element seeds the analysis (LRM 6.6)") {
+    const Analyzed a = analyze(R"(
+        module top;
+            wire [3:0] part [0:2];
+            assign part[0] = 4'd2;
+            wire [3:0] copy = part[1];
+            wire [3:0] inner [0:1];
+            assign inner[0][1:0] = 2'd1;
+            assign inner[0][3:2] = 2'd2;
+            assign inner[1]      = 4'd3;
+            wire [3:0] inner_copy = inner[1];
+        endmodule
+    )");
+    CHECK(a.z("part"));
+    CHECK(a.z("copy"));
+    CHECK(!a.z("inner"));
+    CHECK(!a.z("inner_copy"));
+}
+
 TEST_CASE("a z literal marks its target and transitive copies") {
     const Analyzed a = analyze(R"(
         module top;

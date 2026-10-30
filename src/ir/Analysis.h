@@ -282,9 +282,11 @@ struct DesignFacts {
     // z word.
     std::vector<bool> ref_arg;
 
-    // Per-bit undriven mask for a PARTIALLY driven packed 4-state net -- the
-    // refinement of `undriven`, which is whole-signal (`w[3:0] = ...` marks all of
-    // `w` driven, so its remaining bits would wrongly power on x instead of z).
+    // Per-bit undriven mask for a PARTIALLY driven 4-state net -- the refinement
+    // of `undriven`, which is whole-signal (`w[3:0] = ...` marks all of `w`
+    // driven, so its remaining bits would wrongly power on x instead of z). For a
+    // fixed unpacked array of packed elements the mask spans every leaf, bit
+    // `leaf ordinal * element width + bit` (leaves in row-major order).
     //
     // Flat rather than a vector-of-vectors: the mask is absent for almost every
     // signal, and per-signal vectors meant one heap allocation each. Read it
