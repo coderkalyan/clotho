@@ -1790,6 +1790,64 @@ TEST_CASE("%t of a negative operand prints its sign in a constant and in a runti
                  "[ -1.000 ns]\n");
 }
 
+// LRM 21.2.1.3 gives the display rules for an unknown or high-impedance value only
+// for %d, %h/%x/%o and %b, and says nothing for %t (docs/LRM_NOTES.md, note 41). A
+// %t operand with an x or z bit used to print its known bits as a time: x as 0,
+// `8'b0000_1x01` as 9 units. It now prints the one character %d prints for it, `x`
+// when every bit is x, `z` when every bit is z, `X` when some are x, `Z` when some
+// are z and none x, followed by the $timeformat suffix and justified to its
+// minimum field width, on the constant and the runtime format alike. The 128-bit
+// operand has its x above the low word, which a 64-bit tick count could not carry.
+// iverilog prints the character inside the scaled number (`x000`, `x.00 ns`) and a
+// known `0 ns` for a finer unit than the display unit, so it is not the oracle.
+TEST_CASE("%t of an operand with an x or z bit prints one character, in a constant and in a runtime format") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          string f;
+          logic [7:0] ax, px, az, pz, pxz, k;
+          logic x1;
+          logic [127:0] wide;
+          logic signed [7:0] sx;
+          initial begin
+            f = "%0t";
+            ax = 8'bx;  px = 8'b0000_1x01;  az = 8'bz;  pz = 8'b0000_1z01;
+            pxz = 8'b0000_xz01;  k = 8'd5;  x1 = 1'bx;  sx = 8'bx;
+            wide = 128'd7;  wide[100] = 1'bx;
+            $display("all x    [%0t] [%s]", ax,  $sformatf(f, ax));
+            $display("some x   [%0t] [%s]", px,  $sformatf(f, px));
+            $display("all z    [%0t] [%s]", az,  $sformatf(f, az));
+            $display("some z   [%0t] [%s]", pz,  $sformatf(f, pz));
+            $display("x and z  [%0t] [%s]", pxz, $sformatf(f, pxz));
+            $display("one bit  [%0t] [%s]", x1,  $sformatf(f, x1));
+            $display("signed   [%0t] [%s]", sx,  $sformatf(f, sx));
+            $display("wide     [%0t] [%s]", wide, $sformatf(f, wide));
+            $display("known    [%0t] [%s]", k,   $sformatf(f, k));
+            $display("default  [%t] [%t]", ax, pz);
+            $timeformat(-9, 2, " ns", 12);
+            f = "%t";
+            $display("[%t] [%s]", ax, $sformatf(f, ax));
+            $display("[%t] [%s]", px, $sformatf(f, px));
+            $display("[%t] [%s]", k,  $sformatf(f, k));
+            $display("[%5t] [%0t] [%-9t]", az, pz, px);
+          end
+        endmodule
+    )");
+    CHECK(out == "all x    [x] [x]\n"
+                 "some x   [X] [X]\n"
+                 "all z    [z] [z]\n"
+                 "some z   [Z] [Z]\n"
+                 "x and z  [X] [X]\n"
+                 "one bit  [x] [x]\n"
+                 "signed   [x] [x]\n"
+                 "wide     [X] [X]\n"
+                 "known    [5000] [5000]\n"
+                 "default  [                   x] [                   Z]\n"
+                 "[        x ns] [        x ns]\n"
+                 "[        X ns] [        X ns]\n"
+                 "[     5.00 ns] [     5.00 ns]\n"
+                 "[ z ns] [Z ns] [X ns     ]\n");
+}
+
 // A %t time whose tick count does not fit 64 bits cannot be shown exactly, and the
 // LRM does not say what it means (docs/LRM_NOTES.md, note 40). A constant-format
 // real saturated (26cd52aa), but an integral operand wrapped: 2**61 ns over a 1ps

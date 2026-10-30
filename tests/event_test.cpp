@@ -320,6 +320,50 @@ TEST_CASE("->> #d e schedules a detached trigger without blocking") {
     CHECK(out.find("fired=5") != std::string::npos);
 }
 
+// The `->> #d e` expiry thunk is one function shared by every delayed trigger in
+// the design, and the design is split into one LLVM module per definition plus a
+// root. A trigger in a fork child and another in a plain process reach it from two
+// modules, and LLVM's verifier rejected the second one's bare reference ("Global
+// is referenced in a different module!") for every delay. The waiters observe the
+// two triggers' own instants. iverilog implements no `->>`.
+TEST_CASE("->> #d e in a fork child and in a plain process shares one expiry thunk") {
+    const std::string out = run_capture(R"(
+        module top;
+          event e;
+          initial begin
+            fork
+              ->> #1 e;
+            join_none
+          end
+          initial ->> #2 e;
+          initial begin
+            @(e) $display("a t=%0t", $time);
+            @(e) $display("b t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "a t=1\nb t=2\n");
+}
+
+// LRM 15.5.1: the update event of `->> #d e` triggers the event "in the
+// nonblocking assignment region" of the instant its delay expires, as `->> #0 e`
+// does. A positive delay's timer used to fire the event at the top of that instant,
+// so its waiter woke in the Active region and read `q` before the NBA update that
+// the same instant executes (4.4.2.4) had committed it. The waiter now sees the
+// committed value, `->> e`'s behaviour (above). iverilog implements no `->>`.
+TEST_CASE("->> #d e wakes its waiter in the NBA region of the expiry instant") {
+    const std::string out = run_capture(R"(
+        module top;
+          event e;
+          logic [7:0] q = 0;
+          initial ->> #5 e;
+          initial #5 q <= 8'hAA;
+          initial begin @(e); $display("nb=%02h t=%0t", q, $time); end
+        endmodule
+    )");
+    CHECK(out == "nb=aa t=5\n");
+}
+
 // `->> #0 e` (LRM 15.5.1): the delay control expires in the current time slot, so
 // the trigger is that slot's NBA-region event, exactly `->> e`. The delay used to
 // reach the wheel, which cannot hold a timer due now, so the waiter never woke and

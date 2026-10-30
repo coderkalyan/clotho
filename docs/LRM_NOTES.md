@@ -381,7 +381,27 @@ A time whose tick count (the operand times the module's ticks per unit) does not
 fit 63 bits is shown as the largest count of its sign, +-(2**63 - 1) ticks, for an
 integral operand of any width and for a real alike, as a real delay beyond that
 count saturates (`saturating_ticks`), instead of keeping the low 64 bits of the
-product. iverilog prints the exact count. An x or z bit of the operand reads as 0
-(iverilog prints x).
+product. iverilog prints the exact count. An operand with an x or z bit has no
+count at all: note 41.
 
 Code: `src/lower/Assign.cpp` (`scale_to_ticks`), `src/lower/SystemTasks.cpp` (`saturating_ticks`), `src/runtime/Format.cpp` (`render_time`, `coerce_dyn_arg`, `integral_time_ticks`, `real_time_ticks`). Tests: `tests/llvm_backend_test.cpp` ("%t of a negative operand prints its sign in a constant and in a runtime format", "%t of a time beyond 2**63 ticks saturates in a constant and in a runtime format"), `tests/real_test.cpp` ("a real delay beyond 2**63 ticks saturates instead of wrapping into an early event").
+
+## 41. `%t` of an operand with an x or z bit (21.2.1.3, 20.4.3)
+
+21.2.1.3 gives the rules for displaying an unknown or high-impedance value only
+for `%d`, `%h`/`%x`/`%o` and `%b`; Table 21-1 and 20.4.3 say nothing for `%t`.
+`%t` writes a decimal number, so Clotho applies the `%d` rule to it: the whole
+number is replaced by one character, `x` when every bit of the operand is x, `z`
+when every bit is z, `X` when some bit is x but not every one is, `Z` when some
+bit is z and none is x. The `$timeformat` suffix and minimum field width (or an
+explicit width) still apply, so under `$timeformat(-9, 2, " ns", 12)` an unknown
+operand prints `        x ns`. No known number is ever printed for an unknown
+value, and the precision and the unit conversion have nothing to act on. A
+constant and a runtime format string print the same text.
+
+iverilog is not followed: it prints the character as the last digit of the
+number, scaled by the unit conversion and padded to the precision (`x000`,
+`x.00 ns`, `0.00x`), and for a finer unit than the display unit it prints a known
+`0 ns` for an unknown value.
+
+Code: `src/runtime/Format.cpp` (`unknown_decimal_char`, `render_arg`, `coerce_dyn_arg`), `src/lower/Assign.cpp` (`scale_to_ticks`). Tests: `tests/llvm_backend_test.cpp` ("%t of an operand with an x or z bit prints one character, in a constant and in a runtime format").

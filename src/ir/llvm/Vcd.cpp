@@ -220,9 +220,9 @@ void Backend::vcd_touch_array(Signal sig) {
 }
 
 // Emit an rt_vcd_touch for a dumped named event. Called from emit_event_fire,
-// the one place every trigger form converges (`-> e` in a process body, the
-// NBA-region service of `->> e`, and the `->> #d e` expiry thunk), so the dump
-// sees an occurrence however it was produced.
+// the one place every trigger form converges (`-> e` in a process body and the
+// NBA-region service of `->> e` / `->> #d e`), so the dump sees an occurrence
+// however it was produced.
 void Backend::vcd_touch_event_obj(llvm::Value* obj) {
     if (!design_uses_vcd_) {
         return;

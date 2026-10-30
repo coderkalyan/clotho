@@ -167,6 +167,33 @@ uint32_t dec_digits(uint64_t v) {
     return n;
 }
 
+// The one character %d prints for an operand with an x or z bit, or 0 when every
+// bit is known (LRM §21.2.1.3): `x` when every bit is x, `z` when every bit is z,
+// an uppercase `X` when some bit is x but not every one is, and `Z` when some bit
+// is z and none is x. A %t operand follows the same rule (docs/LRM_NOTES.md, note
+// 41), so both read it from here. `topm` clips the top word to the operand width;
+// the planes are zero above it.
+char unknown_decimal_char(const rt_arg& a, uint32_t words, uint64_t topm) {
+    bool any_unknown = false, any_x = false, all_x = true, all_z = true;
+    for (uint32_t k = 0; k < words; ++k) {
+        const uint64_t full = k + 1 == words ? topm : ~uint64_t{ 0 };
+        const uint64_t xzk  = a.xz[k] & full;
+        const uint64_t zk   = a.z[k] & full;
+        const uint64_t xk   = xzk & ~zk;
+        any_unknown |= xzk != 0;
+        any_x |= xk != 0;
+        all_x &= xk == full;
+        all_z &= zk == full;
+    }
+    if (!any_unknown) {
+        return 0;
+    }
+    if (any_x) {
+        return all_x ? 'x' : 'X';
+    }
+    return all_z ? 'z' : 'Z';
+}
+
 // Render one descriptor under the parsed specifier, appending to `out`.
 // Justification follows LRM §21.2.1.2: no explicit width sizes the field to the
 // largest possible value (decimal space-padded, other radices zero-padded, %t
@@ -192,21 +219,8 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
     switch (spec.conv) {
         case 'd':
         case 'D': {
-            // Whole-field x/z collapse test across every plane word (LRM
-            // §21.2.1.3): lowercase only when every bit is x (resp. z),
-            // uppercase X when x bits mix with anything, uppercase Z when z bits
-            // mix with known bits.
-            bool any_unknown = false, any_x = false, all_x = true, all_z = true;
-            for (uint32_t k = 0; k < words; ++k) {
-                const uint64_t full = k + 1 == words ? topm : ~uint64_t{ 0 };
-                const uint64_t xzk  = a.xz[k] & full;
-                const uint64_t zk   = a.z[k] & full;
-                const uint64_t xk   = xzk & ~zk;
-                any_unknown |= xzk != 0;
-                any_x |= xk != 0;
-                all_x &= xk == full;
-                all_z &= zk == full;
-            }
+            // Whole-field x/z collapse (LRM §21.2.1.3): see unknown_decimal_char.
+            const char unknown = unknown_decimal_char(a, words, topm);
             if (!spec.has_width) {
                 // Automatic size: the widest text a `w`-bit operand can take (a
                 // signed operand's most negative value, sign included; LRM
@@ -218,12 +232,8 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                     target = wide_dec_maxlen(w, (a.flags & 1u) != 0);
                 }
             }
-            if (any_unknown) {
-                if (any_x) {
-                    field += all_x ? 'x' : 'X';
-                } else {
-                    field += all_z ? 'z' : 'Z';
-                }
+            if (unknown != 0) {
+                field += unknown;
             } else if (w <= 64) {
                 const uint64_t mask = width_mask(w);
                 const uint64_t val  = a.val[0] & mask;
@@ -286,8 +296,19 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             // the low word is the tick count and the descriptor's signedness says
             // whether it is negative. render_time converts it per the current
             // $timeformat, whose min width is the default field width for %t.
-            const bool negative = (a.flags & 1u) != 0 && static_cast<int64_t>(a.val[0]) < 0;
-            render_time(field, negative ? uint64_t{ 0 } - a.val[0] : a.val[0], negative);
+            //
+            // An operand with an x or z bit is not a time: the whole number is the
+            // one character %d prints for it, then the suffix, justified as any
+            // other %t (docs/LRM_NOTES.md, note 41). The frontend passes such an
+            // operand's classification as the 64-bit word's own planes, and a
+            // runtime format passes the operand itself (coerce_dyn_arg).
+            if (const char u = unknown_decimal_char(a, words, topm); u != 0) {
+                field += u;
+                field += timeformat.suffix;
+            } else {
+                const bool negative = (a.flags & 1u) != 0 && static_cast<int64_t>(a.val[0]) < 0;
+                render_time(field, negative ? uint64_t{ 0 } - a.val[0] : a.val[0], negative);
+            }
             if (!spec.has_width && timeformat.min_width > 0) {
                 target = static_cast<uint32_t>(timeformat.min_width);
             }
@@ -577,6 +598,15 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
         return scratch.arg;
     }
     if (lc == 't') {
+        // An operand with an x or z bit has no tick count (LRM §21.2.1.3 rule,
+        // docs/LRM_NOTES.md, note 41): hand the renderer the operand itself, which
+        // classifies its planes as it does for %d. scale_to_ticks's constant-format
+        // path builds a word that classifies the same way.
+        const uint32_t w    = a.width != 0 ? a.width : 1;
+        const uint64_t topm = (w % 64 == 0) ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << (w % 64)) - 1);
+        if (unknown_decimal_char(a, plane_words(w), topm) != 0) {
+            return a;
+        }
         // scale_to_ticks's count: the operand's value times the unit multiplier,
         // saturating, signed as the operand is (docs/LRM_NOTES.md, note 40).
         scratch.val = static_cast<uint64_t>(integral_time_ticks(a, dyn->time_mul));
