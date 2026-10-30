@@ -81,7 +81,7 @@ ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
             // copy. See docs/design/event-handles.md.
             if (sym.kind == SymbolKind::Parameter) {
                 const ParameterSymbol& p = sym.as<ParameterSymbol>();
-                return b.constant(lower_constant(p.getValue(), p.getType()), l);
+                return b.constant(lower_param_constant(p, p.getType()), l);
             }
             if (sym.kind == SymbolKind::EnumValue) {
                 // An enum member (LRM 6.19) is a named compile-time constant of
@@ -257,7 +257,7 @@ ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
                 // (`obj.param`, LRM 8.5): a compile-time constant of the
                 // specialization, independent of the object. slang cannot fold
                 // `obj.param` (obj is a runtime handle), so fold it here.
-                return b.constant(lower_constant(param->getValue(), *ma.type), l);
+                return b.constant(lower_param_constant(*param, *ma.type), l);
             }
             const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_member_lvalue(ma, b, l), l);
             return narrow_to_declared(v, *ma.type, b, l);

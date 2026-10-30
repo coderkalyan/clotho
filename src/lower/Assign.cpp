@@ -42,7 +42,25 @@ void Lowerer::store_leaf(ir::Inst::Tag        tag,
         return;
     }
     if (!t->is_event) {
+        if (!t->zero) {
+            b.store_nb_delay(lv, v, t->delay, l);
+            return;
+        }
+        // A delay that is zero at run time lands in the current instant's NBA
+        // region, ordered with the other `<=` by execution order (LRM 10.4.2,
+        // 4.9.4), so it takes the plain `<=` path exactly as a compile-time `#0`
+        // does (intra_nb_delay_is_const_zero). The deferred record's commit order
+        // is fixed instead, which put it after a later `<=` to the same signal.
+        // Per leaf, like the repeat count below: the delay is evaluated once.
+        b.open_region();
+        b.binary(ir::Inst::Tag::StoreNb, lv, v, l);
+        const ir::ExtraSlice now_r = b.close_region();
+
+        b.open_region();
         b.store_nb_delay(lv, v, t->delay, l);
+        const ir::ExtraSlice later_r = b.close_region();
+
+        b.cond(*t->zero, now_r, later_r, l);
         return;
     }
     if (!t->nonpos) {
@@ -1395,9 +1413,20 @@ bool Lowerer::assoc_value_may_carry_xz(ir::Ref type) const {
 // timescale (LRM §20.4.3). A value in module units times this instance's
 // time-unit multiplier yields ticks; the result is widened to 64 bits so the
 // runtime reads the full tick count.
+//
+// The count keeps the operand's own sign. LRM 21.2.1.1 and 20.4.3 say nothing
+// about a negative %t operand; the argument is a value, so -1 is a time of minus
+// one unit (iverilog prints -1), and not 2**32 - 1 or 2**64 - 1. The sign is the
+// operand's signedness, not its top bit, so an unsigned all-ones operand stays
+// positive. The run-time-format path reaches the same count in
+// coerce_dyn_arg (docs/LRM_NOTES.md, note 40).
+//
+// A count that does not fit 64 bits saturates at +-INT64_MAX ticks instead of
+// wrapping, as a real operand's does (saturating_ticks): `longint unsigned u =
+// 2**61` in a 1ns module over a 1ps tick is 2**61 * 1000 ticks, whose low 64 bits
+// are 0, and a 128-bit operand must not be cut to its low word first.
 ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
-    const ir::SourceLoc l   = loc(arg);
-    const ir::Ref       u64 = make_int_type(64, false);
+    const ir::SourceLoc l = loc(arg);
     if (arg.type->isFloating()) {
         // A real (realtime) argument scales in the real domain, then rounds
         // to the nearest tick (FtoI rounds half away from zero); only
@@ -1412,14 +1441,77 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
               b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(time_mul_)), l);
             scaled = b.binary(ir::Inst::Tag::FMul, scaled, mul, l);
         }
-        return saturating_ticks(scaled, 1, b, l);
+        return saturating_ticks(scaled, 1, b, l, /*is_signed=*/true);
     }
-    const ir::Index w = b.convert(v, u64, false, l);
-    if (time_mul_ <= 1) {
-        return w;
+    // The test is on the operand, at its own width or at 64 bits if narrower,
+    // against the largest one whose product with the multiplier stays within the
+    // ceiling, so the multiply cannot wrap either. Each sign saturates at the
+    // ceiling of its own sign. The operand extends by its own signedness and its
+    // x/z bits read as 0 here (the unknown case is decided below).
+    const bool      is_signed = arg.type->isSigned();
+    const ir::Ref   ty        = make_int_type(64, false);
+    const ir::Ref   wide_ty   = make_int_type(std::max<uint32_t>(64, arg.type->getBitWidth()), false);
+    const ir::Index wide      = b.convert(v, wide_ty, is_signed, l);
+    const uint64_t  mul       = std::max<uint64_t>(time_mul_, 1);
+    const ir::Index limit     = b.constant(module_.pool.put_int(wide_ty, INT64_MAX / mul), l);
+    ir::Index       ticks     = b.convert(wide, ty, is_signed, l);
+    if (mul > 1) {
+        ticks = b.binary(ir::Inst::Tag::Mul, ticks, b.constant(module_.pool.put_int(ty, mul), l), l);
     }
-    const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
-    return b.binary(ir::Inst::Tag::Mul, w, mul, l);
+    const ir::Index over = b.binary(is_signed ? ir::Inst::Tag::SGt : ir::Inst::Tag::UGt, wide, limit, l);
+    const ir::Index top  = b.constant(module_.pool.put_int(ty, INT64_MAX), l);
+    ir::Index       known;
+    if (!is_signed) {
+        known = b.select(over, top, ticks, l);
+    } else {
+        const ir::Index neg_limit =
+          b.binary(ir::Inst::Tag::Sub, b.constant(module_.pool.put_int(wide_ty, 0), l), limit, l);
+        const ir::Index under = b.binary(ir::Inst::Tag::SLt, wide, neg_limit, l);
+        const ir::Index bottom =
+          b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(-static_cast<int64_t>(INT64_MAX))), l);
+        known = b.select(over, top, b.select(under, bottom, ticks, l), l);
+    }
+    // $time and $stime read the simulation clock, which is never unknown, though
+    // their `time` type is 4-state: the commonest %t operand pays nothing extra.
+    const auto* call = arg.as_if<CallExpression>();
+    if (!arg.type->isFourState() || (call != nullptr && call->isSystemCall() &&
+                                     (call->getSubroutineName() == "$time" || call->getSubroutineName() == "$stime"))) {
+        return known;
+    }
+
+    // An operand with an x or z bit is not a time, so no tick count stands for it:
+    // the argument becomes a 64-bit 4-state word the renderer classifies with the
+    // %d rule (LRM 21.2.1.3, docs/LRM_NOTES.md note 41): all bits x is all x, all z
+    // is all z, otherwise one x bit when any bit is x, else one z bit. The counts
+    // are the operand's own, at its own width, which the 64-bit word could not
+    // carry.
+    const ir::Ref  ty4   = make_int_type(64, true);
+    const ir::Ref  cnt_t = make_int_type(32, false);
+    const uint32_t w     = arg.type->getBitWidth();
+    const auto     fill  = [&](bool is_z) {
+        slang::SVInt k = is_z ? slang::SVInt::createFillZ(64, is_signed) : slang::SVInt::createFillX(64, is_signed);
+        return b.constant(svint_to_ref(k, ty4), l);
+    };
+    // One x (z) bit and the rest zero: fromDigits takes the digits most significant first.
+    const auto one_bit = [&](bool is_z) {
+        std::vector<slang::logic_t> digits(64, slang::logic_t(0));
+        digits.back() = is_z ? slang::logic_t::z : slang::logic_t::x;
+        return b.constant(svint_to_ref(slang::SVInt::fromDigits(64,
+                                                                slang::LiteralBase::Binary,
+                                                                is_signed,
+                                                                /*anyUnknown=*/true,
+                                                                digits),
+                                       ty4),
+                          l);
+    };
+    const ir::Index nx    = b.count_bits(v, ir::CountX, l);
+    const ir::Index nz    = b.count_bits(v, ir::CountZ, l);
+    const ir::Index width = b.constant(module_.pool.put_int(cnt_t, w), l);
+    const ir::Index zero  = b.constant(module_.pool.put_int(cnt_t, 0), l);
+    ir::Index       cls   = b.select(b.binary(ir::Inst::Tag::Ne, nx, zero, l), one_bit(false), one_bit(true), l);
+    cls                   = b.select(b.binary(ir::Inst::Tag::Eq, nz, width, l), fill(true), cls, l);
+    cls                   = b.select(b.binary(ir::Inst::Tag::Eq, nx, width, l), fill(false), cls, l);
+    return b.select(b.unary(ir::Inst::Tag::IsUnknown, v, l), cls, b.to_four(known, ty4, l), l);
 }
 
 // Whether a nonblocking intra-assignment target's select chain resolves
@@ -1635,12 +1727,32 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_timing(const Assig
     if (intra_nb_delay_is_const_zero(delay_expr)) {
         return std::nullopt;
     }
+    return lower_intra_nb_delay(delay_expr, b);
+}
+
+// Lower an intra-assignment `#d` that is not a compile-time zero into its
+// timing. `zero` is set unless `d` is an integer constant known to be nonzero:
+// anything else (a variable, a real that may round to zero ticks) can be zero at
+// run time, and then the store is a plain `<=` (store_leaf). A known nonzero
+// constant, the usual `<= #5`, adds nothing to the IR.
+Lowerer::IntraNbTiming Lowerer::lower_intra_nb_delay(const Expression& delay_expr, ir::Builder& b) {
     IntraNbTiming t;
     t.delay = scaled_delay(delay_expr, b);
+    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+    slang::ast::EvalContext    ev(ectx);
+    const slang::ConstantValue cv = delay_expr.eval(ev);
+    const bool                 nonzero_const =
+      cv.isInteger() && !cv.integer().hasUnknown() && cv.integer().as<uint64_t>().value_or(0) != 0;
+    if (!nonzero_const) {
+        const ir::SourceLoc l = loc(delay_expr);
+        t.zero                = b.binary(
+          ir::Inst::Tag::Eq, t.delay, b.constant(module_.pool.put_int(make_int_type(64, false), 0), l), l);
+    }
     return t;
 }
 
-// Whether an intra-assignment `#d` is a COMPILE-TIME zero. Such a store lands
+// Whether an intra-assignment `#d` is a COMPILE-TIME zero, a delay that is 0 or
+// has an x or z bit (LRM 9.4.1, see scaled_delay). Such a store lands
 // in the current instant's NBA region either way, so it is lowered as a plain
 // `<=`: that keeps its ordering against the same signal's other NBAs by
 // statement-execution order (LRM 10.4.2) through the one block-commit path,
@@ -1652,6 +1764,9 @@ bool Lowerer::intra_nb_delay_is_const_zero(const Expression& delay_expr) {
     const slang::ConstantValue cv = delay_expr.eval(ev);
     if (!cv.isInteger()) {
         return false;
+    }
+    if (cv.integer().hasUnknown()) {
+        return true;
     }
     const auto v = cv.integer().as<uint64_t>();
     return v && *v == 0;
@@ -1907,10 +2022,9 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
                 // suspend between them, and 9.4.5's "the right-hand expression
                 // shall be evaluated before the delay" is about the delay ELAPSING
                 // ("instead of after the delay"), not about the delay expression.
-                const ir::Index val   = lower_expr(a.right(), b);
-                const ir::Index delay = scaled_delay(delay_expr, b);
-                const ir::Index lvd   = lower_lvalue(a.left(), b, /*is_write=*/true);
-                b.store_nb_delay(lvd, in_lvalue_domain(lvd, val, b, loc(a)), delay, loc(a));
+                const ir::Index     val = lower_expr(a.right(), b);
+                const IntraNbTiming t   = lower_intra_nb_delay(delay_expr, b);
+                store_leaf(ir::Inst::Tag::StoreNb, &t, lower_lvalue(a.left(), b, /*is_write=*/true), val, b, loc(a));
                 return val;
             }
             // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.

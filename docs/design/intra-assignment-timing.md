@@ -44,16 +44,17 @@ first-fire-wins removal. R-c (`iff`) and R-d (the owned-handle record class, so
 `s <= #5 t` and `q <= #2 r`) remain scoped and loud-failing, as do the blocking
 form's own two gaps; all of them are in "The remainder" below.
 
-Ordering refinement: a **compile-time** `#0` is const-folded in the frontend and
-lowered as a plain `<=` (StoreNb), so it shares the one block-commit path and its
-updates to a signal order with that signal's other NBAs by statement-execution
-order (LRM 10.4.2). Only a genuinely **runtime** zero delay (`#(expr)` that
-evaluates to 0) reaches the deferred path's arm-site zero branch; it commits with
-the correct value and timing (current-instant NBA region), but because the
-deferred commit runs after block-commit in `ncommit`, its order *relative to a
-plain NBA to the same signal in the same instant* is fixed rather than
-execution-order — a documented edge, now reachable for an array element as well
-(`mem[i] <= a;` then `mem[i] <= #0 b;` with a runtime-computed zero delay).
+Ordering refinement: a zero delay lowers as a plain `<=` (StoreNb), so it shares
+the one block-commit path and its updates to a signal order with that signal's
+other NBAs by statement-execution order (LRM 10.4.2). A **compile-time** zero
+(`#0`, or an x/z constant, LRM 9.4.1) is const-folded in the frontend. A delay
+that is not a known nonzero constant (`#(expr)`, or a real that may round to zero
+ticks) lowers to a test of `delay == 0` that picks the plain `<=` or the deferred
+record (`store_leaf`, per leaf, so a decomposing target shares one evaluation of
+the delay). The deferred path's arm-site zero branch (`emit_intra_nba_arm`) is
+therefore only a safety net: a deferred commit runs after block-commit in
+`ncommit`, so a zero-delay record arriving there would order after a plain NBA to
+the same signal in the same instant, not by execution order.
 
 ## Semantics (the two facts that shape the design)
 

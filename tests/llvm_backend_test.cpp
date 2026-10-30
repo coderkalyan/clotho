@@ -1495,6 +1495,69 @@ TEST_CASE("a negative delay sign-extends before the time unit multiplier") {
     CHECK(out == "u32 at 4294967295\nt=2**32\n");
 }
 
+// LRM 9.4.1: a delay that "evaluates to an unknown or high-impedance value ...
+// shall be interpreted as zero delay", and 9.4.5's intra-assignment delay is the
+// same delay control. Any x or z bit makes the value unknown (scaled_delay), so
+// `#(4'b1x01)` waits 0, not the 9 that its known bits spell: each delay below used
+// to wait nine units (a z-only `4'bzzzz` waited 0 already, its known bits being
+// zero). A compile-time unknown nonblocking delay also stays a plain `<=` for
+// ordering (LRM 10.4.2): `a <= #(1'bx) 1; a <= 2` ends at 2, as it did not when
+// only the delay's time was right. Oracle: iverilog 13, byte for byte.
+TEST_CASE("a delay with an x or z bit is a zero delay") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module m;
+          localparam logic [3:0] D = 4'b1x01;
+          logic [3:0] dx = 4'b1x01, dz = 4'bzzzz, dp = 4'b1z01;
+          logic       qb, qn, qd, qv;
+          logic [7:0] a, b;
+          initial begin
+            #10;
+            #(4'b1x01) $display("literal x at %0t", $time);
+            #(D)       $display("parameter x at %0t", $time);
+            #(dx)      $display("variable x at %0t", $time);
+            #(dz)      $display("variable z at %0t", $time);
+            #(dp)      $display("variable z bit at %0t", $time);
+            qb = #(dx) 1'b1;
+            $display("blocking intra-assignment at %0t qb=%b", $time, qb);
+            qn <= #(4'b1x01) 1'b1;
+            qd <= #(dx)      1'b1;
+            qv <= #(dz)      1'b1;
+            #1 $display("nonblocking intra-assignment at %0t qn=%b qd=%b qv=%b", $time, qn, qd, qv);
+            a = 0; a <= #(1'bx) 1; a <= 2;
+            b = 0; b <= #0 1;      b <= 2;
+            #1 $display("ordering a=%0d b=%0d", a, b);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "literal x at 10\n"
+                 "parameter x at 10\n"
+                 "variable x at 10\n"
+                 "variable z at 10\n"
+                 "variable z bit at 10\n"
+                 "blocking intra-assignment at 10 qb=1\n"
+                 "nonblocking intra-assignment at 11 qn=1 qd=1 qv=1\n"
+                 "ordering a=2 b=2\n");
+}
+
+// The same through the unit multiplier: the unknown amount is zeroed before it is
+// multiplied by the module's ticks per unit, in a module whose unit is 1000 ticks.
+TEST_CASE("an unknown delay is zero before the time unit multiplier") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          logic [3:0] dx = 4'b1x01;
+          initial #0.001 ;
+          initial begin
+            #10;
+            #(dx)      $display("variable x at %0d", $time);
+            #(4'bzz01) $display("literal z bit at %0d", $time);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "variable x at 10\nliteral z bit at 10\n");
+}
+
 TEST_CASE("$time rounds the scaled clock to the nearest module time unit") {
     // Global precision is 1ns. fine's #15 lands the wheel on tick 15; top's unit
     // is 10ns, so $time = round(15 / 10) = 2 (1.5 rounds up, LRM §20.3.1).
@@ -1662,6 +1725,186 @@ TEST_CASE("%t scales to ticks independent of the calling module time unit") {
     )");
 
     CHECK(out == "t:5000 ns\n");
+}
+
+// LRM 21.2.1.1 (Table 21-1: %t "Display in current time format") and 20.4.3
+// ($timeformat: units, precision, suffix and minimum width) say nothing about the
+// sign of a %t operand. The argument is a value, so a negative one is a negative
+// time, as for %d, and its sign is its signedness, not its top bit: an unsigned
+// all-ones operand stays positive (docs/LRM_NOTES.md, note 40). A constant format
+// zero-extended a negative operand narrower than 64 bits (`-1` printed 4294967295
+// units) and a runtime one sign-extended it and printed 2**64 - 1; a 64-bit, a
+// 128-bit and a real operand were unsigned on both. Each pair below is the constant
+// format then the runtime one, and both are now iverilog 13's text, byte for byte.
+// `#0.001` pins the design tick to 1ps, so the real keeps its fraction.
+TEST_CASE("%t of a negative operand prints its sign in a constant and in a runtime format") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          string f;
+          int i;  byte by;  integer ig;  longint lg;  shortint si;
+          logic signed [127:0] w;
+          bit [31:0] u32;  bit [7:0] u8;  longint unsigned ul;
+          real r;
+          initial #0.001 ;
+          initial begin
+            f = "%0t";
+            i = -1;  by = -3;  ig = -5;  lg = -7;  si = -9;
+            w = -128'sd11;  r = -2.5;
+            u32 = 32'hFFFF_FFFF;  u8 = 8'hFF;  ul = 64'd3;
+            $display("int      [%0t] [%s]", i,   $sformatf(f, i));
+            $display("byte     [%0t] [%s]", by,  $sformatf(f, by));
+            $display("integer  [%0t] [%s]", ig,  $sformatf(f, ig));
+            $display("longint  [%0t] [%s]", lg,  $sformatf(f, lg));
+            $display("shortint [%0t] [%s]", si,  $sformatf(f, si));
+            $display("w128     [%0t] [%s]", w,   $sformatf(f, w));
+            $display("real     [%0t] [%s]", r,   $sformatf(f, r));
+            $display("u32 max  [%0t] [%s]", u32, $sformatf(f, u32));
+            $display("u8 0xFF  [%0t] [%s]", u8,  $sformatf(f, u8));
+            $display("ulongint [%0t] [%s]", ul,  $sformatf(f, ul));
+            $display("lit -1   [%0t] [%s]", -1,  $sformatf(f, -1));
+            $display("padded   [%t]", i);
+            f = "%t";
+            r = -1.5;
+            $timeformat(-9, 3, " ns", 14);
+            $display("[%t] [%s]", r, $sformatf(f, r));
+            $display("[%t] [%s]", i, $sformatf(f, i));
+            $display("[%10t]", i);
+          end
+        endmodule
+    )");
+    CHECK(out == "int      [-1000] [-1000]\n"
+                 "byte     [-3000] [-3000]\n"
+                 "integer  [-5000] [-5000]\n"
+                 "longint  [-7000] [-7000]\n"
+                 "shortint [-9000] [-9000]\n"
+                 "w128     [-11000] [-11000]\n"
+                 "real     [-2500] [-2500]\n"
+                 "u32 max  [4294967295000] [4294967295000]\n"
+                 "u8 0xFF  [255000] [255000]\n"
+                 "ulongint [3000] [3000]\n"
+                 "lit -1   [-1000] [-1000]\n"
+                 "padded   [               -1000]\n"
+                 "[     -1.500 ns] [     -1.500 ns]\n"
+                 "[     -1.000 ns] [     -1.000 ns]\n"
+                 "[ -1.000 ns]\n");
+}
+
+// LRM 21.2.1.3 gives the display rules for an unknown or high-impedance value only
+// for %d, %h/%x/%o and %b, and says nothing for %t (docs/LRM_NOTES.md, note 41). A
+// %t operand with an x or z bit used to print its known bits as a time: x as 0,
+// `8'b0000_1x01` as 9 units. It now prints the one character %d prints for it, `x`
+// when every bit is x, `z` when every bit is z, `X` when some are x, `Z` when some
+// are z and none x, followed by the $timeformat suffix and justified to its
+// minimum field width, on the constant and the runtime format alike. The 128-bit
+// operand has its x above the low word, which a 64-bit tick count could not carry.
+// iverilog prints the character inside the scaled number (`x000`, `x.00 ns`) and a
+// known `0 ns` for a finer unit than the display unit, so it is not the oracle.
+TEST_CASE("%t of an operand with an x or z bit prints one character, in a constant and in a runtime format") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          string f;
+          logic [7:0] ax, px, az, pz, pxz, k;
+          logic x1;
+          logic [127:0] wide;
+          logic signed [7:0] sx;
+          initial begin
+            f = "%0t";
+            ax = 8'bx;  px = 8'b0000_1x01;  az = 8'bz;  pz = 8'b0000_1z01;
+            pxz = 8'b0000_xz01;  k = 8'd5;  x1 = 1'bx;  sx = 8'bx;
+            wide = 128'd7;  wide[100] = 1'bx;
+            $display("all x    [%0t] [%s]", ax,  $sformatf(f, ax));
+            $display("some x   [%0t] [%s]", px,  $sformatf(f, px));
+            $display("all z    [%0t] [%s]", az,  $sformatf(f, az));
+            $display("some z   [%0t] [%s]", pz,  $sformatf(f, pz));
+            $display("x and z  [%0t] [%s]", pxz, $sformatf(f, pxz));
+            $display("one bit  [%0t] [%s]", x1,  $sformatf(f, x1));
+            $display("signed   [%0t] [%s]", sx,  $sformatf(f, sx));
+            $display("wide     [%0t] [%s]", wide, $sformatf(f, wide));
+            $display("known    [%0t] [%s]", k,   $sformatf(f, k));
+            $display("default  [%t] [%t]", ax, pz);
+            $timeformat(-9, 2, " ns", 12);
+            f = "%t";
+            $display("[%t] [%s]", ax, $sformatf(f, ax));
+            $display("[%t] [%s]", px, $sformatf(f, px));
+            $display("[%t] [%s]", k,  $sformatf(f, k));
+            $display("[%5t] [%0t] [%-9t]", az, pz, px);
+          end
+        endmodule
+    )");
+    CHECK(out == "all x    [x] [x]\n"
+                 "some x   [X] [X]\n"
+                 "all z    [z] [z]\n"
+                 "some z   [Z] [Z]\n"
+                 "x and z  [X] [X]\n"
+                 "one bit  [x] [x]\n"
+                 "signed   [x] [x]\n"
+                 "wide     [X] [X]\n"
+                 "known    [5000] [5000]\n"
+                 "default  [                   x] [                   Z]\n"
+                 "[        x ns] [        x ns]\n"
+                 "[        X ns] [        X ns]\n"
+                 "[     5.00 ns] [     5.00 ns]\n"
+                 "[ z ns] [Z ns] [X ns     ]\n");
+}
+
+// A %t time whose tick count does not fit 64 bits cannot be shown exactly, and the
+// LRM does not say what it means (docs/LRM_NOTES.md, note 40). A constant-format
+// real saturated (26cd52aa), but an integral operand wrapped: 2**61 ns over a 1ps
+// tick is 2**61 * 1000 ticks, whose low 64 bits are 0, so it printed 0, as did
+// every 128-bit operand whose low word is 0, and a runtime format wrapped a huge
+// real into a meaningless count where the constant one saturated. Every kind now
+// prints the largest count of its sign, 2**63 - 1 ticks, which the renderer shows
+// as 9223372036854775808 (the nearest double), and a count in range is exact.
+// Oracle: the in-range lines are iverilog 13's text; for the saturated ones it
+// prints the exact, unbounded count, so those expectations are the decision.
+// `fine` pins the design tick to 1ps under m's 1ns unit.
+TEST_CASE("%t of a time beyond 2**63 ticks saturates in a constant and in a runtime format") {
+    const std::string out = run_capture(R"(
+        `timescale 1ps/1ps
+        module fine;
+          initial #1 ;
+        endmodule
+        `timescale 1ns/1ns
+        module m;
+          fine u();
+          string f;
+          longint unsigned big_u, in_u;
+          longint big_s;
+          logic [127:0] w_u, w_in;
+          logic signed [127:0] w_s, w_neg;
+          int imax;
+          real r;
+          initial begin
+            f = "%0t";
+            big_u = 64'd1 << 61;  big_s = -(64'sd1 << 61);
+            w_u = 128'd1 << 64;   w_s = -(128'sd1 << 100);
+            w_in = 128'd5;        w_neg = -128'sd5;
+            in_u = 64'd9000000000000;  imax = 2147483647;
+            $display("2**61 unsigned   [%0t] [%s]", big_u, $sformatf(f, big_u));
+            $display("-2**61 signed    [%0t] [%s]", big_s, $sformatf(f, big_s));
+            $display("2**64 wide       [%0t] [%s]", w_u,   $sformatf(f, w_u));
+            $display("-2**100 wide     [%0t] [%s]", w_s,   $sformatf(f, w_s));
+            $display("5 wide           [%0t] [%s]", w_in,  $sformatf(f, w_in));
+            $display("-5 wide          [%0t] [%s]", w_neg, $sformatf(f, w_neg));
+            $display("9e12 unsigned    [%0t] [%s]", in_u,  $sformatf(f, in_u));
+            $display("int max          [%0t] [%s]", imax,  $sformatf(f, imax));
+            r = 1.0e30;
+            $display("real 1e30        [%0t] [%s]", r,     $sformatf(f, r));
+            r = -1.0e30;
+            $display("real -1e30       [%0t] [%s]", r,     $sformatf(f, r));
+          end
+        endmodule
+    )");
+    CHECK(out == "2**61 unsigned   [9223372036854775808] [9223372036854775808]\n"
+                 "-2**61 signed    [-9223372036854775808] [-9223372036854775808]\n"
+                 "2**64 wide       [9223372036854775808] [9223372036854775808]\n"
+                 "-2**100 wide     [-9223372036854775808] [-9223372036854775808]\n"
+                 "5 wide           [5000] [5000]\n"
+                 "-5 wide          [-5000] [-5000]\n"
+                 "9e12 unsigned    [9000000000000000] [9000000000000000]\n"
+                 "int max          [2147483647000] [2147483647000]\n"
+                 "real 1e30        [9223372036854775808] [9223372036854775808]\n"
+                 "real -1e30       [-9223372036854775808] [-9223372036854775808]\n");
 }
 
 TEST_CASE("a later $timeformat changes the format mid-simulation") {

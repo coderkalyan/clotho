@@ -209,6 +209,29 @@ TEST_CASE("single-value gate delay is inertial (LRM 28.16)") {
     CHECK(out == "y=x\ny=1\ny=0\ny=0\n");
 }
 
+// LRM 9.4.1: a delay that evaluates to an unknown value "shall be interpreted as
+// zero delay". 28.16 does not repeat it for a gate delay, which takes the same
+// delay_value (see scaled_delay), so any x or z bit zeroes it: `buf #D` with
+// `D = 4'b1x01` waited 9 and now drives its output in the same instant (the NBA
+// region of t=10, seen at t=11). Byte-identical to iverilog 13.
+TEST_CASE("gate delay with an x or z bit is a zero delay") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ns
+        module m;
+            localparam logic [3:0] D = 4'b1x01;
+            logic a; wire y;
+            buf #D g (y, a);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #1 $display("t=%0t y=%b", $time, y);
+                #30 $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "t=11 y=1\n");
+}
+
 TEST_CASE("gate rise/fall/turn-off delay triples are reported as unsupported") {
     const LowerResult r = lower_text(R"(
         module m;

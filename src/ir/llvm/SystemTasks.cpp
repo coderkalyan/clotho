@@ -124,15 +124,12 @@ void Backend::lower_timeformat(Index i) {
 // in emit_active_run), which is where the target body actually evaluates its
 // format args and prints: LRM 21.2.2 defers the evaluation itself, not just
 // the print, so nothing about this call site's own state matters afterward.
-// The record slot mirrors a normal task_call ramp (lower_task_call_inst) —
-// the target task never suspends, so it never touches it, but the ramp ABI
-// requires the parameter regardless.
+// The record is the shared null one (pend_record_slot): the pending process
+// may finish, and free its frame, before Postponed.
 void Backend::lower_strobe_pend(Index i) {
     const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-    llvm::Value* record = record_slot();
-    b_.CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), record);
     std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
     if (design_uses_process_) {
         argv.push_back(proc_arg());
@@ -140,7 +137,7 @@ void Backend::lower_strobe_pend(Index i) {
     if (design_uses_home_arg_) {
         argv.push_back(callee_home());
     }
-    argv.push_back(record);
+    argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     b_.CreateCall(strobe_pend_fn(), { hdl });
 }
@@ -154,8 +151,8 @@ void Backend::lower_strobe_pend(Index i) {
 //
 // The ramp is emitted at the call site, so every execution builds its own
 // frame: an assertion that fails on N clock ticks pends N distinct handles.
-// The record is a module-wide slot rather than an alloca in this frame; see
-// reactive_record_slot for why the pending body's frame will not do.
+// The record is the shared null one; see pend_record_slot for why the
+// pending body's frame will not do.
 void Backend::lower_reactive_pend(Index i) {
     const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
@@ -172,7 +169,7 @@ void Backend::lower_reactive_pend(Index i) {
     if (design_uses_home_arg_) {
         argv.push_back(b_.getInt8(kReactiveHomeTag));
     }
-    argv.push_back(reactive_record_slot());
+    argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     emit_reactive_push(b_, hdl);
 }
@@ -301,20 +298,29 @@ void Backend::lower_expect_wake(Index i) {
     b_.SetInsertPoint(done);
 }
 
-// The task-call record a reactive pend hands its action block. Unlike a
-// $strobe pend this CANNOT be an alloca in the pending body's frame: the
-// Observed process that pends is ramped, resumed and destroyed in one go
-// (emit_observed_run), so its frame is already freed by the time the reactive
-// drain resumes the pended body -- and a task's epilogue loads the parent
-// handle back out of the record to resume whoever called it (lower_task), so
-// reading it there would push a garbage handle onto the active queue.
+// The task-call record a pended body ($strobe, an action block) is ramped with.
+// It CANNOT be an alloca in the pending body's frame: that frame can be freed
+// before the drain resumes the pended body -- an Observed process is ramped,
+// resumed and destroyed in one go (emit_observed_run), and an `initial` that
+// pends a $strobe and runs off its end in the same time step is destroyed
+// before Postponed -- and a task's epilogue loads the parent handle back out of
+// the record to resume whoever called it (lower_task), so reading it there
+// pushes a garbage handle onto the active queue.
 //
 // A pended body has no caller to resume: the drain runs it, nothing blocks on
 // it, and no code ever writes a parent here. So one slot that stays null
 // serves every pend, however many are live at once.
-llvm::Value* Backend::reactive_record_slot() {
-    ensure_reactive_queue();
-    return sym(reactive_record_gv_);
+llvm::Value* Backend::pend_record_slot() {
+    if (pend_record_gv_ == nullptr) {
+        auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
+        pend_record_gv_ = new llvm::GlobalVariable(env_->llmod,
+                                                   ptr_ty,
+                                                   false,
+                                                   llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantPointerNull::get(ptr_ty),
+                                                   "clotho.pend_record");
+    }
+    return sym(pend_record_gv_);
 }
 
 // Leave the body being lowered the way a $finish must: through its own

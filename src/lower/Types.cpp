@@ -577,6 +577,15 @@ ir::Ref Lowerer::svint_to_ref(const slang::SVInt& v, ir::Ref ty) {
 //
 // An aggregate constant has no single pooled value; a runtime reference to
 // one is materialized as a constant table instead (const_table_signal).
+// A parameter's value as a constant of `type`, the type slang gave the reference.
+ir::Ref Lowerer::lower_param_constant(const slang::ast::ParameterSymbol& p, const slang::ast::Type& type) {
+    if (refused_params_.contains(&p)) {
+        // Its value is not of its type; check_defparam_type reported why.
+        fail(std::format("parameter '{}' cannot be read: the defparam that sets it is refused", p.name));
+    }
+    return lower_constant(p.getValue(), type);
+}
+
 ir::Ref Lowerer::lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type) {
     // Real / shortreal parameters (LRM 6.20), including untyped
     // `parameter r = 5.7`, whose type slang resolves to real.
@@ -602,6 +611,38 @@ ir::Ref Lowerer::lower_constant(const slang::ConstantValue& cv, const slang::ast
         fail("only integral, real, string and null constant parameters are supported");
     }
     return svint_to_ref(cv.integer(), lower_type(type));
+}
+
+// NOTE: An implicitly typed parameter takes the type of its final value, after
+// every override (LRM 6.20.2). slang retypes it for an instance override but not
+// for a defparam: the parameter keeps its original initializer's type and holds
+// the defparam's value unconverted, so every reference is typed by the old
+// initializer (`defparam u.p = 6.5` onto `parameter p = 4` leaves `p` an int
+// holding a real). Simulating that would be wrong wherever the type matters --
+// widths, signedness, real arithmetic -- so a defparam whose value is not of its
+// target's type is refused. slang binds a defparam onto an explicitly typed
+// parameter as an rvalue of that type, so only an implicitly typed target can
+// differ. The check compares types rather than the parameter's value, whose
+// width and signedness slang's constant evaluator does not always keep in step
+// with the type (a localparam initialized by a function using `%=`).
+void Lowerer::check_defparam_type(const slang::ast::DefParamSymbol& d) {
+    const Symbol* target = d.getTarget();
+    if (target == nullptr || target->kind != SymbolKind::Parameter) {
+        return; // slang reported the bad target
+    }
+    const auto&                   p     = target->as<slang::ast::ParameterSymbol>();
+    const slang::ast::Expression& value = d.getInitializer();
+    if (value.bad() || value.type->isMatching(p.getType())) {
+        return;
+    }
+    // TODO: give an implicitly typed parameter the type of its defparam value
+    // (LRM 6.20.2); slang types every reference by the original initializer.
+    refused_params_.insert(&p);
+    fail(std::format("a defparam gives parameter '{}' a value of type '{}', but it keeps type '{}'; an implicitly "
+                     "typed parameter taking its final value's type (LRM 6.20.2) is not supported",
+                     p.name,
+                     value.type->toString(),
+                     p.getType().toString()));
 }
 
 // Append one integral constant's canonical plane bytes to `out`: the val

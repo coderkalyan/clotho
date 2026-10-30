@@ -2923,7 +2923,7 @@ private:
 
     void lower_expect_wake(Index i);
 
-    llvm::Value* reactive_record_slot();
+    llvm::Value* pend_record_slot();
 
     void emit_finish_exit();
 
@@ -4099,7 +4099,7 @@ private:
     llvm::GlobalVariable*               reactive_tail_gv_  = nullptr;
     llvm::GlobalVariable*               re_inactive_gv_    = nullptr;
     llvm::GlobalVariable*               re_inactive_top_gv_ = nullptr;
-    llvm::GlobalVariable*               reactive_record_gv_ = nullptr;
+    llvm::GlobalVariable*               pend_record_gv_     = nullptr;
     // Per-`expect` waiter queues (LRM 16.17), keyed by monitor index and created
     // on demand by expect_queue: {array of parked handles, count}. Same shape as
     // the inactive batch -- push at the top, drain the whole thing -- because an

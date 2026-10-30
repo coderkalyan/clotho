@@ -1982,18 +1982,47 @@ void Backend::lower_inst(Index i) {
         }
 
         case Inst::Tag::EventTriggerNbDelayed: {
-            // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that fires
+            // `->> #d e` (LRM 15.5.1): schedule a detached wheel timer that fires
             // the event `d` ticks from now. The process does not block. The timer
             // node carries the handle, so ONE thunk serves the whole design (the
             // target may be any event expression, not a fixed declared one).
-            llvm::Value* handle = must_of(value_of(p.binary.r));
-            llvm::Value* ticks  = cast(must_of(value_of(p.binary.l)), 64, false);
-            auto*        nty    = event_timer_ty();
-            llvm::Value* node   = b_.CreateCall(
-              alloc_fn(), { b_.getInt64(env_->llmod.getDataLayout().getTypeAllocSize(nty)) });
-            b_.CreateStore(handle, b_.CreateStructGEP(nty, node, 2));
-            // Relative, so the runtime's saturating `now + ticks` applies.
-            b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, node, ticks, event_delay_thunk() });
+            //
+            // A zero delay cannot arm the wheel (rt_wheel_schedule_rel needs a
+            // delay above 0). Its delay control expires in the current time slot,
+            // so the trigger is that slot's NBA-region event, which is exactly
+            // `->> e`: link it onto the pending chain instead. A constant delay
+            // emits only the taken path; a runtime one branches on zero, as
+            // emit_intra_nba_arm does for `x <= #d y`.
+            llvm::Value* handle   = must_of(value_of(p.binary.r));
+            llvm::Value* ticks    = cast(must_of(value_of(p.binary.l)), 64, false);
+            auto         schedule = [&] {
+                auto*        nty = event_timer_ty();
+                llvm::Value* node =
+                  b_.CreateCall(alloc_fn(), { b_.getInt64(env_->llmod.getDataLayout().getTypeAllocSize(nty)) });
+                b_.CreateStore(handle, b_.CreateStructGEP(nty, node, 2));
+                // Relative, so the runtime's saturating `now + ticks` applies.
+                b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, node, ticks, event_delay_thunk() });
+            };
+            if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
+                if (c->isZero()) {
+                    emit_event_pend_guarded(handle);
+                } else {
+                    schedule();
+                }
+                return;
+            }
+            auto* fn    = b_.GetInsertBlock()->getParent();
+            auto* zbb   = llvm::BasicBlock::Create(ctx_, "evdelay.zero", fn);
+            auto* nzbb  = llvm::BasicBlock::Create(ctx_, "evdelay.sched", fn);
+            auto* contb = llvm::BasicBlock::Create(ctx_, "evdelay.armed", fn);
+            b_.CreateCondBr(b_.CreateICmpEQ(ticks, b_.getInt64(0)), zbb, nzbb);
+            b_.SetInsertPoint(zbb);
+            emit_event_pend_guarded(handle);
+            b_.CreateBr(contb);
+            b_.SetInsertPoint(nzbb);
+            schedule();
+            b_.CreateBr(contb);
+            b_.SetInsertPoint(contb);
             return;
         }
 

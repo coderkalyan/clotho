@@ -6207,3 +6207,24 @@ module t;
 endmodule
 )") == "5");
 }
+// %m in an action block names the assertion's scope: the enclosing module or
+// block, and the assertion's label if it has one, which creates a named block
+// around it (LRM 16.3, 21.2.1.5). The body is a synthesized task, whose own name
+// once leaked as `top.sva.fail`. Verilator 5.050 prints the same four names;
+// Icarus Verilog 13 does not support concurrent assertions.
+TEST_CASE("%m in a concurrent assertion's action block names its scope and label") {
+    const auto action_scope = [](std::string_view item, bool procedural) {
+        std::string src = "module top;\n  logic clk = 0;\n  logic x = 0;\n  always #5 clk = ~clk;\n";
+        if (procedural) {
+            src += "  always @(posedge clk) begin : pblk\n    " + std::string(item) + "\n  end\n";
+        } else {
+            src += "  " + std::string(item) + "\n";
+        }
+        src += "  initial #7 $finish(0);\nendmodule\n";
+        return sva_run_capture(src);
+    };
+    CHECK(action_scope("assert property (@(posedge clk) x) else $display(\"%m\");", false) == "top\n");
+    CHECK(action_scope("clbl: assert property (@(posedge clk) x) else $display(\"%m\");", false) == "top.clbl\n");
+    CHECK(action_scope("assert property (x) else $display(\"%m\");", true) == "top.pblk\n");
+    CHECK(action_scope("plbl: assert property (x) else $display(\"%m\");", true) == "top.pblk.plbl\n");
+}

@@ -108,7 +108,7 @@ struct TimeFormat {
 // library; docs/design/executables.md).
 extern TimeFormat timeformat;
 
-void render_time(std::string& out, uint64_t ticks);
+void render_time(std::string& out, uint64_t ticks, bool negative);
 
 [[noreturn]] void format_fatal(const std::string& what);
 
@@ -172,6 +172,10 @@ struct CoercedArg {
 };
 
 int64_t sat_round_i64(double v);
+
+int64_t integral_time_ticks(const rt_arg& a, uint64_t mul);
+
+int64_t real_time_ticks(double v, uint64_t mul);
 
 const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, const rt_fmt_dyn* dyn);
 

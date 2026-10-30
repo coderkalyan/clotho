@@ -236,22 +236,36 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
 // conversion's own answer, zero. A negative count inside the ceiling is left
 // alone: LRM 9.4.1 reads a negative delay as a two's-complement unsigned
 // integer, which is what the conversion's cast already gives.
-ir::Index Lowerer::saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Builder& b, ir::SourceLoc l) {
+//
+// `is_signed` gives the count as a signed 64-bit one instead, for a %t operand
+// (scale_to_ticks). There a negative real is a negative time, not a delay read
+// as an unsigned integer, so it converts as signed and each sign saturates at
+// the ceiling of its own sign, -INT64_MAX and INT64_MAX.
+ir::Index Lowerer::saturating_ticks(ir::Index     scaled,
+                                    uint64_t      tick_mul,
+                                    ir::Builder&  b,
+                                    ir::SourceLoc l,
+                                    bool          is_signed) {
     using T                    = ir::Inst::Tag;
-    const ir::Ref      u64     = make_int_type(64, false);
+    const ir::Ref      ty      = make_int_type(64, false);
     constexpr uint64_t ceiling = INT64_MAX;
     const uint64_t     mul     = std::max<uint64_t>(tick_mul, 1);
     const double       bound   = static_cast<double>(ceiling / mul);
     const ir::Ref      real_ty = module_.pool.real_type;
 
-    ir::Index ticks = b.float_cvt(T::FtoI, scaled, u64, l);
+    ir::Index ticks = b.float_cvt(T::FtoI, scaled, ty, l);
     if (mul > 1) {
-        ticks = b.binary(T::Mul, ticks, b.constant(module_.pool.put_int(u64, mul), l), l);
+        ticks = b.binary(T::Mul, ticks, b.constant(module_.pool.put_int(ty, mul), l), l);
     }
     const ir::Index above = b.binary(T::FGe, scaled, b.constant(module_.pool.put_real(real_ty, bound), l), l);
     const ir::Index below = b.binary(T::FLe, scaled, b.constant(module_.pool.put_real(real_ty, -bound), l), l);
-    const ir::Index huge  = b.binary(T::Lor, above, below, l);
-    return b.select(huge, b.constant(module_.pool.put_int(u64, ceiling), l), ticks, l);
+    const ir::Index top   = b.constant(module_.pool.put_int(ty, ceiling), l);
+    if (!is_signed) {
+        return b.select(b.binary(T::Lor, above, below, l), top, ticks, l);
+    }
+    const ir::Index bottom =
+      b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(-static_cast<int64_t>(ceiling))), l);
+    return b.select(above, top, b.select(below, bottom, ticks, l), l);
 }
 
 // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
@@ -259,7 +273,8 @@ ir::Index Lowerer::saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Bui
 // bits first and then multiplied, so a large unit (e.g. seconds against fs
 // precision) cannot overflow the amount's declared width. An integer delay times
 // the unit is always an exact multiple of the tick (LRM §3.14), so no rounding is
-// needed. The result is always a 64-bit unsigned tick count for an integral amount.
+// needed. The result is always a 64-bit unsigned tick count for an integral amount,
+// and 0 for one with an unknown bit (LRM 9.4.1, below).
 ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     const ir::SourceLoc l   = loc(amount);
     const ir::Ref       u64 = make_int_type(64, false);
@@ -297,7 +312,24 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     // 2**64 - 1, not 2**32 - 1. An unsigned amount zero-extends and a wider one
     // truncates. The backend consumes the count as is, so this is the one place
     // the extension is decided.
-    const ir::Index ticks = coerce(lower_expr(amount, b), *amount.type, u64, b, l);
+    //
+    // LRM 9.4.1: "If the delay expression evaluates to an unknown or high-impedance
+    // value, it shall be interpreted as zero delay." The clause does not say whether
+    // a value with only some bits x or z is unknown. Any such bit makes it so, as in
+    // 11.4.4 ("contains an unknown (x) or high-impedance (z) value"), and as iverilog
+    // reads it: `#(4'b1x01)` waits 0, not the 9 that the 4-state to 2-state
+    // conversion below would keep from its known bits. 9.4.5 and 15.5.1 take their
+    // delay from this same delay control. 10.3.3 and 28.16 do not repeat the rule
+    // for a continuous-assignment, gate or net delay, but those take the same
+    // `delay_value` / `mintypmax_expression` (A.2.2.3, A.6.5), so they follow it
+    // (iverilog agrees for the first two and implements no net delay;
+    // docs/LRM_NOTES.md, note 39).
+    const ir::Index amt   = lower_expr(amount, b);
+    ir::Index       ticks = coerce(amt, *amount.type, u64, b, l);
+    if (amount.type->isFourState()) {
+        ticks =
+          b.select(b.unary(ir::Inst::Tag::IsUnknown, amt, l), b.constant(module_.pool.put_int(u64, 0), l), ticks, l);
+    }
     if (time_mul_ <= 1) {
         return ticks;
     }
@@ -1641,29 +1673,34 @@ std::string Lowerer::instance_path() const {
 // instances are flattened per-instance and subroutine bodies are lowered
 // per defining instance.
 std::string Lowerer::hier_name() const {
-    std::string path = instance_path();
-    if (path.empty() && scope_ != nullptr) {
-        // A package / $unit subroutine sits under no instance, so the instance
-        // path is empty; %m still owes the scope chain (LRM 21.2.1.3, Verilator
-        // renders `pkg.fn`). UVM's uvm_instance_scope (base/uvm_misc.svh) scans
-        // %m backwards for a '.' / ':' separated prefix and reports SCPSTR --
-        // 128 times, then a BUILDERR fatal -- when there is none, so the
-        // package segment is load-bearing, not cosmetic.
-        for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
-            const Symbol& sym = s->asSymbol();
-            if (sym.kind == SymbolKind::Package) {
-                path = std::string(sym.name);
-                break;
-            }
-            if (sym.kind == SymbolKind::CompilationUnit) {
-                path = "$unit";
-                break;
+    std::string path;
+    if (fn_ctx_ != nullptr && fn_ctx_->invoking_scope) {
+        path = *fn_ctx_->invoking_scope;
+    } else {
+        path = instance_path();
+        if (path.empty() && scope_ != nullptr) {
+            // A package / $unit subroutine sits under no instance, so the instance
+            // path is empty; %m still owes the scope chain (LRM 21.2.1.3, Verilator
+            // renders `pkg.fn`). UVM's uvm_instance_scope (base/uvm_misc.svh) scans
+            // %m backwards for a '.' / ':' separated prefix and reports SCPSTR --
+            // 128 times, then a BUILDERR fatal -- when there is none, so the
+            // package segment is load-bearing, not cosmetic.
+            for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
+                const Symbol& sym = s->asSymbol();
+                if (sym.kind == SymbolKind::Package) {
+                    path = std::string(sym.name);
+                    break;
+                }
+                if (sym.kind == SymbolKind::CompilationUnit) {
+                    path = "$unit";
+                    break;
+                }
             }
         }
-    }
-    if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
-        path += '.';
-        path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+        if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
+            path += '.';
+            path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+        }
     }
     for (const OpenBlock& nb : named_blocks_) {
         path += '.';
@@ -2535,9 +2572,10 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                   arg->type->isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF, v, module_.pool.real_type, al);
             }
             if (conv == 't') {
-                // The scaled tick count is an unsigned 64-bit value.
+                // The scaled tick count is a 64-bit value with the operand's own sign
+                // (scale_to_ticks); a real operand's count is signed.
                 v        = scale_to_ticks(*arg, v, b);
-                v_signed = false;
+                v_signed = fl || arg->type->isSigned();
             }
             args.push_back({ v, v_signed });
         }

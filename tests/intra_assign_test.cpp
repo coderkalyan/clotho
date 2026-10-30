@@ -249,6 +249,54 @@ TEST_CASE("nonblocking intra-delay #0 orders with plain NBAs by execution order"
     CHECK(run_capture_finish(src) == "a=2\n");
 }
 
+// The same holds when the delay is zero only at RUN time (LRM 10.4.2: a nonblocking
+// assignment with a zero delay is scheduled like one without, in execution order;
+// 4.9.4: the update is an NBA event in the current time step). It used to commit
+// through the deferred record, after every plain NBA of the instant, so `a` ended
+// at 1. An x or z delay is a zero delay too (LRM 9.4.1), and so is a real that
+// rounds to zero ticks. The `g` line has the zero-delay store LAST: it wins. A
+// nonzero runtime delay (`h`) still commits later, after the plain `h <= 2`.
+// iverilog prints the same.
+TEST_CASE("nonblocking intra-delay that is zero at run time orders with plain NBAs") {
+    constexpr std::string_view src = R"(
+        `timescale 1ns/1ns
+        module m;
+            logic [7:0] a, c, d, g, h;
+            int n = 0, n5 = 5;
+            logic [3:0] dx = 4'b1x01;
+            initial begin
+                a = 0; a <= #(n) 1; a <= 2;
+                c = 0; c <= #(dx) 1; c <= 2;
+                d = 0; d <= #(0.4) 1; d <= 2;
+                g = 0; g <= 2; g <= #(n) 1;
+                h = 0; h <= #(n5) 1; h <= 2;
+                #1 $display("a=%0d c=%0d d=%0d g=%0d h=%0d", a, c, d, g, h);
+                #10 $display("h=%0d", h);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a=2 c=2 d=2 g=1 h=2\nh=1\n");
+}
+
+// A target that decomposes into several leaves arms one record per leaf against
+// ONE evaluation of the delay (LRM 9.4.5), so a zero delay routes every leaf to the
+// plain `<=` path. iverilog prints p=3 q=4.
+TEST_CASE("nonblocking intra-delay that is zero at run time on a concatenation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] p, q;
+            int n = 0;
+            initial begin
+                p = 0; q = 0;
+                {p, q} <= #(n) 16'h0102;
+                {p, q} <= 16'h0304;
+                #1 $display("p=%0d q=%0d", p, q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "p=3 q=4\n");
+}
+
 // A dynamic (runtime-valued) delay is supported. iverilog: a == 9 at the end.
 TEST_CASE("nonblocking intra-delay accepts a dynamic delay") {
     constexpr std::string_view src = R"(

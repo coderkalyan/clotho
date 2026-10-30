@@ -516,7 +516,8 @@ TEST_CASE("real delay in a submodule, integer-only parent") {
 // 2**64 ns is 2**64 * 1000 ps, whose low 64 bits are 0, so it used to fire at
 // once. Oracle: none; the expected output follows from that decision (no event
 // fires before the finite ones at 15 and 35, and every unrepresentable time
-// prints as the same saturated time, a representable one does not).
+// prints as the same saturated time of its own sign, a representable one does
+// not; a negative time is negative, docs/LRM_NOTES.md note 40).
 TEST_CASE("a real delay beyond 2**63 ticks saturates instead of wrapping into an early event") {
     const std::string out = run_capture(R"(
         `timescale 1ns/1ps
@@ -541,7 +542,7 @@ TEST_CASE("a real delay beyond 2**63 ticks saturates instead of wrapping into an
             s2 = $sformatf("%0t", big);
             s3 = $sformatf("%0t", neg);
             s4 = $sformatf("%0t", mid);
-            $display("%0d %0d %0d", s1 == s2, s2 == s3, s4 == s1);
+            $display("%0d %0d %0d", s1 == s2, s3 == $sformatf("-%s", s2), s4 == s1);
             $finish;
           end
         endmodule

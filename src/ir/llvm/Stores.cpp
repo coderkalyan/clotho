@@ -230,6 +230,16 @@ void Backend::nba_classify_ir(const Ir& ir) {
             design_uses_nb_events_ = true;
             continue;
         }
+        if (ir.tag(idx) == Inst::Tag::EventTriggerNbDelayed) {
+            // `->> #d e` arms a wheel timer for a positive delay, but a zero one
+            // (a literal `#0`, or a runtime value that is 0 or x/z, LRM 9.4.1)
+            // pends the event like `->> e`, so the NBA region needs its chain. The
+            // delay reaches here as arithmetic over a constant, not a constant
+            // itself, so this cannot tell a nonzero literal from a runtime value;
+            // the cost is one pointer test per NBA check in such a design.
+            design_uses_nb_events_ = true;
+            continue;
+        }
         // A whole-container nonblocking assignment (`q <= rhs`, `d <= rhs`,
         // `a <= rhs` -- its own op): the target signal defers a staged deep copy
         // into a per-signal buffer, moved into the live handle in the NBA region.

@@ -1395,6 +1395,7 @@ ir::FunctionId Lowerer::build_action_body(const Statement& body, std::string_vie
 
     FnCtx ctx;
     ctx.name_prefix = std::string(name) + ".";
+    ctx.invoking_scope = hier_name();
     ctx.is_task     = true;
     const FnScope fn_scope(*this, &ctx);
 

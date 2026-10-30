@@ -777,6 +777,13 @@ void Lowerer::lower_members(const Scope&       scope,
                     });
                 }
                 break;
+            // slang resolves a defparam, but the type it gives its target is
+            // checked here; see check_defparam_type. In Collect, so the whole
+            // design knows which parameters are refused before Emit reads any.
+            case SymbolKind::DefParam:
+                if (pass == Pass::Collect)
+                    recover([&] { check_defparam_type(m.as<DefParamSymbol>()); });
+                break;
             // Known-inert members: elaboration artifacts and declarations
             // that bear no simulation behavior of their own. Ports are wired
             // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -827,7 +834,6 @@ void Lowerer::lower_members(const Scope&       scope,
             case SymbolKind::EmptyMember:
             case SymbolKind::ElabSystemTask:
             case SymbolKind::Specparam:
-            case SymbolKind::DefParam:
             // A named `sequence` / `property` declaration is a template, not
             // a member with behavior of its own: nothing elaborates until it
             // is instantiated, and slang expands the body with the actual

@@ -1324,8 +1324,8 @@ void Backend::service_dynamic_queue(Signal sig, uint32_t edge) {
 }
 
 // The detached timer node a `->> #d e` schedules: an rt_timer ({next,
-// on_expire}) followed by the event handle to fire. Carrying the handle is what
-// lets ONE thunk serve every delayed trigger in the design -- the target of
+// on_expire}) followed by the event handle to trigger. Carrying the handle is
+// what lets ONE thunk serve every delayed trigger in the design -- the target of
 // `->> #d e` can be any event expression, so there is no declared event to
 // specialise on.
 llvm::StructType* Backend::event_timer_ty() {
@@ -1334,12 +1334,23 @@ llvm::StructType* Backend::event_timer_ty() {
 }
 
 // The design's one detached on-expiry thunk. The wheel calls it as
-// on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the drain's
-// rt_wheel_advance ctx); it reads the handle out of the node, fires that event,
-// then frees the node the schedule site allocated.
+// on_expire(rt_timer* t, void* ctx) (ctx, the wheel, is unused here); it reads
+// the handle out of the node, pends that event for the NBA region, then frees the
+// node the schedule site allocated.
+//
+// LRM 15.5.1: the update event of `->> #d e` "shall trigger the referenced event
+// in the nonblocking assignment region" of the instant the delay expires. The
+// wheel fires this at the top of that instant, ahead of its Active region, so
+// firing the event here would wake the waiter in the Active region; pending it
+// leaves the wake to the NBA drain, exactly as for `->> e`.
+//
+// Defined in whichever module first needs it and reached from every other one
+// through sym(), like enqueue_trampoline: returning the bare definition to a
+// second module is a cross-module global reference, which LLVM rejects
+// (docs/design/module-split.md).
 llvm::Function* Backend::event_delay_thunk() {
     if (event_delay_thunk_ != nullptr) {
-        return event_delay_thunk_;
+        return sym(event_delay_thunk_);
     }
     auto*             ptr  = raw_ptr_ty();
     auto*             fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
@@ -1352,13 +1363,13 @@ llvm::Function* Backend::event_delay_thunk() {
     auto* nty = event_timer_ty();
     llvm::Value* handle =
       b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(nty, event_delay_thunk_->getArg(0), 2));
-    emit_event_fire_guarded(handle, event_delay_thunk_->getArg(1)); // ctx is the wheel
+    emit_event_pend_guarded(handle);
     b_.CreateCall(free_fn(), { event_delay_thunk_->getArg(0) });
     b_.CreateRetVoid();
     if (saved_bb != nullptr) {
         b_.SetInsertPoint(saved_bb, saved_pt);
     }
-    return event_delay_thunk_;
+    return sym(event_delay_thunk_);
 }
 
 // Link an event object onto the NBA pending chain (LRM 15.5.4), unless it is
@@ -1444,7 +1455,7 @@ void Backend::emit_event_pend_drain(llvm::Value* wheel) {
 // Stamp event `sig`'s trigger time (from `wheel`) and wake every waiter on its
 // object's list. Shared by `-> e` in a process body (wheel_), the NBA-region
 // `->> e` service (the drain's local wheel — wheel_ is stale there, so it must
-// be passed in) and the `->> #d e` expiry thunk (ctx == the wheel).
+// be passed in).
 void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
