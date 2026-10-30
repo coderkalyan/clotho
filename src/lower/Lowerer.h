@@ -2717,7 +2717,7 @@ private:
 
     void lower_var_initializer(const VariableSymbol& vs);
 
-    const Expression* declaration_initializer(const VariableSymbol& vs) const;
+    const Expression* declaration_initializer(const VariableSymbol& vs);
 
     void finalize_preinit();
 

@@ -287,3 +287,24 @@ TEST_CASE("a select port resolves against another driver of the same bits") {
     )");
     CHECK(out == "zz11\n");
 }
+
+// The initializer of a variable output port belongs to the declared variable (LRM
+// 23.2.2.2, A.2.3 list_of_variable_port_identifiers; applied before any procedure
+// starts, 6.8), whatever select of it the port names. slang binds it to the port's
+// own type, the select's, so it has to be bound to the variable again. Expected
+// values from iverilog 13.
+TEST_CASE("a variable's initializer holds when its port is a select of it") {
+    const std::string out = run_capture(R"(
+        module m(x[3:2]); output reg [3:0] x = 4'b1001; endmodule
+        module m_bit(b[0]); output reg [7:0] b = 8'hA5; endmodule
+        module m_int(i[7:0]); output int i = 32'h12345678; endmodule
+        module m_two(x[3:2], x); output reg [3:0] x = 4'b1001; endmodule
+        module top;
+            wire [1:0] w; wire wb; wire [7:0] wi; wire [1:0] hi; wire [3:0] all;
+            m u(w); m_bit v(wb); m_int t(wi); m_two s(hi, all);
+            initial #1 $display("w=%b u.x=%b wb=%b v.b=%h wi=%h t.i=%h hi=%b all=%b s.x=%b",
+                                w, u.x, wb, v.b, wi, t.i, hi, all, s.x);
+        endmodule
+    )");
+    CHECK(out == "w=10 u.x=1001 wb=1 v.b=a5 wi=78 t.i=12345678 hi=10 all=1001 s.x=1001\n");
+}

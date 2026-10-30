@@ -983,13 +983,34 @@ void Lowerer::emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::So
 // The initializer a variable's declaration carries (LRM 6.8). The variable a
 // variable output port declares (`output logic x = 1`, ANSI or non-ANSI, LRM
 // 23.2.2.2) is initialized by that port declaration, and slang keeps the
-// initializer on the port rather than on the variable.
-const Expression* Lowerer::declaration_initializer(const VariableSymbol& vs) const {
+// initializer on the port rather than on the variable. slang binds it to the
+// port's own type, which for a select port (`module m(x[3:2])`, LRM 23.2.2.1) is
+// the select's, so that one is bound again to the variable from its declarator.
+const Expression* Lowerer::declaration_initializer(const VariableSymbol& vs) {
     if (const Expression* init = vs.getInitializer()) {
         return init;
     }
     const auto it = port_initializers_.find(&vs);
-    return it != port_initializers_.end() ? it->second->getInitializer() : nullptr;
+    if (it == port_initializers_.end()) {
+        return nullptr;
+    }
+    const PortSymbol& p = *it->second;
+    if (p.getInternalExpr() == nullptr) {
+        return p.getInitializer();
+    }
+    const slang::syntax::SyntaxNode* syn = vs.getSyntax();
+    if (syn == nullptr || syn->kind != slang::syntax::SyntaxKind::Declarator ||
+        syn->as<slang::syntax::DeclaratorSyntax>().initializer == nullptr) {
+        // TODO: the initializer of a select port whose variable is declared apart from
+        // the port (`output x = 1;` and `reg [3:0] x;`): it is not on the variable's
+        // own declarator.
+        fail("an initializer on a select port of a variable declared apart from the port is not supported");
+    }
+    const slang::syntax::EqualsValueClauseSyntax& eq = *syn->as<slang::syntax::DeclaratorSyntax>().initializer;
+    const slang::ast::ASTContext ctx(*p.getParentScope(),
+                                     slang::ast::LookupLocation::after(vs),
+                                     slang::ast::ASTFlags::NonProcedural | slang::ast::ASTFlags::StaticInitializer);
+    return &Expression::bindRValue(vs.getType(), *eq.expr, { eq.equals.location(), eq.equals.location() + 1 }, ctx);
 }
 
 // Apply a module-level (static) variable's declaration initializer (LRM 6.8)
