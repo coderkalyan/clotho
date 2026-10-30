@@ -623,6 +623,38 @@ TEST_CASE("a delayed continuous assignment to a forced variable is rejected") {
     CHECK(lower_error(src).find("continuous assignment delay on a force-target variable") != std::string::npos);
 }
 
+// A gate output on a variable (LRM 10.3: "Variables can only be driven by one continuous
+// assignment or by one primitive output") stored with no force gate, delayed or not, so its
+// value landed over an active force (`and g (y, a, b)`, b=1 at 13, force y=z at 11: y=1 at 13
+// where the force holds z) and a release did not restore it (y stayed z, not the gate's 1).
+// Refused rather than gated: 10.6.2 lists what a force on a variable overrides ("a procedural
+// assignment, continuous assignment or an assign procedural continuous assignment") and which
+// driver a release reestablishes ("a continuous assignment"), and names no primitive output in
+// either, so what a release does with the gate is open. iverilog 13 refuses a primitive driving
+// a variable at all, so there is no oracle. The same gate on a NET is exact: the resolver folds
+// it under the force (the net tests above and in net_delay_test.cpp).
+TEST_CASE("a gate or switch output on a forced variable is rejected") {
+    for (const std::string_view gate : { "and g (y, a, b);",
+                                         "and #3 g (y, a, b);",
+                                         "bufif1 g (y, a, b);",
+                                         "nmos g (y, a, b);",
+                                         "buf g (z, y, a);",
+                                         "not #2 g (y, z, a);" }) {
+        const std::string src = "module m; logic a, b, y, z;\n " + std::string(gate) +
+                                "\n initial begin force y = 1'bz; release y; end endmodule";
+        const std::string err = lower_error(src);
+        CHECK_MESSAGE(
+          err.find("a gate or switch output on a force-target variable") != std::string::npos, err, " for ", gate);
+    }
+    // The input side of a gate is no driver of the variable, and a net output is no variable.
+    const LowerResult input_side = lower_text(R"(
+        module m; logic a, b, y; wire z;
+            and g (z, a, y);
+            initial begin force y = 1'b1; release y; force z = 1'b0; release z; end
+        endmodule)");
+    CHECK_MESSAGE(input_side.ok, input_side.diagnostic_text());
+}
+
 // A partial force of a VARIABLE stays rejected — the site state is per whole
 // variable, and LRM 10.6.2 permits a partial force only on a net. slang flags
 // the lvalue (-Wbad-procedural-force) and leaves the statement unbound, so the

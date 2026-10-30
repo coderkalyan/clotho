@@ -2400,6 +2400,33 @@ void Lowerer::check_mos_switch_strength(const PrimitiveInstanceSymbol& gi, const
 
 void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
     const PrimitiveSymbol& prim = gi.primitiveType;
+    if (cur_pass_ == Pass::Emit) {
+        // TODO: a gate or switch output on a force-target variable. LRM 10.3 lets a
+        // variable "be driven by one continuous assignment or by one primitive
+        // output", and the gate's store below carries no force gate, so its value
+        // lands over an active force. Gating it is not enough: 10.6.2 says what a
+        // force on a variable overrides ("a procedural assignment, continuous
+        // assignment or an assign procedural continuous assignment") and which
+        // driver a release reestablishes ("a continuous assignment"), and names no
+        // primitive output in either list, so whether a release restores the gate's
+        // value or holds the forced one is open. iverilog 13 refuses a primitive
+        // driving a variable at all. A net output is unaffected: the net's resolver
+        // folds the gate under the force.
+        // The output terminals: all but the last of a buf/not, else terminal 0.
+        const auto   conns = gi.getPortConnections();
+        const size_t n_out = prim.primitiveKind == PrimitiveSymbol::NOutput && conns.size() > 1
+                               ? conns.size() - 1
+                               : std::min<size_t>(1, conns.size());
+        for (size_t i = 0; i < n_out; ++i) {
+            if (conns[i] == nullptr || conns[i]->kind != ExpressionKind::Assignment) {
+                continue;
+            }
+            const ValueSymbol* root = lvalue_root(conns[i]->as<AssignmentExpression>().left());
+            if (root != nullptr && force_info_of(*root) != nullptr) {
+                fail("a gate or switch output on a force-target variable is not supported");
+            }
+        }
+    }
     if (prim.name == "pullup" || prim.name == "pulldown") {
         lower_pull_source(gi, prim.name == "pullup");
         return;
