@@ -501,10 +501,10 @@ TEST_CASE("wide multiply, divide and modulo through the JIT match APInt, 2- and 
 }
 
 TEST_CASE("a 16384-bit multiply, divide and modulo compile and run") {
-    // LLVM's own 4-state multiply takes about 90 s of CPU to compile at this width (12x
-    // more per doubling past 4096 bits) and its divide runs bit by bit, so these 24 sites
-    // would take most of an hour to compile without the routines. One pair of random
-    // operands, in all four kinds and both contexts.
+    // Before the routines, LLVM compiled one 16384-bit multiply in 65-84 s of CPU and one
+    // modulo in 140-150 s (a divide in 4-7 s), per site, so these 24 sites took tens of
+    // minutes and ran the divide bit by bit; now each is a call and the test is a few
+    // seconds. One pair of random operands, in all four kinds and both contexts.
     check_design(16384, { pairs_for(16384)[0] });
 }
 
