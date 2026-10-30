@@ -320,6 +320,52 @@ TEST_CASE("->> #d e schedules a detached trigger without blocking") {
     CHECK(out.find("fired=5") != std::string::npos);
 }
 
+// `->> #0 e` (LRM 15.5.1): the delay control expires in the current time slot, so
+// the trigger is that slot's NBA-region event, exactly `->> e`. The delay used to
+// reach the wheel, which cannot hold a timer due now, so the waiter never woke and
+// a fork joining on it never joined. The expected order is the LRM's regions
+// (4.4.2.3, 4.4.2.4): the `#0` continuation runs in the Inactive region, before
+// the NBA region that triggers `e`. Each fork branch `@(f)` runs in the Active
+// region, before the NBA region too, so it is waiting by the time `f` triggers
+// whatever order the branches start in. iverilog implements no `->>`, so this is
+// pinned to the LRM. It runs in a process of its own because the unfixed wheel
+// asserts, which would otherwise end the whole test file.
+TEST_CASE("->> #0 e triggers in the current slot's NBA region") {
+    constexpr std::string_view src = R"(
+        module top;
+          event e, f, g;
+          int d;
+          initial begin
+            d = 0;
+            #1;
+            ->> #0 e;
+            #0 $display("inactive t=%0t", $time);
+          end
+          initial begin @(e); $display("e woke t=%0t", $time); end
+          initial begin
+            #2;
+            fork
+              @(f);
+              ->> #0 f;
+            join
+            $display("f joined t=%0t", $time);
+          end
+          initial begin
+            #3;
+            fork
+              @(g);
+              ->> #(d) g;
+            join
+            $display("g joined t=%0t", $time);
+          end
+        endmodule
+    )";
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(test::run_design_subprocess(src) ==
+          "inactive t=1\ne woke t=1\nf joined t=2\ng joined t=3\n");
+}
+
 // Tier-2 forms loud-fail rather than being silently mis-lowered (PRINCIPLES.md).
 // A named event declared at package scope materializes its trigger state like a
 // module-scope event, so triggering/waiting it (imported or explicitly scoped)
