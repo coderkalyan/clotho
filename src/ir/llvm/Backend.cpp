@@ -468,6 +468,31 @@ llvm::Value* Backend::z_of(Plane a) {
 }
 
 // Wrap a single iW value as a 2-state Plane.
+// A plane from storage, an ABI return, a runtime helper or an aggregate walk, in
+// the encoding of the value an instruction of IR type `t` is. Those producers see
+// the representation they read: a 2-state signal is stored packed when a
+// pointer-ABI task writes it, every function ABI passes packed planes, and an
+// aggregate walk mixes its leaves. The IR type is what the VALUE is, so this is
+// the boundary between the two encodings, not a repair of an operand: set_value
+// asserts the result, and an operator never converts its operands.
+Plane Backend::in_type_domain(Plane p, ValueType t) {
+    if (t.is_string || t.is_real) {
+        return p;
+    }
+    if (t.four_state) {
+        assert(!p.two && "a 4-state value is read from packed planes");
+
+        return p;
+    }
+
+    return p.two ? p : two_val(must_of(p));
+}
+
+// A value that is never x or z, in the encoding of the domain its IR type has.
+Plane Backend::known_plane(llvm::Value* v, bool four_state) {
+    return four_state ? packed(v, v, zero(v->getType()->getIntegerBitWidth())) : two_val(v);
+}
+
 Plane Backend::two_val(llvm::Value* v) {
     return { v, nullptr, true };
 }

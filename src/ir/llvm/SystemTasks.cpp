@@ -493,14 +493,14 @@ void Backend::lower_fopen_fd(Index i) {
     const AsciiArg m    = spill_ascii_arg(p.r, "fopen.mode");
     llvm::Value*   desc = b_.CreateCall(fopen_fd_fn(), { n.ptr, n.len, n.fwd, m.ptr, m.len, m.fwd });
     // The descriptor is a plain known integer (no x/z): must == may, z == 0.
-    set_value(i, packed(desc, desc, zero(32)));
+    set_value(i, two_val(desc));
 }
 
 // Lower a one-argument $fopen: materialize the filename and open a fresh MCD.
 void Backend::lower_fopen_mcd(Index i) {
     const AsciiArg n    = spill_ascii_arg(ir_->payload(i).unary, "fopen.name");
     llvm::Value*   desc = b_.CreateCall(fopen_mcd_fn(), { n.ptr, n.len, n.fwd });
-    set_value(i, packed(desc, desc, zero(32)));
+    set_value(i, two_val(desc));
 }
 
 // Lower a $system: materialize the command string (packed-ASCII vector or
@@ -515,7 +515,7 @@ void Backend::lower_system(Index i) {
     llvm::Value*   has_arg = b_.getInt32(p.imm != 0 ? 1 : 0);
     llvm::Value*   rc      = b_.CreateCall(system_fn(), { c.ptr, c.len, c.fwd, has_arg });
     // The return is a plain known integer (no x/z): must == may, z == 0.
-    set_value(i, packed(rc, rc, zero(32)));
+    set_value(i, two_val(rc));
 }
 
 // -- Functional coverage (LRM 19) ------------------------------------------
@@ -538,7 +538,7 @@ void Backend::lower_cover_query(Index i) {
         }
         return cast(must_of(value_of(args[0])), 64, false);
     };
-    const auto ival = [&](llvm::Value* v) { set_value(i, packed(v, v, zero(32))); };
+    const auto ival = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     const auto hval = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     switch (info.op) {
         case CoverOp::New:
@@ -655,7 +655,7 @@ void Backend::lower_file_unary(Index i, const char* fn) {
     auto*        i32  = b_.getInt32Ty();
     auto*        fnty = llvm::FunctionType::get(i32, { i32 }, false);
     llvm::Value* r    = b_.CreateCall(env_->llmod.getOrInsertFunction(fn, fnty), { fd });
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // $ungetc(c, fd).
@@ -666,7 +666,7 @@ void Backend::lower_ungetc(Index i) {
     auto*        i32  = b_.getInt32Ty();
     auto*        fnty = llvm::FunctionType::get(i32, { i32, i32 }, false);
     llvm::Value* r = b_.CreateCall(env_->llmod.getOrInsertFunction("rt_ungetc", fnty), { c, fd });
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // $fseek(fd, offset, operation).
@@ -679,7 +679,7 @@ void Backend::lower_fseek(Index i) {
     auto*        i32  = b_.getInt32Ty();
     auto*        fnty = llvm::FunctionType::get(i32, { i32, i32, i32 }, false);
     llvm::Value* r = b_.CreateCall(env_->llmod.getOrInsertFunction("rt_fseek", fnty), { fd, off, op });
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Lower a $fgets: a string-object destination goes straight to the runtime's
@@ -697,14 +697,14 @@ void Backend::lower_fgets(Index i) {
         llvm::Value* r    = b_.CreateCall(
           fgets_str_fn(), { lv_string_ptr(lv, StringUse::Write), fd, alloc_site_global(loc_text(i), "string") });
         str_chg_after(lv, snap);
-        set_value(i, packed(r, r, zero(32)));
+        set_value(i, two_val(r));
         return;
     }
     const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
     const ServiceSnapshot old          = service_snapshot(lv);
     llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
     service_after_write(lv, old);
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Resolve a whole packed-vector lvalue to (must|may plane ptr, z plane ptr, bit
@@ -800,14 +800,14 @@ void Backend::lower_ferror(Index i) {
         llvm::Value* r    = b_.CreateCall(
           ferror_str_fn(), { fd, lv_string_ptr(lv, StringUse::Write), alloc_site_global(loc_text(i), "string") });
         str_chg_after(lv, snap);
-        set_value(i, packed(r, r, zero(32)));
+        set_value(i, two_val(r));
         return;
     }
     const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
     const ServiceSnapshot old          = service_snapshot(lv);
     llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
     service_after_write(lv, old);
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Lower a $fscanf / $sscanf: build the rt_scan_arg[] descriptor array from the
@@ -882,7 +882,7 @@ void Backend::lower_scanf(Index i) {
     for (uint32_t k = 0; k < n; ++k) {
         service_after_write(lvalue_of(outs[k]), olds[k]);
     }
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Lower $test$plusargs(str): the query string is a compile-time literal
@@ -893,7 +893,7 @@ void Backend::lower_test_plusargs(Index i) {
     llvm::Value*       str_ptr = b_.CreateGlobalString(str);
     llvm::Value*       r       = b_.CreateCall(
       test_plusargs_fn(), { str_ptr, b_.getInt32(static_cast<uint32_t>(str.size())) });
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Lower $value$plusargs(user_string, var) (LRM §21.6).
@@ -933,7 +933,7 @@ void Backend::lower_value_plusargs(Index i) {
           { prefix_ptr, prefix_len, lv_string_ptr(lv, StringUse::Write),
             alloc_site_global(loc_text(i), "string") });
         str_chg_after(lv, snap);
-        set_value(i, packed(r, r, zero(32)));
+        set_value(i, two_val(r));
         return;
     }
     if (lv.width != lv.store_width) {
@@ -955,7 +955,7 @@ void Backend::lower_value_plusargs(Index i) {
     llvm::Value*           r   = b_.CreateCall(
       value_plusargs_fn(), { prefix_ptr, prefix_len, b_.getInt32(info.conv), arg });
     service_after_write(lv, old);
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Spill a packed-ASCII string value's must-bits to a stack byte buffer and
@@ -1007,7 +1007,7 @@ void Backend::lower_fread_word(Index i) {
                                             b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
                                             b_.getInt64(0), b_.getInt32(flags) });
     service_after_write(lv, old);
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Lower a $fread into a memory: reuse the $readmem geometry (plane bases,
@@ -1059,7 +1059,7 @@ void Backend::lower_fread_mem(Index i) {
     if (!silent_stores_) {
         vcd_touch_array(info.mem);   // bulk write: mark the array for the dump
     }
-    set_value(i, packed(r, r, zero(32)));
+    set_value(i, two_val(r));
 }
 
 // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled

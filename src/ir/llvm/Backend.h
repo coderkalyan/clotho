@@ -3311,6 +3311,8 @@ private:
     llvm::Value* z_of(Plane a);
 
     Plane two_val(llvm::Value* v);
+    Plane known_plane(llvm::Value* v, bool four_state);
+    Plane in_type_domain(Plane p, ValueType t);
 
     Plane to_four(Plane a);
 

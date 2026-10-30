@@ -71,23 +71,15 @@ Plane Backend::value_of(Index i) const {
 }
 
 void Backend::set_value(Index i, Plane p) {
-    // Keep a value's encoding in lockstep with its IR type's domain. slang
-    // unifies operand *types* (inserting conversions), not our Plane flags, so
-    // the "operands share a domain" invariant the operator dispatch relies on
-    // holds only if every value's `two` flag matches type_of(i). Producers that
-    // always emit the packed form (Arg, Call, SimTime, string ops, ...) are
-    // projected to a single iW here when their type is 2-state; the projection
-    // is lossless because such a value has must == may and no z.
-    const ValueType t = type_of(i);
-    // A real value stays fp-only; pack/unpack happens at the storage / ABI
-    // boundaries (see the real helpers).
-    if (!t.is_string && !t.is_real) {
-        if (t.four_state && p.two) {
-            p = to_four(p);
-        } else if (!t.four_state && !p.two) {
-            p = two_val(must_of(p));
-        }
-    }
+    // A value's encoding is its IR type's domain, which is the single source of
+    // truth: the operator dispatch reads `two` as the domain of both operands, so
+    // a producer whose plane disagrees with type_of(i) is a backend bug. Producers
+    // that read storage or an ABI cross the boundary with in_type_domain. A real
+    // value stays fp-only; pack/unpack happens at the storage / ABI boundaries (see
+    // the real helpers).
+    [[maybe_unused]] const ValueType t = type_of(i);
+    assert((t.is_string || t.is_real || p.two == !t.four_state) &&
+           "a value's plane encoding follows its IR type's domain");
     values_[static_cast<uint32_t>(i)] = p;
 }
 
@@ -978,7 +970,7 @@ void Backend::lower_inst(Index i) {
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
             }
-            set_value(i, v);
+            set_value(i, in_type_domain(v, t));
             return;
         }
         case Inst::Tag::Store: {
@@ -1459,7 +1451,8 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::AggEq: {
             const auto info = ir_->extra_data<AggEqInfo>(p.op_extra.extra);
-            set_value(i, lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type));
+            set_value(
+              i, in_type_domain(lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type), type_of(i)));
             return;
         }
 
@@ -1516,7 +1509,7 @@ void Backend::lower_inst(Index i) {
                 // $realtobits / $shortrealtobits: float -> integral pattern.
                 llvm::Value* pat = b_.CreateBitCast(fp_of(value_of(p.op_type.op)), int_ty(st.width));
                 pat              = cast(pat, dt.width, false);
-                set_value(i, packed(pat, pat, zero(dt.width)));
+                set_value(i, two_val(pat));
             }
             return;
         }
@@ -1637,7 +1630,7 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::StrLen: {
             llvm::Value* n = b_.CreateCall(str_len_fn(), { str_of(p.unary) });
             llvm::Value* v = b_.CreateTrunc(n, int_ty(32));
-            set_value(i, packed(v, v, zero(32)));
+            set_value(i, two_val(v));
             return;
         }
         case Inst::Tag::StrGetc: {
@@ -1646,7 +1639,7 @@ void Backend::lower_inst(Index i) {
             emit_string_bounds_check(i, str, p.binary.r, "<string>", /*is_write=*/false);
             llvm::Value* c = b_.CreateCall(str_getc_fn(), { str, idx });
             llvm::Value* v = b_.CreateTrunc(c, int_ty(8));
-            set_value(i, packed(v, v, zero(8)));
+            set_value(i, two_val(v));
             return;
         }
         case Inst::Tag::StrPutc: {
@@ -1673,7 +1666,8 @@ void Backend::lower_inst(Index i) {
                               : tag == T::StrAtooct ? str_atooct_fn()
                                                     : str_atobin_fn();
             llvm::Value* v = b_.CreateCall(fn, { str_of(p.unary) });
-            set_value(i, packed(v, v, zero(32)));
+            // LRM 6.16.9: the result is an `integer`, 4-state though never x or z.
+            set_value(i, known_plane(v, type_of(i).four_state));
             return;
         }
         case Inst::Tag::StrAtoreal: {
@@ -1712,7 +1706,7 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::StrICmp: {
             auto         fn = ir_->tag(i) == Inst::Tag::StrCmp ? str_cmp_fn() : str_icmp_fn();
             llvm::Value* c  = b_.CreateCall(fn, { str_of(p.binary.l), str_of(p.binary.r) });
-            set_value(i, packed(c, c, zero(32)));
+            set_value(i, two_val(c));
             return;
         }
         case Inst::Tag::StrUpper:
@@ -1865,7 +1859,7 @@ void Backend::lower_inst(Index i) {
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.unpack");
             b_.CreateCall(str_to_packed_fn(), { str_of(p.op_type.op), buf, b_.getInt32(to.width) });
             llvm::Value* v = b_.CreateAlignedLoad(int_ty(to.width), buf, llvm::Align(1));
-            set_value(i, packed(v, v, zero(to.width)));
+            set_value(i, two_val(v));
             return;
         }
         case Inst::Tag::StrAppendPacked: {
@@ -2209,7 +2203,7 @@ void Backend::lower_inst(Index i) {
                 now = b_.CreateUDiv(b_.CreateAdd(now, b_.getInt64(p.scale / 2)),
                                     b_.getInt64(p.scale));
             }
-            set_value(i, packed(now, now, zero(64)));
+            set_value(i, two_val(now));
             return;
         }
 
@@ -2220,7 +2214,7 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::Random: {
             // The PRNG draw is always known (no x/z): must == may, z == 0.
             llvm::Value* draw = b_.CreateCall(random_fn(), {});
-            set_value(i, packed(draw, draw, zero(32)));
+            set_value(i, two_val(draw));
             return;
         }
 
@@ -2337,7 +2331,7 @@ void Backend::lower_inst(Index i) {
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
             }
-            set_value(i, v);
+            set_value(i, in_type_domain(v, t));
             return;
         }
         case Inst::Tag::Ret:
@@ -2451,7 +2445,7 @@ Plane Backend::lower_string_relation(Inst::Tag tag, Index l, Index r) {
             break;
     }
     llvm::Value* bit = b_.CreateICmp(pred, c, b_.getInt32(0));
-    return bit_plane(bit, bit);
+    return two_val(bit);
 }
 
 // Assemble an APInt of `width` bits from little-endian canonical plane bytes.
@@ -2680,7 +2674,8 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
         args.push_back(zbuf);
         args.push_back(zbuf);
     } else {
-        const Plane f = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+        const Plane f = rhs;
         args.push_back(spill(must_of(f), "wins.must"));
         args.push_back(spill(may_of(f), "wins.may"));
         args.push_back(spill(f.z != nullptr ? f.z : zero(n), "wins.z"));
@@ -2878,11 +2873,15 @@ void Backend::lower_select_lazy(Index i) {
     // lower_short_circuit reduces a real operand to a truth bit (FNe
     // against 0.0) before the merge.
     const bool is_real = type_of(i).is_real;
-    // The two arms may disagree in Plane domain (a 2-state constant against a
-    // 4-state Land/Lor result), so each is normalized to the instruction's own
-    // domain inside its block — the PHIs need identical value types.
+    // Both arms are in the instruction's own domain (ir::verify: select-arm-domain):
+    // the PHIs need identical value types.
     const bool four = type_of(i).four_state;
-    const auto norm = [&](Index v) { return four ? to_four(value_of(v)) : Plane{ must_of(value_of(v)), nullptr, true }; };
+    const auto norm = [&](Index v) {
+        const Plane p = value_of(v);
+        assert(p.two == !four && "lazy select arms share the result's domain (ir::verify: select-arm-domain)");
+
+        return p;
+    };
 
     b_.SetInsertPoint(then_bb);
     lower_region(ir_->region(sel.then_));

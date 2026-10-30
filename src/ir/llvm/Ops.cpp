@@ -445,7 +445,7 @@ Plane Backend::lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
             c = b_.CreateFCmpOGE(x, y);
             break;
     }
-    return bit_plane(c, c);
+    return two_val(c);
 }
 
 // Float -> integral. FtoI rounds half away from zero (LRM 6.12.1, the
@@ -499,7 +499,7 @@ Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValueType to) {
     auto* phi = b_.CreatePHI(int_ty(to.width), 2);
     phi->addIncoming(fast, entry);
     phi->addIncoming(bigv, bigbb);
-    return packed(phi, phi, zero(to.width));
+    return known_plane(phi, to.four_state);
 }
 
 // Mux with real alternatives. Definite condition selects normally; an
@@ -675,18 +675,12 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w    = width_of(a);
 
     // 2-state: a single native op on the value; no X rule, no plane duplication.
-    // Both operands must be 2-state for this -- a 4-state/2-state mix (LRM
-    // 5.7: any 4-state operand makes the result 4-state) still needs the
-    // packed-plane path below, which assumes both operands already arrived
-    // as i(2W) (xz_mask reads a.mm/b.mm raw, not through must_of/may_of).
-    // Promote the narrower side instead of trusting the dispatch on `a`
-    // alone -- a mismatched-domain pair here is malformed LLVM IR (an i(2W)
-    // vs iW operand pair), not just a wrong answer.
-    if (a.two && !b.two) {
-        a = to_four(a);
-    } else if (!a.two && b.two) {
-        b = to_four(b);
-    } else if (a.two) {
+    // The IR has one domain for both operands (LRM 5.7: any 4-state operand makes
+    // the result 4-state, and the frontend converts the other side), so the planes
+    // agree and the packed-plane path below sees both as i(2W). A mismatched pair
+    // would be malformed LLVM IR, so it is an assertion, not a repair.
+    assert(a.two == b.two && "arithmetic operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         switch (tag) {
             case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
             case Inst::Tag::Sub: return two_val(b_.CreateSub(a.mm, b.mm));
@@ -764,19 +758,11 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     // INT_MIN / -1 is also poison, patched to the wrapped value like the
     // 4-state path.
     //
-    // Both operands must be 2-state for this fast path -- a 4-state/2-state
-    // mix (LRM 5.7: any 4-state operand makes the result 4-state) still
-    // needs the packed-plane path below, which assumes both operands
-    // already arrived as i(2W) (xz_mask reads a.mm/b.mm raw). Promote the
-    // narrower side instead of trusting the dispatch on `a` alone -- a
-    // mismatched-domain pair here is malformed LLVM IR (an i(2W) vs iW
-    // operand to the same icmp/select), observed to crash inside LLVM's
-    // constant folder rather than just miscompile.
-    if (a.two && !b.two) {
-        a = to_four(a);
-    } else if (!a.two && b.two) {
-        b = to_four(b);
-    } else if (a.two) {
+    // The IR has one domain for both operands; a mismatched pair is malformed LLVM
+    // IR (an i(2W) vs iW operand to the same icmp/select) that crashes inside LLVM's
+    // constant folder, so it is an assertion, not a repair.
+    assert(a.two == b.two && "divide / modulo operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
         llvm::Value* r;
         if (!sign) {
@@ -1007,18 +993,11 @@ Plane Backend::single_bit_lut(uint32_t lut, Plane a, Plane b) {
 Plane Backend::lower_bitwise(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w = width_of(a);
 
-    // 2-state: one native bitwise op; xnor is ~(xor). Both operands must be
-    // 2-state for this -- a 4-state/2-state mix (LRM 5.7: any 4-state
-    // operand makes the result 4-state) still needs the packed-plane path
-    // below, which assumes both operands already arrived as i(2W). Promote
-    // the narrower side instead of trusting the dispatch on `a` alone -- a
-    // mismatched-domain pair here is malformed LLVM IR, not just a wrong
-    // answer.
-    if (a.two && !b.two) {
-        a = to_four(a);
-    } else if (!a.two && b.two) {
-        b = to_four(b);
-    } else if (a.two) {
+    // 2-state: one native bitwise op; xnor is ~(xor). The IR has one domain for
+    // both operands (LRM 5.7), so a mismatched pair is malformed LLVM IR and an
+    // assertion, not a repair.
+    assert(a.two == b.two && "bitwise operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         switch (tag) {
             case Inst::Tag::Band:  return two_val(b_.CreateAnd(a.mm, b.mm));
             case Inst::Tag::Bor:   return two_val(b_.CreateOr(a.mm, b.mm));
@@ -1430,7 +1409,10 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
                                   real_plane(planes_to_real(pb, vt.width)));
     }
-    return lower_compare(Inst::Tag::Eq, pa, pb);
+    // Each leaf was read from its own storage, whose encoding is the signal's
+    // (a 2-state leaf of an aggregate written from a z-capable source is stored
+    // packed); the leaf's type says what its value is.
+    return lower_compare(Inst::Tag::Eq, in_type_domain(pa, vt), in_type_domain(pb, vt));
 }
 
 Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {
@@ -1459,14 +1441,12 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {
         }
     };
     // 2-state operands carry no x or z, so the result is a definite bit from one
-    // native compare.
-    if (a.two && b.two) {
+    // native compare. The IR has one domain for both operands, and a 4-state pair
+    // is the packed encoding below; a mismatched pair is malformed LLVM IR.
+    assert(a.two == b.two && "compare operands share a domain (ir::verify: operand-domain)");
+    if (a.two) {
         return two_val(b_.CreateICmp(predicate(), a.mm, b.mm));
     }
-    // A 4-state result. A 2-state operand next to a 4-state one is lifted into the
-    // packed encoding.
-    a = to_four(a);
-    b = to_four(b);
 
     // Equality keeps a branchless mask form (and a width-1 LUT). LRM 11.4.5:
     // the result is X only if unknown bits make the relation AMBIGUOUS. A bit
@@ -1521,15 +1501,12 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {
 //   CasexEq:  x and z bits in either operand are don't-care
 //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
 Plane Backend::lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
-    const uint32_t w = std::max(width_of(a), width_of(b));
+    assert(a.two == b.two && "case-compare operands share a domain (ir::verify: operand-domain)");
+    assert(width_of(a) == width_of(b) && "case-compare operands share a width (ir::verify: operand-width)");
     // 2-state operands carry no x or z, so every case form is a plain ==.
-    if (a.two && b.two) {
-        return two_val(b_.CreateICmpEQ(cast_plane(a, w, false).mm, cast_plane(b, w, false).mm));
+    if (a.two) {
+        return two_val(b_.CreateICmpEQ(a.mm, b.mm));
     }
-    // Lift operands to the packed form the masking below needs (z / may planes
-    // materialized).
-    a = cast_plane(to_four(a), w, false);
-    b = cast_plane(to_four(b), w, false);
 
     llvm::Value* eq;
     if (tag == Inst::Tag::CaseEq) {
@@ -1587,14 +1564,13 @@ Plane Backend::lower_inside_set(Index i) {
 }
 
 Plane Backend::lower_wildeq(Plane a, Plane b) {
-    const uint32_t w = std::max(width_of(a), width_of(b));
+    assert(a.two == b.two && "wildcard-equality operands share a domain (ir::verify: operand-domain)");
+    assert(width_of(a) == width_of(b) && "wildcard-equality operands share a width (ir::verify: operand-width)");
+    const uint32_t w = width_of(a);
     // 2-state operands have no wildcard (x/z) bits, so ==? is a plain ==.
-    if (a.two && b.two) {
-        return two_val(b_.CreateICmpEQ(cast_plane(a, w, false).mm, cast_plane(b, w, false).mm));
+    if (a.two) {
+        return two_val(b_.CreateICmpEQ(a.mm, b.mm));
     }
-    // A 4-state result: lift operands.
-    a = cast_plane(to_four(a), w, false);
-    b = cast_plane(to_four(b), w, false);
     auto*          wide  = int_ty(2 * w);
     llvm::Value*   unkb  = b_.CreateXor(must_of(b), may_of(b)); // x/z bits of b
     llvm::Value*   keep  = b_.CreateNot(unkb);
@@ -1718,11 +1694,13 @@ Plane Backend::lower_lequiv(Plane a, Plane b) {
 }
 
 Plane Backend::lower_select(Plane cond, Plane a, Plane b) {
-    // 2-state arms: a native select. slang unifies the two arms to a common
-    // type, so both are 2-state here. A 4-state condition may be x (LRM
+    // The arms share one domain: the frontend converts both to the conditional's
+    // type (LRM 11.4.11), and a mismatched pair would be malformed LLVM IR.
+    assert(a.two == b.two && "select arms share a domain (ir::verify: select-arm-domain)");
+    // 2-state arms: a native select. A 4-state condition may be x (LRM
     // 1800-2023 11.4.11: bitwise merge, x where the arms disagree); in a
     // 2-state result that x collapses to 0, which is exactly `a & b`.
-    if (a.two && b.two) {
+    if (a.two) {
         llvm::Value* ct  = b_.CreateICmpNE(must_of(cond), zero(1));
         llvm::Value* sel = b_.CreateSelect(ct, a.mm, b.mm);
         if (cond.two) {
@@ -1731,11 +1709,6 @@ Plane Backend::lower_select(Plane cond, Plane a, Plane b) {
         llvm::Value* known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
         return two_val(b_.CreateSelect(known, sel, b_.CreateAnd(a.mm, b.mm)));
     }
-    // Defensive: a lone 2-state arm is lifted so the packed body's direct plane
-    // access is uniform.
-    a = to_four(a);
-    b = to_four(b);
-
     const uint32_t w          = width_of(a);
     llvm::Value*   cond_known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
     llvm::Value*   cond_true  = b_.CreateICmpNE(must_of(cond), zero(1));
