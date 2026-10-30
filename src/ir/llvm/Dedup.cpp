@@ -252,6 +252,117 @@ void Backend::report_dedup_shapes(const std::vector<llvm::Function*>& group_fns)
                  (unsigned long long)skipped);
 }
 
+// `--stat=unit-code`: how far the backend is from compiling each unit once
+// (docs/design/modular-compilation.md, step 3). For every unit with several
+// instances, compares each of its single-scope groups across the instances
+// after numbering every design symbol (`@clotho.*`) by first occurrence: what
+// such a symbol names an instance record binding could supply, so a mismatch
+// left is an immediate or a code shape baked per instance. Groups spanning
+// instances and processes outside any instance have no unit to compare in and
+// are counted apart.
+void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
+    const auto normalize = [](llvm::Function* fn) {
+        std::string raw;
+        {
+            llvm::raw_string_ostream os(raw);
+            fn->print(os);
+        }
+        const auto ident = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+                   c == '$' || c == '-';
+        };
+        ankerl::unordered_dense::map<std::string, uint32_t> ids;
+        std::string                                         out;
+        size_t                                              i = 0;
+        while (i < raw.size()) {
+            if (raw[i] != '@') {
+                out += raw[i++];
+                continue;
+            }
+            size_t j = i + 1;
+            while (j < raw.size() && ident(raw[j])) {
+                ++j;
+            }
+            const std::string tok = raw.substr(i, j - i);
+            if (tok == "@" + fn->getName().str()) {
+                out += "@FN";
+            } else if (tok.starts_with("@clotho.")) {
+                const auto [it, fresh] = ids.try_emplace(tok, static_cast<uint32_t>(ids.size()));
+                out += "@SYM" + std::to_string(it->second);
+            } else {
+                out += tok;
+            }
+            i = j;
+        }
+        return out;
+    };
+
+    // (unit, unit-local group ordinal) -> the group in each instance.
+    ankerl::unordered_dense::map<uint64_t, std::vector<uint32_t>> by_slot;
+    ankerl::unordered_dense::map<uint32_t, uint32_t>              instances;
+    for (const Anchor& a : anchors_) {
+        if (a.unit != InstanceScope::no_unit) {
+            ++instances[a.unit];
+        }
+    }
+    uint64_t cross = 0, cross_members = 0, unanchored = 0;
+    for (uint32_t g = 0; g < groups_.size(); ++g) {
+        const uint32_t aid = group_unit_anchor_[g];
+        if (aid == SignalSlot::no_anchor) {
+            const uint32_t sc = mod_.processes()[groups_[g].front()].scope;
+            if (sc == Process::no_scope) {
+                ++unanchored;
+            } else {
+                ++cross;
+                cross_members += groups_[g].size();
+            }
+            continue;
+        }
+        const uint32_t unit = anchors_[aid].unit;
+        if (unit == InstanceScope::no_unit || instances[unit] < 2) {
+            continue;
+        }
+        by_slot[(static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]].push_back(g);
+    }
+
+    uint64_t    compared = 0, same = 0;
+    unsigned    shown = 0;
+    std::string samples;
+    for (const auto& [key, gs] : by_slot) {
+        if (gs.size() < 2) {
+            continue;
+        }
+        ++compared;
+        const std::string first = normalize(group_fns[gs.front()]);
+        bool              equal = true;
+        for (size_t m = 1; m < gs.size() && equal; ++m) {
+            const std::string other = normalize(group_fns[gs[m]]);
+            if (other == first) {
+                continue;
+            }
+            equal = false;
+            if (shown++ < 8) {
+                std::istringstream a(first), b(other);
+                std::string        la, lb;
+                while (std::getline(a, la) && std::getline(b, lb) && la == lb) {
+                }
+                samples += "  " + group_fns[gs.front()]->getName().str() + " vs " + group_fns[gs[m]]->getName().str() +
+                           ":\n    " + la + "\n    " + lb + "\n";
+            }
+        }
+        same += equal ? 1 : 0;
+    }
+    std::fprintf(stderr,
+                 "unit-code: %llu groups of multi-instance units compared, %llu identical up to design "
+                 "symbols; %llu groups span instances (%llu members), %llu belong to no instance\n%s",
+                 (unsigned long long)compared,
+                 (unsigned long long)same,
+                 (unsigned long long)cross,
+                 (unsigned long long)cross_members,
+                 (unsigned long long)unanchored,
+                 samples.c_str());
+}
+
 // The single @clotho.inst.* global a function references, or null when it
 // references none, more than one, or one from a PHI operand (a shape the
 // ctx-to-parameter rewrite below does not handle). Eligible bodies

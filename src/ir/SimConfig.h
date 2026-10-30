@@ -46,6 +46,9 @@ enum class Stat : uint32_t {
     // Frontend units: how many instances each specialization has, and which
     // specializations' instances do not yet lower to identical unit IR.
     Units = 1u << 5,
+    // Backend units: which single-scope groups of multi-instance units still
+    // lower to different code per instance (report_unit_code).
+    UnitCode = 1u << 6,
 };
 
 [[nodiscard]] inline bool stat_on(uint32_t stats, Stat s) {

@@ -988,6 +988,8 @@ struct Anchor {
     uint32_t              ctx_wait_base = 0;
     // Def-local single-scope group count (sizes the blk fields).
     uint32_t n_groups = 0;
+    // The Design unit the scope expands (InstanceScope::unit).
+    uint32_t unit = InstanceScope::no_unit;
 };
 
 // One function-frame local: its slot type and width / domain. A 2-state local is
@@ -1945,6 +1947,8 @@ private:
     static std::string normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst = nullptr);
 
     void report_dedup_shapes(const std::vector<llvm::Function*>& group_fns);
+
+    void report_unit_code(const std::vector<llvm::Function*>& group_fns);
 
     // -- Module-instance body sharing (dedup V1) --
 

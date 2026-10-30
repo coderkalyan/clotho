@@ -126,6 +126,9 @@ void Backend::run() {
     if (!shape_sets_.empty()) {
         report_dedup_shapes(group_fns);
     }
+    if (stat_on(config_.stats, Stat::UnitCode)) {
+        report_unit_code(group_fns);
+    }
     if (config_.dedup && config_.thunk) {
         share_twin_groups(group_fns);
     }

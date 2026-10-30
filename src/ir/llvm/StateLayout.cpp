@@ -173,7 +173,7 @@ bool Backend::is_assoc_type(Ref type) const {
 // storage_ptr addresses signals anchor-relative.
 void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier) {
     const auto aid = static_cast<uint32_t>(anchors_.size());
-    anchors_.push_back(Anchor{ .name = hier });
+    anchors_.push_back(Anchor{ .name = hier, .unit = scope.unit });
     if (scope.id >= anchor_of_scope_.size()) {
         anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
     }

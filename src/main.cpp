@@ -450,7 +450,7 @@ void register_options(Registry& r, Options& o) {
                     "--stat",
                     o.stats,
                     "Print a compiler statistic while building, for working on clotho: dedup, "
-                    "dedup-sets, comb-fuse, finish, parallel or units (repeatable, comma-separated)",
+                    "dedup-sets, comb-fuse, finish, parallel, units or unit-code (repeatable, comma-separated)",
                     "<name>",
                     slang::CommandLineFlags::CommaList);
     r.add(kBuildRun,
@@ -1313,9 +1313,11 @@ int main(int argc, char** argv) {
             config.stats |= static_cast<uint32_t>(Stat::Parallel);
         } else if (name == "units") {
             config.stats |= static_cast<uint32_t>(Stat::Units);
+        } else if (name == "unit-code") {
+            config.stats |= static_cast<uint32_t>(Stat::UnitCode);
         } else {
             return usage_error(std::format("unknown --stat '{}'; expected dedup, dedup-sets, comb-fuse, "
-                                           "finish, parallel or units",
+                                           "finish, parallel, units or unit-code",
                                            name));
         }
     }
