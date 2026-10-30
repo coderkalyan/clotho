@@ -831,20 +831,23 @@ void Lowerer::emit_wire_resolvers() {
         if (sites.empty()) {
             body = b.finish();
         } else {
-            // A forceable net's fold lives in a task so that `release` can run it
-            // too (release_net); the process just calls it.
+            // A forceable net's fold lives in a plain function so that `release`
+            // can run it too (release_net), from any procedural context a release
+            // may appear in, a function included (LRM 13.4.4: a function may hold
+            // any statement that does not block, and the fold never blocks). The
+            // process just calls it.
             b.ret_void(l);
-            const ir::FunctionId fid = net_resolver_task(net_u);
+            const ir::FunctionId fid = net_resolver_fn(net_u);
             module_.set_function(fid,
                                  ir::Function{ .name        = module_.signal(net).name + "$resolve",
                                                .return_type = module_.pool.void_type,
                                                .param_types = {},
                                                .arg_dirs    = {},
                                                .local_types = {},
-                                               .is_task     = true,
+                                               .is_task     = false,
                                                .ir          = b.finish() });
             ir::Builder pb(module_.pool);
-            pb.task_call(fid, {}, l);
+            pb.call(fid, {}, l);
             body = pb.finish();
         }
         module_.add_process(ir::Process{ .activation    = ir::Activation::Always,
@@ -857,8 +860,8 @@ void Lowerer::emit_wire_resolvers() {
     }
 }
 
-ir::FunctionId Lowerer::net_resolver_task(uint32_t net) {
-    const auto [it, fresh] = net_resolver_task_.try_emplace(net);
+ir::FunctionId Lowerer::net_resolver_fn(uint32_t net) {
+    const auto [it, fresh] = net_resolver_fn_.try_emplace(net);
     if (fresh) {
         it->second = module_.reserve_function();
     }
@@ -1472,7 +1475,7 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
         // LRM 10.6.2: "when released, the net shall immediately be assigned the
         // value determined by the drivers of the net". Run the resolver's fold
         // now rather than leave it to the process the store above only wakes.
-        b.task_call(net_resolver_task(static_cast<uint32_t>(sit->second)), {}, l);
+        b.call(net_resolver_fn(static_cast<uint32_t>(sit->second)), {}, l);
     }
 }
 

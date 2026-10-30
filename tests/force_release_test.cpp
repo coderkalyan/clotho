@@ -665,3 +665,56 @@ TEST_CASE("release of a net takes the driven value at once") {
         endmodule)";
     CHECK(run_capture_finish(src) == "bus=0000\npb=1000\npb=0000\nund=zzzz\nmd=0100\n");
 }
+
+// `release` is legal wherever a statement that does not block is (LRM 13.4.4), so
+// it can sit in a function or a class method function, and the net takes its
+// driven value at once there too (LRM 10.6.2). The release runs the net's
+// resolver, which therefore has to be callable from a plain function. A net with
+// a net delay folds through an inertial store, the other shape of that resolver:
+// it is released from a function in two instances and settles on its driver.
+// Oracle: iverilog 13 prints the first three lines for the same source (it does
+// not support net delays, so the last two are the LRM's: the driver's value).
+TEST_CASE("release of a net inside a function and a class method function") {
+    constexpr std::string_view src = R"(
+        module sub(input [3:0] d);
+            wire [3:0] bus = d;
+            wire [3:0] #2 dbus;
+            assign dbus = d;
+            function void rel();
+                release bus;
+                release dbus;
+            endfunction
+            initial begin
+                #1 force bus = 4'b1111;
+                force dbus = 4'b1010;
+                #1 rel();
+                $display("%m bus=%b", bus);
+                #8 $display("%m dbus=%b", dbus);
+            end
+        endmodule
+        module top;
+            logic [3:0] in = 4'b0000;
+            wire  [3:0] cbus = in;
+            sub a(4'b0001);
+            sub b(4'b0110);
+            class Drv;
+                function void unforce();
+                    release cbus;
+                endfunction
+            endclass
+            Drv drv;
+            initial begin
+                drv = new;
+                #1 force cbus = 4'b1111;
+                #1 drv.unforce();
+                $display("cbus=%b", cbus);
+                #9 $finish;
+            end
+        endmodule)";
+    const std::string          out = run_capture_finish(src);
+    CHECK(out.find("cbus=0000\n") != std::string::npos);
+    CHECK(out.find("top.a bus=0001\n") != std::string::npos);
+    CHECK(out.find("top.b bus=0110\n") != std::string::npos);
+    CHECK(out.find("top.a dbus=0001\n") != std::string::npos);
+    CHECK(out.find("top.b dbus=0110\n") != std::string::npos);
+}
