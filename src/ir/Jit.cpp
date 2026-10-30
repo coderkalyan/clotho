@@ -293,6 +293,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         llvm::orc::ExecutorAddr::fromPtr(&rt_finishing),
         llvm::JITSymbolFlags::Exported,
     };
+    // rt_intra_total is a data symbol too: generated code tests it inline to keep a plain
+    // NBA behind the timed updates already released.
+    rt_syms[(*jit)->mangleAndIntern("rt_intra_total")] = {
+        llvm::orc::ExecutorAddr::fromPtr(&rt_intra_total),
+        llvm::JITSymbolFlags::Exported,
+    };
     expose("rt_vcd_flush", &rt_vcd_flush);
     expose("rt_vcd_off", &rt_vcd_off);
     expose("rt_vcd_on", &rt_vcd_on);
@@ -418,6 +424,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_assoc_move", &rt_assoc_move);
     expose("rt_intra_alloc", &rt_intra_alloc);
     expose("rt_intra_cb", &rt_intra_cb);
+    expose("rt_intra_now", &rt_intra_now);
     expose("rt_intra_ready_base", &rt_intra_ready_base);
     expose("rt_intra_ready_count", &rt_intra_ready_count);
     expose("rt_intra_any", &rt_intra_any);

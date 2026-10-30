@@ -2005,6 +2005,12 @@ void* rt_intra_alloc(uint32_t idx, uint32_t stride);
 // not touch design state (commit is the NBA region's job).
 void rt_intra_cb(rt_timer* timer, void* ctx);
 
+// Link a record onto its site's ready list at the moment its update is created by the
+// statement that filled it (a plain NBA copied there, or a zero delay): behind every
+// record already on the list, and ahead of any that matures later. The commit then
+// applies the records in list order. Does not touch design state.
+void rt_intra_now(void* rec);
+
 // Base (a `void**` array of record pointers) and length of site `idx`'s ready
 // list, read once in the NBA region to drive the backend-emitted commit loop.
 void*    rt_intra_ready_base(uint32_t idx);
@@ -2013,6 +2019,11 @@ uint32_t rt_intra_ready_count(uint32_t idx);
 // Total ready records across all sites; nba.check tests this to decide whether a
 // deferred commit is needed.
 uint32_t rt_intra_any(void);
+
+// The same total as a variable, so generated code can test it inline: a plain NBA to a
+// signal that also takes timed ones asks whether any record is waiting before it pays
+// for the per-site count.
+extern uint32_t rt_intra_total;
 
 // Return site `idx`'s committed records to its freelist and clear its ready list
 // (called by the backend after the site's commit loop).

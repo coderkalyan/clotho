@@ -52,9 +52,9 @@ that is not a known nonzero constant (`#(expr)`, or a real that may round to zer
 ticks) lowers to a test of `delay == 0` that picks the plain `<=` or the deferred
 record (`store_leaf`, per leaf, so a decomposing target shares one evaluation of
 the delay). The deferred path's arm-site zero branch (`emit_intra_nba_arm`) is
-therefore only a safety net: a deferred commit runs after block-commit in
-`ncommit`, so a zero-delay record arriving there would order after a plain NBA to
-the same signal in the same instant, not by execution order.
+therefore only a safety net: it links the record onto the ready list at once
+(`rt_intra_now`), which commits after the block commit, and a plain NBA that
+executes after it copies itself behind it ("Order against plain NBAs" below).
 
 ## Semantics (the two facts that shape the design)
 
@@ -326,7 +326,74 @@ these lists in a separate slot-indexed vector so the id's high bit never sizes o
 `design_uses_event_triggers_` gates the extra call, so a design with no such control
 emits nothing new.
 
-Deferred follow-ups are scoped in full in the next section.
+Deferred follow-ups are scoped in full in "The remainder" below.
+
+## Order against plain NBAs
+
+A plain `<=` stages into the target's block shadow (or the array / aggregate queue) and
+commits ahead of the ready list, so a deferred update of the same bits used to commit after
+every plain NBA of the instant, whenever that NBA executed.
+
+LRM 4.6 b): "NBAs shall be performed in the order the statements were executed", and 10.4.2:
+"if there is clear ordering of the execution of a set of nonblocking assignments, then the
+order of the resulting updates of the destination of the nonblocking assignments shall be the
+same as the ordering of the execution". Let A be the execution of the deferred statement, T
+the moment its update becomes ready (the delay elapses, or the event occurs) and P a plain
+NBA to the same bits, all in one NBA region:
+
+| executed in the order | performed last | because |
+|---|---|---|
+| P, A, T | the update | P is earlier than A, and than T |
+| A, T, P | P | P is later than A, and than T |
+| A, P, T | not decided | A is earlier than P, T is later |
+
+For `#d` the update event is scheduled when the statement executes (4.9.4: "schedules the
+update as an NBA update event ... as a future event if the delay is nonzero", and 10.4.2
+Example 6 orders two updates for one instant by the order their statements executed), so T is
+the arm and the last row cannot occur: a plain NBA executed in the instant a delayed update
+fires is later than it.
+
+**The open question.** In the last row 4.6 b) puts the update first, since its statement
+executed first, and 15.5.4 puts it last (of `->>`: "it creates a nonblocking assign update
+event in the time in which the delay control expires or the event control occurs"); 4.9.4 and
+9.4.5 do not say when an event-controlled update is placed. Clotho commits the update last, as
+it always did, and `tests/intra_assign_test.cpp` pins that as a snapshot. The same question
+orders two event-controlled updates that mature in the opposite order to their arms: they
+commit in arm order, as before. Neither oracle settles it. iverilog applies the update in the
+active region at the occurrence (`x <= @e v; -> e; $display(x)` prints v), so every plain NBA
+of the step wins. Verilator orders by source position: it prints the other answer when the
+arming statement sits in a later `initial` than the plain write and the trigger.
+
+A deferred update is released synchronously with its trigger, before the triggering process
+executes its next statement, so a plain NBA that follows `-> e` in that process is later than
+the update. (4.7 leaves the interleaving of a release with the triggering process's
+continuation to the simulator; iverilog and Clotho both release at once.)
+
+### Mechanism
+
+The plain NBA is unchanged. One to a signal that is also an intra target (`intra_nba_sigs_`)
+additionally tests `rt_intra_ready_count(idx)`. A record on the ready list was released
+before this write executed, so the write is later than it, and the write also arms itself as
+a record that is linked at once (`emit_intra_nba_ordered`, then `emit_intra_nba_arm` with a
+zero delay, then `rt_intra_now`). The commit applies the staged write with the other plain
+NBAs, then the list in order: the released records, then the copy, which re-applies the
+write's own bits over them (the record carries the positioned value and mask the staged write
+used). A write before the arm, the update and a write after the trigger on overlapping bits
+therefore land in that order, bit for bit.
+
+`rt_intra_now` appends and moves the site's `plain_end` past the copy. A record that matures
+later is inserted in arm order but never ahead of `plain_end` (`intra_ready_push`), so it
+still commits after a plain write that executed before it matured, as every record did.
+Records that no plain write separates keep their arm order; with a plain write between their
+releases, the one released first commits first.
+
+A signal with no timed NBA compiles to what it did before. A plain NBA to one that has pays
+a load of `rt_intra_total`, and the `rt_intra_ready_count` call and the copy only while a
+record is waiting somewhere.
+`classify_ordered_plain` classifies each plain site on such a signal as an intra site, so
+the record type carries the mask or destination pointer the plain write needs. A
+runtime-offset select of a very wide vector cannot be encoded in the record; a plain NBA of
+that shape to such a signal is refused, as the timed forms are.
 
 ## The remainder (scoped, not implemented)
 

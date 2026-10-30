@@ -1032,3 +1032,56 @@ TEST_CASE("virtual interface: intra-assignment event commits into the handle's i
     )");
     CHECK(out == "t=11 b0=00 b1=00\nt=23 b0=00 b1=3c\n");
 }
+
+// A write through a handle after the trigger of an event-controlled update to the same
+// member commits after the update (LRM 4.6 b), 10.4.2; docs/design/intra-assignment-
+// timing.md, "Order against plain NBAs"), in the instance the handle names, and a plain
+// write to the twin instance is not disturbed by the pending record. The same holds
+// when the update is a delayed one. Derived from the LRM clauses: iverilog 13 has no
+// interface support.
+TEST_CASE("virtual interface: a plain write after the trigger commits after a timed update") {
+    SUBCASE("event control") {
+        const std::string out = run_capture(R"(
+            interface ibus; logic [7:0] d; endinterface
+            module top;
+                ibus b0(); ibus b1();
+                virtual ibus vif;
+                event e;
+                initial begin
+                    b0.d = 8'h00;
+                    b1.d = 8'h00;
+                    vif  = b1;
+                    vif.d <= @e 8'h11;
+                    #1;
+                    -> e;
+                    vif.d <= 8'h22;
+                    b0.d  <= 8'h33;
+                    #1 $display("b0=%h b1=%h", b0.d, b1.d);
+                    $finish;
+                end
+            endmodule
+        )");
+        CHECK(out == "b0=33 b1=22\n");
+    }
+    SUBCASE("delay") {
+        const std::string out = run_capture(R"(
+            interface ibus; logic [7:0] d; endinterface
+            module top;
+                ibus b0(); ibus b1();
+                virtual ibus vif;
+                initial begin
+                    b0.d = 8'h00;
+                    b1.d = 8'h00;
+                    vif  = b1;
+                    vif.d <= #1 8'h11;
+                    #1;
+                    vif.d <= 8'h22;
+                    b0.d  <= 8'h33;
+                    #1 $display("b0=%h b1=%h", b0.d, b1.d);
+                    $finish;
+                end
+            endmodule
+        )");
+        CHECK(out == "b0=33 b1=22\n");
+    }
+}

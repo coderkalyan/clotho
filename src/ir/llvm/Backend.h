@@ -1312,6 +1312,8 @@ private:
 
     void classify_intra_target(const Ir& ir, Index lv_idx, const NbaTarget& t);
 
+    void classify_ordered_plain(const Ir& ir);
+
     void nba_classify_ir(const Ir& ir);
 
     void nba_classify();
@@ -2351,6 +2353,8 @@ private:
 
     llvm::FunctionCallee intra_alloc_fn();
     llvm::FunctionCallee intra_cb_fn();
+    llvm::FunctionCallee intra_now_fn();
+    llvm::Constant*      intra_total_gv();
     llvm::FunctionCallee intra_ready_base_fn();
     llvm::FunctionCallee intra_ready_count_fn();
     llvm::FunctionCallee intra_any_fn();
@@ -2446,6 +2450,7 @@ private:
     llvm::Value* emit_gc_ref_container_add(const LValue& lv);
 
     uint32_t intra_idx(Signal sig) const;
+    bool              is_intra_target(Signal sig) const;
     llvm::StructType* intra_rec_ty(const SignalSlot& s);
     uint32_t intra_rec_mask(const SignalSlot& s) const;
     uint32_t intra_rec_mm_ptr(const SignalSlot& s) const;
@@ -2837,6 +2842,8 @@ private:
     void fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructType* rt, llvm::Value* rec);
 
     void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
+
+    void emit_intra_nba_ordered(const LValue& lv, Plane rhs);
 
     void emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
 

@@ -165,6 +165,30 @@ void Backend::classify_intra_target(const Ir& ir, Index lv_idx, const NbaTarget&
     }
 }
 
+// Classify the plain NBAs to signals that also take timed ones. Such a write copies
+// itself onto the ready list (emit_intra_nba_ordered), so the record has to be able to
+// encode its shape: classifying it as an intra site too sets the flags the record
+// type is built from (`intra_masked`, `intra_ptr`). The set of intra targets is
+// complete only after every body has been scanned, hence a second pass.
+void Backend::classify_ordered_plain(const Ir& ir) {
+    if (intra_nba_sigs_.empty()) {
+        return;
+    }
+    for (size_t k = 0; k < ir.inst_count(); ++k) {
+        const auto idx = static_cast<Index>(k);
+        if (ir.tag(idx) != Inst::Tag::StoreNb) {
+            continue;
+        }
+        const Index     lv_idx = ir.payload(idx).binary.l;
+        const NbaTarget t      = nba_target(ir, lv_idx);
+        // A string place stages an owned handle, which the record does not hold; its
+        // writes take the string path and are not copied.
+        if (is_intra_target(t.sig) && !lvalue_is_string_place(ir, lv_idx)) {
+            classify_intra_target(ir, lv_idx, t);
+        }
+    }
+}
+
 // Mark NBA-target signals reached by one IR body (a process or a task): set
 // `nba`, `nba_partial` (any bit/part-select site), `nba_dyn` (any runtime-indexed
 // select), and collect unpacked-array targets for the runtime deferred queue.
@@ -365,6 +389,12 @@ void Backend::nba_classify() {
     // signal's shadow. A subroutine with no NBA records nothing.
     for (uint32_t i = 0; i < mod_.function_count(); ++i) {
         nba_classify_ir(mod_.function(static_cast<FunctionId>(i)).ir);
+    }
+    for (const Process& p : mod_.processes()) {
+        classify_ordered_plain(p.ir);
+    }
+    for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+        classify_ordered_plain(mod_.function(static_cast<FunctionId>(i)).ir);
     }
     n_nba_          = 0;
     const auto sigs = mod_.signals();
@@ -947,6 +977,10 @@ void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
 uint32_t Backend::intra_idx(Signal sig) const {
     const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
     return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
+}
+
+bool Backend::is_intra_target(Signal sig) const {
+    return std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig) != intra_nba_sigs_.end();
 }
 
 llvm::StructType* Backend::intra_rec_ty(const SignalSlot& s) {
@@ -1976,14 +2010,13 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
 
     // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
     // (deadline must be > now) and its update lands in the current instant's
-    // NBA region, so push the record straight onto the ready list (rt_intra_cb).
+    // NBA region, so link the record straight onto the ready list (rt_intra_now).
     // A compile-time-constant delay emits only the taken path; a runtime delay
     // that happens to be zero branches to the same immediate path.
-    auto* nullp     = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     auto  schedule  = [&] {
         b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, intra_cb_trampoline() });
     };
-    auto immediate = [&] { b_.CreateCall(intra_cb_fn(), { rec, nullp }); };
+    auto immediate = [&] { b_.CreateCall(intra_now_fn(), { rec }); };
 
     if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
         if (c->isZero()) {
@@ -2004,6 +2037,51 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     schedule();
     b_.CreateBr(contb);
     b_.SetInsertPoint(contb);
+}
+
+// A plain NBA to a signal that also takes `<= #d` / `<= @e`. NBAs are performed in the
+// order the statements were executed (LRM 4.6 b), 10.4.2), and this write is later than
+// every deferred update of the signal whose delay elapsed or whose event occurred
+// before it executed: those records are already on the ready list. But the write stages
+// into the block shadow (or the array / aggregate queue), which commits BEFORE the
+// ready list, so left alone it would lose to them. When such a record is waiting, also
+// copy the write onto the list behind it: the record carries the value and mask the
+// staged write used, so replaying it re-applies exactly the bits this write selects.
+//
+// The staged write itself is unchanged, which keeps the order against a record that
+// matures AFTER this write executed as it was, with the record last. The LRM text does
+// not say which is later there -- the statement that was armed first, or the update
+// scheduled by the later occurrence (docs/design/intra-assignment-timing.md, "Order
+// against plain NBAs") -- so nothing is decided for it here. A write executed while no
+// record is waiting anywhere costs one load of rt_intra_total.
+void Backend::emit_intra_nba_ordered(const LValue& lv, Plane rhs) {
+    if (lv.wide_dyn) {
+        // TODO: a runtime-offset select of a very wide vector stages through
+        // rt_wide_ins, which the deferred record has no room to encode (see
+        // fill_intra_payload). Refused rather than left ordered wrongly against the
+        // timed updates of the same vector.
+        throw BackendError{ "nonblocking assignment to a runtime-offset select of a very wide "
+                            "vector that also takes a timed nonblocking assignment is not "
+                            "supported" };
+    }
+    auto* fn    = b_.GetInsertBlock()->getParent();
+    auto* probe = llvm::BasicBlock::Create(ctx_, "intraord.probe", fn);
+    auto* copy  = llvm::BasicBlock::Create(ctx_, "intraord.copy", fn);
+    auto* cont  = llvm::BasicBlock::Create(ctx_, "intraord.cont", fn);
+    // A word every simulation keeps, ahead of the per-site count: it is zero for almost
+    // every write, and the count is a call into the runtime.
+    b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(b_.getInt32Ty(), intra_total_gv()), b_.getInt32(0)), probe, cont);
+
+    b_.SetInsertPoint(probe);
+    llvm::Value* waiting =
+      b_.CreateICmpNE(b_.CreateCall(intra_ready_count_fn(), { intra_id_value(lv.sig) }), b_.getInt32(0));
+    b_.CreateCondBr(waiting, copy, cont);
+
+    b_.SetInsertPoint(copy);
+    emit_intra_nba_arm(lv, rhs, b_.getInt64(0));
+    b_.CreateBr(cont);
+
+    b_.SetInsertPoint(cont);
 }
 
 // Arm (or reschedule) an inertial continuous-assignment delay (`assign #d x = y`,

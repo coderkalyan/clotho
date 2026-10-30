@@ -1184,6 +1184,15 @@ llvm::FunctionCallee Backend::intra_cb_fn() {
     return rt_fn("rt_intra_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
+llvm::FunctionCallee Backend::intra_now_fn() {
+    return rt_fn("rt_intra_now", b_.getVoidTy(), { raw_ptr_ty() });
+}
+
+// The runtime rt_intra_total word: records waiting on any ready list.
+llvm::Constant* Backend::intra_total_gv() {
+    return env_->llmod.getOrInsertGlobal("rt_intra_total", b_.getInt32Ty());
+}
+
 llvm::FunctionCallee Backend::intra_ready_base_fn() {
     return rt_fn("rt_intra_ready_base", raw_ptr_ty(), { b_.getInt32Ty() });
 }
