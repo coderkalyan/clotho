@@ -1179,10 +1179,9 @@ void Backend::build_rng_global() {
 //
 // A subroutine is may-finish if its own body contains a Finish ($finish,
 // $stop, or the finish $fatal appends) or if it calls a may-finish callee.
-// Virtual calls take the statically named target, matching how the
-// by-pointer argument scan resolves them; an override that finishes where
-// its prototype does not would be missed, so treat the virtual figure as a
-// lower bound.
+// A virtual call can dispatch to any override, so once anything in the design
+// finishes, a body that makes a virtual call is may-finish too (matching
+// virtual_call_may_finish at the call site itself).
 //
 // Scan one body for a Finish, collecting its call edges on the way. The edges
 // are ir::collect_callees', so a `$finish` inside a fork child marks the
@@ -1239,6 +1238,21 @@ std::vector<uint8_t> Backend::compute_may_finish(std::vector<uint8_t>* direct_ou
     // cycle contributes what the in-progress callee has so far; a recursive
     // subroutine that finishes is still caught by its own seed.
     std::vector<uint8_t> may(direct);
+    // Seeded before the closure so a virtual call's may-finish reaches every
+    // caller up the chain. Without it the call site tested rt_finishing and left,
+    // but its caller, not in the closure, ran on with whatever the abandoned call
+    // returned -- a garbage class handle in UVM, after a stubbed method's $fatal.
+    if (std::any_of(direct.begin(), direct.end(), [](uint8_t v) { return v != 0; })) {
+        for (uint32_t f = 0; f < nf; ++f) {
+            const Ir& ir = mod_.function(static_cast<FunctionId>(f)).ir;
+            for (uint32_t k = 0; k < ir.inst_count() && may[f] == 0; ++k) {
+                const Inst::Tag tag = ir.tag(static_cast<Index>(k));
+                if (tag == Inst::Tag::CallVirtual || tag == Inst::Tag::TaskCallVirtual) {
+                    may[f] = 1;
+                }
+            }
+        }
+    }
     std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
     const auto           close = [&](this const auto& self, uint32_t f) -> void {
         if (state[f] != 0) {
