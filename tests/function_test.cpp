@@ -1089,3 +1089,17 @@ TEST_CASE("aggregate returns Clotho still refuses loudly") {
         CHECK(d.find("return of an unpacked-array slice is not supported") != std::string::npos);
     }
 }
+
+// LRM 13.4.3: a constant function call initializes its variables "as they would
+// be for normal simulation", static ones included, and no value carries over
+// between calls. slang skips the static initializer without a patch.
+TEST_CASE("a constant function call runs its static variable initializers") {
+    CHECK(run_capture(R"(
+        module m;
+            function int f(int n); static int acc = 5; acc += n; return acc; endfunction
+            localparam int P = f(1);
+            localparam int Q = f(1);
+            initial $display("%0d %0d %0d", P, Q, f(1));
+        endmodule
+    )") == "6 6 6\n");
+}

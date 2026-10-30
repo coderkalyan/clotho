@@ -218,6 +218,11 @@ FetchContent_Declare(
   GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a # v10.0-360-g6933832c9
   # Every patches/slang-*.patch is applied, in name order:
   #
+  # slang-const-eval-static-init: LRM 13.4.3 says a constant function call's
+  # variables "are initialized as they would be for normal simulation". slang
+  # skipped a static variable's initializer with a warning, so
+  # `localparam P = f(1)` folded from 0 instead of the initializer. Not upstream.
+  #
   # slang-class-forward-ref: LRM 8.6 (class methods), 18.5 (constraint blocks),
   # and 19.4/19.5 (a covergroup's coverpoint/cross/iff/event expressions
   # embedded in a class) all give a class's own members unordered visibility to

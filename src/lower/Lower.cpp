@@ -173,9 +173,6 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // LRM 23.10.1: of several defparams on one parameter the last wins; slang
     // keeps the first.
     engine.setSeverity(slang::diag::DuplicateDefparam, slang::DiagnosticSeverity::Error);
-    // LRM 13.4.3: a constant function call initializes its variables as normal
-    // simulation would; slang skips a static variable's initializer.
-    engine.setSeverity(slang::diag::ConstEvalStaticSkipped, slang::DiagnosticSeverity::Error);
     // LRM 34: slang drops a protected envelope's contents.
     engine.setSeverity(slang::diag::ProtectedEnvelope, slang::DiagnosticSeverity::Error);
 

@@ -1679,13 +1679,6 @@ TEST_CASE("legal source slang elaborates differently from the LRM is refused") {
     refused("module c #(parameter P = 1); endmodule\n"
             "module m; c i(); defparam i.P = 2; defparam i.P = 3; endmodule",
             "already has a defparam override");
-    // LRM 13.4.3: P would be 6; slang skips `acc = 5` and folds 1.
-    refused("module m;\n"
-            "  function int f(int n); static int acc = 5; acc += n; return acc; endfunction\n"
-            "  localparam int P = f(1);\n"
-            "  initial $display(\"%0d\", P);\n"
-            "endmodule",
-            "static variable initialization is skipped");
     refused("module m;\n"
             "`pragma protect begin_protected\n"
             "`pragma protect encoding=(enctype=\"base64\")\n"

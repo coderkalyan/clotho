@@ -96,8 +96,6 @@ Milestones, in order; lower ones unblock higher ones:
   parameter keeps its original initializer's type, so the override is refused.
 - [ ] **Several `defparam`s on one parameter** (23.10.1) — the last one in source order wins,
   but slang keeps the first, so the design is refused.
-- [ ] **Static variable initializer in a constant function call** (13.4.3) — slang skips the
-  initializer during elaboration, so the call is refused.
 
 ### Procedural control
 
