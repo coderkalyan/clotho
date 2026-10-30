@@ -1945,6 +1945,15 @@ ir::FunctionId Lowerer::iface_rand_sig(ir::Ref iface_ref, bool ops) {
                                        .arg_dirs    = std::move(dirs),
                                        .local_types = std::move(locals),
                                        .ir          = b.finish() });
+    // The stub belongs to no class, so it belongs to no unit: every unit that
+    // dispatches through the interface imports it from the glue unit, under a
+    // name unique per interface type (and per Lowerer that built one).
+    std::string name =
+      std::string(ops ? "$iface.randops." : "$iface.randomize.") + std::to_string(static_cast<uint32_t>(iface_ref));
+    if (const uint32_t seen = owners_->names["glue:" + name]++; seen != 0) {
+        name += "#" + std::to_string(seen + 1);
+    }
+    record_function(id, ir::Owner{ .kind = ir::Owner::Kind::Glue }, std::move(name));
     cache.emplace(iface_ref, id);
     return id;
 }
