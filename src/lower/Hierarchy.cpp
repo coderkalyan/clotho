@@ -1047,11 +1047,21 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
             continue;
         }
 
+        // A non-ANSI port reference with a constant select (`module m(a[3:2])`,
+        // LRM 23.2.2.1) is those bits of its internal symbol and nothing else; any
+        // other port is the whole symbol. p.getType() is the port's own type
+        // either way: the connection is converted to it, and an output port's
+        // value has it.
+        const Expression* sel = p.getInternalExpr();
+
         if (cur_pass_ == Pass::Classify) {
             // The connection is a continuous driver: an output drives the
-            // parent-side lvalue, an input drives the whole child net.
+            // parent-side lvalue, an input drives the port's own bits of the
+            // child net.
             if (expr->kind == ExpressionKind::Assignment) {
                 record_net_driver(expr->as<AssignmentExpression>().left());
+            } else if (sel != nullptr) {
+                record_net_driver(*sel);
             } else {
                 record_net_driver_whole(p.internalSymbol->as<ValueSymbol>());
             }
@@ -1062,6 +1072,13 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         const ir::SourceLoc        l         = to_source_loc(p.location);
         ir::Builder                b(module_.pool);
         std::vector<ir::WaitEvent> sens;
+        const slang::ast::Type&    ptype = p.getType();
+        // The port's own storage: the child net, or the bits of it a select port
+        // names.
+        const auto port_rvalue = [&] {
+            return sel != nullptr ? lower_expr(*sel, b) : b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+        };
+        const auto port_lvalue = [&] { return sel != nullptr ? lower_lvalue(*sel, b) : b.signal(child_sig, l); };
         // A connected container port. The port copy is a continuous assignment,
         // so it would have to deep-copy the handle whenever the source changes
         // (value semantics, LRM 7.5 / 7.9 / 7.10) and detect that change through
@@ -1075,7 +1092,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         // a backend error with no source location instead of a diagnostic.
         // TODO: container ports (a handle-aware continuous copy). Reached by a
         // `program` port too, hence no "module" in the message.
-        if (ir::types::is_container(module_.pool, lower_type(p.internalSymbol->as<ValueSymbol>().getType()))) {
+        if (ir::types::is_container(module_.pool, lower_type(ptype))) {
             fail("a dynamic-array, queue or associative-array port connection "
                  "is not supported");
         }
@@ -1103,8 +1120,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                     // TODO: aggregate driver of a multiply-driven net.
                     fail("aggregate driver of a multiply-driven net is not supported");
                 }
-                const ir::Index child_val =
-                  lower_port_output(a, b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), b);
+                const ir::Index  child_val = lower_port_output(a, port_rvalue(), b);
                 const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
                 const ir::Signal slot = alloc_driver_slot(*net, l, /*strength=*/0x0303, child_is_program);
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
@@ -1119,17 +1135,17 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 // share the recursive storage layout (a plain unpacked array is
                 // trivially copyable, so emit_port_agg_copy memcpy's it).
                 const ir::Index dst = lower_lvalue(a.left(), b);
-                const ir::Index src = b.signal(child_sig, l);
+                const ir::Index src = port_lvalue();
                 emit_port_agg_copy(dst, src, lower_type(*a.left().type), b, l);
             } else if (a.left().kind == ExpressionKind::Concatenation) {
                 // Output connected to a concatenation target `.o({a,b})`:
                 // sample the child net once and scatter it MSB-first into the
                 // operands, the same destructure as `{a,b} = x` (store_concat).
                 reject_concat_resolved_driver(a.left());
-                const ir::Index val = lower_port_output(a, b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), b);
+                const ir::Index val = lower_port_output(a, port_rvalue(), b);
                 store_concat(a.left().as<ConcatenationExpression>(), val, ir::Inst::Tag::Store, b, l);
             } else {
-                const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                const ir::Index val = port_rvalue();
                 const ir::Index dst = lower_lvalue(a.left(), b);
                 const ir::Index src = lower_port_output(a, val, b);
                 b.binary(ir::Inst::Tag::Store, dst, src, l);
@@ -1138,8 +1154,8 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         } else {
             // Input: drive the child net from the source rvalue, resized to the
             // port width; wakes on the source's reads. The copy is a continuous
-            // driver of the whole child-side net.
-            const slang::ast::Type& itype = p.internalSymbol->as<ValueSymbol>().getType();
+            // driver of the port's own bits of the child-side net: all of it, or
+            // the bits a select port names.
             if (resolved_nets_.contains(static_cast<uint32_t>(child_sig))) {
                 // The child net has more than one driver total: this input
                 // copy plus at least one other, possibly reached from a
@@ -1165,21 +1181,24 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 // 24.3 makes a design reference to a program signal an error
                 // but explicitly allows "hierarchical references to extend
                 // from one program scope to another program scope".
-                if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
+                if (is_aggregate(ptype) || is_unpacked_array_type(ptype)) {
                     // TODO: aggregate driver of a multiply-driven net (matches
                     // the OUTPUT port and continuous-assign refusals above).
                     fail("aggregate driver of a multiply-driven net is not supported");
                 }
-                const ir::Ref    ty   = lower_type(itype);
-                const ir::Index  val  = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
+                const ir::Ref   ty     = lower_type(ptype);
+                const ir::Index driven = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
+                // A select port drives its bits only: its slot holds z, the
+                // resolution identity, in the rest.
+                const ir::Index  val = sel != nullptr ? build_driver_slot_value(child_sig, *sel, driven, b, l) : driven;
                 const ir::Signal slot = alloc_driver_slot(child_sig, l, /*strength=*/0x0303, child_is_program);
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
                 collect_expr_reads(*expr, sens);
                 add_continuous_process(std::move(sens), l, b, child_is_program);
                 continue;
             }
-            const ir::Ref ty = lower_type(itype);
-            if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
+            const ir::Ref ty = lower_type(ptype);
+            if (is_aggregate(ptype) || is_unpacked_array_type(ptype)) {
                 // A whole unpacked-struct / unpacked-array / aggregate input
                 // port: whole-object copy of the source into the child net (a
                 // plain unpacked array memcpy's via emit_port_agg_copy). An
@@ -1196,9 +1215,9 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 const Expression& src = unwrap_conversion(*expr);
                 const ir::Index   av  = is_struct_lvalue_shape(src) ? lower_lvalue(src, b)
                                                                    : agg_input_actual(src, ty, b, l);
-                emit_port_agg_copy(b.signal(child_sig, l), av, ty, b, l);
+                emit_port_agg_copy(port_lvalue(), av, ty, b, l);
             } else {
-                const ir::Index dst = b.signal(child_sig, l);
+                const ir::Index dst = port_lvalue();
                 const ir::Index val = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
                 b.binary(ir::Inst::Tag::Store, dst, val, l);
             }

@@ -213,3 +213,76 @@ TEST_CASE("an output port converts between real and integral connections") {
     )");
     CHECK(out == "3 -3 -2.0 254.0\n");
 }
+
+// A non-ANSI port reference with a constant select (`module m(arg[3:2])`, LRM
+// 23.2.2.1: "a bit-select of a vector declared within the module", "a
+// part-select") is those bits of the declared port and nothing else: the
+// connection drives (input) or reads (output) them alone, the rest of the net is
+// not part of the port. Two ports may split one vector, and an explicitly named
+// port takes the same select. Expected values from the LRM; iverilog 13 prints
+// the same.
+TEST_CASE("a non-ANSI port reference with a select connects only those bits") {
+    const std::string out = run_capture(R"(
+        module p_part(arg[3:2]);
+            input [3:0] arg;
+        endmodule
+        module p_bit(arg[1]);
+            input [2:0] arg;
+        endmodule
+        module p_expl(.x(o[3:2]));
+            input [3:0] o;
+        endmodule
+        module p_two(arg[3:2], arg[1:0]);
+            input [3:0] arg;
+        endmodule
+        module p_out(o[3:2]);
+            output [3:0] o;
+            assign o = 4'b1001;
+        endmodule
+        module p_outv(r[2:1]);
+            output reg [3:0] r;
+            initial r = 4'b0100;
+        endmodule
+        module p_mix(arg[3:2]);
+            input [3:0] arg;
+            assign arg[1:0] = 2'b01;
+        endmodule
+        module top;
+            reg  [1:0] a = 2'b10;
+            reg        b = 1'b1;
+            reg  [1:0] c = 2'b01;
+            wire [1:0] wo;
+            wire [3:0] wo4;
+            wire [1:0] wv;
+            p_part u1(a);
+            p_bit  u2(b);
+            p_expl u3(.x(a));
+            p_two  u4(a, c);
+            p_out  u5(wo);
+            p_out  u6(wo4);
+            p_outv u7(wv);
+            p_mix  u8(a);
+            initial #1 $display("%b %b %b %b %b %b %b %b", u1.arg, u2.arg, u3.o, u4.arg, wo, wo4, wv, u8.arg);
+        endmodule
+    )");
+    CHECK(out == "10zz z1z 10zz 1001 10 0010 10 1001\n");
+}
+
+// The select port's bits drive the net like any other partial driver, so they
+// resolve against a driver of the same bits made inside the child: here the
+// connection (1z) and the child's own `assign` (z1) fold to 11, and the bits no
+// driver reaches stay z.
+TEST_CASE("a select port resolves against a child driver of the same bits") {
+    const std::string out = run_capture(R"(
+        module p_res(arg[1:0]);
+            input [3:0] arg;
+            assign arg[1:0] = 2'bz1;
+        endmodule
+        module top;
+            reg [1:0] a = 2'b1z;
+            p_res u(a);
+            initial #1 $display("%b", u.arg);
+        endmodule
+    )");
+    CHECK(out == "zz11\n");
+}

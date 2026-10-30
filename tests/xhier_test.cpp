@@ -404,3 +404,20 @@ TEST_CASE("defparam check: a localparam computed by a function using %= simulate
         endmodule
     )") == "1 1\n");
 }
+
+// An inout port that is a select of its net (`module m(io[1:0])`, LRM 23.2.2.1)
+// connects those bits only, but an alias shares the connection's storage with the
+// whole net, so it would put a 2-bit signal under all 4 bits.
+TEST_CASE("an inout port that is a select of its net fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module leaf(io[1:0]);
+          inout [3:0] io;
+        endmodule
+        module top;
+          wire [1:0] w;
+          leaf u(w);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("select port expression") != std::string::npos);
+}

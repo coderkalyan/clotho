@@ -1001,6 +1001,12 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
         if (expr == nullptr) {
             continue; // unconnected inout/ref: the child net stands alone
         }
+        if (p.getInternalExpr() != nullptr) {
+            // TODO: an inout/ref port that is a select of its net (`module
+            // m(io[1:0])`, LRM 23.2.2.1) connects those bits only; aliasing the
+            // whole net would put the connection's storage under all of it.
+            fail("inout/ref port with a select port expression is not supported");
+        }
         // slang may wrap the connection in an AssignmentExpression; the shared
         // net is the underlying value reference.
         const Expression& conn =
