@@ -231,6 +231,10 @@ void Backend::lower_wait(ExtraIndex info) {
                             parked_handle(b_, hdl_), sched_ptr_,
                             /*record_owner=*/!event_is_mono(e.signal));
         } else {
+            std::optional<CtxOverride> ov;
+            if (llvm::Value* rec = bound_record(slot_of(e.signal)); rec != nullptr) {
+                ov.emplace(*this, rec, slot_of(e.signal).anchor);
+            }
             emit_dynamic_register(e.signal, e.edge);
         }
     }
@@ -259,6 +263,10 @@ void Backend::lower_wait(ExtraIndex info) {
             emit_event_unlink(event_wait_node(ev_k++),
                               event_is_mono(e.signal) ? event_obj(e.signal) : nullptr);
         } else if (remove_sigs) {
+            std::optional<CtxOverride> ov;
+            if (llvm::Value* rec = bound_record(slot_of(e.signal)); rec != nullptr) {
+                ov.emplace(*this, rec, slot_of(e.signal).anchor);
+            }
             emit_dynamic_remove(e.signal, e.edge);
         }
     }
@@ -960,6 +968,10 @@ Backend::ServiceSnapshot Backend::service_snapshot(const Guarded& g) {
 
 void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
     g.when_valid(b_, [&](const LValue& lv) {
+        // Wake buckets, trigger bits and the dump-var index of a written signal are
+        // the owner's: its record, when the write reached it through a binding or a
+        // virtual interface handle.
+        CtxOverride ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
         if (old.str != nullptr) {
             str_chg_after(lv, old.str);
         } else if (old.container) {

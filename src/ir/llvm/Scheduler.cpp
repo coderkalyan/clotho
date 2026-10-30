@@ -834,6 +834,24 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     const auto ctx_ptr = [&](Anchor& a, uint32_t field) {
         return b_.CreateInBoundsGEP(a.ctx_ty, sym(a.ctx_gv), { b_.getInt32(0), b_.getInt32(field) });
     };
+    // A binding names the record of the instance that owns its signal, so that
+    // record must exist before anything is filled; creating it can make the owner
+    // an instance with bindings of its own to fill.
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (Anchor& a : anchors_) {
+            if (a.ctx_gv == nullptr) {
+                continue;
+            }
+            for (uint32_t k = 0; k < a.bind_used.size(); ++k) {
+                const SignalSlot& s = slot_of(a.externs[k]);
+                if (a.bind_used[k] != 0 && s.anchor != SignalSlot::no_anchor && anchors_[s.anchor].ctx_gv == nullptr) {
+                    ensure_ctx(anchors_[s.anchor]);
+                    grew = true;
+                }
+            }
+        }
+    }
     for (Anchor& a : anchors_) {
         if (a.ctx_gv == nullptr) {
             continue;
@@ -847,6 +865,19 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         }
         if (a.first_vcd >= 0) {
             b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, 3));
+        }
+        // The imports this instance's code reads: where each signal is and who
+        // owns it (nobody, for a package's).
+        for (uint32_t k = 0; k < a.bind_used.size(); ++k) {
+            if (a.bind_used[k] == 0) {
+                continue;
+            }
+            const SignalSlot& s = slot_of(a.externs[k]);
+            b_.CreateStore(storage_address(s), ctx_ptr(a, a.ctx_bind_base + 2 * k));
+            b_.CreateStore(s.anchor != SignalSlot::no_anchor
+                             ? static_cast<llvm::Value*>(sym(anchors_[s.anchor].ctx_gv))
+                             : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)),
+                           ctx_ptr(a, a.ctx_bind_base + 2 * k + 1));
         }
         for (const Signal sj : anchor_signals_[static_cast<size_t>(&a - anchors_.data())]) {
             if (sj == Signal{ ~0u }) {

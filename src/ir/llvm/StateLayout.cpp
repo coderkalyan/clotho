@@ -185,6 +185,19 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
         anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
     }
     anchor_of_scope_[scope.id] = aid;
+    for (const Signal e : scope.externs) {
+        if (e == InstanceScope::no_extern) {
+            continue;
+        }
+        Anchor& an = anchors_[aid];
+        // Two declarations can name one signal in one instance (an inout port
+        // and the contribution a child drives through it, when the child is the
+        // net's only driver). A flat signal says nothing of which declaration the
+        // code named, so the first stands for all of them: code is shared
+        // between instances whose declarations alias alike (code_key).
+        an.bind_of.try_emplace(static_cast<uint32_t>(e), static_cast<uint32_t>(an.externs.size()));
+        an.externs.push_back(e);
+    }
     const std::vector<Signal>& defined = scope.unit == InstanceScope::no_unit ? scope.signals : scope.locals;
     std::vector<llvm::Type*>   fields;
     for (uint32_t k = 0; k < defined.size(); ++k) {
@@ -540,15 +553,76 @@ const SignalSlot& Backend::slot_of(Signal s) const {
     return slots_[static_cast<uint32_t>(s)];
 }
 
+// The binding through which the code being lowered reaches `s`: the own
+// instance's extern declaration bound to this very signal. Only code that
+// belongs to an instance has one; a signal of the own instance, and one an
+// installed instance context describes, are addressed through the record or the
+// context instead.
+uint32_t Backend::binding_of(const SignalSlot& s) {
+    if (own_anchor_ == SignalSlot::no_anchor || s.anchor == own_anchor_ || ctx_override_for(s)) {
+        return no_bind;
+    }
+    if (&s < slots_.data() || &s >= slots_.data() + slots_.size()) {
+        return no_bind;
+    }
+    Anchor&    a  = anchors_[own_anchor_];
+    const auto it = a.bind_of.find(static_cast<uint32_t>(&s - slots_.data()));
+    if (it == a.bind_of.end()) {
+        return no_bind;
+    }
+    a.bind_used.resize(a.externs.size(), 0);
+    a.bind_used[it->second] = 1;
+    return it->second;
+}
+
+// A field of the own instance's record: the parameter of a thunk row, else the
+// instance's record global.
+llvm::Value* Backend::own_field(uint32_t field, llvm::Type* ty) {
+    Anchor& a = anchors_[own_anchor_];
+    if (own_ctx_ != nullptr) {
+        return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, own_ctx_, { b_.getInt32(0), b_.getInt32(field) }));
+    }
+    auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
+      a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
+    return b_.CreateLoad(ty, gep);
+}
+
+// The address of a signal's storage as a link-time constant: what a binding to
+// the signal holds.
+llvm::Constant* Backend::storage_address(const SignalSlot& s) {
+    std::vector<llvm::Constant*> idx{ b_.getInt32(0) };
+    for (const uint32_t f : s.path) {
+        idx.push_back(b_.getInt32(f));
+    }
+    if (s.anchor == SignalSlot::no_anchor) {
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, sym(state_global_), idx);
+    }
+    Anchor& a = anchors_[s.anchor];
+    return llvm::ConstantExpr::getInBoundsGetElementPtr(a.ty, sym(a.state_gv), idx);
+}
+
+llvm::Value* Backend::bound_record(const SignalSlot& s) {
+    const uint32_t k = binding_of(s);
+    if (k == no_bind || s.anchor == SignalSlot::no_anchor) {
+        return nullptr;
+    }
+    return own_field(anchors_[own_anchor_].ctx_bind_base + 2 * k + 1, llvm::PointerType::getUnqual(ctx_));
+}
+
 // Pointer to a signal's whole storage (its slot struct, or its [N x slot]
-// memory), addressed through its owning scope's own state global:
-// `@clotho.inst.<hier>.state + the scope-relative field path`. A real
-// symbol plus a def-local addend, so the GEP folds to a link-time-constant
-// address and the code bytes never depend on whole-design layout. A
-// shareable reused-definition body instead loads the base pointer from its
-// instance context (one shared body cannot bake N instance symbols). An
-// unscoped signal (flat root scope) keeps the direct root GEP.
+// memory). A signal of another instance or of a package is the address of a
+// binding of the own instance. One of the own instance (or one an installed
+// instance context describes) is `@clotho.inst.<hier>.state + the
+// scope-relative field path` -- a real symbol plus a def-local addend -- or,
+// inside a group of the instance, the base loaded from its record. An unscoped
+// signal outside a group keeps the direct root GEP.
 llvm::Value* Backend::storage_ptr(const SignalSlot& s) {
+    if (const uint32_t k = binding_of(s); k != no_bind) {
+        // Another instance's (or a package's) signal: its address is a binding
+        // of the own instance, filled at startup, so the code names no storage
+        // of a neighbour.
+        return own_field(anchors_[own_anchor_].ctx_bind_base + 2 * k, llvm::PointerType::getUnqual(ctx_));
+    }
     std::vector<llvm::Value*> idx;
     idx.push_back(b_.getInt32(0));
     if (s.anchor == SignalSlot::no_anchor) {
@@ -723,8 +797,14 @@ llvm::GlobalVariable* Backend::ensure_ctx(Anchor& a) {
 // stay while the record they are read from is whichever instance the handle
 // names (LRM 25.9).
 llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
-    llvm::Value* rec = ctx_override_;
-    if (rec == nullptr && own_ctx_ != nullptr && &a == &anchors_[own_anchor_]) {
+    // An installed context describes ONE instance; a field of any other
+    // instance's record (the own instance's, while it writes through a binding)
+    // comes from that record.
+    llvm::Value* rec = nullptr;
+    if (ctx_override_ != nullptr && ctx_override_anchor_ != SignalSlot::no_anchor &&
+        &a == &anchors_[ctx_override_anchor_]) {
+        rec = ctx_override_;
+    } else if (own_ctx_ != nullptr && &a == &anchors_[own_anchor_]) {
         rec = own_ctx_;
     }
     if (rec != nullptr) {
@@ -999,10 +1079,14 @@ void Backend::build_instance_ctx_layout() {
 
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     auto* i32 = b_.getInt32Ty();
-    ankerl::unordered_dense::map<llvm::StructType*, llvm::StructType*> def_ctx;
+    // Per unit, not per state type: two units can lay their own signals out
+    // alike (the same definition at different parameters) yet import different
+    // things, and the record is as much a unit's as its code is.
+    std::map<std::pair<llvm::StructType*, uint32_t>, llvm::StructType*> def_ctx;
     for (Anchor& a : anchors_) {
         a.n_blk        = def_blk[a.ty];
         a.n_mask       = any_guarded_ ? a.n_blk : 0;
+        a.n_bind       = static_cast<uint32_t>(a.externs.size());
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;
         uint32_t nsta  = 0;
@@ -1022,7 +1106,8 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_trig_base        = a.ctx_cap_base + nsta;
         a.ctx_mmask_base       = a.ctx_trig_base + nsta;
         a.ctx_gmask_base       = a.ctx_mmask_base + a.n_mask;
-        const auto [it, fresh] = def_ctx.try_emplace(a.ty, nullptr);
+        a.ctx_bind_base        = a.ctx_gmask_base + a.n_mask;
+        const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
             f.insert(f.end(), a.n_blk, i32);
@@ -1030,6 +1115,7 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), nsta, i32);
             f.insert(f.end(), nsta, b_.getInt64Ty());
             f.insert(f.end(), 2 * a.n_mask, b_.getInt64Ty());
+            f.insert(f.end(), 2 * a.n_bind, ptr);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }

@@ -2559,33 +2559,37 @@ llvm::ConstantInt* Backend::const_from_bytes(std::span<const uint8_t> bytes, uin
     return llvm::ConstantInt::get(ctx_, apint_from_bytes(bytes, width));
 }
 
-// Whole-storage lvalue for a module signal (state struct).
+// Whole-storage lvalue for a module signal (state struct). A signal the own
+// instance reaches through a binding carries the record of the instance that
+// owns it, which is what a virtual interface member carries too: every
+// def-relative base of the access (wake buckets, shadow, dump-var index) is then
+// read from the owner's record, at the owner's field constants.
 LValue Backend::signal_lvalue(Signal sig) {
     const SignalSlot& s = slot_of(sig);
+    LValue            lv{};
     if (s.is_agg) {
         // The aggregate root; a following MemberSelect / ElemSelect chain
         // extends agg_path and (at a scalar/string leaf) fills the leaf
         // metadata. A bare aggregate lvalue is never loaded/stored directly.
-        LValue lv{};
         lv.base      = storage_ptr(s);
         lv.root_ty   = s.storage_ty;
         lv.is_agg    = true;
         lv.is_signal = true;
         lv.sig       = sig;
-        return lv;
+    } else {
+        lv.base        = storage_ptr(s);
+        lv.slot_ty     = s.slot_ty;
+        lv.four_state  = s.four_state;
+        lv.has_z       = s.has_z;
+        lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
+        lv.store_width = s.width;
+        lv.bit_off     = b_.getInt64(0);
+        lv.width       = s.width;
+        lv.is_signal   = true;
+        lv.sig         = sig;
+        lv.is_string   = s.is_string;
     }
-    LValue lv;
-    lv.base        = storage_ptr(s);
-    lv.slot_ty     = s.slot_ty;
-    lv.four_state  = s.four_state;
-    lv.has_z       = s.has_z;
-    lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
-    lv.store_width = s.width;
-    lv.bit_off     = b_.getInt64(0);
-    lv.width       = s.width;
-    lv.is_signal   = true;
-    lv.sig         = sig;
-    lv.is_string   = s.is_string;
+    lv.vif_ctx = bound_record(s);
     return lv;
 }
 

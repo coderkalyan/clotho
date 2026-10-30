@@ -301,8 +301,14 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
     // drops it).
     CHECK(raw.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
     CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
-    CHECK(raw.find("@clotho.inst.top.u0.state = dso_local global %leaf.state") != std::string::npos);
-    CHECK(raw.find("@clotho.inst.top.u1.state = dso_local global %leaf.state") != std::string::npos);
+    // Whether a global is internal or external depends on whether another module
+    // names it, which is not what this test is about.
+    const auto global_line = [&](std::string_view name) {
+        const size_t at = raw.find(name);
+        return at == std::string::npos ? std::string() : raw.substr(at, raw.find('\n', at) - at);
+    };
+    CHECK(global_line("@clotho.inst.top.u0.state = ").find(" global %leaf.state") != std::string::npos);
+    CHECK(global_line("@clotho.inst.top.u1.state = ").find(" global %leaf.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u0.shadow = internal global %leaf.state.shadow") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u1.shadow = internal global %leaf.state.shadow") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).

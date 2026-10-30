@@ -992,12 +992,15 @@ struct Anchor {
     //   ctx_gmask_base i64 same indexing: for the front process of a guarded
     //                      group, the union of its members' bits, which the
     //                      group's fail-safe tests
+    //   ctx_bind_base ptr  two per binding (see n_bind): the address of an
+    //                      imported signal's storage, and the record of the
+    //                      instance that owns it (null for a signal of none)
     // A writer in the instance's own code reads a bucket's base, count and
     // trigger bits here, and a guarded group its masks, so none of them is
     // baked into unit code: the buckets depend on who subscribes and the bits
     // on the design-global colours (compute_trigger_masks), which are other
     // units' business.
-    // ctx_ty is shared across instances of one definition; the global is
+    // ctx_ty is shared across instances of one unit; the global is
     // created lazily by the first def-relative use.
     llvm::StructType*     ctx_ty        = nullptr;
     llvm::GlobalVariable* ctx_gv        = nullptr;
@@ -1011,6 +1014,21 @@ struct Anchor {
     // of each mask array (the same, or 0 when no group of the design is guarded).
     uint32_t n_blk  = 0;
     uint32_t n_mask = 0;
+    // Bindings: one per extern signal declaration of the unit that names an
+    // instance's storage (InstanceScope::externs), in the unit's order, two
+    // record fields each at ctx_bind_base + 2 * ordinal -- the address of the
+    // imported signal's storage, and the record of the instance that owns it
+    // (null for a signal of no instance) -- so every instance of a unit has the
+    // same layout whatever its imports resolve to. `externs` is the flat signal
+    // each is bound to in THIS instance; bind_of is its inverse, which names a
+    // flat signal's binding while the code of this instance is lowered.
+    uint32_t ctx_bind_base = 0;
+    uint32_t n_bind        = 0;
+    std::vector<Signal> externs;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
+    // Which bindings the lowered code of this instance reads (only those are
+    // filled).
+    std::vector<uint8_t> bind_used;
     // The Design unit the scope expands (InstanceScope::unit).
     uint32_t unit = InstanceScope::no_unit;
 };
@@ -1581,6 +1599,25 @@ private:
     const SignalSlot& slot_of(Signal s) const;
 
     llvm::Value* storage_ptr(const SignalSlot& s);
+
+    // The binding (an index into the own anchor's externs) through which the
+    // code being lowered reaches `s`, or no_bind when it addresses `s` directly:
+    // a signal of the own instance, one an installed instance context supplies,
+    // and every access outside a group of an instance. Marks the binding used.
+    static constexpr uint32_t no_bind = ~0u;
+    uint32_t                  binding_of(const SignalSlot& s);
+
+    // One field of the own instance's record, whatever instance context is
+    // installed for another instance's signals.
+    llvm::Value* own_field(uint32_t field, llvm::Type* ty);
+
+    // The constant address of a signal's storage, as a binding is filled with.
+    llvm::Constant* storage_address(const SignalSlot& s);
+
+    // The record of the instance that owns `s` when the code reaches it through a
+    // binding, else null (the signal is addressed directly, or belongs to no
+    // instance).
+    llvm::Value* bound_record(const SignalSlot& s);
 
     llvm::Value* vif_head_ptr(Signal sig, uint32_t edge);
 

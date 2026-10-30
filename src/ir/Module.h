@@ -108,6 +108,16 @@ struct InstanceScope {
     // scope (driver slots, constant tables, assertion state). Empty when
     // `unit` is no_unit; the scope then defines exactly `signals`.
     std::vector<Signal> locals;
+    // The flat signal each extern signal declaration of the unit is bound to in
+    // this instance, in the unit's signal order: one entry per UnitSignal whose
+    // import is not kLocal (a signal of another instance, of a package, or the
+    // net a bound port aliases), so every instance of a unit has the same
+    // entries and a unit's code can name its imports by position. A
+    // declaration that only supplies a layout (Import::Kind::Representative)
+    // names no storage of this instance's and holds `no_extern`. Empty when
+    // `unit` is no_unit.
+    static constexpr Signal no_extern = static_cast<Signal>(UINT32_MAX);
+    std::vector<Signal>     externs;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the

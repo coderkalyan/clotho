@@ -372,8 +372,18 @@ code go.
      instance scope has a record, and a fusion group addresses its own
      storage, shadow, sched flags, wait buckets, dump-var index and NBA block
      ids through it (block ids at the record's field for the function's
-     def-local process ordinal). Other instances' signals stay absolute, and
-     array, trigger and name ids are not in the record yet.
+     def-local process ordinal). A signal outside the instance (another
+     instance's, a package's) is reached through a binding: two record fields
+     per extern declaration of the unit (`InstanceScope::externs`, in the unit's
+     order), the address of the signal's storage and the record of the instance
+     that owns it, filled at startup. A write through one wakes the owner's
+     readers from the owner's record (buckets, trigger bits, shadow, dump-var
+     index), exactly as an access through a virtual interface handle does, so
+     what it needs of the owner is data and not a symbol. Two declarations of
+     one instance can name one signal (an inout port and the contribution a
+     child drives through it); the first stands for both, so instances whose
+     declarations alias differently do not share code. Array, trigger and name
+     ids are not in the record yet.
    - **3c, code once per unit.** Each unit's processes and functions are
      lowered once from the unit's IR, taking the record, into the unit's module.
      Fusion runs within a unit; groups spanning instances become dispatch
