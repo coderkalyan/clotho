@@ -26,7 +26,6 @@ struct ValueType {
     uint32_t width = 0;
     // 4-state (a meaningful x/z plane) rather than 2-state.
     bool four_state = false;
-    bool is_signed  = false;
     // A string: an rt_string handle, never planes.
     bool is_string = false;
     // A real (width 64) or shortreal (width 32); never 4-state.
@@ -38,8 +37,7 @@ struct ValueType {
 static_assert(sizeof(ValueType) == 8, "one ValueType per instruction; keep it one word");
 
 // The value type of a declared type: a constant's type, an Arg's or Local's
-// declared type, a call's return type, a Resize target. A real counts as
-// signed (LRM 11.8.1).
+// declared type, a call's return type, a conversion's target.
 ValueType value_type_of(const InternPool& pool, Ref type);
 
 // The type of instruction `i` of `ir`, given the types of every instruction

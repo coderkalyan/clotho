@@ -99,8 +99,25 @@ public:
         return { static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) };
     }
 
+    // -- Conversions --
+    // Widen / narrow / change the domain of an integral value to `type` (see
+    // Inst::Tag::ZExt). Each is one instruction and the caller says which; most code
+    // wants convert().
+    Index zext(Index op, Ref type, SourceLoc loc);
+    Index sext(Index op, Ref type, SourceLoc loc);
+    Index trunc(Index op, Ref type, SourceLoc loc);
+    Index to_four(Index op, Ref type, SourceLoc loc);
+    Index to_two(Index op, Ref type, SourceLoc loc);
+    // Convert the integral value `op` to `type`: x/z bits first become 0 if the
+    // target is 2-state (LRM 6.3.1), then the width changes (a widening copies the
+    // top bit when `sign_extend`, else fills with zeros), then a 4-state target gains
+    // its x/z plane. Emits nothing for a value already of that width and domain.
+    // Whether to sign-extend is the language's call, not a property of the value:
+    // LRM 11.8.3 takes the SOURCE's signedness for an assignment or a cast,
+    // LRM 11.8.2 the propagated TARGET's for an operand.
+    Index convert(Index op, Ref type, bool sign_extend, SourceLoc loc);
+
     // -- Irregular shapes --
-    Index resize(Index op, Ref type, SourceLoc loc);
 
     // Emit a float conversion (ItoF / FtoI / FtoITrunc / FBitcast / FResize)
     // of `op` to `type`.

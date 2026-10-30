@@ -152,8 +152,50 @@ Index Builder::store_nb_event(Index lvalue, Index value, Index count, ExtraSlice
     return emit({ Inst::Tag::StoreNbEvent, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }
 
-Index Builder::resize(Index op, Ref type, SourceLoc loc) {
-    return emit({ Inst::Tag::Resize, Inst::Payload{ .op_type = { op, type } } }, loc);
+Index Builder::zext(Index op, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::ZExt, Inst::Payload{ .op_type = { op, type } } }, loc);
+}
+
+Index Builder::sext(Index op, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::SExt, Inst::Payload{ .op_type = { op, type } } }, loc);
+}
+
+Index Builder::trunc(Index op, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::Trunc, Inst::Payload{ .op_type = { op, type } } }, loc);
+}
+
+Index Builder::to_four(Index op, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::ToFour, Inst::Payload{ .op_type = { op, type } } }, loc);
+}
+
+Index Builder::to_two(Index op, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::ToTwo, Inst::Payload{ .op_type = { op, type } } }, loc);
+}
+
+Index Builder::convert(Index op, Ref type, bool sign_extend, SourceLoc loc) {
+    const ValueType from = type_of(op);
+    const ValueType to   = value_type_of(pool_, type);
+    assert(!from.is_string && !from.is_real && !to.is_string && !to.is_real);
+    Index    v     = op;
+    uint32_t width = from.width;
+    // x/z become 0 first, at the narrower of the two widths' cost: the value is the
+    // must plane either way.
+    if (from.four_state && !to.four_state) {
+        const Ref two = pool_.int_type(width, false);
+        v             = to_two(v, two, loc);
+    }
+    if (to.width > width) {
+        const Ref wide = pool_.int_type(to.width, from.four_state && to.four_state);
+        v              = sign_extend ? sext(v, wide, loc) : zext(v, wide, loc);
+    } else if (to.width < width) {
+        const Ref narrow = pool_.int_type(to.width, from.four_state && to.four_state);
+        v                = trunc(v, narrow, loc);
+    }
+    if (!from.four_state && to.four_state) {
+        v = to_four(v, type, loc);
+    }
+
+    return v;
 }
 
 Index Builder::float_cvt(Inst::Tag tag, Index op, Ref type, SourceLoc loc) {

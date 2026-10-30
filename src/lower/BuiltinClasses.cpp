@@ -32,7 +32,7 @@ ir::Ref Lowerer::lower_process_class(const slang::ast::ClassType& clt) {
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
     std::vector<ir::FieldRow> fields;
-    fields.push_back({ kProcessCtlField, make_int_type(64, false, false), 0 });
+    fields.push_back({ kProcessCtlField, make_int_type(64, false), 0 });
     module_.pool.set_struct_fields(fid, std::move(fields));
     class_rand_.emplace(&clt, ClassRand{});
     compute_vtable(clt, ref);
@@ -63,9 +63,9 @@ ir::Ref Lowerer::lower_semaphore_class(const slang::ast::ClassType& clt) {
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
     std::vector<ir::FieldRow> fields;
-    fields.push_back({ kSemKeysField, make_int_type(64, false, true), kSemKeys });
-    fields.push_back({ kSemHeadField, make_int_type(64, false, false), kSemQHead });
-    fields.push_back({ kSemTailField, make_int_type(64, false, false), kSemQTail });
+    fields.push_back({ kSemKeysField, make_int_type(64, false), kSemKeys });
+    fields.push_back({ kSemHeadField, make_int_type(64, false), kSemQHead });
+    fields.push_back({ kSemTailField, make_int_type(64, false), kSemQTail });
     module_.pool.set_struct_fields(fid, std::move(fields));
     // Same two obligations lower_process_class has: the reserved randomization
     // slots need an (empty) rand block for the generated bodies to read, and the
@@ -160,9 +160,9 @@ ir::Ref Lowerer::lower_mailbox_class(const slang::ast::ClassType& clt) {
     t.element   = ir::Ref::Invalid;
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
-    const ir::Ref word = make_int_type(64, false, false);
+    const ir::Ref             word = make_int_type(64, false);
     std::vector<ir::FieldRow> fields;
-    fields.push_back({ kMbxBoundField, make_int_type(64, false, true), kMbxBound });
+    fields.push_back({ kMbxBoundField, make_int_type(64, false), kMbxBound });
     fields.push_back({ kMbxFifoField, fifo, kMbxFifo });
     fields.push_back({ kMbxGetHeadField, word, kMbxGetHead });
     fields.push_back({ kMbxGetTailField, word, kMbxGetTail });
@@ -280,8 +280,8 @@ std::optional<ir::Index> Lowerer::lower_sync_method(const CallExpression&   call
     }
     const ir::Ref   ref    = lower_type(*call.thisClass()->type);
     const ir::Index handle = lower_expr(*call.thisClass(), b);
-    const ir::Ref   i64    = make_int_type(64, false, true);
-    const ir::Ref   int_ty = make_int_type(32, true, true);
+    const ir::Ref   i64    = make_int_type(64, false);
+    const ir::Ref   int_ty = make_int_type(32, true);
     // The body lvalue is re-derived per access rather than held across the park:
     // a suspend may have run in between, and an lvalue is a place, not a copy.
     const auto field = [&](uint32_t idx) {
@@ -335,7 +335,7 @@ std::optional<ir::Index> Lowerer::lower_sync_method(const CallExpression&   call
         // rule (and Accellera's Interpretation #1 of it) makes a blocked head
         // block later arrivals even when the keys would satisfy them.
         const ir::Index head              = b.unary(ir::Inst::Tag::Load, field(kSemQHead), l);
-        const ir::Index none              = b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l);
+        const ir::Index                none = b.constant(module_.pool.put_int(make_int_type(64, false), 0), l);
         const ir::Index empty             = b.binary(ir::Inst::Tag::Eq, head, none, l);
         const std::array<ir::Index, 2> qw = qwords();
         emit_sync_park_loop(
@@ -372,9 +372,9 @@ std::optional<ir::Index> Lowerer::lower_mailbox_method(const CallExpression&   c
     const ir::Ref   fifo_ty =
       module_.pool.struct_fields(std::get<ir::Type>(module_.pool.get(ref)).fields_id)[kMbxFifo].type;
     const ir::Ref elem_ty = std::get<ir::Type>(module_.pool.get(fifo_ty)).element;
-    const ir::Ref i64     = make_int_type(64, false, true);
-    const ir::Ref int_ty  = make_int_type(32, true, true);
-    const ir::Ref word    = make_int_type(64, false, false);
+    const ir::Ref i64     = make_int_type(64, false);
+    const ir::Ref int_ty  = make_int_type(32, true);
+    const ir::Ref word    = make_int_type(64, false);
 
     const auto field = [&](uint32_t idx) {
         return b.member_select(b.handle_deref(handle, ref, l), idx, ref, l);
@@ -398,13 +398,13 @@ std::optional<ir::Index> Lowerer::lower_mailbox_method(const CallExpression&   c
         const ir::Index limit     = bound();
         const ir::Index none      = zero64();
         const ir::Index unbounded = b.binary(ir::Inst::Tag::Eq, limit, none, l);
-        const ir::Index used      = b.resize(size(), i64, l);
+        const ir::Index used      = b.convert(size(), i64, true, l);
         const ir::Index cap       = bound();
         const ir::Index under     = b.binary(ir::Inst::Tag::SLt, used, cap, l);
         return b.binary(ir::Inst::Tag::Lor, unbounded, under, l);
     };
     const auto has_msg = [&] {
-        const ir::Index used = b.resize(size(), i64, l);
+        const ir::Index used = b.convert(size(), i64, true, l);
         const ir::Index none = zero64();
         return b.binary(ir::Inst::Tag::SGt, used, none, l);
     };
@@ -553,7 +553,7 @@ std::optional<ir::Index> Lowerer::lower_mailbox_method(const CallExpression&   c
         // that only asks whether a message is there.
         const uint32_t    site = sync_site_seq_++;
         const Expression& d    = dest();
-        const ir::Index   any  = b.constant(module_.pool.put_int(make_int_type(1, false, false), 1), l);
+        const ir::Index   any  = b.constant(module_.pool.put_int(make_int_type(1, false), 1), l);
         emit_sync_park_loop(site, qwords(kMbxPeekHead, kMbxPeekTail), any, [&] { return has_msg(); },
                             /*require_head=*/false, b, l);
         const ir::Index fifo = field(kMbxFifo);
@@ -592,7 +592,7 @@ std::optional<ir::Index> Lowerer::lower_builtin_class_method(const CallExpressio
                                                              const SubroutineSymbol& sub,
                                                              ir::Builder&            b) {
     const ir::SourceLoc l    = loc(call);
-    const ir::Ref       u64  = make_int_type(64, false, false);
+    const ir::Ref       u64  = make_int_type(64, false);
     const auto          args = call.arguments();
     if (sub.name == "pre_randomize" || sub.name == "post_randomize") {
         // The synthesized default is empty (a user override is not BuiltIn and
@@ -619,7 +619,7 @@ std::optional<ir::Index> Lowerer::lower_builtin_class_method(const CallExpressio
         }
         const uint64_t  which = sub.name == "srandom" ? kRandOpSrandom : kRandOpModeAll;
         const ir::Index op    = b.constant(module_.pool.put_int(u64, which), l);
-        emit_randops_dispatch(*clt, self, op, b.resize(lower_expr(*args[0], b), u64, l), b, l);
+        emit_randops_dispatch(*clt, self, op, b.convert(lower_expr(*args[0], b), u64, false, l), b, l);
         return std::nullopt;
     }
     if (sub.name == "constraint_mode") {

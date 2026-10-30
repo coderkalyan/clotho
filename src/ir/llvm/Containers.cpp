@@ -61,7 +61,7 @@ Backend::ContainerFmt Backend::container_fmt(Ref container_type) {
         cf.width     = e.width;
         cf.four      = e.four_state ? 1u : 0u;
         cf.has_z     = e.has_z ? 1u : 0u;
-        cf.is_signed = std::get<Type>(mod_.pool.get(e.elem_type)).is_signed ? 1u : 0u;
+        cf.is_signed = std::get<Type>(mod_.pool.get(container_type)).elem_signed ? 1u : 0u;
         if (e.has_z) {
             cf.z_off = static_cast<uint32_t>(
               env_->llmod.getDataLayout().getStructLayout(e.slot_ty)->getElementOffset(1));
@@ -295,10 +295,12 @@ Backend::SortDesc Backend::dynarr_sort_desc(Ref array_type) const {
     if (vt.is_real) {
         return { 2u, vt.width };
     }
+    // The container's element ordering is part of its type.
+    const bool is_signed = std::get<Type>(mod_.pool.get(array_type)).elem_signed;
     if (vt.four_state) {
-        return { vt.is_signed ? 4u : 3u, vt.width };
+        return { is_signed ? 4u : 3u, vt.width };
     }
-    return { vt.is_signed ? 1u : 0u, vt.width };
+    return { is_signed ? 1u : 0u, vt.width };
 }
 
 // Whether a type is a queue (LRM 7.10).

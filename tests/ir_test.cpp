@@ -58,19 +58,19 @@ TEST_CASE("intern pool deduplicates types in one Ref space") {
     CHECK(pool.logic_type != pool.bit_type);
 
     // logic [7:0] — packed array of logic.
-    const auto vec = [&](bool is_signed) {
-        return pool.put(Type{
-          .kind = Type::Kind::PackedArray, .is_signed = is_signed, .element = pool.logic_type, .left = 7, .right = 0 });
+    const auto vec = [&] {
+        return pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.logic_type, .left = 7, .right = 0 });
     };
-    CHECK(vec(false) == vec(false)); // structurally identical -> same Ref
-    CHECK(vec(false) != vec(true));  // signedness distinguishes
+    CHECK(vec() == vec());                                 // structurally identical -> same Ref
+    CHECK(vec() == pool.int_type(8, /*four_state=*/true)); // int_type interns the same type
+    CHECK(vec() != pool.int_type(8, /*four_state=*/false));
 
     // logic [7:0] mem [0:255] — unpacked array (memory) of the vector.
-    const Ref mem = pool.put(Type{ .kind = Type::Kind::UnpackedArray, .element = vec(false), .left = 0, .right = 255 });
+    const Ref   mem   = pool.put(Type{ .kind = Type::Kind::UnpackedArray, .element = vec(), .left = 0, .right = 255 });
     const Type& mem_t = std::get<Type>(pool.get(mem));
     CHECK(mem_t.kind == Type::Kind::UnpackedArray);
-    CHECK(mem_t.element == vec(false));
-    CHECK(std::get<Type>(pool.get(vec(false))).left == 7);
+    CHECK(mem_t.element == vec());
+    CHECK(std::get<Type>(pool.get(vec())).left == 7);
 }
 
 TEST_CASE("a packed struct's field table participates in interning") {
@@ -699,11 +699,10 @@ endmodule
     // table to one line per class, the signal line to a bare name, and both to the
     // exact spelling the old inline form used inside its braces.
     CHECK(ir.find("module top\n"
-                  "  class plain {x:signed bit[31:0], s:string, l:class leaf, q:logic [$], "
-                  "m:class leaf [signed bit[31:0]]}\n"
-                  "  class leaf {x:signed bit[31:0]}\n"
-                  "  s0: class plain p (internal)")
-          == 0);
+                  "  class plain {x:bit[31:0], s:string, l:class leaf, q:logic [$], "
+                  "m:class leaf [bit[31:0]]}\n"
+                  "  class leaf {x:bit[31:0]}\n"
+                  "  s0: class plain p (internal)") == 0);
     CHECK(occurrences(ir, "^") == 0);
 }
 
@@ -780,7 +779,7 @@ endmodule
     // of them plainly `box`, so the label has to take the arguments from the type's
     // own rendering or every specialization of a generic class would collide -- which
     // in UVM is most of them (`uvm_queue#(uvm_callback)`).
-    CHECK(ir.find("\n  class box#(int,1) {v:signed bit[31:0]}\n") != std::string::npos);
+    CHECK(ir.find("\n  class box#(int,1) {v:bit[31:0]}\n") != std::string::npos);
     CHECK(ir.find("\n  class box#(string,2) {v:string}\n") != std::string::npos);
     CHECK(ir.find("s0: class box#(int,1) bi (internal)") != std::string::npos);
     CHECK(ir.find("s1: class box#(string,2) bs (internal)") != std::string::npos);
@@ -806,7 +805,7 @@ endmodule
     CHECK(occurrences(ir, "class c") > 0);
     CHECK(occurrences(ir, "class c") == occurrences(ir, "class c#"));
     // One table line each, and the bodies say which is which.
-    CHECK(occurrences(ir, " {a:signed bit[31:0]}\n") == 1);
+    CHECK(occurrences(ir, " {a:bit[31:0]}\n") == 1);
     CHECK(occurrences(ir, " {b:string}\n") == 1);
 }
 
@@ -826,7 +825,7 @@ endmodule
     // its enclosing class: the enclosing scope is dropped for the same reason a
     // package's is.
     CHECK(ir.find("\n  class outer {i:class inner}\n") != std::string::npos);
-    CHECK(ir.find("\n  class inner {y:signed bit[31:0]}\n") != std::string::npos);
+    CHECK(ir.find("\n  class inner {y:bit[31:0]}\n") != std::string::npos);
 }
 
 TEST_CASE("a format-family op carries one sign flag per argument") {

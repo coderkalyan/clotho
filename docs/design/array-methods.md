@@ -362,8 +362,8 @@ Not by teaching the runtime comparator a multi-word compare, but by routing a wi
 element through the IR permutation sort above (7.12.2's bare form is
 `with (item)`, so it needs nothing else). `slot_less` / `slot_cmp4` still load one
 word each and are still only reached by elements that fit them. Signed and
-unsigned both work — the key's own type carries the signedness, so the emitted
-`Lt` / `Gt` picks the arithmetic, which is the same reason the locator family
+unsigned both work — the frontend reads the key's slang type and emits `SLt` / `ULt`
+(and `SGt` / `UGt`), so the opcode picks the arithmetic, which is the same reason the locator family
 never needed a descriptor. A wide **4-state** element needed nothing further than
 §3's ordering: the unknown test is one reduction of the whole unknown plane, at
 any width.

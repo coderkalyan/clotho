@@ -1617,22 +1617,20 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::NetPull:
             set_value(i, lower_net_pull(value_of(p.op_imm.op), p.op_imm.imm));
             return;
-        case Inst::Tag::Resize: {
-            // Truncate or extend all planes (sign per target type).
-            if (type_of(p.op_type.op).is_string) {
-                throw BackendError{ "internal: string value in resize" };
+        case Inst::Tag::ZExt:
+        case Inst::Tag::SExt:
+        case Inst::Tag::Trunc:
+        case Inst::Tag::ToFour:
+        case Inst::Tag::ToTwo: {
+            const ValueType from = type_of(p.op_type.op);
+            const ValueType to   = type_of(i);
+            // Depth guard: an integer conversion would silently extend or drop bits of
+            // a float's bit pattern or a string handle. The frontend converts a float
+            // with ItoF / FtoI / FResize and never hands a string to one.
+            if (from.is_string || from.is_real || to.is_string || to.is_real) {
+                throw BackendError{ "internal: conversion of a string or a real value" };
             }
-            const ValueType to = value_type_of(mod_.pool, p.op_type.type);
-            // Depth guard: an integer resize would silently zext / trunc a
-            // float bit pattern. The frontend must emit ItoF / FtoI /
-            // FResize instead.
-            if (type_of(p.op_type.op).is_real || to.is_real) {
-                throw BackendError{ "internal: resize on a real value" };
-            }
-            // Resize is also the domain-conversion site: slang lowers an
-            // implicit 2-state <-> 4-state conversion (LRM 6.3.1) as a
-            // ConversionExpression -> Resize to the target type.
-            set_value(i, convert(value_of(p.op_type.op), to.width, to.four_state, to.is_signed));
+            set_value(i, lower_conversion(ir_->tag(i), value_of(p.op_type.op), to));
             return;
         }
 

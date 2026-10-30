@@ -677,8 +677,8 @@ namespace {
 // Constant behind a store's value, seeing through the width cast, or nullopt.
 std::optional<uint64_t> const_bits(const ir::Module& m, const ir::Ir& ir, ir::Index v) {
     ir::Index i = v;
-    while (ir.tag(i) == ir::Inst::Tag::Resize) {
-        i = ir.payload(i).unary;
+    while (ir::is_conversion(ir.tag(i))) {
+        i = ir.payload(i).op_type.op;
     }
     if (ir.tag(i) != ir::Inst::Tag::Constant) {
         return std::nullopt;

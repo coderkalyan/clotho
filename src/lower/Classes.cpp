@@ -309,7 +309,7 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     if (rand.present) {
         const ir::Ref state_ty = rng_state_type();
         fields.push_back({ "$rand.rng", state_ty, rand.rng_field });
-        fields.push_back({ "$rand.mode", make_int_type(64, false, false), rand.mode_field });
+        fields.push_back({ "$rand.mode", make_int_type(64, false), rand.mode_field });
         for (const RandProp& p : rand.props) {
             if (p.cyclic) {
                 fields.push_back({ "$rand.randc", state_ty, p.randc_field });
@@ -651,9 +651,9 @@ void Lowerer::compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref
     // class still laying itself out below this frame).
     const uint32_t randomize_slot = slots.at(kRandomizeSlot);
     const uint32_t randops_slot   = slots.at(kRandOpsSlot);
-    table[randomize_slot]         = rand_body_id(clt, class_ref, make_int_type(32, false, true), randomize_fn_);
+    table[randomize_slot]         = rand_body_id(clt, class_ref, make_int_type(32, false), randomize_fn_);
     filled[randomize_slot]        = true;
-    table[randops_slot]           = rand_body_id(clt, class_ref, make_int_type(64, false, false), randops_fn_);
+    table[randops_slot]           = rand_body_id(clt, class_ref, make_int_type(64, false), randops_fn_);
     filled[randops_slot]          = true;
     // Un-overridden slots: a pure virtual in an abstract class. Fill with a
     // prototype-built stub (the slot's signature source).
@@ -974,7 +974,7 @@ ir::Index Lowerer::lower_new_class(const slang::ast::NewClassExpression& nc, ir:
         // die on an out-of-range formal index, so the argument is stored into the
         // synthetic body here instead. The rest of the body powers on all-zero,
         // which is exactly an empty wait queue.
-        const ir::Ref i64 = make_int_type(64, false, true);
+        const ir::Ref i64 = make_int_type(64, false);
         ir::Index     arg = b.constant(module_.pool.put_int(i64, 0), l);
         if (const Expression* cc = nc.constructorCall()) {
             const CallExpression& call = cc->as<CallExpression>();
@@ -1048,10 +1048,10 @@ void Lowerer::emit_object_rng_seed(const slang::ast::ClassType& clt,
     if (!rd.present) {
         return;
     }
-    const ir::Ref   u64  = make_int_type(64, false, false);
+    const ir::Ref   u64  = make_int_type(64, false);
     const ir::Index body = b.handle_deref(handle, class_ref, l);
     const ir::Index rng  = b.member_select(body, rd.rng_field, class_ref, l);
-    const ir::Index seed = b.resize(b.urandom(l), u64, l);
+    const ir::Index seed = b.convert(b.urandom(l), u64, false, l);
     b.obj_rand_seed(rng, seed, l);
     // Every rand property starts enabled (LRM 18.8).
     const ir::Index mode = b.member_select(body, rd.mode_field, class_ref, l);

@@ -32,7 +32,7 @@ before the frame/`this` paths). `static` methods reuse the free-subroutine path
 or container initializer (unpacked struct / array, queue, dynamic array,
 associative array) routes through `emit_struct_store` into that shared slot, the
 same element-wise path a module-level declaration initializer takes; a `string`
-initializer stores whole, bypassing `coerce` (whose `Resize` rejects a string
+initializer stores whole, bypassing `coerce` (whose integer conversion rejects a string
 value). The initializer is lowered with `fn_ctx_` and `ctor_this_` cleared: it is
 class scope, and LRM 8.11 allows `this` only inside a non-static method, so a
 stray non-static reference must fail loudly rather than bind to whichever frame or

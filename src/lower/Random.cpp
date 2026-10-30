@@ -66,7 +66,7 @@ const char* Lowerer::rand_type_unsupported(const slang::ast::Type& ty) {
 ir::Ref Lowerer::rng_state_type() {
     ir::Type t;
     t.kind    = ir::Type::Kind::UnpackedArray;
-    t.element = make_int_type(64, false, false);
+    t.element = make_int_type(64, false);
     t.left    = 3;
     t.right   = 0;
     return module_.pool.put(ir::Item{ t });
@@ -121,11 +121,11 @@ void Lowerer::lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builde
     // The weight domain is 2-state: an x/z weight bit reads as 0, which is how
     // $urandom_range already treats its own operands (18.16 does not define a
     // 4-state weight).
-    const ir::Ref          wty = make_int_type(width, false, false);
+    const ir::Ref          wty = make_int_type(width, false);
     std::vector<ir::Index> weights;
     weights.reserve(rc.items.size());
     for (const slang::ast::RandCaseStatement::Item& item : rc.items) {
-        weights.push_back(b.resize(lower_expr(*item.expr, b), wty, loc(*item.expr)));
+        weights.push_back(b.convert(lower_expr(*item.expr, b), wty, false, loc(*item.expr)));
     }
 
     ir::Index sum = weights[0];
@@ -136,10 +136,10 @@ void Lowerer::lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builde
     // The draw is guarded, not clamped: with a zero sum there is no branch to
     // take, and $urandom_range(-1, 0) would otherwise draw over the full range
     // (and consume a value from the process stream).
-    const ir::Ref   u32  = make_int_type(32, false, false);
+    const ir::Ref   u32  = make_int_type(32, false);
     const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
     b.open_region();
-    const ir::Index wide = b.resize(sum, u32, l);
+    const ir::Index wide = b.convert(sum, u32, false, l);
     const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
     const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
     const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
@@ -168,7 +168,7 @@ void Lowerer::lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
     }
     const ir::SourceLoc l    = loc(*rc.items[k].stmt);
     const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-    const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.resize(next, u32, l), l);
+    const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
 
     b.open_region();
     lower_stmt(*rc.items[k].stmt, b);
@@ -388,7 +388,7 @@ uint32_t Lowerer::rand_join_units(const RsProd::Rule& rule) {
 
 void Lowerer::build_production(const RsProd& p, const RandSeqCtx& rs, ir::FunctionId id) {
     const ir::SourceLoc l    = to_source_loc(p.location);
-    const ir::Ref       bit1 = make_int_type(1, false, false);
+    const ir::Ref       bit1 = make_int_type(1, false);
     const Type&         rty  = p.getReturnType();
 
     FnCtx ctx;
@@ -472,7 +472,7 @@ void Lowerer::build_production(const RsProd& p, const RandSeqCtx& rs, ir::Functi
 // `$rule` is -1 when the weights summed to zero, which generates nothing.
 void Lowerer::build_production_plan(const RsProd& p, const RandSeqCtx& rs, ir::FunctionId id) {
     const ir::SourceLoc l   = to_source_loc(p.location);
-    const ir::Ref       i32 = make_int_type(32, false, true);
+    const ir::Ref       i32 = make_int_type(32, false);
 
     FnCtx ctx;
     ctx.name_prefix = "randseq." + std::string(p.name) + ".plan.";
@@ -502,7 +502,7 @@ void Lowerer::build_production_plan(const RsProd& p, const RandSeqCtx& rs, ir::F
     // A plan body raises no abort of its own -- a weight expression is an
     // ordinary expression -- but in_randseq is set for the shared helpers, so
     // give the flag a slot nothing writes.
-    ctx.randseq_abort = anon_local(make_int_type(1, false, false));
+    ctx.randseq_abort = anon_local(make_int_type(1, false));
     // As `step`: a reference to the driver's activation cell, so `plan`'s weight
     // expressions read exactly what the units will.
     for (const FormalArgumentSymbol* fa : p.arguments) {
@@ -559,8 +559,8 @@ void Lowerer::build_production_plan(const RsProd& p, const RandSeqCtx& rs, ir::F
 //                        <declared formals>, <captures...> )
 void Lowerer::build_production_step(const RsProd& p, const RandSeqCtx& rs, ir::FunctionId id) {
     const ir::SourceLoc l    = to_source_loc(p.location);
-    const ir::Ref       bit1 = make_int_type(1, false, false);
-    const ir::Ref       i32  = make_int_type(32, false, true);
+    const ir::Ref       bit1 = make_int_type(1, false);
+    const ir::Ref       i32  = make_int_type(32, false);
     const Type&         rty  = p.getReturnType();
 
     FnCtx ctx;
@@ -803,9 +803,9 @@ void Lowerer::gen_rand_join(const RsProd::Rule&    rule,
                             const RandSeqRuleVars& vars,
                             ir::Builder&           b) {
     const ir::SourceLoc l      = to_source_loc(rule.ruleBlock->location);
-    const ir::Ref       i32    = make_int_type(32, false, true);
-    const ir::Ref       u32    = make_int_type(32, false, false);
-    const ir::Ref       bit1   = make_int_type(1, false, false);
+    const ir::Ref       i32    = make_int_type(32, false);
+    const ir::Ref       u32    = make_int_type(32, false);
+    const ir::Ref       bit1   = make_int_type(1, false);
     const auto          kconst = [&](int64_t v) { return b.constant(module_.pool.put_int(i32, v), l); };
 
     // One operand's live interleaving state. Everything the production holds
@@ -931,7 +931,7 @@ void Lowerer::gen_rand_join(const RsProd::Rule&    rule,
         const ir::Index has_left = b.binary(ir::Inst::Tag::SGt, left, kconst(0), l);
         const ir::Index none     = kconst(0);
         const ir::Index weight   = b.select(has_left, w, none, l);
-        weights.push_back(b.resize(weight, u32, l));
+        weights.push_back(b.convert(weight, u32, false, l));
     }
     ir::Index sum = weights[0];
     for (size_t i = 1; i < weights.size(); i++) {
@@ -1225,15 +1225,16 @@ void Lowerer::gen_case_prod(const RsProd::CaseProd& cp,
             signd = signd && e->type->isSigned();
         }
     }
-    const ir::Ref   ty  = make_int_type(width, four, signd);
-    const ir::Index sel = b.resize(lower_expr(*cp.expr, b), ty, l);
-    gen_case_arm(cp, 0, sel, ty, rs, vars, b);
+    const ir::Ref   ty  = make_int_type(width, four);
+    const ir::Index sel = b.convert(lower_expr(*cp.expr, b), ty, signd, l);
+    gen_case_arm(cp, 0, sel, ty, signd, rs, vars, b);
 }
 
 void Lowerer::gen_case_arm(const RsProd::CaseProd& cp,
                            size_t                  k,
                            ir::Index               sel,
                            ir::Ref                 ty,
+                           bool                    signd,
                            const RandSeqCtx&       rs,
                            const RandSeqRuleVars&  vars,
                            ir::Builder&            b) {
@@ -1245,15 +1246,16 @@ void Lowerer::gen_case_arm(const RsProd::CaseProd& cp,
     }
     const RsProd::CaseItem& ci = cp.items[k];
     const ir::SourceLoc     l  = loc(*ci.expressions[0]);
-    ir::Index pred = b.binary(ir::Inst::Tag::CaseEq, sel, b.resize(lower_expr(*ci.expressions[0], b), ty, l), l);
+    ir::Index               pred =
+      b.binary(ir::Inst::Tag::CaseEq, sel, b.convert(lower_expr(*ci.expressions[0], b), ty, signd, l), l);
     for (size_t j = 1; j < ci.expressions.size(); j++) {
         // Labels sharing one production (`1, 2 : DISK`) match as a set.
         const ir::SourceLoc el = loc(*ci.expressions[j]);
-        pred =
-          b.binary(ir::Inst::Tag::Bor,
-                   pred,
-                   b.binary(ir::Inst::Tag::CaseEq, sel, b.resize(lower_expr(*ci.expressions[j], b), ty, el), el),
-                   el);
+        pred                   = b.binary(
+          ir::Inst::Tag::Bor,
+          pred,
+          b.binary(ir::Inst::Tag::CaseEq, sel, b.convert(lower_expr(*ci.expressions[j], b), ty, signd, el), el),
+          el);
     }
 
     b.open_region();
@@ -1261,7 +1263,7 @@ void Lowerer::gen_case_arm(const RsProd::CaseProd& cp,
     const ir::ExtraSlice then_region = b.close_region();
 
     b.open_region();
-    gen_case_arm(cp, k + 1, sel, ty, rs, vars, b);
+    gen_case_arm(cp, k + 1, sel, ty, signd, rs, vars, b);
     const ir::ExtraSlice else_region = b.close_region();
 
     b.cond(pred, then_region, else_region, l);
@@ -1349,7 +1351,7 @@ void Lowerer::emit_result_copy(ir::Index place, ir::Index temp, ir::Ref ty, ir::
 // return; at the randsequence statement there is nothing above to unwind, so it
 // is a write-only temp.
 ir::Index Lowerer::abort_lvalue(ir::Builder& b, ir::SourceLoc l) {
-    const ir::Ref bit1 = make_int_type(1, false, false);
+    const ir::Ref bit1 = make_int_type(1, false);
     if (fn_ctx_ != nullptr && fn_ctx_->in_randseq) {
         return b.local(fn_ctx_->randseq_abort, bit1, l);
     }
@@ -1364,7 +1366,7 @@ void Lowerer::emit_abort_check(ir::Builder& b, ir::SourceLoc l) {
     if (fn_ctx_ == nullptr || !fn_ctx_->in_randseq) {
         return;
     }
-    const ir::Ref bit1 = make_int_type(1, false, false);
+    const ir::Ref bit1 = make_int_type(1, false);
     b.open_region();
     b.ret_void(l);
     const ir::ExtraSlice abort_region = b.close_region();
@@ -1399,7 +1401,7 @@ ir::Index Lowerer::result_slot(const RsProdItem&      item,
         return base;
     }
     // The array is `[1:N]`, and ElemSelect indexes in declared-range coordinates.
-    const ir::Ref idx_ty = make_int_type(32, false, true);
+    const ir::Ref idx_ty = make_int_type(32, false);
     return b.elem_select(base,
                          b.constant(module_.pool.put_int(idx_ty, oit->second), l),
                          lower_type(vit->second->getType()),
@@ -1481,8 +1483,8 @@ void Lowerer::emit_rand_hook(const slang::ast::ClassType& clt,
 // constraint-independent.
 void Lowerer::build_randomize_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
     const ir::SourceLoc l   = to_source_loc(clt.location);
-    const ir::Ref       u64 = make_int_type(64, false, false);
-    const ir::Ref       i32 = make_int_type(32, false, true);
+    const ir::Ref       u64 = make_int_type(64, false);
+    const ir::Ref       i32 = make_int_type(32, false);
     ir::Builder         b(module_);
     const ClassRand&    rd   = class_rand_.at(&clt);
     if (!rd.unsupported.empty()) {
@@ -1561,7 +1563,8 @@ void Lowerer::emit_rand_assign(const RandProp&  p,
         const ir::Index seen = b.member_select(body, p.randc_field, class_ref, l);
         const ir::Index rng  = b.member_select(body, rd.rng_field, class_ref, l);
         const ir::Index v    = b.randc_next(seen, rng, p.randc_vals, l);
-        b.binary(ir::Inst::Tag::Store, lv, b.resize(v, lower_type(p.sym->getType()), l), l);
+        b.binary(
+          ir::Inst::Tag::Store, lv, b.convert(v, lower_type(p.sym->getType()), p.sym->getType().isSigned(), l), l);
         return;
     }
     const RandDraw draw = [&] { return b.obj_random(b.member_select(body, rd.rng_field, class_ref, l), l); };
@@ -1588,8 +1591,7 @@ void Lowerer::emit_rand_value(ir::Index               lv,
         const slang::ast::Type&      et  = arr->elementType.getCanonicalType();
         for (int32_t c = r.lower(); c <= r.upper(); ++c) {
             const ir::Index idx = b.constant(
-              module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(c))),
-              l);
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(c))), l);
             emit_rand_value(b.elem_select(lv, idx, aty, l), et, draw, b, l);
         }
         return;
@@ -1600,7 +1602,7 @@ void Lowerer::emit_rand_value(ir::Index               lv,
 
 // `if (h != null) h.$randomize(all)`.
 void Lowerer::emit_rand_recurse(ir::Index lv, const slang::ast::ClassType& pointee, ir::Builder& b, ir::SourceLoc l) {
-    const ir::Ref   u64    = make_int_type(64, false, false);
+    const ir::Ref   u64    = make_int_type(64, false);
     const ir::Ref   ref    = lower_class_type(pointee);
     const ir::Index handle = b.unary(ir::Inst::Tag::Load, lv, l);
     b.open_region();
@@ -1629,20 +1631,20 @@ ir::Index Lowerer::emit_rand_scalar(const slang::ast::Type& ty,
     }
     const uint32_t width = ty.getBitWidth();
     if (width <= 32) {
-        return b.resize(draw(), target, l);
+        return b.convert(draw(), target, ty.isSigned(), l);
     }
     // Wider than one draw: one 32-bit draw per chunk, filling from the LSB up.
     // The chunk order is part of the reproducible stream, so it is fixed here
     // rather than left to concat's operand order (which is MSB-first).
-    const ir::Ref          u32   = make_int_type(32, false, false);
+    const ir::Ref          u32   = make_int_type(32, false);
     const uint32_t         n     = (width + 31) / 32;
     std::vector<ir::Index> parts(n);
     for (uint32_t k = 0; k < n; ++k) {
         const uint32_t chunk_w = (k + 1 == n) ? width - 32 * (n - 1) : 32;
-        parts[n - 1 - k]       = chunk_w == 32 ? draw() : b.resize(draw(), make_int_type(chunk_w, false, false), l);
+        parts[n - 1 - k]       = chunk_w == 32 ? draw() : b.convert(draw(), make_int_type(chunk_w, false), false, l);
     }
     (void)u32;
-    return b.resize(b.concat(parts, l), target, l);
+    return b.convert(b.concat(parts, l), target, ty.isSigned(), l);
 }
 
 // Uniform over the enum's distinct values: one draw, mapped onto [0, n) by the
@@ -1663,8 +1665,8 @@ ir::Index Lowerer::emit_rand_enum(const slang::ast::EnumType& et,
     if (values.empty()) {
         fail("internal: rand enum with no members");
     }
-    const ir::Ref   u64   = make_int_type(64, false, false);
-    const ir::Index wide  = b.resize(draw, u64, l);
+    const ir::Ref   u64   = make_int_type(64, false);
+    const ir::Index wide  = b.convert(draw, u64, false, l);
     const ir::Index count = b.constant(module_.pool.put_int(u64, values.size()), l);
     const ir::Index prod  = b.binary(ir::Inst::Tag::Mul, wide, count, l);
     const ir::Index shift = b.constant(module_.pool.put_int(u64, 32), l);
@@ -1684,7 +1686,7 @@ ir::Index Lowerer::emit_rand_enum(const slang::ast::EnumType& et,
 // rather than four slots: these are rare calls, and the vtable is per class.
 void Lowerer::build_randops_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
     const ir::SourceLoc l   = to_source_loc(clt.location);
-    const ir::Ref       u64 = make_int_type(64, false, false);
+    const ir::Ref       u64 = make_int_type(64, false);
     ir::Builder         b(module_);
     const ClassRand&    rd = class_rand_.at(&clt);
     if (rd.present) {
@@ -1868,20 +1870,21 @@ ir::Index Lowerer::lower_rand_mode_call(const CallExpression& call, ir::Builder&
     } else {
         std::tie(self, clt) = implicit_this(b, l);
     }
-    const ir::Ref u64 = make_int_type(64, false, false);
+    const ir::Ref u64 = make_int_type(64, false);
     ir::Index     op  = b.constant(module_.pool.put_int(u64, kRandOpModeQuery), l);
     ir::Index     arg = b.constant(module_.pool.put_int(u64, ordinal), l);
     if (args.size() > 1) {
         // The task form: `ordinal << 1 | (on != 0)`.
-        const ir::Index raw  = b.resize(lower_expr(*args[1], b), u64, l);
+        const ir::Index raw  = b.convert(lower_expr(*args[1], b), u64, false, l);
         const ir::Index zero = b.constant(module_.pool.put_int(u64, 0), l);
         const ir::Index on   = b.binary(ir::Inst::Tag::Ne, raw, zero, l);
         op                   = b.constant(module_.pool.put_int(u64, kRandOpModeOne), l);
         const ir::Index tag  = b.constant(module_.pool.put_int(u64, uint64_t{ ordinal } << 1), l);
-        const ir::Index flag = b.resize(on, u64, l);
+        const ir::Index flag = b.convert(on, u64, false, l);
         arg                  = b.binary(ir::Inst::Tag::Bor, tag, flag, l);
     }
-    return b.resize(emit_randops_dispatch(*clt, self, op, arg, b, l), lower_type(*call.type), l);
+    return b.convert(
+      emit_randops_dispatch(*clt, self, op, arg, b, l), lower_type(*call.type), call.type->isSigned(), l);
 }
 
 // The vtable slot of one of `clt`'s randomization entry points, and the
@@ -1921,8 +1924,8 @@ ir::FunctionId Lowerer::iface_rand_sig(ir::Ref iface_ref, bool ops) {
     if (const auto it = cache.find(iface_ref); it != cache.end()) {
         return it->second;
     }
-    const ir::Ref        u64 = make_int_type(64, false, false);
-    const ir::Ref        i32 = make_int_type(32, false, true);
+    const ir::Ref        u64 = make_int_type(64, false);
+    const ir::Ref        i32 = make_int_type(32, false);
     const ir::Ref        ret = ops ? u64 : i32;
     std::vector<ir::Ref> params =
       ops ? std::vector<ir::Ref>{ iface_ref, u64, u64 } : std::vector<ir::Ref>{ iface_ref, u64 };
@@ -1965,7 +1968,7 @@ ir::Index Lowerer::emit_randomize_dispatch(const slang::ast::ClassType& clt,
                                            ir::Builder&                 b,
                                            ir::SourceLoc                l) {
     const ir::Ref                  ref = lower_class_type(clt);
-    const ir::Ref                  u64 = make_int_type(64, false, false);
+    const ir::Ref                  u64 = make_int_type(64, false);
     const std::array<ir::Index, 2> args{ self, b.constant(module_.pool.put_int(u64, mask), l) };
     if (clt.isInterface) {
         return b.call_virtual(

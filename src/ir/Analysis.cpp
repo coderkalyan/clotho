@@ -83,7 +83,11 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Concat:
         case Inst::Tag::Repl:
         case Inst::Tag::StreamReverse:
-        case Inst::Tag::Resize:
+        case Inst::Tag::ZExt:
+        case Inst::Tag::SExt:
+        case Inst::Tag::Trunc:
+        case Inst::Tag::ToFour:
+        case Inst::Tag::ToTwo:
         case Inst::Tag::Cond:
         case Inst::Tag::Switch:
         case Inst::Tag::Loop:
@@ -1267,10 +1271,14 @@ struct ValueSweep {
                     val_z[raw] = z_of(p.op_imm.op);
                     val_x[raw] = operand_x(ir, i);
                     break;
-                case Inst::Tag::Resize:
+                case Inst::Tag::ZExt:
+                case Inst::Tag::SExt:
+                case Inst::Tag::Trunc:
+                case Inst::Tag::ToFour:
+                case Inst::Tag::ToTwo:
                     // Sign extension replicates a z MSB; truncation keeps low z
-                    // bits; a 4->2-state resize does NOT clear z (the backend casts
-                    // all planes).
+                    // bits. ToTwo is treated like the others: its z plane is
+                    // conservatively kept (the analysis is a may-z over-approximation).
                     val_z[raw] = z_of(p.op_type.op);
                     val_x[raw] = operand_x(ir, i);
                     break;

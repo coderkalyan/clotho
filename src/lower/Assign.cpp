@@ -178,8 +178,7 @@ void Lowerer::emit_string_literal_array_store(ir::Index            lhs,
           t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
         const uint8_t   byte_val = k < text.size() ? static_cast<uint8_t>(text[k]) : 0;
         const ir::Index idx      = b.constant(
-          module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
-          l);
+          module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
         const ir::Index val = b.constant(module_.pool.put_int(t.element, byte_val), l);
         store_leaf(tag, nbt, b.elem_select(lhs, idx, type, l), val, b, l);
     }
@@ -310,10 +309,9 @@ void Lowerer::emit_agg_store(ir::Index            lhs,
                 const int32_t coord =
                   keyed ? static_cast<int32_t>(lo + k)
                         : (t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k));
-                const ir::Index idx =
-                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                             l);
+                const ir::Index idx = b.constant(
+                  module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                  l);
                 emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l, nbt);
             }
             return;
@@ -537,7 +535,7 @@ void Lowerer::emit_agg_conditional(ir::Index                    lhs,
     // Case-equality against the definite bits gives the two definite branches,
     // exactly as lower_lazy_conditional does for an integral result; whatever
     // is left over is x or z and takes the ambiguous merge.
-    const ir::Ref   bit      = make_int_type(1, true, false);
+    const ir::Ref   bit      = make_int_type(1, true);
     const ir::Index one      = b.constant(module_.pool.put_int(bit, 1), l);
     const ir::Index zero     = b.constant(module_.pool.put_int(bit, 0), l);
     const ir::Index is_true  = b.binary(ir::Inst::Tag::CaseEq, pred, one, l);
@@ -619,8 +617,10 @@ void Lowerer::emit_agg_cond_ambiguous(ir::Index                    lhs,
     // "If that comparison is TRUE (1)". AggEq AND-reduces the per-leaf
     // compares with Land, which carries 11.4.5's X-propagation, so an x result
     // is not true and the test has to be the definite one.
-    b.cond(b.binary(ir::Inst::Tag::CaseEq, eq, b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l), l),
-           same, diff, l);
+    b.cond(b.binary(ir::Inst::Tag::CaseEq, eq, b.constant(module_.pool.put_int(make_int_type(1, true), 1), l), l),
+           same,
+           diff,
+           l);
 }
 
 // The array half of the ambiguous-condition rule (LRM 11.4.11): "For
@@ -661,10 +661,8 @@ void Lowerer::emit_agg_cond_elementwise(ir::Index               lhs,
     for (uint32_t k = 0; k < n; ++k) {
         const int32_t coord =
           t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
-        const ir::Index idx =
-          b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                          static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                     l);
+        const ir::Index idx = b.constant(
+          module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
         const ir::Index sa      = b.elem_select(ta, idx, type, l);
         const ir::Index sb      = b.elem_select(tb, idx, type, l);
         const ir::Index matched = agg_cond_elem_match(sa, sb, t.element, b, l);
@@ -689,7 +687,7 @@ void Lowerer::emit_agg_cond_elementwise(ir::Index               lhs,
 // compare that can be x is narrowed to a definite bit; a compare of 2-state
 // (or real, or string) operands is already definite and needs no narrowing.
 ir::Index Lowerer::agg_cond_elem_match(ir::Index a, ir::Index other, ir::Ref ety, ir::Builder& b, ir::SourceLoc l) {
-    const ir::Index one = b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l);
+    const ir::Index one = b.constant(module_.pool.put_int(make_int_type(1, true), 1), l);
     if (is_agg_abi_ref(ety)) {
         guard_agg_eq_members(ety);
         return b.binary(ir::Inst::Tag::CaseEq, b.agg_eq(a, other, ety, l), one, l);
@@ -824,10 +822,9 @@ void Lowerer::emit_table7_1_default(ir::Index               lv,
             for (uint32_t k = 0; k < n; ++k) {
                 const int32_t coord =
                   t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
-                const ir::Index idx =
-                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                             l);
+                const ir::Index idx = b.constant(
+                  module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                  l);
                 emit_table7_1_default(b.elem_select(lv, idx, ty, l), t.element, *est, tag, b, l);
             }
             return;
@@ -881,8 +878,8 @@ void Lowerer::emit_table7_1_default(ir::Index               lv,
     // 2-state side writes.
     const ir::Layout lay = module_.pool.layout(ty);
     const uint32_t   w   = lay.width == 0 ? 1 : lay.width;
-    const ir::Ref dv = lay.domain == ir::Domain::Four ? svint_to_ref(slang::SVInt::createFillX(w, t.is_signed), ty)
-                                                      : module_.pool.put_int(ty, 0);
+    const ir::Ref    dv  = lay.domain == ir::Domain::Four ? svint_to_ref(slang::SVInt::createFillX(w, false), ty)
+                                                          : module_.pool.put_int(ty, 0);
     b.binary(tag, lv, b.constant(dv, l), l);
 }
 
@@ -911,10 +908,10 @@ void Lowerer::emit_handle_literal_init(ir::Index                          lhs,
     const uint32_t n     = static_cast<uint32_t>(elems.size());
     const uint32_t count = n * reps;
     if (t.kind == ir::Type::Kind::DynArray) {
-        const ir::Index size = b.constant(module_.pool.put_int(make_int_type(32, false, false), count), l);
+        const ir::Index size = b.constant(module_.pool.put_int(make_int_type(32, false), count), l);
         b.dyn_array_new(lhs, size, lhs, /*has_init*/ false, type, l);
         for (uint32_t k = 0; k < count; ++k) {
-            const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+            const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false), k), l);
             if (is_agg_abi_ref(t.element)) {
                 // An aggregate element is copied into the slot, not stored as a
                 // value: the slot IS its storage image.
@@ -1035,10 +1032,8 @@ void Lowerer::emit_agg_copy(ir::Index            lhs,
         for (uint32_t e = 0; e < n; ++e) {
             const int32_t coord =
               t.left <= t.right ? static_cast<int32_t>(t.left + e) : static_cast<int32_t>(t.left - e);
-            const ir::Index idx =
-              b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                              static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                         l);
+            const ir::Index idx = b.constant(
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
             const ir::Index dst = b.elem_select(lhs, idx, type, l);
             const ir::Index src = b.elem_select(rhs, idx, type, l);
             emit_agg_copy(dst, src, t.element, tag, b, l, nbt);
@@ -1175,7 +1170,7 @@ void Lowerer::emit_handle_member_copy(ir::Index         lhs,
     } else if (is_unpacked_array(src)) {
         const auto&   fty = src.type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
         const auto    n   = static_cast<uint32_t>(fty.range.width());
-        const ir::Ref i32 = make_int_type(32, false, true);
+        const ir::Ref i32 = make_int_type(32, false);
         b.dyn_array_new(lhs, b.constant(module_.pool.put_int(i32, n), l), lhs, /*has_init=*/false, type, l);
         emit_fixed_array_into_dynarr(lhs, src, type, n, b, l);
     } else {
@@ -1383,7 +1378,7 @@ bool Lowerer::assoc_value_may_carry_xz(ir::Ref type) const {
 // runtime reads the full tick count.
 ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
     const ir::SourceLoc l   = loc(arg);
-    const ir::Ref       u64 = make_int_type(64, false, false);
+    const ir::Ref       u64 = make_int_type(64, false);
     if (arg.type->isFloating()) {
         // A real (realtime) argument scales in the real domain, then rounds
         // to the nearest tick (FtoI rounds half away from zero); only
@@ -1400,7 +1395,7 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
         }
         return saturating_ticks(scaled, 1, b, l);
     }
-    const ir::Index w = b.resize(v, u64, l);
+    const ir::Index w = b.convert(v, u64, false, l);
     if (time_mul_ <= 1) {
         return w;
     }
@@ -1528,8 +1523,7 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_event(const Assign
         // either way. Measured against iverilog 13: a literal 0, an unsigned
         // variable holding 0 and a signed variable holding 0 all store in the
         // arming instant, while an unsigned variable holding -3 waits.
-        const ir::Ref cty =
-          rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
+        const ir::Ref cty = rec.expr.type->isFloating() ? make_int_type(64, false) : lower_type(*rec.expr.type);
         slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
         slang::ast::EvalContext    ev(ectx);
         const slang::ConstantValue cv = rec.expr.eval(ev);
@@ -1568,14 +1562,14 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_event(const Assign
                 // definite bit so the rule is "clamp only when the count is
                 // KNOWN non-positive" rather than whatever an x predicate
                 // happens to do. 9.4.5 says nothing about an unknown count.
-                nonpos = b.binary(ir::Inst::Tag::CaseEq, nonpos,
-                                  b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l), l);
+                nonpos = b.binary(
+                  ir::Inst::Tag::CaseEq, nonpos, b.constant(module_.pool.put_int(make_int_type(1, true), 1), l), l);
             }
             t.nonpos = nonpos;
         }
     } else {
         // Plain `@e` waits for one occurrence.
-        t.count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), l);
+        t.count = b.constant(module_.pool.put_int(make_int_type(32, false), 1), l);
     }
     if (!is_event_control(*evt)) {
         fail("nonblocking intra-assignment requires a delay or event control");
@@ -2190,10 +2184,10 @@ void Lowerer::store_concat_ops(std::span<const Expression* const> ops,
         }
         ir::Index chunk = rhs;
         if (offset != 0) {
-            const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false, false), offset), l);
+            const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), offset), l);
             chunk              = b.binary(ir::Inst::Tag::Srl, rhs, sh, l);
         }
-        const ir::Index val = b.resize(chunk, lower_type(*op.type), l);
+        const ir::Index val = b.convert(chunk, lower_type(*op.type), op.type->isSigned(), l);
         if (op.kind == ExpressionKind::Concatenation) {
             store_concat(op.as<ConcatenationExpression>(), val, tag, b, l, nbt);
         } else if (const auto* nested = as_assignment_pattern(op)) {
@@ -2295,8 +2289,7 @@ void Lowerer::store_pattern(const slang::ast::AssignmentPatternExpressionBase& p
         const int32_t coord =
           rt.left <= rt.right ? static_cast<int32_t>(rt.left + k) : static_cast<int32_t>(rt.left - k);
         const ir::Index idx = b.constant(
-          module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
-          l);
+          module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
         store_pattern_elem(unwrap_lvalue_elem(*elems[k]), b.elem_select(rhs_addr, idx, rhs_ty, l), rt.element,
                            tag, b, l, nbt);
     }
@@ -2344,7 +2337,8 @@ void Lowerer::store_pattern_elem(const Expression&    member,
         }
         return;
     }
-    const ir::Index val = b.resize(b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), lower_type(*member.type), l);
+    const ir::Index val =
+      b.convert(b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), lower_type(*member.type), member.type->isSigned(), l);
     store_leaf(tag, nbt, lower_lvalue(member, b), val, b, l);
 }
 

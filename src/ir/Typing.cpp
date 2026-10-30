@@ -9,12 +9,11 @@ namespace clotho::ir {
 ValueType value_type_of(const InternPool& pool, Ref type) {
     const Type& t = std::get<Type>(pool.get(type));
     if (t.kind == Type::Kind::String) {
-        return { 0, false, false, true };
+        return { 0, false, true };
     }
     const Layout lay = pool.layout(type);
     const bool   fl  = pool.is_float(type);
-    // Reals are signed quantities (LRM 11.8.1).
-    return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, t.is_signed || fl, false, fl };
+    return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, false, fl };
 }
 
 namespace {
@@ -28,12 +27,10 @@ ValueType signal_type(const Module& m, Signal sig) {
     const bool  array = t.kind == Type::Kind::UnpackedArray;
     const Ref   leaf  = types::leaf_type(m.pool, type);
     if (types::is_string(m.pool, leaf)) {
-        return { 1, false, t.is_signed, !array, false };
+        return { 1, false, !array, false };
     }
     const Layout lay = m.pool.layout(type);
-    return {
-        lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, t.is_signed, false, m.pool.is_float(leaf) && !array
-    };
+    return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, false, m.pool.is_float(leaf) && !array };
 }
 
 } // namespace
@@ -58,21 +55,25 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::CallVirtual:
             // All overrides share the statically-resolved method's return type.
             return value_type_of(pool, m.function(ir.extra_data<VirtualCallInfo>(p.extra).func).return_type);
-        case Inst::Tag::Resize:
+        case Inst::Tag::ZExt:
+        case Inst::Tag::SExt:
+        case Inst::Tag::Trunc:
+        case Inst::Tag::ToFour:
+        case Inst::Tag::ToTwo:
             return value_type_of(pool, p.op_type.type);
         case Inst::Tag::Signal:
             return signal_type(m, p.signal);
         case Inst::Tag::BitSelect: {
             const ValueType base = ty(p.binary.l);
-            return { 1, base.four_state, false };
+            return { 1, base.four_state };
         }
         case Inst::Tag::PartSelect: {
             const auto ps = ir.extra_data<PartSelect>(p.op_extra.extra);
-            return { ps.msb - ps.lsb + 1, ty(p.op_extra.op).four_state, false };
+            return { ps.msb - ps.lsb + 1, ty(p.op_extra.op).four_state };
         }
         case Inst::Tag::DynPartSelect: {
             const auto dps = ir.extra_data<DynPartSelect>(p.op_extra.extra);
-            return { dps.width, ty(p.op_extra.op).four_state, false };
+            return { dps.width, ty(p.op_extra.op).four_state };
         }
         case Inst::Tag::ElemSelect: {
             // The result is one element of the indexed array.
@@ -100,7 +101,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
             return value_type_of(pool, p.ref);
         case Inst::Tag::IfaceRef:
             // The instance-context address, as a 2-state 64-bit handle.
-            return { 64, false, false };
+            return { 64, false };
         case Inst::Tag::IfaceSignal: {
             // An lvalue producer (the named member of the handle's instance);
             // its shape is the representative signal's, which every instance of
@@ -110,10 +111,10 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::Load:
             return ty(p.unary);
         case Inst::Tag::SimTime:
-            return { 64, false, false };
+            return { 64, false };
         case Inst::Tag::EventNew:
             // An event handle: a 2-state 64-bit word.
-            return { 64, false, false };
+            return { 64, false };
         case Inst::Tag::ProcQuery:
             // `self` is a class handle, `status` the 32-bit state enum,
             // `get_randstate` a string -- the frontend recorded which on the op.
@@ -121,48 +122,48 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::ProcCtl:
         case Inst::Tag::ProcWait:
             // Statements, never values.
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::SyncWait:
             // 1 when the park resumed as its queue's head: a definite 2-state
             // bit the frontend ANDs with its own resource test.
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::SyncCtl:
             // A statement, never a value.
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::CoverQuery:
             // A covergroup handle, a coverage percentage, or a bin count -- the
             // frontend recorded which on the op.
             return value_type_of(pool, ir.extra_data<CoverInfo>(p.extra).type);
         case Inst::Tag::CoverCtl:
             // A statement, never a value.
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::EventTriggered:
             // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::Random:
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::Clog2:
             // $clog2 returns a 32-bit signed `integer` (4-state: the result
             // is X when the operand carries x/z).
-            return { 32, true, true };
+            return { 32, true };
         case Inst::Tag::Ctz:
         case Inst::Tag::Clz:
             // A definite 2-state 32-bit bit index (counts of the must plane).
-            return { 32, false, false };
+            return { 32, false };
         case Inst::Tag::CountBits:
             // $countbits family: a definite 2-state 32-bit signed `int`
             // (LRM 20.9 return type). Never X — it counts, it does not
             // propagate.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::OneHot:
         case Inst::Tag::OneHot0:
         case Inst::Tag::IsUnknown:
             // Definite 1-bit qualifier results (LRM 20.9); never X.
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::FopenFd:
         case Inst::Tag::FopenMcd:
             // $fopen returns a 32-bit descriptor integer.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::Fgetc:
         case Inst::Tag::Ungetc:
         case Inst::Tag::Feof:
@@ -176,14 +177,14 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::FreadWord:
         case Inst::Tag::FreadMem:
             // The file read / positioning / error / scan functions return i32.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::System:
             // $system returns the raw system() int (a POSIX wait-status).
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::TestPlusArgs:
         case Inst::Tag::ValuePlusArgs:
             // LRM §21.6: an always-known (never x/z) boolean 'int'.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::DynArrayNew:
         case Inst::Tag::DynArrayNewInit:
         case Inst::Tag::DynArraySize:
@@ -192,7 +193,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::DynArrayCopyQueue:
             // Only size() is a value (a definite 2-state int); new / delete /
             // copy are statements whose type is never queried.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::QueuePopBack:
         case Inst::Tag::QueuePopFront:
             // One element of the queue's element type, straight off the
@@ -210,7 +211,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::QueueAppendRange:
             // size() is a definite 2-state int; the rest are statements
             // whose type is never queried.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::DynArrayReverse:
         case Inst::Tag::DynArraySort:
         case Inst::Tag::DynArrayRsort:
@@ -221,7 +222,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::QueueShuffle:
             // Ordering methods (LRM 7.12.2) are void statements; their type
             // is never queried.
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::AssocSelect:
             // One entry of the associative array's value element type.
             return value_type_of(
@@ -241,7 +242,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::AssocCopy:
             // num()/exists() and the traversal status are definite 2-state
             // ints; delete/copy are statements whose type is never queried.
-            return { 32, false, true };
+            return { 32, false };
 
         case Inst::Tag::Add:
         case Inst::Tag::Sub:
@@ -269,14 +270,14 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
             // (net) width — a driver conflict is X, an all-high-Z net is Z —
             // even when the driver slots feeding it are 2-state.
             const ValueType lt = ty(p.binary.l);
-            return { lt.width, true, false };
+            return { lt.width, true };
         }
         case Inst::Tag::StrengthRes: {
             // Strength resolution yields a 4-state net-width result, like
             // WireRes; the width is the first driver slot's width.
             const auto      info = ir.extra_data<StrengthResInfo>(p.extra);
             const ValueType lt   = ty(ir.region(info.values)[0]);
-            return { lt.width, true, false };
+            return { lt.width, true };
         }
         case Inst::Tag::Bnot:
             return ty(p.unary);
@@ -286,7 +287,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::NetPull:
             // A pulled net is 4-state (a driver conflict is still X) but
             // never Z, at the resolved value's width.
-            return { ty(p.op_imm.op).width, true, false };
+            return { ty(p.op_imm.op).width, true };
         case Inst::Tag::Select:
             return ty(ir.extra_data<Select>(p.op_extra.extra).a);
         case Inst::Tag::SelectLazy:
@@ -307,7 +308,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::FLe:
         case Inst::Tag::FGt:
         case Inst::Tag::FGe:
-            return { 1, false, false };
+            return { 1, false };
         case Inst::Tag::UItoF:
         case Inst::Tag::SItoF:
         case Inst::Tag::FtoI:
@@ -318,13 +319,13 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         // Every LRM 20.8.2 routine returns a real.
         case Inst::Tag::RealMathUnary:
         case Inst::Tag::RealMathBinary:
-            return { 64, false, true, false, true };
+            return { 64, false, false, true };
 
         // $dist_* / seeded $random: a packed i64 {seed:32, draw:32}, sliced
         // by the frontend. A definite 2-state word (never x/z).
         case Inst::Tag::DistUnary:
         case Inst::Tag::DistBinary:
-            return { 64, false, false };
+            return { 64, false };
         // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state). An
         // object's own draw (LRM §18.14.2) and a randc draw (LRM §18.6) have
         // the same result type; only the state they advance differs.
@@ -333,7 +334,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::UrandomRange:
         case Inst::Tag::ObjRandom:
         case Inst::Tag::RandcNext:
-            return { 32, false, false };
+            return { 32, false };
 
         // A reduction or logical negation over a 2-state operand is a definite
         // 2-state bit; over a 4-state one it can be x (LRM 11.4.9, 11.4.7).
@@ -341,7 +342,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::RedOr:
         case Inst::Tag::RedXor:
         case Inst::Tag::Lnot:
-            return { 1, ty(p.unary).four_state, false };
+            return { 1, ty(p.unary).four_state };
 
         // A comparison, a wildcard equality and a logical operator are 4-state when
         // either operand is, and only then can the result be x (LRM 11.4.4, 11.4.5,
@@ -362,7 +363,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::Lor:
         case Inst::Tag::Limplies:
         case Inst::Tag::Lequiv:
-            return { 1, ty(p.binary.l).four_state || ty(p.binary.r).four_state, false };
+            return { 1, ty(p.binary.l).four_state || ty(p.binary.r).four_state };
 
         // Case equality compares the planes bit for bit and its result is always a
         // known value (LRM 11.4.5), so it is a definite 2-state bit whatever the
@@ -370,7 +371,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::CaseEq:
         case Inst::Tag::CasezEq:
         case Inst::Tag::CasexEq:
-            return { 1, false, false };
+            return { 1, false };
 
         // An aggregate compare ANDs the leaf compares, so it can be x only when a
         // leaf can carry x or z.
@@ -380,13 +381,13 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         // The selector decides: slang converts every member to its type, so a
         // member is x-free exactly when the selector is.
         case Inst::Tag::InsideSet:
-            return { 1, ty(p.op_extra.op).four_state, false };
+            return { 1, ty(p.op_extra.op).four_state };
 
         case Inst::Tag::ClassIsA:
         case Inst::Tag::ClassImplements:
             // A definite bit: the display entry or the interface bit either
             // matches or it does not.
-            return { 1, false, false };
+            return { 1, false };
 
         case Inst::Tag::Concat: {
             uint32_t width = 0;
@@ -394,29 +395,29 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
             for (Index part : ir.region(ir.extra_data<ExtraSlice>(p.extra))) {
                 const ValueType t = ty(part);
                 if (t.is_string) { // string concat (all parts are strings)
-                    return { 0, false, false, true };
+                    return { 0, false, true };
                 }
                 width += t.width;
                 four = four || t.four_state;
             }
-            return { width, four, false };
+            return { width, four };
         }
         case Inst::Tag::Repl: {
             // Packed only: a string replication is StrRepl (runtime count).
             const ValueType v = ty(p.repl.value);
-            return { v.width * p.repl.count, v.four_state, false };
+            return { v.width * p.repl.count, v.four_state };
         }
         case Inst::Tag::StrRepl:
-            return { 0, false, false, true };
+            return { 0, false, true };
 
         case Inst::Tag::StrLen:
         case Inst::Tag::StrCmp:
         case Inst::Tag::StrICmp:
-            return { 32, false, true };
+            return { 32, false };
         case Inst::Tag::StrGetc:
             // getc / s[i] return `byte`, which is signed (LRM 6.16.3 and
             // Table 6-8), so 0xff displays as -1 under %d.
-            return { 8, false, true };
+            return { 8, false };
         case Inst::Tag::StrUpper:
         case Inst::Tag::StrLower:
         case Inst::Tag::StrSubstr:
@@ -425,11 +426,11 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::EnumName:
         case Inst::Tag::ContainerFmtP:
         case Inst::Tag::TaggedFmtP:
-            return { 0, false, false, true };
+            return { 0, false, true };
         case Inst::Tag::StrToPacked:
             return value_type_of(pool, p.op_type.type);
         case Inst::Tag::StrPutc:
-            return { 0, false, false };
+            return { 0, false };
         case Inst::Tag::StrAtoi:
         case Inst::Tag::StrAtohex:
         case Inst::Tag::StrAtooct:
@@ -437,16 +438,16 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
             // LRM 6.16.9: declared return type `integer` (4-state), though
             // the conversion itself is always definite — no x/z is
             // reachable from a string's bytes.
-            return { 32, true, true };
+            return { 32, true };
         case Inst::Tag::StrAtoreal:
-            return { 64, false, true, false, true };
+            return { 64, false, false, true };
         case Inst::Tag::StrItoa:
         case Inst::Tag::StrHextoa:
         case Inst::Tag::StrOctoa:
         case Inst::Tag::StrBintoa:
         case Inst::Tag::StrRealtoa:
         case Inst::Tag::StrAppendPacked:
-            return { 0, false, false };
+            return { 0, false };
 
         case Inst::Tag::Store:
         case Inst::Tag::StoreNb:
@@ -507,9 +508,9 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
             // Reseeding an object's RNG state yields nothing, like the
             // per-process $urandom(seed) reseed that precedes a draw.
         case Inst::Tag::ObjRandSeed:
-            return { 0, false, false };
+            return { 0, false };
     }
-    return { 0, false, false };
+    return { 0, false };
 }
 
 std::vector<ValueType> value_types(const Module& m, const Ir& ir) {

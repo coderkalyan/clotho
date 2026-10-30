@@ -69,22 +69,17 @@ private:
             case Tag::Bxor:
             case Tag::Bxnor:
                 check_integer_pair(i, p.binary.l, p.binary.r);
-                check_result_sign(i, p.binary.l, p.binary.r);
                 return;
             case Tag::UDiv:
             case Tag::SDiv:
             case Tag::UMod:
             case Tag::SMod:
                 check_integer_pair(i, p.binary.l, p.binary.r);
-                check_sign_pair(i, p.binary.l, p.binary.r);
                 check_forced_four_state(i, p.binary.l, p.binary.r);
-                check_op_sign(i, p.binary.l, signed_tag(ir_.tag(i)));
                 return;
             case Tag::Pow: {
                 const auto info = ir_.extra_data<PowInfo>(p.op_extra.extra);
                 check_forced_four_state(i, p.op_extra.op, info.exp);
-                check_op_sign(i, p.op_extra.op, info.base_signed != 0);
-                check_op_sign(i, info.exp, info.exp_signed != 0);
                 return;
             }
             case Tag::ULt:
@@ -95,12 +90,11 @@ private:
             case Tag::SGt:
             case Tag::UGe:
             case Tag::SGe:
-                check_compare(i, p.binary.l, p.binary.r, /*ordered=*/true);
-                check_op_sign(i, p.binary.l, signed_tag(ir_.tag(i)));
+                check_compare(i, p.binary.l, p.binary.r);
                 return;
             case Tag::Eq:
             case Tag::Ne:
-                check_compare(i, p.binary.l, p.binary.r, /*ordered=*/false);
+                check_compare(i, p.binary.l, p.binary.r);
                 return;
             case Tag::CaseEq:
             case Tag::CasezEq:
@@ -112,13 +106,6 @@ private:
             case Tag::Srl:
             case Tag::Sra:
                 check_shift(i, p.binary.l, p.binary.r);
-                if (ir_.tag(i) == Tag::Sra) {
-                    check_op_sign(i, p.binary.l, true);
-                }
-                return;
-            case Tag::UItoF:
-            case Tag::SItoF:
-                check_op_sign(i, p.op_type.op, signed_tag(ir_.tag(i)));
                 return;
             case Tag::FAdd:
             case Tag::FSub:
@@ -159,56 +146,12 @@ private:
             case Tag::StoreNbEvent:
                 check_store(i, p.op_extra.op, ir_.extra_data<StoreNbEventInfo>(p.op_extra.extra).value);
                 return;
-            case Tag::ElemSelect:
-                check_signed_number(i, ir_.extra_data<ElemSelect>(p.op_extra.extra).index, 64);
-                return;
-            case Tag::StrGetc:
-            case Tag::StrItoa:
-            case Tag::StrHextoa:
-            case Tag::StrOctoa:
-            case Tag::StrBintoa:
-                check_signed_number(i, p.binary.r, 32);
-                return;
-            case Tag::StrRepl:
-                check_signed_number(i, p.binary.r, 64);
-                return;
-            case Tag::StrPutc:
-                check_signed_number(i, ir_.extra_data<StrPutcInfo>(p.op_extra.extra).index, 32);
-                return;
-            case Tag::StrSubstr:
-                check_signed_number(i, ir_.extra_data<StrSubstrInfo>(p.op_extra.extra).i, 32);
-                check_signed_number(i, ir_.extra_data<StrSubstrInfo>(p.op_extra.extra).j, 32);
-                return;
-            case Tag::DynArrayNew:
-                check_signed_number(i, ir_.extra_data<DynArrayArg>(p.op_extra.extra).arg, 64);
-                return;
-            case Tag::DynArrayNewInit:
-                check_signed_number(i, ir_.extra_data<DynArrayNewInitInfo>(p.op_extra.extra).size, 64);
-                return;
-            case Tag::Display:
-                check_fmt_signs(
-                  i, ir_.extra_data<DisplayInfo>(p.extra).args, ir_.extra_data<DisplayInfo>(p.extra).signs);
-                return;
-            case Tag::FDisplay:
-            case Tag::MonitorEmit:
-                check_fmt_signs(i,
-                                ir_.extra_data<DisplayInfo>(p.op_extra.extra).args,
-                                ir_.extra_data<DisplayInfo>(p.op_extra.extra).signs);
-                return;
-            case Tag::Sformat:
-                check_fmt_signs(
-                  i, ir_.extra_data<SformatInfo>(p.extra).args, ir_.extra_data<SformatInfo>(p.extra).signs);
-                return;
-            case Tag::Sformatf:
-                check_fmt_signs(
-                  i, ir_.extra_data<SformatfInfo>(p.extra).args, ir_.extra_data<SformatfInfo>(p.extra).signs);
-                return;
-            case Tag::Severity:
-                check_fmt_signs(
-                  i, ir_.extra_data<SeverityInfo>(p.extra).args, ir_.extra_data<SeverityInfo>(p.extra).signs);
-                return;
-            case Tag::Resize:
-                check_resize(i);
+            case Tag::ZExt:
+            case Tag::SExt:
+            case Tag::Trunc:
+            case Tag::ToFour:
+            case Tag::ToTwo:
+                check_conversion(i);
                 return;
             case Tag::Call:
                 check_call(i, ir_.extra_data<CallInfo>(p.extra).func, ir_.extra_data<CallInfo>(p.extra).args);
@@ -232,47 +175,6 @@ private:
         }
     }
 
-    // -- Opcode signedness --
-
-    // The opcodes that read their operands as signed numbers.
-    static bool signed_tag(Tag t) {
-        return t == Tag::SDiv || t == Tag::SMod || t == Tag::SLt || t == Tag::SLe || t == Tag::SGt || t == Tag::SGe ||
-               t == Tag::SItoF || t == Tag::Sra;
-    }
-
-    // The signedness an opcode asserts about `operand`, against the operand's type.
-    // Types carry a sign until the IR goes signless; until then this is what shows
-    // the frontend's choice of opcode agrees with the language's types.
-    void check_op_sign(Index i, Index operand, bool asserted_signed) {
-        const ValueType a = ty(operand);
-        if (is_scalar(a) && a.is_signed != asserted_signed) {
-            report(Rule::OpSign, i, a);
-        }
-    }
-
-    // An operand the backend reads as a signed number (an index, a size, a count)
-    // is not an unsigned value narrower than the width the backend extends it to:
-    // its top bit would be taken for a sign. Constants are exempt: they are
-    // synthesized small numbers. Types carry a sign until the IR goes signless.
-    void check_signed_number(Index i, Index operand, uint32_t extended_width) {
-        const ValueType a = ty(operand);
-        if (is_scalar(a) && !a.is_signed && a.width < extended_width && ir_.tag(operand) != Tag::Constant) {
-            report(Rule::SignedOperand, i, a);
-        }
-    }
-
-    // The explicit sign of every format argument agrees with its value's type.
-    void check_fmt_signs(Index i, ExtraSlice args, ExtraSlice signs) {
-        const std::span<const Index>    values = ir_.region(args);
-        const std::span<const uint32_t> flags  = ir_.words(signs);
-        for (size_t k = 0; k < values.size() && k < flags.size(); ++k) {
-            const ValueType a = ty(values[k]);
-            if (is_scalar(a) && a.is_signed != (flags[k] != 0)) {
-                report(Rule::FmtArgSign, i, a);
-            }
-        }
-    }
-
     // -- Binary operators --
 
     // Both operands are integers of one width and one domain.
@@ -291,22 +193,6 @@ private:
         }
     }
 
-    void check_sign_pair(Index i, Index l, Index r) {
-        const ValueType a = ty(l);
-        const ValueType b = ty(r);
-        if (is_scalar(a) && is_scalar(b) && a.is_signed != b.is_signed) {
-            report(Rule::OperandSign, i, a, b);
-        }
-    }
-
-    void check_result_sign(Index i, Index l, Index r) {
-        const ValueType a = ty(l);
-        const ValueType b = ty(r);
-        if (is_scalar(a) && is_scalar(b) && a.is_signed != b.is_signed) {
-            report(Rule::ResultSign, i, a, b);
-        }
-    }
-
     // Div / Mod / Pow: the LRM result is 4-state because it can be x.
     void check_forced_four_state(Index i, Index l, Index r) {
         const ValueType a = ty(l);
@@ -316,7 +202,7 @@ private:
     }
 
     // A comparison is either between two strings or between two integers.
-    void check_compare(Index i, Index l, Index r, bool ordered) {
+    void check_compare(Index i, Index l, Index r) {
         const ValueType a = ty(l);
         const ValueType b = ty(r);
         if (a.is_string || b.is_string) {
@@ -326,12 +212,9 @@ private:
             return;
         }
         check_integer_pair(i, l, r);
-        if (ordered) {
-            check_sign_pair(i, l, r);
-        }
     }
 
-    // The amount is self-determined and may differ in width, domain and sign
+    // The amount is self-determined and may differ in width and domain
     // from the shifted operand; the result is the shifted operand's type, so a
     // 4-state amount over a 2-state operand has no home.
     void check_shift(Index i, Index l, Index r) {
@@ -362,10 +245,6 @@ private:
         }
         for (const Index v : ir_.region(info.ranges)) {
             check_integer_pair(i, p.op_extra.op, v);
-            check_sign_pair(i, p.op_extra.op, v);
-        }
-        if (!ir_.region(info.ranges).empty()) {
-            check_op_sign(i, p.op_extra.op, info.ranges_signed != 0);
         }
     }
 
@@ -386,11 +265,6 @@ private:
         }
         if (a.four_state != b.four_state) {
             report(Rule::SelectArmDomain, i, a, b);
-        }
-        // A real is signed whatever its declared type says; the backend's signal
-        // slots do not record it, so comparing would flag a real signal read.
-        if (!a.is_real && a.is_signed != b.is_signed) {
-            report(Rule::SelectArmSign, i, a, b);
         }
     }
 
@@ -480,9 +354,10 @@ private:
         }
     }
 
-    // -- Resize --
+    // -- Conversions --
 
-    void check_resize(Index i) {
+    // The conversion has the shape its opcode names, between integers.
+    void check_conversion(Index i) {
         const Inst::Payload& p      = ir_.payload(i);
         const ValueType      source = ty(p.op_type.op);
         const ValueType      target = value_type_of(m_.pool, p.op_type.type);
@@ -490,15 +365,26 @@ private:
             report(Rule::OperandKind, i, source, target);
             return;
         }
-        if (source.is_signed == target.is_signed) {
-            return;
+        bool ok = false;
+        switch (ir_.tag(i)) {
+            case Tag::ZExt:
+            case Tag::SExt:
+                ok = target.width > source.width && target.four_state == source.four_state;
+                break;
+            case Tag::Trunc:
+                ok = target.width < source.width && target.four_state == source.four_state;
+                break;
+            case Tag::ToFour:
+                ok = target.width == source.width && !source.four_state && target.four_state;
+                break;
+            case Tag::ToTwo:
+                ok = target.width == source.width && source.four_state && !target.four_state;
+                break;
+            default:
+                break;
         }
-        if (target.width > source.width) {
-            report(Rule::ResizeSignWiden, i, source, target);
-        } else if (target.width == source.width) {
-            report(Rule::ResizeSignRetag, i, source, target);
-        } else {
-            report(Rule::ResizeSignNarrow, i, source, target);
+        if (!ok) {
+            report(Rule::ConvertShape, i, source, target);
         }
     }
 
@@ -583,7 +469,7 @@ std::string describe(ValueType t) {
     if (t.is_real) {
         return std::format("real{}", t.width);
     }
-    return std::format("{}{}[{}]", t.is_signed ? "signed " : "", t.four_state ? "logic" : "bit", t.width);
+    return std::format("{}[{}]", t.four_state ? "logic" : "bit", t.width);
 }
 
 } // namespace
@@ -596,16 +482,6 @@ const char* rule_name(Rule rule) {
             return "operand-width";
         case Rule::OperandDomain:
             return "operand-domain";
-        case Rule::OperandSign:
-            return "operand-sign";
-        case Rule::OpSign:
-            return "op-sign";
-        case Rule::SignedOperand:
-            return "signed-operand";
-        case Rule::FmtArgSign:
-            return "fmt-arg-sign";
-        case Rule::ResultSign:
-            return "result-sign";
         case Rule::ResultDomain:
             return "result-domain";
         case Rule::ShiftResult:
@@ -614,20 +490,14 @@ const char* rule_name(Rule rule) {
             return "select-arm-width";
         case Rule::SelectArmDomain:
             return "select-arm-domain";
-        case Rule::SelectArmSign:
-            return "select-arm-sign";
         case Rule::PredicateWidth:
             return "predicate-width";
         case Rule::StoreWidth:
             return "store-width";
         case Rule::StoreDomain:
             return "store-domain";
-        case Rule::ResizeSignWiden:
-            return "resize-sign-widen";
-        case Rule::ResizeSignNarrow:
-            return "resize-sign-narrow";
-        case Rule::ResizeSignRetag:
-            return "resize-sign-retag";
+        case Rule::ConvertShape:
+            return "convert-shape";
         case Rule::CallArity:
             return "call-arity";
         case Rule::CallArgWidth:

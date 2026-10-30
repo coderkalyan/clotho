@@ -205,9 +205,10 @@ TEST_CASE("naming the verdict lattice leaves a ring monitor's emitted IR alone")
     // Re-established again when src/lower/ stopped emitting an argument list in
     // the compiler's evaluation order: GCC and clang used to produce different
     // digests, and both now produce this one, with the count unchanged.
-    CHECK(monitor_shape(m) ==
-          "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.pend0 sva.0.occ sva.0.clk "
-          "step:125:7609481343294756048 ");
+    // Re-established once more when IR integer types went signless: the three
+    // same-width sign retags the step used to carry are gone (125 -> 122).
+    CHECK(monitor_shape(m) == "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.pend0 sva.0.occ sva.0.clk "
+                              "step:122:16090913236442344220 ");
 }
 
 TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone") {
@@ -236,7 +237,7 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     REQUIRE(m.monitors.size() == 1);
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
     CHECK(monitor_shape(m) == "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-                              "step:117:2287638562261415009 final:18:785728055792284918 ");
+                              "step:114:8500337446600503064 final:18:785728055792284918 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {

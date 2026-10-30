@@ -3911,8 +3911,7 @@ TEST_CASE("backend lowers string signals, constants, and string ops (hand-built 
     const Ref       lit   = mod->pool.put_value(
       mod->pool.string_type, { reinterpret_cast<const uint8_t*>(chars.data()), chars.size() });
     const Ref int_ty =
-      mod->pool.put(Type{ .kind = Type::Kind::PackedArray, .is_signed = true, .element = mod->pool.bit_type,
-                          .left = 31, .right = 0 });
+      mod->pool.put(Type{ .kind = Type::Kind::PackedArray, .element = mod->pool.bit_type, .left = 31, .right = 0 });
 
     const Index sig = b.signal(s, loc);
     const Index k   = b.constant(lit, loc);
@@ -4118,8 +4117,7 @@ std::string run_module(ir::Module& m) {
 
 // A 32-bit signed two-state type (int).
 ir::Ref int_type(ir::InternPool& pool) {
-    return pool.put(
-      ir::Type{ .kind = ir::Type::Kind::PackedArray, .is_signed = true, .element = pool.bit_type, .left = 31, .right = 0 });
+    return pool.put(ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = pool.bit_type, .left = 31, .right = 0 });
 }
 
 constexpr auto kLoc = static_cast<ir::SourceLoc>(0);
@@ -4165,12 +4163,12 @@ TEST_CASE("real arithmetic, rounding, and truncation") {
 TEST_CASE("real compares are definite and NaN-correct") {
     ir::Module  m;
     ir::Builder b(m);
-    // Widen the 1-bit compare result through an unsigned type (a signed resize
-    // would sign-extend 1'b1 to -1).
+    // Widen the 1-bit compare result with a zero extension (a sign extension
+    // would turn 1'b1 into -1).
     const ir::Ref u32 = m.pool.put(
       ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 31, .right = 0 });
     const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
-    const auto show = [&](ir::Index bit) { display_int(b, b.resize(bit, u32, kLoc)); };
+    const auto show = [&](ir::Index bit) { display_int(b, b.zext(bit, u32, kLoc)); };
 
     const double    qnan = std::numeric_limits<double>::quiet_NaN();
     const ir::Index nan  = b.constant(m.pool.put_real(m.pool.real_type, qnan), kLoc);

@@ -17,7 +17,7 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             // 64-bit 0 in the chandle representation directly; a surrounding
             // conversion to chandle (also i64) is a width-preserving no-op.
             // (Class / event null handles are separate and not lowered here.)
-            return b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l);
+            return b.constant(module_.pool.put_int(make_int_type(64, false), 0), l);
         case ExpressionKind::UnbasedUnsizedIntegerLiteral:
             // '0/'1/'x/'z (LRM 5.7.1): the single bit fills the whole
             // context-determined width. slang has already propagated the
@@ -313,8 +313,13 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             // operand, so it extends under the propagated type; every other
             // kind (Implicit assignment, Explicit cast, BitstreamCast) is
             // assignment-shaped and extends under the operand's own sign.
-            const Extend ext = cv.conversionKind == ConversionKind::Propagated ? Extend::Target : Extend::Source;
-            return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l, ext);
+            const bool propagated = cv.conversionKind == ConversionKind::Propagated;
+            return coerce(lower_expr(cv.operand(), b),
+                          *cv.operand().type,
+                          lower_type(*expr.type),
+                          b,
+                          l,
+                          propagated ? expr.type->isSigned() : cv.operand().type->isSigned());
         }
         case ExpressionKind::Call: {
             const CallExpression& call = expr.as<CallExpression>();
@@ -340,7 +345,8 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             // handle unchanged.
             const AssignmentExpression& a = expr.as<AssignmentExpression>();
             const ir::Index             v = lower_assign(a, b);
-            return is_string_expr(a.left()) ? v : b.resize(v, lower_type(*a.left().type), l);
+            return is_string_expr(a.left()) ? v
+                                            : b.convert(v, lower_type(*a.left().type), a.left().type->isSigned(), l);
         }
         case ExpressionKind::SimpleAssignmentPattern:
         case ExpressionKind::StructuredAssignmentPattern:
@@ -360,7 +366,7 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             if (!queue_dollar_.has_value()) {
                 fail("'$' is not supported in this context");
             }
-            const ir::Ref   i32  = make_int_type(32, false, true);
+            const ir::Ref   i32  = make_int_type(32, false);
             const ir::Index size = b.queue_size(queue_dollar_->src, queue_dollar_->qty, l);
             return b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
         }
@@ -473,7 +479,7 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
     using B                 = slang::ast::BinaryOperator;
     const ir::SourceLoc l   = loc(bin);
     // A real operand reduces to a 2-state truth bit (FNe) below.
-    const ir::Ref bit = make_int_type(1, false, false);
+    const ir::Ref bit = make_int_type(1, false);
 
     // A real operand reduces to its own definite truth bit (!= 0.0, reals
     // carry no x/z) before the integer machinery below (LRM 11.4.7).
@@ -497,8 +503,7 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
         pred                 = b.unary(T::Lnot, b.binary(T::CaseEq, lhs, zero, l), l);
     } else {
         const ir::Index ror = b.unary(T::RedOr, lhs, l);
-        const ir::Index one =
-          b.constant(module_.pool.put_int(make_int_type(1, b.type_of(ror).four_state, false), 1), l);
+        const ir::Index one = b.constant(module_.pool.put_int(make_int_type(1, b.type_of(ror).four_state), 1), l);
         pred                = b.unary(T::Lnot, b.binary(T::CaseEq, ror, one, l), l);
     }
 
@@ -534,7 +539,7 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
 
     b.open_region();
     // The skipped branch's value has the domain of the combined one.
-    const ir::Ref        dom_ty      = make_int_type(1, b.type_of(combined).four_state, false);
+    const ir::Ref        dom_ty      = make_int_type(1, b.type_of(combined).four_state);
     const ir::Index      dom         = b.constant(module_.pool.put_int(dom_ty, dom_val), l);
     const ir::ExtraSlice else_region = b.close_region();
 
@@ -555,7 +560,7 @@ ir::Index Lowerer::lower_lazy_conditional(const ConditionalExpression& c, ir::In
     using T                 = ir::Inst::Tag;
     const ir::SourceLoc l   = loc(c);
     // The condition's own domain: a 2-state one compares against 2-state constants.
-    const ir::Ref bit = make_int_type(1, b.type_of(pred).four_state, false);
+    const ir::Ref bit = make_int_type(1, b.type_of(pred).four_state);
 
     const ir::Index one     = b.constant(module_.pool.put_int(bit, 1), l);
     const ir::Index zero    = b.constant(module_.pool.put_int(bit, 0), l);
@@ -760,7 +765,7 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
         const bool matches = bin.left().as<TypeReferenceExpression>().targetType.isMatching(
           bin.right().as<TypeReferenceExpression>().targetType);
         const bool result = (bin.op == B::Equality || bin.op == B::CaseEquality) ? matches : !matches;
-        return b.constant(module_.pool.put_int(make_int_type(1, false, false), result ? 1 : 0), loc(bin));
+        return b.constant(module_.pool.put_int(make_int_type(1, false), result ? 1 : 0), loc(bin));
     }
 
     const ir::SourceLoc l   = loc(bin);
@@ -882,7 +887,7 @@ ir::Index Lowerer::inside_leaf_eq(ir::Index               sel,
     if (real) {
         return b.binary(ir::Inst::Tag::FEq, sel, coerce(val, vt, ty, b, l), l);
     }
-    return b.binary(ir::Inst::Tag::WildEq, sel, b.resize(val, ty, l), l);
+    return b.binary(ir::Inst::Tag::WildEq, sel, b.convert(val, ty, false, l), l);
 }
 
 // A FIXED-SIZE unpacked-array member of an `inside` set, as an OR over its
@@ -903,7 +908,7 @@ ir::Index Lowerer::inside_fixed_array_pred(ir::Index               base,
     const slang::ast::Type& et   = *arr.getArrayElementType();
     const bool              nest = et.getCanonicalType().isUnpackedArray();
     const uint32_t          n    = (at.left >= at.right ? at.left - at.right : at.right - at.left) + 1;
-    const ir::Ref           i32  = make_int_type(32, false, true);
+    const ir::Ref           i32  = make_int_type(32, false);
     ir::Index               acc{};
     for (uint32_t k = 0; k < n; ++k) {
         // Element k in DECLARED index coordinates, as every other fixed-array
@@ -942,8 +947,8 @@ ir::Index Lowerer::inside_container_pred(const Expression& m,
     }
     const ir::Ref   aty      = lower_type(*m.type);
     const ir::Index arr      = lower_lvalue(m, b);
-    const ir::Ref   i32      = make_int_type(32, false, true);
-    const ir::Ref   log1     = make_int_type(1, true, false);
+    const ir::Ref   i32      = make_int_type(32, false);
+    const ir::Ref   log1     = make_int_type(1, true);
     const TempCell  hit      = make_temp_cell(log1, "inside_hit");
     const TempCell  idx      = make_temp_cell(i32, "inside_idx");
     const TempCell  bound    = make_temp_cell(i32, "inside_n");
@@ -952,7 +957,7 @@ ir::Index Lowerer::inside_container_pred(const Expression& m,
     const ir::Index hit_init = b.constant(module_.pool.put_int(log1, 0), l);
     b.binary(T::Store, hit_lv, hit_init, l);
     const ir::Index bound_lv  = bound.lv(b, l);
-    const ir::Index bound_val = b.resize(size, i32, l);
+    const ir::Index bound_val = b.convert(size, i32, true, l);
     b.binary(T::Store, bound_lv, bound_val, l);
     const ir::Index idx_lv   = idx.lv(b, l);
     const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -1081,8 +1086,8 @@ ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
                 fold(b.binary(T::Land, above, below, l));
                 continue;
             }
-            ranges.push_back(b.resize(lower_expr(vr.left(), b), ty, loc(vr.left())));
-            ranges.push_back(b.resize(lower_expr(vr.right(), b), ty, loc(vr.right())));
+            ranges.push_back(b.convert(lower_expr(vr.left(), b), ty, e.left().type->isSigned(), loc(vr.left())));
+            ranges.push_back(b.convert(lower_expr(vr.right(), b), ty, e.left().type->isSigned(), loc(vr.right())));
             continue;
         }
         if (m->type->getCanonicalType().isUnpackedArray()) {
@@ -1100,7 +1105,7 @@ ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
             fold(inside_leaf_eq(sel, lower_expr(*m, b), *m->type, ty, real, b, l));
             continue;
         }
-        values.push_back(b.resize(lower_expr(*m, b), ty, loc(*m)));
+        values.push_back(b.convert(lower_expr(*m, b), ty, e.left().type->isSigned(), loc(*m)));
     }
     if (!values.empty() || !ranges.empty()) {
         fold(b.inside_set(sel, values, ranges, e.left().type->isSigned(), l));
@@ -1261,7 +1266,7 @@ ir::Index Lowerer::elem_coord_const(const ir::Type& t, uint32_t pos, ir::Builder
     const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left) + static_cast<int32_t>(pos)
                                             : static_cast<int32_t>(t.left) - static_cast<int32_t>(pos);
     return b.constant(
-      module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
+      module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
 }
 
 // Copy between a positional array slice `rs` (see is_positional_array_slice)
@@ -1332,7 +1337,7 @@ void Lowerer::emit_indexed_slice_copy(const RangeSelectExpression& rs,
                  "runtime bound there are queue-only)");
         }
         n      = static_cast<uint32_t>(*hi - *lo + 1);
-        idx_ty = make_int_type(32, false, true);
+        idx_ty = make_int_type(32, false);
         base   = b.constant(module_.pool.put_int(idx_ty, static_cast<uint64_t>(static_cast<int64_t>(*lo))), il);
     } else {
         n = static_cast<uint32_t>(const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
@@ -1342,9 +1347,11 @@ void Lowerer::emit_indexed_slice_copy(const RangeSelectExpression& rs,
         // (a 64-bit base of 2**32 + 1 is not 1, nor 2**32 - 1 plus one 0).
         const auto    w        = std::max(static_cast<uint32_t>(rs.left().type->getBitWidth()), 32u) + 2;
         const bool    four     = rs.left().type->isFourState();
-        const ir::Ref extended = make_int_type(w, four, rs.left().type->isSigned());
-        idx_ty                 = make_int_type(w, four, true);
-        base                   = b.resize(b.resize(lower_expr(rs.left(), b), extended, il), idx_ty, il);
+        const ir::Ref extended = make_int_type(w, four);
+        idx_ty                 = make_int_type(w, four);
+        // Extended by the index's own signedness; the offset is then a signed quantity
+        // whatever the index is (same width, so no instruction).
+        base = b.convert(lower_expr(rs.left(), b), extended, rs.left().type->isSigned(), il);
     }
     const bool down = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
     const bool asc  = dynarr || at.left <= at.right;
@@ -1534,17 +1541,16 @@ ir::Index Lowerer::lower_tagged_union_set(const slang::ast::TaggedUnionExpressio
 
     std::vector<ir::Index> parts;
     if (tag_bits != 0) {
-        parts.push_back(
-          b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), field.fieldIndex), l));
+        parts.push_back(b.constant(module_.pool.put_int(make_int_type(tag_bits, four), field.fieldIndex), l));
     }
     if (const uint32_t gap_w = lay.width - tag_bits - member_w; gap_w != 0) {
-        parts.push_back(
-          b.constant(four ? svint_to_ref(slang::SVInt::createFillX(gap_w, false), make_int_type(gap_w, true, false))
-                          : module_.pool.put_int(make_int_type(gap_w, false, false), 0),
-                     l));
+        parts.push_back(b.constant(four
+                                     ? svint_to_ref(slang::SVInt::createFillX(gap_w, false), make_int_type(gap_w, true))
+                                     : module_.pool.put_int(make_int_type(gap_w, false), 0),
+                                   l));
     }
     if (member_w != 0) {
-        parts.push_back(b.resize(lower_expr(*tu.valueExpr, b), make_int_type(member_w, four, false), l));
+        parts.push_back(b.convert(lower_expr(*tu.valueExpr, b), make_int_type(member_w, four), false, l));
     }
     return b.concat(parts, l);
 }
@@ -1628,7 +1634,10 @@ ir::Index Lowerer::lower_pattern(const slang::ast::Pattern& pat,
             const auto& var = pat.as<slang::ast::VariablePattern>().variable;
             declare_storage(var, /*force_frame*/ true);
             const ir::Index slot = value_lvalue(var, b, l);
-            b.binary(ir::Inst::Tag::Store, slot, b.resize(subject, lower_type(var.getType()), l), l);
+            b.binary(ir::Inst::Tag::Store,
+                     slot,
+                     b.convert(subject, lower_type(var.getType()), var.getType().isSigned(), l),
+                     l);
             return true_const(b, l);
         }
         case PK::Constant: {
@@ -1637,7 +1646,7 @@ ir::Index Lowerer::lower_pattern(const slang::ast::Pattern& pat,
             // for casez/casex). An x subject under `case` then fails to match.
             const auto&     cp = pat.as<slang::ast::ConstantPattern>();
             const ir::Ref   ty = lower_type(sty);
-            const ir::Index cv = b.resize(lower_expr(cp.expr, b), ty, l);
+            const ir::Index cv = b.convert(lower_expr(cp.expr, b), ty, sty.isSigned(), l);
             return b.binary(cmp, subject, cv, l);
         }
         case PK::Tagged: {
@@ -1649,10 +1658,10 @@ ir::Index Lowerer::lower_pattern(const slang::ast::Pattern& pat,
             if (tag_bits != 0) {
                 const auto      lay  = module_.pool.layout(lower_type(sty));
                 const bool      four = lay.domain == ir::Domain::Four;
-                const ir::Ref   tt   = make_int_type(tag_bits, four, false);
+                const ir::Ref   tt   = make_int_type(tag_bits, four);
                 const ir::Index sh =
-                  b.constant(module_.pool.put_int(make_int_type(32, false, false), lay.width - tag_bits), l);
-                const ir::Index tagv = b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), tt, l);
+                  b.constant(module_.pool.put_int(make_int_type(32, false), lay.width - tag_bits), l);
+                const ir::Index tagv = b.convert(b.binary(ir::Inst::Tag::Srl, subject, sh, l), tt, false, l);
                 const ir::Index idx  = b.constant(module_.pool.put_int(tt, tp.member.fieldIndex), l);
                 tag_pred             = b.binary(cmp, tagv, idx, l);
             }
@@ -1660,7 +1669,7 @@ ir::Index Lowerer::lower_pattern(const slang::ast::Pattern& pat,
                 return tag_pred; // void member: tag match is the whole test.
             }
             const slang::ast::Type& mt      = tp.member.getType();
-            const ir::Index         payload = b.resize(subject, lower_type(mt), l);
+            const ir::Index         payload  = b.convert(subject, lower_type(mt), mt.isSigned(), l);
             const ir::Index sub_pred = lower_pattern(*tp.valuePattern, payload, mt.getCanonicalType(), cmp, b, l);
             return b.binary(ir::Inst::Tag::Land, tag_pred, sub_pred, l);
         }
@@ -1676,9 +1685,9 @@ ir::Index Lowerer::lower_pattern(const slang::ast::Pattern& pat,
             for (const auto& fp : sp.patterns) {
                 const slang::ast::Type& ft = fp.field->getType();
                 const ir::Index         sh = b.constant(
-                  module_.pool.put_int(make_int_type(32, false, false), static_cast<uint32_t>(fp.field->bitOffset)),
-                  l);
-                const ir::Index fv = b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), lower_type(ft), l);
+                  module_.pool.put_int(make_int_type(32, false), static_cast<uint32_t>(fp.field->bitOffset)), l);
+                const ir::Index fv =
+                  b.convert(b.binary(ir::Inst::Tag::Srl, subject, sh, l), lower_type(ft), ft.isSigned(), l);
                 acc                = b.binary(
                   ir::Inst::Tag::Land, acc, lower_pattern(*fp.pattern, fv, ft.getCanonicalType(), cmp, b, l), l);
             }
@@ -2079,7 +2088,7 @@ ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
                                        uint32_t             stride) {
     if (const std::optional<int32_t> c = try_const_int(idx)) {
         const auto off = static_cast<uint32_t>((range.translateIndex(*c) - bias) * static_cast<int32_t>(stride));
-        return b.constant(module_.pool.put_int(make_int_type(32, false, false), off), l);
+        return b.constant(module_.pool.put_int(make_int_type(32, false), off), l);
     }
     const bool    descending = range.isDescending();
     const int64_t adj        = descending ? int64_t{ range.right } + bias : int64_t{ range.right } - bias;
@@ -2093,8 +2102,8 @@ ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
     // puts its caret here) must point at what the user wrote inside the
     // brackets rather than at the vector being indexed.
     const ir::SourceLoc il     = loc(idx);
-    const ir::Ref       off_ty = make_int_type(32, idx.type->isFourState(), idx.type->isSigned());
-    const ir::Index     v      = b.resize(lower_expr(idx, b), off_ty, il);
+    const ir::Ref       off_ty = make_int_type(32, idx.type->isFourState());
+    const ir::Index     v      = b.convert(lower_expr(idx, b), off_ty, idx.type->isSigned(), il);
     ir::Index           off;
     if (range.isDescending()) {
         const int32_t sub = range.right + bias; // off = idx - right - bias
@@ -2137,9 +2146,8 @@ ir::Index Lowerer::lower_wide_packed_offset(const Expression& idx,
     const uint32_t ew = std::max(64u, std::max(w, 32u) + 2 + static_cast<uint32_t>(std::bit_width(stride)));
     // The index extends by its own signedness, then is retyped signed (same
     // width, so no code): the offset is a signed quantity whatever the index is.
-    const ir::Ref   off_ty = make_int_type(ew, four, true);
-    const ir::Index v =
-      b.resize(b.resize(lower_expr(idx, b), make_int_type(ew, four, idx.type->isSigned()), il), off_ty, il);
+    const ir::Ref   off_ty = make_int_type(ew, four);
+    const ir::Index v      = b.convert(lower_expr(idx, b), off_ty, idx.type->isSigned(), il);
     // put_int zero-extends past 64 bits, so only non-negative constants are built.
     const auto constant = [&](uint64_t n) { return b.constant(module_.pool.put_int(off_ty, n), il); };
     ir::Index  off;

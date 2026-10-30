@@ -169,7 +169,7 @@ ir::Index Lowerer::sort_right_wins(const SortIter& s, ir::Builder& b, ir::Source
     const ir::Index ru   = b.unary(T::IsUnknown, right, l);
     const ir::Index open = b.unary(T::Bnot, s.desc ? ru : lu, l);
     const ir::Index win  = b.binary(T::Bor, s.desc ? lu : ru, cmp, l);
-    return b.resize(b.binary(T::Band, open, win, l), s.bit1, l);
+    return b.convert(b.binary(T::Band, open, win, l), s.bit1, false, l);
 }
 
 // One merge step: choose the next index from the left or the right run and
@@ -179,7 +179,7 @@ void Lowerer::emit_merge_step(const SortIter& s, ir::Builder& b, ir::SourceLoc l
     using T                 = ir::Inst::Tag;
     const auto      load    = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
     const auto      ord_at  = [&](ir::Index i) {
-        return b.unary(T::Load, b.elem_select(s.ord, b.resize(i, s.i32, l), s.oty, l), l);
+        return b.unary(T::Load, b.elem_select(s.ord, b.convert(i, s.i32, true, l), s.oty, l), l);
     };
     const ir::Index take_lv   = s.take.lv(b, l);
     const ir::Index take_left = iconst(s.bit1, 0, b, l);
@@ -215,7 +215,8 @@ void Lowerer::emit_merge_step(const SortIter& s, ir::Builder& b, ir::SourceLoc l
     b.cond(b.binary(T::SGe, li, mid, l), left_done, left_live, l);
 
     const auto emit_take = [&](const TempCell& cursor) {
-        const ir::Index slot = b.elem_select(s.buf, b.resize(load(s.out), s.i32, l), s.oty, l, /*for_write=*/true);
+        const ir::Index slot =
+          b.elem_select(s.buf, b.convert(load(s.out), s.i32, true, l), s.oty, l, /*for_write=*/true);
         const ir::Index val  = ord_at(load(cursor));
         b.binary(T::Store, slot, val, l);
         const ir::Index cursor_lv = cursor.lv(b, l);
@@ -337,7 +338,7 @@ void Lowerer::emit_sort_permute(const SortIter& s, bool queue, ir::Builder& b, i
     const ir::ExtraSlice cond    = b.close_region();
 
     b.open_region();
-    const ir::Index k    = b.resize(load(s.out), s.i32, l);
+    const ir::Index k    = b.convert(load(s.out), s.i32, true, l);
     const ir::Index from = b.unary(T::Load, b.elem_select(s.ord, k, s.oty, l), l);
     const ir::Index dst  = b.elem_select(s.arr, k, s.aty, l, /*for_write=*/true);
     const ir::Index elem = b.elem_select(src, from, s.aty, l);
@@ -404,9 +405,9 @@ ir::Index Lowerer::lower_array_sort_iter(std::string_view      name,
     SortIter s;
     s.arr       = arr;
     s.aty       = cty;
-    s.i32       = make_int_type(32, false, true);
-    s.i64       = make_int_type(64, false, true);
-    s.bit1      = make_int_type(1, false, false);
+    s.i32       = make_int_type(32, false);
+    s.i64       = make_int_type(64, false);
+    s.bit1      = make_int_type(1, false);
     s.iter_expr = iter_expr;
     s.iter_var  = iter_var;
     s.agg_elem  = is_agg_abi_ref(std::get<ir::Type>(module_.pool.get(s.aty)).element);
@@ -437,7 +438,7 @@ ir::Index Lowerer::lower_array_sort_iter(std::string_view      name,
 
     const ir::Index size  = queue ? b.queue_size(arr, s.aty, l) : b.dyn_array_size(arr, s.aty, l);
     const ir::Index n_lv  = s.n.lv(b, l);
-    const ir::Index n_val = b.resize(size, s.i64, l);
+    const ir::Index n_val = b.convert(size, s.i64, true, l);
     b.binary(T::Store, n_lv, n_val, l);
     if (iter_var != nullptr) {
         declare_storage(iter_var->as<slang::ast::VariableSymbol>(), /*force_frame*/ true);
@@ -459,7 +460,7 @@ void Lowerer::emit_sort_body(const SortIter& s, bool queue, ir::Builder& b, ir::
     const auto load = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
 
     b.open_region();
-    const ir::Index n32 = b.resize(load(s.n), s.i32, l);
+    const ir::Index n32 = b.convert(load(s.n), s.i32, true, l);
     b.dyn_array_new(s.ord, n32, s.ord, /*has_init*/ false, s.oty, l);
     b.dyn_array_new(s.buf, n32, s.buf, /*has_init*/ false, s.oty, l);
 
@@ -474,7 +475,7 @@ void Lowerer::emit_sort_body(const SortIter& s, bool queue, ir::Builder& b, ir::
     const ir::Index      ipred   = b.binary(T::SLt, out_now, n_now, l);
     const ir::ExtraSlice icond   = b.close_region();
     b.open_region();
-    const ir::Index k = b.resize(load(s.out), s.i32, l);
+    const ir::Index k = b.convert(load(s.out), s.i32, true, l);
     b.binary(T::Store, b.elem_select(s.ord, k, s.oty, l, /*for_write=*/true), k, l);
     const ir::ExtraSlice ibody = b.close_region();
     b.open_region();

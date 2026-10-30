@@ -77,12 +77,19 @@ Load / store / default-init / array-init / NBA-shadow for a 2-state slot read an
 write the raw `iW`. Defaults already special-case 2-state to zero — the constant
 just narrows from `zero(2*width)` to `zero(width)`.
 
-## Conversions (the `Resize` op)
+## Conversions (`ZExt`, `SExt`, `Trunc`, `ToFour`, `ToTwo`)
 
-`Resize` carries the target `ValueType` (width + domain + sign). Extend its lowering
-to project the domain, then width-cast:
+An IR integer type is a width and a domain; it has no sign. A conversion is one
+instruction of the five below, each carrying the target type (width + domain), and
+the frontend picks it. `Builder::convert(v, to, sign_extend)` emits the sequence for
+an integral value (domain down, then width, then domain up) and nothing for a value
+already of that width and domain. Whether a widening fills with the top bit or with
+zeros is the language's call, never the value's: LRM 11.8.3 takes the *source's*
+signedness for an assignment or a cast, LRM 11.8.2 the *propagated type's* for an
+operand, so `coerce` passes whichever applies and a same-width sign change emits
+nothing.
 
-### 4-state → 2-state (LRM 6.3.1: x/z → 0)
+### `ToTwo`: 4-state → 2-state (LRM 6.3.1: x/z → 0)
 
 The 2-state value is exactly the `must` plane: `must` is 0 for X (0,1) and for Z
 (encoded as X), 1 for a defined 1, 0 for a defined 0. One `trunc`:
@@ -92,11 +99,9 @@ The 2-state value is exactly the `must` plane: `must` is 0 for X (0,1) and for Z
 %v = trunc i16 %mm to i8        ; low 8 = must plane; x/z already 0 there
 ```
 
-Then width-cast `%v` to the destination width (trunc/zext/sext by dst sign).
+### `ToFour`: 2-state → 4-state
 
-### 2-state → 4-state
-
-must = may = value, z = 0. Width-cast the value first, then duplicate:
+must = may = value, z = 0. The value is duplicated:
 
 ```llvm
 ; bit[8] %v (i8)  ->  logic[8]  (i16 mm, i8 z)
@@ -106,10 +111,11 @@ must = may = value, z = 0. Width-cast the value first, then duplicate:
 ; z  = 0 : i8
 ```
 
-### Same-domain resize
+### `ZExt`, `SExt`, `Trunc`: width, one domain
 
-2-state → 2-state: plain `trunc`/`zext`/`sext` of the `iW` per dst sign (native,
-replaces the packed `cast_plane`). 4-state → 4-state: unchanged.
+2-state: plain `zext` / `sext` / `trunc` of the `iW` (native, replaces the packed
+`cast_plane`). 4-state: the same on each plane, `SExt` replicating the top bit of
+the must, may and z planes alike.
 
 ## Operators (both operands 2-state, W=8 shown)
 

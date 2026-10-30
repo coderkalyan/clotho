@@ -596,7 +596,6 @@ struct SignalSlot {
     std::vector<uint32_t> path;
     uint32_t width      = 0;
     bool     four_state = false;
-    bool     is_signed  = false;
     // Whether the slot stores a z word: the signal may carry z (compute_may_z)
     // or is a task out/inout target (the task ABI stores z through a pointer to
     // it). A never-z slot is just `{ i(2W) }`.
@@ -2709,11 +2708,12 @@ private:
                                 llvm::Value*     scratch,
                                 llvm::ArrayType* arr_ty,
                                 uint32_t         off,
-                                llvm::Value*&    any_x);
+                                llvm::Value*&    any_x,
+                                bool             is_signed);
 
     AssocKeySpan normalize_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
 
-    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot);
+    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot, bool is_signed);
 
     AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
 
@@ -2732,10 +2732,14 @@ private:
                                       bool         is_signed,
                                       uint32_t     store_width);
 
-    void denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off);
+    void denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off, bool is_signed);
 
-    void denormalize_variable_agg_key(Ref type, const LValue& lv, llvm::Value* kbase, llvm::Value*& off,
-                                      Index at);
+    void denormalize_variable_agg_key(Ref           type,
+                                      const LValue& lv,
+                                      llvm::Value*  kbase,
+                                      llvm::Value*& off,
+                                      Index         at,
+                                      bool          is_signed);
 
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write);
 
@@ -3318,7 +3322,7 @@ private:
 
     Plane cast_plane(Plane a, uint32_t to, bool sign);
 
-    Plane convert(Plane a, uint32_t to_width, bool four_state, bool sign);
+    Plane lower_conversion(Inst::Tag tag, Plane a, ValueType to);
 
     llvm::Value* xz_mask(Plane a, Plane b, uint32_t w);
 

@@ -116,7 +116,7 @@ Backend::AssocKeyInfo Backend::assoc_key_info(Ref assoc_type) {
     }
     const uint32_t w = mod_.pool.layout(key_ty).width;
     info.W           = w == 0 ? 1 : w;
-    info.is_signed   = std::get<Type>(mod_.pool.get(key_ty)).is_signed;
+    info.is_signed   = at.elem_signed;
     return info;
 }
 
@@ -187,20 +187,23 @@ std::pair<llvm::Value*, llvm::Value*> Backend::normalize_integral_key(llvm::Valu
 // non-packed LLVM struct, so it has ABI padding holes, and a frame aggregate is
 // a bare alloca whose padding is never written (emit_agg_init touches leaves
 // only) -- two structs with equal members could differ byte for byte, which
-// would break both the hash and the ordering. Per-leaf normalization also gets
-// the per-leaf signedness right, and gives the ordering LRM 7.8.5 leaves free:
-// lexicographic by member in declaration order.
+// would break both the hash and the ordering. Per-leaf normalization gets the
+// per-leaf signedness right, and gives the ordering LRM 7.8.5 leaves free:
+// lexicographic by member in declaration order. A leaf's signedness is not in its
+// integer type: it is the member's (Field::is_signed) or the array's element
+// (Type::elem_signed), and `is_signed` carries it down to the leaf.
 uint32_t Backend::emit_agg_key_bytes(Ref              type,
                                      const LValue&    lv,
                                      llvm::Value*     scratch,
                                      llvm::ArrayType* arr_ty,
                                      uint32_t         off,
-                                     llvm::Value*&    any_x) {
+                                     llvm::Value*&    any_x,
+                                     bool             is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
         for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-            off = emit_agg_key_bytes(fld.type, agg_member(lv, type, f), scratch, arr_ty, off, any_x);
+            off = emit_agg_key_bytes(fld.type, agg_member(lv, type, f), scratch, arr_ty, off, any_x, fld.is_signed);
             ++f;
         }
         return off;
@@ -208,7 +211,7 @@ uint32_t Backend::emit_agg_key_bytes(Ref              type,
     if (t.kind == Type::Kind::UnpackedArray) {
         const uint32_t n = array_dim(t);
         for (uint32_t k = 0; k < n; ++k) {
-            off = emit_agg_key_bytes(t.element, agg_elem(lv, type, k), scratch, arr_ty, off, any_x);
+            off = emit_agg_key_bytes(t.element, agg_elem(lv, type, k), scratch, arr_ty, off, any_x, t.elem_signed);
         }
         return off;
     }
@@ -222,7 +225,7 @@ uint32_t Backend::emit_agg_key_bytes(Ref              type,
     any_x            = any_x == nullptr ? ux : b_.CreateOr(any_x, ux);
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    emit_key_bytes(must_of(pl), W, std::get<Type>(mod_.pool.get(type)).is_signed, scratch, arr_ty, off);
+    emit_key_bytes(must_of(pl), W, is_signed, scratch, arr_ty, off);
     return off + (W + 7) / 8;
 }
 
@@ -232,7 +235,7 @@ Backend::AssocKeySpan Backend::normalize_agg_key(const LValue& key_lv, const Ass
     auto*          arr_ty  = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
     auto*          scratch = entry_alloca(arr_ty, "assoc.key");
     llvm::Value*   any_x   = nullptr;
-    emit_agg_key_bytes(info.key_ty, key_lv, scratch, arr_ty, 0, any_x);
+    emit_agg_key_bytes(info.key_ty, key_lv, scratch, arr_ty, 0, any_x, info.is_signed);
     llvm::Value* valid = any_x == nullptr ? nullptr : b_.CreateNot(any_x);
     if (valid != nullptr && llvm::isa<llvm::Constant>(valid)) {
         valid = nullptr; // every leaf 2-state: statically valid
@@ -259,12 +262,12 @@ Backend::AssocKeySpan Backend::normalize_agg_key(const LValue& key_lv, const Ass
 // is a compile-time constant with no defining block to violate). A plain
 // load/store through the slot is correct regardless of trip count or
 // nesting depth.
-void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot) {
+void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot, bool is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
         for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-            emit_variable_agg_key_bytes(fld.type, agg_member(lv, type, f), any_x_slot);
+            emit_variable_agg_key_bytes(fld.type, agg_member(lv, type, f), any_x_slot, fld.is_signed);
             ++f;
         }
         return;
@@ -272,7 +275,7 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
     if (t.kind == Type::Kind::UnpackedArray) {
         const uint32_t n = array_dim(t);
         for (uint32_t k = 0; k < n; ++k) {
-            emit_variable_agg_key_bytes(t.element, agg_elem(lv, type, k), any_x_slot);
+            emit_variable_agg_key_bytes(t.element, agg_elem(lv, type, k), any_x_slot, t.elem_signed);
         }
         return;
     }
@@ -312,7 +315,7 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
         b_.CreateCondBr(b_.CreateICmpULT(i, len), body, done);
         b_.SetInsertPoint(body);
         LValue elem_lv = container_elem_lvalue(handle, data, type, e, i);
-        emit_variable_agg_key_bytes(t.element, elem_lv, any_x_slot);
+        emit_variable_agg_key_bytes(t.element, elem_lv, any_x_slot, t.elem_signed);
         b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
         b_.CreateBr(head);
         b_.SetInsertPoint(done);
@@ -370,7 +373,7 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
         llvm::Value*  vslot = b_.CreateCall(assoc_get_ptr_fn(), { handle, kptr, klen });
         const DynElem ve    = dynarr_elem(type);
         LValue        vlv   = tmp_elem_lvalue(vslot, ve, b_.getInt64(0));
-        emit_variable_agg_key_bytes(t.element, vlv, any_x_slot);
+        emit_variable_agg_key_bytes(t.element, vlv, any_x_slot, /*is_signed=*/false);
         llvm::Value* got = b_.CreateCall(assoc_step_fn(/*prev=*/false), { handle, kptr, klen, kptr_a, klen_a });
         b_.CreateStore(b_.CreateTrunc(got, b_.getInt1Ty()), have_a);
         b_.CreateBr(head);
@@ -393,7 +396,7 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
     const uint32_t nbytes  = (W + 7) / 8;
     auto*           arr_ty = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
     auto*           scratch = entry_alloca(arr_ty, "assoc.vkey.leaf");
-    emit_key_bytes(must_of(pl), W, std::get<Type>(mod_.pool.get(type)).is_signed, scratch, arr_ty, 0);
+    emit_key_bytes(must_of(pl), W, is_signed, scratch, arr_ty, 0);
     b_.CreateCall(keybuf_append_fn(), { scratch, b_.getInt32(nbytes) });
 }
 
@@ -408,7 +411,7 @@ Backend::AssocKeySpan Backend::normalize_variable_agg_key(const LValue& key_lv, 
     llvm::Value* mark      = b_.CreateCall(keybuf_begin_fn(), {});
     llvm::Value* any_x_slot = entry_alloca(b_.getInt1Ty(), "assoc.vkey.anyx");
     b_.CreateStore(b_.getInt1(false), any_x_slot);
-    emit_variable_agg_key_bytes(info.key_ty, key_lv, any_x_slot);
+    emit_variable_agg_key_bytes(info.key_ty, key_lv, any_x_slot, info.is_signed);
     llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "assoc.vkey.ptr");
     llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "assoc.vkey.len");
     b_.CreateCall(keybuf_span_fn(), { mark, ptr_slot, len_slot });
@@ -497,10 +500,10 @@ void Backend::denormalize_assoc_key(llvm::Value*  kptr,
     if (info.is_agg) {
         if (info.is_variable) {
             llvm::Value* off = b_.getInt32(0);
-            denormalize_variable_agg_key(info.key_ty, key_lv, kptr, off, at);
+            denormalize_variable_agg_key(info.key_ty, key_lv, kptr, off, at, info.is_signed);
         } else {
             uint32_t off = 0;
-            denormalize_agg_key(info.key_ty, key_lv, kptr, off);
+            denormalize_agg_key(info.key_ty, key_lv, kptr, off, info.is_signed);
         }
         return;
     }
@@ -534,12 +537,12 @@ llvm::Value* Backend::denormalize_key_word(llvm::Value* kptr,
 // Inverse of emit_agg_key_bytes: one store per leaf, in the same declaration
 // order, so a `foreach` / `first` / `next` key variable of aggregate type reads
 // back exactly the key that was inserted.
-void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off) {
+void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off, bool is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
         for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-            denormalize_agg_key(fld.type, agg_member(lv, type, f), kptr, off);
+            denormalize_agg_key(fld.type, agg_member(lv, type, f), kptr, off, fld.is_signed);
             ++f;
         }
         return;
@@ -547,7 +550,7 @@ void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr,
     if (t.kind == Type::Kind::UnpackedArray) {
         const uint32_t n = array_dim(t);
         for (uint32_t k = 0; k < n; ++k) {
-            denormalize_agg_key(t.element, agg_elem(lv, type, k), kptr, off);
+            denormalize_agg_key(t.element, agg_elem(lv, type, k), kptr, off, t.elem_signed);
         }
         return;
     }
@@ -558,9 +561,7 @@ void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr,
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(
-      leaf,
-      two_val(denormalize_key_word(kptr, off, W, std::get<Type>(mod_.pool.get(type)).is_signed, leaf.store_width)));
+    lower_store(leaf, two_val(denormalize_key_word(kptr, off, W, is_signed, leaf.store_width)));
     off += (W + 7) / 8;
 }
 
@@ -574,12 +575,13 @@ void Backend::denormalize_variable_agg_key(Ref           type,
                                            const LValue& lv,
                                            llvm::Value*  kbase,
                                            llvm::Value*& off,
-                                           Index         at) {
+                                           Index         at,
+                                           bool          is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
         for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-            denormalize_variable_agg_key(fld.type, agg_member(lv, type, f), kbase, off, at);
+            denormalize_variable_agg_key(fld.type, agg_member(lv, type, f), kbase, off, at, fld.is_signed);
             ++f;
         }
         return;
@@ -587,7 +589,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
     if (t.kind == Type::Kind::UnpackedArray) {
         const uint32_t n = array_dim(t);
         for (uint32_t k = 0; k < n; ++k) {
-            denormalize_variable_agg_key(t.element, agg_elem(lv, type, k), kbase, off, at);
+            denormalize_variable_agg_key(t.element, agg_elem(lv, type, k), kbase, off, at, t.elem_signed);
         }
         return;
     }
@@ -644,7 +646,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
         b_.SetInsertPoint(body);
         llvm::Value* eoff     = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
         LValue       elem_lv  = tmp_elem_lvalue(tdata, e, i);
-        denormalize_variable_agg_key(t.element, elem_lv, kbase, eoff, at);
+        denormalize_variable_agg_key(t.element, elem_lv, kbase, eoff, at, t.elem_signed);
         b_.CreateStore(eoff, eoff_a);
         b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
         b_.CreateBr(head);
@@ -699,7 +701,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
         llvm::Value*  voff = b_.CreateAdd(b_.CreateAdd(eoff, b_.getInt32(4)), klen);
         const DynElem ve   = dynarr_elem(type);
         LValue        vlv  = tmp_elem_lvalue(slot, ve, b_.getInt64(0));
-        denormalize_variable_agg_key(t.element, vlv, kbase, voff, at);
+        denormalize_variable_agg_key(t.element, vlv, kbase, voff, at, /*is_signed=*/false);
         b_.CreateStore(voff, eoff_a);
         b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
         b_.CreateBr(head);
@@ -715,8 +717,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, two_val(denormalize_key_word(leafptr, 0, W,
-                std::get<Type>(mod_.pool.get(type)).is_signed, leaf.store_width)));
+    lower_store(leaf, two_val(denormalize_key_word(leafptr, 0, W, is_signed, leaf.store_width)));
     off = b_.CreateAdd(off, b_.getInt32((W + 7) / 8));
 }
 

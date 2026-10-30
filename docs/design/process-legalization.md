@@ -1129,7 +1129,7 @@ yosys rejects it by complaining about the sensitivity list, which is not where t
 problem is — so the plan's "reject R22" is now "classify R22 as what it is", and
 M5's acceptance changes accordingly.
 
-Known limits, both conservative: `is_constant` sees through `Resize` and `Concat`
+Known limits, both conservative: `is_constant` sees through the width and domain conversions and `Concat`
 but does not fold arithmetic, so `8'h0F + 1` as a reset value reads as an async
 load; and a reset routed through a function call still degrades to a rejection.
 

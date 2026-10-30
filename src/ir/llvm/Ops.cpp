@@ -1394,9 +1394,9 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         llvm::Value* mark0     = b_.CreateCall(keybuf_begin_fn(), {});
         llvm::Value* xz_slot   = entry_alloca(b_.getInt1Ty(), "aeq.anyx");
         b_.CreateStore(b_.getInt1(false), xz_slot);
-        emit_variable_agg_key_bytes(type, lhs, xz_slot);
+        emit_variable_agg_key_bytes(type, lhs, xz_slot, /*is_signed=*/false);
         llvm::Value* mid = b_.CreateCall(keybuf_begin_fn(), {});
-        emit_variable_agg_key_bytes(type, rhs, xz_slot);
+        emit_variable_agg_key_bytes(type, rhs, xz_slot, /*is_signed=*/false);
         llvm::Value* end = b_.CreateCall(keybuf_begin_fn(), {});
         llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "aeq.ptr");
         llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "aeq.len");

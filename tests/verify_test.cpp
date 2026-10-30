@@ -23,12 +23,11 @@ namespace {
 
 constexpr SourceLoc kLoc{ 1 };
 
-Ref vec(InternPool& pool, bool four, uint32_t width, bool is_signed) {
-    return pool.put(Type{ .kind      = Type::Kind::PackedArray,
-                          .is_signed = is_signed,
-                          .element   = four ? pool.logic_type : pool.bit_type,
-                          .left      = width - 1,
-                          .right     = 0 });
+Ref vec(InternPool& pool, bool four, uint32_t width) {
+    return pool.put(Type{ .kind    = Type::Kind::PackedArray,
+                          .element = four ? pool.logic_type : pool.bit_type,
+                          .left    = width - 1,
+                          .right   = 0 });
 }
 
 // A module with one initial process under construction.
@@ -36,11 +35,11 @@ struct Body {
     Module  m;
     Builder b{ m };
 
-    Ref bits(uint32_t width, bool is_signed = false) {
-        return vec(m.pool, false, width, is_signed);
+    Ref bits(uint32_t width) {
+        return vec(m.pool, false, width);
     }
-    Ref logic(uint32_t width, bool is_signed = false) {
-        return vec(m.pool, true, width, is_signed);
+    Ref logic(uint32_t width) {
+        return vec(m.pool, true, width);
     }
     Index konst(Ref type, uint64_t v = 1) {
         return b.constant(m.pool.put_int(type, v), kLoc);
@@ -118,24 +117,6 @@ TEST_CASE("verify: operand domain") {
     only(t.verified(), Rule::OperandDomain);
 }
 
-TEST_CASE("verify: operand signedness of ordered compares, div and mod; equality is exempt") {
-    Body      t;
-    const Ref s8 = t.bits(8, true);
-    const Ref u8 = t.bits(8);
-    t.b.binary(Inst::Tag::SLt, t.konst(s8), t.konst(u8), kLoc);
-    t.b.binary(Inst::Tag::SMod, t.konst(t.logic(8, true)), t.konst(t.logic(8)), kLoc);
-    t.b.binary(Inst::Tag::Eq, t.konst(s8), t.konst(u8), kLoc);
-    const auto v = t.verified();
-    CHECK(count(v, Rule::OperandSign) == 2);
-    CHECK(v.size() == 2);
-}
-
-TEST_CASE("verify: the result of an add is the left operand's signedness") {
-    Body t;
-    t.b.binary(Inst::Tag::Add, t.konst(t.bits(8, true)), t.konst(t.bits(8)), kLoc);
-    only(t.verified(), Rule::ResultSign);
-}
-
 TEST_CASE("verify: div, mod and pow are 4-state in the LRM") {
     Body      t;
     const Ref u8 = t.bits(8);
@@ -164,7 +145,7 @@ TEST_CASE("verify: a shift amount is self-determined but cannot widen the domain
     Body ok;
     // Any width, sign and (when the operand is 4-state) domain of amount.
     ok.b.binary(Inst::Tag::Sll, ok.konst(ok.bits(8)), ok.konst(ok.bits(3)), kLoc);
-    ok.b.binary(Inst::Tag::Sra, ok.konst(ok.logic(8, true)), ok.konst(ok.logic(5, true)), kLoc);
+    ok.b.binary(Inst::Tag::Sra, ok.konst(ok.logic(8)), ok.konst(ok.logic(5)), kLoc);
     CHECK(ok.verified().empty());
 
     Body t;
@@ -182,12 +163,10 @@ TEST_CASE("verify: select arms") {
     const Index c = t.konst(t.m.pool.bit_type);
     t.b.select(c, t.konst(t.bits(8)), t.konst(t.bits(4)), kLoc);
     t.b.select(c, t.konst(t.bits(8)), t.konst(t.logic(8)), kLoc);
-    t.b.select(c, t.konst(t.bits(8)), t.konst(t.bits(8, true)), kLoc);
     const auto v = t.verified();
     CHECK(count(v, Rule::SelectArmWidth) == 1);
     CHECK(count(v, Rule::SelectArmDomain) == 1);
-    CHECK(count(v, Rule::SelectArmSign) == 1);
-    CHECK(v.size() == 3);
+    CHECK(v.size() == 2);
 }
 
 TEST_CASE("verify: a lazy select's arms are checked like an eager one's") {
@@ -250,26 +229,42 @@ TEST_CASE("verify: a store to a part select compares against the select's width"
     only(bad.verified(), Rule::StoreWidth);
 }
 
-TEST_CASE("verify: resize records a signedness change, split by what it does to the width") {
-    Body      t;
-    const Ref u4 = t.bits(4);
-    const Ref s8 = t.bits(8, true);
-    const Ref s4 = t.bits(4, true);
-    // Same signedness: nothing to record.
-    t.b.resize(t.konst(u4), t.bits(8), kLoc);
-    t.b.resize(t.konst(s8), s4, kLoc);
-    // Signedness differs.
-    t.b.resize(t.konst(u4), s8, kLoc);        // widen
-    t.b.resize(t.konst(s8), t.bits(4), kLoc); // narrow
-    t.b.resize(t.konst(u4), s4, kLoc);        // retag
-    const auto v = t.verified();
-    CHECK(count(v, Rule::ResizeSignWiden) == 1);
-    CHECK(count(v, Rule::ResizeSignNarrow) == 1);
-    CHECK(count(v, Rule::ResizeSignRetag) == 1);
-    CHECK(v.size() == 3);
-    for (const Violation& x : v) {
-        CHECK(is_record(x.rule));
-    }
+TEST_CASE("verify: a conversion has the shape its opcode names") {
+    Body      ok;
+    const Ref u4 = ok.bits(4);
+    const Ref u8 = ok.bits(8);
+    const Ref l4 = ok.logic(4);
+    const Ref l8 = ok.logic(8);
+    ok.b.zext(ok.konst(u4), u8, kLoc);
+    ok.b.sext(ok.konst(l4), l8, kLoc);
+    ok.b.trunc(ok.konst(u8), u4, kLoc);
+    ok.b.to_four(ok.konst(u4), l4, kLoc);
+    ok.b.to_two(ok.konst(l4), u4, kLoc);
+    CHECK(ok.verified().empty());
+
+    Body      bad;
+    const Ref bu4 = bad.bits(4);
+    const Ref bu8 = bad.bits(8);
+    const Ref bl8 = bad.logic(8);
+    bad.b.zext(bad.konst(bu4), bu4, kLoc);    // not wider
+    bad.b.trunc(bad.konst(bu4), bu8, kLoc);   // not narrower
+    bad.b.sext(bad.konst(bu4), bl8, kLoc);    // changes the domain
+    bad.b.to_four(bad.konst(bu4), bu8, kLoc); // changes the width
+    bad.b.to_two(bad.konst(bu4), bu4, kLoc);  // already 2-state
+    const auto v = bad.verified();
+    CHECK(count(v, Rule::ConvertShape) == 5);
+    CHECK(v.size() == 5);
+}
+
+TEST_CASE("verify: convert() emits the conversions in order and nothing for a no-op") {
+    Body        t;
+    const Ref   s4 = t.logic(4);
+    const Index v  = t.konst(s4);
+    CHECK(t.b.convert(v, s4, true, kLoc) == v);
+    const Index wide = t.b.convert(v, t.bits(8), true, kLoc); // to_two, then sext
+    CHECK(t.b.type_of(wide) == ValueType{ 8, false });
+    CHECK(t.b.type_of(t.b.convert(v, t.logic(8), false, kLoc)) == ValueType{ 8, true });
+    CHECK(t.verified().empty());
 }
 
 TEST_CASE("verify: call actuals against formals") {
@@ -332,7 +327,7 @@ TEST_CASE("verify: an Arg and a Ret against the function's signature") {
 TEST_CASE("verify: the typing is the backend's: a signal reports its slot's leaf") {
     Body t;
     // A 4-state memory element: the value type is the element's, not the array's.
-    const Ref elem = t.logic(8, true);
+    const Ref elem = t.logic(8);
     const Ref mem  = t.m.pool.put(Type{ .kind = Type::Kind::UnpackedArray, .element = elem, .left = 0, .right = 3 });
     t.signal(mem);
     const Ir   ir    = t.b.finish();
@@ -340,34 +335,21 @@ TEST_CASE("verify: the typing is the backend's: a signal reports its slot's leaf
     REQUIRE(types.size() == 1);
     CHECK(types[0].width == 8);
     CHECK(types[0].four_state);
-    // The array's own signedness, which an unpacked array never carries.
-    CHECK(!types[0].is_signed);
 }
 
 TEST_CASE("verify: a violation formats with its rule, site, instruction, tag and types") {
     Body t;
-    t.b.binary(Inst::Tag::Add, t.konst(t.bits(8)), t.konst(t.logic(8, true)), kLoc);
+    t.b.binary(Inst::Tag::Add, t.konst(t.bits(8)), t.konst(t.logic(8)), kLoc);
     const auto v = t.verified();
-    REQUIRE(v.size() == 2);
+    REQUIRE(v.size() == 1);
     const auto at = [](SourceSpan) { return SourceText{ .where = "x.sv:3:4" }; };
-    CHECK(format(t.m, v[0], at) == "ir-verify: operand-domain: process 0 %2 add(bit[8], signed logic[8]) at x.sv:3:4");
+    CHECK(format(t.m, v[0], at) == "ir-verify: operand-domain: process 0 %2 add(bit[8], logic[8]) at x.sv:3:4");
     CHECK(format(t.m, v[0]).find(" at ") == std::string::npos);
-}
-
-TEST_CASE("verify: a select over real arms is not an arm-sign violation") {
-    // A real signal's slot is not flagged signed while a real constant is.
-    Body        t;
-    const Ref   real = t.m.pool.real_type;
-    const Index sig  = t.signal(real);
-    const Index load = t.b.unary(Inst::Tag::Load, sig, kLoc);
-    const Index zero = t.b.constant(t.m.pool.put_real(real, 0.0), kLoc);
-    t.b.select(t.konst(t.m.pool.bit_type), load, zero, kLoc);
-    CHECK(t.verified().empty());
 }
 
 TEST_CASE("verify: a DPI open-array formal is a phantom slot, not a value to compare") {
     Body             t;
-    const Ref        i32 = t.bits(32, true);
+    const Ref        i32 = t.bits(32);
     const FunctionId f   = t.m.reserve_function(i32);
     Function         g;
     g.name           = "oa";
@@ -397,9 +379,9 @@ TEST_CASE("typing: Builder::type_of is value_types of the body so far") {
     const std::array<Index, 2> parts{ sum, four };
     const Index                cat = t.b.concat(parts, kLoc);
 
-    CHECK(t.b.type_of(a) == ValueType{ 8, false, false });
-    CHECK(t.b.type_of(sum) == ValueType{ 8, false, false });
-    CHECK(t.b.type_of(cat) == ValueType{ 12, true, false });
+    CHECK(t.b.type_of(a) == ValueType{ 8, false });
+    CHECK(t.b.type_of(sum) == ValueType{ 8, false });
+    CHECK(t.b.type_of(cat) == ValueType{ 12, true });
 
     // What the builder said is what the finished body is typed as.
     const std::vector<ValueType> seen{ t.b.type_of(a), t.b.type_of(sum), t.b.type_of(four), t.b.type_of(cat) };
@@ -413,54 +395,20 @@ TEST_CASE("typing: Builder::type_of is value_types of the body so far") {
 
 TEST_CASE("typing: a call to a function reserved but not yet built has its declared return type") {
     Body             t;
-    const Ref        i16 = t.bits(16, true);
+    const Ref        i16 = t.bits(16);
     const FunctionId f   = t.m.reserve_function(i16);
     const Index      c   = t.b.call(f, {}, kLoc);
-    CHECK(t.b.type_of(c) == ValueType{ 16, false, true });
+    CHECK(t.b.type_of(c) == ValueType{ 16, false });
 }
 
 TEST_CASE("typing: rolling back the builder drops the types of the discarded instructions") {
     Body                t;
     const Builder::Mark mark = t.b.mark();
     const Index         c1   = t.konst(t.bits(8), 1);
-    CHECK(t.b.type_of(c1) == ValueType{ 8, false, false });
+    CHECK(t.b.type_of(c1) == ValueType{ 8, false });
     t.b.rollback(mark);
     // The next instruction reuses c1's index with a different type.
     const Index c2 = t.konst(t.logic(8), 1);
     CHECK(c2 == c1);
-    CHECK(t.b.type_of(c2) == ValueType{ 8, true, false });
-}
-
-// The opcode names the signedness it reads its operands with; while the IR's types
-// still carry one, the frontend's choice has to agree with them.
-TEST_CASE("verify: an opcode's signedness agrees with its operands' types") {
-    Body      t;
-    const Ref s8 = t.logic(8, true);
-    const Ref u8 = t.logic(8);
-    t.b.binary(Inst::Tag::SLt, t.konst(s8), t.konst(s8), kLoc);
-    t.b.binary(Inst::Tag::UGe, t.konst(u8), t.konst(u8), kLoc);
-    t.b.binary(Inst::Tag::SDiv, t.konst(s8), t.konst(s8), kLoc);
-    t.b.binary(Inst::Tag::Sra, t.konst(s8), t.konst(u8), kLoc);
-    t.b.pow(t.konst(s8), t.konst(u8), /*base_signed=*/true, /*exp_signed=*/false, kLoc);
-    const std::array<Index, 2> range{ t.konst(s8), t.konst(s8) };
-    t.b.inside_set(t.konst(s8), {}, range, /*ranges_signed=*/true, kLoc);
-    t.b.float_cvt(Inst::Tag::UItoF, t.konst(u8), t.m.pool.real_type, kLoc);
-    CHECK(t.verified().empty());
-}
-
-TEST_CASE("verify: an opcode that reads its operands with the wrong signedness is reported") {
-    Body      t;
-    const Ref s8 = t.logic(8, true);
-    const Ref u8 = t.logic(8);
-    t.b.binary(Inst::Tag::ULt, t.konst(s8), t.konst(s8), kLoc);
-    t.b.binary(Inst::Tag::SMod, t.konst(u8), t.konst(u8), kLoc);
-    t.b.binary(Inst::Tag::Sra, t.konst(u8), t.konst(u8), kLoc);
-    t.b.pow(t.konst(u8), t.konst(s8), /*base_signed=*/true, /*exp_signed=*/true, kLoc);
-    const std::array<Index, 2> range{ t.konst(u8), t.konst(u8) };
-    t.b.inside_set(t.konst(u8), {}, range, /*ranges_signed=*/true, kLoc);
-    t.b.float_cvt(Inst::Tag::SItoF, t.konst(u8), t.m.pool.real_type, kLoc);
-    const auto v = t.verified();
-    // One per instruction: pow's base is the unsigned one, its exponent agrees.
-    CHECK(count(v, Rule::OpSign) == 6);
-    CHECK(v.size() == 6);
+    CHECK(t.b.type_of(c2) == ValueType{ 8, true });
 }

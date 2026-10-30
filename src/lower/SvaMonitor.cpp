@@ -428,11 +428,11 @@ void Lowerer::emit_history_shift(const SvaHistory& hist, ir::Index edge, ir::Bui
 // answers "definitely 1"; SystemVerilog's `!` is true only when every bit is
 // definitely 0, so the same collapse over Lnot answers "definitely 0".
 ir::Index Lowerer::def_one(ir::Index v, ir::Builder& b, ir::SourceLoc l) {
-    return b.resize(v, module_.pool.bit_type, l);
+    return b.convert(v, module_.pool.bit_type, false, l);
 }
 
 ir::Index Lowerer::def_zero(ir::Index v, ir::Builder& b, ir::SourceLoc l) {
-    return b.resize(b.unary(ir::Inst::Tag::Lnot, v, l), module_.pool.bit_type, l);
+    return b.convert(b.unary(ir::Inst::Tag::Lnot, v, l), module_.pool.bit_type, false, l);
 }
 
 // $rose / $fell (LRM 16.9.3): did the bit move UP (resp. DOWN) the 4-state
@@ -597,8 +597,8 @@ ir::Index Lowerer::lower_sampled_value(std::string_view      name,
     // $rose / $fell are LSB-only (LRM 16.9.3), so a multi-bit operand is
     // truncated to bit 0 -- as 4-state, because the edge order below needs to
     // tell x apart from 0 and 1.
-    const ir::Index old_bit = b.resize(then, module_.pool.logic_type, l);
-    const ir::Index new_bit = b.resize(now, module_.pool.logic_type, l);
+    const ir::Index old_bit = b.convert(then, module_.pool.logic_type, false, l);
+    const ir::Index new_bit = b.convert(now, module_.pool.logic_type, false, l);
     return edge_step(old_bit, new_bit, name == "$rose", b, l);
 }
 
@@ -705,7 +705,7 @@ ir::Index Lowerer::eval_atom(const sva::Atom& atom, bool sampled, ir::Builder& b
     // collapse (LRM 6.3.1 drops x/z to 0), and it also makes the bit definite,
     // which every select below needs -- an x condition would bitwise-merge its
     // arms rather than choose one.
-    return b.resize(value, module_.pool.bit_type, l);
+    return b.convert(value, module_.pool.bit_type, false, l);
 }
 
 // `expr === match` for a `case` property item guard (LRM 16.12.17), which is
@@ -736,11 +736,10 @@ ir::Index Lowerer::eval_case_match(const sva::Atom& atom, ir::Builder& b, ir::So
     if (!sel.isIntegral() || !label.isIntegral()) {
         fail("a case property over a non-integral selector or item label is not supported");
     }
-    const ir::Ref   ty  = make_int_type(std::max(sel.getBitWidth(), label.getBitWidth()),
-                                        sel.isFourState() || label.isFourState(),
-                                        sel.isSigned() && label.isSigned());
-    const ir::Index lhs = b.resize(lower_expr(*atom.expr, b), ty, l);
-    const ir::Index rhs = b.resize(lower_expr(*atom.match, b), ty, l);
+    const ir::Ref ty =
+      make_int_type(std::max(sel.getBitWidth(), label.getBitWidth()), sel.isFourState() || label.isFourState());
+    const ir::Index lhs = b.convert(lower_expr(*atom.expr, b), ty, sel.isSigned() && label.isSigned(), l);
+    const ir::Index rhs = b.convert(lower_expr(*atom.match, b), ty, sel.isSigned() && label.isSigned(), l);
     return b.binary(ir::Inst::Tag::CaseEq, lhs, rhs, l);
 }
 
@@ -889,7 +888,7 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     // previous slot's Observed point. Taking it at the settled point is what
     // makes the monitor step once per cycle however many deltas the clock's
     // own driver needed to settle.
-    const ir::Index clk_now = b.resize(load_signal(mon.clock, b, l), module_.pool.bit_type, l);
+    const ir::Index clk_now = b.convert(load_signal(mon.clock, b, l), module_.pool.bit_type, false, l);
     const ir::Index clk_was = load_signal(st.clkprev, b, l);
     const ir::Index edge    = mon.edge == ir::Edge::Positive
                                 ? b.binary(ir::Inst::Tag::Band, clk_now, bit_not(clk_was, b, l), l)
@@ -1503,7 +1502,7 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
         // failed (docs/LRM_NOTES.md, note 23).
         ir::Index count = load_signal(st.covered, b, l);
         for (const ir::Index bit : hits) {
-            count = b.binary(ir::Inst::Tag::Add, count, b.resize(bit, mask_type(32), l), l);
+            count = b.binary(ir::Inst::Tag::Add, count, b.convert(bit, mask_type(32), false, l), l);
         }
         store_gated(st.covered, count, active, edge, 32, b, l);
     } else if (verdicts) {
@@ -2006,7 +2005,7 @@ void Lowerer::emit_counted_step(const ir::AssertionMonitor& mon,
         // the grouping a counted monitor does not have -- so there is one
         // reading available and both spellings get it.
         const ir::Index covered = load_signal(st.covered, b, l);
-        const ir::Index wide    = b.resize(matches, mask_type(32), l);
+        const ir::Index wide    = b.convert(matches, mask_type(32), false, l);
         const ir::Index count   = b.binary(ir::Inst::Tag::Add, covered, wide, l);
         store_gated(st.covered, count, active, edge, 32, b, l);
     } else if (verdicts) {

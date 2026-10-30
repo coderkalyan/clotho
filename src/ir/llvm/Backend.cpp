@@ -519,18 +519,24 @@ Plane Backend::cast_plane(Plane a, uint32_t to, bool sign) {
     return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
 }
 
-// Convert a value to a target domain + width. Domain projection follows LRM
-// 1800-2023 6.3.1: assigning a 4-state value to a 2-state target drops x/z to
-// 0 (that is exactly the must plane, since must is 0 for both x and z);
-// widening a 2-state value to 4-state duplicates it into both planes with z=0.
-// Width resize (sign-aware) happens after the domain projection.
-Plane Backend::convert(Plane a, uint32_t to_width, bool four_state, bool sign) {
-    if (four_state && a.two) {
-        a = to_four(a);
-    } else if (!four_state && !a.two) {
-        a = two_val(must_of(a));
+// A conversion instruction (ZExt, SExt, Trunc, ToFour, ToTwo). The extension is
+// the opcode's: nothing here reads a sign from a type.
+//
+// ToTwo follows LRM 1800-2023 6.3.1: a 4-state value assigned to a 2-state target
+// drops x/z to 0, which is exactly the must plane (must is 0 for both x and z).
+// ToFour duplicates the value into both planes with z = 0.
+Plane Backend::lower_conversion(Inst::Tag tag, Plane a, ValueType to) {
+    switch (tag) {
+        case Inst::Tag::ZExt:
+        case Inst::Tag::Trunc:
+            return cast_plane(a, to.width, false);
+        case Inst::Tag::SExt:
+            return cast_plane(a, to.width, true);
+        case Inst::Tag::ToFour:
+            return to_four(a);
+        default: // ToTwo
+            return a.two ? a : two_val(must_of(a));
     }
-    return cast_plane(a, to_width, sign);
 }
 
 // Combined per-bit X/Z mask (iW) of two same-width operands, tested once

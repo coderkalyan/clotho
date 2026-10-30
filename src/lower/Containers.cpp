@@ -56,7 +56,7 @@ void Lowerer::emit_fixed_array_into_dynarr(ir::Index         dst,
     const ir::Ref   src_ty = lower_type(*src.type);
     const ir::Type  st     = std::get<ir::Type>(module_.pool.get(src_ty));
     const ir::Type  dt     = std::get<ir::Type>(module_.pool.get(dst_ty));
-    const ir::Ref   i32    = make_int_type(32, false, true);
+    const ir::Ref   i32    = make_int_type(32, false);
     for (uint32_t k = 0; k < n; ++k) {
         const ir::Index dst_el =
           b.elem_select(dst, b.constant(module_.pool.put_int(i32, k), l), dst_ty, l, /*for_write=*/true);
@@ -86,7 +86,7 @@ void Lowerer::emit_fixed_array_into_queue(ir::Index         dst,
     dat.element          = std::get<ir::Type>(module_.pool.get(queue_ty)).element;
     const ir::Ref   daty = module_.pool.put(ir::Item{ dat });
     const ir::Index tmp  = make_arg_temp(daty, b, l);
-    const ir::Ref   i32  = make_int_type(32, false, true);
+    const ir::Ref   i32  = make_int_type(32, false);
     b.dyn_array_new(tmp, b.constant(module_.pool.put_int(i32, n), l), tmp, /*has_init=*/false, daty, l);
     emit_fixed_array_into_dynarr(tmp, src, daty, n, b, l);
     b.queue_copy_dynarr(dst, tmp, queue_ty, l);
@@ -217,7 +217,7 @@ void Lowerer::emit_dyn_array_store(ir::Index         dst,
         // position-wise.
         const auto&   fty = rhs.type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
         const auto    n   = static_cast<uint32_t>(fty.range.width());
-        const ir::Ref i32 = make_int_type(32, false, true);
+        const ir::Ref i32 = make_int_type(32, false);
         b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, aty, l);
         emit_fixed_array_into_dynarr(dst, rhs, aty, n, b, l);
         return;
@@ -244,7 +244,7 @@ void Lowerer::emit_dyn_pattern_fill(ir::Index                                   
                                            "an assignment-pattern replication count (LRM 10.9.1)"))
         : 1;
     for (uint32_t k = 0; k < n * reps; ++k) {
-        const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+        const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false), k), l);
         emit_agg_store(b.elem_select(dst, idx, aty, l), t.element, *elems[k % n], ir::Inst::Tag::Store, b, l);
     }
 }
@@ -259,7 +259,7 @@ ir::Index Lowerer::lower_dyn_array_method(std::string_view      name,
     const ir::Index arr = lower_lvalue(*call.arguments()[0], b, mutates_container(name));
     const ir::Ref   aty = lower_type(*call.arguments()[0]->type);
     if (name == "size") {
-        return b.resize(b.dyn_array_size(arr, aty, l), lower_type(*call.type), l);
+        return b.convert(b.dyn_array_size(arr, aty, l), lower_type(*call.type), call.type->isSigned(), l);
     }
     if (name == "delete") {
         return b.dyn_array_delete(arr, aty, l);
@@ -389,7 +389,7 @@ ir::Index Lowerer::lower_fixed_array_order(std::string_view      name,
     mt.kind           = ir::Type::Kind::DynArray;
     mt.element        = er;
     const ir::Ref mty = module_.pool.put(ir::Item{ mt });
-    const ir::Ref i32 = make_int_type(32, false, true);
+    const ir::Ref i32 = make_int_type(32, false);
 
     const ir::Index mirror = make_arg_temp(mty, b, l);
     b.dyn_array_new(mirror, iconst(i32, map.fixed_count, b, l), mirror, /*has_init*/ false, mty, l);
@@ -427,7 +427,7 @@ void Lowerer::emit_fixed_mirror_copy(ir::Index           arr,
     using T                  = ir::Inst::Tag;
     const ir::Ref   er       = std::get<ir::Type>(module_.pool.get(aty)).element;
     const bool      agg      = is_agg_abi_ref(er);
-    const ir::Ref   i32      = make_int_type(32, false, true);
+    const ir::Ref   i32      = make_int_type(32, false);
     const TempCell  pos      = make_temp_cell(i32, "fxord_pos");
     const ir::Index pos_lv   = pos.lv(b, l);
     const ir::Index pos_init = iconst(i32, 0, b, l);
@@ -510,9 +510,9 @@ std::optional<ir::Index> Lowerer::lower_iterator_index(const CallExpression& cal
     for (size_t k = iter_stack_.size(); k-- > 0;) {
         if (iter_stack_[k].var == &sym) {
             const ir::Index cur  = b.unary(ir::Inst::Tag::Load, iter_stack_[k].index.lv(b, l), l);
-            const ir::Ref   i32  = make_int_type(32, false, true);
+            const ir::Ref   i32  = make_int_type(32, false);
             const ir::Index decl = decl_index_at(iter_stack_[k].map, cur, i32, b, l);
-            return b.resize(decl, lower_type(*call.type), l);
+            return b.convert(decl, lower_type(*call.type), call.type->isSigned(), l);
         }
     }
     fail("the iterator index method is only supported inside its own `with` clause");
@@ -561,17 +561,17 @@ ir::Index Lowerer::lower_array_iter_method(std::string_view      name,
              "(the element itself is not a key: LRM 7.12.1 and 7.12.3 both require the operation "
              "to be defined for the element type)");
     }
-    const ir::Ref   i32   = make_int_type(32, false, true);
-    const ir::Ref   bit1  = make_int_type(1, false, false);
+    const ir::Ref   i32   = make_int_type(32, false);
+    const ir::Ref   bit1  = make_int_type(1, false);
     const ir::Index one1  = b.constant(module_.pool.put_int(bit1, 1), l);
     const ir::Index zero1 = b.constant(module_.pool.put_int(bit1, 0), l);
 
     // 0 .. size-1, with the count snapshotted like a foreach bound.
     const TempCell  idx   = make_temp_cell(i32, "arrm_idx");
     const TempCell  bound = make_temp_cell(i32, "arrm_bound");
-    const ir::Index size  = map.fixed
-                              ? iconst(i32, map.fixed_count, b, l)
-                              : b.resize(queue ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l), i32, l);
+    const ir::Index size =
+      map.fixed ? iconst(i32, map.fixed_count, b, l)
+                : b.convert(queue ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l), i32, true, l);
     b.binary(T::Store, bound.lv(b, l), size, l);
     const ir::Index idx_lv   = idx.lv(b, l);
     const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -682,7 +682,7 @@ ir::Index Lowerer::lower_array_iter_method(std::string_view      name,
         const ir::Index v       = key_of(k);
         const ir::Index acc_lv  = acc.lv(b, l);
         const ir::Index acc_now = b.unary(T::Load, acc.lv(b, l), l);
-        const ir::Index widened = b.resize(v, rty, l);
+        const ir::Index widened = b.convert(v, rty, call.type->isSigned(), l);
         const ir::Index folded  = b.binary(op, acc_now, widened, l);
         b.binary(T::Store, acc_lv, folded, l);
     } else if (minmax) {
@@ -816,7 +816,7 @@ ir::Index Lowerer::var_elem_select(const ElementSelectExpression& es,
                                    bool                           is_write) {
     const ir::Ref arr_ty = lower_type(*es.value().type);
     if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
-        const ir::Ref   i32  = make_int_type(32, false, true);
+        const ir::Ref   i32  = make_int_type(32, false);
         const ir::Index size = b.queue_size(base, arr_ty, l);
         const ir::Index idx  = b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
         return b.elem_select(base, idx, arr_ty, l, is_write);
@@ -957,9 +957,9 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
             // `q[$]`'s size()-1 resolution already produces below), not
             // `rs.left().type`: the base may itself be bare `$`
             // (UnboundedType), which lower_type rejects outright.
-            const ir::Ref   i32   = make_int_type(32, false, true);
-            const ir::Index base  = b.resize(lower_expr(rs.left(), b), i32, l);
-            const ir::Index count = b.resize(lower_expr(rs.right(), b), i32, l);
+            const ir::Ref   i32   = make_int_type(32, false);
+            const ir::Index base  = b.convert(lower_expr(rs.left(), b), i32, true, l);
+            const ir::Index count = b.convert(lower_expr(rs.right(), b), i32, true, l);
             const ir::Index one   = b.constant(module_.pool.put_int(i32, 1), l);
             const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, one, l);
             if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
@@ -990,7 +990,7 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
     const std::span<const Expression* const> pieces =
       pat != nullptr ? pat->elements() : e.as<ConcatenationExpression>().operands();
     // A full-queue append: lo = 0, hi = INT64_MAX (runtime-clamped to len-1).
-    const ir::Ref   i64   = make_int_type(64, false, true);
+    const ir::Ref   i64   = make_int_type(64, false);
     const ir::Index lo0   = b.constant(module_.pool.put_int(i64, 0), l);
     const ir::Index hiEnd = b.constant(module_.pool.put_int(i64, static_cast<uint64_t>(INT64_MAX)), l);
     // A CONCATENATION operand that is itself a queue splices its elements
@@ -1237,7 +1237,7 @@ ir::Index Lowerer::lower_queue_method(std::string_view      name,
     const ir::Index q          = lower_lvalue(*args[0], b, recv_write);
     const ir::Ref   qty  = lower_type(*args[0]->type);
     if (name == "size") {
-        return b.resize(b.queue_size(q, qty, l), lower_type(*call.type), l);
+        return b.convert(b.queue_size(q, qty, l), lower_type(*call.type), call.type->isSigned(), l);
     }
     if (name == "push_back" || name == "push_front") {
         return b.queue_push(q, lower_container_element_value(*args[1], qty, b, l), name == "push_front", qty, l);
@@ -1292,10 +1292,13 @@ ir::Index Lowerer::lower_assoc_method(std::string_view      name,
     const ir::Index a    = lower_lvalue(*args[0], b, mutates_container(name));
     const ir::Ref   aty  = lower_type(*args[0]->type);
     if (name == "num" || name == "size") {
-        return b.resize(b.assoc_num(a, aty, l), lower_type(*call.type), l);
+        return b.convert(b.assoc_num(a, aty, l), lower_type(*call.type), call.type->isSigned(), l);
     }
     if (name == "exists") {
-        return b.resize(b.assoc_exists(a, lower_assoc_key(*args[1], aty, b, l), aty, l), lower_type(*call.type), l);
+        return b.convert(b.assoc_exists(a, lower_assoc_key(*args[1], aty, b, l), aty, l),
+                         lower_type(*call.type),
+                         call.type->isSigned(),
+                         l);
     }
     if (name == "delete") {
         // a.delete() clears all; a.delete(k) removes one entry.
@@ -1315,7 +1318,7 @@ ir::Index Lowerer::lower_assoc_method(std::string_view      name,
                                  : name == "last" ? Step::Last
                                  : name == "next" ? Step::Next
                                                   : Step::Prev;
-        return b.resize(b.assoc_traverse(a, key_lv, step, aty, l), lower_type(*call.type), l);
+        return b.convert(b.assoc_traverse(a, key_lv, step, aty, l), lower_type(*call.type), call.type->isSigned(), l);
     }
     // TODO: find/find_index/min/max/unique/sum reduction & locator methods
     // (need iterator-clause lowering, shared with the queue/dynarr gap above),
@@ -1346,10 +1349,8 @@ ir::Index Lowerer::serialize_agg_lvalue(ir::Index lv, ir::Ref ty, ir::Builder& b
         for (uint32_t k = 0; k < n; ++k) {
             const int32_t coord =
               t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
-            const ir::Index idx =
-              b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                              static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                         l);
+            const ir::Index idx = b.constant(
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
             parts.push_back(serialize_agg_lvalue(b.elem_select(lv, idx, ty, l), t.element, b, l));
         }
     } else if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
@@ -1400,8 +1401,7 @@ ir::Index Lowerer::lower_streaming_concat(const StreamingConcatenationExpression
         const Expression& operand = *stream.operand;
         if (operand.kind == ExpressionKind::Streaming) {
             const auto&   inner = operand.as<StreamingConcatenationExpression>();
-            const ir::Ref inner_ty =
-              make_int_type(static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer, false);
+            const ir::Ref inner_ty = make_int_type(static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer);
             parts.push_back(lower_streaming_concat(inner, inner_ty, b, l));
         } else if (is_agg_bitstream_operand(operand)) {
             // A whole unpacked array / struct operand serializes to its leaf
@@ -1431,13 +1431,13 @@ ir::Index Lowerer::lower_streaming_concat(const StreamingConcatenationExpression
     if (target_w > static_cast<uint32_t>(W)) {
         const uint32_t         pad      = target_w - static_cast<uint32_t>(W);
         const bool             is_four  = module_.pool.layout(target_ty).domain == ir::Domain::Four;
-        const ir::Ref          pad_ty   = make_int_type(pad, is_four, false);
+        const ir::Ref          pad_ty   = make_int_type(pad, is_four);
         const ir::Index        zero_pad = b.constant(module_.pool.put_int(pad_ty, 0), l);
         std::vector<ir::Index> widened  = { raw, zero_pad };
         raw                             = b.concat(widened, l);
     }
 
-    return b.resize(raw, target_ty, l);
+    return b.convert(raw, target_ty, false, l);
 }
 
 // One element's bit width in a container the stream reads or fills, and the
@@ -1471,7 +1471,7 @@ void Lowerer::collect_stream_chunks(const StreamingConcatenationExpression& sc,
         }
         const auto w = static_cast<uint32_t>(sc.getBitstreamWidth());
         out.push_back({ .kind  = StreamChunk::Kind::Fixed,
-                        .value = lower_streaming_concat(sc, make_int_type(w, four, false), b, l),
+                        .value = lower_streaming_concat(sc, make_int_type(w, four), b, l),
                         .width = w });
         return;
     }
@@ -1562,8 +1562,7 @@ void Lowerer::collect_agg_stream_chunks(ir::Index                 lv,
             const int32_t coord =
               t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
             const ir::Index idx = b.constant(
-              module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
-              l);
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
             collect_agg_stream_chunks(b.elem_select(lv, idx, ty, l), t.element, out, b, l);
         }
         return;
@@ -1674,12 +1673,12 @@ ir::Index Lowerer::stream_granule_count(std::span<const StreamChunk> chunks,
                                         ir::Builder&                 b,
                                         ir::SourceLoc                l) {
     using T           = ir::Inst::Tag;
-    const ir::Ref i32 = make_int_type(32, false, true);
+    const ir::Ref i32 = make_int_type(32, false);
     ir::Index     total{};
     for (const StreamChunk& c : chunks) {
         ir::Index add{};
         if (c.kind == StreamChunk::Kind::Str) {
-            add = b.resize(b.unary(T::StrLen, c.value, l), i32, l);
+            add = b.convert(b.unary(T::StrLen, c.value, l), i32, true, l);
         } else if (c.kind == StreamChunk::Kind::Fixed) {
             add = b.constant(module_.pool.put_int(i32, c.width / g), l);
         } else if (c.elem_is_str) {
@@ -1689,7 +1688,7 @@ ir::Index Lowerer::stream_granule_count(std::span<const StreamChunk> chunks,
             const ir::Index acc_init = b.constant(module_.pool.put_int(i32, 0), l);
             b.binary(T::Store, acc_lv, acc_init, l);
             emit_stream_elem_loop(c, b, l, [&](ir::Index elem) {
-                const ir::Index len  = b.resize(b.unary(T::StrLen, b.unary(T::Load, elem, l), l), i32, l);
+                const ir::Index len  = b.convert(b.unary(T::StrLen, b.unary(T::Load, elem, l), l), i32, true, l);
                 const ir::Index slot = acc.lv(b, l);
                 const ir::Index cur  = b.unary(T::Load, acc.lv(b, l), l);
                 const ir::Index next = b.binary(T::Add, cur, len, l);
@@ -1699,7 +1698,7 @@ ir::Index Lowerer::stream_granule_count(std::span<const StreamChunk> chunks,
         } else {
             const ir::Index size =
               c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
-            const ir::Index count = b.resize(size, i32, l);
+            const ir::Index count = b.convert(size, i32, true, l);
             const ir::Index per   = b.constant(module_.pool.put_int(i32, c.width / g), l);
             add                   = b.binary(T::Mul, count, per, l);
         }
@@ -1732,7 +1731,7 @@ void Lowerer::stream_fill_dynarr(ir::Index                    dst,
     using T           = ir::Inst::Tag;
     const ir::Type at = std::get<ir::Type>(module_.pool.get(aty));
     const uint32_t g  = stream_granule_width(at);
-    const ir::Ref  i32 = make_int_type(32, false, true);
+    const ir::Ref  i32 = make_int_type(32, false);
     b.dyn_array_new(dst, stream_granule_count(chunks, g, b, l), dst, /*has_init=*/false, aty, l);
     const TempCell  idx      = make_temp_cell(i32, "stream_o");
     const ir::Index idx_lv   = idx.lv(b, l);
@@ -1767,7 +1766,7 @@ ir::Index Lowerer::stream_reorder_pos(ir::Index     p,
         return p;
     }
     using T             = ir::Inst::Tag;
-    const ir::Ref   i32 = make_int_type(32, false, true);
+    const ir::Ref   i32 = make_int_type(32, false);
     const ir::Index s   = b.constant(module_.pool.put_int(i32, slice), l);
     const ir::Index one = b.constant(module_.pool.put_int(i32, 1), l);
     // Distance from the stream's right (LSB) end -- blocks are formed
@@ -1798,7 +1797,7 @@ void Lowerer::check_stream_fits_fixed(ir::Index                               w,
                                       ir::Builder&                            b,
                                       ir::SourceLoc                           l) {
     using T             = ir::Inst::Tag;
-    const ir::Ref   i32 = make_int_type(32, false, true);
+    const ir::Ref   i32 = make_int_type(32, false);
     const ir::Index bad = b.binary(T::SGt, w, b.constant(module_.pool.put_int(i32, tw), l), l);
     b.open_region();
     {
@@ -1830,7 +1829,7 @@ ir::Index Lowerer::stream_to_fixed(std::span<const StreamChunk>            chunk
                                    ir::Builder&                            b,
                                    ir::SourceLoc                           l) {
     using T              = ir::Inst::Tag;
-    const ir::Ref  i32   = make_int_type(32, false, true);
+    const ir::Ref  i32   = make_int_type(32, false);
     const uint32_t slice = static_cast<uint32_t>(sc.getSliceSize());
     const uint32_t tw    = module_.pool.layout(target_ty).width;
     const bool     four  = module_.pool.layout(target_ty).domain == ir::Domain::Four;
@@ -1854,7 +1853,7 @@ ir::Index Lowerer::stream_to_fixed(std::span<const StreamChunk>            chunk
     // fixed-size lower_streaming_concat above, which builds its padded
     // `raw` the same way and converts to `target_ty` only in its own
     // final `resize`.
-    const ir::Ref   acc_ty   = make_int_type(tw, four, false);
+    const ir::Ref   acc_ty   = make_int_type(tw, four);
     const TempCell  acc      = make_temp_cell(acc_ty, "stream_acc");
     const ir::Index acc_lv   = acc.lv(b, l);
     const ir::Index acc_init = b.constant(module_.pool.put_int(acc_ty, 0), l);
@@ -1864,14 +1863,16 @@ ir::Index Lowerer::stream_to_fixed(std::span<const StreamChunk>            chunk
     const ir::Index pos_init = b.constant(module_.pool.put_int(i32, 0), l);
     b.binary(T::Store, pos_lv, pos_init, l);
 
-    const ir::Ref bit_ty = make_int_type(1, four, false);
+    const ir::Ref bit_ty = make_int_type(1, four);
     walk_stream_granules(chunks, /*g=*/1, bit_ty, b, l, [&](ir::Index bit_v) {
         const ir::Index p       = b.unary(T::Load, pos.lv(b, l), l);
         const ir::Index new_pos = stream_reorder_pos(p, w, nfull, leftover, slice, b, l);
-        const ir::Index shift   = b.resize(
-          b.binary(T::Sub, b.constant(module_.pool.put_int(i32, tw - 1), l), new_pos, l),
-          make_int_type(32, false, false), l);
-        const ir::Index widened = b.resize(bit_v, acc_ty, l);
+        const ir::Index shift =
+          b.convert(b.binary(T::Sub, b.constant(module_.pool.put_int(i32, tw - 1), l), new_pos, l),
+                    make_int_type(32, false),
+                    false,
+                    l);
+        const ir::Index widened = b.convert(bit_v, acc_ty, false, l);
         const ir::Index acc_dst = acc.lv(b, l);
         const ir::Index acc_cur = b.unary(T::Load, acc.lv(b, l), l);
         const ir::Index placed  = b.binary(T::Sll, widened, shift, l);
@@ -1882,18 +1883,18 @@ ir::Index Lowerer::stream_to_fixed(std::span<const StreamChunk>            chunk
         const ir::Index pos_next = b.binary(T::Add, p, one, l);
         b.binary(T::Store, pos_dst, pos_next, l);
     });
-    return b.resize(b.unary(T::Load, acc.lv(b, l), l), target_ty, l);
+    return b.convert(b.unary(T::Load, acc.lv(b, l), l), target_ty, false, l);
 }
 
 ir::Index Lowerer::take_stream_bits(StreamUnpack& u, uint32_t w, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
     const uint32_t lsb = u.pos - w;
     ir::Index      v   = u.src;
     if (lsb != 0) {
-        const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+        const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), lsb), l);
         v                  = b.binary(ir::Inst::Tag::Srl, u.src, sh, l);
     }
     u.pos = lsb;
-    return b.resize(v, ty, l);
+    return b.convert(v, ty, false, l);
 }
 
 // The granule of the first dynamically sized destination in stream order, if
@@ -1981,10 +1982,8 @@ void Lowerer::unpack_stream_agg(ir::Index            lv,
         for (uint32_t k = 0; k < n; ++k) {
             const int32_t coord =
               t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
-            const ir::Index idx =
-              b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                              static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                         l);
+            const ir::Index idx = b.constant(
+              module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
             unpack_stream_agg(b.elem_select(lv, idx, ty, l), t.element, u, tag, b, l, nbt);
         }
         return;
@@ -2020,10 +2019,7 @@ void Lowerer::unpack_stream_dynamic_dest(const Expression& dest,
         }
         check_stream_byte_multiple(bits);
         // One call: the whole run of bytes is contiguous in the source.
-        b.binary(T::StrAppendPacked,
-                 lv,
-                 take_stream_bits(u, bits, make_int_type(bits, false, false), b, l),
-                 l);
+        b.binary(T::StrAppendPacked, lv, take_stream_bits(u, bits, make_int_type(bits, false), b, l), l);
         return;
     }
     const ir::Ref   cty = lower_type(*dest.type);
@@ -2038,7 +2034,7 @@ void Lowerer::unpack_stream_dynamic_dest(const Expression& dest,
         }
         return;
     }
-    const ir::Ref i32 = make_int_type(32, false, true);
+    const ir::Ref i32 = make_int_type(32, false);
     b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, cty, l);
     for (uint32_t k = 0; k < n; ++k) {
         const ir::Index idx   = b.constant(module_.pool.put_int(i32, k), l);
@@ -2086,11 +2082,10 @@ void Lowerer::store_stream_target(const StreamingConcatenationExpression& sc,
     // Take the leftmost `used` bits: the low src_w - used are discarded.
     StreamUnpack u{ .src = rhs, .pos = used, .dyn_bits = dyn };
     if (src_w > used) {
-        const ir::Index sh =
-          b.constant(module_.pool.put_int(make_int_type(32, false, false), src_w - used), l);
+        const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), src_w - used), l);
         u.src = b.binary(ir::Inst::Tag::Srl, rhs, sh, l);
     }
-    u.src = b.resize(u.src, make_int_type(used, rhs_expr.type->isFourState(), false), l);
+    u.src = b.convert(u.src, make_int_type(used, rhs_expr.type->isFourState()), false, l);
     if (const uint64_t s = sc.getSliceSize(); s > 0) {
         if (used % s != 0) {
             // TODO: `{<<S{...}}` where S does not divide the stream. slang's

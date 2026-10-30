@@ -52,9 +52,6 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
         return;
     }
     const Type& t = std::get<Type>(pool.get(type));
-    if (t.is_signed) {
-        os << "signed ";
-    }
     switch (t.kind) {
         case Type::Kind::Void:
             os << "void";
@@ -352,8 +349,16 @@ const char* tag_name(Inst::Tag tag) {
             return "repl";
         case T::StreamReverse:
             return "stream_reverse";
-        case T::Resize:
-            return "resize";
+        case T::ZExt:
+            return "zext";
+        case T::SExt:
+            return "sext";
+        case T::Trunc:
+            return "trunc";
+        case T::ToFour:
+            return "to_four";
+        case T::ToTwo:
+            return "to_two";
         case T::Cond:
             return "cond";
         case T::Switch:

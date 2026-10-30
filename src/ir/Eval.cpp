@@ -231,10 +231,14 @@ EvalValue Eval::compute(Index i) {
             return EvalValue::unknown(1);
         }
 
-        // A resize keeps the low bits it has and knows nothing above them; an
-        // unsigned narrowing is exact, a widening leaves the new bits unknown
-        // unless the source was fully known and unsigned.
-        case Inst::Tag::Resize: {
+        // A conversion keeps the low bits it has and knows nothing above them; a
+        // zero-extension of a fully known value is known, any other widening
+        // leaves the new bits unknown.
+        case Inst::Tag::ZExt:
+        case Inst::Tag::SExt:
+        case Inst::Tag::Trunc:
+        case Inst::Tag::ToFour:
+        case Inst::Tag::ToTwo: {
             const EvalValue a  = value(p.op_type.op);
             const Layout    to = module_.pool.layout(p.op_type.type);
             if (to.width == 0 || to.width > 64) {
@@ -243,11 +247,8 @@ EvalValue Eval::compute(Index i) {
             const uint64_t keep = EvalValue::width_mask(to.width < a.width ? to.width : a.width);
             const uint64_t m    = EvalValue::width_mask(to.width);
             uint64_t       mask = a.mask & keep;
-            if (to.width > a.width) {
-                const Type& t = std::get<Type>(module_.pool.get(p.op_type.type));
-                if (!t.is_signed && a.fully_known()) {
-                    mask = m; // zero-extension of a known value is known
-                }
+            if (to.width > a.width && ir_.tag(i) == Inst::Tag::ZExt && a.fully_known()) {
+                mask = m; // zero-extension of a known value is known
             }
 
             return { a.bits & mask, mask & m, to.width };

@@ -291,7 +291,6 @@ void Backend::build_state_types() {
         slot.ir_type     = sigs[i].type;
         slot.width       = lay.width == 0 ? 1 : lay.width;
         slot.four_state  = lay.domain == Domain::Four;
-        slot.is_signed   = ty.is_signed;
         // A string slot is an opaque rt_string handle: no planes, no z word.
         if (is_string_type(sigs[i].type)) {
             slot.is_string = true;

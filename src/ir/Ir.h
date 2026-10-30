@@ -1805,9 +1805,23 @@ struct Inst {
         // op_imm — op is the built stream value, imm the slice size S).
         StreamReverse,
 
-        // -- Width --
-        // Resize (zero/sign extend or truncate) to a target type (payload: op_type).
-        Resize,
+        // -- Width and domain --
+        // Conversions of an integral value to a target type (payload: op_type: the
+        // operand and the type of the result, whose width and domain are the
+        // target's). The extension is in the opcode: the language, not the value's
+        // bits, decides whether a widening fills with zeros or with a copy of the
+        // top bit (LRM 11.8.2, 11.8.3, 6.24.1), and the frontend chooses.
+        // Widening, in the operand's domain: fill the new high bits with zeros / with
+        // the top bit.
+        ZExt,
+        SExt,
+        // Narrowing, in the operand's domain: keep the low bits.
+        Trunc,
+        // The domain alone, at the operand's width: a 2-state value gains an x/z
+        // plane that is zero, and the x and z bits of a 4-state value become 0
+        // (LRM 6.3.1).
+        ToFour,
+        ToTwo,
 
         // -- Control flow --
         // If / else; condition + then/else regions (payload: op_extra -> Regions).
@@ -2206,7 +2220,7 @@ struct Inst {
         // rounds the tick count down by `scale` (the calling module's unit / the
         // smallest unit) to the module time unit (LRM §20.3.1). `scale` is 1 when
         // unitless or the module owns the smallest unit. $stime truncates the
-        // result to 32 bits via a Resize.
+        // result to 32 bits via a Trunc.
         SimTime,
         // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
@@ -2673,7 +2687,11 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ObjRandSeed:
             return K::Binary;
 
-        case T::Resize:
+        case T::ZExt:
+        case T::SExt:
+        case T::Trunc:
+        case T::ToFour:
+        case T::ToTwo:
         case T::StrToPacked:
         case T::UItoF:
         case T::SItoF:
@@ -3069,6 +3087,13 @@ constexpr bool extra_operand_tails_total() {
 static_assert(extra_operand_tails_total(),
               "a tag on PayloadKind::FDisplay / Sformat / Sformatf / Scanf needs its "
               "extra_operand_tail() case");
+
+// Whether `tag` converts an integral value to another width or domain without
+// otherwise changing it: the instructions a pass looks through to find the value.
+constexpr bool is_conversion(Inst::Tag tag) {
+    return tag == Inst::Tag::ZExt || tag == Inst::Tag::SExt || tag == Inst::Tag::Trunc || tag == Inst::Tag::ToFour ||
+           tag == Inst::Tag::ToTwo;
+}
 
 // A read-only window onto the columns of a body, finished or still growing:
 // what value typing (Typing.h) reads, so an `Ir` and a `Builder` are typed by

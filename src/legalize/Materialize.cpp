@@ -126,7 +126,11 @@ public:
                 out += sig_[static_cast<uint32_t>(p.signal)];
                 return;
             case ir::Inst::Tag::Load:
-            case ir::Inst::Tag::Resize:
+            case ir::Inst::Tag::ZExt:
+            case ir::Inst::Tag::SExt:
+            case ir::Inst::Tag::Trunc:
+            case ir::Inst::Tag::ToFour:
+            case ir::Inst::Tag::ToTwo:
                 // A load names its storage and a resize is a width cast; neither is
                 // visible in source, and re-lowering reinserts both.
                 emit(out, ir, p.unary, prec);
@@ -379,7 +383,7 @@ private:
     // approximated.
     void wild_2005(std::string& out, const ir::Ir& ir, const ir::Inst::Payload& p, int prec) {
         ir::Index rhs = p.binary.r;
-        while (ir.tag(rhs) == ir::Inst::Tag::Resize) {
+        while (ir::is_conversion(ir.tag(rhs))) {
             rhs = ir.payload(rhs).unary;
         }
         if (ir.tag(rhs) != ir::Inst::Tag::Constant) {
@@ -784,7 +788,7 @@ Copy as_copy(const ir::Ir& ir) {
     c.lhs_sig = ir.payload(lv.root).signal;
 
     ir::Index r = c.rhs;
-    while (ir.tag(r) == ir::Inst::Tag::Resize || ir.tag(r) == ir::Inst::Tag::Load) {
+    while (ir::is_conversion(ir.tag(r)) || ir.tag(r) == ir::Inst::Tag::Load) {
         r = ir.payload(r).unary;
     }
     if (ir.tag(r) == ir::Inst::Tag::Signal) {

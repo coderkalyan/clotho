@@ -577,7 +577,7 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
                                            uint32_t                                                type_idx,
                                            const std::vector<const slang::ast::CoverpointSymbol*>& points) {
     const ir::FunctionId id   = module_.reserve_function(module_.pool.void_type);
-    const ir::Ref        word = make_int_type(64, false, false);
+    const ir::Ref        word = make_int_type(64, false);
     const ir::SourceLoc  l    = to_source_loc(cgt.location);
 
     FnCtx ctx;
@@ -618,15 +618,15 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
             // The value crosses the ABI as one unsigned word; a signed
             // coverpoint is sign-extended first so the runtime's signed compare
             // sees the same number the design does.
-            const ir::Index val = b.resize(v, make_int_type(64, false, sp.is_signed), l);
+            const ir::Index val = b.convert(v, make_int_type(64, false), sp.is_signed, l);
             // LRM 19.5.3 / 19.5.4: a sampled value carrying x or z matches no
             // bin. One bit is enough to say so -- which bits are unknown does
             // not matter while wildcard bins are refused -- so $isunknown is
             // the whole mask.
             const ir::Index xmask =
-              sp.four ? b.resize(b.unary(ir::Inst::Tag::IsUnknown, v, l), word, l) : int_const(0, 64, b, l);
+              sp.four ? b.convert(b.unary(ir::Inst::Tag::IsUnknown, v, l), word, false, l) : int_const(0, 64, b, l);
             b.cover_ctl(ir::CoverOp::Hit,
-                        { { b.unary(ir::Inst::Tag::Load, handle, l), b.resize(val, word, l), xmask } },
+                        { { b.unary(ir::Inst::Tag::Load, handle, l), b.convert(val, word, false, l), xmask } },
                         type_idx,
                         k,
                         l);
@@ -689,7 +689,7 @@ void Lowerer::cover_event_process(const slang::ast::CovergroupType& cgt, uint32_
     const ir::Signal    clock = event_signal(sev.expr);
     const ir::Edge      edge  = to_edge(sev.edge);
     const ir::SourceLoc l     = to_source_loc(cgt.location);
-    const ir::Ref       word  = make_int_type(64, false, false);
+    const ir::Ref       word  = make_int_type(64, false);
 
     // Per-instance edge state, exactly the SVA monitor's shape: the clock's
     // value at the previous Observed pass. Read LIVE, not from a Preponed
@@ -699,7 +699,7 @@ void Lowerer::cover_event_process(const slang::ast::CovergroupType& cgt, uint32_
     const TempCell   cur  = make_temp_cell(word, "cover_inst");
 
     ir::Builder     b(module_);
-    const ir::Index clk_now = b.resize(load_signal(clock, b, l), module_.pool.bit_type, l);
+    const ir::Index clk_now = b.convert(load_signal(clock, b, l), module_.pool.bit_type, false, l);
     const ir::Index clk_was = load_signal(prev, b, l);
     ir::Index       fired   = ir::Index{};
     switch (edge) {
@@ -764,7 +764,7 @@ ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpressio
         fail("covergroup arguments are not supported");
     }
     const uint32_t idx  = cover_type_of(cgt);
-    const ir::Ref  word = make_int_type(64, false, false);
+    const ir::Ref  word = make_int_type(64, false);
     // An embedded covergroup captures the object that constructs it, so its
     // coverpoints keep reading that object's properties however sample() is
     // later reached (LRM 19.4 requires the `new` to sit in the enclosing
@@ -865,10 +865,10 @@ ir::Index Lowerer::lower_cover_method(const slang::ast::CallExpression&   call,
             qargs.push_back(h);
         }
         const ir::Index covered_lv = lower_lvalue(*args[0], b, /*is_write=*/true);
-        const ir::Index covered    = b.cover_query(cov, qargs, make_int_type(32, false, true), idx, 0, l);
+        const ir::Index covered    = b.cover_query(cov, qargs, make_int_type(32, false), idx, 0, l);
         b.binary(ir::Inst::Tag::Store, covered_lv, covered, l);
         const ir::Index total_lv = lower_lvalue(*args[1], b, /*is_write=*/true);
-        const ir::Index total    = b.cover_query(tot, qargs, make_int_type(32, false, true), idx, 0, l);
+        const ir::Index total    = b.cover_query(tot, qargs, make_int_type(32, false), idx, 0, l);
         b.binary(ir::Inst::Tag::Store, total_lv, total, l);
     }
     std::vector<ir::Index> qargs;

@@ -1497,40 +1497,14 @@ private:
 
     ir::Ref string_value_ref(std::string_view text);
 
-    ir::Ref make_int_type(uint32_t width, bool is_four, bool is_signed);
-
-    // Which operand's signedness picks the fill bits of an integral WIDENING.
-    // The LRM gives two different answers and the IR's Resize instruction
-    // implements the second one: it extends according to the signedness of its
-    // TARGET type.
-    enum class Extend : uint8_t {
-        // LRM 11.8.3 (assignment): "extend the size of the right-hand side,
-        // performing sign extension if, and only if, the type of the right-hand
-        // side is signed" — the SOURCE decides. LRM 6.24.1 puts a cast under the
-        // same rule: a cast "shall return the value that a variable of the
-        // casting type would hold after being assigned the expression".
-        Source,
-        // LRM 11.8.2, last step: a context-determined operand "shall be
-        // converted to the propagated type and size... sign-extended only if the
-        // propagated type is signed" — the TARGET decides. The two rules really
-        // do disagree, in both directions: with `logic [7:0] u; logic signed
-        // [3:0] s = -1`, `u + s` zero-extends s (16), while `u = s` sign-extends
-        // it (255). Both iverilog 13 and Verilator 5.050 agree on both.
-        Target,
-    };
+    ir::Ref make_int_type(uint32_t width, bool is_four);
 
     ir::Index coerce(ir::Index               v,
                      const slang::ast::Type& from,
                      ir::Ref                 to,
                      ir::Builder&            b,
                      ir::SourceLoc           l,
-                     Extend                  ext = Extend::Source);
-
-    ir::Index extend_by_source_sign(ir::Index               v,
-                                    const slang::ast::Type& from,
-                                    ir::Ref                 to,
-                                    ir::Builder&            b,
-                                    ir::SourceLoc           l);
+                     std::optional<bool>     sign_extend = std::nullopt);
 
     ir::Index narrow_to_declared(ir::Index v, const slang::ast::Type& declared, ir::Builder& b, ir::SourceLoc l);
 
@@ -3008,6 +2982,7 @@ private:
                            ir::Index                     sel,
                            ir::Inst::Tag                 cmp,
                            ir::Ref                       ty,
+                           bool                          is_signed,
                            uint32_t                      width,
                            uint32_t                      key_width,
                            const slang::ast::ASTContext& astCtx,
@@ -3035,6 +3010,7 @@ private:
                          ir::Index                             sel,
                          ir::Inst::Tag                         cmp,
                          ir::Ref                               ty,
+                         bool                                  is_signed,
                          uint32_t                              width,
                          uint32_t                              key_width,
                          const std::vector<std::vector<char>>& keep,
@@ -3238,25 +3214,26 @@ private:
             // change, both sites, one recorded stream shift.
             fail("randsequence production weight wider than 32 bits is not supported");
         }
-        const ir::Ref          wty = make_int_type(width, false, false);
+        const ir::Ref          wty = make_int_type(width, false);
         std::vector<ir::Index> weights;
         weights.reserve(rules.size());
         for (const RsProd::Rule& r : rules) {
             // "If no weight is specified, a production shall use a weight of 1"
             // (18.17.1). A written weight is evaluated on every activation, in rule
             // order, which is what lets it track design state.
-            weights.push_back(r.weightExpr != nullptr ? b.resize(lower_expr(*r.weightExpr, b), wty, loc(*r.weightExpr))
-                                                      : b.constant(module_.pool.put_int(wty, 1), l));
+            weights.push_back(r.weightExpr != nullptr
+                                ? b.convert(lower_expr(*r.weightExpr, b), wty, false, loc(*r.weightExpr))
+                                : b.constant(module_.pool.put_int(wty, 1), l));
         }
         ir::Index sum = weights[0];
         for (size_t k = 1; k < weights.size(); k++) {
             sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
         }
 
-        const ir::Ref   u32  = make_int_type(32, false, false);
+        const ir::Ref   u32  = make_int_type(32, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index wide = b.resize(sum, u32, l);
+        const ir::Index wide = b.convert(sum, u32, false, l);
         const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
         const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
         const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
@@ -3283,7 +3260,7 @@ private:
         }
         const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
         const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.resize(next, u32, l), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
 
         b.open_region();
         emit(k, b);
@@ -3351,7 +3328,7 @@ private:
                             const RandSeqRuleVars& vars,
                             ir::Builder&           b,
                             ir::SourceLoc          l) {
-        const ir::Ref i32    = make_int_type(32, false, true);
+        const ir::Ref i32    = make_int_type(32, false);
         const auto    kconst = [&](int64_t v) { return b.constant(module_.pool.put_int(i32, v), l); };
 
         const RandSeqCtx::Steps& st = rs.steps.at(op.prod);
@@ -3420,6 +3397,7 @@ private:
                       size_t                  k,
                       ir::Index               sel,
                       ir::Ref                 ty,
+                      bool                    signd,
                       const RandSeqCtx&       rs,
                       const RandSeqRuleVars&  vars,
                       ir::Builder&            b);
@@ -3934,12 +3912,12 @@ private:
     template<typename Body>
     void emit_stream_elem_loop(const StreamChunk& c, ir::Builder& b, ir::SourceLoc l, Body body) {
         using T                   = ir::Inst::Tag;
-        const ir::Ref   i32       = make_int_type(32, false, true);
+        const ir::Ref   i32       = make_int_type(32, false);
         const TempCell  idx       = make_temp_cell(i32, "stream_i");
         const TempCell  bound     = make_temp_cell(i32, "stream_n");
         const ir::Index size      = c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
         const ir::Index bound_lv  = bound.lv(b, l);
-        const ir::Index bound_val = b.resize(size, i32, l);
+        const ir::Index bound_val = b.convert(size, i32, true, l);
         b.binary(T::Store, bound_lv, bound_val, l);
         const ir::Index idx_lv   = idx.lv(b, l);
         const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -3972,12 +3950,12 @@ private:
     template<typename Body>
     void emit_stream_byte_loop(ir::Index str, ir::Builder& b, ir::SourceLoc l, Body body) {
         using T                   = ir::Inst::Tag;
-        const ir::Ref   i32       = make_int_type(32, false, true);
-        const ir::Ref   byte_ty   = make_int_type(8, false, false);
+        const ir::Ref   i32       = make_int_type(32, false);
+        const ir::Ref   byte_ty   = make_int_type(8, false);
         const TempCell  idx       = make_temp_cell(i32, "stream_bi");
         const TempCell  bound     = make_temp_cell(i32, "stream_bn");
         const ir::Index bound_lv  = bound.lv(b, l);
-        const ir::Index bound_val = b.resize(b.unary(T::StrLen, str, l), i32, l);
+        const ir::Index bound_val = b.convert(b.unary(T::StrLen, str, l), i32, true, l);
         b.binary(T::Store, bound_lv, bound_val, l);
         const ir::Index idx_lv   = idx.lv(b, l);
         const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
@@ -3990,7 +3968,7 @@ private:
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
-        body(b.resize(b.binary(T::StrGetc, str, b.unary(T::Load, idx.lv(b, l), l), l), byte_ty, l));
+        body(b.convert(b.binary(T::StrGetc, str, b.unary(T::Load, idx.lv(b, l), l), l), byte_ty, false, l));
         const ir::ExtraSlice body_r = b.close_region();
 
         b.open_region();
@@ -4031,11 +4009,10 @@ private:
                 const uint32_t lsb  = w - (k + 1) * g;
                 ir::Index      part = v;
                 if (lsb != 0) {
-                    const ir::Index sh =
-                      b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+                    const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), lsb), l);
                     part = b.binary(T::Srl, v, sh, l);
                 }
-                emit(b.resize(part, gty, l));
+                emit(b.convert(part, gty, false, l));
             }
         };
         for (const StreamChunk& c : chunks) {

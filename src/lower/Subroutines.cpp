@@ -129,7 +129,7 @@ void Lowerer::lower_call(const CallExpression& call, ir::Builder& b) {
         // flushes one MCD / FD.
         ir::Index handle;
         if (call.arguments().empty()) {
-            const ir::Ref u32 = make_int_type(32, false, false);
+            const ir::Ref u32 = make_int_type(32, false);
             handle            = b.constant(module_.pool.put_int(u32, 0), loc(call));
         } else {
             handle = lower_expr(*call.arguments()[0], b);
@@ -1443,8 +1443,7 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
     try {
         // $display / $strobe target the standard-output MCD (descriptor 1); the
         // $f* forms carry an explicit descriptor as the first argument.
-        ir::Index desc =
-          b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false, true)), l);
+        ir::Index desc = b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false)), l);
         if (fd_arg) {
             if (args.empty()) {
                 fail("$fstrobe / $fmonitor requires a file-descriptor argument");

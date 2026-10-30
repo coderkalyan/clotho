@@ -206,7 +206,7 @@ records what each of them became.
 3. **A class handle is a 2-state 64-bit value** (`src/ir/InternPool.cpp:177-182`),
    identical in storage to `chandle`. Assignment is an `i64` store, identity an
    `icmp`, pass-by-value the scalar path, and an upcast is a width-64-to-width-64
-   `Resize`, i.e. a no-op (`src/ir/Builder.cpp:139-141`). **No pointer adjustment
+   conversion, which `Builder::convert` emits nothing for. **No pointer adjustment
    exists anywhere in the class implementation**, which rules out any interface
    design needing an adjusted `this` (§12).
 4. **The descriptor is `{ptr map, [16 x i32] display, [N x ptr] slots}`** and the
@@ -541,7 +541,7 @@ depend on how many interfaces the *object's* class implements.
 
 Plain assignment (not `$cast`) of a class handle to an interface handle needs
 nothing: slang has type-checked it through `Type::implements` including the base
-chain (`Type.cpp:646-661`, `:741-760`), and `coerce`'s `Resize` is a no-op.
+chain (`Type.cpp:646-661`, `:741-760`), and `coerce`'s conversion is a no-op.
 
 ### 6.3 The static-fail arm must not run on an interface operand
 
