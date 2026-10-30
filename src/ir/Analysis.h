@@ -266,10 +266,12 @@ struct DesignFacts {
     // (LRM 6.6); an undriven variable powers on to x. Semantics, not optimization.
     std::vector<bool> undriven;
 
-    // Passed as an output / inout / ref actual somewhere. Such a signal must keep
-    // its z word even when proven never-z, because the pointer ABI reads and
-    // writes the full { must|may, z } slot. A storage constraint, not a may-z
-    // fact, which is why it is a separate bit.
+    // Passed as an output / inout / ref actual somewhere. Such a signal takes the
+    // canonical type-derived slot, whatever the may-z analysis proved: a 4-state
+    // one keeps its z word even when proven never-z, because the pointer ABI reads
+    // and writes the full { must|may, z } slot, and a 2-state one is the native iW
+    // the callee addresses. A storage constraint, not a may-z fact, which is why
+    // it is a separate bit.
     std::vector<bool> ptr_arg;
 
     // Passed as a `ref` actual somewhere. Stronger than ptr_arg: a `ref` formal
@@ -282,9 +284,11 @@ struct DesignFacts {
     // z word.
     std::vector<bool> ref_arg;
 
-    // Per-bit undriven mask for a PARTIALLY driven packed 4-state net -- the
-    // refinement of `undriven`, which is whole-signal (`w[3:0] = ...` marks all of
-    // `w` driven, so its remaining bits would wrongly power on x instead of z).
+    // Per-bit undriven mask for a PARTIALLY driven 4-state net -- the refinement
+    // of `undriven`, which is whole-signal (`w[3:0] = ...` marks all of `w`
+    // driven, so its remaining bits would wrongly power on x instead of z). For a
+    // fixed unpacked array of packed elements the mask spans every leaf, bit
+    // `leaf ordinal * element width + bit` (leaves in row-major order).
     //
     // Flat rather than a vector-of-vectors: the mask is absent for almost every
     // signal, and per-signal vectors meant one heap allocation each. Read it

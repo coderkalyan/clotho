@@ -833,6 +833,38 @@ TEST_CASE("an event-controlled nonblocking trigger fires from a detached subscri
     }
 }
 
+// The control of a detached subscription may itself be a named event
+// (`->> @(e1) e2`, LRM 15.5.1). An event wakes through its object, not a signal
+// edge, so the subscription has to be counted down by the trigger of `e1`; it used
+// to be registered on a signal trigger nothing ever fired, and `e2` never
+// occurred. iverilog does not implement `->>` with an event control, so this is
+// pinned to the LRM.
+TEST_CASE("a nonblocking trigger controlled by a named event fires when that event does") {
+    SUBCASE("plain") {
+        const std::string out = run_capture(R"(
+            module top;
+              event e1, e2;
+              initial begin ->> @(e1) e2; #1 -> e1; end
+              initial begin @(e2); $display("e2 t=%0t", $time); end
+              initial #10 $finish;
+            endmodule
+        )");
+        CHECK(out.find("e2 t=1") != std::string::npos);
+    }
+    SUBCASE("repeat(n) counts occurrences of the controlling event") {
+        const std::string out = run_capture(R"(
+            module top;
+              event e1, e2;
+              initial ->> repeat (2) @(e1) e2;
+              initial begin @(e2); $display("e2 t=%0t", $time); end
+              initial begin #1 -> e1; #1 -> e1; end
+              initial #10 $finish;
+            endmodule
+        )");
+        CHECK(out.find("e2 t=2") != std::string::npos);
+    }
+}
+
 // An event declared in a procedural scope gets signal-like storage through
 // declare_local / declare_static_local. Those two paths never set
 // SignalInfo::is_event, so the backend allocated no trigger-timestamp global and

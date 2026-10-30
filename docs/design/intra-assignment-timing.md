@@ -150,6 +150,18 @@ makes `rt_nba_arr_*` allocation-free after warm-up. The ready-list link reuses
 the record's `timer.next` field (a timer not linked in the wheel is free to
 reuse), so the ready list costs no extra pointer.
 
+A record that carries a **class handle** -- a whole unpacked struct or array target with a
+handle leaf -- is also a **garbage-collection root** while it is in flight. `s <= #5 t`
+samples `t` now, and the program may drop every other reference to the object before the
+delay elapses, so until commit the record holds the only one; a record is native memory no
+root table describes. Such a signal's records come from `rt_intra_alloc_rooted` and return
+through `rt_intra_release_rooted`, which register and drop the record as a conservative range
+(`rt_gc_range_add`) around the usual alloc and release. The range is scanned a word at a
+time, so the aggregate record's payload -- a byte image of one leaf's slot -- starts on a
+word boundary for such a site (`intra_agg_payload`); an array element's handle already does.
+The decision is the target type's (`intra_rec_rooted`), so a design that stages no handle
+emits exactly what it did.
+
 ## Runtime ABI (`rt_intra_*`, mirroring `rt_nba_arr_*`)
 
 The record layout is backend-defined and monomorphized on the target's
@@ -315,6 +327,16 @@ guarded by the edge fact. And a trigger signal that nothing else is sensitive to
 still needs edge detection, so `signal_has_waiters` (and `has_bucket`) treat any
 `trig_id >= 0` (sig, edge) as a waiter. Everything is gated on `trigger_id_`
 being non-empty, so a design without `<= @e` gets identical codegen.
+
+**A named event as the control** (`x <= @e v`, `->> @(e) f`) does not wake through a
+value change at all: `-> e` and the NBA-region service of `->> e` fire the event's
+object waiter list, and never reach the signal wake paths above. So the record is keyed
+by the OBJECT instead of a dense `trig_id`: `RT_TRIG_EVENT | slot`, computed when the
+statement executes from the object the variable names then (LRM 15.5.5.1), and counted
+down by `emit_event_fire`, the one place every trigger form converges. The runtime keeps
+these lists in a separate slot-indexed vector so the id's high bit never sizes one.
+`design_uses_event_triggers_` gates the extra call, so a design with no such control
+emits nothing new.
 
 Deferred follow-ups are scoped in full in the next section.
 

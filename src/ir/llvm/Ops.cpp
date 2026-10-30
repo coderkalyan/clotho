@@ -172,12 +172,22 @@ Backend::ElemBelow Backend::elem_index_below(Plane idx, ValueType t, llvm::Value
 // word-indexed path rather than shifting the whole value inline.
 //
 // The inline form asks LLVM for a variable shift on an i(2*sw) SSA value, which
-// legalizes into O(sw/64) selects per word: measured JIT time for one dynamic bit
-// select is 0.2 s at 4 Kbit, 1.1 s at 8 Kbit, 21 s at 12 Kbit and over half an
-// hour at 64 Kbit (ivtest pr722). Below the threshold the inline form is both
-// cheaper and better optimizable, so it stays; above it the cost is a call whose
-// work is O(selw) and independent of the vector's width. The selection's own
-// width is unrestricted: its planes travel as ceil(selw/64)-word buffers, so
+// legalizes into O(sw/64) selects per word, so its cost grows with the vector: user
+// instructions per bit-select (`perf stat -e instructions:u`, loop of N and 2N
+// iterations), inline against helper:
+//
+//                   128    256    384    512   1024
+//   2-state read    112/182  227/182  362/182  366/182  709/182
+//   2-state write   112/280  225/280  357/280  458/280  1040/280
+//   4-state read    136/211  254/211  403/211  406/211  814/211
+//   4-state write   120/311  252/311  437/311  532/311  1194/311
+//
+// The helper is flat, so the lines cross between 190 and 290 bits and 256 splits them.
+// Time agrees: the helper is 2-15x faster from 512 bits on. Compile time is the
+// other cost of the inline form: 0.2 s per dynamic select at 4 Kbit, 21 s at 12 Kbit
+// and over half an hour at 64 Kbit (ivtest pr722). Above the threshold the cost is a
+// call whose work is O(selw) and independent of the vector's width. The selection's
+// own width is unrestricted: its planes travel as ceil(selw/64)-word buffers, so
 // `[i +: 128]` of a 64 Kbit vector is as cheap as `[i]`.
 bool Backend::wide_dyn_storage(uint32_t sw) {
     return sw > wide_dyn_select_bits;
@@ -387,11 +397,10 @@ llvm::Value* Backend::fp_of(Plane a) {
     return a.fp;
 }
 
-// Bit pattern -> storage planes (must = may = pattern, z = 0).
+// A real's bit pattern as a value: the 2-state word its storage and its ABI hold.
 Plane Backend::real_to_planes(llvm::Value* fp) {
-    const uint32_t w   = fp->getType()->isDoubleTy() ? 64 : 32;
-    llvm::Value*   pat = b_.CreateBitCast(fp, int_ty(w));
-    return packed(pat, pat, zero(w));
+    const uint32_t w = fp->getType()->isDoubleTy() ? 64 : 32;
+    return two_val(b_.CreateBitCast(fp, int_ty(w)));
 }
 
 // Storage planes -> float value (the must half is the bit pattern).
@@ -671,6 +680,30 @@ Plane Backend::lower_real_math_binary(Index i) {
     }
 }
 
+// A multiply, divide or modulo of two iW values through the runtime routine `routine`
+// (rt_wide_mul, rt_wide_udiv, ...). Both operands are spilled zero-extended to whole
+// words, which is the layout the routine reads and leaves nothing set above W, and the
+// result is reloaded from a third buffer. The buffers are entry allocas, like the
+// wide-select helpers', and the three accesses have no suspension point between them.
+llvm::Value* Backend::wide_arith(const char* routine, llvm::Value* a, llvm::Value* b) {
+    const uint32_t w    = bits_of(a);
+    const uint32_t bits = sel_buf_bits(w);
+    assert(w > wide_arith_bits);
+    assert(bits_of(b) == w);
+    auto*        buf_ty = int_ty(bits);
+    llvm::Value* out    = entry_alloca(buf_ty, "warith.out");
+    llvm::Value* a_buf  = entry_alloca(buf_ty, "warith.a");
+    llvm::Value* b_buf  = entry_alloca(buf_ty, "warith.b");
+    b_.CreateStore(cast(a, bits, false), a_buf);
+    b_.CreateStore(cast(b, bits, false), b_buf);
+    b_.CreateCall(wide_arith_fn(routine), { out, a_buf, b_buf, b_.getInt32(w) });
+    return cast(b_.CreateLoad(buf_ty, out), w, false);
+}
+
+llvm::Value* Backend::lower_mul(llvm::Value* a, llvm::Value* b) {
+    return bits_of(a) > wide_arith_bits ? wide_arith("rt_wide_mul", a, b) : b_.CreateMul(a, b);
+}
+
 Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w    = width_of(a);
 
@@ -684,7 +717,7 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
         switch (tag) {
             case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
             case Inst::Tag::Sub: return two_val(b_.CreateSub(a.mm, b.mm));
-            default:             return two_val(b_.CreateMul(a.mm, b.mm)); // Mul
+            default:             return two_val(lower_mul(a.mm, b.mm)); // Mul
         }
     }
 
@@ -731,7 +764,7 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
             r = b_.CreateSub(am, bm);
             break;
         default:
-            r = b_.CreateMul(am, bm);
+            r = lower_mul(am, bm);
             break;
     }
     llvm::Value* val_mm = packed(r, r, zero(w)).mm;
@@ -752,6 +785,10 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     const bool     is_div = tag == Inst::Tag::UDiv || tag == Inst::Tag::SDiv;
     const bool     sign   = tag == Inst::Tag::SDiv || tag == Inst::Tag::SMod;
 
+    // The runtime routine for operands wider than `wide_arith_bits`.
+    const char* const wide_routine = sign ? (is_div ? "rt_wide_sdiv" : "rt_wide_smod")
+                                          : (is_div ? "rt_wide_udiv" : "rt_wide_umod");
+
     // 2-state: divide/modulo by zero is x, which collapses to 0 in a 2-state
     // result (verified against iverilog: `int`/`bit` div/mod by 0 -> 0). Guard
     // the divisor to avoid poison, then select 0 on a zero divisor. Signed
@@ -763,6 +800,11 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     // constant folder, so it is an assertion, not a repair.
     assert(a.two == b.two && "divide / modulo operands share a domain (ir::verify: operand-domain)");
     if (a.two) {
+        if (w > wide_arith_bits) {
+            // The routine gives 0 for a zero divisor and wraps MIN / -1 itself, so the
+            // operands go in as they are.
+            return two_val(wide_arith(wide_routine, a.mm, b.mm));
+        }
         llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
         llvm::Value* r;
         if (!sign) {
@@ -814,7 +856,12 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     // two's-complement overflow value at width W.
     b_.SetInsertPoint(val_bb);
     llvm::Value* r = nullptr;
-    if (!sign) {
+    if (w > wide_arith_bits) {
+        // The branch above sent a zero divisor to x, and the routine wraps MIN / -1
+        // itself, so the operands go in as they are.
+        r = wide_arith(wide_routine, am, bm);
+    }
+    else if (!sign) {
         r = is_div ? b_.CreateUDiv(am, bm) : b_.CreateURem(am, bm);
     }
     else {
@@ -952,9 +999,9 @@ Plane Backend::lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed) {
     // Multiply result by base when the low exponent bit is set; always square
     // the base and shift the exponent down.
     llvm::Value* odd      = b_.CreateTrunc(exp, b_.getInt1Ty());
-    llvm::Value* product  = b_.CreateMul(result, base);
+    llvm::Value* product  = lower_mul(result, base);
     llvm::Value* next_res = b_.CreateSelect(odd, product, result);
-    llvm::Value* next_bas = b_.CreateMul(base, base);
+    llvm::Value* next_bas = lower_mul(base, base);
     llvm::Value* next_exp = b_.CreateLShr(exp, llvm::ConstantInt::get(ety, 1));
     llvm::Value* more     = b_.CreateICmpNE(next_exp, zero(ew));
 
@@ -1409,10 +1456,9 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
                                   real_plane(planes_to_real(pb, vt.width)));
     }
-    // Each leaf was read from its own storage, whose encoding is the signal's
-    // (a 2-state leaf of an aggregate written from a z-capable source is stored
-    // packed); the leaf's type says what its value is.
-    return lower_compare(Inst::Tag::Eq, in_type_domain(pa, vt), in_type_domain(pb, vt));
+    // Each leaf was read from its own storage, the native slot of its type.
+    assert(pa.two == !vt.four_state && pb.two == !vt.four_state);
+    return lower_compare(Inst::Tag::Eq, pa, pb);
 }
 
 Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {

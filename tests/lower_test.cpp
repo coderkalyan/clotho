@@ -1646,3 +1646,108 @@ TEST_CASE("lower_buffer keeps use-based findings but drops driver-based ones") {
         CHECK(r.diagnostic_text().find("unused net 'foo'") != std::string::npos);
     }
 }
+
+TEST_CASE("source the LRM makes illegal is refused, not warned about") {
+    // slang accepts each of these with a warning for compatibility with other
+    // tools; Clotho's severity policy makes them errors. The four imported ivtest
+    // designs that use them (br_gh79, br_gh62, parameter_override_invalid1/7)
+    // expect a compile failure.
+    const auto refused = [](std::string_view source, std::string_view needle) {
+        const LowerResult r = lower_text(source);
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find(needle) != std::string::npos, r.diagnostic_text());
+    };
+    // LRM 5.7.1: an underscore is legal anywhere in a number except as its first
+    // character.
+    refused("module m; reg [3:0] n; initial n = 4'b_1; endmodule",
+            "numeric literals must not start with a leading underscore");
+    // LRM 23.10.2.2: a named parameter assignment names a parameter of the module.
+    refused("module a #(parameter A = 1); endmodule\n"
+            "module m; a #(.Z(10)) i(); endmodule",
+            "parameter 'Z' does not exist in 'a'");
+    // LRM 11.5.1: a bit-select of a single bit selects from a scalar.
+    refused("module m; reg [15:0] v; reg r; initial r = v[0][0]; endmodule", "scalar");
+}
+
+TEST_CASE("legal source slang elaborates differently from the LRM is refused") {
+    const auto refused = [](std::string_view source, std::string_view needle) {
+        const LowerResult r = lower_text(source);
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find(needle) != std::string::npos, r.diagnostic_text());
+    };
+    // LRM 23.10.1: P would be 3; slang keeps the first override, 2.
+    refused("module c #(parameter P = 1); endmodule\n"
+            "module m; c i(); defparam i.P = 2; defparam i.P = 3; endmodule",
+            "already has a defparam override");
+    refused("module m;\n"
+            "`pragma protect begin_protected\n"
+            "`pragma protect encoding=(enctype=\"base64\")\n"
+            "`pragma protect data_block\n"
+            "YWJj\n"
+            "`pragma protect end_protected\n"
+            "endmodule",
+            "protected envelopes cannot be decrypted");
+}
+
+// -- Values wider than an LLVM integer (docs/design/kernel.md, Values) --
+
+TEST_CASE("a value too wide for an LLVM integer is refused where its width is introduced") {
+    // LLVM's integers stop at 2^23 bits, so a 2-state value may be 2^23 bits wide and a
+    // 4-state one 2^22 (one integer of twice its width). slang refuses only at 2^24, and
+    // a value just past the limit used to crash inside LLVM's instruction selection or
+    // fail its verifier, with no diagnostic. LRM 6.9.1 and 7.4.1 let an implementation
+    // limit the length of a vector as long as the limit is at least 65536 bits.
+    //
+    // `refused_at` lowers `src` and finds the error, which must name the limit and sit
+    // at the given line and column (1-based; the source starts with a newline).
+    const auto refused_at = [](std::string_view src, uint32_t line, uint32_t column) {
+        const LowerResult r = lower_text(src);
+        CHECK_FALSE(r.ok);
+        const auto error = std::find_if(r.diagnostics.begin(), r.diagnostics.end(), [](const Diagnostic& d) {
+            return d.severity == Severity::Error && d.message.find("too wide") != std::string::npos;
+        });
+        REQUIRE_MESSAGE(error != r.diagnostics.end(), r.diagnostic_text());
+        const SourcePosition at = r.sources->resolve(error->span.start);
+        CHECK(at.valid);
+        CHECK(at.line == line);
+        CHECK(at.column == column);
+        CHECK(error->message.find("8388608") != std::string::npos);
+    };
+
+    SUBCASE("a 4-state declaration: 2^22 bits is held, one more is refused") {
+        CHECK(lower_text("\nmodule m;\n    logic [4194303:0] x;\nendmodule\n").ok);
+        refused_at("\nmodule m;\n    logic [4194304:0] x;\nendmodule\n", 3, 23);
+    }
+
+    SUBCASE("a 2-state declaration: 2^23 bits is held, one more is refused") {
+        CHECK(lower_text("\nmodule m;\n    bit [8388607:0] x;\nendmodule\n").ok);
+        refused_at("\nmodule m;\n    bit [8388608:0] x;\nendmodule\n", 3, 21);
+    }
+
+    SUBCASE("a packed struct is refused by its total width") {
+        refused_at(R"(
+module m;
+    typedef struct packed { bit [4194303:0] a; bit [4194303:0] b; bit c; } t;
+    t s;
+endmodule
+)",
+                   4, 7);
+    }
+
+    SUBCASE("a concatenation or replication of values that each fit is refused at the expression") {
+        refused_at(R"(
+module m;
+    bit [4194303:0] a;
+    initial if ({a, a, a} == 0) $display("zero");
+endmodule
+)",
+                   4, 17);
+        refused_at(R"(
+module m;
+    bit [4194303:0] a;
+    initial if ({3{a}} == 0) $display("zero");
+endmodule
+)",
+                   4, 17);
+    }
+}

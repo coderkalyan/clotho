@@ -199,9 +199,9 @@ initializer, decoding it into the signal's own slot layout (`const_data_init` �
 `const_slot` for flat storage, `const_agg` walking the IR type and the storage
 type in lockstep for the aggregate mirror, since `agg_storage_ty` mints a fresh
 `StructType` per call). `init_state` skips these signals so the X-fill cannot
-erase them, and `build_state_types` ORs `const_image_has_z` into `has_z` — the
-may-z analysis proves a table never-z from an empty seed set, but a parameter may
-itself hold z.
+erase them. Nothing stores into a table, so the may-z fixpoint never sees its
+image; `analyze()` seeds the table's z and x bits from the image itself (a
+parameter may hold z), walking the type the way `const_agg` does.
 
 **Seeded** — anything holding a heap-backed leaf (`has_heap_leaf`): string,
 queue, dynamic array, associative array, and aggregates containing them. Only

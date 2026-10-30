@@ -843,3 +843,22 @@ The three unspecified 9.6.2 effects (output/inout results, already-scheduled
 NBAs, procedural continuous assignments), the refusal to model the undefined
 `disable`-from-within-a-function case, and the 16.4.4 drop reading above are the
 LRM-interpretation decisions this design rests on.
+
+## Forked children are occupants of the blocks they were forked inside
+
+LRM 9.6.2 ends "all activities enabled within the named block", so a named `fork`'s
+children, and the children of any fork inside a targeted `begin` block, are activations
+of that block. `lower_fork` hands each child the targeted blocks open around it
+(`build_fork_child`, `Function::fork_targets`; nested forks inherit them), and the child
+links one node on each target's list in its RAMP (`lower_task`), not when its body
+starts: a `join_none` / `join_any` sibling sits queued before it has run, and a
+`disable` landing then must still end it. Until the body starts the node publishes a
+word held at 1 as its scheduled flag, so the force-wake marks it without pushing it a
+second time; the body then replaces the flag and gives up at once if it was marked. A
+child's own `disable` of one of these blocks marks the others and ends itself
+(`DisableAbort`). A fork whose children are all in one target no longer counts as a park
+the abort cannot claim (`hard_park`), since they release the join.
+
+Still refused, with a TODO: a target with forked children that parks behind a
+time-consuming call or an `expect`, and a block whose body calls a subroutine that forks
+(those children are built outside the block).

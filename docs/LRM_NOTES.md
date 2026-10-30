@@ -343,11 +343,23 @@ switch still passes a z data bit through as z.
 
 Code: `src/lower/Nets.cpp` (`gate_tristate_value`). Tests: `tests/gate_test.cpp` ("three-state gate truth tables match LRM table 28-5, including X/Z", "MOS switch truth tables match LRM table 28-6, including the z pass-through").
 
-## 38. Resistive switches (28.14)
+## 38. MOS switch strength (28.13, 28.14)
 
-Deviation: with no strength model there is nothing for the strength reduction of
-28.14 to act on, so `rnmos`, `rpmos` and `rcmos` behave exactly as `nmos`, `pmos`
-and `cmos`. Not gated.
+Deviation: Clotho has no strength on a net's value, so a MOS switch drives strong
+whatever its data input carries (28.13), and `rnmos`, `rpmos` and `rcmos` do not
+reduce it (28.14, Table 28-8). That is exact when nothing the strength could be
+compared with is there, so it is gated: `check_mos_switch_strength` propagates the
+strength levels a switch can output (a net's levels are any level when a driver of
+it has an explicit weak or pull strength, it is a pullup / pulldown target or a
+tri0 / tri1 net, otherwise strong plus what the switches driving it output) and
+refuses a switch whose output net is resolved against another driver or a weak pull
+unless the strengths order as strong does: every switch on the net outputs exactly
+strong, or the switches are the net's only drivers and output one single level, or
+the switch is its net's only driver. A data input that is not a net, or a net
+reached through an input or output port, is strong: Clotho models those port
+connections as continuous assignments (4.9.6, 23.3.3), which reset the strength;
+a simulator that collapses the nets (23.3.3.7) keeps it, and so can differ. An
+inout port aliases the net, so its strength is kept.
 
 Code: `src/lower/Nets.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").
 
@@ -405,3 +417,126 @@ number, scaled by the unit conversion and padded to the precision (`x000`,
 `0 ns` for an unknown value.
 
 Code: `src/runtime/Format.cpp` (`unknown_decimal_char`, `render_arg`, `coerce_dyn_arg`), `src/lower/Assign.cpp` (`scale_to_ticks`). Tests: `tests/llvm_backend_test.cpp` ("%t of an operand with an x or z bit prints one character, in a constant and in a runtime format").
+
+## 42. Implicit return variable of a static function (13.4.1, 13.4.2, 6.21)
+
+13.4.1: "The function definition shall implicitly declare a variable, internal to
+the function, with the same name as the function." 13.4.2: "Functions defined
+within a module, interface, program, or package default to being static, with all
+declared items being statically allocated. These items shall be shared across all
+uses of the function executing concurrently." 6.21 gives a static variable the
+whole simulation as its lifetime and initializes only an automatic one "on each
+entry to the call"; 6.8: "A variable shall store a value from one assignment to
+the next". No clause resets the variable when a static function is entered, and
+13.3.2 says in so many words that a static task's variables "shall retain their
+values between invocations". So Clotho gives the implicit variable of a static
+function its type's default value once and keeps it from call to call:
+`function int g(int x); g = g + x; endfunction` returns 5 and then 10 for two calls
+with 5, a recursive call finds what the call below it left, and each instance of a
+module has its own. An `automatic` function, a function of an `automatic` module and
+every class method (8.6; 8.10: a `static` method's lifetime is that of the method
+within the class, not of its variables) start the variable afresh on every call.
+
+`return expr;` hands the caller `expr` and does not write the variable. 13.4.1 only
+says the `return` statement "shall override any value assigned to the function
+name", and never says it assigns it, so `function int h(int x); if (x < 0) return
+100; h = h + x; endfunction` returns 5, 100, 10 for `h(5)`, `h(-1)`, `h(5)`.
+
+A constant function call is evaluated by slang at elaboration with fresh variables
+on every call (13.4.3), which leaves the simulation-time variable alone, as the
+LRM says: `localparam P1 = g(5), P2 = g(5)` is 5 and 5, and the first run-time
+`g(5)` still returns 5.
+
+The variable only gets storage that outlives the call where the entry value can be
+seen: a read of it, or the end of the body, on a path that has not overwritten the
+whole variable first, or a function that can be re-entered through its own body.
+Any other function behaves identically with a fresh cell per call and keeps it.
+
+iverilog 13 and Verilator 5.050 reset the variable on every call (iverilog keeps a
+queue return value and resets an `int`), so neither is followed.
+
+Code: `src/lower/Subroutines.cpp` (`declare_static_return`, `implicit_return_ref`, `build_function`), `src/lower/Scans.cpp` (`static_return_needs_storage`). Tests: `tests/function_test.cpp` ("the implicit return variable of a static function keeps its value between calls" and the tests after it).
+
+## 43. Port coercion to inout (23.3.3.1)
+
+"A port that is declared as input (output) but used as an output (input) or inout may be coerced to inout. If not coerced to inout, a warning shall be issued." Clotho copies the value across an input or output port (23.3.3: "a continuous assignment from source to sink") and does not coerce by default. A coerced port makes its inner and outer net one net, so a copy and a coercion differ only where a value travels against the port's direction. A net port is therefore an error, not a warning, in exactly two cases:
+
+- an **input** port whose net the module drives itself (an `assign`, a gate output, a child's output port): the outer net sees that driver when coerced and does not when copied;
+- an **output** port whose outer net has other drivers (another assignment, gate or output port reaching the same bits, or the pull of a `tri0` / `tri1` / supply net), when the module **reads** its own net: it sees the resolved value when coerced and only its own drivers when copied. "The same bits" is decided as the driver tracking decides it: constant and genvar selects of a packed, multi-dimensional or unpacked-array net (an element, a part select, an indexed `+:` / `-:` select) are told apart per instance, so the instances of a generate loop that each drive their own slice of one net, as basejump_stl's `bsg_wormhole_concentrator_in` does with `.data_o(fifo_data_lo[i])`, do not count against each other. A net's continuous drivers cannot be indexed at run time (slang rejects it), so the whole-net fallback covers only a shape the tracking cannot place.
+
+A module that only drives its output net cannot tell, and any number of output ports driving one net is the multiple-driver case 23.3.3.2 permits, so those are accepted. A variable port is never coerced (23.3.3.2), and an unconnected port has no outer net. The message says which case it is and names `--allow-port-coercion`.
+
+`--allow-port-coercion` coerces exactly those ports: the inner net takes the outer net's storage, as for an `inout` port, so every driver of both resolves together. It needs a port connected to a whole net of its own width; a variable, a select, a concatenation, an expression or another width is an error. slang's own `port-coercion` warnings ("coerced to 'inout'") are not shown, since they flag every net with a port driver beside another driver and claim a coercion that did not happen. iverilog always coerces, so it matches the flag and not the default.
+
+Code: `src/lower/Types.cpp` (`needs_port_coercion`, `build_inout_aliases`). Tests: `tests/xhier_test.cpp` ("an input port the module drives is refused unless coercion is allowed", "an output port read by its module while its net has other drivers is refused unless coercion is allowed", "ports whose coercion changes nothing are accepted by default"). Design: `docs/design/cli.md` (Options).
+
+## 44. The time-zero run of `always_comb` / `always_latch` (9.2.2.2, 9.2.2.3)
+
+9.2.2.2: the procedure "is automatically triggered once at time zero, after all
+initial and always procedures have been started so that the outputs of the procedure
+are consistent with the inputs"; 9.2.2.3 applies it to `always_latch`. "Started"
+does not say how far the other procedures have run, so Clotho takes the simple
+reading its FIFO active ring gives: every `initial` and sensitivity-less `always`
+runs up to its first suspension, then each `always_comb` / `always_latch` runs once,
+whatever the source order. A comb written above an `initial` that reads its output
+at time zero therefore reads the unsettled value (`x`), and a `disable` of a block
+of a later `initial` finds the block started and parked, so it ends it (9.6.2).
+iverilog does the same.
+
+A continuous assignment also evaluates once at time zero but is not a procedure,
+so alone it is not deferred; 4.9.1 leaves its order against the procedures open. One
+that comb fusion puts in the same group as an `always_comb` starts with it, because a
+group is one body: that is inside the same freedom (4.7 lets active events run in any
+order), and splitting every `assign` / `always_comb` cone to avoid it cost 1.9x on a
+mixed design.
+
+Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `deferred_comb`), `src/ir/Module.h` (`Process::starts_after_procedures`), `src/lower/Statements.cpp` (`lower_procedural_block`). Tests: `tests/comb_fusion_test.cpp` ("always_comb and always_latch run once at time zero after every initial has started").
+
+## 45. Width of an untyped parameter set to an unbased unsized literal (6.20.2, 5.7.1)
+
+`parameter P = '1;` meets two rules. 5.7.1 makes `'1` "an unsized unsigned
+single-bit value" that "in a self-determined context ... shall have a width of 1
+bit". 6.20.2 gives a parameter with no type or range "for which the final value
+assigned to it is unsized" an implied range whose MSB is "an
+implementation-dependent value of at least 31". Clotho applies 6.20.2, the rule
+written for this declaration, so `P` is 32 bits of ones. slang folds the
+parameter the same way. iverilog and Verilator make `P` one bit wide.
+
+Code: slang's parameter elaboration (no Clotho code). Tests: `tests/unbased_test.cpp` ("an untyped parameter set to '1 is at least 32 bits of ones").
+
+## 46. `disable` of a block a process has already left (9.6.2, 12.8)
+
+A process that leaves a named block by `break`, `continue` or `return` is no
+longer in it. A later `disable` of that block terminates nothing: 9.6.2 ends "the
+activity of a task or a named block", and the block has none. The process keeps
+running where it is. iverilog 13 still counts the process as inside the block,
+aborts whatever it is waiting on, and resumes it after the block, so a loop left by
+`break` runs again. Clotho follows the LRM.
+
+Code: `src/ir/llvm/Inst.cpp` (`leave_blocks`). Tests: `tests/loop_test.cpp` ("an exit that skips a block's end takes the activation off its list", subcase "a `break` out of a block that a later disable names"). Oracle: iverilog 13 disagrees, as above.
+
+## 47. `foreach` with every loop variable omitted (12.7.3)
+
+12.7.3 lets any loop variable be omitted "to indicate no iteration over that
+dimension", and its example skips one dimension without changing how often the
+body runs. Taken to the case with no loop variables at all, that rule runs the body
+once, even over an empty array. The LRM never states this case. iverilog and
+Verilator both run the body zero times, and so does Clotho, with a
+`foreach-no-loop-variables` warning that the loop is poorly formed.
+
+Code: `src/lower/Statements.cpp` (`lower_foreach`). Tests: `tests/loop_test.cpp` ("foreach with no loop variables never runs its body and warns"). Oracle: iverilog 13 and Verilator 5.050 agree.
+
+## 48. Sorting reals that contain NaN (7.12.2)
+
+7.12.2 sorts "in ascending order" by the relational operators, and 6.12 only
+says a real is an IEEE 754 double. A comparison with NaN is false in IEEE 754, so
+`<` is not an ordering over a set that holds a NaN: a NaN is neither before nor
+after any number, and a comparison sort over that relation has no defined result
+(`std::sort` is undefined, and the numbers around the NaN come out misordered).
+Clotho orders NaN after every number and treats all NaNs as equal, so `sort` puts
+NaNs last and `rsort`, the mirror, puts them first. The numbers themselves always
+come out in order. The runtime sort is unstable among equal NaNs and numbers
+(equal elements are byte-equal there); a `with` clause sort is stable, so equal
+NaN keys keep their input order.
+
+Code: `src/runtime/Containers.cpp` (`slot_less`), `src/lower/Sort.cpp` (`sort_right_wins`). Tests: `tests/array_ordering_test.cpp` ("sorting reals with a NaN orders the numbers and puts NaN last", "sorting by a real key with a NaN"). Oracle: none; the LRM does not say, and iverilog does not implement these methods on reals.

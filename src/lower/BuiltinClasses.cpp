@@ -31,6 +31,7 @@ ir::Ref Lowerer::lower_process_class(const slang::ast::ClassType& clt) {
     t.element   = ir::Ref::Invalid;
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
+    module_.set_process_class(ref);
     std::vector<ir::FieldRow> fields;
     fields.push_back({ kProcessCtlField, make_int_type(64, false), 0 });
     module_.pool.set_struct_fields(fid, std::move(fields));

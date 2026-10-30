@@ -220,14 +220,17 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     module_.add_process(ir::Process{ .activation  = activation,
                                      .wait_events = std::move(wait_events),
                                      .self_start  = self_start,
+                                     // LRM 9.2.2.2: the time-zero run of always_comb /
+                                     // always_latch follows every initial / always start.
+                                     .starts_after_procedures = self_start,
                                      // LRM 13.4.4: an `initial` / `always` procedure is a thread
                                      // whose calls may spawn background processes. A `final`
                                      // block is not one of the two, and its children could never
                                      // run anyway (the drain has ended by then).
-                                     .spawn_root  = activation != ir::Activation::Final,
-                                     .span        = span_of(sym),
-                                     .ir          = std::move(body_ir),
-                                     .scope       = cur_scope_id() });
+                                     .spawn_root = activation != ir::Activation::Final,
+                                     .span       = span_of(sym),
+                                     .ir         = std::move(body_ir),
+                                     .scope      = cur_scope_id() });
 }
 
 void Lowerer::lower_stmt(const Statement& stmt, ir::Builder& b) {
@@ -445,18 +448,38 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
         }
         return;
     }
-    bool     found = false;
-    uint32_t label = kNoBlockLabel;
+    if (disable_fork_via_call_.contains(&target)) {
+        // TODO: a block whose body calls a subroutine that forks. LRM 9.6.2 ends "all
+        // activities enabled within the named block", but those children are built
+        // in the callee, outside the block, so no activation list names them and the
+        // disable would leave them running.
+        fail("disable of a block whose body calls a subroutine that forks is not supported "
+             "yet (the forked processes are not in the block)");
+    }
+    bool     found     = false;
+    bool     inherited = false;
+    uint32_t label     = kNoBlockLabel;
     for (size_t n = named_blocks_.size(); n > 0 && !found; --n) {
         if (named_blocks_[n - 1].sym == &target) {
-            found = true;
-            label = named_blocks_[n - 1].label;
+            found     = true;
+            label     = named_blocks_[n - 1].label;
+            inherited = named_blocks_[n - 1].inherited;
         }
     }
 
-    if (found && fn_ctx_ != nullptr) {
+    if (found && (inherited || disable_forked_.contains(&target)) && disable_hard_.contains(&target)) {
+        // TODO: a block with forked children whose body can park behind a
+        // time-consuming task call or an `expect`. A child is woken by a `disable`
+        // exactly as a block occupant is, and the abort cannot claim those parks (the
+        // call's completion would resume it a second time).
+        fail("disable of a block with forked children whose body can park on a "
+             "time-consuming task call or an expect is not supported yet (the abort cannot "
+             "claim that park)");
+    }
+    if (found && (fn_ctx_ != nullptr || disable_forked_.contains(&target))) {
         // A block that encloses this statement inside a body that can have
-        // several activations. A bare branch would end only the one running it,
+        // several activations, or that has a fork in it, whose children are
+        // activations of it too. A bare branch would end only the one running it,
         // and LRM 9.6.2 ends them all — so mark every activation on the list
         // first (the walk skips this one, which is running, not parked) and then
         // take the ordinary structured exit out of our own copy.
@@ -488,6 +511,19 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
     }
     if (label == kNoBlockLabel) {
         fail("internal: disable target was not labelled in the Collect pass");
+    }
+    if (inherited) {
+        // This body is a fork child of the target's, an activation of it with no
+        // region of its own to leave: it ends itself, after the walk above marked
+        // every other activation (LRM 9.6.2 example 4's shape, for a block).
+        if (disable_roots_.contains(&target) && disable_flushes_.contains(&target)) {
+            // LRM 16.4.4: the target is a procedure's OUTERMOST scope, so its pending
+            // deferred reports are dropped, as in the lexical and remote forms. This body
+            // is a fork child, so the bump names the target's procedure, not ours.
+            b.defer_flush(it->second, loc(s));
+        }
+        b.disable_abort(loc(s));
+        return;
     }
     if (&target == proc_root_block_ && disable_flushes_.contains(&target)) {
         // LRM 16.4.4 / 16.14.6.4: disabling the OUTERMOST scope of a procedure
@@ -655,8 +691,23 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
 
     std::vector<ir::FunctionId> ids;
     ids.reserve(children.size());
+    // The targeted blocks every child is activity within (LRM 9.6.2: "all activities
+    // enabled within the named block ... shall be terminated as well"): the ones
+    // open around this fork, and the fork block itself when a `disable` names it.
+    // Each child becomes an activation of them (build_fork_child).
+    std::vector<OpenBlock> enclosing;
+    for (const OpenBlock& ob : named_blocks_) {
+        if (ob.label != kNoBlockLabel) {
+            enclosing.push_back({ ob.sym, ob.label, true });
+        }
+    }
+    if (blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty()) {
+        if (const auto own = disable_targets_.find(blk.blockSymbol); own != disable_targets_.end()) {
+            enclosing.push_back({ blk.blockSymbol, own->second, true });
+        }
+    }
     for (const Statement* c : children) {
-        ids.push_back(build_fork_child(*c, captures, kind));
+        ids.push_back(build_fork_child(*c, captures, kind, enclosing));
     }
 
     // The capture actuals, in the order the children took their formals: each is
@@ -979,6 +1030,39 @@ void Lowerer::emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::So
     b.binary(ir::Inst::Tag::Store, lv, b.constant(dv, l), l);
 }
 
+// The initializer a variable's declaration carries (LRM 6.8). The variable a
+// variable output port declares (`output logic x = 1`, ANSI or non-ANSI, LRM
+// 23.2.2.2) is initialized by that port declaration, and slang keeps the
+// initializer on the port rather than on the variable. slang binds it to the
+// port's own type, which for a select port (`module m(x[3:2])`, LRM 23.2.2.1) is
+// the select's, so that one is bound again to the variable from its declarator.
+const Expression* Lowerer::declaration_initializer(const VariableSymbol& vs) {
+    if (const Expression* init = vs.getInitializer()) {
+        return init;
+    }
+    const auto it = port_initializers_.find(&vs);
+    if (it == port_initializers_.end()) {
+        return nullptr;
+    }
+    const PortSymbol& p = *it->second;
+    if (p.getInternalExpr() == nullptr) {
+        return p.getInitializer();
+    }
+    const slang::syntax::SyntaxNode* syn = vs.getSyntax();
+    if (syn == nullptr || syn->kind != slang::syntax::SyntaxKind::Declarator ||
+        syn->as<slang::syntax::DeclaratorSyntax>().initializer == nullptr) {
+        // TODO: the initializer of a select port whose variable is declared apart from
+        // the port (`output x = 1;` and `reg [3:0] x;`): it is not on the variable's
+        // own declarator.
+        fail("an initializer on a select port of a variable declared apart from the port is not supported");
+    }
+    const slang::syntax::EqualsValueClauseSyntax& eq = *syn->as<slang::syntax::DeclaratorSyntax>().initializer;
+    const slang::ast::ASTContext ctx(*p.getParentScope(),
+                                     slang::ast::LookupLocation::after(vs),
+                                     slang::ast::ASTFlags::NonProcedural | slang::ast::ASTFlags::StaticInitializer);
+    return &Expression::bindRValue(vs.getType(), *eq.expr, { eq.equals.location(), eq.equals.location() + 1 }, ctx);
+}
+
 // Apply a module-level (static) variable's declaration initializer (LRM 6.8)
 // as a store in the run-once pre-init process. The store services no wait queue
 // (the backend suppresses servicing for a PreInit process), so initialization
@@ -987,7 +1071,7 @@ void Lowerer::emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::So
 // its own, and whose struct type has no field-level defaults either, keeps
 // its power-on default (X / 0), set by the backend's init_state.
 void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
-    const Expression* init = vs.getInitializer();
+    const Expression* init = declaration_initializer(vs);
     if (init == nullptr) {
         if (aggregate_has_field_defaults(vs.getType())) {
             if (!preinit_) {
@@ -1182,6 +1266,18 @@ void Lowerer::lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
 // whatever indexing the body performs on the result is ordinary,
 // pre-existing ElemSelect/BitSelect lowering, untouched by this loop nest.
 void Lowerer::lower_foreach(const ForeachLoopStatement& f, ir::Builder& b) {
+    // NOTE: With every loop variable omitted, 12.7.3's skipped-dimension rule
+    // would run the body once, even over an empty array. The LRM never states the
+    // case; iverilog and Verilator both run it zero times, and so does Clotho
+    // (docs/LRM_NOTES.md note 47).
+    if (std::ranges::none_of(f.loopDims, [](const ForeachLoopStatement::LoopDim& d) { return d.loopVar != nullptr; })) {
+        report(Severity::Warning,
+               "foreach-no-loop-variables",
+               "foreach with no loop variables iterates no dimension; the LRM does not define it (12.7.3), "
+               "and its body never runs",
+               to_source_span(f.sourceRange));
+        return;
+    }
     const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
     lower_foreach_dim(f, 0, b);
 }
@@ -1525,12 +1621,11 @@ void Lowerer::check_case_pragmas(const CaseStatement& c) {
     // Per value: how many items match it. Saturated at 2 -- the only
     // questions are "none" (not full) and "more than one" (not parallel).
     std::vector<uint8_t>    hits(space, 0);
-    slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext ectx(actx);
+    const slang::ast::ASTContext actx(*scope_, slang::ast::LookupLocation::max);
 
     for (const CaseStatement::ItemGroup& item : c.items) {
         for (const Expression* e : item.expressions) {
-            const slang::ConstantValue cv = e->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*e, Fold::Runtime, actx);
             if (cv.bad() || !cv.isInteger()) {
                 return; // Not decidable; say nothing.
             }
@@ -2181,8 +2276,7 @@ std::vector<std::vector<char>> Lowerer::case_dedup(const CaseStatement&         
             if (e.kind == ExpressionKind::ValueRange) {
                 continue;
             }
-            slang::ast::EvalContext    ev(astCtx);
-            const slang::ConstantValue cv = e.eval(ev);
+            const slang::ConstantValue cv = fold_const(e, Fold::Runtime, astCtx);
             if (!cv.isInteger()) {
                 continue;
             }
@@ -2283,8 +2377,7 @@ std::optional<Lowerer::SwitchRun> Lowerer::find_switch_run(const CaseStatement& 
             if (keep != nullptr && !(*keep)[i][j]) {
                 continue; // already proven dead by the whole-statement case_dedup.
             }
-            slang::ast::EvalContext    ev(astCtx);
-            const slang::ConstantValue cv = e->eval(ev);
+            const slang::ConstantValue cv = fold_const(*e, Fold::Runtime, astCtx);
             if (!cv.isInteger() || cv.integer().hasUnknown()) {
                 eligible = false;
                 break;
@@ -2293,16 +2386,19 @@ std::optional<Lowerer::SwitchRun> Lowerer::find_switch_run(const CaseStatement& 
             if (v.getBitWidth() < width) {
                 v = v.extend(width, e->type->isSigned());
             }
-            const std::optional<uint64_t> u = v.as<uint64_t>();
-            if (!u) {
-                eligible = false;
-                break;
-            }
+            // The key is the label's `width` bits as the selector's plane holds
+            // them, not its numeric value: SVInt::as would sign-extend a negative
+            // signed label to 64 bits, which the backend truncates to the key
+            // width (2 * width for a 4-state selector), so the label's sign bits
+            // would land in the unknown half of the key and never match.
+            // key_width <= 64 bounds `width` to one word, which SVInt keeps with
+            // its unused high bits clear.
+            const uint64_t key = v.getRawPtr()[0];
             if (keep != nullptr) {
                 // case_dedup already guarantees this key is unique statement-wide.
-                keys.push_back(*u);
-            } else if (local_seen.insert(*u).second) {
-                keys.push_back(*u);
+                keys.push_back(key);
+            } else if (local_seen.insert(key).second) {
+                keys.push_back(key);
             }
         }
         if (!eligible) {
@@ -2358,9 +2454,7 @@ std::optional<Lowerer::OneHotPlan> Lowerer::build_onehot_plan(const CaseStatemen
     }
     // Selector must be exactly the 1-bit constant 1.
     {
-        slang::ast::ASTContext     ctx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ev(ctx);
-        const slang::ConstantValue cv = c.expr.eval(ev);
+        const slang::ConstantValue cv = fold_const(c.expr, Fold::Runtime);
         if (!cv.isInteger() || cv.integer().getBitWidth() != 1 || cv.integer().hasUnknown() ||
             cv.integer().as<uint64_t>().value_or(0) != 1) {
             return std::nullopt;
@@ -2878,10 +2972,10 @@ void Lowerer::lower_return(const ReturnStatement& r, ir::Builder& b) {
         // an aggregate / whole array / dynamic array yields its lvalue (copied
         // out by the backend), else the loaded value.
         if (is_agg_abi_ref(fn_ctx_->ret_type)) {
-            b.unary(ir::Inst::Tag::Ret, ret_var_ref(*fn_ctx_, l, b), l);
+            b.unary(ir::Inst::Tag::Ret, implicit_return_ref(*fn_ctx_, l, b), l);
             return;
         }
-        const ir::Index rv = ret_var_ref(*fn_ctx_, l, b);
+        const ir::Index rv = implicit_return_ref(*fn_ctx_, l, b);
         b.unary(ir::Inst::Tag::Ret, is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
     } else {
         b.ret_void(l);

@@ -336,6 +336,9 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         const bool   is_packed = !ct.isUnpackedStruct();
         const Scope& body      = is_packed ? static_cast<const Scope&>(ct.as<slang::ast::PackedStructType>())
                                            : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
+        if (is_packed) {
+            check_value_width(ct.getBitWidth(), ct.isFourState(), cur_range_);
+        }
         std::vector<ir::FieldRow> fields;
         for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
             // Packed member: `bitOffset` is the field's bit position. Unpacked
@@ -381,6 +384,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
             return cached->second;
         }
+        check_value_width(ct.getBitWidth(), ct.isFourState(), cur_range_);
 
         // A tagged packed union (LRM 7.3.2) is still a flat bit-vector, just
         // with the tag reserved in the high `tagBits` bits — slang's
@@ -461,6 +465,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         // unpacked union has no slang-dictated width. tagBits = ceil(log2 n).
         const uint32_t tag_bits =
           ut.isTagged && nmembers > 1 ? static_cast<uint32_t>(std::bit_width(nmembers - 1)) : 0;
+        check_value_width(max_width + tag_bits, four, cur_range_);
 
         ir::Type t;
         t.kind      = ir::Type::Kind::Struct;
@@ -532,12 +537,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
     return make_int_type(ct.getBitWidth(), ct.isFourState());
 }
 
-// Intern an integer literal, preserving x/z bits. Slang stores a 4-state
-// SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
-// the opposite val convention from the pool's VPI planes (X=(val1,xz1),
-// Z=(val0,xz1)). The unknown word IS the xz plane; the val plane is
-// value^unknown so the per-bit codes line up. 2-state literals take the fast
-// uint64 path.
+// Intern an integer literal, preserving x/z bits.
 ir::Ref Lowerer::lower_int_literal(const IntegerLiteral& lit) {
     return svint_to_ref(lit.getValue(), lower_type(*lit.type));
 }
@@ -550,24 +550,12 @@ ir::Ref Lowerer::svint_to_ref(const slang::SVInt& v, ir::Ref ty) {
         return module_.pool.put_int(ty, v.as<uint64_t>().value_or(0));
     }
 
-    // General path: pack the raw words into val / xz planes. A wide (>64-bit)
-    // value heap-allocates even when fully known (e.g. a packed string literal
-    // like a 96-bit "hello world!"), so the fast path above must not swallow it
-    // via a 64-bit truncation. getRawPtr lays out value words, followed by the
-    // unknown words only when hasUnknown.
-    const uint32_t        words = (width + 63) / 64;
-    const uint64_t*       raw   = v.getRawPtr();
-    const bool            unk   = v.hasUnknown();
-    std::vector<uint64_t> planes(static_cast<size_t>(words) * 2, 0);
-    for (uint32_t i = 0; i < words; ++i) {
-        planes[i]         = unk ? (raw[i] ^ raw[words + i]) : raw[i]; // val plane (VPI)
-        planes[words + i] = unk ? raw[words + i] : 0;                 // xz plane (unknown)
-    }
-
-    const uint32_t       pb = ir::plane_bytes(width);
-    std::vector<uint8_t> bytes(static_cast<size_t>(pb) * 2, 0);
-    std::memcpy(bytes.data(), planes.data(), pb);
-    std::memcpy(bytes.data() + pb, planes.data() + words, pb);
+    // General path: a wide (>64-bit) value heap-allocates even when fully known
+    // (e.g. a packed string literal like a 96-bit "hello world!"), so the fast
+    // path above must not swallow it via a 64-bit truncation. The planes come
+    // from append_svint_bytes, the one lowering-side producer of plane bytes.
+    std::vector<uint8_t> bytes;
+    append_svint_bytes(v, ty, bytes);
 
     return module_.pool.put_value(ty, bytes);
 }
@@ -646,9 +634,12 @@ void Lowerer::check_defparam_type(const slang::ast::DefParamSymbol& d) {
 }
 
 // Append one integral constant's canonical plane bytes to `out`: the val
-// plane, then the xz plane for a 4-state type. Same VPI convention and same
-// packing as svint_to_ref, but writing into a larger image instead of
-// interning a value of its own.
+// plane, then the xz plane for a 4-state type, each ir::plane_bytes(width)
+// long, so the image is exactly the layout of `ty`. Slang stores a 4-state
+// SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
+// the opposite val convention from the pool's VPI planes (X=(val1,xz1),
+// Z=(val0,xz1)). The unknown word IS the xz plane; the val plane is
+// value^unknown so the per-bit codes line up.
 void Lowerer::append_svint_bytes(const slang::SVInt& src, ir::Ref ty, std::vector<uint8_t>& out) {
     const ir::Layout   lay = module_.pool.layout(ty);
     const slang::SVInt v   = src.getBitWidth() == lay.width ? src : src.resize(lay.width);
@@ -989,32 +980,325 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
         // the handle instead would be wrong -- a later merge on one side would
         // not be seen on the other -- and there is nothing to propagate, since
         // an event carries occurrences rather than a value.
-        const bool event_port =
-          p.internalSymbol != nullptr && p.internalSymbol->kind == SymbolKind::Variable &&
-          p.internalSymbol->as<VariableSymbol>().getType().isEvent();
-        if (!event_port && p.direction != slang::ast::ArgumentDirection::InOut &&
-            p.direction != slang::ast::ArgumentDirection::Ref) {
-            continue;
-        }
+        const bool event_port = p.internalSymbol != nullptr && p.internalSymbol->kind == SymbolKind::Variable &&
+                                p.internalSymbol->as<VariableSymbol>().getType().isEvent();
         if (p.internalSymbol == nullptr) {
             continue;
         }
         const Expression* expr = pc->getExpression();
+        // An input or output port that LRM 23.3.3.1 lets a tool coerce to inout, and
+        // that coercion would change what the design observes (needs_port_coercion).
+        const bool coerced =
+          !event_port &&
+          (p.direction == slang::ast::ArgumentDirection::In || p.direction == slang::ast::ArgumentDirection::Out) &&
+          needs_port_coercion(*pc, p);
+        if (!event_port && !coerced && p.direction != slang::ast::ArgumentDirection::InOut &&
+            p.direction != slang::ast::ArgumentDirection::Ref) {
+            continue;
+        }
         if (expr == nullptr) {
             continue; // unconnected inout/ref: the child net stands alone
+        }
+        if (coerced) {
+            const bool input       = p.direction == slang::ast::ArgumentDirection::In;
+            cur_range_             = input ? slang::SourceRange{ p.location, p.location } : expr->sourceRange;
+            const std::string port = std::string(input ? "input" : "output") + " port '" +
+                                     std::string(p.name.empty() ? p.internalSymbol->name : p.name) + "'";
+            if (!allow_port_coercion_) {
+                fail(port +
+                     (input ? " is driven from inside the module"
+                            : " is read inside the module while its net has other drivers") +
+                     "; Clotho does not coerce ports to inout by default (LRM 23.3.3.1); pass --allow-port-coercion to "
+                     "coerce it");
+            }
+            const Expression& c =
+              expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left() : *expr;
+            // TODO: coercing a port connected to a select, a concatenation or an
+            // expression, or of another width than its net (LRM 23.3.3.1): the
+            // two nets become one net, which needs sub-signal aliasing.
+            if ((c.kind != ExpressionKind::NamedValue && c.kind != ExpressionKind::HierarchicalValue) ||
+                p.getInternalExpr() != nullptr || !c.type->isIntegral() ||
+                c.type->getBitWidth() != p.getType().getBitWidth()) {
+                fail(port +
+                     " needs coercion to inout (LRM 23.3.3.1), which is only supported for a port connected to a "
+                     "whole net of the same width");
+            }
+            if (canonical_value_symbol(c.as<ValueExpressionBase>().symbol).kind != SymbolKind::Net) {
+                fail(port + " needs coercion to inout (LRM 23.3.3.1), but a variable cannot be connected to an inout "
+                            "port (LRM 23.3.3.2)");
+            }
+            coerced_ports_.insert(&p);
+        }
+        if (p.getInternalExpr() != nullptr) {
+            // TODO: an inout/ref port that is a select of its net (`module
+            // m(io[1:0])`, LRM 23.2.2.1) connects those bits only; aliasing the
+            // whole net would put the connection's storage under all of it.
+            fail("inout/ref port with a select port expression is not supported");
         }
         // slang may wrap the connection in an AssignmentExpression; the shared
         // net is the underlying value reference.
         const Expression& conn =
           expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left() : *expr;
+        // The port and its connection share one storage (below), so they must be
+        // as wide as each other. Connected in the bits they share, the rest of
+        // the wider side unconnected, a port and a net of another width have no
+        // common storage: aliasing put a 64-bit port over a 1-bit slot, and the
+        // child's writes landed on the variables declared next to it.
+        // TODO: an inout/ref port and a net of different widths (LRM 23.3.3);
+        // needs sub-signal aliasing.
+        const slang::ast::Type& port_type = p.getType();
+        if (port_type.isIntegral() && conn.type->isIntegral() && port_type.getBitWidth() != conn.type->getBitWidth()) {
+            fail("inout/ref port connected to a net of another width (" + std::to_string(port_type.getBitWidth()) +
+                 " and " + std::to_string(conn.type->getBitWidth()) + " bits) is not supported");
+        }
         if (conn.kind != ExpressionKind::NamedValue && conn.kind != ExpressionKind::HierarchicalValue) {
             // TODO: inout/ref port with a bit/part-select or concat connection
             // (per-bit collapse or resolved-net partial-driver slots).
             fail("inout/ref port with a non-whole-signal connection is not supported");
         }
-        const ValueSymbol& parent      = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
-        inout_alias_[p.internalSymbol] = signal_of(parent);
+        const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
+        const ir::Signal   target = signal_of(parent);
+        // Two ports bound to one internal net (`module m(a, a)`, LRM 23.2.2.1) connected
+        // to one parent net share that net's alias target; connected to different nets
+        // they would make those one net, which the one target cannot express.
+        // TODO: two connected inout/ref ports bound to one net, connected to different
+        // nets: the nets they connect become one net.
+        if (const auto prior = inout_alias_.find(p.internalSymbol);
+            prior != inout_alias_.end() && prior->second != target) {
+            fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+        }
+        inout_alias_[p.internalSymbol] = target;
     }
+}
+
+// Whether coercing the net port `p` of one instance to inout (LRM 23.3.3.1: "A port
+// that is declared as input (output) but used as an output (input) or inout may be
+// coerced to inout") would change what the design observes.
+//
+// NOTE: Clotho copies the value across an input or output port (LRM 23.3.3: "a
+// continuous assignment from source to sink") and does not coerce unless asked
+// (--allow-port-coercion). A coerced port makes its inner and outer net one net, so
+// the two differ only where a value travels against the port's direction:
+//  - an input port whose net the module drives itself: the outer net sees that
+//    driver when coerced and does not when copied;
+//  - an output port whose outer net has other drivers, when the module reads its
+//    own net: it sees the resolved value when coerced and only its own drivers when
+//    copied. A module that only drives its output net cannot tell, and any number
+//    of output ports driving one net is the multiple-driver case LRM 23.3.3.2
+//    permits, so that stays accepted.
+// Only those ports are refused or coerced. A variable port is never coerced (LRM
+// 23.3.3.2), and an unconnected port has no outer net. The drivers and reads are
+// found by scanning the top's hierarchy (scan_net_uses), not taken from slang's
+// port-coercion warnings, which say "coerced to 'inout'" and flag every net with a
+// port driver beside another driver; those are not shown.
+bool Lowerer::needs_port_coercion(const PortConnection& pc, const PortSymbol& p) {
+    if (p.internalSymbol == nullptr || p.internalSymbol->kind != SymbolKind::Net || pc.getExpression() == nullptr) {
+        return false;
+    }
+    const ValueSymbol& inner = p.internalSymbol->as<ValueSymbol>();
+    if (p.direction == slang::ast::ArgumentDirection::In) {
+        return port_driven_inside(p);
+    }
+    const Expression& e = *pc.getExpression();
+    if (p.direction != slang::ast::ArgumentDirection::Out || e.kind != ExpressionKind::Assignment ||
+        !net_is_read(inner)) {
+        return false;
+    }
+    const auto shared = [&](auto&& self, const Expression& lhs) -> bool {
+        if (lhs.kind == ExpressionKind::Concatenation) {
+            for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                if (self(self, *op)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return other_driver_of(lhs);
+    };
+    return shared(shared, e.as<AssignmentExpression>().left());
+}
+
+namespace {
+
+using WriteMap = ankerl::unordered_dense::map<const ValueSymbol*, std::vector<const Expression*>>;
+
+// Every value symbol a hierarchy reads, and every target it writes by root symbol. A
+// reference is a read but for the root of an assignment target (a select's index and
+// a compound assignment's target are reads). An output port connection and a gate
+// output terminal are assignments too.
+struct NetUseScan : ASTVisitor<NetUseScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const ValueSymbol*>*                           reads  = nullptr;
+    WriteMap*                                                                   writes = nullptr;
+    ankerl::unordered_dense::map<const Expression*, const InstanceBodySymbol*>* in     = nullptr;
+    const InstanceBodySymbol*                                                   body   = nullptr;
+
+    // `whole` is the target as written, which a select or conversion only narrows.
+    void target(const Expression& e, const Expression& whole) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+                (*writes)[&canonical_value_symbol(e.as<NamedValueExpression>().symbol)].push_back(&whole);
+                return;
+            case ExpressionKind::HierarchicalValue:
+                (*writes)[&canonical_value_symbol(e.as<HierarchicalValueExpression>().symbol)].push_back(&whole);
+                return;
+            case ExpressionKind::ElementSelect:
+                target(e.as<ElementSelectExpression>().value(), whole);
+                e.as<ElementSelectExpression>().selector().visit(*this);
+                return;
+            case ExpressionKind::RangeSelect:
+                target(e.as<RangeSelectExpression>().value(), whole);
+                e.as<RangeSelectExpression>().left().visit(*this);
+                e.as<RangeSelectExpression>().right().visit(*this);
+                return;
+            case ExpressionKind::MemberAccess:
+                target(e.as<MemberAccessExpression>().value(), whole);
+                return;
+            case ExpressionKind::Conversion:
+                target(e.as<ConversionExpression>().operand(), whole);
+                return;
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : e.as<ConcatenationExpression>().operands()) {
+                    (*in)[op] = body;
+                    target(*op, *op);
+                }
+                return;
+            default:
+                e.visit(*this);
+                return;
+        }
+    }
+
+    void handle(const AssignmentExpression& a) {
+        if (a.isCompound()) {
+            visitDefault(a);
+            return;
+        }
+        (*in)[&a.left()] = body;
+        target(a.left(), a.left());
+        a.right().visit(*this);
+    }
+
+    // The connections are written in the instantiating body, the members in the child's.
+    void handle(const InstanceSymbol& i) {
+        for (const PortConnection* pc : i.getPortConnections()) {
+            if (const Expression* e = pc->getExpression()) {
+                e->visit(*this);
+            }
+        }
+        const InstanceBodySymbol* saved = body;
+        body                            = &i.body;
+        i.body.visit(*this);
+        body = saved;
+    }
+
+    // `force` and `release` override a net and are not drivers of it.
+    void handle(const ProceduralAssignStatement& s) {
+        if (const auto* a = s.assignment.as_if<AssignmentExpression>()) {
+            a->right().visit(*this);
+        }
+    }
+
+    void handle(const ProceduralDeassignStatement&) {}
+
+    void handle(const NamedValueExpression& nv) {
+        reads->insert(&canonical_value_symbol(nv.symbol));
+    }
+
+    void handle(const HierarchicalValueExpression& hv) {
+        reads->insert(&canonical_value_symbol(hv.symbol));
+    }
+};
+
+} // namespace
+
+void Lowerer::scan_net_uses() {
+    if (reads_scanned_) {
+        return;
+    }
+    read_syms_.clear();
+    writes_.clear();
+    write_in_.clear();
+    NetUseScan scan;
+    scan.reads  = &read_syms_;
+    scan.writes = &writes_;
+    scan.in     = &write_in_;
+    top_inst_->visit(scan);
+    reads_scanned_ = true;
+}
+
+// Whether anything in the top's hierarchy reads `sym`: its own module, a child it is
+// passed to, or a hierarchical reference from outside. Fails closed (true) when no
+// top is known.
+bool Lowerer::net_is_read(const ValueSymbol& sym) {
+    if (top_inst_ == nullptr) {
+        return true;
+    }
+    scan_net_uses();
+    return read_syms_.contains(&sym);
+}
+
+// Whether the module the port `p` belongs to drives the net behind it itself: an
+// assignment, gate output or child output port written in the module's own body, to
+// bits the port connects. A driver from outside (a hierarchical assignment) is not
+// the module's, and the port's own copy is not an assignment at all. Bits are
+// compared as the driver tracking does (net_region_of): constant and genvar selects
+// of packed, multi-dimensional and unpacked-array nets are told apart, and a
+// run-time index covers the whole net. Fails closed (true) when no top is known.
+bool Lowerer::port_driven_inside(const PortSymbol& p) {
+    if (top_inst_ == nullptr) {
+        return true;
+    }
+    scan_net_uses();
+    const ValueSymbol& net = canonical_value_symbol(p.internalSymbol->as<ValueSymbol>());
+    const auto         it  = writes_.find(&net);
+    if (it == writes_.end()) {
+        return false;
+    }
+    const Symbol*     body = &p.getParentScope()->asSymbol();
+    const Expression* sel  = p.getInternalExpr();
+    const NetRegion   mine = sel != nullptr ? net_region_of(*sel, net) : kWholeNet;
+    for (const Expression* w : it->second) {
+        const auto where = write_in_.find(w);
+        if (where == write_in_.end() || static_cast<const Symbol*>(where->second) != body) {
+            continue;
+        }
+        if (mine.overlaps(net_region_of(*w, net))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether the net `own` (one target of an output port connection) roots at has a
+// driver besides this connection that can reach the same bits: another assignment,
+// gate output or port connection, or the pull of its net type. Bits are compared as
+// the driver tracking does (net_region_of), so the instances of a generate loop that
+// each drive a constant slice of one net do not count against each other; a
+// run-time index covers the whole net. Fails closed (true) when no top is known.
+bool Lowerer::other_driver_of(const Expression& own) {
+    const ValueSymbol* raw = lvalue_root(own);
+    if (raw == nullptr) {
+        return false;
+    }
+    const ValueSymbol& root = canonical_value_symbol(*raw);
+    if (root.kind != SymbolKind::Net) {
+        return false;
+    }
+    if (top_inst_ == nullptr || net_pull_value(root.as<NetSymbol>().netType.netKind).has_value()) {
+        return true;
+    }
+    scan_net_uses();
+    const auto it = writes_.find(&root);
+    if (it == writes_.end()) {
+        return false;
+    }
+    const NetRegion mine = net_region_of(own, root);
+    for (const Expression* w : it->second) {
+        if (w != &own && mine.overlaps(net_region_of(*w, root))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Lowerer::collect_signals(const InstanceBodySymbol& body) {
@@ -1026,6 +1310,12 @@ void Lowerer::collect_signals(const InstanceBodySymbol& body) {
             const PortSymbol& p = m.as<PortSymbol>();
             if (p.internalSymbol) {
                 port_dir[p.internalSymbol] = direction_of(p.direction);
+                // Only a variable output port may carry an initializer; an input's
+                // is its default connection (LRM 23.2.2.4), which slang already
+                // substitutes into the port connection.
+                if (p.direction == slang::ast::ArgumentDirection::Out && p.hasInitializer()) {
+                    port_initializers_.emplace(p.internalSymbol, &p);
+                }
             }
         }
     }
@@ -1101,13 +1391,13 @@ void Lowerer::collect_scope_signals(
                             fail("net delay rise/fall/turn-off triples (wire #(a,b,c)) are "
                                  "not supported");
                         }
-                        if (is_aggregate(vs.getType())) {
-                            // TODO: net delay on an unpacked-aggregate net —
-                            // needs a leaf-wise inertial replay (like the
+                        if (is_aggregate(vs.getType()) || vs.getType().getCanonicalType().isUnpackedArray()) {
+                            // TODO: net delay on an unpacked array or aggregate
+                            // net — needs a leaf-wise inertial replay (like the
                             // intra-assignment aggregate commit), not the
                             // flat packed-plane resolver fold this forces
                             // every other net delay through.
-                            fail("net delay on an unpacked-aggregate net is not supported");
+                            fail("net delay on an unpacked-array or unpacked-aggregate net is not supported");
                         }
                     }
                     info.is_net = true;
@@ -1375,6 +1665,20 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
     const auto it = sigmap_.find(&prop);
     if (it != sigmap_.end()) {
         return it->second;
+    }
+    if (globals_ != nullptr && this != globals_ && is_global_scope(prop.getParentScope())) {
+        // A property of a package / `$unit` class has no instance multiplicity
+        // (LRM 8.9: one version "shared by all instances"; 6.21): one slot for the
+        // design, owned by the shared globals Lowerer -- the same one that lowers
+        // the class's methods (function_id's delegation). Declaring it here as well
+        // would give this top's accesses (`obj.p`, `C::p`) a slot the methods never
+        // see. Cached locally so the lookup above hits next time. A property of a
+        // generic specialized with a module's own class is not global
+        // (is_global_scope): it is this top's, like the methods that reach it.
+        const Restore<const Scope*> scope(globals_->scope_, prop.getParentScope());
+        const ir::Signal            sig = globals_->declare_static_prop(prop);
+        sigmap_.emplace(&prop, sig);
+        return sig;
     }
     std::string cls;
     if (const slang::ast::Scope* sc = prop.getParentScope()) {

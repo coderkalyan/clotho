@@ -2,7 +2,53 @@
 
 #include "lower/Lowerer.h"
 
+#include <bit>
+#include <cassert>
+
 namespace clotho::lower {
+
+namespace {
+
+// Strength levels the MOS check tracks, as one bit each, low to high: the
+// charge-like small and medium exist only as results of the reduction in LRM
+// Table 28-8, the others are the drive strengths of 28.11. A strength level here
+// is the strength a switch's data input arrives with.
+constexpr uint8_t kSmall    = 1 << 0;
+constexpr uint8_t kMedium   = 1 << 1;
+constexpr uint8_t kWeak     = 1 << 2;
+constexpr uint8_t kPull     = 1 << 3;
+constexpr uint8_t kStrong   = 1 << 4;
+constexpr uint8_t kSupply   = 1 << 5;
+constexpr uint8_t kAnyLevel = kSmall | kMedium | kWeak | kPull | kStrong | kSupply;
+
+// What nmos, pmos and cmos do to a strength (LRM 28.13): pass it on, except that
+// supply becomes strong.
+uint8_t mos_pass_levels(uint8_t in) {
+    return static_cast<uint8_t>((in & ~kSupply) | ((in & kSupply) != 0 ? kStrong : 0));
+}
+
+// What the resistive switches do (LRM 28.14, Table 28-8): supply and strong become
+// pull, pull weak, weak medium, medium and small small.
+uint8_t mos_reduce_levels(uint8_t in) {
+    uint8_t out = 0;
+    out |= (in & (kSupply | kStrong)) != 0 ? kPull : 0;
+    out |= (in & kPull) != 0 ? kWeak : 0;
+    out |= (in & kWeak) != 0 ? kMedium : 0;
+    out |= (in & (kMedium | kSmall)) != 0 ? kSmall : 0;
+
+    return out;
+}
+
+// Whether a packed drive strength pair can drive a value weaker than strong: a side
+// that drives (not highz) at weak or pull. Supply is reduced to strong by a MOS
+// switch (LRM 28.13), so it is not weak here.
+bool strength_may_be_weak(uint16_t packed) {
+    const auto weak = [](uint32_t level) { return level == 1 || level == 2; };
+
+    return weak(packed & 0xFF) || weak(packed >> 8);
+}
+
+} // namespace
 
 // The multi-driver reducer for a net kind: wire/tri/uwire resolve to X on a
 // 0-vs-1 conflict; wand/triand fold wired-AND, wor/trior wired-OR (LRM 6.6).
@@ -65,8 +111,7 @@ void Lowerer::record_net_driver_region(const ValueSymbol& raw, const NetRegion& 
     auto&      regions  = net_driven_[net];
     bool       resolve  = has_pull;
     for (const NetRegion& p : regions) {
-        if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi && reg.bit_lo <= p.bit_hi &&
-            p.bit_lo <= reg.bit_hi) {
+        if (reg.overlaps(p)) {
             // Emit routes every driver of a resolved net to its own slot and
             // folds them through the net-kind's reducer (wire -> X on
             // conflict, wand/wor -> wired-AND/OR), then applies any pull.
@@ -143,9 +188,7 @@ std::optional<ir::Index> Lowerer::try_lower_constant_select(const Expression& ex
     if (root == nullptr || !is_elaboration_constant(*root)) {
         return std::nullopt;
     }
-    slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ectx(actx);
-    const slang::ConstantValue cv = expr.eval(ectx);
+    const slang::ConstantValue cv = fold_const(expr, Fold::Runtime);
     if (cv.bad()) {
         return std::nullopt;
     }
@@ -163,9 +206,7 @@ std::optional<ir::Index> Lowerer::try_lower_constant_select(const Expression& ex
 ir::Index Lowerer::select_base_lvalue(const Expression& base, ir::Builder& b, ir::SourceLoc l) {
     const ValueSymbol* root = lvalue_root(base);
     if (root != nullptr && is_elaboration_constant(*root) && base.type->getCanonicalType().isIntegral()) {
-        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = base.eval(ectx);
+        const slang::ConstantValue cv = fold_const(base, Fold::Runtime);
         if (!cv.bad()) {
             const ir::Index tmp = make_arg_temp(lower_type(*base.type), b, l);
             b.binary(ir::Inst::Tag::Store, tmp, b.constant(lower_constant(cv, *base.type), l), l);
@@ -269,7 +310,8 @@ Lowerer::NetRegion Lowerer::net_region_of(const Expression& lhs, const ValueSymb
             if (step->kind != ExpressionKind::ElementSelect) {
                 return kWholeNet;
             }
-            const std::optional<int32_t> c = try_const_int(step->as<ElementSelectExpression>().selector());
+            const std::optional<int32_t> c =
+              try_const_int(step->as<ElementSelectExpression>().selector(), Fold::Required);
             if (!c) {
                 return kWholeNet;
             }
@@ -312,7 +354,7 @@ std::optional<std::pair<uint32_t, uint32_t>> Lowerer::packed_bit_range(const Exp
             if (!es.value().type->isIntegral()) {
                 return std::nullopt;
             }
-            if (const std::optional<int32_t> c = try_const_int(es.selector())) {
+            if (const std::optional<int32_t> c = try_const_int(es.selector(), Fold::Required)) {
                 const auto w   = static_cast<uint32_t>(es.type->getBitWidth());
                 const auto ord = static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
                 return std::make_pair(ord * w, ord * w + w - 1);
@@ -331,8 +373,8 @@ std::optional<std::pair<uint32_t, uint32_t>> Lowerer::packed_bit_range(const Exp
             const uint32_t w  = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
             const slang::ConstantRange range = packed_range_of(rs.value());
             if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-                const std::optional<int32_t> left  = try_const_int(rs.left());
-                const std::optional<int32_t> right = try_const_int(rs.right());
+                const std::optional<int32_t> left  = try_const_int(rs.left(), Fold::Required);
+                const std::optional<int32_t> right = try_const_int(rs.right(), Fold::Required);
                 if (!left || !right) {
                     return std::nullopt;
                 }
@@ -344,7 +386,7 @@ std::optional<std::pair<uint32_t, uint32_t>> Lowerer::packed_bit_range(const Exp
             // base is a static bit range: the base element's offset (biased by
             // count-1 when the window extends away from the LSB end) scaled by
             // W, spanning count*W bits. A non-constant base is not slot-able.
-            const std::optional<int32_t> base = try_const_int(rs.left());
+            const std::optional<int32_t> base = try_const_int(rs.left(), Fold::Required);
             if (!base) {
                 return std::nullopt;
             }
@@ -491,30 +533,21 @@ ir::Signal Lowerer::alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t 
     return slot;
 }
 
-// An all-Z constant of `width` bits (VPI planes: val = 0, xz = 1 for every
-// bit). Used as the resolution identity in the undriven bits of a partial
-// driver's slot value.
 // A definite (2-state, z-free) all-0 or all-1 constant of `width` bits, in the
 // 4-state plane encoding. Used to inject a tri0/tri1 pull as a synthetic
 // Pull-strength driver into the strength fold.
 ir::Ref Lowerer::def_constant_ref(uint32_t width, bool one) {
-    const uint32_t       pb = (width + 7) / 8;
-    std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // xz plane = 0 (no z/x)
+    slang::SVInt v(width, 0, /*isSigned=*/false);
     if (one) {
-        for (uint32_t bit = 0; bit < width; ++bit) {
-            bytes[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // val plane = 1
-        }
+        v.setAllOnes();
     }
-    return module_.pool.put_value(make_int_type(width, /*is_four=*/true), bytes);
+    return svint_to_ref(v, make_int_type(width, /*is_four=*/true));
 }
 
+// An all-Z constant of `width` bits. Used as the resolution identity in the
+// undriven bits of a partial driver's slot value.
 ir::Ref Lowerer::z_constant_ref(uint32_t width) {
-    const uint32_t       pb = (width + 7) / 8;
-    std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // val plane = 0
-    for (uint32_t bit = 0; bit < width; ++bit) {
-        bytes[pb + bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // xz plane = 1 (Z)
-    }
-    return module_.pool.put_value(make_int_type(width, /*is_four=*/true), bytes);
+    return svint_to_ref(slang::SVInt::createFillZ(width, /*isSigned=*/false), make_int_type(width, /*is_four=*/true));
 }
 
 // The full-width value one driver stages into its slot: for a whole-net
@@ -648,6 +681,43 @@ void Lowerer::emit_resolved_driver(ir::Signal                  net,
     add_continuous_process(continuous_events(a), l, b);
 }
 
+// Store `val` into `lv` of type `ty`: one store for a packed value, and for a fixed
+// unpacked array a loop per dimension over its declared range (ascending or
+// descending as declared) that stores into every leaf element. `val` is the value
+// of one leaf element. A loop, not a store per element, so the code does not grow
+// with the array: a 64K-element array took seconds to lower unrolled.
+void Lowerer::store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l) {
+    const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
+    if (t.kind != ir::Type::Kind::UnpackedArray) {
+        b.binary(ir::Inst::Tag::Store, lv, val, l);
+        return;
+    }
+    const ir::Ref  i32       = make_int_type(32, false);
+    const bool     ascending = t.left <= t.right;
+    const TempCell iter      = make_temp_cell(i32, "net_fill");
+    b.binary(ir::Inst::Tag::Store, iter.lv(b, l), iconst(i32, t.left, b, l), l);
+
+    b.open_region();
+    const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter.lv(b, l), l);
+    const ir::Index pred =
+      b.binary(ascending ? ir::Inst::Tag::SLe : ir::Inst::Tag::SGe, cur, iconst(i32, t.right, b, l), l);
+    const ir::ExtraSlice cond = b.close_region();
+
+    b.open_region();
+    const ir::Index el = b.elem_select(lv, b.unary(ir::Inst::Tag::Load, iter.lv(b, l), l), ty, l, /*for_write=*/true);
+    store_every_element(el, t.element, val, b, l);
+    const ir::ExtraSlice body = b.close_region();
+
+    b.open_region();
+    const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter.lv(b, l), l);
+    const ir::Index next =
+      b.binary(ascending ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, step_cur, iconst(i32, 1, b, l), l);
+    b.binary(ir::Inst::Tag::Store, iter.lv(b, l), next, l);
+    const ir::ExtraSlice step = b.close_region();
+
+    b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
+}
+
 // Fold every resolved net's driver slots through WireRes and store the
 // resolved value into the net. One self-starting process per net, sensitive
 // to all its slots; the net is written only here, so its readers wake on the
@@ -776,7 +846,10 @@ void Lowerer::emit_wire_resolvers() {
             const ir::Index ticks = scaled_delay(*nd_it->second, b);
             b.store_inertial_delay(dst, acc, ticks, l);
         } else {
-            b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+            // An unpacked array net reaches here only when nothing drives it (a
+            // driver's slot is refused for one), and the pull, or the z, of a
+            // driverless net lands in every element alike.
+            store_every_element(b.signal(net, l), module_.signal(net).type, acc, b, l);
         }
         for (const NetForceSite& site : sites) {
             const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
@@ -817,14 +890,45 @@ void Lowerer::emit_wire_resolvers() {
         // no sentence of the LRM asks for, and which has no defined answer for
         // how the two partial folds combine into the net's single value.
         const bool reactive_home = program_driven_nets_.contains(net_u);
+        ir::Ir     body;
+        if (sites.empty()) {
+            body = b.finish();
+        } else {
+            // A forceable net's fold lives in a plain function so that `release`
+            // can run it too (release_net), from any procedural context a release
+            // may appear in, a function included (LRM 13.4.4: a function may hold
+            // any statement that does not block, and the fold never blocks). The
+            // process just calls it.
+            b.ret_void(l);
+            const ir::FunctionId fid = net_resolver_fn(net_u);
+            module_.set_function(fid,
+                                 ir::Function{ .name        = module_.signal(net).name + "$resolve",
+                                               .return_type = module_.pool.void_type,
+                                               .param_types = {},
+                                               .arg_dirs    = {},
+                                               .local_types = {},
+                                               .is_task     = false,
+                                               .ir          = b.finish() });
+            ir::Builder pb(module_);
+            pb.call(fid, {}, l);
+            body = pb.finish();
+        }
         module_.add_process(ir::Process{ .activation    = ir::Activation::Always,
                                          .wait_events   = std::move(wait_events),
                                          .self_start    = true,
                                          .reactive_home = reactive_home,
                                          .span          = ir::SourceSpan{ l, l },
-                                         .ir            = b.finish(),
+                                         .ir            = std::move(body),
                                          .scope         = scope });
     }
+}
+
+ir::FunctionId Lowerer::net_resolver_fn(uint32_t net) {
+    const auto [it, fresh] = net_resolver_fn_.try_emplace(net);
+    if (fresh) {
+        it->second = module_.reserve_function(module_.pool.void_type);
+    }
+    return it->second;
 }
 
 void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
@@ -849,6 +953,9 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
 
     if (cur_pass_ == Pass::Classify) {
         record_net_driver(left);
+        if (strength_may_be_weak(strength)) {
+            note_weak_driver(left);
+        }
         return;
     }
 
@@ -1046,6 +1153,13 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     const auto sit = sigmap_.find(&canonical_value_symbol(root));
     if (sit == sigmap_.end()) {
         return; // hierarchical / not-yet-collected: guarded loud
+    }
+    if (!lhs.type->getCanonicalType().isIntegral()) {
+        // A whole unpacked array or struct net: its layout width is one element's, so
+        // a site over it would force element 0 only. Left unregistered, lower_proc_assign
+        // refuses it.
+        // TODO: force / release of an unpacked-aggregate net.
+        return;
     }
     const auto     net_u = static_cast<uint32_t>(sit->second);
     const uint32_t net_w = module_.pool.layout(module_.signal(sit->second).type).width;
@@ -1418,12 +1532,45 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
         rlo = r->first;
         rhi = r->second;
     }
+    // A force site is one `force` statement's whole range, active as a unit. A
+    // release of part of an ACTIVE site (LRM 10.6.2: the released bits take their
+    // drivers' value, the rest stay forced) has no representation, so it stops the
+    // run with a diagnostic instead of releasing all of it, or none. Whether the
+    // site is active is a run-time fact: a release that only overlaps a site not
+    // forced at that moment (ivtest force_release_wire_pv forces [2:1] after it has
+    // released [3:2]) is exact.
+    // TODO: per-bit release of a wider force site (needs per-segment active flags
+    // fixed at Collect, from every release range of the net).
+    for (const NetForceSite& site : fs->second) {
+        if (site.lo <= rhi && rlo <= site.hi && !(site.lo >= rlo && site.hi <= rhi)) {
+            const std::string banner = banner_at(lv.sourceRange.start());
+            b.open_region();
+            b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                       severity_banner(lv.sourceRange.start()),
+                       "release of part of an active force is not supported (LRM 10.6.2)",
+                       {},
+                       l);
+            b.finish(banner + "release", 1, l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(site_is(site.active, 1, b, l), then_r, else_r, l, /*unlikely=*/true);
+        }
+    }
+    bool released = false;
     for (const NetForceSite& site : fs->second) {
         if (site.lo >= rlo && site.hi <= rhi) {
             const ir::Index flag = b.signal(site.active, l);
             const ir::Index off  = site_const(0, b, l);
             b.binary(ir::Inst::Tag::Store, flag, off, l);
+            released = true;
         }
+    }
+    if (released) {
+        // LRM 10.6.2: "when released, the net shall immediately be assigned the
+        // value determined by the drivers of the net". Run the resolver's fold
+        // now rather than leave it to the process the store above only wakes.
+        b.call(net_resolver_fn(static_cast<uint32_t>(sit->second)), {}, l);
     }
 }
 
@@ -1440,6 +1587,9 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
     }
     if (cur_pass_ == Pass::Classify) {
         record_net_driver_whole(ns);
+        if (strength_may_be_weak(pack_strength(ns.getDriveStrength()))) {
+            weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(ns)));
+        }
         return;
     }
     const bool resolved = resolved_nets_.contains(static_cast<uint32_t>(signal_of(ns)));
@@ -1636,8 +1786,8 @@ std::optional<ir::Signal> Lowerer::gate_select_base(const Expression& value) {
 // bit position (translateIndex maps both descending and ascending ranges to
 // distance from the LSB end), so non-zero-based and ascending ranges resolve
 // correctly.
-std::optional<uint32_t> Lowerer::gate_select_bit(const Expression& value, const Expression& index) {
-    const std::optional<int32_t> idx = try_const_int(index);
+std::optional<uint32_t> Lowerer::gate_select_bit(const Expression& value, const Expression& index, Fold mode) {
+    const std::optional<int32_t> idx = try_const_int(index, mode);
     if (!idx) {
         return std::nullopt;
     }
@@ -1652,7 +1802,7 @@ std::optional<uint32_t> Lowerer::gate_select_bit(const Expression& value, const 
 // Resolve a terminal expression to a static (signal, bit) location if it is a
 // plain scalar reference, a constant bit-select, or a constant 1-bit
 // part-select of a packed signal (gate instance arrays produce the latter).
-std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e) {
+std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e, Fold mode) {
     const Expression& base = unwrap_conversions(e);
     if (base.kind == ExpressionKind::NamedValue) {
         const ValueSymbol& sym = base.as<NamedValueExpression>().symbol;
@@ -1671,7 +1821,7 @@ std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e) 
             return std::nullopt;
         }
         const auto sig = gate_select_base(es.value());
-        const auto bit = sig ? gate_select_bit(es.value(), es.selector()) : std::nullopt;
+        const auto bit = sig ? gate_select_bit(es.value(), es.selector(), mode) : std::nullopt;
         if (!bit) {
             return std::nullopt;
         }
@@ -1685,7 +1835,7 @@ std::optional<Lowerer::GateTerm> Lowerer::gate_static_term(const Expression& e) 
             return std::nullopt;
         }
         const auto sig = gate_select_base(rs.value());
-        const auto bit = sig ? gate_select_bit(rs.value(), rs.right()) : std::nullopt;
+        const auto bit = sig ? gate_select_bit(rs.value(), rs.right(), Fold::Required) : std::nullopt;
         if (!bit) {
             return std::nullopt;
         }
@@ -1707,9 +1857,7 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
     // 28-3), while a MOS pass switch propagates it as z (LRM Table 28-6), so
     // gate_input_value resolves the code per caller.
     {
-        slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    evalCtx(astCtx);
-        const slang::ConstantValue cv = e.eval(evalCtx);
+        const slang::ConstantValue cv = fold_const(e, Fold::Runtime);
         if (cv.isInteger()) {
             const slang::logic_t bit = cv.integer()[0];
             // logic_t::operator== is a 4-state compare (x == z yields x), so
@@ -1723,7 +1871,7 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
         }
     }
 
-    if (const auto term = gate_static_term(e)) {
+    if (const auto term = gate_static_term(e, Fold::Runtime)) {
         return GateInput{ .sig = term->sig, .bit = term->bit };
     }
 
@@ -1778,7 +1926,7 @@ Lowerer::GateTerm Lowerer::lower_gate_output(const Expression& conn) {
         fail("malformed gate output terminal");
     }
     const Expression& lhs  = conn.as<AssignmentExpression>().left();
-    const auto        term = gate_static_term(lhs);
+    const auto        term = gate_static_term(lhs, Fold::Required);
     if (!term) {
         // TODO: concatenation / part-select / unpacked-element gate output
         // lvalues (rare in netlists).
@@ -1810,31 +1958,63 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     if (sym.kind != SymbolKind::Net) {
         fail("pullup/pulldown target must be a net");
     }
+    // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
+    // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
+    const auto [ds0, ds1] = gi.getDriveStrength();
+    const uint8_t driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
+    emit_pull_driver(sym, up, driven, to_source_loc(gi.location), /*program_driver=*/false);
+}
+
+// A permanent driver of all ones (`up`) or all zeros on a whole net at drive
+// strength `level`, lowered as a strength driver slot so it folds against any
+// real driver: a stronger driver wins, else the net holds the pull value. The
+// source a pullup / pulldown primitive (LRM 28.5) is, and an unconnected input
+// port under `unconnected_drive (LRM 22.9) is.
+void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, ir::SourceLoc l, bool program_driver) {
     if (cur_pass_ == Pass::Classify) {
         record_net_driver_whole(sym);
         force_net_resolved(signal_of(sym));
+        if (level != 4) {
+            weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(sym)));
+        }
         return;
     }
     if (cur_pass_ != Pass::Emit) {
         return;
     }
-    const ir::Signal    net = signal_of(sym);
-    const ir::SourceLoc l   = to_source_loc(gi.location);
-    const uint32_t      w   = module_.pool.layout(module_.signal(net).type).width;
-    // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
-    // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
-    const auto [ds0, ds1] = gi.getDriveStrength();
-    const uint8_t driven =
-      up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
-    const uint16_t   strength = up ? static_cast<uint16_t>(driven)       // (highz0, drivenN)
-                                   : static_cast<uint16_t>(driven << 8); // (drivenN, highz1)
+    const ir::Signal net = signal_of(sym);
+    const uint32_t   w   = module_.pool.layout(module_.signal(net).type).width;
+    // (highz0, level1) for a pull up, (level0, highz1) for a pull down.
+    const uint16_t   strength = up ? static_cast<uint16_t>(level) : static_cast<uint16_t>(level << 8);
     ir::Builder      b(module_);
-    const ir::Signal slot = alloc_driver_slot(net, l, strength);
+    const ir::Signal slot = alloc_driver_slot(net, l, strength, program_driver);
     const ir::Index  dst  = b.signal(slot, l);
     const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
     b.binary(ir::Inst::Tag::Store, dst, val, l);
     // A permanent source: self-starting, never re-evaluated (empty sensitivity).
-    add_continuous_process({}, l, b);
+    add_continuous_process({}, l, b, program_driver);
+}
+
+// An unconnected input port of a module declared under `unconnected_drive pull0 /
+// pull1 (LRM 22.9) is pulled down / up instead of floating: a Pull-strength
+// driver of its net, so a driver of the child's own beats it. Only a whole
+// packed net port is pulled. LRM 22.9 says nothing of what pulling a variable
+// means (23.3.3.2 gives an unconnected input variable its data type's default),
+// so a variable, an aggregate and a select port are refused; an event is not
+// driven and has nothing to pull.
+void Lowerer::lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver) {
+    const ValueSymbol& sym = p.internalSymbol->as<ValueSymbol>();
+    if (sym.getType().isEvent()) {
+        return;
+    }
+    if (sym.kind != SymbolKind::Net || p.getInternalExpr() != nullptr || is_aggregate(sym.getType()) ||
+        is_unpacked_array_type(sym.getType())) {
+        // TODO: `unconnected_drive on an unconnected input variable, aggregate
+        // or select port.
+        fail("`unconnected_drive on an unconnected input port that is not a whole packed net is not "
+             "supported");
+    }
+    emit_pull_driver(sym, up, /*level=*/2, to_source_loc(p.location), program_driver);
 }
 
 // A cmos / rcmos switch (LRM 28.9). The LRM defines it purely by
@@ -1858,11 +2038,13 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         // is what marks the net resolved.
         record_net_driver(left);
         record_net_driver(left);
+        note_mos_switch(gi);
         return;
     }
     if (cur_pass_ != Pass::Emit) {
         return;
     }
+    check_mos_switch_strength(gi, left);
     const TimingControl* cmos_delay = gi.getDelay();
     if (cmos_delay != nullptr && cmos_delay->kind != TimingControlKind::Delay) {
         // TODO: cmos/rcmos rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16)
@@ -1908,6 +2090,208 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
     };
     emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
     emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
+}
+
+// Record that `lhs` is driven at a weak strength: every net it names, through
+// concatenations and conversions like record_net_driver.
+void Lowerer::note_weak_driver(const Expression& lhs) {
+    switch (lhs.kind) {
+        case ExpressionKind::Concatenation:
+            for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                note_weak_driver(*op);
+            }
+            return;
+        case ExpressionKind::Conversion:
+            note_weak_driver(lhs.as<ConversionExpression>().operand());
+            return;
+        default:
+            break;
+    }
+    const ValueSymbol* root = lvalue_root(lhs);
+    if (root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net) {
+        weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(canonical_value_symbol(*root))));
+    }
+}
+
+// What a MOS switch instance (nmos, pmos, cmos and their resistive forms) drives
+// and reads, or nullopt for any other primitive or a terminal that is not a net.
+std::optional<Lowerer::MosSwitch> Lowerer::mos_switch_info(const PrimitiveInstanceSymbol& gi) {
+    const std::string_view name = gi.primitiveType.name;
+    const bool             cmos = name == "cmos" || name == "rcmos";
+    if (!cmos && !mos_switch_of(name)) {
+        return std::nullopt;
+    }
+    const auto conns = gi.getPortConnections();
+    if (conns.size() < 2 || conns[0] == nullptr || conns[1] == nullptr ||
+        conns[0]->kind != ExpressionKind::Assignment) {
+        return std::nullopt; // slang has diagnosed the terminal list
+    }
+    const ValueSymbol* root = lvalue_root(conns[0]->as<AssignmentExpression>().left());
+    if (root == nullptr || canonical_value_symbol(*root).kind != SymbolKind::Net) {
+        return std::nullopt;
+    }
+    MosSwitch sw{ .out         = signal_of(canonical_value_symbol(*root)),
+                  .data        = std::nullopt,
+                  .data_opaque = false,
+                  .resistive   = name.starts_with('r'),
+                  .drivers     = cmos ? 2u : 1u };
+    // A data input that is a net bit passes that net's strength; a constant, a
+    // variable or an expression is a strong driver. A net reached some other way
+    // (an element of a net array) is lowered as an expression, so its strength is
+    // not known here.
+    if (const auto term = gate_static_term(*conns[1], Fold::Runtime)) {
+        if (module_.signal(term->sig).is_net) {
+            sw.data = term->sig;
+        }
+    } else if (const ValueSymbol* in = lvalue_root(*conns[1]);
+               in != nullptr && canonical_value_symbol(*in).kind == SymbolKind::Net) {
+        sw.data_opaque = true;
+    }
+
+    return sw;
+}
+
+void Lowerer::note_mos_switch(const PrimitiveInstanceSymbol& gi) {
+    if (const std::optional<MosSwitch> sw = mos_switch_info(gi)) {
+        mos_switches_.push_back(*sw);
+        mos_strength_.reset();
+    }
+}
+
+// The strength levels each recorded switch can drive, by propagation to a fixed
+// point over the switches (a switch's output feeds the next one's data input).
+//
+// A net's levels, as seen by a switch reading it:
+//  - any level, when some driver of it can be weak (weak_driven_nets_) or it has a
+//    tri0 / tri1 pull: the strength then depends on which driver is active;
+//  - otherwise strong, when it has a driver that is not a switch (every such
+//    driver is strong or supply, which a switch treats alike), a supply pull or
+//    no driver at all, plus what each switch driving it can output.
+// A switch outputs the pass or the reduction of its input's levels; its input is
+// strong when it is not a net.
+const Lowerer::MosStrength& Lowerer::mos_strength() {
+    if (mos_strength_) {
+        return *mos_strength_;
+    }
+    MosStrength  r;
+    const size_t n = mos_switches_.size();
+    r.levels.assign(n, 0);
+    ankerl::unordered_dense::map<uint32_t, std::vector<uint32_t>> readers; // data net -> switches
+    for (uint32_t i = 0; i < n; ++i) {
+        r.by_out[static_cast<uint32_t>(mos_switches_[i].out)].push_back(i);
+        if (mos_switches_[i].data) {
+            readers[static_cast<uint32_t>(*mos_switches_[i].data)].push_back(i);
+        }
+    }
+    const auto net_levels = [&](uint32_t net) -> uint8_t {
+        if (weak_driven_nets_.contains(net)) {
+            return kAnyLevel;
+        }
+        const auto pull = net_pull_.find(net);
+        if (pull != net_pull_.end() && pull->second.strength < 4) {
+            return kAnyLevel;
+        }
+        uint8_t  levels      = 0;
+        uint32_t switch_drvs = 0;
+        if (const auto it = r.by_out.find(net); it != r.by_out.end()) {
+            for (const uint32_t i : it->second) {
+                levels |= r.levels[i];
+                switch_drvs += mos_switches_[i].drivers;
+            }
+        }
+        const auto   driven = net_driven_.find(net);
+        const size_t total  = driven != net_driven_.end() ? driven->second.size() : 0;
+        if (total > switch_drvs || total == 0 || pull != net_pull_.end()) {
+            levels |= kStrong;
+        }
+
+        return levels;
+    };
+
+    // A worklist: a switch is revisited when a switch driving its data net grew.
+    // Each switch's level set only gains bits (at most six), so the number of
+    // visits is bounded by the switch count plus six per reader edge.
+    std::vector<uint32_t> work;
+    std::vector<bool>     queued(n, true);
+    size_t                edges = 0;
+    for (const auto& [net, rs] : readers) {
+        edges += rs.size();
+    }
+    work.reserve(n);
+    for (uint32_t i = n; i-- > 0;) {
+        work.push_back(i);
+    }
+    size_t budget = n + 6 * edges + 1;
+    while (!work.empty()) {
+        assert(budget > 0 && "MOS strength propagation did not converge");
+        --budget;
+        const uint32_t i = work.back();
+        work.pop_back();
+        queued[i]           = false;
+        const MosSwitch& sw = mos_switches_[i];
+        const uint8_t in = sw.data_opaque ? kAnyLevel : sw.data ? net_levels(static_cast<uint32_t>(*sw.data)) : kStrong;
+        const uint8_t out = sw.resistive ? mos_reduce_levels(in) : mos_pass_levels(in);
+        if ((r.levels[i] | out) == r.levels[i]) {
+            continue;
+        }
+        r.levels[i] |= out;
+        if (const auto it = readers.find(static_cast<uint32_t>(sw.out)); it != readers.end()) {
+            for (const uint32_t j : it->second) {
+                if (!queued[j]) {
+                    queued[j] = true;
+                    work.push_back(j);
+                }
+            }
+        }
+    }
+    mos_strength_ = std::move(r);
+
+    return *mos_strength_;
+}
+
+// The Emit-time verdict for one MOS switch whose output is `out_left`. Clotho
+// drives every switch strong (see the block comment in Lowerer.h), which is exact
+// when nothing the switch's strength could be compared with is there:
+//  - the output net is not resolved: the switch alone drives it and no pull does;
+//  - the switch is the only driver of its net and the net has no weak pull;
+//  - every switch on the net outputs exactly strong: it orders against any other
+//    driver or pull as strong does;
+//  - every driver is a switch outputting the same single level and no weak pull
+//    competes: the whole net shifts by one step and orders as it did.
+// Anything else is refused instead of resolved wrongly.
+// TODO: carry a strength with a net's value (LRM 28.13, 28.14).
+void Lowerer::check_mos_switch_strength(const PrimitiveInstanceSymbol& gi, const Expression& out_left) {
+    const std::optional<MosSwitch>  sw  = mos_switch_info(gi);
+    const std::optional<ir::Signal> net = resolved_net_of(out_left);
+    if (!sw || !net) {
+        return;
+    }
+    const MosStrength& st     = mos_strength();
+    const auto         net_u  = static_cast<uint32_t>(*net);
+    const auto         on_net = st.by_out.find(net_u);
+    if (on_net == st.by_out.end()) {
+        return;
+    }
+    uint32_t switch_drvs = 0;
+    bool     all_strong  = true;
+    bool     uniform     = true;
+    for (const uint32_t i : on_net->second) {
+        switch_drvs += mos_switches_[i].drivers;
+        all_strong = all_strong && st.levels[i] == kStrong;
+        uniform    = uniform && st.levels[i] == st.levels[on_net->second.front()] && std::has_single_bit(st.levels[i]);
+    }
+    const auto   driven    = net_driven_.find(net_u);
+    const size_t total     = driven != net_driven_.end() ? driven->second.size() : 0;
+    const auto   pull      = net_pull_.find(net_u);
+    const bool   weak_pull = pull != net_pull_.end() && pull->second.strength < 4;
+    const bool   others    = total > switch_drvs;
+    if (all_strong || (!others && !weak_pull && (on_net->second.size() == 1 || uniform))) {
+        return;
+    }
+    fail("MOS switch '" + std::string(gi.primitiveType.name) +
+         "' shares its output net with another driver or a pull, and its output strength is not known to order "
+         "like strong there (LRM 28.13: it passes its data input's strength; LRM 28.14: a resistive switch "
+         "reduces it), which is not supported: Clotho has no strength on a net value");
 }
 
 void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
@@ -1967,9 +2351,18 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         for (const Expression* out : output_span) {
             if (out->kind == ExpressionKind::Assignment) {
                 record_net_driver(out->as<AssignmentExpression>().left());
+                if (strength_may_be_weak(gate_strength)) {
+                    note_weak_driver(out->as<AssignmentExpression>().left());
+                }
             }
         }
+        if (mos) {
+            note_mos_switch(gi);
+        }
         return;
+    }
+    if (mos) {
+        check_mos_switch_strength(gi, output_span[0]->as<AssignmentExpression>().left());
     }
     std::vector<GateInput> inputs;
     inputs.reserve(input_span.size());

@@ -1057,3 +1057,108 @@ TEST_CASE("fixed-array reverse and shuffle work on chandle elements") {
     CHECK(run_capture(src) == "rev 1 1 1\n"
                               "shuf nulls=1 present=1\n");
 }
+
+// -- Reals with a NaN (LRM 7.12.2; docs/LRM_NOTES.md note 48) ----------------
+//
+// `<` is false on a NaN, so the raw relation is not a strict weak order and the
+// comparison sort over it is undefined: the numbers around a NaN came out
+// misordered (57 inversions in 1000 elements, one NaN in seven). Clotho orders
+// NaN after every number, all NaNs equal. Oracle: none -- the LRM does not say
+// and iverilog does not implement the methods on reals; the property checked is
+// the one that makes the answer defined: the numbers are in order, NaNs are
+// together at the end (rsort: the start), and no element is lost.
+TEST_CASE("sorting reals with a NaN orders the numbers and puts NaN last") {
+    constexpr std::string_view src = R"(
+        module m;
+            real nan_v;
+            real q[$];
+            real d[];
+            function automatic int check(input real a[$], input bit nan_first);
+                int  bad = 0, nans = 0;
+                bit  seen_num = 0, seen_nan = 0;
+                real prev = 0.0;
+                foreach (a[i]) begin
+                    if (a[i] != a[i]) begin
+                        nans++;
+                        if (nan_first ? seen_num : 0) bad++;
+                        seen_nan = 1;
+                    end else begin
+                        if (!nan_first && seen_nan) bad++;
+                        if (seen_num && (nan_first ? a[i] > prev : a[i] < prev)) bad++;
+                        seen_num = 1;
+                        prev = a[i];
+                    end
+                end
+                return bad * 1000 + nans;
+            endfunction
+            initial begin
+                nan_v = $bitstoreal(64'h7FF8_0000_0000_0000);
+                for (int i = 0; i < 300; i++)
+                    q.push_back(i % 7 == 0 ? nan_v : real'((i * 37) % 41) - 20.0);
+                d = new[300];
+                foreach (d[i]) d[i] = q[i];
+                q.sort();
+                $display("sort %0d", check(q, 0));
+                q.rsort();
+                $display("rsort %0d", check(q, 1));
+                d.sort();
+                foreach (d[i]) q[i] = d[i];
+                $display("dyn %0d", check(q, 0));
+            end
+        endmodule
+    )";
+    // 43 NaNs among 300 elements; no inversion, in either direction.
+    CHECK(run_capture(src) == "sort 43\nrsort 43\ndyn 43\n");
+}
+
+// The keyed form is a stable merge sort in generated code, not the runtime
+// comparator, so it needs its own NaN rule: a NaN key follows every numeric key
+// ascending, and NaN keys keep their input order.
+TEST_CASE("sorting by a real key with a NaN") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int id; real k; } rec;
+            rec q[$];
+            real nan_v;
+            initial begin
+                nan_v = $bitstoreal(64'h7FF8_0000_0000_0000);
+                q.push_back('{0, 3.0});
+                q.push_back('{1, nan_v});
+                q.push_back('{2, 1.0});
+                q.push_back('{3, nan_v});
+                q.push_back('{4, 2.0});
+                q.sort() with (item.k);
+                foreach (q[i]) $write(" %0d", q[i].id);
+                $display;
+                q.rsort() with (item.k);
+                foreach (q[i]) $write(" %0d", q[i].id);
+                $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == " 2 4 0 1 3\n 1 3 0 4 2\n");
+}
+
+// A shortreal element is a 4-byte float slot. The runtime comparator read eight
+// bytes as a double, so a shortreal queue sorted by its neighbour's bits
+// (`3 1 2 0.5` came back `0.5 2 3 1`). Oracle: none; the expectation is the
+// numeric order of LRM 7.12.2.
+TEST_CASE("sorting shortreals orders them numerically, NaN last") {
+    constexpr std::string_view src = R"(
+        module m;
+            shortreal q[$];
+            shortreal d[];
+            shortreal nan_v;
+            initial begin
+                nan_v = shortreal'($bitstoreal(64'h7FF8_0000_0000_0000));
+                q = '{3.0, 1.0, nan_v, 2.0, 0.5};
+                q.sort();  foreach (q[i]) $write(" %g", q[i]); $display;
+                q.rsort(); foreach (q[i]) $write(" %g", q[i]); $display;
+                d = new[4];
+                d[0] = 4.0; d[1] = -1.0; d[2] = 2.5; d[3] = 0.0;
+                d.sort();  foreach (d[i]) $write(" %g", d[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == " 0.5 1 2 3 nan\n nan 3 2 1 0.5\n -1 0 2.5 4\n");
+}

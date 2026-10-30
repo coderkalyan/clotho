@@ -840,6 +840,24 @@ ir::Index Lowerer::var_elem_select(const ElementSelectExpression& es,
 ir::Index Lowerer::lower_assoc_key(const Expression& key, ir::Ref assoc_ty, ir::Builder& b, ir::SourceLoc l) {
     const ir::Type at = std::get<ir::Type>(module_.pool.get(assoc_ty));
     if (at.right != 0) {
+        // LRM 7.8.1: a wildcard index is any integral value, its numeric value
+        // alone distinguishing the entry. The key is normalized to a fixed 64-bit
+        // big-endian form (assoc_key_info), which keeps every value of a key up
+        // to 64 bits distinct and merges every representation of one value, as
+        // the LRM asks. A wider key would be truncated, so two different values
+        // with equal low 64 bits would be one entry.
+        //
+        // TODO: a wildcard index wider than 64 bits. Needs a value-canonical
+        // variable-length key (the 64-bit form for a value below 2^64, a longer
+        // form that sorts after it above), and the traversal methods decode keys
+        // back through it.
+        const uint32_t width = static_cast<uint32_t>(key.type->getBitWidth());
+        if (width > 64) {
+            throw LowerError{ std::format("a wildcard [*] index of {} bits is not supported: only an index "
+                                          "of at most 64 bits keeps distinct values distinct",
+                                          width),
+                              to_source_span(key.sourceRange) };
+        }
         return lower_expr(key, b); // wildcard [*]: any integral value
     }
     const auto     kr = static_cast<ir::Ref>(at.fields_id);

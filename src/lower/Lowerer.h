@@ -438,6 +438,37 @@ struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
 
 bool is_speculation_safe(const slang::ast::Expression& e);
 
+// Whether an expression calls a user subroutine -- a function, a task or a class
+// method, anything but a system function -- anywhere in its tree. The call's
+// callee body is not part of the expression, so it is not walked.
+struct UserCallScan : ASTVisitor<UserCallScan, VisitFlags::Expressions> {
+    bool found = false;
+
+    void handle(const CallExpression& call) {
+        if (!call.isSystemCall()) {
+            found = true;
+            return;
+        }
+        visitDefault(call);
+    }
+};
+
+bool has_user_call(const slang::ast::Expression& e);
+
+// The module instance a scope depends on (its body, or the root for a scope outside
+// every instance and package), or null for a package or `$unit` scope. See Scans.cpp.
+const slang::ast::Scope* enclosing_instance_scope(const slang::ast::Scope* s);
+
+// Whether the implicit return variable of a STATIC function (LRM 13.4.1, 13.4.2)
+// has to be persistent storage. It keeps its value from call to call, but that is
+// only observable if some call can see the value an earlier one left: the body
+// reads it, or returns it, on a path that has not overwritten it first, or the
+// function can be re-entered through its own body, where a nested call's value is
+// what the outer one finds. A function that overwrites it on every path before
+// any read, and cannot re-enter, behaves the same with a fresh cell per call, which
+// costs nothing. Anything the analysis does not model counts as observable.
+bool static_return_needs_storage(const slang::ast::SubroutineSymbol& sub);
+
 // Detects whether an expression reads any symbol in a given set (used to find
 // frame-local / formal-argument references in an event operand).
 struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
@@ -950,6 +981,13 @@ public:
 
     void init_static_class_props(const Scope& scope);
 
+    // The same for the package / `$unit` generics `top` specializes with a class one
+    // of its modules declares: those belong to the module (is_global_scope), so the
+    // globals pass skips them and this one runs them on the top that owns them.
+    void init_local_class_specializations(const InstanceSymbol& top);
+
+    void init_static_props_of(const std::vector<const ClassType*>& classes);
+
     const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& sigmap() const {
         return sigmap_;
     }
@@ -971,6 +1009,11 @@ public:
     // `clocks` must outlive every call made through this Lowerer.
     void set_inferred_clocks(const InferredClockMap* clocks) {
         inferred_clocks_ = clocks;
+    }
+
+    // Whether `--allow-port-coercion` is given (LRM 23.3.3.1).
+    void set_allow_port_coercion(bool allow) {
+        allow_port_coercion_ = allow;
     }
 
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
@@ -1068,6 +1111,12 @@ private:
     void report(Severity sev, std::string code, std::string msg, ir::SourceSpan span);
 
     [[noreturn]] void fail(std::string msg);
+
+    // Refuse, at `where`, a value of `width` bits that no LLVM integer can hold
+    // (ir::max_integer_bits; a 4-state value takes twice its width), which would
+    // otherwise crash inside LLVM. LRM 6.9.1 and 7.4.1 let an implementation limit the
+    // length of a vector or packed array, as long as the limit is at least 65536 bits.
+    void check_value_width(uint32_t width, bool four_state, slang::SourceRange where);
 
     // Run one behavioural member's lowering, and on a guard failure record the
     // diagnostic and carry on with the next member instead of abandoning the
@@ -1506,6 +1555,27 @@ private:
 
     ir::Ref make_int_type(uint32_t width, bool is_four);
 
+    // Whether an expression slang can fold is allowed to be folded, which depends
+    // on what the site does with it.
+    //
+    // Required: the grammar demands a constant expression here (a part-select
+    // bound, a replication count, a bin bound, a `$past` tick count, ...), so
+    // slang has already diagnosed anything else, and a constant function call is
+    // legal in it. LRM 13.4.3: "The execution of a constant function call has no
+    // effect on the initial values of the variables used either at simulation
+    // time or among multiple invocations of a function at elaboration time", so
+    // slang's evaluation, every call on fresh variables, is the right one.
+    //
+    // Runtime: an ordinary run-time expression the lowering tries to specialize
+    // when it happens to fold (a case label, a delay, a selector, a gate input).
+    // A call to a user subroutine in it has to run each time the expression is
+    // evaluated: it may read and write static variables, including its own
+    // implicit return variable (LRM 13.4.2), and write module state. slang's
+    // evaluator gives every call fresh variables and ignores the side effects,
+    // so such an expression is never folded, and the site takes its run-time
+    // path.
+    enum class Fold : uint8_t { Required, Runtime };
+
     ir::Index coerce(ir::Index               v,
                      const slang::ast::Type& from,
                      ir::Ref                 to,
@@ -1551,6 +1621,16 @@ private:
 
     void build_inout_aliases(const InstanceSymbol& inst);
 
+    bool needs_port_coercion(const PortConnection& pc, const PortSymbol& p);
+
+    bool net_is_read(const ValueSymbol& sym);
+
+    bool port_driven_inside(const PortSymbol& p);
+
+    bool other_driver_of(const Expression& own_target);
+
+    void scan_net_uses();
+
     void collect_signals(const InstanceBodySymbol& body);
 
     void collect_scope_signals(const Scope&                                                                  scope,
@@ -1594,6 +1674,10 @@ private:
         uint64_t elem_lo, elem_hi; // linearized unpacked-element ordinals
         uint32_t bit_lo, bit_hi;   // packed bit range within one element
         bool     operator==(const NetRegion&) const = default;
+        // Two regions share a bit iff their element bands and their bit ranges intersect.
+        bool overlaps(const NetRegion& o) const {
+            return elem_lo <= o.elem_hi && o.elem_lo <= elem_hi && bit_lo <= o.bit_hi && o.bit_lo <= bit_hi;
+        }
     };
 
     static constexpr NetRegion kWholeNet{ 0, UINT64_MAX, 0, UINT32_MAX };
@@ -1670,6 +1754,50 @@ private:
 
     void emit_wire_resolvers();
 
+    // -- MOS switch strength (LRM 28.13, 28.14) --
+    //
+    // A MOS switch passes the strength of its data input to its output, and a
+    // resistive one reduces it. Clotho has no strength on a net's value, so every
+    // switch drives strong. That is exact whenever no other driver or pull
+    // competes with the switch's strength, or the strengths involved order the same
+    // as strong does; check_mos_switch_strength refuses the rest. Classify records
+    // what it needs (note_weak_driver, note_mos_switch); the verdict runs in Emit,
+    // once Classify has seen every driver of the design.
+    struct MosSwitch {
+        // The net the switch drives, and the net its data input reads (empty for a
+        // constant, a variable or an expression: those drive strong).
+        ir::Signal                out;
+        std::optional<ir::Signal> data;
+        // The data input names a net in a shape the switch lowering reads as an
+        // expression (an element of a net array): the strength it would pass is
+        // then unknown.
+        bool data_opaque;
+        bool resistive;
+        // Drivers the switch makes on `out`: 1, or 2 for a cmos (its two halves).
+        uint32_t drivers;
+    };
+    // Per-switch and per-net results of the strength propagation over every
+    // switch Classify recorded; built on first use by mos_strength().
+    struct MosStrength {
+        // Possible strength levels (a bit set, see Nets.cpp) of each switch's output,
+        // parallel to mos_switches_.
+        std::vector<uint8_t> levels;
+        // Output net -> indices of the switches driving it.
+        ankerl::unordered_dense::map<uint32_t, std::vector<uint32_t>> by_out;
+    };
+
+    void note_weak_driver(const Expression& lhs);
+
+    std::optional<MosSwitch> mos_switch_info(const PrimitiveInstanceSymbol& gi);
+
+    void note_mos_switch(const PrimitiveInstanceSymbol& gi);
+
+    const MosStrength& mos_strength();
+
+    void check_mos_switch_strength(const PrimitiveInstanceSymbol& gi, const Expression& out_left);
+
+    void store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l);
+
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym);
@@ -1719,6 +1847,15 @@ private:
     // Net handle -> its force sites (in registration order; the resolver blends
     // them in that order, exact for disjoint ranges).
     ankerl::unordered_dense::map<uint32_t, std::vector<NetForceSite>> net_force_sites_;
+    // Net handle -> the zero-formal function that re-folds the net's drivers and
+    // overlays its force sites. The resolver process calls it, and so does a
+    // `release` of the net, so the net takes its driven value at once (LRM
+    // 10.6.2) instead of when the resolver process next runs. A plain function,
+    // not a task, because a release may sit in a function. Reserved on first
+    // use, filled by emit_wire_resolvers.
+    ankerl::unordered_dense::map<uint32_t, ir::FunctionId> net_resolver_fn_;
+
+    ir::FunctionId net_resolver_fn(uint32_t net);
     // A `force` statement -> (net handle, index into net_force_sites_) so the Emit
     // lowering reuses the site the Collect scan created.
     ankerl::unordered_dense::map<const void*, std::pair<uint32_t, uint32_t>> stmt_force_site_;
@@ -1840,15 +1977,22 @@ private:
 
     std::optional<ir::Signal> gate_select_base(const Expression& value);
 
-    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index);
+    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index, Fold mode);
 
-    std::optional<GateTerm> gate_static_term(const Expression& e);
+    // `mode` is how a bit-select index is folded: Required for an output terminal
+    // (a net_lvalue takes a constant_select, LRM A.8.5), Runtime for an input,
+    // which is any expression. A part-select bound is always Required.
+    std::optional<GateTerm> gate_static_term(const Expression& e, Fold mode);
 
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index);
 
     GateTerm lower_gate_output(const Expression& conn);
 
     void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up);
+
+    void emit_pull_driver(const ValueSymbol& net, bool up, uint8_t level, ir::SourceLoc l, bool program_driver);
+
+    void lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver);
 
     void lower_cmos_switch(const PrimitiveInstanceSymbol& gi);
 
@@ -1895,6 +2039,8 @@ private:
     void wire_ports(const InstanceSymbol& child);
 
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out);
+
+    ir::Index lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b);
 
     static const Statement& unwrap_blocks(const Statement& stmt);
 
@@ -2121,9 +2267,11 @@ private:
 
     void scan_disable_targets(const ProceduralBlockSymbol& blk);
 
-    bool hard_park(const Statement& body);
+    bool hard_park(const Statement& body, bool forked_children_are_occupants = false);
 
     bool subroutine_parks(const SubroutineSymbol& sub);
+
+    bool design_virtual_forks(slang::ast::Compilation& comp);
 
     void record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
                             const Symbol*                                  owner,
@@ -2679,6 +2827,8 @@ private:
 
     void lower_var_initializer(const VariableSymbol& vs);
 
+    const Expression* declaration_initializer(const VariableSymbol& vs);
+
     void finalize_preinit();
 
     void finalize_sva_history();
@@ -3075,6 +3225,7 @@ private:
     // take them by reference.
     struct FnCtx;
     struct CopyOutArg;
+    struct OpenBlock;
 
     struct RandSeqCtx {
         // Production -> the ir::Function it lowered to.
@@ -4317,7 +4468,15 @@ private:
 
     uint64_t const_uint(const Expression& e, std::string_view what);
 
-    std::optional<int32_t> try_const_int(const Expression& e);
+    // The one place Clotho asks slang to evaluate an expression. A bad value when
+    // `e` is not constant, or when `mode` forbids folding it. The overload without
+    // a context evaluates against the current scope; a caller folding many
+    // expressions in one scope passes its own.
+    slang::ConstantValue fold_const(const Expression& e, Fold mode);
+
+    slang::ConstantValue fold_const(const Expression& e, Fold mode, const slang::ast::ASTContext& astCtx);
+
+    std::optional<int32_t> try_const_int(const Expression& e, Fold mode = Fold::Runtime);
 
     // -- Packed-select index normalization --
     //
@@ -4362,10 +4521,19 @@ private:
         ankerl::unordered_dense::map<const ValueSymbol*, uint32_t> localmap;
         // Storage type per Local index.
         std::vector<ir::Ref> local_types;
-        // The return variable's Local index / type (valid iff has_ret_local).
-        uint32_t ret_local     = 0;
-        ir::Ref  ret_type      = ir::Ref::Invalid;
-        bool     has_ret_local = false;
+        // The return slot's Local index / type (valid iff has_ret_local): the
+        // frame cell a `return` hands the caller its value through. For an
+        // automatic function it is also the implicit return variable (LRM 13.4.1).
+        // For a static one the implicit variable is ret_static instead and this
+        // cell is only scratch, made on first use (ret_var_ref).
+        uint32_t ret_local       = 0;
+        ir::Ref  ret_type        = ir::Ref::Invalid;
+        bool     has_ret_local   = false;
+        bool     ret_local_ready = false;
+        // The implicit return variable of a STATIC function: persistent
+        // module-signal storage shared by every call (LRM 13.4.2). Unset for an
+        // automatic function.
+        std::optional<ir::Signal> ret_static;
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
@@ -4549,6 +4717,8 @@ private:
 
     ir::Signal declare_static_local(const ValueSymbol& vs);
 
+    ir::Signal declare_static_return(const SubroutineSymbol& sub);
+
     ir::Signal declare_static_prop(const slang::ast::ClassPropertySymbol& prop);
 
     bool is_static_local(const VariableSymbol& vs, bool force_frame) const;
@@ -4565,6 +4735,8 @@ private:
 
     static bool is_global_subroutine(const SubroutineSymbol& sub);
 
+    static bool is_global_scope(const Scope* scope);
+
     static std::optional<ir::DpiCType> dpi_ctype(const slang::ast::Type& type);
 
     void build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id);
@@ -4575,6 +4747,8 @@ private:
                                   std::vector<ir::ArgDir>&            arg_dirs,
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
+
+    static const InstanceSymbol* owning_top(const Scope* scope);
 
     static const InstanceSymbol* owning_top(const SubroutineSymbol& sub);
 
@@ -4661,7 +4835,8 @@ private:
 
     ir::FunctionId build_fork_child(const Statement&                    body,
                                     std::span<const ValueSymbol* const> captures,
-                                    ir::ForkKind                        kind);
+                                    ir::ForkKind                        kind,
+                                    const std::vector<OpenBlock>&       enclosing);
 
     ir::FunctionId build_deferred_body(std::span<const Expression* const> args,
                                        char                               default_conv,
@@ -4669,7 +4844,12 @@ private:
                                        bool                               fd_arg,
                                        bool                               monitor);
 
+    // The frame cell a `return expr` stages an aggregate in and hands the caller.
     ir::Index ret_var_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b);
+
+    // The function's implicit return variable (LRM 13.4.1): what a bare `return;`
+    // and the end of the body hand the caller.
+    ir::Index implicit_return_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b);
 
     void build_function(const SubroutineSymbol& sub, ir::FunctionId id);
 
@@ -5042,6 +5222,11 @@ private:
     // of allocating fresh storage. Both sides then read/write one signal and
     // multi-driver resolution folds competing drivers.
     ankerl::unordered_dense::map<const Symbol*, ir::Signal> inout_alias_;
+    // The variable output ports (LRM 23.2.2.2) whose declaration carries an
+    // initializer, by the variable each declares. slang keeps that initializer on
+    // the PortSymbol and not on the variable, so declaration_initializer finds it
+    // here. Filled by collect_signals for every instance body.
+    ankerl::unordered_dense::map<const Symbol*, const PortSymbol*> port_initializers_;
     // Continuous-driver coverage per net signal: the closed regions already
     // driven, checked for overlap by record_net_driver_region (NetRegion defined
     // in the net-driver-tracking section).
@@ -5094,6 +5279,17 @@ private:
     // child, or one declared in a subroutine body. Each activation is its own
     // occupant with its own frame, so the remote form refuses these.
     ankerl::unordered_dense::set<const Symbol*> disable_multi_;
+    // Named blocks that enclose a `fork`, anywhere in their body. The forked children
+    // are activity "enabled within" the block (LRM 9.6.2), so each child is an
+    // activation of every enclosing targeted block (build_fork_child), and a `disable`
+    // of one has to walk the list even from inside a single-activation process body.
+    ankerl::unordered_dense::set<const Symbol*> disable_forked_;
+    // Named blocks whose body calls a subroutine that forks. The children are not
+    // lexically inside the block, so a `disable` cannot end them; refused.
+    ankerl::unordered_dense::set<const Symbol*> disable_fork_via_call_;
+    // Whether any user virtual method of the design forks (design_virtual_forks);
+    // computed on first use.
+    std::optional<bool> design_virtual_forks_;
     // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
     // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
     // hard_park. The remote form refuses one, the lexical form does not care -- it
@@ -5107,6 +5303,14 @@ private:
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
+    // Nets some driver can drive weaker than strong (an `assign`, net declaration
+    // assignment or gate with an explicit weak or pull drive strength, a pullup /
+    // pulldown), recorded by the Classify pass for check_mos_switch_strength.
+    ankerl::unordered_dense::set<uint32_t> weak_driven_nets_;
+    // Every MOS switch Classify saw, in source order, and the propagation result
+    // over them (reset whenever one is added).
+    std::vector<MosSwitch>     mos_switches_;
+    std::optional<MosStrength> mos_strength_;
     // The subset of resolved_nets_ with at least one PROGRAM-side driver: a
     // driver lowered while in_program_ (a program's hierarchical `assign`, a
     // net declaration assignment, a `force`) or a wire_ports port copy for a
@@ -5177,6 +5381,12 @@ private:
         // ir::BlockInfo label when some `disable` targets this block, else
         // kNoBlockLabel: an untargeted block emits no instruction at all.
         uint32_t label;
+        // True for a frame of the PARENT body that a fork child re-pushes so its
+        // own `disable` can still find the target (build_fork_child). The child is
+        // an activation of that block but not lexically inside a region of it, so
+        // it leaves by aborting itself, and %m does not repeat the parent's name
+        // (the child's invoking scope already carries it).
+        bool inherited = false;
     };
     static constexpr uint32_t kNoBlockLabel = UINT32_MAX;
     std::vector<OpenBlock>    named_blocks_;
@@ -5372,6 +5582,19 @@ private:
     // Inference verdicts for concurrent assertions (see set_inferred_clocks).
     // Null when nothing populated it.
     const InferredClockMap* inferred_clocks_ = nullptr;
+    // Port coercion (LRM 23.3.3.1); see set_allow_port_coercion.
+    bool allow_port_coercion_ = false;
+    // The ports build_inout_aliases coerced to inout: wire_ports copies nothing for them.
+    ankerl::unordered_dense::set<const PortSymbol*> coerced_ports_;
+    // Every write target in this top's hierarchy, by the value symbol it roots at, and
+    // the instance body each one is written in.
+    ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, std::vector<const Expression*>> writes_;
+    ankerl::unordered_dense::map<const Expression*, const slang::ast::InstanceBodySymbol*>       write_in_;
+    // Every value symbol this top's hierarchy reads somewhere (net_is_read), built on
+    // the first question and valid for the top lower_top was given.
+    const InstanceSymbol*                                        top_inst_      = nullptr;
+    bool                                                         reads_scanned_ = false;
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> read_syms_;
     // The event control of the procedure currently being lowered, or null when it
     // has none. Set by lower_procedural_block; read by lower_concurrent_assertion
     // to resolve an inferred clock inside the instance being lowered.
@@ -5383,6 +5606,10 @@ private:
     // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
     // outside a compound assignment.
     std::optional<ir::Index> compound_lv_;
+    // The value an output port's connection assigns, read by the EmptyArgument
+    // slang leaves for it in the connection's right-hand side (lower_port_output).
+    // Nullopt outside one; scoped by Restore, never assigned bare.
+    std::optional<ir::Index> port_value_;
     // The queue `$` resolves against inside a queue range-select's bounds (see
     // QueueDollarCtx). Nullopt outside one; scoped by Restore, never assigned
     // bare.

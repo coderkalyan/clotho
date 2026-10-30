@@ -148,6 +148,23 @@ ir::Index Lowerer::sort_right_wins(const SortIter& s, ir::Builder& b, ir::Source
     const T         ascend  = s.key_real ? T::FLt : (s.key_signed ? T::SLt : T::ULt);
     const T         descend = s.key_real ? T::FGt : (s.key_signed ? T::SGt : T::UGt);
     const ir::Index cmp     = b.binary(s.desc ? descend : ascend, right, left, l);
+    if (s.key_real) {
+        // FLt / FGt are false whenever a key is NaN, which is not an ordering: a
+        // NaN neither precedes nor follows anything, yet the keys around it are
+        // ordered, so equivalence stops being transitive and the merge produces
+        // an order no comparison supports. Clotho's order (LRM_NOTES.md, 7.12.2)
+        // puts NaN after every number, all NaNs equal and so kept in input order:
+        //
+        //   ascending   right wins iff  !nan(right) && (nan(left) || right < left)
+        //   descending  right wins iff  !nan(left)  && (nan(right) || right > left)
+        //
+        // FNe is the unordered compare, so FNe(x, x) is exactly isnan(x).
+        const ir::Index ln = b.binary(T::FNe, left, left, l);
+        const ir::Index rn = b.binary(T::FNe, right, right, l);
+        const ir::Index open = b.unary(T::Bnot, s.desc ? ln : rn, l);
+        const ir::Index win  = b.binary(T::Bor, s.desc ? rn : ln, cmp, l);
+        return b.binary(T::Band, open, win, l);
+    }
     if (!s.key_four) {
         return cmp;
     }

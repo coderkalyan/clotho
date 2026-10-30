@@ -2,8 +2,9 @@
 
 #include "lower/Lowerer.h"
 
-#include "ir/Verify.h"
+#include <slang/diagnostics/AllDiags.h>
 
+#include "ir/Verify.h"
 namespace clotho {
 
 namespace {
@@ -120,6 +121,62 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // preference, so it does not vary by policy.
     engine.setSeverity(slang::diag::AlwaysWithoutTimingControl, slang::DiagnosticSeverity::Warning);
 
+    // Constructs the LRM makes illegal -- "shall be an error", "shall not", or no
+    // derivation from the Annex A grammar -- that slang accepts with a warning for
+    // compatibility with other tools. Clotho rejects source the LRM rejects.
+    // Most are errors in slang's own driver without --compat, but Clotho issues
+    // diagnostics through its own engine, which starts from slang's defaults.
+    for (const slang::DiagCode code : {
+           slang::diag::EnumRangeLiteral,              // 6.19.2
+           slang::diag::EmptyUdpPort,                  // A.5.4
+           slang::diag::LifetimeForPrototype,          // A.2.6
+           slang::diag::InvalidPulseStyle,             // 30.7.4.1
+           slang::diag::ImplicitNamedPortTypeMismatch, // 23.3.2.3
+           slang::diag::SplitDistWeightOp,             // A.1.10
+           slang::diag::DPIPureTask,                   // 35.5.1.3
+           slang::diag::SpecifyPathConditionExpr,      // 30.4.4.1
+           slang::diag::SolveBeforeDisallowed,         // A.1.10
+           slang::diag::DynamicNotProcedural,          // 6.21
+           slang::diag::NonstandardStringConcat,       // 6.16
+           slang::diag::MisplacedTrailingSeparator,    // A.1.3
+           slang::diag::QualifiersOnOutOfBlock,        // 8.24
+           slang::diag::InitializerRequired,           // 6.3.2
+           slang::diag::PackageImportInClass,          // A.10
+           slang::diag::ForeachCallExpr,               // 12.7.3
+           slang::diag::NonstandardHierarchicalCross,  // A.2.11
+           slang::diag::NonstandardInside,             // A.8.3
+           slang::diag::BareAssociativePattern,        // A.6.7.1
+           slang::diag::DigitsLeadingUnderscore,       // 5.7.1
+           slang::diag::RefArgAutomaticFunc,           // 13.5.2
+           slang::diag::NonstandardConstraintBlock,    // A.1.10
+           slang::diag::FormatEmptyArg,                // 21.2.1.1
+           slang::diag::ClockVarTargetAssign,          // 14.16.2
+           slang::diag::CrossIdentInBinsof,            // 19.6
+           slang::diag::RefArgForkJoin,                // 9.3.2
+           slang::diag::CannotIndexScalar,             // 11.5.1
+           slang::diag::VirtualArgNameMismatch,        // 8.20
+           slang::diag::ParameterDoesNotExist,         // 23.10.2.2
+         }) {
+        engine.setSeverity(code, slang::DiagnosticSeverity::Error);
+    }
+    // NOTE: SeqNoMatch stays a warning although LRM 16.12.22 forbids a degenerate
+    // sequence as a property: slang reports it for sequences that can match, such
+    // as `(a ##[1:$] b) intersect (c ##[1:2] d)`, whose lengths meet at 2 and 3.
+    // NOTE: Three more stay warnings, as common idioms Clotho simulates as
+    // written. StaticInitializerMustBeExplicit (6.21): `int i = 0;` in an initial
+    // block. MultipleAlwaysAssigns (9.2.2.2): an FPGA power-on value set by an
+    // initial block for an always_ff variable. UnsizedInConcat (11.4.12): `{'0, x}`,
+    // whose `'0` is one bit wide in a self-determined context (5.7.1).
+
+    // Legal source slang elaborates differently from the LRM, warning as it does.
+    // Accepting it would simulate something other than what was written.
+    // TODO: Each is a docs/TODO.md entry.
+    // LRM 23.10.1: of several defparams on one parameter the last wins; slang
+    // keeps the first.
+    engine.setSeverity(slang::diag::DuplicateDefparam, slang::DiagnosticSeverity::Error);
+    // LRM 34: slang drops a protected envelope's contents.
+    engine.setSeverity(slang::diag::ProtectedEnvelope, slang::DiagnosticSeverity::Error);
+
     // The unused-parameter pair, silenced. CheckUnused is on for every run, and
     // on real parameterised RTL this one finding drowns the rest: measured on
     // hazard3, 718 of 722 unused findings are unused parameters, against three
@@ -127,9 +184,8 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // config parameter set through every module and using the subset each needs
     // IS the idiom -- so the check reports a pattern rather than a problem, at a
     // volume that buries the three findings that matter. Not a semantic question,
-    // hence here rather than in the policy below. Re-enable per design with
-    // `-Wunused-parameter`, which reaches slang's engine through the forwarded
-    // driver options.
+    // hence here rather than in the policy below. NOTE: `-W` options do not
+    // reach this engine (see main.cpp), so it cannot be re-enabled per design.
     engine.setSeverity(slang::diag::UnusedParameter, slang::DiagnosticSeverity::Ignored);
     engine.setSeverity(slang::diag::UnusedPackageParameter, slang::DiagnosticSeverity::Ignored);
 
@@ -459,7 +515,9 @@ LowerResult lower_design(slang::ast::Compilation&                            com
                          const std::shared_ptr<slang::TextDiagnosticClient>& client,
                          Timings*                                            timings,
                          ir::SystemAccess                                    allow_system,
-                         bool                                                partial) {
+                         bool                                                partial,
+                         bool                                                allow_port_coercion) {
+    // (allow_port_coercion reaches each Lowerer below.)
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
     // as never null, and there are a dozen early returns.
@@ -593,6 +651,12 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             });
             analysis.analyze(comp);
             for (const slang::Diagnostic& d : analysis.getDiagnostics()) {
+                // LRM 23.3.3.1 port coercion: slang says "coerced to 'inout'", which Clotho does
+                // not do, and flags every net with a port driver beside another driver.
+                // Lowerer::needs_port_coercion decides, and says it in its own words.
+                if (d.code == slang::diag::InputPortCoercion || d.code == slang::diag::OutputPortCoercion) {
+                    continue;
+                }
                 harvest(d);
             }
             comp.unfreeze();
@@ -739,6 +803,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
             Lowerer           lw(*module, *result.sources, tick_fs, allow_system);
+            lw.set_allow_port_coercion(allow_port_coercion);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
@@ -966,11 +1031,13 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               std::shared_ptr<SourceContext> ctx,
                               Timings*                       timings,
                               ir::SystemAccess               allow_system,
-                              bool                           partial = false,
-                              DiagStyle                      style   = {}) {
+                              bool                           partial             = false,
+                              DiagStyle                      style               = {},
+                              bool                           allow_port_coercion = false) {
     const slang::SourceManager* const sm = comp.getSourceManager();
     if (sm == nullptr) {
-        LowerResult bare = lower_design(comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial);
+        LowerResult bare =
+          lower_design(comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial, allow_port_coercion);
         assert_well_typed(bare);
 
         return bare;
@@ -981,7 +1048,8 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         style.client = std::make_shared<slang::TextDiagnosticClient>();
     }
     engine.addClient(style.client);
-    LowerResult result = lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial);
+    LowerResult result =
+      lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion);
     assert_well_typed(result);
 
     // slang's own items arrive rendered (lower_design harvests them one by one).
@@ -998,7 +1066,10 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
 
 } // namespace
 
-LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_files(std::span<const std::string_view> paths,
+                        Timings*                          timings,
+                        ir::SystemAccess                  allow_system,
+                        bool                              allow_port_coercion) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // One SourceManager shared across every tree so the Compilation's diagnostics
@@ -1033,13 +1104,14 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, std::move(ctx), timings, allow_system);
+    return lower_compilation(comp, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
 }
 
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          Timings*                               timings,
                          ir::SystemAccess                       allow_system,
-                         PathPrefixMap                          path_prefix_map) {
+                         PathPrefixMap                          path_prefix_map,
+                         bool                                   allow_port_coercion) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`
@@ -1096,10 +1168,14 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // The design's diagnostics are rendered the way the Driver renders its own, so
     // colour and `--diag-source`, `--diag-column`, `--diag-location`, ... apply to
     // them alike.
-    return lower_compilation(cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr));
+    return lower_compilation(
+      cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr), allow_port_coercion);
 }
 
-LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_sources(std::span<const std::string_view> args,
+                          Timings*                          timings,
+                          ir::SystemAccess                  allow_system,
+                          bool                              allow_port_coercion) {
     auto                   driver = std::make_unique<slang::driver::Driver>();
     slang::driver::Driver& dr     = *driver;
     dr.addStandardArgs();
@@ -1132,10 +1208,13 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
                                                  .reported = true });
         return result;
     }
-    return lower_driver(std::move(driver), timings, allow_system);
+    return lower_driver(std::move(driver), timings, allow_system, {}, allow_port_coercion);
 }
 
-LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_text(std::string_view source,
+                       Timings*         timings,
+                       ir::SystemAccess allow_system,
+                       bool             allow_port_coercion) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // `SyntaxTree::fromText` uses slang's process-wide default SourceManager, so
@@ -1151,7 +1230,7 @@ LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAcce
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(cr, std::move(ctx), timings, allow_system);
+    return lower_compilation(cr, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
 }
 
 LowerResult lower_buffer(std::string_view path,

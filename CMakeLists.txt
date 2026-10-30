@@ -218,6 +218,11 @@ FetchContent_Declare(
   GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a # v10.0-360-g6933832c9
   # Every patches/slang-*.patch is applied, in name order:
   #
+  # slang-const-eval-static-init: LRM 13.4.3 says a constant function call's
+  # variables "are initialized as they would be for normal simulation". slang
+  # skipped a static variable's initializer with a warning, so
+  # `localparam P = f(1)` folded from 0 instead of the initializer. Not upstream.
+  #
   # slang-class-forward-ref: LRM 8.6 (class methods), 18.5 (constraint blocks),
   # and 19.4/19.5 (a covergroup's coverpoint/cross/iff/event expressions
   # embedded in a class) all give a class's own members unordered visibility to
@@ -251,6 +256,25 @@ FetchContent_Declare(
   # code block once per prod, which bound its statements N times and
   # desynchronized createRule's positional pairing for a rule with two or more
   # code-block prods. See docs/design/randsequence.md §13.
+  #
+  # slang-enum-cast-context: LRM 6.19.4 says "Casting to an enum type shall cause
+  # a conversion of the expression to its base type", and 6.24.1 that a static
+  # cast returns "the value that a variable of the casting type would hold after
+  # being assigned the expression". So the operand is sized by the cast's base
+  # type, as in any assignment. slang only pushed the target's width into the
+  # operand when the operand was assignment compatible with the target, which an
+  # enum never is, so `e_t'('hx)` (40-bit base) was `00xxxxxxxx`, `e_t'('1)` was 1
+  # and `e_t'(x + 2'd1)` lost its carry. This is upstream slang commit 15f633ba6
+  # verbatim; it must apply before slang-unsized-xz-extend, which extends the
+  # same operand, and it sorts first. Drop it on the first bump past that commit.
+  #
+  # slang-unsized-xz-extend: LRM 5.7.1 says an unsized unsigned literal whose
+  # high-order bit is x or z "shall be extended to the size of the expression
+  # containing the literal constant", with x or z. slang only zero-extended, so
+  # `reg [63:0] r = 'bx` held 32 x bits under 32 zeros, in the AST Clotho lowers
+  # and in every value slang folds (parameters, enum members, constant
+  # functions, case labels). This is upstream slang commit 0f89ca18 verbatim
+  # (IntegerLiteral::propagateType); drop it on the first bump past that commit.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
 )
@@ -1012,6 +1036,7 @@ set(CLOTHO_TEST_SOURCES
   tests/interface_test.cpp
   tests/concat_select_test.cpp
   tests/wide_select_test.cpp
+  tests/wide_arith_test.cpp
   tests/force_release_test.cpp
   tests/system_test.cpp
   tests/diagnostic_render_test.cpp
@@ -1147,11 +1172,26 @@ if(NOT WIN32)
   set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
 endif()
 
+# A --dpi-lib definition wins over a same-named libc symbol, under the JIT and
+# in a linked executable alike. getpid is the probe: libc defines it, LLVM never
+# synthesizes it, and the real value cannot be 31337.
+if(NOT WIN32)
+  add_library(clotho_dpi_shadow SHARED tests/dpi_shadow/shadow.c)
+  add_test(NAME dpi_shadows_libc
+           COMMAND clotho_cli run --dpi-lib $<TARGET_FILE:clotho_dpi_shadow>
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/dpi_shadow/shadow.sv")
+  set_tests_properties(dpi_shadows_libc PROPERTIES PASS_REGULAR_EXPRESSION "pid=31337")
+  clotho_exe_test(exe_dpi_shadow tests/dpi_shadow/shadow.sv DPI $<TARGET_FILE:clotho_dpi_shadow>
+                  DEPENDS clotho_dpi_shadow)
+  add_test(NAME exe_dpi_shadow COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shadow${CMAKE_EXECUTABLE_SUFFIX}")
+  set_tests_properties(exe_dpi_shadow PROPERTIES PASS_REGULAR_EXPRESSION "pid=31337")
+endif()
+
 # What `clotho build` links into an executable is not sanitized: the executable
 # carries no sanitizer runtime (docs/design/executables.md), so instrumented code
 # there could neither link nor load. The compiler that builds it is sanitized.
 if(CLOTHO_SANITIZE)
-  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared)
+  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared clotho_dpi_shadow)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -fno-sanitize=all)
       target_link_options(${target} PRIVATE -fno-sanitize=all)

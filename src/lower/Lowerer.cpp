@@ -25,6 +25,18 @@ void Lowerer::fail(std::string msg) {
     throw LowerError{ std::move(msg), to_source_span(cur_range_) };
 }
 
+void Lowerer::check_value_width(uint32_t width, bool four_state, slang::SourceRange where) {
+    if (ir::integer_bits(width, four_state) <= ir::max_integer_bits) {
+        return;
+    }
+    const uint32_t limit = ir::max_integer_bits / (four_state ? 2 : 1);
+    throw LowerError{ std::format("a {}-state value of {} bits is too wide: Clotho holds a value in one LLVM "
+                                  "integer of at most {} bits, and a 4-state value takes twice its width, "
+                                  "so the limit here is {} bits",
+                                  four_state ? 4 : 2, width, ir::max_integer_bits, limit),
+                      to_source_span(where) };
+}
+
 ir::SourceLoc Lowerer::loc(const Expression& e) const {
     return to_source_loc(e.sourceRange.start());
 }
@@ -371,6 +383,7 @@ ir::Ref Lowerer::string_value_ref(std::string_view text) {
 // carries no signedness: the opcode or the instruction data that reads a value
 // says how.
 ir::Ref Lowerer::make_int_type(uint32_t width, bool is_four) {
+    check_value_width(width, is_four, cur_range_);
     return module_.pool.int_type(width, is_four);
 }
 

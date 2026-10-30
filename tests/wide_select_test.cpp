@@ -1,5 +1,5 @@
 // Runtime-offset bit / part-selects of a vector too wide to shift inline
-// (LRM 11.5.1 / 11.5.2). Above `wide_dyn_select_bits` (4096) the backend stops
+// (LRM 11.5.1 / 11.5.2). Above `wide_dyn_select_bits` (256) the backend stops
 // asking LLVM for a variable shift on an i(2W) value -- which legalizes into
 // O(W/64) selects per word, so JIT time grew as O(W^2): 21 s for a 12 Kbit vector
 // and over half an hour for ivtest pr722's 65537-bit one -- and calls
@@ -312,8 +312,8 @@ TEST_CASE("a blocking and a nonblocking write to one wide vector keep their orde
 }
 
 TEST_CASE("the wide and inline select paths agree across the threshold") {
-    // The crossover is a codegen choice: a 4096-bit vector shifts inline, a
-    // 4104-bit one goes through the runtime, and the same program text on each
+    // The crossover is a codegen choice: a 256-bit vector shifts inline, a
+    // 264-bit one goes through the runtime, and the same program text on each
     // must print the same thing (in range, out of range, and x-indexed).
     constexpr std::string_view src        = R"(
         module m;
@@ -345,8 +345,8 @@ TEST_CASE("the wide and inline select paths agree across the threshold") {
         }
         return run_capture(s);
     };
-    const std::string inl  = with_width("4096"); // inline variable shift
-    const std::string wide = with_width("4104"); // runtime word-indexed path
+    const std::string inl  = with_width("256"); // inline variable shift
+    const std::string wide = with_width("264"); // runtime word-indexed path
     CHECK(inl == "deadbeef\nx0\nxx\nxx\nff\n");
     CHECK(wide == inl);
 }
@@ -732,4 +732,39 @@ TEST_CASE("a watched wide select store does not load or compare the whole vector
     )");
     CHECK(ir.find("load i131072") == std::string::npos);
     CHECK(ir.find("icmp ne i131072") == std::string::npos);
+}
+
+TEST_CASE("a constant-offset select of wide storage stays inline and a runtime offset calls the helper") {
+    // kernel.md: the helper serves runtime-indexed selects only. A constant offset has
+    // no variable shift to legalize, so a 512-bit vector, past the threshold, is read and
+    // written with plain constant-position code.
+    const auto source = [](std::string_view index) {
+        std::string s = R"(
+            module m;
+              logic [511:0] v;
+              bit   [511:0] b;
+              int           i, acc;
+              initial begin
+                i = $urandom;
+                v = 0; b = 0;
+                v[INDEX] = 1'b1; b[INDEX] = 1'b1;
+                acc = v[INDEX] + b[INDEX];
+                v[INDEX +: 8] = 8'hff;
+                $display("%0d %h", acc, v[INDEX +: 8]);
+              end
+            endmodule
+        )";
+        for (size_t p = s.find("INDEX"); p != std::string::npos; p = s.find("INDEX", p)) {
+            s.replace(p, 5, index);
+            p += index.size();
+        }
+        return s;
+    };
+    const std::string constant = emit_ir(source("300"));
+    const std::string runtime  = emit_ir(source("i"));
+    CHECK(constant.find("@rt_wide_sel") == std::string::npos);
+    CHECK(constant.find("@rt_wide_ins") == std::string::npos);
+    CHECK(runtime.find("@rt_wide_sel") != std::string::npos);
+    CHECK(runtime.find("@rt_wide_ins") != std::string::npos);
+    CHECK(run_capture(source("300")) == "2 ff\n");
 }

@@ -94,11 +94,17 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`defparam` across top-level modules** — a path into another top is refused.
 - [ ] **`defparam` that changes an implicitly typed parameter's type** (6.20.2, 23.10.1) — the
   parameter keeps its original initializer's type, so the override is refused.
+- [ ] **Several `defparam`s on one parameter** (23.10.1) — the last one in source order wins,
+  but slang keeps the first, so the design is refused.
 
 ### Procedural control
 
 - [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
-  time-consuming task call, a `fork` or an `expect` cannot be aborted down the enable chain.
+  time-consuming task call or an `expect`, or a task that forks, cannot be aborted. A block
+  whose body calls a subroutine that forks is refused too: those children are not in it.
+- [ ] **Order of an event-controlled `<=` against plain NBAs** (4.6, 10.4.2) — the update of
+  `x <= @e v` or `x <= @(posedge c) v` commits after the step's plain NBAs, not in the order
+  its event occurred, so a plain `x <= w` executed after the trigger loses to it.
 
 ## M2 — Icarus Verilog parity
 
@@ -166,18 +172,22 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Net delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
     declaration assignment `wire #(r, f) w = e;` (10.3.3).
-  - [ ] **Net delay on an unpacked-aggregate net** — resolution folds packed planes only;
-    needs a leaf-wise inertial replay.
+  - [ ] **Net delay on an unpacked array or aggregate net** — resolution folds packed planes
+    only; needs a leaf-wise inertial replay.
   - [ ] **Net delay on a user-defined-nettype net** — needs nettype resolution functions.
 
 ### Procedural continuous assignment & force
 
+- [ ] **`release` of part of a wider net force** (10.6.2) — `force n = v; release n[0];`
+  should free only bit 0; a force site is released as a unit, so executing the release
+  while that force is active stops the run with a fatal error.
 - [ ] **`force` of an input or inout port target** (10.6.2) — the port-copy driver does not
   honour the force.
 - [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must
   be decided when the deferred update commits, but the deferred record carries no gate.
 - [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
   bit/part-selects as the target.
+- [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
 
 ### Real numbers
 
@@ -210,8 +220,6 @@ Milestones, in order; lower ones unblock higher ones:
   task-call record slot that only a coroutine has.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
-- [ ] **Clotho IR dump of a design that calls `$monitor`** — `clotho build --emit ir`
-  crashes with a segmentation fault partway through printing.
 - [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
   suspended when a simulation ends are not freed, so a host running several leaks them.
 
@@ -276,8 +284,9 @@ Milestones, in order; lower ones unblock higher ones:
     definite value where the range model yields x.
   - [ ] **Drive strength on `wand` / `wor` nets**.
   - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
-  - [ ] **Strength reduction through gates** — including the r-variants (`rnmos`, `rpmos`,
-    `rcmos`), which behave as their nonresistive forms (28.14).
+  - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the
+    r-variants do not reduce it; refused when the output net is resolved against a
+    driver or weak pull and the strengths do not order as strong (LRM_NOTES note 38).
 
 ### Hierarchy reach
 
@@ -285,8 +294,23 @@ Milestones, in order; lower ones unblock higher ones:
   its own signal map.
 - [ ] **Hierarchical path through a generate-block instance or an instance-array element**
   — `g.u.sig` and `arr[i].sig` fail at elaboration.
-- [ ] **`inout` / `ref` port connected to a select or concatenation** (23.3.3) — needs
-  sub-signal aliasing.
+- [~] **`inout` / `ref` port aliasing** (23.2.2.1, 23.3.3) — a port and its connection must be
+  one whole net each, of one width; missing pieces:
+  - [ ] **Port that is a select, or connection that is a select or concatenation** — needs
+    sub-signal aliasing.
+  - [ ] **Connection to a net of another width** — the bits they share connect and the rest of
+    the wider side is unconnected; needs sub-signal aliasing.
+  - [ ] **Two ports bound to one internal net, connected to different nets** (`module m(a, a)`)
+    — the two connected nets become one net; needs merging the nets of one scope.
+- [ ] **Port expression that is not a select of one internal net** (23.2.2.1, 23.2.2.2) — a
+  non-ANSI concatenation port `module m({a, b})` and an ANSI `.p(expr)` port are refused.
+- [ ] **`` `unconnected_drive `` on an unconnected input variable, aggregate or select port**
+  (22.9) — only a whole packed net port is pulled; the others are refused.
+- [ ] **Port coercion to inout of a port that is not a whole net of its own width** (23.3.3.1)
+  — with `--allow-port-coercion`, a connection to a select, concatenation, expression or net
+  of another width is refused.
+- [ ] **Initializer on a select port whose variable is declared apart from the port** (23.2.2.2)
+  — `output x = 1;` with a later `reg [3:0] x;` under `module m(x[3:2])` is refused.
 
 ### Timing checks (basic)
 
@@ -297,8 +321,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Data types
 
-- [ ] **2-state formal in the call ABI (performance)** — a 2-state formal is still passed as a
-  4-state (mm, z) plane pair whose z plane is constant 0.
 - [ ] **Nonblocking assignment to a string character** (10.4.2) — `s[i] <= c` is refused; it needs
   a masked character record rather than a whole-string one.
 - [ ] **NBA to a class property** — `c.x <= v`, of any type including `string`, is refused; NBA
@@ -374,6 +396,8 @@ Milestones, in order; lower ones unblock higher ones:
   refused; X propagation differs from a byte compare.
 - [ ] **Associative-array key mixing a class handle with a variable-width component** (7.8) — a
   `string`, queue, dynamic-array or associative-array component beside the handle is refused.
+- [ ] **Wildcard `[*]` index wider than 64 bits** (7.8.1) — an index expression (including a
+  string literal of more than 8 characters) wider than 64 bits is refused.
 - [ ] **Assignment-pattern lvalue over a container or handle** (10.9) — a queue, dynamic-array or
   associative-array right-hand side, or a `string` / handle member, is refused.
 - [ ] **Bit-stream casting** (6.24.3) — `{<<{...}}` / `{>>{...}}` as cast operands.
@@ -457,8 +481,14 @@ Milestones, in order; lower ones unblock higher ones:
 ### Full object orientation
 
 - [~] **Garbage collection** (8.4) — collector coverage and policy still missing.
-  - [ ] **Collector tracing of event, `mailbox`, `semaphore`, `process` and
+  - [ ] **Collector tracing of event, `mailbox`, `semaphore` and
     `std::weak_reference` handles** (8.4) — not yet described to the collector.
+  - [ ] **Collection inside a delay-free loop** (8.4) — a loop that allocates and never
+    suspends grows the heap without bound; the collector runs only at time-step boundaries.
+  - [ ] **Collection trigger counts buffers owned by objects** (8.4) — the trigger sees only
+    object bytes, so objects owning large strings or containers can fill memory before one runs.
+  - [ ] **Covergroup instances are freed only at exit** (19.3) — an instance created in a loop
+    is never reclaimed during the run.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
@@ -699,6 +729,7 @@ Milestones, in order; lower ones unblock higher ones:
   expressions, coverage merge and database; see docs/design/functional-coverage.md.
 - [ ] **Attributes** — semantic meaning for `(* ... *)` attributes beyond
   parse-through.
+- [ ] **Protected envelopes** (34) — encrypted source cannot be decrypted, so it is refused.
 
 ### Complete system task / function library
 

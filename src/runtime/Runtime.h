@@ -304,6 +304,29 @@ void rt_wide_ins(void* mm, void* z, uint32_t width, int64_t base, uint32_t cwidt
                  uint32_t n, uint32_t four, uint32_t has_z, uint32_t unknown,
                  const uint64_t* must, const uint64_t* may, const uint64_t* z_bits);
 
+// -- Multiply, divide and modulo of very wide integers --
+
+// out = a * b (rt_wide_mul), a / b (rt_wide_udiv, rt_wide_sdiv) or a % b (rt_wide_umod,
+// rt_wide_smod) of two `width`-bit values. The backend calls these for an operand wider
+// than `wide_arith_bits` (128), where LLVM's own lowering is a bit-serial divide and a
+// multiply whose compile time grows as width^2 (docs/design/kernel.md).
+//
+// `out`, `a` and `b` are little-endian arrays of ceil(width / 64) words, the in-memory
+// layout of an i(width), with the bits above `width` zero in both operands and in the
+// result. `out` overlaps neither operand; `a` and `b` may be one buffer.
+//
+// The result is what the LLVM operation at that width gives: wrapped modulo 2^width, with
+// the `s` forms reading two's complement, the quotient truncated toward zero and the
+// remainder taking the dividend's sign. A multiply needs no signed form, since the low
+// `width` bits of the product are the same either way. The 2-state divide rules hold: a
+// zero divisor gives 0, and the signed MIN / -1 wraps (quotient MIN, remainder 0). A
+// 4-state divide treats x and a zero divisor in generated code, so never passes one here.
+void rt_wide_mul(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_udiv(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_sdiv(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_umod(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_smod(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 // The site of one guarded class-handle use — a property dereference or a virtual
@@ -1700,11 +1723,12 @@ typedef struct rt_event {
 void rt_run_init(void* event_static_block, uint32_t event_static_count);
 
 // Detached one-shot event subscriptions (`->> @(x) e`, LRM 15.5.1), keyed by the
-// dense (signal, edge) trigger id. Growable: a `->> @(x) e` in a loop makes one
-// registration per pass, which no static wait bucket can bound. `count` is the
-// `repeat (n)` countdown; the edge decrements and only a record reaching zero
-// fires. rt_event_detach_fire moves the matured handles to a ready list the caller
-// reads back with rt_event_detach_ready.
+// trigger id of the control: a dense (signal, edge) id, or RT_TRIG_EVENT | slot
+// when the control names an event (see rt_intra_event_register). Growable: a
+// `->> @(x) e` in a loop makes one registration per pass, which no static wait
+// bucket can bound. `count` is the `repeat (n)` countdown; the trigger decrements
+// and only a record reaching zero fires. rt_event_detach_fire moves the matured
+// handles to a ready list the caller reads back with rt_event_detach_ready.
 void     rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count);
 uint32_t rt_event_detach_fire(uint32_t trig_id);
 uint64_t rt_event_detach_ready(uint32_t i);
@@ -1832,9 +1856,16 @@ void rt_proc_adopt(void* to, void* from);
 // reference this was.
 void rt_proc_thread_done(void* pcb);
 
-// Take / drop the reference a `process` object holds on the block it names.
+// Take / drop the reference a `process` object holds on the block it names. The
+// drop runs from the object's finalizer: `obj` is the object being reclaimed, and
+// the block's weak memo of it is cleared so a later `self()` mints a fresh object.
 void rt_proc_obj_retain(void* pcb);
-void rt_proc_obj_release(void* pcb);
+void rt_proc_obj_release(void* pcb, void* obj);
+
+// Pooled blocks carved out of the chunk pool so far: a high-water mark, since a
+// released block returns to the freelist rather than to the allocator. Bounded
+// across a loop of fork children exactly when their blocks are released.
+uint32_t rt_proc_pool_blocks(void);
 
 // LRM 9.7 makes `p.await()` on the current process an error; the check is dynamic
 // (the target is a handle value), so this is its located fatal.
@@ -2010,6 +2041,12 @@ uint32_t rt_intra_any(void);
 // (called by the backend after the site's commit loop).
 void rt_intra_release(uint32_t idx);
 
+// The same pair for a site whose records stage a class handle (LRM 9.4.5 on an aggregate
+// or an array with a handle leaf). Between alloc and release the record is a conservative
+// GC root: until the delay elapses it may hold the only reference to the object it carries.
+void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride);
+void  rt_intra_release_rooted(uint32_t idx);
+
 // Reclaim every record (including any left scheduled by a $finish mid-flight)
 // into its freelist and clear all ready lists. Called once at simulation start.
 void rt_intra_reset(void);
@@ -2054,12 +2091,24 @@ void rt_inertial_cb(rt_timer* timer, void* ctx);
 
 // -- Event-triggered deferred stores (`x <= @e y` / `x <= repeat(N) @e y`) --
 //
-// Same records and NBA-region commit as the `#d` path, but fired by a signal edge
-// instead of the wheel. A `<= @e` site registers its record on a dense trigger id
-// `trig_id` (a distinct (trigger-signal, edge) pair); when that edge fires (from a
-// blocking store or an NBA commit), the backend calls rt_intra_event_fire, which
-// counts the record down and, at zero, moves it to its target's ready list for the
-// NBA region. `count` is N for `repeat(N) @e`, 1 for a plain `@e`.
+// Same records and NBA-region commit as the `#d` path, but fired by an event
+// control instead of the wheel. A `<= @e` site registers its record on a trigger
+// id `trig_id`; when that trigger fires, the backend calls rt_intra_event_fire,
+// which counts the record down and, at zero, moves it to its target's ready list
+// for the NBA region. `count` is N for `repeat(N) @e`, 1 for a plain `@e`.
+//
+// A trigger id names one of two things. Without RT_TRIG_EVENT it is the backend's
+// dense (signal, edge) id, fired from both signal wake paths (a blocking store and
+// an NBA commit). With RT_TRIG_EVENT, the low bits are the slot of a named event
+// OBJECT, fired wherever that object is triggered (`-> e`, and the NBA-region
+// service of `->> e`): an event wakes through its object, not through a value
+// change, and the record waits on the object its variable named when the
+// statement executed (LRM 15.5.5.1). Object slots are never reused, so the key
+// cannot go stale.
+enum { RT_TRIG_EVENT = 0x80000000u };
+
+// The trigger id of the event object at `obj`: RT_TRIG_EVENT | its slot.
+uint32_t rt_event_trig_id(const void* obj);
 
 // Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
 void rt_intra_event_register(uint32_t trig_id, void* rec);

@@ -528,7 +528,8 @@ collection fails to satisfy the request.
 | Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table of `{ ptr base, u32 nhandles, u32 offsets[] }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`) | precise |
 | Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, u64 size }` node in the frame, linked at the ramp, unlinked at frame free | conservative, validated, **pinning** |
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
-| NBA / intra staging images (`rt_nba_arr_slot`, `rt_intra_alloc`), `$strobe` / `$monitor` argument images, deferred-report queues | Registered with their element descriptor | precise |
+| Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
+| NBA staging images (`rt_nba_arr_slot`), `$strobe` / `$monitor` argument images, deferred-report queues | Registered with their element descriptor | precise |
 | Detached `->> #d e` timer node (`src/ir/llvm/`), later `rt_event` waiter lists | Explicit root registration at creation | precise |
 | Wheel timers, wait buckets, the active ring, fork/disable records | Nothing to do — they hold *frame* pointers, and frames are enumerated above | — |
 | VCD var tables, `rt_ref_names`, `chandle` | **Not roots.** VCD caches only pointers into `clotho.state`; `chandle` is foreign | — |

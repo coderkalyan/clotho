@@ -483,16 +483,16 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
         CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
     SUBCASE("`pure` on an imported task (LRM 35.5.1.3)") {
-        // "An imported task can never be declared pure." slang only warns
-        // (-Wdpi-pure-task), so the refusal has to be Clotho's: is_pure would mark
-        // the C declaration readnone + willreturn and let the optimizer CSE or
+        // "An imported task can never be declared pure." Clotho's severity policy
+        // makes slang's -Wdpi-pure-task an error; accepting it would let is_pure
+        // mark the C declaration readnone + willreturn, and the optimizer CSE or
         // delete a call kept purely for its side effects.
         constexpr std::string_view src = R"(
             module m;
               import "DPI-C" pure task t(input int x);
               initial t(1);
             endmodule)";
-        CHECK(lower_fail(src).find("cannot be declared `pure`") != std::string::npos);
+        CHECK(lower_fail(src).find("DPI tasks cannot be marked 'pure'") != std::string::npos);
     }
     SUBCASE("an import task enabled from a function (inherited from slang)") {
         // LRM 35.8's SV-side half: a function may not perform a task enable, so a

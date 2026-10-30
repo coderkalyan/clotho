@@ -5,12 +5,14 @@
 // the IR into something compilable; the library is no longer "just IR".
 //
 // Model (see ir/llvm/Backend.h for the full rationale):
-//   * One shared state struct holds a slot per module signal: a packed must|may
-//     word plus a z word — the z word elided when the may-z analysis
-//     (Analysis.h) proves the signal never carries z.
+//   * One shared state struct holds a slot per module signal: a 2-state signal is
+//     one native word, a 4-state one a packed must|may word plus a z word -- the z
+//     word elided when the may-z analysis (Analysis.h) proves the signal never
+//     carries z.
 //   * Each process becomes a switched-resume coroutine `ptr <name>(ptr state)`;
 //     Load/Store address fields of that struct.
-//   * Every SSA value is lowered as a (must|may, z) plane pair so X/Z propagate.
+//   * A 4-state SSA value is lowered as a (must|may, z) plane pair so X/Z
+//     propagate; a 2-state value is one native integer.
 
 #include <memory>
 #include <vector>

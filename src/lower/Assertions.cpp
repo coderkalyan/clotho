@@ -336,6 +336,49 @@ void Lowerer::scan_assert_control(const ProceduralBlockSymbol& blk) {
     blk.getBody().visit(v);
 }
 
+// Whether some user virtual method of the design forks, directly or through the
+// subroutines it calls. A virtual call's static callee says nothing of the override
+// that runs, so a `disable` of a block that makes one has to assume the worst. The
+// design is walked once, from the compilation root, skipping procedural blocks, which
+// hold no class.
+bool Lowerer::design_virtual_forks(slang::ast::Compilation& comp) {
+    if (design_virtual_forks_) {
+        return *design_virtual_forks_;
+    }
+    struct Forks : ASTVisitor<Forks, VisitFlags::AllGood> {
+        ankerl::unordered_dense::set<const SubroutineSymbol*> seen;
+        bool                                                  found = false;
+        void                                                  handle(const BlockStatement& s) {
+            found = found || s.blockKind != StatementBlockKind::Sequential;
+            visitDefault(s);
+        }
+        void handle(const CallExpression& c) {
+            visitDefault(c);
+            if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
+                const auto* sub = std::get<const SubroutineSymbol*>(c.subroutine);
+                if (sub != nullptr && seen.insert(sub).second) {
+                    sub->getBody().visit(*this);
+                }
+            }
+        }
+    };
+    struct Virtuals : ASTVisitor<Virtuals, VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const ProceduralBlockSymbol&) {}
+        void handle(const SubroutineSymbol& s) {
+            if (!found && s.isVirtual() && !s.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+                Forks f;
+                s.getBody().visit(f);
+                found = f.found;
+            }
+        }
+    };
+    Virtuals v;
+    comp.getRoot().visit(v);
+    design_virtual_forks_ = v.found;
+    return v.found;
+}
+
 // Collect: the named blocks some `disable` in this process targets, how each
 // one is named (lexically from inside itself, or remotely from outside), and
 // whether disabling the outermost one would have to flush a deferred queue
@@ -375,6 +418,15 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
         uint32_t                                         fork_depth = 0;
         uint32_t                                         sub_depth  = 0;
         ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
+        // Reaches the enclosing Lowerer for the design-wide virtual-override question.
+        Lowerer* self = nullptr;
+        // The named blocks a `fork` sits in, directly (`fork_in`) or inside a
+        // subroutine they call (`via_call`). `forks_seen` lets a call tell whether
+        // its callee forked; `sub_forks` remembers the answer per subroutine.
+        std::vector<const Symbol*>                                  fork_in;
+        std::vector<const Symbol*>                                  via_call;
+        uint32_t                                                    forks_seen = 0;
+        ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_forks;
 
         // Follow a user subroutine once. `sub_depth` marks everything found
         // inside as multi-activation; `open` is swapped empty, because a
@@ -385,15 +437,53 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
                 return;
             }
             const auto* sub = std::get<const SubroutineSymbol*>(c.subroutine);
-            if (sub == nullptr || !entered.insert(sub).second) {
-                return; // recursion, or already walked
+            if (sub == nullptr) {
+                return;
             }
+            bool forks = false;
+            if (const auto known = sub_forks.find(sub); known != sub_forks.end()) {
+                forks = known->second; // already walked
+            } else if (entered.insert(sub).second) {
+                std::vector<const Symbol*> saved;
+                saved.swap(open);
+                ++sub_depth;
+                const uint32_t before = forks_seen;
+                sub->getBody().visit(*this);
+                forks = forks_seen != before;
+                --sub_depth;
+                open.swap(saved);
+                sub_forks[sub] = forks;
+            } else {
+                return; // recursion in progress
+            }
+            // The static callee of a virtual call says nothing of the override that runs.
+            // Assume the worst when any virtual method of the design forks: that
+            // override's children are not in this block, and nothing here ends them.
+            if (!forks && !open.empty() && sub->isVirtual() && !sub->flags.has(slang::ast::MethodFlags::BuiltIn) &&
+                self->design_virtual_forks(sub->getParentScope()->getCompilation())) {
+                forks = true;
+            }
+            if (forks) {
+                ++forks_seen;
+                via_call.insert(via_call.end(), open.begin(), open.end());
+            }
+        }
+        // A randsequence's productions lower to functions of their own, outside every
+        // block open here, so a fork in one is activity the block cannot hold. slang's
+        // visitor does not descend into them, so they are walked by hand, as a call.
+        void handle(const RandSequenceStatement& s) {
             std::vector<const Symbol*> saved;
             saved.swap(open);
             ++sub_depth;
-            sub->getBody().visit(*this);
+            const uint32_t before = forks_seen;
+            Lowerer::visit_randseq(s, *this);
+            const bool forks = forks_seen != before;
             --sub_depth;
             open.swap(saved);
+            if (forks) {
+                ++forks_seen;
+                via_call.insert(via_call.end(), open.begin(), open.end());
+            }
         }
         void handle(const BlockStatement& s) {
             const bool forks  = s.blockKind != StatementBlockKind::Sequential;
@@ -405,6 +495,12 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
                     multi.push_back(s.blockSymbol);
                 }
                 bodies.emplace_back(s.blockSymbol, &s.body);
+            }
+            if (forks) {
+                // This fork's children are activity within every block open here,
+                // including the fork block itself when it is named.
+                ++forks_seen;
+                fork_in.insert(fork_in.end(), open.begin(), open.end());
             }
             visitDefault(s);
             if (named) {
@@ -432,6 +528,7 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
         }
     };
     Scan v;
+    v.self = this;
     blk.getBody().visit(v);
 
     // The block that IS this procedure's outermost scope, recorded per target
@@ -451,8 +548,17 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
     for (const Symbol* t : v.multi) {
         disable_multi_.insert(t);
     }
+    for (const Symbol* t : v.fork_in) {
+        disable_forked_.insert(t);
+    }
+    for (const Symbol* t : v.via_call) {
+        disable_fork_via_call_.insert(t);
+    }
     for (const auto& [sym, body] : v.bodies) {
-        if (hard_park(*body)) {
+        // A fork inside a named block parks its parent at the join, but its children are
+        // activations of the block too (build_fork_child) and end with it, so the join
+        // is released by them: not a park the abort cannot claim.
+        if (hard_park(*body, /*forked_children_are_occupants=*/true)) {
             disable_hard_.insert(sym);
         }
     }
@@ -480,7 +586,10 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
                 }
                 continue;
             }
-            if (set == &v.remote) {
+            // A block with a `fork` inside needs the occupant bookkeeping too, even
+            // when only its own body disables it: the forked children are
+            // activations of it, and the lexical exit alone would leave them running.
+            if (set == &v.remote || disable_forked_.contains(t)) {
                 disable_remote_.insert(t);
             }
         }
@@ -497,13 +606,14 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
 // would resume it
 // a second time; an `expect` parks on a reactive verdict. Refused rather than
 // silently double-woken.
-bool Lowerer::hard_park(const Statement& body) {
+bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupants) {
     struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
-        Lowerer* self  = nullptr;
-        bool     found = false;
+        Lowerer* self         = nullptr;
+        bool     found        = false;
+        bool     fork_is_hard = true;
 
         void handle(const BlockStatement& s) {
-            found = found || s.blockKind != StatementBlockKind::Sequential;
+            found = found || (fork_is_hard && s.blockKind != StatementBlockKind::Sequential);
             visitDefault(s);
         }
         void handle(const slang::ast::ConcurrentAssertionStatement& s) {
@@ -531,7 +641,8 @@ bool Lowerer::hard_park(const Statement& body) {
         }
     };
     Park p;
-    p.self = this;
+    p.self         = this;
+    p.fork_is_hard = !forked_children_are_occupants;
     body.visit(p);
 
     return p.found;

@@ -1,10 +1,13 @@
 #include "Analysis.h"
 
 #include <algorithm>
+#include <cassert>
 #include <optional>
+#include <span>
 #include <variant>
 
 #include "Module.h"
+#include "TypeModel.h"
 
 namespace clotho::ir {
 
@@ -399,14 +402,27 @@ namespace {
 // subscription-order write scan, and five design_uses_* scans).
 // ---------------------------------------------------------------------------
 
-// The constant driven bit range of a packed lvalue select chain. `whole` marks a
-// dynamic / unpacked / whole-storage store whose driven bits cannot be pinned
-// (the caller then marks every bit driven). Composes nested constant packed
-// selects: each PartSelect adds its `lsb` to the accumulated window, a constant
-// BitSelect pins one bit. Mirrors the frontend's net_region_of.
+// The constant driven bit range of an lvalue select chain, in the flat bit
+// coordinates of the root's storage: for a packed net, the bit within the
+// vector; for a fixed unpacked array of packed elements, `leaf ordinal * element
+// width + bit within the element`, leaves in row-major order (the backend's flat
+// array storage model). Mirrors the frontend's net_region_of.
+//
+// `whole` marks a store whose bits cannot be pinned (a run-time index, an
+// unpacked-struct member): the caller then marks every bit driven. `empty` marks
+// a pinned store that addresses no storage at all, a constant select wholly
+// outside its base: a write to one is a no-op (LRM 11.5.1, 7.4.5), so it drives
+// nothing. Otherwise [lo, hi] are the bits written, inside the root.
+//
+// Every select of the chain is a window on its base, and a select that reaches
+// past its base only affects the bits that are in range (LRM 11.5.1). So the
+// chain is composed from the root outward, each select intersected with the
+// window its base has left, never against the whole root: an out-of-range window
+// nested in an element must not spill into the element beside it.
 struct DriveRange {
     Index    root;
     bool     whole = true;
+    bool     empty = false;
     uint32_t lo    = 0;
     uint32_t hi    = 0;
 };
@@ -438,50 +454,181 @@ std::optional<uint64_t> const_index(const Module& m, const Ir& ir, Index c) {
     return val;
 }
 
+// An operand that is a definite constant, or conversions over one, as the bits it
+// holds and the width of its type. The frontend widens an unsigned array index by a
+// zero bit (Lowerer::as_signed_number), so a constant index reaches the IR as
+// ZExt(Constant) as often as a bare Constant, and no conversion changes which number
+// it denotes. nullopt for anything else, for a constant with an x or z bit
+// (const_index) or wider than 64 bits, and for a conversion to more than 128.
+struct ConstBits {
+    unsigned __int128 bits;
+    uint32_t          width;
+};
+
+std::optional<ConstBits> const_bits(const Module& m, const Ir& ir, Index c) {
+    const auto mask = [](uint32_t width) {
+        return width >= 128 ? ~static_cast<unsigned __int128>(0) : (static_cast<unsigned __int128>(1) << width) - 1;
+    };
+    if (ir.tag(c) == Inst::Tag::Constant) {
+        const uint32_t                w   = m.pool.layout(std::get<Value>(m.pool.get(ir.payload(c).ref)).type).width;
+        const std::optional<uint64_t> raw = const_index(m, ir, c);
+        if (!raw || w > 64) {
+            return std::nullopt;
+        }
+
+        return ConstBits{ *raw & mask(w), w };
+    }
+    if (!is_conversion(ir.tag(c))) {
+        return std::nullopt;
+    }
+    const std::optional<ConstBits> from = const_bits(m, ir, ir.payload(c).op_type.op);
+    const uint32_t                 w    = m.pool.layout(ir.payload(c).op_type.type).width;
+    if (!from || w > 128) {
+        return std::nullopt;
+    }
+    unsigned __int128 bits = from->bits;
+    if (ir.tag(c) == Inst::Tag::SExt && ((bits >> (from->width - 1)) & 1) != 0) {
+        bits |= ~static_cast<unsigned __int128>(0) << from->width;
+    }
+
+    return ConstBits{ bits & mask(w), w };
+}
+
+// const_bits as the signed number the backend reads an array index as: a declared-
+// range coordinate, sign-extended from the operand's own width. A value no int64
+// holds saturates, which lies outside every array all the same.
+std::optional<int64_t> const_signed_index(const Module& m, const Ir& ir, Index c) {
+    const std::optional<ConstBits> k = const_bits(m, ir, c);
+    if (!k) {
+        return std::nullopt;
+    }
+    auto value = static_cast<__int128>(k->bits);
+    if (k->width < 128 && ((k->bits >> (k->width - 1)) & 1) != 0) {
+        value = static_cast<__int128>(k->bits | (~static_cast<unsigned __int128>(0) << k->width));
+    }
+
+    return static_cast<int64_t>(std::clamp(value, static_cast<__int128>(INT64_MIN), static_cast<__int128>(INT64_MAX)));
+}
+
+// The offset a packed select reads from a constant: the frontend folds a select
+// offset into a 32-bit value (lower_packed_offset), and the backend takes it as a
+// signed one, so a base below the vector (`x[-1+:4]`) arrives as 0xFFFFFFFF.
+std::optional<int64_t> const_offset(const Module& m, const Ir& ir, Index c) {
+    const std::optional<ConstBits> k = const_bits(m, ir, c);
+    if (!k || k->width > 32) {
+        return std::nullopt;
+    }
+
+    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(k->bits)));
+}
+
 DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
-    uint32_t lo = 0, hi = 0;
-    bool     have = false, dyn = false;
+    // One select of the chain: the bits it addresses, as [lo, lo + width) in the
+    // coordinates of its base. Outermost first.
+    struct Step {
+        int64_t lo;
+        int64_t width;
+    };
+    std::vector<Step> steps;
+    bool              dyn = false, outside = false;
     for (;;) {
         switch (ir.tag(lv)) {
             case Inst::Tag::PartSelect: {
                 const PartSelect ps = ir.extra_data<PartSelect>(ir.payload(lv).op_extra.extra);
-                if (!have) {
-                    lo   = ps.lsb;
-                    hi   = ps.msb;
-                    have = true;
-                } else {
-                    lo += ps.lsb;
-                    hi += ps.lsb;
-                }
+                const auto       lsb = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
+                const auto       msb = static_cast<int64_t>(static_cast<int32_t>(ps.msb));
+                steps.push_back({ lsb, msb - lsb + 1 });
                 lv = ir.payload(lv).op_extra.op;
                 break;
             }
             case Inst::Tag::BitSelect: {
-                const std::optional<uint64_t> b = const_index(m, ir, ir.payload(lv).binary.r);
-                if (!b) {
-                    dyn = true;
-                } else if (!have) {
-                    lo   = static_cast<uint32_t>(*b);
-                    hi   = lo;
-                    have = true;
+                if (const std::optional<int64_t> b = const_offset(m, ir, ir.payload(lv).binary.r)) {
+                    steps.push_back({ *b, 1 });
                 } else {
-                    lo += static_cast<uint32_t>(*b);
-                    hi += static_cast<uint32_t>(*b);
+                    dyn = true;
                 }
                 lv = ir.payload(lv).binary.l;
                 break;
             }
-            case Inst::Tag::DynPartSelect:
-            case Inst::Tag::ElemSelect:
-            case Inst::Tag::ArrSlice:
+            case Inst::Tag::DynPartSelect: {
+                const auto dps = ir.extra_data<DynPartSelect>(ir.payload(lv).op_extra.extra);
+                if (const std::optional<int64_t> off = const_offset(m, ir, dps.offset)) {
+                    steps.push_back({ *off, dps.width });
+                } else {
+                    dyn = true;
+                }
+                lv = ir.payload(lv).op_extra.op;
+                break;
+            }
+            case Inst::Tag::ElemSelect: {
+                // One dimension of a fixed unpacked array: the selected element
+                // spans `stride` leaves of `leaf_w` bits, starting at leaf
+                // `pos * stride`. A run-time index, or a dynamic array / queue
+                // element in a heap buffer, cannot be pinned in the flat plane; a
+                // constant index outside the array addresses nothing (LRM 7.4.5).
+                const auto  es = ir.extra_data<ElemSelect>(ir.payload(lv).op_extra.extra);
+                const Type& at = std::get<Type>(m.pool.get(es.array_type));
+                if (at.kind != Type::Kind::UnpackedArray) {
+                    dyn = true;
+                } else if (const std::optional<int64_t> idx = const_signed_index(m, ir, es.index)) {
+                    if (const std::optional<uint32_t> pos = types::elem_position(at, *idx)) {
+                        const int64_t elem_w = int64_t{ types::array_leaf_count(m.pool, at.element) } *
+                                               m.pool.layout(types::leaf_type(m.pool, es.array_type)).width;
+                        steps.push_back({ int64_t{ *pos } * elem_w, elem_w });
+                    } else {
+                        outside = true;
+                    }
+                } else {
+                    dyn = true;
+                }
+                lv = ir.payload(lv).op_extra.op;
+                break;
+            }
+            case Inst::Tag::ArrSlice: {
+                // A constant-bounds slice of a fixed array: `count` elements from
+                // the 0-based position `first_pos` (see ArrSlice).
+                const auto    as     = ir.extra_data<ArrSlice>(ir.payload(lv).op_extra.extra);
+                const Type&   st     = std::get<Type>(m.pool.get(as.slice_type));
+                const int64_t elem_w = int64_t{ types::array_leaf_count(m.pool, st.element) } *
+                                       m.pool.layout(types::leaf_type(m.pool, as.slice_type)).width;
+                steps.push_back({ int64_t{ as.first_pos } * elem_w, int64_t{ types::array_dim(st) } * elem_w });
+                lv = ir.payload(lv).op_extra.op;
+                break;
+            }
             case Inst::Tag::MemberSelect:
-                // Runtime-offset packed slice, or an unpacked-array/struct element:
-                // the driven bits cannot be pinned in the flat plane.
+                // An unpacked-struct member: not a bit range of the flat plane.
                 dyn = true;
                 lv  = ir.payload(lv).op_extra.op;
                 break;
-            default:
-                return { lv, dyn || !have, lo, hi };
+            default: {
+                if (dyn || ir.tag(lv) != Inst::Tag::Signal) {
+                    return { lv, true, false, 0, 0 };
+                }
+                if (outside) {
+                    return { lv, false, true, 0, 0 };
+                }
+                if (steps.empty()) {
+                    return { lv, true, false, 0, 0 }; // no select: the whole storage
+                }
+                // Compose from the root outward: each select's bits, placed at its
+                // base's offset, intersected with the part of its base still in range.
+                const Signal sig = ir.payload(lv).signal;
+                const Layout lay =
+                  m.pool.layout(types::leaf_type(m.pool, m.signals()[static_cast<uint32_t>(sig)].type));
+                const int64_t root_w =
+                  int64_t{ lay.width } * types::array_leaf_count(m.pool, m.signals()[static_cast<uint32_t>(sig)].type);
+                int64_t base_lo = 0, lo = 0, hi = root_w - 1;
+                for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
+                    const int64_t at_lo = base_lo + it->lo;
+                    lo                  = std::max(lo, at_lo);
+                    hi                  = std::min(hi, at_lo + it->width - 1);
+                    base_lo             = at_lo;
+                }
+                if (lo > hi) {
+                    return { lv, false, true, 0, 0 };
+                }
+                return { lv, false, false, static_cast<uint32_t>(lo), static_cast<uint32_t>(hi) };
+            }
         }
     }
 }
@@ -541,15 +688,16 @@ struct Structural {
         }
     }
 
-    void set_range(uint32_t sig, uint32_t a, uint32_t b) {
+    // Mark the bits [lo, hi] of `sig` driven. An empty range (hi < lo) still
+    // records that the net was stored to with a pinned range, so its bits power on
+    // z with a mask of their own rather than x.
+    void set_range(uint32_t sig, uint32_t lo, int64_t hi) {
         const uint32_t words = (partial_width[sig] + 63) / 64;
         if (partial_driven[sig].empty()) {
             partial_driven[sig].assign(words, 0);
         }
-        const uint32_t lo = std::min(a, b);
-        const uint32_t hi = std::min(std::max(a, b), partial_width[sig] - 1);
-        for (uint32_t bit = lo; bit <= hi; ++bit) {
-            partial_driven[sig][bit / 64] |= 1ull << (bit % 64);
+        for (int64_t bit = lo; bit <= hi; ++bit) {
+            partial_driven[sig][static_cast<size_t>(bit) / 64] |= 1ull << (static_cast<size_t>(bit) % 64);
         }
     }
 
@@ -567,6 +715,8 @@ struct Structural {
         partial_touched[sig] = true;
         if (dr.whole) {
             partial_whole[sig] = true;
+        } else if (dr.empty) {
+            set_range(sig, 0, -1);
         } else {
             set_range(sig, dr.lo, dr.hi);
         }
@@ -866,8 +1016,19 @@ struct Structural {
 //      Table 21-7).
 //   5. Wire / wand / wor / strength resolution results (all drivers high-Z).
 //   6. DPI imports with a 4-state return or output (opaque C body).
+//   7. A materialized constant table whose image holds a z bit
+//      (SignalInfo::const_data): the image is the signal's initializer, so no
+//      store ever shows it to the fixpoint.
+//   8. The input and inout formals of an exported DPI subroutine with a 4-state
+//      type: native C passes any aval / bval pair (svLogicVecVal).
 // Not seeds: gate primitives and force/release are lowered through the stores
 // and resolvers above, so they need no separate entry.
+//
+// Transfers follow the planes the backend really emits. A 2-state value has no z
+// or x plane, so ToTwo clears both (LRM 6.3.1). An element of a container, an
+// associative-array entry or an unpacked-struct member is 4-state when any leaf
+// under its type is (types::has_four_state_leaf): an unpacked aggregate has no
+// plane layout of its own, so its Layout domain says nothing about its leaves.
 //
 // may-x is deliberately COARSER: "x if any operand is x OR z", plus an explicit
 // generator set. Treating a z operand as producing x over-approximates for the
@@ -935,16 +1096,16 @@ struct ValueSweep {
         return false;
     }
 
-    // Whether the storage behind an lvalue is 4-state (can hold x/z at all).
-    // Unknown leaves are conservatively 4-state.
+    // Whether the storage behind an lvalue can hold x/z at all: any 4-state leaf
+    // under its type. Unknown leaves are conservatively 4-state.
     bool storage_four_state(const Ir& ir, const FnState* fn, Index lv) const {
         const Index root = lvalue_root(ir, lv).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
-                return m.pool.layout(m.signal(ir.payload(root).signal).type).domain == Domain::Four;
+                return types::has_four_state_leaf(m.pool, m.signal(ir.payload(root).signal).type);
             case Inst::Tag::Local:
                 return fn == nullptr ||
-                       m.pool.layout(fn->func->local_types[ir.payload(root).local.index]).domain == Domain::Four;
+                       types::has_four_state_leaf(m.pool, fn->func->local_types[ir.payload(root).local.index]);
             default:
                 return true;
         }
@@ -1086,7 +1247,7 @@ struct ValueSweep {
                     const auto  es = ir.extra_data<ElemSelect>(p.op_extra.extra);
                     const Type& at = std::get<Type>(m.pool.get(es.array_type));
                     if (at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue) {
-                        val_z[raw] = m.pool.layout(at.element).domain == Domain::Four ? 1 : 0;
+                        val_z[raw] = types::has_four_state_leaf(m.pool, at.element) ? 1 : 0;
                     } else {
                         val_z[raw] = z_of(p.op_extra.op);
                     }
@@ -1100,7 +1261,7 @@ struct ValueSweep {
                     // regardless of the handle; report conservatively.
                     const auto  aa   = ir.extra_data<AssocArg>(p.op_extra.extra);
                     const Type& at   = std::get<Type>(m.pool.get(aa.assoc_type));
-                    const bool  four = m.pool.layout(at.element).domain == Domain::Four;
+                    const bool  four = types::has_four_state_leaf(m.pool, at.element);
                     val_z[raw]       = four ? 1 : 0;
                     val_x[raw]       = four ? 1 : 0;
                     break;
@@ -1109,7 +1270,7 @@ struct ValueSweep {
                     // The pattern default slot is an element slot like any other,
                     // so a 4-state value element may carry x/z.
                     const Type& dt   = std::get<Type>(m.pool.get(p.op_type.type));
-                    const bool  four = m.pool.layout(dt.element).domain == Domain::Four;
+                    const bool  four = types::has_four_state_leaf(m.pool, dt.element);
                     val_z[raw]       = four ? 1 : 0;
                     val_x[raw]       = four ? 1 : 0;
                     break;
@@ -1204,7 +1365,7 @@ struct ValueSweep {
                     // pop* yields an element; each element keeps its own planes in
                     // the heap buffer, so report conservatively by element domain.
                     const bool four =
-                      m.pool.layout(std::get<Type>(m.pool.get(p.op_type.type)).element).domain == Domain::Four;
+                      types::has_four_state_leaf(m.pool, std::get<Type>(m.pool.get(p.op_type.type)).element);
                     val_z[raw] = four ? 1 : 0;
                     val_x[raw] = four ? 1 : 0;
                     break;
@@ -1275,12 +1436,16 @@ struct ValueSweep {
                 case Inst::Tag::SExt:
                 case Inst::Tag::Trunc:
                 case Inst::Tag::ToFour:
-                case Inst::Tag::ToTwo:
-                    // Sign extension replicates a z MSB; truncation keeps low z
-                    // bits. ToTwo is treated like the others: its z plane is
-                    // conservatively kept (the analysis is a may-z over-approximation).
+                    // Sign extension replicates a z MSB; truncation keeps low z bits.
                     val_z[raw] = z_of(p.op_type.op);
                     val_x[raw] = operand_x(ir, i);
+                    break;
+                case Inst::Tag::ToTwo:
+                    // A 4-state value assigned to a 2-state target keeps only its must
+                    // plane (LRM 6.3.1), so x and z both become 0 and the result has
+                    // neither plane.
+                    val_z[raw] = 0;
+                    val_x[raw] = 0;
                     break;
 
                 // Seed 5: resolution can produce genuine Z (all drivers high-Z) or
@@ -1769,6 +1934,49 @@ CombFuse comb_fuse_verdict(const Process& p, const ProcessFacts& pf, CombFuse bo
     return CombFuse::Eligible;
 }
 
+// The x / z content of a materialized constant table's image
+// (SignalInfo::const_data). The image is leaf-major, as the lowerer wrote it: an
+// unpacked array is its elements back to back, an unpacked struct its fields in
+// declaration order, and a leaf its canonical planes, [val][xz] for a 4-state leaf
+// and [val] alone for a 2-state one. The walk follows the type, not the byte
+// count. A bit is z when xz & ~val and x when xz & val.
+struct ImageUnknown {
+    bool z = false;
+    bool x = false;
+};
+
+void scan_image(const Module& m, Ref type, std::span<const uint8_t>& cursor, ImageUnknown& out) {
+    if (types::contains_struct(m.pool, type)) {
+        const Type& t = std::get<Type>(m.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            for (uint32_t k = 0; k < types::array_dim(t); ++k) {
+                scan_image(m, t.element, cursor, out);
+            }
+        } else {
+            for (const Field& f : m.pool.struct_fields(t.fields_id)) {
+                scan_image(m, f.type, cursor, out);
+            }
+        }
+        return;
+    }
+    // A leaf, or arrays of leaves: the layout of an unpacked array is its leaf's,
+    // with the whole element count in byte_count.
+    const Layout lay = m.pool.layout(type);
+    assert(cursor.size() >= lay.byte_count && "a constant table's image matches its type");
+    if (lay.domain == Domain::Four) {
+        const uint32_t pb = plane_bytes(lay.width);
+        for (uint32_t el = 0; el + 2 * pb <= lay.byte_count; el += 2 * pb) {
+            for (uint32_t k = 0; k < pb; ++k) {
+                const uint8_t val = cursor[el + k];
+                const uint8_t xz  = cursor[el + pb + k];
+                out.z             = out.z || (xz & static_cast<uint8_t>(~val)) != 0;
+                out.x             = out.x || (xz & val) != 0;
+            }
+        }
+    }
+    cursor = cursor.subspan(lay.byte_count);
+}
+
 } // namespace
 
 DesignFacts analyze(const Module& m) {
@@ -1791,23 +1999,23 @@ DesignFacts analyze(const Module& m) {
     st.partial_whole.assign(nsig, false);
     st.partial_driven.resize(nsig);
 
-    // A partial-undriven mask is only meaningful for a packed 4-state net: a
-    // 2-state signal has no z plane, an unpacked array has per-element storage
-    // (whole-signal power-on, a follow-up), and a variable powers on x not z.
+    // A partial-undriven mask is only meaningful for a 4-state net of packed
+    // elements: a 2-state signal has no z plane, a variable powers on x not z,
+    // and an aggregate (an unpacked struct, or an array over a container) takes
+    // the recursive storage mirror with its own power-on walk. A fixed unpacked
+    // array of packed elements is flat storage, and its mask spans every leaf:
+    // bit `leaf ordinal * element width + bit` (see DriveRange).
     for (uint32_t i = 0; i < nsig; ++i) {
         const SignalInfo& s = m.signals()[i];
-        if (!s.is_net || s.force_agg) {
+        if (!s.is_net || s.force_agg || types::needs_agg_storage(m.pool, s.type)) {
             continue;
         }
-        if (std::get<Type>(m.pool.get(s.type)).kind == Type::Kind::UnpackedArray) {
-            continue;
-        }
-        const Layout lay = m.pool.layout(s.type);
+        const Layout lay = m.pool.layout(types::leaf_type(m.pool, s.type));
         if (lay.domain != Domain::Four || lay.width == 0) {
             continue;
         }
         st.partial_candidate[i] = true;
-        st.partial_width[i]     = lay.width;
+        st.partial_width[i]     = lay.width * types::array_leaf_count(m.pool, s.type);
     }
 
     std::vector<CombFuse> body_verdict(nproc, CombFuse::Eligible);
@@ -1944,11 +2152,48 @@ DesignFacts analyze(const Module& m) {
         }
     }
 
-    // Seed 1: an undriven 4-state net holds its default value z (LRM 6.6). The
-    // backend initializes exactly these to z.
+    // Seed 8: native C calls an exported subroutine with any aval / bval pair, so a
+    // 4-state input or inout formal may arrive carrying x and z. An output formal is
+    // written by the body, which the sweep already follows.
+    for (const DpiExport& ex : m.dpi_exports) {
+        ValueSweep::FnState& fs = vs.fns[static_cast<uint32_t>(ex.func)];
+        assert(ex.arg_dirs.size() == fs.func->param_types.size());
+        for (size_t k = 0; k < ex.arg_dirs.size(); ++k) {
+            if (ex.arg_dirs[k] != ArgDir::Out && types::has_four_state_leaf(m.pool, fs.func->param_types[k])) {
+                fs.param_z[k] = 1;
+                fs.param_x[k] = 1;
+            }
+        }
+    }
+
+    // Seed 1: a net holds its default value z (LRM 6.6) wherever nothing drives
+    // it, and the backend initializes exactly those bits to z: every bit of an
+    // undriven 4-state net, and the undriven bits of a partially driven one
+    // (the mask computed above). A reader of either must keep its z word.
     for (uint32_t i = 0; i < nsig; ++i) {
-        if (facts.undriven[i] && m.signals()[i].is_net && m.pool.layout(m.signals()[i].type).domain == Domain::Four) {
+        if (!m.signals()[i].is_net || m.pool.layout(m.signals()[i].type).domain != Domain::Four) {
+            continue;
+        }
+        if (facts.undriven[i] || !facts.undriven_mask(static_cast<Signal>(i)).empty()) {
             vs.sig_z[i] = 1;
+        }
+    }
+
+    // Seed 7: a materialized constant table holds its image as the signal's
+    // initializer, so no store ever shows the fixpoint what is in it.
+    for (uint32_t i = 0; i < nsig; ++i) {
+        const SignalInfo& s = m.signals()[i];
+        if (s.const_data == Ref::Invalid) {
+            continue;
+        }
+        std::span<const uint8_t> image = m.pool.bytes(s.const_data);
+        ImageUnknown             bits;
+        scan_image(m, s.type, image, bits);
+        if (bits.z) {
+            vs.sig_z[i] = 1;
+        }
+        if (bits.x) {
+            vs.sig_x[i] = 1;
         }
     }
 
@@ -1968,7 +2213,7 @@ DesignFacts analyze(const Module& m) {
         }
     }
     for (uint32_t i = 0; i < nsig; ++i) {
-        if (!preinit_written[i] && m.pool.layout(m.signals()[i].type).domain == Domain::Four) {
+        if (!preinit_written[i] && types::has_four_state_leaf(m.pool, m.signals()[i].type)) {
             vs.sig_x[i] = 1;
         }
     }

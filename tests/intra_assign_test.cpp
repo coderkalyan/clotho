@@ -1196,6 +1196,121 @@ TEST_CASE("intra-assignment timing on a whole dynamic-array target is rejected")
     CHECK(!lower_error(src).empty());
 }
 
+// LRM 9.4.5 with a NAMED EVENT as the control: `x <= @e v` samples v now and updates
+// x in the NBA region of the instant `e` is triggered. An event wakes through its
+// object, not a signal edge, so the record has to be counted down by `-> e` itself;
+// it used to be registered on a signal trigger nothing ever fired, and the update was
+// silently lost (the posedge, `#d` and blocking `= @e` forms all worked). Checks are
+// made a time step after the trigger. Oracle: iverilog 13 on each design, except the
+// last subcase, whose oracle is LRM 4.9.4 (and Verilator): iverilog applies the update
+// in the active region, contrary to the clause.
+TEST_CASE("nonblocking intra-assignment on a named event updates when it is triggered") {
+    SUBCASE("whole variable, @e and @(e)") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x, y; event e;
+                initial begin
+                    x <= @e 4'd1;
+                    y <= @(e) 4'd2;
+                    #1 -> e;
+                    #1 $display("x=%0d y=%0d", x, y);
+                    $finish;
+                end
+            endmodule)") == "x=1 y=2\n");
+    }
+    SUBCASE("triggered from another process later") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e;
+                initial x <= @e 4'd6;
+                initial begin #3 -> e; #1 $display("x=%0d", x); $finish; end
+            endmodule)") == "x=6\n");
+    }
+    SUBCASE("concatenation, part select and array element targets") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] a, b; bit [7:0] v; bit [7:0] mem [0:1]; event e;
+                initial begin
+                    {a, b} <= @e 8'hc5;
+                    v[5:2] <= @e 4'hf;
+                    mem[1] <= @(e) 8'h77;
+                    #1 -> e;
+                    #1 $display("a=%h b=%h v=%h m1=%h", a, b, v, mem[1]);
+                    $finish;
+                end
+            endmodule)") == "a=c b=5 v=3c m1=77\n");
+    }
+    SUBCASE("each execution arms its own record") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                int n = 0; event e;
+                initial begin
+                    n <= @e 5;
+                    #1 -> e;
+                    #1 n <= @e 7;
+                    #1 -> e;
+                    #1 $display("n=%0d", n);
+                    $finish;
+                end
+            endmodule)") == "n=7\n");
+    }
+    SUBCASE("repeat(n) counts occurrences of the event") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e;
+                initial begin
+                    x <= repeat (3) @e 4'd8;
+                    #1 -> e; #1 -> e;
+                    #1 $display("x=%0d", x);
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=0\nx=8\n");
+    }
+    SUBCASE("an event list matures on the first listed event, once") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e, f;
+                initial begin
+                    x <= @(e or f) 4'd9;
+                    #1 -> f;
+                    #1 $display("x=%0d", x);
+                    x <= @(e or f) 4'd4;
+                    #1 -> e; -> f;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=9\nx=4\n");
+    }
+    SUBCASE("an event mixed with a signal edge in one list") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e; bit s;
+                initial begin
+                    x <= @(posedge s or e) 4'd5;
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=5\n");
+    }
+    SUBCASE("the update lands in the NBA region, after the active region reads") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                bit [3:0] x; event e;
+                initial begin
+                    x <= @e 4'd3;
+                    #1;
+                    -> e;
+                    $display("same step x=%0d", x);
+                    #1 $display("next step x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "same step x=0\nnext step x=3\n");
+    }
+}
+
 // LRM 9.4.2.3 makes `iff` part of the EVENT, so the guard has to be evaluated at
 // fire time and only enabled occurrences may count down; the deferred record has
 // no guard hook (R5).
@@ -1255,4 +1370,65 @@ TEST_CASE("intra-assignment timing on a class property is rejected") {
             initial o.p <= #5 3;
         endmodule)";
     CHECK(lower_error(src).find("class property") != std::string::npos);
+}
+
+// LRM 15.5.5.1: merged events are ONE object, and 15.5.3's own idiom `event done_too =
+// done;` names it twice. A control that lists both, `@(done or done_too)`, got its
+// record registered on that object twice: one occurrence matured it, and the second
+// entry wrapped its countdown below zero and stayed behind. When the record was reused
+// by the next `<=` to the same target it matured that one early, on an event it was
+// not waiting for. No oracle: iverilog 13 implements neither merge form.
+TEST_CASE("a control that lists two names of one event counts it once") {
+    SUBCASE("declared alias") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                int x;
+                event done;
+                event done_too = done;
+                event c;
+                initial begin
+                    x <= @(done or done_too) 1;
+                    #1 -> done;
+                    #1 $display("x=%0d", x);
+                    x <= @(c) 5;
+                    #1 -> done;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\nx=1\n");
+    }
+    SUBCASE("merged by assignment") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                int x;
+                event a, b, c;
+                initial begin
+                    a = b;
+                    x <= @(a or b) 1;
+                    #1 -> b;
+                    #1 $display("x=%0d", x);
+                    x <= @(c) 5;
+                    #1 -> b;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\nx=1\n");
+    }
+}
+
+// `-> ev` through a task's event formal names the object by a runtime handle; the
+// record was registered on the same object by its slot, so the two have to agree.
+TEST_CASE("an event triggered through a handle matures an event-controlled update") {
+    CHECK(run_capture_finish(R"(
+        module m;
+            event e;
+            bit [3:0] x;
+            task automatic trig(event ev); -> ev; endtask
+            initial begin
+                x <= @e 4'd7;
+                #1 trig(e);
+                #1 $display("x=%0d", x);
+                $finish;
+            end
+        endmodule)") == "x=7\n");
 }

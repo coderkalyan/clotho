@@ -274,9 +274,11 @@ the canonical mirror (row-major, same leaf type), so the callee's nested GEP and
 the caller's flat GEP compute the same address, and same-typed arrays keep the
 same storage whether or not one of them is a ref actual.
 
-Overriding the pointer-ABI's force-packed rule is sound because a *user* signal
-becomes `ptr_arg` only by being a ref actual: an out / inout actual is always a
-compiler-materialized temp (`make_arg_temp`), and a temp is never a ref actual.
+A pointer-ABI actual takes this shape whatever the may-z analysis proved
+(`ptr_arg`): a *user* signal is one only by being a ref actual, and the out /
+inout actual of a call is always a compiler-materialized temp (`make_arg_temp`),
+which a callee writes through a pointer to its value word, and its z word when
+4-state.
 
 The cost, stated plainly: a 4-state signal that is a ref actual keeps its z word
 even where the may-z analysis could have elided it, and every ordinary reader of

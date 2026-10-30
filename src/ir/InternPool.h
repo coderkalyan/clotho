@@ -62,6 +62,20 @@ constexpr uint32_t plane_bytes(uint32_t width) {
     return ((width + 63) / 64) * 8;
 }
 
+// The widest integer a value can be held in: LLVM's IntegerType::MAX_INT_BITS, which
+// the backend asserts it equals (this layer does not see LLVM). Values of any width up to
+// it are plain LLVM integers (docs/design/kernel.md, "Values"); a wider one has no
+// representation, and the frontend refuses it at the declaration or expression that
+// introduces the width.
+constexpr uint32_t max_integer_bits = 1u << 23;
+
+// The bits of the integer that holds a value: a 2-state value of width W is one
+// integer of W bits, a 4-state one of 2W (its must and may planes side by side), so a
+// 4-state value can be only half as wide. Wide, so that no width overflows it.
+constexpr uint64_t integer_bits(uint32_t width, bool four_state) {
+    return (four_state ? 2 : 1) * uint64_t{ width };
+}
+
 // A SystemVerilog type. Aliases (reg, int, byte, ...) are lowered to these
 // before interning. Composite kinds refer to their element via another interned
 // Ref, so the pool is self-referential and dedup stays meaningful.

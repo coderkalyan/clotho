@@ -222,6 +222,15 @@ struct Process {
     // false: it runs only when a wait event fires. Only meaningful with a non-empty
     // wait list (a sensitivity-less process already runs once via the seed loop).
     bool self_start = false;
+    // An always_comb / always_latch procedure (LRM 9.2.2.2, 9.2.2.3): its time-zero run
+    // happens "after all initial and always procedures have been started", so that its
+    // outputs are consistent with their effects on its inputs. The seed loop enqueues
+    // such a process behind every other body instead of in source order. A continuous
+    // assignment is also `self_start` but is not a procedure, so alone it keeps its place
+    // (LRM 4.9.1 leaves its time-zero order open); fused into one group with such a
+    // procedure it starts with it, a group being one body. Meaningful only with
+    // `self_start`.
+    bool starts_after_procedures = false;
     // A continuously-active process whose home region is the reactive region set
     // rather than the active one: a continuous construct declared inside a
     // `program` (LRM 24.3.1 -- "The continuous assignment assign tclk = clk;
@@ -615,6 +624,12 @@ struct Function {
     // the record is heap-allocated and reference-counted and the last one out frees
     // it (lower_fork_inst).
     ForkKind fork_kind = ForkKind::Join;
+    // The `disable` target ids of every named block this fork child was forked
+    // inside, innermost last (LRM 9.6.2: a block's forked children are activity
+    // within it). Only meaningful with is_fork_child. The child links one node onto
+    // each target's list in its RAMP, before it has run, so a `disable` that lands
+    // while it is still queued (a `join_none` / `join_any` sibling) still ends it.
+    std::vector<uint32_t> fork_targets;
     // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
     // extern_name, not lowered from IR. The backend emits an external declaration
     // (dpi_arg_ctypes / dpi_ret_ctype give the native C signature) and marshals
@@ -981,6 +996,23 @@ public:
         return std::nullopt;
     }
 
+    // Record that `class_ref` is the built-in `process` class (LRM 9.7). Its object
+    // names a native control block, which the object's finalizer releases
+    // (docs/design/process-class.md §4.2). Keyed on the interned Ref, like
+    // set_iface_type_id, so each Lowerer that interns `std::process` registers its own.
+    void set_process_class(Ref class_ref) {
+        process_classes_.push_back(class_ref);
+    }
+
+    bool is_process_class(Ref class_ref) const {
+        for (const Ref r : process_classes_) {
+            if (r == class_ref) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // The descriptor of a class type, or null when the type has not been lowered
     // as a class (every lowered class registers one).
     const ClassDesc* class_desc(Ref class_ref) const {
@@ -1051,6 +1083,9 @@ private:
     // Interned interface class Ref -> bitmap bit (LRM 8.26). One entry per Ref, so
     // an interface reached through two Lowerers appears twice with one id.
     std::vector<std::pair<Ref, uint32_t>> iface_type_ids_;
+    // Interned Refs of the built-in `process` class (LRM 9.7), one per Lowerer that
+    // lowered it.
+    std::vector<Ref> process_classes_;
     // Change notifiers of waited-on class properties (LRM 9.4.2), one entry per
     // (class Ref, property field). Empty in a design that waits on no property,
     // which is what change_notify's early-out keys on.

@@ -265,8 +265,17 @@ llvm::Value* Backend::intra_id_value(Signal sig) {
     return b_.getInt32(id);
 }
 
-// Dense `<= @e` trigger id of (signal, edge), as an IR value.
+// Trigger id of (signal, edge), as an IR value. A dense `<= @e` id for a value
+// signal. For a declared event it is RT_TRIG_EVENT | the slot of the object the
+// variable names NOW (LRM 15.5.5.1: a control captures the object when it
+// executes), which is what emit_event_fire counts down.
 llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
+    if (event_slot_[static_cast<uint32_t>(sig)] != 0) {
+        llvm::Value* slot = event_is_mono(sig)
+                              ? static_cast<llvm::Value*>(b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]))
+                              : b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+        return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
+    }
     const auto        id = static_cast<uint32_t>(trigger_id(sig, edge));
     const SignalSlot& s  = slot_of(sig);
     if (abs_id_eligible(s)) {
@@ -296,6 +305,11 @@ ModuleEnv& Backend::unit_env(const Anchor& a) {
     }
     return *it->second;
 }
+
+// Every value's width reaches here through the frontend's check against this limit, so the
+// integer types built from it fit LLVM's own; the two numbers are one fact.
+static_assert(max_integer_bits == static_cast<uint32_t>(llvm::IntegerType::MAX_INT_BITS),
+              "ir::max_integer_bits is LLVM's IntegerType::MAX_INT_BITS");
 
 llvm::IntegerType* Backend::int_ty(uint32_t width) const {
     return llvm::IntegerType::get(ctx_, width == 0 ? 1 : width);
@@ -467,13 +481,11 @@ llvm::Value* Backend::z_of(Plane a) {
     return a.two ? zero(width_of(a)) : a.z;
 }
 
-// A plane from storage, an ABI return, a runtime helper or an aggregate walk, in
-// the encoding of the value an instruction of IR type `t` is. Those producers see
-// the representation they read: a 2-state signal is stored packed when a
-// pointer-ABI task writes it, every function ABI passes packed planes, and an
-// aggregate walk mixes its leaves. The IR type is what the VALUE is, so this is
-// the boundary between the two encodings, not a repair of an operand: set_value
-// asserts the result, and an operator never converts its operands.
+// The result of a whole-aggregate compare in the encoding of the domain its IR
+// type has: lower_agg_eq builds a 1-bit packed answer for an associative-array
+// compare whatever the leaves are, while the type of an `==` over 2-state leaves
+// is 2-state. This converts a producer's result; it is not a storage or ABI
+// boundary, and an operator never converts its operands.
 Plane Backend::in_type_domain(Plane p, ValueType t) {
     if (t.is_string || t.is_real) {
         return p;

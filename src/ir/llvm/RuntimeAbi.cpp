@@ -178,6 +178,15 @@ llvm::FunctionCallee Backend::wide_ins_fn() {
                    raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
+// -- Multiply, divide and modulo of very wide integers --
+
+// void rt_wide_mul / rt_wide_udiv / rt_wide_sdiv / rt_wide_umod / rt_wide_smod(
+//     u64* out, const u64* a, const u64* b, u32 width): all five share one shape.
+llvm::FunctionCallee Backend::wide_arith_fn(const char* name) {
+    return rt_fn(name, b_.getVoidTy(),
+                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+}
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 llvm::StructType* Backend::null_site_ty() {
@@ -1072,6 +1081,10 @@ llvm::FunctionCallee Backend::event_ptr_fn() {
     return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
 }
 
+llvm::FunctionCallee Backend::event_trig_id_fn() {
+    return rt_fn("rt_event_trig_id", b_.getInt32Ty(), { raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::run_init_fn() {
     return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
 }
@@ -1100,6 +1113,10 @@ llvm::FunctionCallee Backend::proc_thread_done_fn() {
 
 llvm::FunctionCallee Backend::proc_obj_retain_fn() {
     return rt_fn("rt_proc_obj_retain", b_.getVoidTy(), { raw_ptr_ty() });
+}
+
+llvm::FunctionCallee Backend::proc_obj_release_fn() {
+    return rt_fn("rt_proc_obj_release", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
 llvm::FunctionCallee Backend::proc_await_self_fn() {
@@ -1167,6 +1184,10 @@ llvm::FunctionCallee Backend::intra_alloc_fn() {
     return rt_fn("rt_intra_alloc", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
 }
 
+llvm::FunctionCallee Backend::intra_alloc_rooted_fn() {
+    return rt_fn("rt_intra_alloc_rooted", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
 llvm::FunctionCallee Backend::intra_cb_fn() {
     return rt_fn("rt_intra_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
@@ -1185,6 +1206,10 @@ llvm::FunctionCallee Backend::intra_any_fn() {
 
 llvm::FunctionCallee Backend::intra_release_fn() {
     return rt_fn("rt_intra_release", b_.getVoidTy(), { b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::intra_release_rooted_fn() {
+    return rt_fn("rt_intra_release_rooted", b_.getVoidTy(), { b_.getInt32Ty() });
 }
 
 llvm::FunctionCallee Backend::intra_reset_fn() {

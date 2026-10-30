@@ -114,8 +114,8 @@ copy (guarded, follow-up).
 - **Call ABI** (`declare_function` / `declare_task`): each aggregate parameter is
   one pointer param (the caller's object) in every by-value direction; an
   aggregate return is a `void` return plus a trailing pointer out-param.
-  `param_indices` counts one LLVM slot per aggregate formal (not the scalar
-  `(mm, z)` pair), for a task as well as a function.
+  `param_indices` counts one LLVM slot per aggregate formal (not the scalar's one
+  `iW` or `(mm, z)` pair), for a task as well as a function.
 - **Marshalling**: the callee copies each aggregate `input` / `inout` formal into
   its frame at prologue (`emit_agg_copyin`, an `emit_agg_storage_copy` memcpy) so
   a mutation of the formal cannot reach the caller, and copies an `output` /

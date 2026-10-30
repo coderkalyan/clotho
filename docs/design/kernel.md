@@ -15,14 +15,12 @@ when it does.
   plane. AND, OR and NOT need no masking.
 - In SSA the two planes are one 2W-bit integer; the z plane is a separate W-bit
   value.
-- A 2-state value is a native W-bit integer. Its domain comes from its IR type,
-  the single source of truth; the backend asserts at every instruction that the
-  value's plane encoding agrees. A producer that reads storage or an ABI converts
-  at that boundary (`in_type_domain`), because the encoding there is the
-  storage's choice, not the type's: a 2-state signal is stored packed when a
-  task's pointer ABI or the may-z analysis gives it a z word. **Not yet:** each
-  value also carries its own encoding tag (`Plane::two`), which operators read
-  instead of the type.
+- A 2-state value is a native W-bit integer, and its domain comes from its IR
+  type alone: one source of truth, no per-value flag to keep in agreement. A
+  2-state variable's storage, and the call ABI, use the native form too, so no
+  boundary ever holds a 2-state value in the packed form. **Not yet:** the code
+  generator tracks each value's encoding in a flag (`Plane::two`) that it asserts
+  against the type.
 - An IR integer type is a width and a domain; it has no sign. Domains, signedness
   and extension are decided by the language, through slang's legalized AST, and the
   IR carries them explicitly: signed and unsigned opcodes (`SDiv`/`UDiv`,
@@ -41,9 +39,12 @@ when it does.
   result and lowers to a native compare; a case-equality is always 2-state.
 - A value's width and domain come from one function (`ir::value_types`) shared by
   the builder, the verifier and the backend, not stored on instructions.
-- Values of any width are LLVM integers of that width. If profiling shows compile
-  time or code quality falling off, or a width exceeds LLVM's limit, a ceiling
-  routes wider values to our own bigint. **Not yet:** no profiling, no ceiling.
+- Values of any width are LLVM integers of that width. Multiply, divide and modulo
+  above 128 bits call runtime word routines (`rt_wide_*`) in place of the native
+  operation, which LLVM lowers to a bit-serial loop (divide) or a quadratic
+  expansion (multiply); no other operator has a ceiling. A value whose integer would
+  pass LLVM's limit (2^23 bits; 2W for a 4-state value of width W) is refused with a
+  located error at the declaration or expression that introduces the width.
 - The constant pool keeps the frontend's encoding; the backend converts on read
   through one shared set of helpers.
 - The encoding's invariants are checked by assertions in debug builds at stores
@@ -80,8 +81,7 @@ when it does.
 
 - Each signal's slot has the best encoding known for it: a 2-state signal is one
   W-bit word, and a 4-state signal drops its z plane when the may-z analysis
-  proves it z-free. **Not yet:** a 2-state signal written from a z-capable source
-  keeps a z word.
+  proves it z-free.
 - Storage that aliases has one layout. A signal is narrowed only when every use,
   by-reference aliases included, allows it. **Not yet:** any signal passed by
   reference takes its type's default layout.
@@ -107,10 +107,11 @@ when it does.
 - A dynamic select branches to a plain fast path when its index is known and in
   range; the mask path runs only otherwise. **Not yet:** a storage-wide mask on
   every access.
-- A runtime helper serves only runtime-indexed selects of storage above a fixed
-  threshold. It works a 64-bit word at a time and receives only the planes the
-  destination needs. **Not yet:** constant indices also call it, it loops per bit,
-  and all three planes are always passed.
+- A runtime helper serves only runtime-indexed selects of storage above 256 bits,
+  where it costs less than the inline shift (it is flat at 180-310 instructions; the
+  inline form grows with the width). It works a 64-bit word at a time and receives
+  only the planes the destination needs. **Not yet:** it loops per bit, and all three
+  planes are always passed.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.
 - An element access with an invalid index is guarded so only valid paths touch
@@ -127,7 +128,7 @@ when it does.
 ## Calls and the runtime boundary
 
 - Scalar arguments and results pass by domain: a 2-state scalar is one native
-  word, a 4-state scalar the full form. **Not yet:** always the full form.
+  word, a 4-state scalar the full form.
 - A runtime routine receives a pointer to the value's own storage and a
   compile-time constant shape descriptor; the runtime decodes the planes through
   shared helpers. **Not yet:** values are translated per call into a separate
