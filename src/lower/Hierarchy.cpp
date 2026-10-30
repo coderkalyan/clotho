@@ -1186,9 +1186,18 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 const ir::Index val = port_rvalue();
                 const ir::Index dst = lower_lvalue(a.left(), b);
                 const ir::Index src = lower_port_output(a, val, b);
-                b.binary(ir::Inst::Tag::Store, dst, src, l);
+                // The copy is an implicit continuous assignment (LRM 4.9.6), so a `force`
+                // on the variable it drives overrides it and a `release` re-evaluates it
+                // (LRM 10.6.2), like `assign v = child_net;`. The gate is only where the
+                // root is a force target; every other copy is the plain store.
+                if (ForceInfo* fi = pca_info_of_lvalue(a.left())) {
+                    store_or_gate(fi, ir::Inst::Tag::Store, dst, src, b, l);
+                } else {
+                    b.binary(ir::Inst::Tag::Store, dst, src, l);
+                }
             }
             sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
+            sens = with_force_wake(std::move(sens), a.left());
         } else {
             // Input: drive the child net from the source rvalue, resized to the
             // port width; wakes on the source's reads. The copy is a continuous

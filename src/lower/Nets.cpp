@@ -1288,11 +1288,21 @@ void Lowerer::register_pca_target(const Expression& lhs, bool is_force) {
     }
 }
 
-// A continuous driver (module-level `assign`) of a forced variable must also
-// wake on `force_site` so that `release` (force_site -> 0) re-evaluates it and
-// reverts the variable to the driver's current value (LRM 10.6.2 reestablish).
-// Appends that wait event when `lhs`'s root is forceable; a no-op otherwise.
+// A continuous driver (module-level `assign`, or a port connection) of a forced
+// variable must also wake on `force_site` so that `release` (force_site -> 0)
+// re-evaluates it and reverts the variable to the driver's current value (LRM 10.6.2
+// reestablish). Appends that wait event for every forceable root `lhs` writes, each
+// operand of a concatenation (whose own root is none) included; a no-op otherwise.
 std::vector<ir::WaitEvent> Lowerer::with_force_wake(std::vector<ir::WaitEvent> ev, const Expression& lhs) {
+    if (lhs.kind == ExpressionKind::Concatenation) {
+        for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+            ev = with_force_wake(std::move(ev), *op);
+        }
+        return ev;
+    }
+    if (lhs.kind == ExpressionKind::Conversion) {
+        return with_force_wake(std::move(ev), lhs.as<ConversionExpression>().operand());
+    }
     if (const ValueSymbol* r = lvalue_root(lhs)) {
         if (ForceInfo* fi = force_info_of(*r)) {
             ev.push_back(ir::WaitEvent{ .signal = fi->site, .edge = ir::Edge::Any });

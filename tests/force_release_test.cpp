@@ -655,6 +655,117 @@ TEST_CASE("a gate or switch output on a forced variable is rejected") {
     CHECK_MESSAGE(input_side.ok, input_side.diagnostic_text());
 }
 
+// A port connection is "a continuous assignment from a local output expression to an outside
+// net or variable" (LRM 4.9.6), so a force on the variable it drives overrides it and a release
+// reestablishes it (LRM 10.6.2), like `assign v = child_net;`. The copy stored with no force
+// gate and never woke on the force site: a child change landed over the force (a=1 at 14: v=1
+// at 14 where the force of 12 holds z) and a release did not restore it (v stayed z). The
+// child's own delay (`assign #5 y = a` in the child) is no different: the force is on the
+// parent's variable, the copy is undelayed. Oracle: iverilog 13, byte-identical.
+TEST_CASE("force: a variable an output port copies into takes the force, and the copy after release") {
+    constexpr std::string_view change_under_force = R"(
+        module sub(input logic a, output logic y);
+            assign y = a;
+        endmodule
+        module m;
+            logic a, v;
+            sub u(.a(a), .y(v));
+            always @(v) $display("%0t chg v=%b", $time, v);
+            initial begin
+                a = 0;
+                #12 force v = 1'bz;
+                #2 a = 1;
+                #4 $strobe("%0t s v=%b", $time, v);
+                #2 release v;
+                #1 $strobe("%0t s v=%b", $time, v);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(change_under_force) == "0 chg v=0\n12 chg v=z\n18 s v=z\n20 chg v=1\n21 s v=1\n");
+
+    constexpr std::string_view delayed_child = R"(
+        module sub(input logic a, output logic y);
+            assign #5 y = a;
+        endmodule
+        module m;
+            logic a, v;
+            sub u(.a(a), .y(v));
+            always @(v) $display("%0t chg v=%b", $time, v);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force v = 1'bz;
+                #6 $strobe("%0t s v=%b", $time, v);
+                #2 release v;
+                #1 $strobe("%0t s v=%b", $time, v);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(delayed_child) == "5 chg v=0\n12 chg v=z\n18 s v=z\n20 chg v=1\n21 s v=1\n");
+
+    // Only the release: the change landed before the force, and the force was released after
+    // the child last changed, so nothing wakes the copy but the release itself.
+    constexpr std::string_view release_only = R"(
+        module sub(input logic a, output logic y);
+            assign y = a;
+        endmodule
+        module m;
+            logic a, v;
+            sub u(.a(a), .y(v));
+            always @(v) $display("%0t chg v=%b", $time, v);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force v = 1'bz;
+                #6 $strobe("%0t s v=%b", $time, v);
+                #2 release v;
+                #1 $strobe("%0t s v=%b", $time, v);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(release_only) == "0 chg v=0\n10 chg v=1\n12 chg v=z\n18 s v=z\n20 chg v=1\n21 s v=1\n");
+}
+
+// The shapes of an output port's actual: a concatenation operand, the whole variable, and a
+// part of a variable forced as a whole, beside a continuous assignment onto a concatenation
+// (`assign {c1, c0} = a`), whose release did not restore the forced operand either. Oracle:
+// iverilog 13 for the first two lines; the last bits of `sel` that the port does not drive
+// are left out, since a variable that is partly continuously driven is no clause's case.
+TEST_CASE("force: concatenation, whole and select actuals of an output port, and a concatenated assign") {
+    constexpr std::string_view src = R"(
+        module sub(input logic [1:0] a, output logic [1:0] y);
+            assign y = a;
+        endmodule
+        module m;
+            logic [1:0] a;
+            logic v1, v0, c1, c0;
+            logic [1:0] w;
+            logic [3:0] sel;
+            sub u1(.a(a), .y({v1, v0}));
+            sub u2(.a(a), .y(w));
+            sub u3(.a(a), .y(sel[1:0]));
+            assign {c1, c0} = a;
+            initial begin
+                a = 2'b00;
+                #1 force v1 = 1'b1;
+                force c1 = 1'b1;
+                force w = 2'b10;
+                force sel = 4'b1010;
+                #1 a = 2'b01;
+                #1 $display("forced %b%b %b%b %b %b", v1, v0, c1, c0, w, sel);
+                release v1;
+                release c1;
+                release w;
+                release sel;
+                #1 $display("released %b%b %b%b %b %b", v1, v0, c1, c0, w, sel[1:0]);
+                #1 a = 2'b10;
+                #1 $display("later %b%b %b%b %b %b", v1, v0, c1, c0, w, sel[1:0]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "forced 11 11 10 1010\nreleased 01 01 01 01\nlater 10 10 10 10\n");
+}
+
 // A partial force of a VARIABLE stays rejected — the site state is per whole
 // variable, and LRM 10.6.2 permits a partial force only on a net. slang flags
 // the lvalue (-Wbad-procedural-force) and leaves the statement unbound, so the
