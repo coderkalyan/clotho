@@ -428,6 +428,62 @@ void Backend::nba_classify() {
             s.nba_agg     = agg;
         }
     }
+    // The ids a signal has are record fields at def-local ordinals, so every
+    // instance of a unit must have the same ones: a buffer one instance's
+    // writers need (a hierarchical NBA into one twin only) exists in all of them.
+    for (const std::vector<Signal>& set : unit_twins_) {
+        bool am = false, gm = false, im = false, ip = false;
+        uint32_t it = 0;
+        for (const Signal sig : set) {
+            const SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+            am = am || s.arr_masked;
+            gm = gm || s.agg_masked;
+            im = im || s.intra_masked;
+            ip = ip || s.intra_ptr;
+            it = std::max(it, s.intra_trigs);
+        }
+        for (const Signal sig : set) {
+            SignalSlot& s  = slots_[static_cast<uint32_t>(sig)];
+            s.arr_masked   = am;
+            s.agg_masked   = gm;
+            s.intra_masked = im;
+            s.intra_ptr    = ip;
+            s.intra_trigs  = it;
+        }
+        const auto in = [&](const std::vector<Signal>& l, Signal x) { return std::find(l.begin(), l.end(), x) != l.end(); };
+        const auto join = [&](std::vector<Signal>& l, std::vector<Ref>* types) {
+            const auto first = std::find_if(set.begin(), set.end(), [&](Signal x) { return in(l, x); });
+            if (first == set.end()) {
+                return;
+            }
+            const Ref ty = types != nullptr ? (*types)[static_cast<size_t>(std::find(l.begin(), l.end(), *first) - l.begin())]
+                                            : Ref::Invalid;
+            for (const Signal x : set) {
+                if (!in(l, x)) {
+                    l.push_back(x);
+                    if (types != nullptr) {
+                        types->push_back(ty);
+                    }
+                }
+            }
+        };
+        join(array_nba_sigs_, nullptr);
+        join(agg_nba_sigs_, nullptr);
+        join(handle_nba_sigs_, &handle_nba_types_);
+        join(string_nba_sigs_, nullptr);
+        join(intra_nba_sigs_, nullptr);
+        for (uint32_t e = 0; e < 3; ++e) {
+            const bool any = std::any_of(set.begin(), set.end(), [&](Signal x) {
+                return trigger_id_[static_cast<uint32_t>(x)][e] >= 0;
+            });
+            for (const Signal x : set) {
+                int32_t& tid = trigger_id_[static_cast<uint32_t>(x)][e];
+                if (any && tid < 0) {
+                    tid = static_cast<int32_t>(n_triggers_++);
+                }
+            }
+        }
+    }
     n_nba_          = 0;
     const auto sigs = mod_.signals();
     for (uint32_t i = 0; i < sigs.size(); ++i) {
@@ -1075,7 +1131,7 @@ llvm::StructType* Backend::intra_rec_ty(const SignalSlot& s) {
         // The dense trigger ids this record registered on, so rt_intra_event_fire
         // can remove it from the ones that did not fire. It lives in the RECORD
         // rather than in a constant global because a trigger id is a per-INSTANCE
-        // link-time constant (abs_id_const): twin instances of one definition
+        // id (a field of the instance record): twin instances of one definition
         // share the emitted code and have different ids, so a baked-in array
         // would name the wrong instance's triggers. Placed last so that adding it
         // moves no existing tail index.
@@ -1489,7 +1545,7 @@ void Backend::emit_handle_whole_nba(Index i) {
     auto*             rt   = handle_rec_ty(qa.queue_type);
     const auto        strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      rec  = b_.CreateCall(nba_arr_slot_fn(),
-                                           { b_.getInt32(handle_buf_idx(dlv.sig)), b_.getInt32(strd) });
+                                           { handle_id_value(dlv.sig), b_.getInt32(strd) });
     b_.CreateAlignedStore(lv_handle_ptr(dlv, HandleUse::Place), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
     // Every container handle's empty image is all-zero, so a memset constructs
     // the staging handle the deep copy below then assigns into.
@@ -1579,7 +1635,7 @@ llvm::StructType* Backend::str_rec_ty() {
 void Backend::emit_string_whole_nba(const LValue& lv, Index rhs) {
     auto*        rt   = str_rec_ty();
     const auto   strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-    llvm::Value* rec  = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(str_buf_idx(lv.sig)), b_.getInt32(strd) });
+    llvm::Value* rec  = b_.CreateCall(nba_arr_slot_fn(), { str_id_value(lv.sig), b_.getInt32(strd) });
     b_.CreateAlignedStore(lv_string_ptr(lv, StringUse::Place), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
     llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
     b_.CreateCall(str_init_fn(), { staged });

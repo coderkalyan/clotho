@@ -1084,6 +1084,55 @@ TEST_CASE("virtual interface: a plain write after the trigger commits after a ti
         )");
         CHECK(out == "b0=33 b1=22\n");
     }
+    // Nothing here names an instance hierarchically, so b0 and b1 are twins of one unit
+    // with ids of their own for the member. The write through a handle must still find the
+    // record the statement through the same handle armed.
+    SUBCASE("event control, twins of one unit") {
+        const std::string out = run_capture(R"(
+            interface ibus; logic [7:0] d; endinterface
+            module top;
+                ibus b0(); ibus b1();
+                virtual ibus v0, v1;
+                event e;
+                initial begin
+                    v0 = b0;
+                    v1 = b1;
+                    v0.d = 8'h00;
+                    v1.d = 8'h00;
+                    v1.d <= @e 8'h11;
+                    #1;
+                    -> e;
+                    v1.d <= 8'h22;
+                    v0.d <= 8'h33;
+                    #1 $display("b0=%h b1=%h", v0.d, v1.d);
+                    $finish;
+                end
+            endmodule
+        )");
+        CHECK(out == "b0=33 b1=22\n");
+    }
+    SUBCASE("delay, twins of one unit") {
+        const std::string out = run_capture(R"(
+            interface ibus; logic [7:0] d; endinterface
+            module top;
+                ibus b0(); ibus b1();
+                virtual ibus v0, v1;
+                initial begin
+                    v0 = b0;
+                    v1 = b1;
+                    v0.d = 8'h00;
+                    v1.d = 8'h00;
+                    v1.d <= #1 8'h11;
+                    #1;
+                    v1.d <= 8'h22;
+                    v0.d <= 8'h33;
+                    #1 $display("b0=%h b1=%h", v0.d, v1.d);
+                    $finish;
+                end
+            endmodule
+        )");
+        CHECK(out == "b0=33 b1=22\n");
+    }
 }
 
 // A record released while its own member commits -- here by the wake of the first of two

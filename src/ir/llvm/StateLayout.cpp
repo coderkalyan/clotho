@@ -1055,10 +1055,60 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
     return lv_field_ptr(lv, 1);
 }
 
-// Compute each instance context's type (see Anchor): shared per definition,
-// fields sized from the instance's process count (one block-id field per
-// owned process, and when some group is guarded two trigger-mask fields
-// each) and wait-bucket slots. Runs after fusion grouping, trigger colouring,
+// Give every signal an instance owns a field in its record for each design-wide
+// id it has (IdFamily), in the signal's def-local order, so the ordinals are the
+// same in every instance of a unit, and remember the id each field holds for the
+// startup fill. Presence is uniform across a unit's instances because the sets
+// the ids index are joined over them (nba_classify).
+void Backend::assign_id_fields() {
+    const size_t n = mod_.signals().size();
+    id_ord_.assign(n, [] {
+        std::array<uint32_t, kIdFamilies> a;
+        a.fill(no_id);
+        return a;
+    }());
+    id_val_ = id_ord_;
+    const auto note = [&](const std::vector<Signal>& sigs, IdFamily f, uint32_t base) {
+        for (uint32_t k = 0; k < sigs.size(); ++k) {
+            id_val_[static_cast<uint32_t>(sigs[k])][static_cast<uint32_t>(f)] = base + k;
+        }
+    };
+    const auto na = static_cast<uint32_t>(array_nba_sigs_.size());
+    const auto ng = static_cast<uint32_t>(agg_nba_sigs_.size());
+    const auto nh = static_cast<uint32_t>(handle_nba_sigs_.size());
+    note(array_nba_sigs_, IdFamily::Arr, 0);
+    note(agg_nba_sigs_, IdFamily::Agg, na);
+    note(handle_nba_sigs_, IdFamily::Handle, na + ng);
+    note(string_nba_sigs_, IdFamily::Str, na + ng + nh);
+    note(intra_nba_sigs_, IdFamily::Intra, 0);
+    for (uint32_t i = 0; i < n && i < trigger_id_.size(); ++i) {
+        for (uint32_t e = 0; e < 3; ++e) {
+            if (trigger_id_[i][e] >= 0) {
+                id_val_[i][static_cast<uint32_t>(IdFamily::TrigPos) + e] = static_cast<uint32_t>(trigger_id_[i][e]);
+            }
+        }
+    }
+    for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
+        uint32_t next = 0;
+        for (const Signal sj : anchor_signals_[ai]) {
+            if (sj == Signal{ ~0u }) {
+                continue;
+            }
+            const auto si = static_cast<uint32_t>(sj);
+            for (uint32_t f = 0; f < kIdFamilies; ++f) {
+                if (id_val_[si][f] != no_id) {
+                    id_ord_[si][f] = next++;
+                }
+            }
+        }
+        anchors_[ai].n_id = next;
+    }
+}
+
+// Compute each instance context's type (see Anchor): shared per unit, fields
+// sized from the instance's process count (one block-id field per owned
+// process, and when some group is guarded two trigger-mask fields each), wait
+// buckets, bindings and ids. Runs after fusion grouping, trigger colouring,
 // wait-queue sizing and build_sched_flags (the process ordinals), before
 // lowering.
 //
@@ -1068,6 +1118,7 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
 // field holds their first id, and the field is the same in every instance of a
 // unit because every instance has the same groups.
 void Backend::build_instance_ctx_layout() {
+    assign_id_fields();
     // Twin instances own the same number of processes; size blk fields by the
     // definition-wide maximum so layouts agree even if one of them degenerated
     // (they should be equal by construction).
@@ -1107,6 +1158,7 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_mmask_base       = a.ctx_trig_base + nsta;
         a.ctx_gmask_base       = a.ctx_mmask_base + a.n_mask;
         a.ctx_bind_base        = a.ctx_gmask_base + a.n_mask;
+        a.ctx_id_base          = a.ctx_bind_base + 2 * a.n_bind;
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1116,10 +1168,12 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), nsta, b_.getInt64Ty());
             f.insert(f.end(), 2 * a.n_mask, b_.getInt64Ty());
             f.insert(f.end(), 2 * a.n_bind, ptr);
+            f.insert(f.end(), a.n_id, i32);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
+        assert(a.ctx_ty->getNumElements() == a.ctx_id_base + a.n_id && "instances of one unit lay their records out alike");
     }
 }
 

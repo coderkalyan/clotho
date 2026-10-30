@@ -1055,8 +1055,9 @@ void Backend::lower_inst(Index i) {
         // the NBA update region (see emit_nba_region), which commits shadow ->
         // live and services wait queues only after every active process has run.
         case Inst::Tag::StoreNb: {
-            const Guarded& lv = lvalue_of(p.binary.l);
-            CtxOverride   ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
+            const Guarded&             lv = lvalue_of(p.binary.l);
+            std::optional<CtxOverride> ov;
+            ov.emplace(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
             emit_bounds_reports(lv, /*is_write=*/true);
             if (lv.is_string) {
                 // A whole-string NBA stages an owned deep copy in its own record
@@ -1104,8 +1105,14 @@ void Backend::lower_inst(Index i) {
                     lower_store_nb(v, rhs);
                 }
                 // A signal that also takes timed NBAs keeps this write behind the deferred
-                // updates that were already released (emit_intra_nba_ordered).
+                // updates that were already released (emit_intra_nba_ordered). The copy and
+                // its probe name the record list the timed arms stage under, and the arms
+                // install no instance context: a write through a handle names the member's
+                // list (the representative's), whichever instance the handle named, and the
+                // record carries the instance. The instance's own record would hold another
+                // twin's id, or none at all in a unit of its own.
                 if (v.is_signal && is_intra_target(v.sig)) {
+                    ov.reset();
                     emit_intra_nba_ordered(v, rhs);
                 }
             });

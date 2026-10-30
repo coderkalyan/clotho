@@ -884,6 +884,11 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
                 continue;
             }
             const auto si = static_cast<uint32_t>(sj);
+            for (uint32_t f = 0; f < kIdFamilies; ++f) {
+                if (id_ord_[si][f] != no_id) {
+                    b_.CreateStore(b_.getInt32(id_val_[si][f]), ctx_ptr(a, a.ctx_id_base + id_ord_[si][f]));
+                }
+            }
             for (uint32_t e = 0; e < 3; ++e) {
                 if (wait_slot_sta_[si][e] != no_wait_slot) {
                     b_.CreateStore(sym(wait_sta_gv_[si][e]),

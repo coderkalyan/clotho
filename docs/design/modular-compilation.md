@@ -315,7 +315,7 @@ between instances:
   count and trigger bits), and the trigger masks of the guarded groups it runs.
 
 Today's per-definition `@clotho.inst.<hier>.ctx` (StateLayout.cpp) is the
-seed of it; the `abs_id` / `idval` relocations and constant anchors in unit
+seed of it; the `abs_id` / `idval` relocations (gone: ids are record fields) and constant anchors in unit
 code go.
 
 ## Staging
@@ -382,8 +382,12 @@ code go.
      what it needs of the owner is data and not a symbol. Two declarations of
      one instance can name one signal (an inout port and the contribution a
      child drives through it); the first stands for both, so instances whose
-     declarations alias differently do not share code. Array, trigger and name
-     ids are not in the record yet.
+     declarations alias differently do not share code. The ids of its signals in
+     design-wide spaces (array, aggregate, container, string and intra NBA
+     buffers, `<= @e` triggers) are record fields at def-local ordinals, filled
+     at startup, and the sets they index are joined over a unit's instances;
+     the dump-var base was a field already. A signal of no instance keeps its
+     immediates. Name ids (`inst_path`) are not in the record yet.
    - **3c, code once per unit.** Each unit's processes and functions are
      lowered once from the unit's IR, taking the record, into the unit's module.
      Fusion runs within a unit; groups spanning instances become dispatch

@@ -134,22 +134,25 @@ void Backend::vcd_index_signal(Signal sig, uint32_t& next) {
     vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next++);
 }
 
-// The rt_vcd_touch index of a dumped signal: def-relative (instance vcd base
-// + def-local offset) inside the owner's own group, the folded constant
-// otherwise — the same split as storage / sched anchors.
+// The rt_vcd_touch index of a dumped signal: the instance's dump-var base (a
+// record field) + the signal's def-local offset. The record is the own
+// instance's, or the one a binding or an installed context names for another
+// instance's signal; code outside a group, and a signal of no instance, keep the
+// folded constant.
 llvm::Value* Backend::vcd_index_value(Signal sig, int32_t base) {
     const SignalSlot& s = slot_of(sig);
-    if (s.anchor != SignalSlot::no_anchor && def_relative_for(s)) {
-        Anchor& a = anchors_[s.anchor];
-        if (a.first_vcd >= 0) {
-            llvm::Value* b0 = ctx_field(a, 3, b_.getInt32Ty());
+    if (s.anchor != SignalSlot::no_anchor && anchors_[s.anchor].first_vcd >= 0) {
+        Anchor&      a  = anchors_[s.anchor];
+        llvm::Value* b0 = nullptr;
+        if (def_relative_for(s)) {
+            b0 = ctx_field(a, 3, b_.getInt32Ty());
+        } else if (llvm::Value* rec = bound_record(s); rec != nullptr) {
+            b0 = b_.CreateLoad(b_.getInt32Ty(),
+                               b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(3) }));
+        }
+        if (b0 != nullptr) {
             return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
         }
-    }
-    if (abs_id_eligible(s) && anchors_[s.anchor].first_vcd >= 0) {
-        Anchor& a = anchors_[s.anchor];
-        return abs_id_const("vcd." + a.name, static_cast<uint32_t>(a.first_vcd),
-                            static_cast<uint32_t>(base - a.first_vcd));
     }
     return b_.getInt32(static_cast<uint32_t>(base));
 }

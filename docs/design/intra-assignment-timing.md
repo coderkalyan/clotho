@@ -466,6 +466,13 @@ bits over them (the record carries the positioned value and mask the staged writ
 write before the arm, the update and a write after the trigger on overlapping bits therefore
 land in that order, bit for bit.
 
+The probe and the copy name the list the timed arms stage under: the id of the member the
+statement names. Through a virtual interface handle that is the representative's, whichever
+instance the handle names, with the destination and the instance carried in the record. The
+probe does not read the id from the record of the named instance: that holds another twin's
+id, or none when the twin is a unit of its own. `StoreNb` drops the handle's instance context
+for the copy for that reason.
+
 The list is kept in creation order by batches. `intra_ready_push` puts a record behind every
 record of an earlier batch and, inside its own batch, in `seq` order. A batch is the records
 pushed with no `rt_intra_moment` between them: the wheel never calls it, so a tick is one
@@ -696,8 +703,8 @@ maturing edge and only by multi-trigger sites; single-trigger codegen is unchang
 `ExtraSlice` of packed two-word `IntraTrigger` records (the `WaitInfo` encoding),
 packed ONCE per statement so an N-leaf decomposing target interns one list, not N.
 And the record's id array is filled from `trigger_id_value`, not from compile-time
-constants: a dense trigger id is a per-INSTANCE link-time constant
-(`abs_id_const`) while twin instances of a definition share the emitted code, so a
+constants: a dense trigger id is a per-INSTANCE record field
+while twin instances of a definition share the emitted code, so a
 constant global would name one instance's triggers from both. That is also why the
 array has to live in the record rather than beside it — a first attempt at a
 private constant global was wrong for exactly this reason, and there is a

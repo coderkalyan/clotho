@@ -924,6 +924,15 @@ struct SignalSlot {
     bool vif_rec = false;
 };
 
+// The design-wide id spaces a signal can have an id in, each dense over the
+// design: a runtime NBA buffer (arrays, aggregates, containers, strings), the
+// intra-assignment record pools, and the `<= @e` triggers of each edge. A
+// signal's ids sit in its instance's record, so the code that uses one names
+// no number.
+enum class IdFamily : uint32_t { Arr, Agg, Handle, Str, Intra, TrigPos, TrigNeg, TrigAny };
+inline constexpr uint32_t kIdFamilies = 8;
+inline constexpr uint32_t no_id       = ~0u;
+
 // One instance-scope occurrence: the addressing anchor for every signal the
 // scope declares. Each scope owns its own state global
 // (@clotho.inst.<hier>.state, own signals only — children own theirs), so a
@@ -1023,6 +1032,10 @@ struct Anchor {
     // each is bound to in THIS instance; bind_of is its inverse, which names a
     // flat signal's binding while the code of this instance is lowered.
     uint32_t ctx_bind_base = 0;
+    // The signals' ids in design-wide spaces (see IdFamily), one i32 field per
+    // (signal, family) the unit's signals have, at ctx_id_base + Backend::id_ord_.
+    uint32_t ctx_id_base = 0;
+    uint32_t n_id        = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -1181,19 +1194,28 @@ private:
     llvm::Function* sym(llvm::Function* f);
     llvm::GlobalVariable* sym(llvm::GlobalVariable* g);
 
-    bool unit_emission() const;
-
-    llvm::Value* abs_id_const(const std::string& key, uint32_t value, uint32_t addend);
-
-    bool abs_id_eligible(const SignalSlot& s) const;
+    // A design-numbering id the code being lowered uses (a runtime buffer index
+    // or a trigger id), as an IR value: the field of the record of the instance
+    // that owns `sig` -- the own instance's, or the one a binding or an installed
+    // context names -- and an immediate where no record describes the signal
+    // (code outside a group, a signal of no instance).
+    llvm::Value* id_value(Signal sig, IdFamily family, uint32_t id);
 
     llvm::Value* arr_id_value(Signal sig);
 
     llvm::Value* agg_id_value(Signal sig);
 
+    llvm::Value* handle_id_value(Signal sig);
+
+    llvm::Value* str_id_value(Signal sig);
+
     llvm::Value* intra_id_value(Signal sig);
 
     llvm::Value* trigger_id_value(Signal sig, uint32_t edge);
+
+    // Give every signal's ids their record fields, and record each id's value
+    // for the fill (build_instance_ctx_layout).
+    void assign_id_fields();
 
     ModuleEnv& unit_env(const Anchor& a);
 
@@ -4262,8 +4284,10 @@ private:
     llvm::GlobalVariable*   proc_pcb_gv_      = nullptr;
     llvm::ArrayType*        proc_pcb_arr_ty_  = nullptr;
     ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
-    // Root-defined integer-id value globals (abs_id_const): name -> global.
-    ankerl::unordered_dense::map<std::string, llvm::GlobalVariable*> idval_gvs_;
+    // Per flat signal and id family: the signal's ordinal among its instance's id
+    // fields (Anchor::ctx_id_base + ordinal), or no_id when it has none.
+    std::vector<std::array<uint32_t, kIdFamilies>> id_ord_;
+    std::vector<std::array<uint32_t, kIdFamilies>> id_val_;
     llvm::IRBuilder<>       b_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).

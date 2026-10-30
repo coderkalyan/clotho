@@ -502,7 +502,7 @@ TEST_CASE("nonblocking intra-assignment concat target with a multi-signal trigge
 }
 
 // A multi-signal trigger inside a module instantiated TWICE. A dense trigger id
-// is a per-instance link-time constant (abs_id_const) while twin instances share
+// is a per-instance id (a record field) while twin instances share
 // the emitted code, so the id list the record registers on -- and is removed from
 // -- has to be built per instance. It lives in the record's own tail for exactly
 // this reason; a compile-time constant global would bake u0's ids into u1. Each

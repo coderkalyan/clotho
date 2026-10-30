@@ -200,82 +200,55 @@ llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
     return llvm::cast<llvm::GlobalVariable>(it->second);
 }
 
-// True while emission targets a definition-unit module (split mode);
-// root-module code keeps plain immediates for the id families below.
-bool Backend::unit_emission() const {
-    return env_ != root_env_.get();
-}
-
-// A design-numbering integer id, referenced from unit-module code without
-// baking the number: a load of a root-defined i32 value global
-// (@clotho.idval.<key>), named by hierarchy + def-local ordinal, so the
-// unit's bytes stay independent of whole-design numbering (root always
-// recompiles and carries the value). Deliberately NOT an absolute-symbol
-// relocation: a truncating-ptrtoint constant in operand position measured
-// ~+3KB codegen per hot pico thunk -- SelectionDAG (the -O0 fallback for
-// blocks FastISel misses) keeps the symbol address live across the whole
-// function and spills it, costing more executed instructions per
-// activation than this one L1-hot 4-byte load per site (llc A/B on the
-// extracted thunk: constexpr 72248 B, instruction-form 72169 B, this load
-// form 70992 B, literal floor 69298 B).
-llvm::Value* Backend::abs_id_const(const std::string& key, uint32_t value, uint32_t addend) {
-    std::string name = "clotho.idval." + key;
-    if (addend != 0) {
-        name += "+" + std::to_string(addend);
+// A design-numbering id the code being lowered uses, as an IR value. The ids of
+// a signal's instance sit in that instance's record (assign_id_fields), so the
+// code that uses one names no number and the unit's code is the same whichever
+// instance it runs for: the own instance's record, or the record of the
+// instance a binding or an installed context names, at the signal's def-local
+// field. Where no record describes the signal -- code outside a group, a signal
+// of no instance -- the id is the immediate it has always been.
+llvm::Value* Backend::id_value(Signal sig, IdFamily family, uint32_t id) {
+    const SignalSlot& s = slot_of(sig);
+    if (s.anchor != SignalSlot::no_anchor && !id_ord_.empty()) {
+        const uint32_t ord = id_ord_[static_cast<uint32_t>(sig)][static_cast<uint32_t>(family)];
+        if (ord != no_id) {
+            Anchor& a = anchors_[s.anchor];
+            if (def_relative_for(s)) {
+                return ctx_field(a, a.ctx_id_base + ord, b_.getInt32Ty());
+            }
+            if (llvm::Value* rec = bound_record(s); rec != nullptr) {
+                return b_.CreateLoad(
+                  b_.getInt32Ty(),
+                  b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(a.ctx_id_base + ord) }));
+            }
+        }
     }
-    auto [it, inserted] = idval_gvs_.try_emplace(name, nullptr);
-    if (inserted) {
-        auto* i32  = b_.getInt32Ty();
-        it->second = new llvm::GlobalVariable(root_env_->llmod, i32, /*isConstant=*/true,
-                                              llvm::GlobalValue::InternalLinkage,
-                                              llvm::ConstantInt::get(i32, value + addend), name);
-        it->second->setAlignment(llvm::Align(4));
-    } else if (llvm::cast<llvm::ConstantInt>(it->second->getInitializer())->getZExtValue() !=
-               value + addend) {
-        throw BackendError{ "id value global '" + name + "' bound to two values" };
-    }
-    return b_.CreateLoad(b_.getInt32Ty(), sym(it->second));
-}
-
-// Whether `s`'s design-numbering ids should emit as absolute-symbol
-// relocations in the current emission context: unit-module code only, and
-// only for scope-owned signals (an unscoped signal referenced from a unit
-// keeps the immediate — rare, costs only that unit's cache stability).
-bool Backend::abs_id_eligible(const SignalSlot& s) const {
-    return config_.split && unit_emission() && s.anchor != SignalSlot::no_anchor;
+    return b_.getInt32(id);
 }
 
 // rt_nba_arr_* buffer index of an array-NBA signal, as an IR value.
 llvm::Value* Backend::arr_id_value(Signal sig) {
-    const uint32_t    id = arr_idx(sig);
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("arr." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, IdFamily::Arr, arr_idx(sig));
 }
 
 // rt_nba_arr_* buffer index of an aggregate-NBA signal, as an IR value.
 llvm::Value* Backend::agg_id_value(Signal sig) {
-    const uint32_t    id = agg_buf_idx(sig);
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("agg." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, IdFamily::Agg, agg_buf_idx(sig));
+}
+
+// rt_nba_arr_* buffer index of a whole-container NBA signal, as an IR value.
+llvm::Value* Backend::handle_id_value(Signal sig) {
+    return id_value(sig, IdFamily::Handle, handle_buf_idx(sig));
+}
+
+// rt_nba_arr_* buffer index of a whole-string NBA signal, as an IR value.
+llvm::Value* Backend::str_id_value(Signal sig) {
+    return id_value(sig, IdFamily::Str, str_buf_idx(sig));
 }
 
 // rt_intra_* record-buffer index of an intra-assignment target, as an IR value.
 llvm::Value* Backend::intra_id_value(Signal sig) {
-    const uint32_t    id = intra_idx(sig);
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("intra." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, IdFamily::Intra, intra_idx(sig));
 }
 
 // Trigger id of (signal, edge), as an IR value. A dense `<= @e` id for a value
@@ -289,14 +262,8 @@ llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
                               : b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
         return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
     }
-    const auto        id = static_cast<uint32_t>(trigger_id(sig, edge));
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("trig." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()) +
-                              ".e" + std::to_string(edge),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, static_cast<IdFamily>(static_cast<uint32_t>(IdFamily::TrigPos) + edge),
+                    static_cast<uint32_t>(trigger_id(sig, edge)));
 }
 
 // The definition unit's env for an anchored scope, created (with its
