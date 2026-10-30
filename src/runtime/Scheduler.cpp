@@ -872,12 +872,12 @@ std::vector<DeferReport> g_defer;
 } // namespace
 
 extern "C" void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val,
-                                const char* banner, const char* fmt, uint32_t argc,
-                                const rt_arg* argv) {
+                                const char* banner, const rt_string* path, const char* tail, const char* fmt,
+                                uint32_t argc, const rt_arg* argv) {
     io_ensure_init();
     // Rendered, and stamped with the time, now: the arguments are sampled at the
     // point the assertion executes, and maturation is in the same instant.
-    std::string line = severity_line(level, banner, fmt, argc, argv);
+    std::string line = severity_line(level, banner, path, tail, fmt, argc, argv);
     g_defer.push_back(
       { std::move(line), static_cast<const uint64_t*>(gen), gen_val, is_final != 0 });
 }

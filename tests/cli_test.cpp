@@ -1010,6 +1010,37 @@ TEST_CASE("cli: instances of one module share a unit whatever hidden temporaries
     CHECK(split_specializations(r.err) == 0);
 }
 
+// An instance's name is data the body reads, not text in it: %m prints the path, a
+// report names its instance by it, and the instances of a module that does both,
+// with an assertion of each kind in it, still lower alike.
+TEST_CASE("cli: instances of one module share a unit whatever names they print or report") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf(input logic clk);
+          logic a = 0, b = 0;
+          initial begin
+            $display("%m");
+            $error("plain");
+            assert (a) else $error("checked");
+          end
+          ap: assert property (@(posedge clk) a |=> b);
+        endmodule
+        module top;
+          logic clk = 0;
+          leaf u1(clk);
+          leaf u2(clk);
+        endmodule
+    )");
+    const Result   r      = s.run(std::format("run --stat=units \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(r.out == "top.u1\ntop.u2\n");
+    CHECK(contains(r.err, "top.u1 at 0 s: plain"));
+    CHECK(contains(r.err, "top.u2 at 0 s: plain"));
+    CHECK(contains(r.err, "top.u1 at 0 s: checked"));
+    CHECK(contains(r.err, "top.u2 at 0 s: checked"));
+    CHECK(split_specializations(r.err) == 0);
+}
+
 // A covergroup is built per instance, but its type says nothing of the instance:
 // the prefix the report names the instance by is read when the group is built, so
 // the instances of a module that builds one still share a unit.

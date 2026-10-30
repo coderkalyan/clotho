@@ -449,25 +449,30 @@ void Backend::lower_case_viol(Index i) {
 
 // Lower a severity report ($info / $warning / $error / $fatal, or an
 // immediate-assertion default failure): build the message descriptor array
-// and call the runtime, passing the severity label, compile-time banner, and
-// format string. Needs no wheel (the report carries no simulation time), so
+// and call the runtime, passing the severity label, the banner's pieces, and
+// the format string. Needs no wheel (the report carries no simulation time), so
 // it lowers cleanly inside a pure function too.
+//
+// The banner is not built here. Its leading text, the instance's path (the
+// borrowed handle of an InstPath, null when the banner is all text) and its
+// trailing text (null when empty) go to the runtime as they are, which joins them
+// when it issues the line. Building the banner at the call site would put its
+// temporaries in the prologue of every body that holds a report, paid by every
+// activation, to name an instance on the rare one that fires.
 void Backend::lower_severity(Index i) {
-    const auto  info = ir_->extra_data<SeverityInfo>(ir_->payload(i).extra);
+    const auto        info   = ir_->extra_data<SeverityInfo>(ir_->payload(i).extra);
     const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+    const std::string tail   = ir_->extra_bytes(info.tail, info.tail_len);
     const std::string fmt    = ir_->extra_bytes(info.fmt, info.fmt_len);
 
-    // A banner that names the instance is a string value built at run time; the
-    // runtime reads it as a C string (a string handle keeps its NUL terminator) and
-    // has finished with it by the time the report call returns.
-    llvm::Value* banner_ptr = info.banner_value != kNoIndex
-                                ? static_cast<llvm::Value*>(b_.CreateCall(str_data_fn(), { str_of(info.banner_value) }))
-                                : static_cast<llvm::Value*>(b_.CreateGlobalString(banner));
+    auto*        null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    llvm::Value* path = info.path != kNoIndex ? str_of(info.path) : static_cast<llvm::Value*>(null);
+    llvm::Value* text = tail.empty() ? static_cast<llvm::Value*>(null) : b_.CreateGlobalString(tail);
     const std::span<const Index> args = ir_->region(info.args);
     llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     if (info.defer == 0) {
         b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
-                                       banner_ptr, b_.CreateGlobalString(fmt),
+                                       b_.CreateGlobalString(banner), path, text, b_.CreateGlobalString(fmt),
                                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
         return;
     }
@@ -484,12 +489,11 @@ void Backend::lower_severity(Index i) {
                      : static_cast<llvm::Value*>(b_.getInt64(0));
     llvm::Value* gen_arg =
       gen != nullptr ? gen
-                     : static_cast<llvm::Value*>(
-                         llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+                     : static_cast<llvm::Value*>(null);
     b_.CreateCall(defer_report_fn(),
                   { b_.getInt32(static_cast<int32_t>(info.level)),
                     b_.getInt64(info.defer == 2 ? 1 : 0), gen_arg, gen_val,
-                    banner_ptr, b_.CreateGlobalString(fmt),
+                    b_.CreateGlobalString(banner), path, text, b_.CreateGlobalString(fmt),
                     b_.getInt32(static_cast<uint32_t>(args.size())), arr });
 }
 

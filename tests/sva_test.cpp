@@ -233,19 +233,23 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     // and order are untouched and the banner is the whole difference.
     //
     // Re-established again when the banner began to read the instance's path at run
-    // time: the default failure now builds it from four more instructions (the two
-    // text constants, inst_path and their concat), so the final process is 18 + 4 =
-    // 22 instructions. The step process, which holds the counting arithmetic this
-    // case guards, keeps its digest. Measured the way the case above describes: the
-    // `--emit ir` dumps before and after differ in those four instructions and the
-    // severity's banner operand, and in nothing else but the renumbering after them.
+    // time: the default failure built it from four more instructions (the two text
+    // constants, inst_path and their concat), so the final process was 18 + 4 = 22
+    // instructions. And once more when the report stopped building the banner at
+    // all: the severity keeps the pieces apart ("source:4: ", the inst_path operand,
+    // ".ap") for the runtime to join when it reports, so the final process is 18 + 1
+    // = 19 instructions -- the one inst_path -- as the IR printer shows. The step
+    // process, which holds the counting arithmetic this case guards, keeps its digest
+    // through both. Measured the way the case above describes: the `--emit ir` dumps
+    // before and after each change differ in those instructions and the severity's
+    // banner operands, and in nothing else but the renumbering after them.
     LowerResult       r;
     const ir::Module& m = lower_for_monitor(counted_implication, r);
 
     REQUIRE(m.monitors.size() == 1);
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
     CHECK(monitor_shape(m) == "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-                              "step:114:8500337446600503064 final:22:14481299348803842354 ");
+                              "step:114:8500337446600503064 final:19:18196170908955638981 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {

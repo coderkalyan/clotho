@@ -256,7 +256,9 @@ path, then the enclosing task, function, named block or assertion label (23.6).
 `<time>` is written as the `$finish` banner writes it, and `: <message>` is left
 out when the call has none. The default failure of an assertion is a `$error`
 made in the assertion's own scope, so a labelled `ap: assert ...` reports
-`top.ap`; iverilog reports `top` for it.
+`top.ap`; iverilog reports `top` for it. The instance's path is read from the
+instance and joined to the text around it only when the line is issued, so a
+call site that does not report builds no banner.
 
 `$fatal` "terminates the simulation with an error code" (20.10): the run ends
 with exit status 1, after its `final` blocks, whatever its finish number.

@@ -1034,10 +1034,14 @@ Index Builder::severity(uint32_t                level,
                         std::span<const FmtArg> args,
                         SourceLoc               loc,
                         uint32_t                defer,
-                        Index                   banner_value) {
-    // Order in the extra buffer: banner bytes, format bytes, then the arg-index
-    // slice and its flags, then the SeverityInfo record pointing at all of them.
+                        Index                   path,
+                        std::string_view        tail) {
+    assert((path != kNoIndex || tail.empty()) && "text after the path needs a path");
+    // Order in the extra buffer: banner bytes, tail bytes, format bytes, then the
+    // arg-index slice and its flags, then the SeverityInfo record pointing at all
+    // of them.
     const ExtraIndex banner_at = add_bytes(banner);
+    const ExtraIndex tail_at   = add_bytes(tail);
     const ExtraIndex fmt_at    = add_bytes(fmt);
     ExtraSlice       signs;
     const ExtraSlice slice = add_fmt_args(args, signs);
@@ -1049,7 +1053,9 @@ Index Builder::severity(uint32_t                level,
                                                      defer,
                                                      slice,
                                                      signs,
-                                                     banner_value });
+                                                     path,
+                                                     tail_at,
+                                                     static_cast<uint32_t>(tail.size()) });
     return emit({ Inst::Tag::Severity, pay(&Inst::Payload::extra, extra) }, loc);
 }
 

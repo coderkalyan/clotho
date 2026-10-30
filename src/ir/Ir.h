@@ -962,9 +962,15 @@ enum class Severity : uint32_t {
 };
 
 // Extra payload for `severity`: an $info / $warning / $error / $fatal report
-// (LRM 20.10) or an immediate-assertion default failure (LRM 16.3). `banner` /
-// `banner_len` are the packed bytes of the compile-time "<file>:<line>: " prefix
-// the runtime completes with the message. `fmt` / `fmt_len` are the packed
+// (LRM 20.10) or an immediate-assertion default failure (LRM 16.3). The report's
+// banner "<file>:<line>: <scope>" is three pieces: the packed bytes `banner` /
+// `banner_len` (all of it for a report outside every instance), then, when `path`
+// is not kNoIndex, the instance path that value holds, then the packed bytes
+// `tail` / `tail_len` (the scope after the instance: generate blocks, subroutine,
+// named blocks). The pieces stay apart and the runtime joins them when it issues
+// the report, because most reports never fire and an activation that does not
+// issue one pays nothing for the banner. `path` is an InstPath, a borrowed string
+// the runtime reads and never keeps. `fmt` / `fmt_len` are the packed
 // $display-style format bytes; `args` the value operands its specifiers consume
 // (both empty for a bare `$error;` or a default assertion failure). `level` is
 // the ir::Severity label. `defer` selects the scheduling region for a deferred
@@ -972,9 +978,9 @@ enum class Severity : uint32_t {
 // where it is lowered), 1 = observed deferred (`assert #0`, matures + fires in
 // the Observed region), 2 = final deferred (`assert final`, Postponed region).
 struct SeverityInfo {
-    // First extra word of the packed banner-prefix bytes.
+    // First extra word of the packed bytes of the banner's leading text.
     ExtraIndex banner;
-    // Banner-prefix length in bytes.
+    // Length of that text in bytes.
     uint32_t banner_len;
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
@@ -988,10 +994,13 @@ struct SeverityInfo {
     ExtraSlice args;
     // As DisplayInfo::signs.
     ExtraSlice signs;
-    // The banner as a runtime STRING VALUE, for a report whose scope begins with the
-    // path of the instance it is in: that path is read at run time, so the banner is
-    // built from it. kNoIndex when `banner` / `banner_len` carry the text instead.
-    Index banner_value;
+    // The path of the instance the report is made in (an InstPath value), or
+    // kNoIndex when `banner` already holds the whole banner.
+    Index path;
+    // First extra word of the packed bytes of the banner's text after the path.
+    ExtraIndex tail;
+    // Length of that text in bytes; zero when `path` is kNoIndex.
+    uint32_t tail_len;
 };
 
 // Extra payload for `fseek`: $fseek(fd, offset, operation) — the descriptor is
@@ -2234,10 +2243,11 @@ struct Inst {
         // Severity system task report ($info / $warning / $error / $fatal, LRM
         // 20.10) or the default failure of an immediate assertion (LRM 16.3),
         // both non-terminating (payload: extra -> SeverityInfo, carrying the
-        // severity level, compile-time banner prefix, and $display-style format
-        // + value args). Lowers to an rt_severity call that renders the message
-        // and writes the labelled diagnostic to stderr, then returns. $fatal's
-        // termination is a separate Finish the frontend emits after this report.
+        // severity level, the banner (compile-time text around an optional
+        // InstPath operand), and $display-style format + value args). Lowers to
+        // an rt_severity call that renders the message and writes the labelled
+        // diagnostic to stderr, then returns. $fatal's termination is a separate
+        // Finish the frontend emits after this report.
         Severity,
         // $fflush: flush a descriptor's output buffers (payload: unary, the
         // descriptor value; the no-argument form passes a constant 0, which the
@@ -3090,9 +3100,9 @@ enum class ExtraOperandTail : uint8_t {
     // handles are strided three words apart inside the packed WaitEdge run, so
     // they are not a slice and cannot be a span.
     WaitHandles,
-    // + SeverityInfo::banner_value, when the report's banner is a runtime string
-    // value (it names the instance, which is read at run time).
-    SeverityBanner,
+    // + SeverityInfo::path, when the report's banner names the instance it is
+    // made in: an InstPath value, read at run time.
+    SeverityPath,
 };
 
 // Constexpr for the same reason as extra_operand_shape(): operand walks inline
@@ -3117,7 +3127,7 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
         case T::Wait:
             return E::WaitHandles;
         case T::Severity:
-            return E::SeverityBanner;
+            return E::SeverityPath;
         default:
             return E::None;
     }
@@ -3147,7 +3157,7 @@ constexpr bool extra_operand_tails_total() {
         if ((kind == Inst::PayloadKind::Sformatf) != (tail == ExtraOperandTail::SformatfFmt)) {
             return false;
         }
-        if ((kind == Inst::PayloadKind::Severity) != (tail == ExtraOperandTail::SeverityBanner)) {
+        if ((kind == Inst::PayloadKind::Severity) != (tail == ExtraOperandTail::SeverityPath)) {
             return false;
         }
         if (tail == ExtraOperandTail::InsideSetMembers && tag != Inst::Tag::InsideSet) {
@@ -3427,10 +3437,10 @@ public:
                 }
                 return;
             }
-            case ExtraOperandTail::SeverityBanner: {
+            case ExtraOperandTail::SeverityPath: {
                 const auto info = extra_data<SeverityInfo>(p.extra);
-                if (info.banner_value != kNoIndex) {
-                    fn(info.banner_value);
+                if (info.path != kNoIndex) {
+                    fn(info.path);
                 }
                 return;
             }

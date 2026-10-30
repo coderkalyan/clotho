@@ -105,9 +105,11 @@ std::string Lowerer::banner_at(slang::SourceLocation sl) const {
 // runtime adds " at <time>: <message>" (rt_severity). `where` is the
 // "<file>:<line>: " prefix. The scope is what `%m` prints at the same place -- the
 // instance, the enclosing subroutine, and every named block or assertion label
-// around the call. Inside an instance the banner is a string built at run time
-// from the instance's path, so it is the same in every instance of the
-// specialization; elsewhere it is text.
+// around the call. Inside an instance the report names the instance by reading its
+// path (inst_path) and keeps the rest of the scope as text after it, so it is the
+// same in every instance of the specialization; the runtime joins the three pieces
+// when it issues the line, and nothing is built where the report does not fire.
+// Elsewhere the banner is all text.
 void Lowerer::emit_report(ir::Builder&                b,
                           uint32_t                    level,
                           const std::string&          where,
@@ -124,11 +126,8 @@ void Lowerer::emit_report(ir::Builder&                b,
         b.severity(level, banner + scope.text, fmt, args, l, defer);
         return;
     }
-    std::vector<ir::Index> parts{ b.constant(string_value_ref(where), l), b.inst_path(l) };
-    if (!scope.text.empty()) {
-        parts.push_back(b.constant(string_value_ref(scope.text), l));
-    }
-    b.severity(level, {}, fmt, args, l, defer, b.concat(parts, l));
+    const ir::Index path = b.inst_path(l);
+    b.severity(level, where, fmt, args, l, defer, path, scope.text);
 }
 
 // Banner for a unique/priority case or if violation, located at the statement.

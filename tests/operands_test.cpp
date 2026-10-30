@@ -498,9 +498,9 @@ TEST_CASE("exactly nine tags hold operands back from the span") {
                                                // slice, so it cannot be a span.
                                                ir::Inst::Tag::Wait,
                                                // Severity: a report inside an instance
-                                               // builds its banner at run time from the
-                                               // instance's path, so the banner is a
-                                               // string VALUE beside the format args.
+                                               // names the instance by its path, a
+                                               // string VALUE the banner is joined
+                                               // around when the report is issued.
                                                ir::Inst::Tag::Severity };
     CHECK(tailed == expected);
 }

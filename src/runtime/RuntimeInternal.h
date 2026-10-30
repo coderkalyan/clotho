@@ -363,7 +363,14 @@ extern std::vector<ObservedCaseViol> g_observed_case;
 // Set by a fatal severity report: rt_sim_run folds it into the exit status.
 inline bool g_fatal_seen = false;
 
-std::string severity_line(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
+// The line of a severity report; `path` and `tail` may be null (see rt_severity).
+std::string severity_line(int32_t          level,
+                          const char*      banner,
+                          const rt_string* path,
+                          const char*      tail,
+                          const char*      fmt,
+                          uint32_t         argc,
+                          const rt_arg*    argv);
 
 // Reports already emitted, keyed by access site: the emitted "<file>:<line>:
 // <col>" string's address (one per instrumented access, stable for the run)

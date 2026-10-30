@@ -108,19 +108,22 @@ llvm::FunctionCallee Backend::observed_flush_fn() {
     return rt_fn("rt_observed_flush", b_.getVoidTy(), {});
 }
 
-// void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
-// renders the message and writes the labelled diagnostic to stderr, then
-// returns (non-fatal).
+// void rt_severity(i32 level, ptr banner, ptr path, ptr tail, ptr fmt, i32 argc,
+// ptr argv) — renders the message and writes the labelled diagnostic to stderr,
+// then returns (non-fatal). `path` is a borrowed rt_string (null for none) and
+// `tail` a C string (null for none) the banner continues with after it.
 llvm::FunctionCallee Backend::severity_fn() {
     return rt_fn("rt_severity", b_.getVoidTy(),
-                 { b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+                 { b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(),
+                   raw_ptr_ty() });
 }
 
 // void rt_defer_report(i32 level, i64 is_final, ptr gen, i64 gen_val, ptr
-// banner, ptr fmt, i32 argc, ptr argv) — queue a deferred assertion report.
+// banner, ptr path, ptr tail, ptr fmt, i32 argc, ptr argv) — queue a deferred
+// assertion report; the banner is as rt_severity's.
 llvm::FunctionCallee Backend::defer_report_fn() {
     return rt_fn("rt_defer_report", b_.getVoidTy(),
-                 { b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty(),
+                 { b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty(),
                    raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
 }
 

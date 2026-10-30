@@ -155,25 +155,33 @@ void rt_observed_flush(void);
 //
 // `level` is the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it
 // selects LABEL, and a fatal also makes the run end with exit status 1
-// (rt_run). `banner` is the compile-time "<file>:<line>: <scope>" prefix:
-// the call's location and the hierarchical name of the scope it is made in, both
-// of which LRM 20.10 requires the report to carry (an empty banner drops the
-// prefix). `<time>` is the simulation time, written as the $finish banner writes
-// it. ": <message>" is left out when the message is empty. $fatal's termination
-// is a separate rt_finish_coop the caller emits after this report.
-void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
+// (rt_run). The banner is "<file>:<line>: <scope>": the call's location and the
+// hierarchical name of the scope it is made in, both of which LRM 20.10 requires
+// the report to carry (an empty banner drops the prefix). It arrives in three
+// pieces and is joined here, when the report is issued, so that nothing is built
+// at a call site that does not report: `banner` is the compile-time text before
+// the scope's instance path, `path` the instance's path (a borrowed string this
+// reads and never keeps; null for a banner that is all text) and `tail` the
+// compile-time text after it (the generate blocks, subroutine and named blocks of
+// the scope; null for none). `<time>` is the simulation time, written as the
+// $finish banner writes it. ": <message>" is left out when the message is empty.
+// $fatal's termination is a separate rt_finish_coop the caller emits after this
+// report.
+void rt_severity(int32_t level, const char* banner, const struct rt_string* path, const char* tail, const char* fmt,
+                 uint32_t argc, const rt_arg* argv);
 
 // Queue a deferred immediate assertion report (LRM 16.4) for maturation in the
 // Observed (`is_final` == 0) or Postponed (`is_final` != 0) region. The message
 // is rendered now (arguments sampled at the Active-region execution point);
-// `level` is the ir::Severity label, `banner` the "<file>:<line>: <scope>" prefix
+// `level` is the ir::Severity label, `banner` / `path` / `tail` the banner pieces
 // of rt_severity, whose line this queues. The time it carries is the instant the
 // assertion executed, which is the instant it matures in.
 // `gen` is the owning process's generation-counter address and `gen_val` its
 // value at queue time: at maturation the report fires only if `*gen` still
 // equals `gen_val`, i.e. the process has not re-activated (flushed) since.
-void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val,
-                     const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
+void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val, const char* banner,
+                     const struct rt_string* path, const char* tail, const char* fmt, uint32_t argc,
+                     const rt_arg* argv);
 
 // Mature and clear the queued observed / final deferred assertion reports.
 // Called by the sim loop at the Observed / Postponed points, and by rt_finish.

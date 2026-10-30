@@ -903,11 +903,11 @@ private:
             }
             case Inst::PayloadKind::Severity: {
                 const auto info = ir_.extra_data<SeverityInfo>(p.extra);
-                os_ << "level" << info.level << ", ";
-                if (info.banner_value != kNoIndex) {
-                    ref(info.banner_value);
-                } else {
-                    os_ << '"' << ir_.extra_bytes(info.banner, info.banner_len) << '"';
+                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len) << '"';
+                if (info.path != kNoIndex) {
+                    os_ << ", ";
+                    ref(info.path);
+                    os_ << ", \"" << ir_.extra_bytes(info.tail, info.tail_len) << '"';
                 }
                 os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
