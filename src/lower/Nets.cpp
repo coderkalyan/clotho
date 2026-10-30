@@ -1629,46 +1629,33 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
             b.cond(site_is(site.active, 1, b, l), then_r, else_r, l, /*unlikely=*/true);
         }
     }
-    // A net with a net delay (LRM 28.16) answers a release with what the drivers have
-    // delivered through it, which is the fold unless a driver change is still on its
-    // way. Then the LRM does not say what the freed bits take. 10.6.2: "the net shall
-    // immediately be assigned the value determined by the drivers of the net", and
-    // the drivers have changed. 10.3.3: "any value change that is to be applied to
-    // [the net] by some other statement shall be delayed ... before it takes effect",
-    // and the change has not taken effect. Neither yields to the other in the text, so
-    // the run stops here instead of picking one. The two answers differ exactly when
-    // the site's bits of the delayed fold and of the fold do.
-    // TODO: release of a net while its net delay holds a driver change (needs the
-    // LRM question above settled; the freed bits then take `fold` or `delayed`).
+    // A net with a net delay (LRM 28.16): the freed bits take what the drivers say NOW,
+    // `$fold`, at once, not what the net delay has delivered so far, `$delayed`. 10.6.2:
+    // "When released, the net shall immediately be assigned the value determined by the
+    // drivers of the net". 28.16 times "any driver on the net changing value", which a
+    // release is not (38.34: a force or release is "with no delay (same as the
+    // SystemVerilog procedural force)"). `$delayed` takes the fold for those bits, so a
+    // driver change still in flight lands as a no-op when it matches, and a later one goes
+    // through the net delay as usual: the inertial store compares with `$delayed`. Only
+    // the bits of a site that is ACTIVE move; releasing what is not forced leaves the delay
+    // alone. The resolver call below folds the drivers once more and stores the net once.
     if (const auto sh = net_delay_shadow_.find(static_cast<uint32_t>(sit->second)); sh != net_delay_shadow_.end()) {
         for (const NetForceSite& site : fs->second) {
             if (site.lo < rlo || site.hi > rhi) {
                 continue;
             }
             const auto bits = [&](ir::Signal sig) {
-                const ir::Index part = (site.lo == 0 && site.hi == net_w - 1)
-                                         ? b.signal(sig, l)
-                                         : b.part_select(b.signal(sig, l), site.hi, site.lo, l);
-                return b.unary(ir::Inst::Tag::Load, part, l);
+                return (site.lo == 0 && site.hi == net_w - 1) ? b.signal(sig, l)
+                                                              : b.part_select(b.signal(sig, l), site.hi, site.lo, l);
             };
-            const ir::Index   delayed = bits(sh->second.delayed);
-            const ir::Index   fold    = bits(sh->second.fold);
-            const ir::Index   same    = b.binary(ir::Inst::Tag::CaseEq, delayed, fold, l);
-            const ir::Index   moving  = b.unary(ir::Inst::Tag::Lnot, same, l);
-            const ir::Index   pending = b.binary(ir::Inst::Tag::Land, site_is(site.active, 1, b, l), moving, l);
-            const std::string banner  = banner_at(lv.sourceRange.start());
+            const ir::Index delayed = bits(sh->second.delayed);
+            const ir::Index fold    = bits(sh->second.fold);
             b.open_region();
-            b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-                       severity_banner(lv.sourceRange.start()),
-                       "release of a net while its net delay holds a driver change is not supported "
-                       "(LRM 10.6.2, 10.3.3)",
-                       {},
-                       l);
-            b.finish(banner + "release", 1, l);
+            b.binary(ir::Inst::Tag::Store, delayed, b.unary(ir::Inst::Tag::Load, fold, l), l);
             const ir::ExtraSlice then_r = b.close_region();
             b.open_region();
             const ir::ExtraSlice else_r = b.close_region();
-            b.cond(pending, then_r, else_r, l, /*unlikely=*/true);
+            b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
         }
     }
     bool released = false;

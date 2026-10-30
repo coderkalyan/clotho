@@ -202,11 +202,12 @@ inertial store compares against `$delayed`, not the net, so the forced value is 
 for the net's own. A net with a net delay and no force, and a forced net with no delay, do not
 pay for any of this.
 
-Not settled by the LRM: a release while a driver change is still on its way (`$fold` and
-`$delayed` differ in the released bits). 10.6.2 has the net "immediately be assigned the value
-determined by the drivers", and 10.3.3 has a value change "delayed ... before it takes
-effect". The run stops with a fatal error there (`release_net`); every other release is exact.
-See `docs/LRM_NOTES.md`.
+A release takes the drivers' value at once: the freed bits of `$delayed` are overwritten
+with `$fold` (only for a site that is active), and the resolver then stores the net once.
+10.6.2 has the net "immediately be assigned the value determined by the drivers", and 28.16
+times a driver changing value, which a release is not. A change still in flight lands as a
+no-op when it matches; a later one goes through the net delay as usual, since the inertial
+store compares with `$delayed`. See `docs/LRM_NOTES.md`, note 49.
 
 ## Oracle
 

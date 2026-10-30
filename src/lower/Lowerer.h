@@ -1852,8 +1852,8 @@ private:
     // be stored into the net itself: it would land over an active force, and the
     // inertial store would take the forced value for the net's own. The resolver
     // keeps the delayed fold in `delayed` and lays the active sites over it for the
-    // net. `fold` is the latest undelayed fold, which a release compares with
-    // `delayed` to tell whether a driver change is still on its way (release_net).
+    // net. `fold` is the latest undelayed fold: a release copies it into the freed bits
+    // of `delayed`, so they take the drivers' value at once (release_net, LRM note 49).
     // Allocated with the net's first force site (register_net_force_site).
     struct NetDelayShadow {
         ir::Signal delayed{ 0 };
