@@ -764,7 +764,9 @@ TEST_CASE("wide ^~ lowers as xnor over the xor path") {
         endmodule
     )");
     CHECK(ir.find("-526254045") == std::string::npos); // not the 1-bit LUT
-    CHECK(ir.find("fshl") != std::string::npos);        // bnot's plane swap
+    // bnot's plane swap. Asserted on the call: this used to match `fshl` in a
+    // `declare` nothing called, which linking the unit modules into one drops.
+    CHECK(ir.find("call i16 @llvm.bswap.i16") != std::string::npos);
 }
 
 TEST_CASE("single-bit &&, ||, !, ~ agree with LRM Kleene semantics") {
