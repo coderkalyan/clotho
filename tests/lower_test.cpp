@@ -1646,3 +1646,66 @@ TEST_CASE("lower_buffer keeps use-based findings but drops driver-based ones") {
         CHECK(r.diagnostic_text().find("unused net 'foo'") != std::string::npos);
     }
 }
+
+// -- Values wider than an LLVM integer (docs/design/kernel.md, Values) --
+
+TEST_CASE("a value too wide for an LLVM integer is refused where its width is introduced") {
+    // LLVM's integers stop at 2^23 bits, so a 2-state value may be 2^23 bits wide and a
+    // 4-state one 2^22 (one integer of twice its width). slang refuses only at 2^24, and
+    // a value just past the limit used to crash inside LLVM's instruction selection or
+    // fail its verifier, with no diagnostic. LRM 6.9.1 and 7.4.1 let an implementation
+    // limit the length of a vector as long as the limit is at least 65536 bits.
+    //
+    // `refused_at` lowers `src` and finds the error, which must name the limit and sit
+    // at the given line and column (1-based; the source starts with a newline).
+    const auto refused_at = [](std::string_view src, uint32_t line, uint32_t column) {
+        const LowerResult r = lower_text(src);
+        CHECK_FALSE(r.ok);
+        const auto error = std::find_if(r.diagnostics.begin(), r.diagnostics.end(), [](const Diagnostic& d) {
+            return d.severity == Severity::Error && d.message.find("too wide") != std::string::npos;
+        });
+        REQUIRE_MESSAGE(error != r.diagnostics.end(), r.diagnostic_text());
+        const SourcePosition at = r.sources->resolve(error->span.start);
+        CHECK(at.valid);
+        CHECK(at.line == line);
+        CHECK(at.column == column);
+        CHECK(error->message.find("8388608") != std::string::npos);
+    };
+
+    SUBCASE("a 4-state declaration: 2^22 bits is held, one more is refused") {
+        CHECK(lower_text("\nmodule m;\n    logic [4194303:0] x;\nendmodule\n").ok);
+        refused_at("\nmodule m;\n    logic [4194304:0] x;\nendmodule\n", 3, 23);
+    }
+
+    SUBCASE("a 2-state declaration: 2^23 bits is held, one more is refused") {
+        CHECK(lower_text("\nmodule m;\n    bit [8388607:0] x;\nendmodule\n").ok);
+        refused_at("\nmodule m;\n    bit [8388608:0] x;\nendmodule\n", 3, 21);
+    }
+
+    SUBCASE("a packed struct is refused by its total width") {
+        refused_at(R"(
+module m;
+    typedef struct packed { bit [4194303:0] a; bit [4194303:0] b; bit c; } t;
+    t s;
+endmodule
+)",
+                   4, 7);
+    }
+
+    SUBCASE("a concatenation or replication of values that each fit is refused at the expression") {
+        refused_at(R"(
+module m;
+    bit [4194303:0] a;
+    initial if ({a, a, a} == 0) $display("zero");
+endmodule
+)",
+                   4, 17);
+        refused_at(R"(
+module m;
+    bit [4194303:0] a;
+    initial if ({3{a}} == 0) $display("zero");
+endmodule
+)",
+                   4, 17);
+    }
+}

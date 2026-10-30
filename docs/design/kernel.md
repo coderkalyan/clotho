@@ -44,9 +44,9 @@ when it does.
 - Values of any width are LLVM integers of that width. Multiply, divide and modulo
   above 128 bits call runtime word routines (`rt_wide_*`) in place of the native
   operation, which LLVM lowers to a bit-serial loop (divide) or a quadratic
-  expansion (multiply); no other operator has a ceiling. A width past LLVM's
-  integer limit (2^23 bits; 2W for a 4-state value) is refused with a located
-  error. **Not yet:** it crashes inside LLVM or fails its verifier.
+  expansion (multiply); no other operator has a ceiling. A value whose integer would
+  pass LLVM's limit (2^23 bits; 2W for a 4-state value of width W) is refused with a
+  located error at the declaration or expression that introduces the width.
 - The constant pool keeps the frontend's encoding; the backend converts on read
   through one shared set of helpers.
 - The encoding's invariants are checked by assertions in debug builds at stores
