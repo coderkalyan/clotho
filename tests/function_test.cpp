@@ -153,28 +153,38 @@ TEST_CASE("recursive fibonacci") {
     CHECK(run_capture(src) == "8 55 610\n");
 }
 
-// An unwritten return path yields X (the return variable's uninitialized value).
-TEST_CASE("unassigned return path yields X") {
+// An unwritten return path yields the return variable's current value (LRM 13.4:
+// a function with no statements "returns the current value of the implicit
+// variable"). Nothing has set it on the first call, so it is the type's default,
+// X for a 4-state vector (Table 6-7). A static function's variable keeps what an
+// earlier call wrote (13.4.2, docs/LRM_NOTES.md note 42), an automatic one is
+// initialized on each entry (6.21).
+TEST_CASE("unassigned return path yields the variable's current value") {
     constexpr std::string_view src = R"(
         module m;
+            function [7:0] never(input [7:0] a); endfunction
             function [7:0] maybe(input [7:0] a, input sel);
                 if (sel) maybe = a;
             endfunction
+            function automatic [7:0] maybea(input [7:0] a, input sel);
+                if (sel) maybea = a;
+            endfunction
             initial begin
+                $display("%h", never(8'd1));
                 $display("%0d", maybe(8'd55, 1'b1));
-                $display("%h", maybe(8'd55, 1'b0));
+                $display("%0d", maybe(8'd55, 1'b0));
+                $display("%0d", maybea(8'd55, 1'b1));
+                $display("%h", maybea(8'd55, 1'b0));
             end
         endmodule
     )";
-    CHECK(run_capture(src) == "55\nxx\n");
+    CHECK(run_capture(src) == "xx\n55\n55\n55\nxx\n");
 }
 
-// LRM 13.4.2 distinction (matches iverilog): a static (non-automatic) function's
-// NAMED local persists across calls (the queue accumulates 1,2,3), while the
-// implicit return variable is fresh each call (`maybe` unwritten path yields X
-// above, not the prior call's value). A frame-Local return var gives the latter;
-// persisting it would leak the prior value on the unwritten path.
-TEST_CASE("static function: named local persists, return var is fresh") {
+// LRM 13.4.2: a static (non-automatic) function's NAMED local persists across
+// calls (the queue accumulates 1,2,3), and so does its implicit return variable,
+// which the test above and the ones at the end of this file cover.
+TEST_CASE("static function: a named local persists across calls") {
     constexpr std::string_view src = R"(
         module m;
             function int q_accum();
@@ -1194,4 +1204,199 @@ TEST_CASE("a constant function call still folds where a constant is required") {
             initial #1 $display("%b %b %b %b", v[w(2) - 1:0], o[w(1)], o[w(1) + 1], {w(1){1'b1}});
         endmodule
     )") == "0101 1 1 11\n");
+}
+
+// The implicit return variable of a static function (LRM 13.4.1, 13.4.2). The
+// definition "shall implicitly declare a variable, internal to the function, with
+// the same name as the function", and a static function has "all declared items
+// being statically allocated", shared "across all uses of the function executing
+// concurrently". A static variable exists for the whole simulation and is
+// initialized on each entry only if it is automatic (6.21), so the variable
+// starts at its type's default and keeps its value from call to call. Icarus
+// Verilog 13 and Verilator 5.050 reset it on every call (iverilog even keeps a
+// queue and resets an int), so the expectations below are the LRM text alone
+// (docs/LRM_NOTES.md, note 42).
+TEST_CASE("the implicit return variable of a static function keeps its value between calls") {
+    CHECK(run_capture(R"(
+        module m;
+            function int g(int x); g = g + x; endfunction
+            function automatic int ga(int x); ga = ga + x; endfunction
+            initial $display("%0d %0d | %0d %0d", g(5), g(5), ga(5), ga(5));
+        endmodule
+    )") == "5 10 | 5 5\n");
+}
+
+// Where the function lives decides the default lifetime (13.4.2): a module,
+// interface, program or package function, and a $unit one, is static; a class
+// method is always automatic (8.6), a static one too (8.10: "the lifetime of the
+// method within the class", not of its variables); `automatic` and a module
+// declared `automatic` make it automatic; `static` inside an automatic module
+// brings it back. Each instance of a module has its own static storage.
+TEST_CASE("the lifetime of a function decides whether its implicit return variable persists") {
+    CHECK(run_capture(R"(
+        package P;
+            function int pg(int x); pg = pg + x; endfunction
+        endpackage
+        function int ug(int x); ug = ug + x; endfunction
+        class C;
+            function int cm(int x); cm = cm + x; endfunction
+            static function int sm(int x); sm = sm + x; endfunction
+        endclass
+        interface ifc;
+            function int ig(int x); ig = ig + x; endfunction
+        endinterface
+        module sub #(int D = 1);
+            function int g(int x); g = g + x; endfunction
+            initial begin
+                int a, b;
+                #D;
+                a = g(1); b = g(1);
+                $display("%m %0d %0d", a, b);
+            end
+        endmodule
+        module automatic am;
+            function int g(int x); g = g + x; endfunction
+            function static int gs(int x); gs = gs + x; endfunction
+            initial begin
+                #3;
+                $display("am g %0d %0d gs %0d %0d", g(5), g(5), gs(5), gs(5));
+            end
+        endmodule
+        module m;
+            ifc i();
+            C c1 = new, c2 = new;
+            sub #(1) s1();
+            sub #(2) s2();
+            am a();
+            initial begin
+                #4;
+                $display("pkg %0d %0d | unit %0d %0d", P::pg(2), P::pg(2), ug(2), ug(2));
+                $display("cm %0d %0d sm %0d %0d", c1.cm(5), c2.cm(5), C::sm(5), C::sm(5));
+                $display("ifc %0d %0d", i.ig(5), i.ig(5));
+            end
+        endmodule
+    )") == "m.s1 1 2\n"
+           "m.s2 1 2\n"
+           "am g 5 5 gs 5 10\n"
+           "pkg 2 4 | unit 2 4\n"
+           "cm 5 5 sm 5 5\n"
+           "ifc 5 10\n");
+}
+
+// Every way the entry value can be seen: read before the write, a write on only
+// some paths (a branch, a case with no default, a loop that may not run), a
+// compound assignment, a part-select write that leaves the other bits, a nested
+// assignment, and the function reached again through itself. Recursion shares the
+// one variable (13.4.2), so the outer call finds what the inner one left: 0 here,
+// where the automatic twin keeps its own and gives 2 + (1 + 0) = 3.
+TEST_CASE("an implicit return variable whose entry value is observed persists") {
+    CHECK(run_capture(R"(
+        module m;
+            function int cp(int x); cp += x; endfunction
+            function int lp(int n); for (int i = 0; i < n; i++) lp = i; endfunction
+            function int cs(int x); case (x) 0: cs = 10; 1: cs = 11; endcase endfunction
+            function int dw(int x); do dw = dw + x; while (0); endfunction
+            function bit [7:0] part(bit [7:0] x); part[3:0] = x[3:0]; part[7] = ~part[7]; endfunction
+            function int nest(int x); if ((nest = x) > 100) nest = 0; endfunction
+            function int rec(int n); rec = n; if (n > 0) begin int t; t = rec(n - 1); rec = rec + t; end endfunction
+            function automatic int reca(int n);
+                reca = n; if (n > 0) begin int t; t = reca(n - 1); reca = reca + t; end
+            endfunction
+            function logic [3:0] f4(logic en); if (en) f4 = 4'd9; endfunction
+            initial begin
+                $display("cp %0d %0d", cp(5), cp(5));
+                $display("lp %0d %0d %0d", lp(3), lp(0), lp(2));
+                $display("cs %0d %0d %0d", cs(0), cs(2), cs(1));
+                $display("dw %0d %0d", dw(2), dw(2));
+                $display("part %h %h %h", part(8'hA5), part(8'h3C), part(8'hF7));
+                $display("nest %0d %0d", nest(7), nest(200));
+                $display("rec %0d reca %0d", rec(2), reca(2));
+                $display("f4 %b %b %b", f4(1'b0), f4(1'b1), f4(1'b0));
+            end
+        endmodule
+    )") == "cp 5 10\n"
+           "lp 2 2 1\n"
+           "cs 10 10 11\n"
+           "dw 2 4\n"
+           "part 85 0c 87\n"
+           "nest 7 0\n"
+           "rec 0 reca 3\n"
+           "f4 xxxx 1001 1001\n");
+}
+
+// An implicit return variable that is overwritten on every path before it is read
+// is indistinguishable from a fresh one, which is what keeps these functions free
+// of design-state storage; `return expr` hands the caller `expr` and does not
+// write the variable (13.4.1: it "shall override any value assigned to the
+// function name"), so `h(-1)` leaves what `h(5)` stored for the next call.
+TEST_CASE("an implicit return variable overwritten before any read, and return expr") {
+    CHECK(run_capture(R"(
+        module m;
+            function int w1(int x); w1 = x + 1; endfunction
+            function int w2(int x); if (x > 0) w2 = 1; else w2 = 2; endfunction
+            function int w3(int x); case (x) 0: w3 = 5; default: w3 = 6; endcase endfunction
+            function int w4(int x); return x * 2; endfunction
+            function int w5(int x); w5 = 0; for (int i = 0; i < x; i++) w5 = w5 + i; endfunction
+            function int h(int x); if (x < 0) return 100; h = h + x; endfunction
+            function int r(int x); return r + x; endfunction
+            initial begin
+                $display("%0d %0d | %0d %0d | %0d %0d | %0d %0d | %0d %0d",
+                         w1(1), w1(1), w2(1), w2(0), w3(0), w3(9), w4(3), w4(3), w5(4), w5(4));
+                $display("h %0d %0d %0d r %0d %0d", h(5), h(-1), h(5), r(5), r(5));
+            end
+        endmodule
+    )") == "2 2 | 1 2 | 5 6 | 6 6 | 6 6\n"
+           "h 5 100 10 r 5 5\n");
+}
+
+// The variable has the function's whole return type: a string appends, an
+// unpacked struct keeps its members, and a queue keeps its elements, while the
+// caller gets a copy (the queue a caller holds does not grow with later calls).
+TEST_CASE("the implicit return variable persists for a string, a struct and a queue") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } st_t;
+            typedef int q_t[$];
+            function string s(string t); s = {s, t}; endfunction
+            function st_t sf(int x); sf.a = sf.a + x; sf.b = x; endfunction
+            function q_t qf(int x); qf.push_back(x); endfunction
+            initial begin
+                st_t t1, t2;
+                q_t  q1, q2;
+                $display("s %s|%s", s("ab"), s("cd"));
+                t1 = sf(3); t2 = sf(4);
+                $display("sf %0d %0d %0d %0d", t1.a, t1.b, t2.a, t2.b);
+                q1 = qf(1); q2 = qf(2);
+                $display("qf %0d %0d %0d %0d", q1.size(), q2.size(), q1[0], q2[1]);
+            end
+        endmodule
+    )") == "s ab|abcd\n"
+           "sf 3 3 7 4\n"
+           "qf 1 2 1 2\n");
+}
+
+// LRM 13.4.3: a constant function call at elaboration time leaves the variables of
+// simulation time alone, and each call there starts afresh, so the two localparams
+// are 5 and 5 while the simulation-time calls go on from 0. slang evaluates it.
+TEST_CASE("a constant function call does not touch the simulation-time return variable") {
+    CHECK(run_capture(R"(
+        module m;
+            function int g(int x); g = g + x; endfunction
+            localparam int P1 = g(5);
+            localparam int P2 = g(5);
+            initial $display("P1=%0d P2=%0d g=%0d g=%0d", P1, P2, g(5), g(5));
+        endmodule
+    )") == "P1=5 P2=5 g=5 g=10\n");
+}
+
+// The case label of a stateful static function sees the running value too: the
+// label folding that used to hide it is the previous commit.
+TEST_CASE("a case label calling a function that reads its own return variable") {
+    CHECK(run_capture(R"(
+        module m;
+            function int g(int x); g = g + x; endfunction
+            int sel = 10;
+            initial case (sel) g(5): $display("first"); g(5): $display("second"); default: $display("none"); endcase
+        endmodule
+    )") == "second\n");
 }

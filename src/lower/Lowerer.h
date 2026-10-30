@@ -455,6 +455,16 @@ struct UserCallScan : ASTVisitor<UserCallScan, VisitFlags::Expressions> {
 
 bool has_user_call(const slang::ast::Expression& e);
 
+// Whether the implicit return variable of a STATIC function (LRM 13.4.1, 13.4.2)
+// has to be persistent storage. It keeps its value from call to call, but that is
+// only observable if some call can see the value an earlier one left: the body
+// reads it, or returns it, on a path that has not overwritten it first, or the
+// function can be re-entered through its own body, where a nested call's value is
+// what the outer one finds. A function that overwrites it on every path before
+// any read, and cannot re-enter, behaves the same with a fresh cell per call, which
+// costs nothing. Anything the analysis does not model counts as observable.
+bool static_return_needs_storage(const slang::ast::SubroutineSymbol& sub);
+
 // Detects whether an expression reads any symbol in a given set (used to find
 // frame-local / formal-argument references in an event operand).
 struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
@@ -4408,10 +4418,19 @@ private:
         ankerl::unordered_dense::map<const ValueSymbol*, uint32_t> localmap;
         // Storage type per Local index.
         std::vector<ir::Ref> local_types;
-        // The return variable's Local index / type (valid iff has_ret_local).
-        uint32_t ret_local     = 0;
-        ir::Ref  ret_type      = ir::Ref::Invalid;
-        bool     has_ret_local = false;
+        // The return slot's Local index / type (valid iff has_ret_local): the
+        // frame cell a `return` hands the caller its value through. For an
+        // automatic function it is also the implicit return variable (LRM 13.4.1).
+        // For a static one the implicit variable is ret_static instead and this
+        // cell is only scratch, made on first use (ret_var_ref).
+        uint32_t ret_local       = 0;
+        ir::Ref  ret_type        = ir::Ref::Invalid;
+        bool     has_ret_local   = false;
+        bool     ret_local_ready = false;
+        // The implicit return variable of a STATIC function: persistent
+        // module-signal storage shared by every call (LRM 13.4.2). Unset for an
+        // automatic function.
+        std::optional<ir::Signal> ret_static;
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
@@ -4595,6 +4614,8 @@ private:
 
     ir::Signal declare_static_local(const ValueSymbol& vs);
 
+    ir::Signal declare_static_return(const SubroutineSymbol& sub);
+
     ir::Signal declare_static_prop(const slang::ast::ClassPropertySymbol& prop);
 
     bool is_static_local(const VariableSymbol& vs, bool force_frame) const;
@@ -4713,7 +4734,12 @@ private:
                                        bool                               fd_arg,
                                        bool                               monitor);
 
+    // The frame cell a `return expr` stages an aggregate in and hands the caller.
     ir::Index ret_var_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b);
+
+    // The function's implicit return variable (LRM 13.4.1): what a bare `return;`
+    // and the end of the body hand the caller.
+    ir::Index implicit_return_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b);
 
     void build_function(const SubroutineSymbol& sub, ir::FunctionId id);
 

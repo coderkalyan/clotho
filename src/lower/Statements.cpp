@@ -2860,10 +2860,10 @@ void Lowerer::lower_return(const ReturnStatement& r, ir::Builder& b) {
         // an aggregate / whole array / dynamic array yields its lvalue (copied
         // out by the backend), else the loaded value.
         if (is_agg_abi_ref(fn_ctx_->ret_type)) {
-            b.unary(ir::Inst::Tag::Ret, ret_var_ref(*fn_ctx_, l, b), l);
+            b.unary(ir::Inst::Tag::Ret, implicit_return_ref(*fn_ctx_, l, b), l);
             return;
         }
-        const ir::Index rv = ret_var_ref(*fn_ctx_, l, b);
+        const ir::Index rv = implicit_return_ref(*fn_ctx_, l, b);
         b.unary(ir::Inst::Tag::Ret, is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
     } else {
         b.ret_void(l);

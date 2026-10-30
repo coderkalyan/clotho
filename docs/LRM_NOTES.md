@@ -405,3 +405,42 @@ number, scaled by the unit conversion and padded to the precision (`x000`,
 `0 ns` for an unknown value.
 
 Code: `src/runtime/Format.cpp` (`unknown_decimal_char`, `render_arg`, `coerce_dyn_arg`), `src/lower/Assign.cpp` (`scale_to_ticks`). Tests: `tests/llvm_backend_test.cpp` ("%t of an operand with an x or z bit prints one character, in a constant and in a runtime format").
+
+## 42. Implicit return variable of a static function (13.4.1, 13.4.2, 6.21)
+
+13.4.1: "The function definition shall implicitly declare a variable, internal to
+the function, with the same name as the function." 13.4.2: "Functions defined
+within a module, interface, program, or package default to being static, with all
+declared items being statically allocated. These items shall be shared across all
+uses of the function executing concurrently." 6.21 gives a static variable the
+whole simulation as its lifetime and initializes only an automatic one "on each
+entry to the call"; 6.8: "A variable shall store a value from one assignment to
+the next". No clause resets the variable when a static function is entered, and
+13.3.2 says in so many words that a static task's variables "shall retain their
+values between invocations". So Clotho gives the implicit variable of a static
+function its type's default value once and keeps it from call to call:
+`function int g(int x); g = g + x; endfunction` returns 5 and then 10 for two calls
+with 5, a recursive call finds what the call below it left, and each instance of a
+module has its own. An `automatic` function, a function of an `automatic` module and
+every class method (8.6; 8.10: a `static` method's lifetime is that of the method
+within the class, not of its variables) start the variable afresh on every call.
+
+`return expr;` hands the caller `expr` and does not write the variable. 13.4.1 only
+says the `return` statement "shall override any value assigned to the function
+name", and never says it assigns it, so `function int h(int x); if (x < 0) return
+100; h = h + x; endfunction` returns 5, 100, 10 for `h(5)`, `h(-1)`, `h(5)`.
+
+A constant function call is evaluated by slang at elaboration with fresh variables
+on every call (13.4.3), which leaves the simulation-time variable alone, as the
+LRM says: `localparam P1 = g(5), P2 = g(5)` is 5 and 5, and the first run-time
+`g(5)` still returns 5.
+
+The variable only gets storage that outlives the call where the entry value can be
+seen: a read of it, or the end of the body, on a path that has not overwritten the
+whole variable first, or a function that can be re-entered through its own body.
+Any other function behaves identically with a fresh cell per call and keeps it.
+
+iverilog 13 and Verilator 5.050 reset the variable on every call (iverilog keeps a
+queue return value and resets an `int`), so neither is followed.
+
+Code: `src/lower/Subroutines.cpp` (`declare_static_return`, `implicit_return_ref`, `build_function`), `src/lower/Scans.cpp` (`static_return_needs_storage`). Tests: `tests/function_test.cpp` ("the implicit return variable of a static function keeps its value between calls" and the tests after it).
