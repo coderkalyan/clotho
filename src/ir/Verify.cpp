@@ -1,7 +1,9 @@
 #include "ir/Verify.h"
 
+#include <cassert>
 #include <format>
 #include <optional>
+#include <print>
 #include <variant>
 
 #include "ir/Printer.h"
@@ -509,6 +511,16 @@ std::vector<Violation> verify(const Module& m) {
         }
     }
     return out;
+}
+
+void assert_well_typed([[maybe_unused]] const Module& m, [[maybe_unused]] const LocResolver& resolve) {
+#ifndef NDEBUG
+    const std::vector<Violation> found = verify(m);
+    for (const Violation& v : found) {
+        std::println(stderr, "{}", format(m, v, resolve));
+    }
+    assert(found.empty() && "the lowered IR violates the typing rules of docs/design/kernel.md");
+#endif
 }
 
 std::string format(const Module& m, const Violation& v, const LocResolver& resolve) {

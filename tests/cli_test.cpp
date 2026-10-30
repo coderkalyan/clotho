@@ -424,7 +424,6 @@ TEST_CASE("cli: --help-all lists every option, tagged with the commands that tak
     REQUIRE(source_at != std::string::npos);
     const std::vector<std::string> developer = listed_options(all.out.substr(dev_at, source_at - dev_at));
     CHECK(developer == std::vector<std::string>{ "--stat",
-                                                 "--verify-ir",
                                                  "--gc-stress",
                                                  "--gc-nursery",
                                                  "--gc-heap-max",
@@ -584,38 +583,6 @@ TEST_CASE("cli: build and run accept the code-generation options") {
         const Result r = s.run(std::format("run -O --sanitize=bounds --gc-full-every=3 \"{}\"", design.string()));
         CHECK(r.code == 0);
         CHECK(r.out == "W=4 S=dflt\n");
-    }
-}
-
-TEST_CASE("cli: --verify-ir reports typing findings to stderr and never changes the exit status") {
-    const Scratch s;
-    SUBCASE("a member of a 4-state packed struct stores in the struct's domain, so nothing is reported") {
-        // The member is a 2-state bit inside the struct's 4-state storage; the
-        // frontend converts the value to the storage's domain.
-        const fs::path design = s.write("t.sv",
-                                        "module t;\n  typedef struct packed { logic [3:0] a; bit [7:0] b; } s_t;\n"
-                                        "  s_t x;\n  initial x.b = 8'hAB;\nendmodule\n");
-        const Result   r      = s.run(std::format("build --emit=ir --verify-ir \"{}\"", design.string()));
-        CHECK(r.code == 0);
-        CHECK(contains(r.err, "ir-verify: 0 violations\n"));
-    }
-    SUBCASE("a design with nothing to report says so") {
-        const fs::path design = s.write("design.sv", kParamDesign);
-        const Result   r      = s.run(std::format("run --verify-ir \"{}\"", design.string()));
-        CHECK(r.code == 0);
-        CHECK(r.out == "W=4 S=dflt\n");
-        CHECK(contains(r.err, "ir-verify: 0 violations\n"));
-    }
-    SUBCASE("without the option nothing is checked") {
-        const fs::path design = s.write("t.sv", "module t;\n  bit a;\n  always @(posedge a) a <= !a;\nendmodule\n");
-        const Result   r      = s.run(std::format("build --emit=ir \"{}\"", design.string()));
-        CHECK(!contains(r.err, "ir-verify"));
-    }
-    SUBCASE("lint compiles nothing to check, so the option is refused there") {
-        const fs::path design = s.write("t.sv", "module t; endmodule\n");
-        const Result   r      = s.run(std::format("lint --verify-ir \"{}\"", design.string()));
-        CHECK(r.code == 2);
-        CHECK(contains(r.err, "--verify-ir"));
     }
 }
 

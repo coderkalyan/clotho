@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "Lower.h"
 #include "ir/Builder.h"
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
@@ -394,4 +395,40 @@ TEST_CASE("typing: rolling back the builder drops the types of the discarded ins
     const Index c2 = t.konst(t.logic(8), 1);
     CHECK(c2 == c1);
     CHECK(t.b.type_of(c2) == ValueType{ 8, true });
+}
+
+// The shapes the frontend once delivered in a domain the language did not give them
+// (each was a store-domain or operand-domain finding): the verifier is part of the
+// test suite's contract with the frontend, whatever the build's assertions do.
+TEST_CASE("verify: lowered designs satisfy the typing rules") {
+    const char* const designs[] = {
+        // A 2-state member of a 4-state packed struct is stored in the struct's domain.
+        "module m; typedef struct packed { logic [3:0] a; bit [7:0] b; } s_t; s_t x;\n"
+        "  initial begin x.b = 8'hAB; x.b <= x.b + 8'd1; end endmodule\n",
+        // System function results and the $random seed writeback land in their types.
+        "module m; integer seed, x, n, fd; string msg;\n"
+        "  initial begin seed = 1; x = $random(seed); n = $ferror(fd, msg); end endmodule\n",
+        // A builtin method's return value.
+        "module m; semaphore s; int r; initial begin s = new; r = s.try_get(1); end endmodule\n",
+        // The ambiguous-condition arm of an aggregate conditional.
+        "module m; typedef struct { int a; byte b; } st; st x, y, v; logic c;\n"
+        "  initial begin c = 1'bx; v = c ? x : y; end endmodule\n",
+        // The sort comparator's unknown tests over a 4-state key.
+        "module m; logic [7:0] q[$]; initial begin q.push_back(8'bx); q.sort(); end endmodule\n",
+        // wait_order's failure flag.
+        "module m; event a, b; bit ok;\n"
+        "  initial begin wait_order(a, b) ok = 1; else ok = 0; end endmodule\n",
+        // Signed and unsigned operands meeting in one expression.
+        "module m; logic signed [3:0] s; logic [7:0] u; int i; bit [15:0] r;\n"
+        "  initial begin r = u + s; r = s * i; i = (u < s) ? i : -i; end endmodule\n",
+    };
+    for (const char* const src : designs) {
+        const clotho::LowerResult r = clotho::lower_text(src);
+        REQUIRE(r.module != nullptr);
+        const std::vector<Violation> found = verify(*r.module);
+        for (const Violation& v : found) {
+            MESSAGE(format(*r.module, v));
+        }
+        CHECK(found.empty());
+    }
 }

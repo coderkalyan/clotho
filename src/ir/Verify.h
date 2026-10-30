@@ -118,4 +118,11 @@ std::vector<Violation> verify(const Module& m);
 // `resolve` is optional, as for print_module.
 std::string format(const Module& m, const Violation& v, const LocResolver& resolve = {});
 
+// Abort, naming every finding on stderr, if `m` violates a rule. The lowering's
+// contract with the backend: the backend asserts the invariants these rules state
+// and never repairs them. Compiled out under NDEBUG (every default build type keeps
+// assertions, see CMakeLists.txt), where the callers that want the answer anyway
+// call verify() themselves.
+void assert_well_typed(const Module& m, const LocResolver& resolve = {});
+
 } // namespace clotho::ir
