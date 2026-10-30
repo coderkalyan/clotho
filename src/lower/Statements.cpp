@@ -516,6 +516,12 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
         // This body is a fork child of the target's, an activation of it with no
         // region of its own to leave: it ends itself, after the walk above marked
         // every other activation (LRM 9.6.2 example 4's shape, for a block).
+        if (disable_roots_.contains(&target) && disable_flushes_.contains(&target)) {
+            // LRM 16.4.4: the target is a procedure's OUTERMOST scope, so its pending
+            // deferred reports are dropped, as in the lexical and remote forms. This body
+            // is a fork child, so the bump names the target's procedure, not ours.
+            b.defer_flush(it->second, loc(s));
+        }
         b.disable_abort(loc(s));
         return;
     }

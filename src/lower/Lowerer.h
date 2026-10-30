@@ -2142,6 +2142,8 @@ private:
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
+    bool design_virtual_forks(slang::ast::Compilation& comp);
+
     void record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
                             const Symbol*                                  owner,
                             const Symbol*                                  label);
@@ -5096,6 +5098,9 @@ private:
     // Named blocks whose body calls a subroutine that forks. The children are not
     // lexically inside the block, so a `disable` cannot end them; refused.
     ankerl::unordered_dense::set<const Symbol*> disable_fork_via_call_;
+    // Whether any user virtual method of the design forks (design_virtual_forks);
+    // computed on first use.
+    std::optional<bool> design_virtual_forks_;
     // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
     // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
     // hard_park. The remote form refuses one, the lexical form does not care -- it

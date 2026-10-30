@@ -1619,6 +1619,120 @@ TEST_CASE("an exit that skips a block's end takes the activation off its list") 
     }
 }
 
+// LRM 16.4.4: disabling the outermost scope of a procedure drops its pending deferred
+// reports. A fork child that does it (an activation of that block, with no region of its
+// own to leave) skipped the flush, and the report matured after the procedure had ended.
+// A deferred assertion's action is a severity task, whose message goes to stderr. No
+// oracle: iverilog does not implement deferred assertions.
+TEST_CASE("a fork child's disable of the outermost block drops its deferred reports") {
+    const test::DesignRun dropped = test::run_design_captured(R"(
+        module t;
+          bit a = 0;
+          initial begin : P
+            #5;
+            assert #0 (a) else $error("pending report of P not flushed");
+            fork
+              #0 disable P;
+            join
+            $display("FAILED: not reached");
+          end
+          initial #10 $display("end %0t", $time);
+        endmodule
+    )");
+    CHECK(dropped.out == "end 10\n");
+    CHECK(dropped.err.find("not flushed") == std::string::npos);
+
+    // Without the disable the same report matures, so the case above is a drop and not
+    // a report that never existed.
+    const test::DesignRun matured = test::run_design_captured(R"(
+        module t;
+          bit a = 0;
+          initial begin : P
+            #5;
+            assert #0 (a) else $error("pending report of P matured");
+            fork
+              #0 ;
+            join
+            #1 $display("P done %0t", $time);
+          end
+          initial #10 $display("end %0t", $time);
+        endmodule
+    )");
+    CHECK(matured.out == "P done 6\nend 10\n");
+    CHECK(matured.err.find("matured") != std::string::npos);
+}
+
+// The children of a fork a block holds are ended with it only when the fork is lexically
+// inside the block. One reached through a virtual call (any override in the design may
+// be the one that runs) or a randsequence production (lowered to a function of its own)
+// is not, so a disable of such a block is refused rather than left to run on.
+TEST_CASE("disable of a block that may fork through a virtual call or a randsequence is refused") {
+    const std::string classes = R"(
+        class Base; virtual task start(); endtask endclass
+        class Spawner extends Base;
+          virtual task start();
+            fork #50 $display("grandchild"); join_none
+          endtask
+        endclass
+        class Quiet extends Base;
+          virtual task start(); #1; endtask
+        endclass
+    )";
+    const LowerResult virt    = lower_text(classes + R"(
+        module t;
+          Base h;
+          Spawner s = new;
+          initial begin
+            h = s;
+            begin : B
+              h.start();
+              #10;
+            end
+          end
+          initial #5 disable t.B;
+        endmodule
+    )");
+    CHECK_FALSE(virt.ok);
+    CHECK(virt.diagnostic_text().find("calls a subroutine that forks") != std::string::npos);
+
+    const LowerResult rs = lower_text(R"(
+        module t;
+          initial begin : P
+            begin : B
+              randsequence (main)
+                main : { fork #50 $display("production child"); join_none };
+              endsequence
+              #10;
+            end
+          end
+          initial #5 disable t.P.B;
+        endmodule
+    )");
+    CHECK_FALSE(rs.ok);
+    CHECK(rs.diagnostic_text().find("calls a subroutine that forks") != std::string::npos);
+
+    // A virtual call is not refused when no virtual method of the design forks.
+    const LowerResult quiet = lower_text(R"(
+        class Base; virtual task start(); endtask endclass
+        class Quiet extends Base;
+          virtual task start(); #1; endtask
+        endclass
+        module t;
+          Base h;
+          Quiet q = new;
+          initial begin
+            h = q;
+            begin : B
+              h.start();
+              #10;
+            end
+          end
+          initial #5 disable t.B;
+        endmodule
+    )");
+    CHECK_MESSAGE(quiet.ok, quiet.diagnostic_text());
+}
+
 // An assertion action block is an ordinary body to the remote form: it marks the
 // target's activations and pushes their handles, which needs no coroutine of its
 // own and no region correction. The failing attempt at the first posedge ends the
