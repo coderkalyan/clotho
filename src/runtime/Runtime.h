@@ -1559,7 +1559,9 @@ void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops);
 // share storage. A handle must be constructed with rt_string_init before any
 // other call and released with rt_string_deinit. Every operation that writes a
 // destination handle requires it already constructed and reuses its existing
-// capacity, so steady-state reassignment in a loop does not allocate.
+// capacity, so steady-state reassignment in a loop does not allocate. Every
+// operation only READS its source handles, which is what lets the backend hand
+// out a borrowed handle (rt_string_heap_flag) that owns nothing.
 typedef struct rt_string {
     alignas(8) unsigned char storage[32];
 } rt_string;
@@ -1570,6 +1572,22 @@ typedef struct rt_string {
 // constant — the two MUST agree or that constant corrupts. See the SSO block in
 // runtime/RuntimeInternal.h.
 constexpr uint64_t rt_string_inline_cap = 30;
+
+// The heap form of a handle: `rt_string_heap` fills bytes 0..23 and byte 31 holds
+// rt_string_heap_flag (the inline form keeps its length there instead, below the
+// flag). `ptr` addresses cap + 1 bytes, byte[len] being the NUL terminator. Shared
+// with the backend, which builds a BORROWED handle in this form for a string value
+// that needs storage of nobody's: an instance's path (ir Inst::Tag::InstPath) is a
+// read-only handle over constant bytes, so reading it costs no init, copy or
+// release. A borrowed handle is only ever a SOURCE operand (the `const rt_string*`
+// parameters below); it is never initialized, written, moved or deinitialized.
+constexpr unsigned char rt_string_heap_flag = 0x80;
+
+struct rt_string_heap {
+    char*    ptr;
+    uint64_t len;
+    uint64_t cap;
+};
 
 // Construct the empty string "" in caller-owned storage. Never allocates.
 void rt_string_init(rt_string* s);

@@ -1417,6 +1417,16 @@ struct Inst {
         // compiling units directly will read it from a per-instance record. A body
         // that belongs to no instance (a package or `$unit` subroutine) never holds
         // one.
+        //
+        // The value is BORROWED: a read-only string that lives as long as the
+        // instance (a constant today, a record field later) and that nothing owns,
+        // so evaluating it costs nothing and an activation that never reports pays
+        // nothing for it. It may only be read -- a display or `$sformatf` argument,
+        // a part of a severity banner, a source operand of a concatenation,
+        // comparison or copy. A consumer that needs a string of its own copies it
+        // (a store does), and one that wants text around it keeps that text apart
+        // and joins them when it runs (SeverityInfo, display formats), because a
+        // concatenation would make a temporary of it per activation.
         InstPath,
 
         // -- Lvalue derivation --

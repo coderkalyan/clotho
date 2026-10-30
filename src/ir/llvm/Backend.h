@@ -1100,6 +1100,10 @@ struct ModuleEnv {
     // The shared zero word a `ref` through a stable place aims its epoch at
     // (no_epoch_global).
     llvm::GlobalVariable* no_epoch = nullptr;
+    // The borrowed string handle of each instance's path, keyed by the instance's
+    // anchor index (inst_path_handle). Per module like the other internal constants:
+    // every unit module that reads an instance's path holds its own.
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> inst_paths;
 };
 
 // Builds the shared state struct and lowers every process. One instance per
@@ -2877,7 +2881,7 @@ private:
 
     void lower_string_constant(Index i, Ref ref);
 
-    void lower_inst_path(Index i);
+    llvm::Value* inst_path_handle(uint32_t scope);
 
     uint32_t body_scope() const;
 

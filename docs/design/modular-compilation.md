@@ -354,14 +354,16 @@ Each of these makes lowered IR depend on something outside the unit:
   from `Process::scope` / `Function::scope`; a covergroup takes it as an operand
   of `CoverOp::New`, so `CoverType` carries no scope; a declaration initializer
   reads it like any other body), hidden temporaries are numbered per name
-  prefix, and assertion state is named by an instance-relative ordinal. Still
-  text: virtual-interface bodies and `$printtimescale(inst)`. A covergroup type
-  belongs to the unit that declares it and instances build it through an
-  import, so a package's type built by two instances no longer aborts partition.
-  Still lowered once per Lowerer that reaches it (a second top gets an ordinal in
-  its import name, like a package class), and the coverage-event process of a
-  package type stays with the first instance that builds it, which splits that
-  specialization.
+  prefix, and assertion state is named by an instance-relative ordinal.
+  `inst_path` is a borrowed string, a read-only handle over constant bytes today
+  (a record field later), so evaluating it takes no temporary and no init or
+  release. Still text: virtual-interface bodies and `$printtimescale(inst)`. A
+  covergroup type belongs to the unit that declares it and instances build it
+  through an import, so a package's type built by two instances no longer
+  aborts partition. Still lowered once per Lowerer that reaches it (a second top
+  gets an ordinal in its import name, like a package class), and the
+  coverage-event process of a package type stays with the first instance that
+  builds it, which splits that specialization.
 - Whole-top facts that change other modules' IR: `forceable_`, resolved nets,
   `events_merge_`, `WaitedProps`, `assert_control_used_`, and which blocks are
   `disable` targets. The last is joined over the instances of a specialization

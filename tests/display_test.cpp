@@ -277,6 +277,25 @@ TEST_CASE("%m prints the % of an escaped instance name literally") {
     )") == "in top.u%d\nin top.v%s\n");
 }
 
+// The path is read in place from the instance, not copied into a string of the
+// body's own, so nothing about its length matters: this one is past what a string
+// holds inline (30 bytes), and a copy of it is what $sformatf makes of %m.
+TEST_CASE("%m prints an instance path longer than a string holds inline") {
+    CHECK(run_capture(R"(
+        module leaf;
+            function automatic string who();
+                return $sformatf("<%m>");
+            endfunction
+            initial $display("[%m] %s", who());
+        endmodule
+        module top;
+            leaf an_instance_name_well_past_thirty_bytes_long ();
+            leaf s ();
+        endmodule
+    )") == "[top.an_instance_name_well_past_thirty_bytes_long] <top.an_instance_name_well_past_thirty_bytes_long.who>\n"
+           "[top.s] <top.s.who>\n");
+}
+
 // The scope is where the subroutine is declared, not where it is called from
 // (LRM 21.2.1.3: the scope that holds the $display call).
 TEST_CASE("%m in a subroutine called through a hierarchical name names its own instance") {

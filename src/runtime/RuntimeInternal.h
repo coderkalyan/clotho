@@ -213,16 +213,19 @@ std::string unpack_ascii(const char* buf, uint32_t len);
 // DPI). Embedded NULs are legal — only a C-string *view* truncates at the first;
 // every clotho op uses the length. A heap buffer never shrinks back to inline —
 // the capacity is kept for reuse so reassignment in a loop stops allocating.
+//
+// A heap-form handle may be BORROWED (Runtime.h, rt_string_heap_flag): the backend
+// builds one over constant bytes for an instance's path, so its `ptr` is not the
+// handle's to write or free. Only a source operand ever sees one -- every
+// writer or releaser here is handed a handle that was init'd -- so nothing in
+// this file tells the two apart.
 
 constexpr uint64_t      str_inline_cap = rt_string_inline_cap; // 30 (see Runtime.h)
-constexpr unsigned char str_heap_flag  = 0x80;
+constexpr unsigned char str_heap_flag  = rt_string_heap_flag;
 
-// The heap form's header, memcpy'd in and out of the handle bytes.
-struct StrHeap {
-    char*    ptr;
-    uint64_t len;
-    uint64_t cap;
-};
+// The heap form's header, memcpy'd in and out of the handle bytes. Runtime.h
+// defines it: the backend builds a borrowed handle in this form.
+using StrHeap = rt_string_heap;
 static_assert(sizeof(StrHeap) == 24);
 static_assert(sizeof(StrHeap) < sizeof(rt_string));
 static_assert(alignof(StrHeap) <= alignof(rt_string));

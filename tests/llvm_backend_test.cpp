@@ -1816,6 +1816,27 @@ TEST_CASE("$printtimescale names the $unit and $root scopes") {
                  "Time scale of ($root) is 1s / 1s\n");
 }
 
+// An instance's path is a borrowed, read-only string (Inst::Tag::InstPath), so a body
+// that names its instance on a rare path owns no string for it: no handle to
+// initialize at entry and none to release at exit. Both instances share the body
+// text, so this is also what keeps the cost off every activation.
+TEST_CASE("%m of an instance costs its body no string handle") {
+    const std::string ir = emit(R"(
+        module leaf(input logic clk, input logic c);
+            always @(posedge clk) if (c) $display("at %m");
+        endmodule
+        module top;
+            logic clk, c;
+            leaf a(clk, c);
+            leaf b(clk, c);
+        endmodule
+    )");
+
+    CHECK(ir.find("@rt_string_init") == std::string::npos);
+    CHECK(ir.find("@rt_string_deinit") == std::string::npos);
+    CHECK(ir.find("@rt_string_assign_bytes") == std::string::npos);
+}
+
 TEST_CASE("%t formats time per $timeformat units, precision, suffix, and width") {
     // Verified against iverilog. $time is 100 ns; changing only the units reprints
     // the same instant in ns then ps, and width right-justifies number + suffix.
