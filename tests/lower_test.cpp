@@ -1196,14 +1196,16 @@ TEST_CASE("a blocking task called from always_comb is rejected") {
     CHECK(r.diagnostic_text().find("blocking timing control") != std::string::npos);
 }
 
-TEST_CASE("a variable driven by always_comb and another process warns") {
+TEST_CASE("a variable driven by always_comb and another process is refused") {
+    // LRM 9.2.2.2: "The variables assigned on the left-hand side of assignments
+    // shall not be assigned by any other process."
     const LowerResult r = lower_text(R"(
         module m(output reg y);
             always_comb y = 1'b0;
             initial y = 1'b1;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("cannot be written to by any other process") != std::string::npos);
 }
 
@@ -1645,4 +1647,28 @@ TEST_CASE("lower_buffer keeps use-based findings but drops driver-based ones") {
         )");
         CHECK(r.diagnostic_text().find("unused net 'foo'") != std::string::npos);
     }
+}
+
+TEST_CASE("source the LRM makes illegal is refused, not warned about") {
+    // slang accepts each of these with a warning for compatibility with other
+    // tools; Clotho's severity policy makes them errors. The four imported ivtest
+    // designs that use them (br_gh79, br_gh62, parameter_override_invalid1/7)
+    // expect a compile failure.
+    const auto refused = [](std::string_view source, std::string_view needle) {
+        const LowerResult r = lower_text(source);
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find(needle) != std::string::npos, r.diagnostic_text());
+    };
+    // LRM 5.7.1: an underscore is legal anywhere in a number except as its first
+    // character.
+    refused("module m; reg [3:0] n; initial n = 4'b_1; endmodule",
+            "numeric literals must not start with a leading underscore");
+    // LRM 23.10.2.2: a named parameter assignment names a parameter of the module.
+    refused("module a #(parameter A = 1); endmodule\n"
+            "module m; a #(.Z(10)) i(); endmodule",
+            "parameter 'Z' does not exist in 'a'");
+    // LRM 11.5.1: a bit-select of a single bit selects from a scalar.
+    refused("module m; reg [15:0] v; reg r; initial r = v[0][0]; endmodule", "scalar");
+    // LRM 11.4.12: unsized constants are not allowed in a concatenation.
+    refused("module m; reg [3:0] a; reg [35:0] r; initial r = {1, a}; endmodule", "unsized integer in concat");
 }

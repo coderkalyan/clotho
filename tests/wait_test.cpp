@@ -849,7 +849,7 @@ TEST_CASE("a scalar property store wakes only the written object's waiter") {
 TEST_CASE("a scalar property written through a ref formal or a base method wakes its waiter") {
     constexpr std::string_view src = R"(
         module m;
-            function void set_s(ref string r); r = "done"; endfunction
+            function automatic void set_s(ref string r); r = "done"; endfunction
             class D; int id; endclass
             class B;
                 D      h;

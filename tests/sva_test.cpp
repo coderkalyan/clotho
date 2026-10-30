@@ -1289,11 +1289,13 @@ TEST_CASE("a user function call nested inside a sampled bit-vector system functi
     // never hide a call in the first place).
     refuses(R"(
 module t;
-  bit clk, a, b;
-  function automatic bit f(); return 1; endfunction
-  ap: assert property (@(posedge clk) $isunknown(f()) |=> b);
+  bit clk, b;
+  logic a;
+  function automatic logic f(logic x); return x; endfunction
+  ap: assert property (@(posedge clk) $isunknown(f(a)) |=> b);
 endmodule
-)", "function call in a concurrent assertion expression");
+)",
+            "function call in a concurrent assertion expression");
 }
 
 TEST_CASE("a sequence method is refused by name, not as a stray function call") {

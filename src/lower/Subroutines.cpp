@@ -641,14 +641,6 @@ std::optional<ir::DpiCType> Lowerer::dpi_ctype(const slang::ast::Type& type) {
 // docs/design/dpi-c.md).
 void Lowerer::build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
     const bool is_task = sub.subroutineKind == SubroutineKind::Task;
-    if (is_task && sub.flags.has(MethodFlags::Pure)) {
-        // LRM 35.5.1.3: "An imported task can never be declared pure." slang
-        // only warns (-Wdpi-pure-task), and the mistake is not benign here --
-        // is_pure marks the C declaration readnone + willreturn, so the
-        // optimizer would CSE or delete calls to a task whose whole purpose is
-        // its side effects. Refuse rather than silently miscompile.
-        fail("an imported DPI task cannot be declared `pure` (LRM 35.5.1.3)");
-    }
     // TODO: T2 -- an import task whose C calls an exported task that consumes
     // time. The call site below stays an ordinary plain `Call`, which cannot
     // suspend, so the C frame is not suspendable; the export-task thunk reports
