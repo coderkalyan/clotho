@@ -531,32 +531,23 @@ void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) 
         block_commits_.push_back({});
         cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
         llvm::Value* id  = b_.getInt32(cur_block_id_);
-        if (sched_anchor_ != SignalSlot::no_anchor) {
-            Anchor&        a     = anchors_[sched_anchor_];
-            const uint32_t field = a.ctx_blk_base + group_def_ordinal_[sched_group_];
+        if (own_anchor_ != SignalSlot::no_anchor) {
+            // Instance-relative: the instance record's field for this function
+            // (a single-scope group, or a member of a group spanning instances)
+            // holds its first block id, and a later block adds its local
+            // ordinal -- a function's blocks are id-contiguous because they
+            // open only while it lowers. main stores the first id once the
+            // ids are known (ctx_blk_fills_).
+            assert(blk_ordinal_ != ~0u && "an instance-relative function has a block-id ordinal");
+            Anchor&        a     = anchors_[own_anchor_];
+            const uint32_t field = a.ctx_blk_base + blk_ordinal_;
             if (group_first_block_ < 0) {
                 group_first_block_ = static_cast<int64_t>(cur_block_id_);
-                ctx_blk_fills_.emplace_back(sched_anchor_, field, cur_block_id_);
+                ctx_blk_fills_.emplace_back(own_anchor_, field, cur_block_id_);
             }
             id = b_.CreateAdd(
               ctx_field(a, field, b_.getInt32Ty()),
               b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
-        } else if (config_.split && unit_emission()) {
-            // Unit-module code of a unique definition: the block id via a
-            // root-defined value global keyed by (instance, def-local
-            // ordinal) — the owning group's, or the member's own when an
-            // outlined cross-instance member is lowering — with the
-            // group-/member-local block ordinal as the addend.
-            if (group_first_block_ < 0) {
-                group_first_block_ = static_cast<int64_t>(cur_block_id_);
-            }
-            const std::string key =
-              outline_anchor_ != ~0u
-                ? "blk." + anchors_[outline_anchor_].name + ".p" + std::to_string(outline_ord_)
-                : "blk." + anchors_[group_unit_anchor_[sched_group_]].name + ".g" +
-                    std::to_string(group_unit_ordinal_[sched_group_]);
-            id = abs_id_const(key, static_cast<uint32_t>(group_first_block_),
-                              cur_block_id_ - static_cast<uint32_t>(group_first_block_));
         }
         b_.CreateCall(sym(nba_block_enqueue_fn_), { id });
     }
@@ -765,7 +756,7 @@ void Backend::emit_agg_commit(Signal sig, const llvm::APInt& mask) {
 // commit function, and emit the enqueue stub body. No-op when the path was never
 // used.
 void Backend::finalize_block_nba() {
-    sched_anchor_ = SignalSlot::no_anchor; // commit machinery addresses absolutely
+    own_anchor_ = SignalSlot::no_anchor; // commit machinery addresses absolutely
     if (nba_block_enqueue_fn_ == nullptr) {
         return;
     }
@@ -1931,14 +1922,7 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
         // through one, the instance formal 0 named (the body-wide override);
         // from the member's own instance, that instance's own record. Either
         // way the replay wakes the instance the value actually landed in.
-        llvm::Value* ctx = lv.vif_ctx;
-        if (ctx == nullptr && ctx_override_for(s)) {
-            ctx = ctx_override_;
-        }
-        if (ctx == nullptr) {
-            ctx = ensure_ctx(anchors_[s.anchor]);
-        }
-        b_.CreateAlignedStore(ctx, b_.CreateStructGEP(rt, rec, arr_rec_ctx(s)), a1);
+        b_.CreateAlignedStore(record_ptr(s, lv.vif_ctx), b_.CreateStructGEP(rt, rec, arr_rec_ctx(s)), a1);
     }
 }
 
@@ -2033,14 +2017,7 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
         // "virtual interface reference" in an lvalue. Same resolution order as
         // emit_array_nba's arr_rec_ctx, deliberately -- the two paths must agree
         // on which instance a given statement writes.
-        llvm::Value* ctx = lv.vif_ctx;
-        if (ctx == nullptr && ctx_override_for(s)) {
-            ctx = ctx_override_;
-        }
-        if (ctx == nullptr) {
-            ctx = ensure_ctx(anchors_[s.anchor]);
-        }
-        b_.CreateAlignedStore(ctx, b_.CreateStructGEP(rt, rec, intra_rec_ctx(s)), a1);
+        b_.CreateAlignedStore(record_ptr(s, lv.vif_ctx), b_.CreateStructGEP(rt, rec, intra_rec_ctx(s)), a1);
     }
 }
 

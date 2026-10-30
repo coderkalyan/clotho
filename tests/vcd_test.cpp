@@ -28,7 +28,7 @@ std::string unique_path() {
 // JIT-run a design and return the VCD it wrote. The source must open its dump with
 // $dumpfile("OUT.vcd"); the token is rewritten to a unique path. stdout ($display)
 // is discarded so a design's prints do not pollute the test log.
-std::string run_vcd(std::string source) {
+std::string run_vcd(std::string source, ir::SimulationConfig config = {}) {
     const std::string path = unique_path();
     const auto        tok  = source.find("OUT.vcd");
     REQUIRE(tok != std::string::npos);
@@ -45,7 +45,7 @@ std::string run_vcd(std::string source) {
         dup2(fileno(null), fileno(stdout));
     }
 
-    ir::run_jit(*r.module);
+    ir::run_jit(*r.module, nullptr, config);
 
     std::fflush(stdout);
     dup2(saved, fileno(stdout));
@@ -838,4 +838,40 @@ TEST_CASE("vcd: a packed struct signal dumps as the vector it is") {
     const std::string vcd = run_vcd(src);
     CHECK(contains(vcd, "$var reg 8 ! ps $end"));
     CHECK(contains(body_of(vcd), "b10100101 !"));
+}
+
+TEST_CASE("vcd: members of a group spanning instances dump their own instance's signals") {
+    // The two clocked blocks share one sensitivity (the interface's clk) and so
+    // run as one group over two instances; each member touches the dump index
+    // of ITS instance's counters (a blocking write and an NBA commit). The
+    // trace must be what the unfused schedule writes, and must show each
+    // instance's own values.
+    const std::string src = R"(
+        interface bus_if; logic clk = 0; endinterface
+        module leaf(bus_if b, input int id);
+          reg [3:0] m = 0, n = 0;
+          always @(posedge b.clk) begin
+            m = m + id[3:0];
+            n <= n + 4'd1;
+          end
+        endmodule
+        module top;
+          bus_if bus();
+          leaf u0(bus, 1);
+          leaf u1(bus, 3);
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1; #1 $finish;
+          end
+        endmodule
+    )";
+    const std::string fused = run_vcd(src);
+    CHECK(run_vcd(src, { .fuse = false }) == fused);
+    // u0.m runs 1, 2 and u1.m runs 3, 6; both n counters reach 2.
+    const std::string body = body_of(fused);
+    CHECK(contains(body, "b1 "));
+    CHECK(contains(body, "b10 "));
+    CHECK(contains(body, "b11 "));
+    CHECK(contains(body, "b110 "));
 }

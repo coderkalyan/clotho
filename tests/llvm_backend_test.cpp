@@ -2205,6 +2205,42 @@ TEST_CASE("a coroutine fusion group stays inside one instance") {
     }
 }
 
+// A group spanning instances runs as one function per member, each handed its
+// own instance's record: what a member writes of its own instance (a signal
+// with waiters, an NBA target, the dump index) must land in THAT instance, and
+// what it writes of another instance's (an interface it is connected to) must
+// still reach that one. Fused and unfused agree on every line.
+TEST_CASE("members of a group spanning instances address their own instance") {
+    constexpr std::string_view src = R"(
+        interface bus_if; logic clk = 0; endinterface
+        interface sig_if; logic [7:0] v = 0; endinterface
+        module leaf(bus_if b, sig_if s, input int id);
+            reg [7:0] q = 0, n = 0;
+            always @(posedge b.clk) begin
+                q = q + 8'd1 + id[7:0];       // blocking: wakes this instance's waiter
+                n <= n + 8'd1;                // NBA staged in this instance
+                s.v = s.v + id[7:0];          // another instance's signal
+            end
+            always @(q) $display("leaf%0d q=%0d", id, q);
+        endmodule
+        module top;
+            bus_if bus();
+            sig_if s0(), s1();
+            leaf u0(bus, s0, 1);
+            leaf u1(bus, s1, 10);
+            initial begin
+                #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1;
+                #1 $display("n %0d %0d v %0d %0d", u0.n, u1.n, s0.v, s1.v);
+            end
+        endmodule
+    )";
+    const std::string expected = "leaf1 q=2\nleaf10 q=11\nleaf1 q=4\nleaf10 q=22\nn 2 2 v 2 20\n";
+    CHECK(count_substr(emit(src), ".f2.thunk(ptr noalias %state") == 1);
+    CHECK(run_capture(src) == expected);
+    CHECK(run_capture(src, { .fuse = false }) == expected);
+    CHECK(run_capture(src, { .thunk = false }) == expected);
+}
+
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
 // once shifted the accumulator by the full result width, which is poison in LLVM
 // (shift >= bitwidth). Replication wraps its operand in a single-element concat,

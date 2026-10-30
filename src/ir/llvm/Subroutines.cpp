@@ -18,19 +18,24 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
     // This group's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
-    // constant GEP so it is valid in any block of the function. Dedup prep:
-    // a group fully inside one reused-definition instance instead loads the
-    // instance's sched base and indexes the def-local ordinal — the same
-    // slot, materialized at function entry (materialize_sched_ptr); a
-    // unique-definition or cross-instance group keeps the folded constant.
-    sched_anchor_      = SignalSlot::no_anchor;
-    sched_group_       = group_of_[proc_index];
-    const uint32_t gaid = group_anchor_of_[sched_group_];
+    // constant GEP so it is valid in any block of the function. A group fully
+    // inside one instance instead loads the instance record's sched base and
+    // indexes the def-local ordinal — the same slot, materialized at function
+    // entry (materialize_group_ctx), and addresses everything else of its
+    // instance through the record too. An unscoped group, and a group spanning
+    // instances (whose dispatcher owns the flag and whose members take their
+    // own records), keep the folded constant.
+    const uint32_t g_ = group_of_[proc_index];
+    own_anchor_       = SignalSlot::no_anchor;
+    own_ctx_          = nullptr;
+    blk_ordinal_      = ~0u;
+    const uint32_t gaid = group_anchor_of_[g_];
     if (gaid != SignalSlot::no_anchor) {
-        sched_anchor_  = gaid;
+        own_anchor_    = gaid;
         sched_ordinal_ = proc_sched_ord_[proc_index];
+        blk_ordinal_   = group_def_ordinal_[g_];
     }
-    sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
+    sched_ptr_ = own_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
 
     // Deferred immediate assertion (LRM 16.4): a group carrying one gets a
     // per-process generation counter, bumped at each activation, that tags
@@ -44,15 +49,15 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     cur_defer_group_ = -1;
     if (std::any_of(members.begin(), members.end(),
                     [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
-        cur_defer_group_ = static_cast<int32_t>(sched_group_);
+        cur_defer_group_ = static_cast<int32_t>(g_);
     }
 
-    // Same-eligibility NBA prep: the group's block registrations pass
-    // (instance block base + group-local ordinal) instead of the absolute
-    // block id — identical value (a group's blocks are id-contiguous by
-    // construction: block_register only runs while its group lowers), in the
-    // def-relative form a shared body needs. Main stores the base into the
-    // instance ctx after lowering, once the ids are known (ctx_blk_fills_).
+    // Same-eligibility NBA prep: the function's block registrations pass
+    // (instance block base + function-local ordinal) instead of the absolute
+    // block id — identical value (a function's blocks are id-contiguous by
+    // construction: block_register only runs while it lowers), in the
+    // def-relative form shared code needs. Main stores the base into the
+    // instance record after lowering, once the ids are known (ctx_blk_fills_).
     group_first_block_ = -1;
 
     // Name a process by its owner: a definition-unit group (split mode) is
@@ -64,7 +69,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // naming would collide across instances of one module (processes
     // share the AST location); proc.loc still carries the source mapping.
     // A fused group is named by its first member plus its size.
-    const uint32_t ua   = group_unit_anchor_[group_of_[proc_index]];
+    const uint32_t ua   = group_unit_anchor_[g_];
     std::string    name = config_.split && ua != SignalSlot::no_anchor
                             ? "clotho.inst." + anchors_[ua].name + ".p" +
                                 std::to_string(proc_sched_ord_[proc_index])
@@ -170,13 +175,18 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // merged body inside their unit (no call overhead). Only the population
     // that cannot otherwise leave root pays the per-member call, not every comb
     // group (docs/design/module-split.md, Partition).
+    //
+    // A member takes its instance's record (@clotho.inst.<hier>.ctx) as its
+    // first parameter and addresses everything of its own instance through
+    // it, exactly as a single-scope group does through the record global
+    // (own_anchor_ / own_ctx_); the dispatcher passes each member's record.
+    // Signals of other instances a member reaches stay absolute.
     // Member cap: a cross-module member call cannot be inlined, so the
     // per-activation dispatch cost scales with member count — a 256-member
     // comb group measured 3.7x sim outlined (combchain), while the real
     // cross-instance populations on cores (2-7 member clocked groups) are
     // wall-neutral. Groups past the cap keep the merged root body.
     constexpr size_t outline_max_members = 16;
-    const uint32_t g_ = group_of_[proc_index];
     // A thunk group is not a thread: no frame, no handle, no control block, and
     // proc_arg's own contract already says such a body passes null. Reset here,
     // ahead of both thunk paths, because they return before the coroutine path's
@@ -189,12 +199,26 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // forks widens the population it is latent in, so fix it rather than reason
     // about it again.
     pcb_ = nullptr;
-    // Nor is a thunk group a PreInit or Preponed capture, whose stores generate
-    // no event: that is a property of the process being lowered, so it must not
-    // be inherited from the one lowered before this group (a declaration
-    // initializer of an earlier top), or every member store of the group wakes
-    // nobody. The outlined member functions below read it without ever setting it.
-    silent_stores_ = false;
+    // What a thunk body starts from: no thread, no wait or fork state, not a
+    // task, stores that generate events. The last is a property of the process
+    // being lowered (a PreInit or Preponed capture has silent stores), so a
+    // thunk group must not inherit it from the process lowered before it: every
+    // member store would wake nobody.
+    const auto reset_thunk_state = [&] {
+        awaiter_       = nullptr;
+        record_        = nullptr;
+        fork_record_   = nullptr;
+        fork_live_     = nullptr;
+        disable_node_  = nullptr;
+        fork_disable_nodes_.clear();
+        spawn_sched_   = nullptr;
+        block_nodes_.clear();
+        event_wait_nodes_.clear();
+        sync_nodes_.clear();
+        cur_is_task_   = false;
+        silent_stores_ = false;
+        hdl_           = nullptr;
+    };
     if (config_.split && config_.outline && thunk_group_[g_] &&
         members.size() > 1 && members.size() <= outline_max_members &&
         group_unit_anchor_[g_] == SignalSlot::no_anchor &&
@@ -203,6 +227,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
 
+        // The dispatcher's flag: members never touch it, and a constant naming
+        // root's array must not leak into a unit module's function.
+        llvm::Value* const group_sched = sched_ptr_;
         std::vector<llvm::Function*> member_fns;
         member_fns.reserve(members.size());
         for (const uint32_t m : members) {
@@ -213,21 +240,26 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
                              std::to_string(proc_sched_ord_[m])
                          : mod_.name + ".p" + std::to_string(m);
             fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, mname, env_->llmod);
-            state_ = fn_->getArg(0);
-            state_->setName("state");
+            fn_->getArg(0)->setName("ctx");
             wheel_ = fn_->getArg(1);
             wheel_->setName("wheel");
-            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+            if (aid != ~0u) {
+                fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+            }
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            reset_thunk_state();
+            // The `state` argument callees still take is the root state.
+            state_    = sym(state_global_);
             rng_slot_ = sym(rng_global_);
-            // Member bodies never touch the sched flag (the dispatcher
-            // owns the timeline) and address absolutely (no ctx), but
-            // their NBA block ids need a member-scoped def-stable idval
-            // key: block_register keys on outline_anchor_/outline_ord_
-            // while these are set, with block ids member-contiguous
-            // (group_first_block_ reset per member).
-            outline_anchor_    = aid;
-            outline_ord_       = proc_sched_ord_[m];
+            // The record the member was handed stands for its instance; a
+            // member that belongs to no instance has none. Member bodies
+            // never touch the sched flag (the dispatcher owns the timeline),
+            // and their NBA block ids are record base + member-local ordinal,
+            // block ids member-contiguous (group_first_block_ reset per member).
+            own_anchor_        = aid;
+            own_ctx_           = aid != ~0u ? fn_->getArg(0) : nullptr;
+            blk_ordinal_       = aid != ~0u ? member_blk_ordinal_[m] : ~0u;
+            sched_ptr_         = nullptr;
             group_first_block_ = -1;
             select_member(m);
             str_vals_.assign(ir_->inst_count(), nullptr);
@@ -239,7 +271,10 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             b_.CreateRetVoid();
             member_fns.push_back(fn_);
         }
-        outline_anchor_    = ~0u;
+        own_anchor_        = SignalSlot::no_anchor;
+        own_ctx_           = nullptr;
+        blk_ordinal_       = ~0u;
+        sched_ptr_         = group_sched;
         group_first_block_ = -1;
 
         env_ = root_env_.get();
@@ -253,8 +288,11 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         rng_slot_ = sym(rng_global_);
         const bool guarded = open_group(g_);
         for (size_t i = 0; i < member_fns.size(); ++i) {
+            const uint32_t    aid = proc_sched_anchor_[members[i]];
+            llvm::Value*      rec = aid != ~0u ? static_cast<llvm::Value*>(ensure_ctx(anchors_[aid]))
+                                               : llvm::ConstantPointerNull::get(ptr_ty);
             llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
-            b_.CreateCall(fnty, sym(member_fns[i]), { state_, wheel_ });
+            b_.CreateCall(fnty, sym(member_fns[i]), { rec, wheel_ });
             close_guard(join);
         }
         b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
@@ -262,7 +300,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         return fn_;
     }
 
-    if (thunk_group_[group_of_[proc_index]]) {
+    if (thunk_group_[g_]) {
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
         fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
@@ -271,18 +309,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         wheel_ = fn_->getArg(1);
         wheel_->setName("wheel");
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-        awaiter_          = nullptr;
-        record_           = nullptr;
-        fork_record_      = nullptr;
-        fork_live_        = nullptr;
-        disable_node_     = nullptr;
-        fork_disable_nodes_.clear();
-        spawn_sched_ = nullptr;
-        block_nodes_.clear();
-        event_wait_nodes_.clear();
-    sync_nodes_.clear();
-        cur_is_task_      = false;
-        hdl_              = nullptr;
+        reset_thunk_state();
         auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
         b_.SetInsertPoint(entry_bb);
         // A thunk group cannot reach a draw (compute_fusion_groups excludes one
@@ -294,14 +321,14 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
         // process, so deinit_body_strings frees exactly this member's temps.
-        const bool guarded = open_group(group_of_[proc_index]);
+        const bool guarded = open_group(g_);
         for (size_t i = 0; i < members.size(); ++i) {
             select_member(members[i]);
             str_vals_.assign(ir_->inst_count(), nullptr);
             build_str_temps();
             build_dynarr_temps();
             build_agg_elem_temps();
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
+            llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -558,13 +585,13 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.CreateBr(loop_bb);
         b_.SetInsertPoint(loop_bb);
         emit_defer_gen_bump(); // activation start = deferred-assertion flush point
-        const bool guarded = open_group(group_of_[proc_index]);
+        const bool guarded = open_group(g_);
         for (size_t i = 0; i < members.size(); ++i) {
             select_member(members[i]);
             str_vals_     = member_strs[i];
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
+            llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
@@ -1204,7 +1231,7 @@ void Backend::deinit_body_strings() {
 // shared instruction lowering — Arg reads a parameter, Local addresses the
 // frame, Ret is a real return, Call invokes another function.
 void Backend::lower_function(FunctionId id) {
-    sched_anchor_ = SignalSlot::no_anchor; // functions are not a shareable group
+    own_anchor_ = SignalSlot::no_anchor; // functions address every instance absolutely
     const Function& f = mod_.function(id);
     // A subroutine reached through a virtual interface handle addresses its
     // interface's signals through the instance formal 0 names, for the whole
@@ -1451,7 +1478,7 @@ void Backend::lower_task(FunctionId id) {
     // intra-body @event waits, exactly like a process's proc_sched slot.
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
-    sched_anchor_      = SignalSlot::no_anchor;
+    own_anchor_        = SignalSlot::no_anchor;
     group_first_block_ = -1;
     // And, for a task some `disable` names, this activation's list node — same
     // placement and for the same reason: a `disable` reads it while we are parked.

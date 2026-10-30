@@ -747,7 +747,7 @@ void Backend::emit_program_end(uint32_t proc_index) {
 // delayed/woken processes) until idle, then run the `final` blocks. Returns
 // 0. Not `main`: a linked executable has its own, which calls rt_run.
 void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
-    sched_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
+    own_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
     auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
     auto* subfnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
 

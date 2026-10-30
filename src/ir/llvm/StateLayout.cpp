@@ -30,10 +30,7 @@ void Backend::build_sched_flags() {
     std::vector<uint32_t> owned(anchors_.size(), 0);
     uint32_t              n_root = 0;
     for (uint32_t k = 0; k < procs.size(); ++k) {
-        const uint32_t sc = procs[k].scope;
-        if (sc != Process::no_scope && sc < anchor_of_scope_.size() &&
-            anchor_of_scope_[sc] != SignalSlot::no_anchor) {
-            const uint32_t aid    = anchor_of_scope_[sc];
+        if (const uint32_t aid = process_anchor(procs[k]); aid != SignalSlot::no_anchor) {
             proc_sched_anchor_[k] = aid;
             proc_sched_ord_[k]    = owned[aid]++;
         } else {
@@ -54,6 +51,13 @@ void Backend::build_sched_flags() {
     sched_arr_ty_ = llvm::ArrayType::get(word, std::max<uint32_t>(n_root, 1));
     sched_gv_     = new llvm::GlobalVariable(env_->llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                              llvm::ConstantAggregateZero::get(sched_arr_ty_), "clotho.proc_sched");
+}
+
+// The anchor of the instance scope that owns process `p`: no_anchor for a
+// process of no instance (PreInit / package) or of a scope without one.
+uint32_t Backend::process_anchor(const Process& p) const {
+    return p.scope != Process::no_scope && p.scope < anchor_of_scope_.size() ? anchor_of_scope_[p.scope]
+                                                                              : SignalSlot::no_anchor;
 }
 
 // The LLVM type of a wake word. One place, because materialize_group_ctx
@@ -594,24 +598,24 @@ llvm::Value* Backend::vif_head_ptr(Signal sig, uint32_t edge) {
 // from a global keeps codegen from folding shadow addresses into
 // state+constant, so the colliding form cannot arise.
 // Whether the code being emitted should address `owner`'s per-instance
-// runtime structures def-relatively. True only inside a single-scope group
-// of `owner`'s own instance — the population body sharing can cover.
-// Everything else (cross-instance fused groups, tasks, commit functions,
-// cross-hierarchy references) is unshareable by construction and keeps the
-// absolute/folded form, which the optimizer amortizes to one hoisted base:
-// a 32-member cross-instance fused NBA thunk measured +23% -O sim with
-// unconditional indirection (32 per-instance base loads GVN cannot merge).
-// Either form addresses the same storage; this is codegen policy only.
+// runtime structures def-relatively, through the instance record: inside a
+// single-scope group or a member function of a group spanning instances, for
+// the signals of the instance that function was emitted for (own_anchor_), and
+// for a virtual interface access. Everything else (tasks, functions, commit
+// functions, signals of another instance a body reaches by hierarchical
+// reference) keeps the absolute/folded form until bindings supply those
+// records too. Either form addresses the same storage; this is codegen policy
+// only.
 bool Backend::def_relative_for(const SignalSlot& owner) const {
     // A virtual interface access is def-relative by construction: the instance
     // is not known until run time, so there is no absolute form to fold to.
     return ctx_override_for(owner) ||
-           (sched_anchor_ != SignalSlot::no_anchor && owner.anchor == sched_anchor_);
+           (own_anchor_ != SignalSlot::no_anchor && owner.anchor == own_anchor_);
 }
 
 // `owner` is the signal whose (def-local, for an anchored signal) shadow
-// field is addressed. A reused definition's own single-scope group loads
-// its instance's shadow base (@clotho.inst.*.shadow); every other context
+// field is addressed. An instance's own code (def_relative_for) loads its
+// record's shadow base (@clotho.inst.*.shadow); every other context
 // folds the sub-struct index through the root base; unscoped signals keep
 // the flat root field. Every path loads a base pointer, preserving the
 // opacity requirement above.
@@ -695,9 +699,9 @@ void Backend::emit_state_global() {
     }
 }
 
-// Lazily create the instance context global (see Anchor). The type is
-// computed by build_instance_ctx_layout; only instances actually addressed
-// def-relatively materialize a global (and a fill in main).
+// Lazily create the instance record global (see Anchor). The type is computed
+// by build_instance_ctx_layout; only instances actually addressed through
+// their record materialize a global (and a fill in main).
 llvm::GlobalVariable* Backend::ensure_ctx(Anchor& a) {
     if (a.ctx_gv == nullptr) {
         a.ctx_gv = new llvm::GlobalVariable(env_->llmod, a.ctx_ty, false,
@@ -708,18 +712,43 @@ llvm::GlobalVariable* Backend::ensure_ctx(Anchor& a) {
     return sym(a.ctx_gv);
 }
 
-// A def-relative load of one instance-context field. `ctx_override_` redirects
-// it to an instance chosen at run time -- a virtual interface access, whose
-// whole point is that the def-local field constants stay while the record they
-// are read from is whichever instance the handle names (LRM 25.9).
+// A def-relative load of one instance-record field. The record is the one
+// body being emitted was handed (own_ctx_: a member function's first
+// parameter) or, for a single-scope group, the instance's record global.
+// `ctx_override_` redirects it to an instance chosen at run time -- a virtual
+// interface access, whose whole point is that the def-local field constants
+// stay while the record they are read from is whichever instance the handle
+// names (LRM 25.9).
 llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
-    if (ctx_override_ != nullptr) {
-        return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, ctx_override_,
-                                                      { b_.getInt32(0), b_.getInt32(field) }));
+    llvm::Value* rec = ctx_override_;
+    if (rec == nullptr && own_ctx_ != nullptr && &a == &anchors_[own_anchor_]) {
+        rec = own_ctx_;
+    }
+    if (rec != nullptr) {
+        return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(field) }));
     }
     auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
       a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
     return b_.CreateLoad(ty, gep);
+}
+
+// The record of the instance a deferred store to `s` lands in, which its
+// replay hands to the wait-queue service so it wakes the instance the value
+// actually reached: through a virtual interface handle the one the handle
+// named; inside a subroutine reached through one, the instance formal 0
+// named (the body-wide override); from a member function its own record; from
+// a single-scope group the instance's record global.
+llvm::Value* Backend::record_ptr(const SignalSlot& s, llvm::Value* vif_ctx) {
+    if (vif_ctx != nullptr) {
+        return vif_ctx;
+    }
+    if (ctx_override_for(s)) {
+        return ctx_override_;
+    }
+    if (own_ctx_ != nullptr && s.anchor == own_anchor_) {
+        return own_ctx_;
+    }
+    return ensure_ctx(anchors_[s.anchor]);
 }
 
 // The anchor a vif-rooted lvalue's context record describes: its representative
@@ -735,18 +764,15 @@ bool Backend::ctx_override_for(const SignalSlot& owner) const {
     return ctx_override_ != nullptr && owner.anchor == ctx_override_anchor_;
 }
 
-// Materialize the group's deferred def-relative context at the current
-// insert point (a function entry, so it dominates every use): the sched-flag
-// pointer (instance sched base + def-local ordinal) and, when the group can
-// register NBA blocks, the instance's block-id base (block_register adds the
-// group-local block ordinal). No-op when lower_group chose the absolute
-// constants; a dead base load in a group that ends up registering no block
-// is swept by the tier-0 dce pass.
+// Materialize a single-scope group's deferred sched-flag pointer at the
+// current insert point (a function entry, so it dominates every use): the
+// instance's sched base (record field 2) plus the group's def-local ordinal.
+// No-op when lower_group chose the absolute constant.
 void Backend::materialize_group_ctx() {
     if (sched_ptr_ != nullptr) {
         return;
     }
-    Anchor&      a    = anchors_[sched_anchor_];
+    Anchor&      a    = anchors_[own_anchor_];
     llvm::Value* base = ctx_field(a, 2, llvm::PointerType::getUnqual(ctx_));
     sched_ptr_ = b_.CreateInBoundsGEP(sched_word_ty(), base, b_.getInt32(sched_ordinal_));
 }
@@ -947,16 +973,20 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
 }
 
 // Compute each instance context's type (see Anchor): shared per definition,
-// fields sized from the def-local single-scope group count and wait-bucket
+// fields sized from the def-local block-id ordinal count and wait-bucket
 // slots. Runs after fusion grouping and wait-queue sizing, before lowering.
 // Also attributes each fusion group to its scope anchor + def-local
-// ordinal (the shareable-group identity every def-relative site keys on).
+// ordinal (the shareable-group identity every def-relative site keys on), and
+// gives each member of a group spanning instances its own ordinal in its
+// instance's record: such a member is a function of its own, and its NBA
+// blocks are contiguous within it, so one field holds their first id.
 void Backend::build_instance_ctx_layout() {
     const auto all = mod_.processes();
     group_anchor_of_.assign(groups_.size(), SignalSlot::no_anchor);
     group_def_ordinal_.assign(groups_.size(), ~0u);
     group_unit_anchor_.assign(groups_.size(), SignalSlot::no_anchor);
     group_unit_ordinal_.assign(groups_.size(), ~0u);
+    member_blk_ordinal_.assign(all.size(), ~0u);
     std::vector<uint32_t> scope_counter(anchors_.size(), 0);
     std::vector<uint32_t> unit_counter(anchors_.size(), 0);
     for (uint32_t g = 0; g < groups_.size(); ++g) {
@@ -967,6 +997,15 @@ void Backend::build_instance_ctx_layout() {
         }
         if (!same || sc >= anchor_of_scope_.size() ||
             anchor_of_scope_[sc] == SignalSlot::no_anchor) {
+            // A group spanning instances (more than one member, always a thunk
+            // group: see compute_fusion_groups) lowers as one function per member.
+            if (groups_[g].size() > 1) {
+                for (const uint32_t m : groups_[g]) {
+                    if (const uint32_t maid = process_anchor(all[m]); maid != SignalSlot::no_anchor) {
+                        member_blk_ordinal_[m] = scope_counter[maid]++;
+                    }
+                }
+            }
             continue;
         }
         const uint32_t aid = anchor_of_scope_[sc];
@@ -980,12 +1019,12 @@ void Backend::build_instance_ctx_layout() {
         group_anchor_of_[g]   = aid;
         group_def_ordinal_[g] = scope_counter[aid]++;
     }
-    // Twin instances see the same def-local group count; size blk fields by
+    // Twin instances see the same def-local ordinal count; size blk fields by
     // the definition-wide maximum so layouts agree even if a member's group
     // list degenerated (they should be equal by construction).
-    ankerl::unordered_dense::map<llvm::StructType*, uint32_t> def_groups;
+    ankerl::unordered_dense::map<llvm::StructType*, uint32_t> def_blk;
     for (uint32_t a = 0; a < anchors_.size(); ++a) {
-        auto& n = def_groups[anchors_[a].ty];
+        auto& n = def_blk[anchors_[a].ty];
         n       = std::max(n, scope_counter[a]);
     }
 
@@ -993,7 +1032,7 @@ void Backend::build_instance_ctx_layout() {
     auto* i32 = b_.getInt32Ty();
     ankerl::unordered_dense::map<llvm::StructType*, llvm::StructType*> def_ctx;
     for (Anchor& a : anchors_) {
-        a.n_groups     = def_groups[a.ty];
+        a.n_blk        = def_blk[a.ty];
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;
         for (const Signal sj : anchor_signals_[&a - anchors_.data()]) {
@@ -1006,11 +1045,11 @@ void Backend::build_instance_ctx_layout() {
                 nwait += wait_slot_dyn_[si][e] != no_wait_slot ? 2 : 0;
             }
         }
-        a.ctx_wait_base = a.ctx_blk_base + a.n_groups;
+        a.ctx_wait_base = a.ctx_blk_base + a.n_blk;
         const auto [it, fresh] = def_ctx.try_emplace(a.ty, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
-            f.insert(f.end(), a.n_groups, i32);
+            f.insert(f.end(), a.n_blk, i32);
             f.insert(f.end(), nwait, ptr);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
