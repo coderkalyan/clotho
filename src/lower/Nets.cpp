@@ -839,54 +839,72 @@ void Lowerer::emit_wire_resolvers() {
         const std::span<const NetForceSite> sites = fs_it != net_force_sites_.end()
                                                       ? std::span<const NetForceSite>(fs_it->second)
                                                       : std::span<const NetForceSite>();
-        // Lay every site over the lvalue `base()` makes, a fresh one per use.
-        const auto overlay = [&](const auto& base) {
+        const ir::Ref                       net_ty = module_.signal(net).type;
+        // The net's value as the overlay builds it, a fresh lvalue per use.
+        const auto cell = [&] { return b.local(0, net_ty, l); };
+        // A net delay (LRM 28.16, `wire #5 w;`) delays the resolved fold itself,
+        // not any one driver's slot -- "the time it takes from any driver on the
+        // net changing value to the time when the net value is updated". A force
+        // is not a driver but an override of all of them (LRM 10.6.2), and it is
+        // an active update event of its own (LRM 4.9.2), so it takes effect at
+        // once and the net delay does not touch it. On a net that is also forced
+        // the delayed fold therefore goes into a signal of its own, and the net is
+        // that signal with the active sites laid over it (NetDelayShadow): a driver
+        // change that is on its way lands under an active force, and a release
+        // shows what the drivers have delivered. Stored into the net itself, the
+        // delayed fold landed over the force, and the inertial store compared its
+        // fold with the forced value, so a release changed nothing.
+        const auto nd_it   = net_delay_.find(net_u);
+        const auto sh_it   = net_delay_shadow_.find(net_u);
+        const bool delayed = nd_it != net_delay_.end();
+        const bool forced  = !sites.empty();
+        assert((delayed && forced) == (sh_it != net_delay_shadow_.end()) && "a delayed forced net has its shadow");
+        ir::Index value = acc; // what the force sites are laid over
+        if (delayed && forced) {
+            const NetDelayShadow& sh    = sh_it->second;
+            const ir::Index       dst   = b.signal(sh.delayed, l);
+            const ir::Index       ticks = scaled_delay(*nd_it->second, b);
+            b.binary(ir::Inst::Tag::Store, b.signal(sh.fold, l), acc, l);
+            b.store_inertial_delay(dst, acc, ticks, l);
+            value = b.unary(ir::Inst::Tag::Load, b.signal(sh.delayed, l), l);
+        } else if (delayed) {
+            const ir::Index dst   = b.signal(net, l);
+            const ir::Index ticks = scaled_delay(*nd_it->second, b);
+            b.store_inertial_delay(dst, acc, ticks, l);
+        }
+        if (forced) {
+            b.binary(ir::Inst::Tag::Store, cell(), value, l);
             for (const NetForceSite& site : sites) {
-                const ir::Index lv =
-                  (site.lo == 0 && site.hi == net_w - 1) ? base() : b.part_select(base(), site.hi, site.lo, l);
+                const ir::Index part =
+                  (site.lo == 0 && site.hi == net_w - 1) ? cell() : b.part_select(cell(), site.hi, site.lo, l);
                 b.open_region();
-                b.binary(ir::Inst::Tag::Store, lv, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
+                b.binary(ir::Inst::Tag::Store, part, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
                 const ir::ExtraSlice then_r = b.close_region();
                 b.open_region();
                 const ir::ExtraSlice else_r = b.close_region();
                 b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
             }
-        };
-        // A net delay (LRM 28.16, `wire #5 w;`) delays the resolved fold
-        // itself, not any one driver's slot -- "the time it takes from any
-        // driver on the net changing value to the time when the net value
-        // is updated". It rides this store alone; the force overlay below
-        // stays immediate (force is an override, not a driver LRM 28.16
-        // times).
-        const auto nd_it   = net_delay_.find(net_u);
-        const bool delayed = nd_it != net_delay_.end();
-        const bool staged  = !delayed && !sites.empty();
-        if (delayed) {
-            const ir::Index dst   = b.signal(net, l);
-            const ir::Index ticks = scaled_delay(*nd_it->second, b);
-            b.store_inertial_delay(dst, acc, ticks, l);
-            overlay([&] { return b.signal(net, l); });
-        } else if (staged) {
-            const ir::Ref net_ty = module_.signal(net).type;
-            const auto    cell   = [&] { return b.local(0, net_ty, l); };
-            b.binary(ir::Inst::Tag::Store, cell(), acc, l);
-            overlay(cell);
-            b.binary(ir::Inst::Tag::Store, b.signal(net, l), b.unary(ir::Inst::Tag::Load, cell(), l), l);
-        } else {
+            const ir::Index result = b.unary(ir::Inst::Tag::Load, cell(), l);
+            b.binary(ir::Inst::Tag::Store, b.signal(net, l), result, l);
+        } else if (!delayed) {
             // An unpacked array net reaches here only when nothing drives it (a
             // driver's slot is refused for one), and the pull, or the z, of a
             // driverless net lands in every element alike.
-            store_every_element(b.signal(net, l), module_.signal(net).type, acc, b, l);
+            store_every_element(b.signal(net, l), net_ty, acc, b, l);
         }
 
         std::vector<ir::WaitEvent> wait_events;
-        wait_events.reserve(slots.size() + sites.size() * 2);
+        wait_events.reserve(slots.size() + sites.size() * 2 + 1);
         for (const ir::Signal s : slots) {
             wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
         for (const NetForceSite& site : sites) {
             wait_events.push_back(ir::WaitEvent{ .signal = site.active, .edge = ir::Edge::Any });
             wait_events.push_back(ir::WaitEvent{ .signal = site.val, .edge = ir::Edge::Any });
+        }
+        if (delayed && forced) {
+            // The delayed fold landing changes the net, which is built from it.
+            wait_events.push_back(ir::WaitEvent{ .signal = sh_it->second.delayed, .edge = ir::Edge::Any });
         }
         // LRM 24.3.2: "the driving and resolution of nets on the other side of
         // a program port connection also occurs in the reactive region set."
@@ -922,8 +940,7 @@ void Lowerer::emit_wire_resolvers() {
                                                .return_type = module_.pool.void_type,
                                                .param_types = {},
                                                .arg_dirs    = {},
-                                               .local_types = staged ? std::vector<ir::Ref>{ module_.signal(net).type }
-                                                                     : std::vector<ir::Ref>{},
+                                               .local_types = std::vector<ir::Ref>{ net_ty },
                                                .is_task     = false,
                                                .ir          = b.finish() });
             ir::Builder pb(module_);
@@ -1215,6 +1232,22 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     const uint32_t idx   = static_cast<uint32_t>(sites.size());
     sites.push_back(site);
     stmt_force_site_[&s] = { net_u, idx };
+    if (net_delay_.contains(net_u)) {
+        const auto [shadow, fresh] = net_delay_shadow_.try_emplace(net_u);
+        if (fresh) {
+            const std::string net_name = module_.signal(sit->second).name;
+            const ir::Ref     net_ty   = module_.signal(sit->second).type;
+            const auto        hidden   = [&](const char* suffix) {
+                ir::SignalInfo info;
+                info.name = net_name + suffix;
+                info.type = net_ty;
+                info.dir  = ir::SignalInfo::Direction::Internal;
+                return register_signal(std::move(info));
+            };
+            shadow->second.delayed = hidden("$delayed");
+            shadow->second.fold    = hidden("$fold");
+        }
+    }
     if (resolved_nets_.insert(net_u).second) {
         net_resolve_op_[net_u] = net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
     }
@@ -1584,6 +1617,48 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
             b.open_region();
             const ir::ExtraSlice else_r = b.close_region();
             b.cond(site_is(site.active, 1, b, l), then_r, else_r, l, /*unlikely=*/true);
+        }
+    }
+    // A net with a net delay (LRM 28.16) answers a release with what the drivers have
+    // delivered through it, which is the fold unless a driver change is still on its
+    // way. Then the LRM does not say what the freed bits take. 10.6.2: "the net shall
+    // immediately be assigned the value determined by the drivers of the net", and
+    // the drivers have changed. 10.3.3: "any value change that is to be applied to
+    // [the net] by some other statement shall be delayed ... before it takes effect",
+    // and the change has not taken effect. Neither yields to the other in the text, so
+    // the run stops here instead of picking one. The two answers differ exactly when
+    // the site's bits of the delayed fold and of the fold do.
+    // TODO: release of a net while its net delay holds a driver change (needs the
+    // LRM question above settled; the freed bits then take `fold` or `delayed`).
+    if (const auto sh = net_delay_shadow_.find(static_cast<uint32_t>(sit->second)); sh != net_delay_shadow_.end()) {
+        for (const NetForceSite& site : fs->second) {
+            if (site.lo < rlo || site.hi > rhi) {
+                continue;
+            }
+            const auto bits = [&](ir::Signal sig) {
+                const ir::Index part = (site.lo == 0 && site.hi == net_w - 1)
+                                         ? b.signal(sig, l)
+                                         : b.part_select(b.signal(sig, l), site.hi, site.lo, l);
+                return b.unary(ir::Inst::Tag::Load, part, l);
+            };
+            const ir::Index   delayed = bits(sh->second.delayed);
+            const ir::Index   fold    = bits(sh->second.fold);
+            const ir::Index   same    = b.binary(ir::Inst::Tag::CaseEq, delayed, fold, l);
+            const ir::Index   moving  = b.unary(ir::Inst::Tag::Lnot, same, l);
+            const ir::Index   pending = b.binary(ir::Inst::Tag::Land, site_is(site.active, 1, b, l), moving, l);
+            const std::string banner  = banner_at(lv.sourceRange.start());
+            b.open_region();
+            b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                       severity_banner(lv.sourceRange.start()),
+                       "release of a net while its net delay holds a driver change is not supported "
+                       "(LRM 10.6.2, 10.3.3)",
+                       {},
+                       l);
+            b.finish(banner + "release", 1, l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(pending, then_r, else_r, l, /*unlikely=*/true);
         }
     }
     bool released = false;

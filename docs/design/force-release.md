@@ -184,6 +184,30 @@ deferred record rather than the sampling site.
     bit-select or a part-select of a variable") — rejected loud — even though iverilog
     accepts it. An open decision (docs/TODO.md).
 
+## Force on a net with a net delay (LRM 10.6.2, 10.3.3, 28.16)
+
+A net delay is "the time it takes from any driver on the net changing value to the time
+when the net value is updated" (28.16). A force is not a driver but an override of all of
+them (10.6.2), and an active update event of its own (4.9.2). Clotho reads the net delay as a
+stage between the drivers and the net value, with the force sitting on the net value past it:
+a force and a release take effect at once, a driver change that is on its way lands under an
+active force without disturbing it, and a release shows what the drivers have delivered.
+
+A net that has both a net delay and a force site (`net_delay_shadow_`, allocated with its
+first site) keeps two more hidden signals. The resolver stores the undelayed fold into
+`$fold` and the delayed fold, through the inertial store, into `$delayed`. The net is
+`$delayed` with the active sites laid over it, built in a frame cell of the resolver function
+and stored once. `$delayed` is in the resolver's sensitivity, so a landing re-runs it. The
+inertial store compares against `$delayed`, not the net, so the forced value is never taken
+for the net's own. A net with a net delay and no force, and a forced net with no delay, do not
+pay for any of this.
+
+Not settled by the LRM: a release while a driver change is still on its way (`$fold` and
+`$delayed` differ in the released bits). 10.6.2 has the net "immediately be assigned the value
+determined by the drivers", and 10.3.3 has a value change "delayed ... before it takes
+effect". The run stops with a fatal error there (`release_net`); every other release is exact.
+See `docs/LRM_NOTES.md`.
+
 ## Oracle
 
 iverilog 13 supports force/release and assign/deassign on variables and nets — the

@@ -1847,6 +1847,19 @@ private:
     // Net handle -> its force sites (in registration order; the resolver blends
     // them in that order, exact for disjoint ranges).
     ankerl::unordered_dense::map<uint32_t, std::vector<NetForceSite>> net_force_sites_;
+    // A net with both a net delay (LRM 28.16) and a force site. The delay is the
+    // drivers' and the force is the net's (LRM 10.6.2), so the delayed fold cannot
+    // be stored into the net itself: it would land over an active force, and the
+    // inertial store would take the forced value for the net's own. The resolver
+    // keeps the delayed fold in `delayed` and lays the active sites over it for the
+    // net. `fold` is the latest undelayed fold, which a release compares with
+    // `delayed` to tell whether a driver change is still on its way (release_net).
+    // Allocated with the net's first force site (register_net_force_site).
+    struct NetDelayShadow {
+        ir::Signal delayed{ 0 };
+        ir::Signal fold{ 0 };
+    };
+    ankerl::unordered_dense::map<uint32_t, NetDelayShadow> net_delay_shadow_;
     // Net handle -> the zero-formal function that re-folds the net's drivers and
     // overlays its force sites. The resolver process calls it, and so does a
     // `release` of the net, so the net takes its driven value at once (LRM

@@ -243,6 +243,260 @@ TEST_CASE("net delay: a 128-bit net delay carries the exact value") {
     CHECK(run_capture_finish(src) == "y=deadbeef00000001123456789abcdef0\n");
 }
 
+// -- force and release on a net with a net delay (LRM 10.6.2, 10.3.3, 28.16) --
+//
+// 28.16 delays "the time it takes from any driver on the net changing value to the
+// time when the net value is updated", and 10.6.2 has a force "override all drivers
+// of the net ... until a release", after which "the net shall immediately be
+// assigned the value determined by the drivers of the net". So the net delay is a
+// stage between the drivers and the net value, a force sits on the net value past it
+// and takes effect at once (4.9.2: a force is an active update event), a driver
+// change that is on its way lands under the force and does not disturb it, and a
+// release shows what the drivers have delivered. That is Clotho's reading of clauses
+// that do not mention each other (docs/LRM_NOTES.md, note 48); a release while a driver
+// change is still on its way is the case the clauses leave open, and the test that
+// stops the run covers it. iverilog 13 implements no net delay, so the expected output
+// is the LRM's; on a net with ONE driver the net delay is that driver's delay, and
+// iverilog 13 prints exactly the lines of the first test for the driver-delay form
+// `wire #5 w = a` (tests/force_release_test.cpp).
+
+// a=1 at 10 is due at 15. The force taken at 12 holds through that landing and the
+// release at 20 shows the 1. The delayed fold was stored into the net itself, so it
+// landed over the force (w=1 at 15, still 1 at 18).
+TEST_CASE("net delay: a driver change on its way lands under an active force") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a;
+            wire #5 w;
+            assign w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force w = 1'bz;
+                #6 $strobe("%0t s w=%b", $time, w);
+                #2 release w;
+                $strobe("%0t s w=%b", $time, w);
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "5 chg w=0\n12 chg w=z\n18 s w=z\n20 chg w=1\n20 s w=1\n");
+}
+
+// "Immediately" (10.6.2): the statement after a release already sees the drivers'
+// value, for a net with nothing on its way, whatever drives it. The release made no
+// store at all when the driver's value was the one last armed, so the net kept the
+// forced value for good (w=1 where the driver says 0).
+TEST_CASE("net delay: a release returns the net to its drivers at once") {
+    constexpr std::string_view single = R"(
+        module m;
+            logic a;
+            wire #5 w;
+            assign w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0;
+                #10 force w = 1'b1;
+                #5 release w;
+                $strobe("%0t s w=%b", $time, w);
+                #10 $strobe("%0t s w=%b", $time, w);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(single) == "5 chg w=0\n10 chg w=1\n15 chg w=0\n15 s w=0\n25 s w=0\n");
+
+    // The same for a wired-AND net of two drivers, a net driven by a gate and an
+    // undriven tri1 net whose pull is its only driver: all resolve through the fold
+    // the net delay follows.
+    constexpr std::string_view kinds = R"(
+        module m;
+            logic a, b;
+            wand #4 wa;
+            assign wa = a;
+            assign wa = b;
+            wire #3 wg;
+            and g (wg, a, b);
+            tri1 #4 wt;
+            initial begin
+                a = 1; b = 1;
+                #10 force wa = 1'b0;
+                force wg = 1'b0;
+                force wt = 1'b0;
+                $display("forced %b%b%b", wa, wg, wt);
+                #5 release wa;
+                release wg;
+                release wt;
+                $display("released %b%b%b", wa, wg, wt);
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(kinds) == "forced 000\nreleased 111\n");
+}
+
+// A forced bit or part holds against the landing and each releases on its own: the
+// landing at 15 changes only the free bit, and every release shows the delivered
+// value of its bits (the net is 1111 once both are free).
+TEST_CASE("net delay: a forced bit and part hold against a landing and release separately") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            wire [3:0] #5 w;
+            assign w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 4'b0000;
+                #10 a = 4'b1111;
+                #2 force w[1] = 1'b0;
+                force w[3:2] = 2'b0z;
+                #6 $strobe("%0t s w=%b", $time, w);
+                #2 release w[1];
+                $strobe("%0t s w=%b", $time, w);
+                #2 release w[3:2];
+                $strobe("%0t s w=%b", $time, w);
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "5 chg w=0000\n12 chg w=0z00\n15 chg w=0z01\n18 s w=0z01\n"
+                                     "20 chg w=0z11\n20 s w=0z11\n22 chg w=1111\n22 s w=1111\n");
+}
+
+// A driver's own delay and the net's stack (see "stacks with a driver's own
+// continuous-assign delay"): a=1 at 10 reaches the slot at 13 and the net at 18, under
+// the force taken at 11, and the release at 25 shows it.
+TEST_CASE("net delay: a driver's own delay and the net delay both pass under a force") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a;
+            wire #5 w;
+            assign #3 w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #1 force w = 1'bz;
+                #9 $strobe("%0t s w=%b", $time, w);
+                #5 release w;
+                $strobe("%0t s w=%b", $time, w);
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "8 chg w=0\n11 chg w=z\n20 s w=z\n25 chg w=1\n25 s w=1\n");
+}
+
+// The force's own right-hand side is a continuous relationship (10.6.2) that the net
+// delay does not touch: the net follows b at 12 and 16 while a=1 at 14 is on its way
+// (due at 19, under the force), and the release at 20 shows it.
+TEST_CASE("net delay: a force follows its right-hand side at once, past the net delay") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            wire #5 w;
+            assign w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0; b = 0;
+                #10 force w = b;
+                #2 b = 1;
+                #2 a = 1;
+                #2 b = 0;
+                #4 release w;
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "5 chg w=0\n12 chg w=1\n16 chg w=0\n20 chg w=1\n");
+}
+
+// Each instance of a module that holds a delayed, forced net has its own delayed fold:
+// s1 is forced and released from inside at 10 and 11, s0 from the top by a hierarchical
+// name at 10 and 12, and each release shows its own driver's value (s0 follows x=1, s1
+// follows y=0).
+TEST_CASE("net delay: every instance of a delayed forced net keeps its own state") {
+    constexpr std::string_view src = R"(
+        module sub #(parameter bit F = 0) (input logic a);
+            wire #3 w;
+            assign w = a;
+            initial if (F) begin
+                #10 force w = 1'bz;
+                #1 release w;
+                $display("%m inside w=%b", w);
+            end
+        endmodule
+        module top;
+            logic x = 1, y = 0;
+            sub #(0) s0 (.a(x));
+            sub #(1) s1 (.a(y));
+            initial begin
+                #10 force s0.w = 1'bz;
+                #2 release s0.w;
+                $display("outside s0.w=%b s1.w=%b", s0.w, s1.w);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "top.s1 inside w=0\noutside s0.w=1 s1.w=0\n");
+}
+
+// A release only meets the update on its way for the bits it frees: bit 0 has nothing
+// pending at 12, so the release is exact although bits 3:2 are due at 15.
+TEST_CASE("net delay: a release is exact for bits that have nothing on their way") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            wire [3:0] #5 w;
+            assign w = a;
+            initial begin
+                a = 4'b0000;
+                #6 force w[0] = 1'b1;
+                #4 a = 4'b1100;
+                #2 release w[0];
+                $display("t=%0t w=%b", $time, w);
+                #4 $display("t=%0t w=%b", $time, w);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=12 w=0000\nt=16 w=1100\n");
+}
+
+// OPEN LRM QUESTION, so refused: a release at 12 while the driver change of 10 is due at
+// 15. 10.6.2 says the net "shall immediately be assigned the value determined by the
+// drivers of the net", and the drivers say 1 since 10; 10.3.3 says a value change "shall be
+// delayed for ten time units before it takes effect" (here five), so the net says 0 until
+// 15. The clauses do not say which wins, and the stuck forced value this run used to show
+// at 12 is neither. The run stops at the release instead.
+TEST_CASE("net delay: a release while a driver change is on its way stops the run") {
+    const test::DesignRun run = test::run_design_captured(R"(
+        module m;
+            logic a;
+            wire #5 w;
+            assign w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0;
+                #7 force w = 1'b1;
+                #3 a = 1;
+                #2 release w;
+                $display("not reached %b", w);
+                $finish;
+            end
+        endmodule)");
+    CHECK(run.out == "5 chg w=0\n7 chg w=1\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("release of a net while its net delay holds a driver change is not supported") !=
+          std::string::npos);
+}
+
+// A rise/fall delay pair is refused for a net that is forced as for any other (the
+// triple form is the test above); the force does not give it a meaning.
+TEST_CASE("net delay: a two-value delay on a forced net is rejected") {
+    const std::string err = lower_error(R"(
+        module m;
+            logic a;
+            wire #(3,4) w;
+            assign w = a;
+            initial begin force w = 1'b1; release w; end
+        endmodule)");
+    CHECK(err.find("rise/fall/turn-off") != std::string::npos);
+}
+
 // Guard: a rise/fall/turn-off delay triple on a plain net delay has no
 // Clotho representation (same gap as `assign #(a,b,c)`), LRM 28.16.
 TEST_CASE("net delay: multi-value delay is rejected") {
