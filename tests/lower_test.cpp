@@ -1672,3 +1672,30 @@ TEST_CASE("source the LRM makes illegal is refused, not warned about") {
     // LRM 11.4.12: unsized constants are not allowed in a concatenation.
     refused("module m; reg [3:0] a; reg [35:0] r; initial r = {1, a}; endmodule", "unsized integer in concat");
 }
+
+TEST_CASE("legal source slang elaborates differently from the LRM is refused") {
+    const auto refused = [](std::string_view source, std::string_view needle) {
+        const LowerResult r = lower_text(source);
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find(needle) != std::string::npos, r.diagnostic_text());
+    };
+    // LRM 23.10.1: P would be 3; slang keeps the first override, 2.
+    refused("module c #(parameter P = 1); endmodule\n"
+            "module m; c i(); defparam i.P = 2; defparam i.P = 3; endmodule",
+            "already has a defparam override");
+    // LRM 13.4.3: P would be 6; slang skips `acc = 5` and folds 1.
+    refused("module m;\n"
+            "  function int f(int n); static int acc = 5; acc += n; return acc; endfunction\n"
+            "  localparam int P = f(1);\n"
+            "  initial $display(\"%0d\", P);\n"
+            "endmodule",
+            "static variable initialization is skipped");
+    refused("module m;\n"
+            "`pragma protect begin_protected\n"
+            "`pragma protect encoding=(enctype=\"base64\")\n"
+            "`pragma protect data_block\n"
+            "YWJj\n"
+            "`pragma protect end_protected\n"
+            "endmodule",
+            "protected envelopes cannot be decrypted");
+}

@@ -94,6 +94,10 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`defparam` across top-level modules** — a path into another top is refused.
 - [ ] **`defparam` that changes an implicitly typed parameter's type** (6.20.2, 23.10.1) — the
   parameter keeps its original initializer's type, so the override is refused.
+- [ ] **Several `defparam`s on one parameter** (23.10.1) — the last one in source order wins,
+  but slang keeps the first, so the design is refused.
+- [ ] **Static variable initializer in a constant function call** (13.4.3) — slang skips the
+  initializer during elaboration, so the call is refused.
 
 ### Procedural control
 
@@ -697,6 +701,7 @@ Milestones, in order; lower ones unblock higher ones:
   expressions, coverage merge and database; see docs/design/functional-coverage.md.
 - [ ] **Attributes** — semantic meaning for `(* ... *)` attributes beyond
   parse-through.
+- [ ] **Protected envelopes** (34) — encrypted source cannot be decrypted, so it is refused.
 
 ### Complete system task / function library
 

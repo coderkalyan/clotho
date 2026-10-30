@@ -164,6 +164,18 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // sequence as a property: slang reports it for sequences that can match, such
     // as `(a ##[1:$] b) intersect (c ##[1:2] d)`, whose lengths meet at 2 and 3.
 
+    // Legal source slang elaborates differently from the LRM, warning as it does.
+    // Accepting it would simulate something other than what was written.
+    // TODO: Each is a docs/TODO.md entry.
+    // LRM 23.10.1: of several defparams on one parameter the last wins; slang
+    // keeps the first.
+    engine.setSeverity(slang::diag::DuplicateDefparam, slang::DiagnosticSeverity::Error);
+    // LRM 13.4.3: a constant function call initializes its variables as normal
+    // simulation would; slang skips a static variable's initializer.
+    engine.setSeverity(slang::diag::ConstEvalStaticSkipped, slang::DiagnosticSeverity::Error);
+    // LRM 34: slang drops a protected envelope's contents.
+    engine.setSeverity(slang::diag::ProtectedEnvelope, slang::DiagnosticSeverity::Error);
+
     // The unused-parameter pair, silenced. CheckUnused is on for every run, and
     // on real parameterised RTL this one finding drowns the rest: measured on
     // hazard3, 718 of 722 unused findings are unused parameters, against three
