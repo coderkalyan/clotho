@@ -1893,7 +1893,7 @@ endmodule
     const ir::Process* p = nullptr;
     for (const ir::Process& proc : m.processes()) {
         if (proc.activation == ir::Activation::Preponed) {
-            REQUIRE(p == nullptr); // one process for the whole top
+            REQUIRE(p == nullptr); // one process for the one scope
             p = &proc;
         }
     }
@@ -2047,12 +2047,13 @@ endmodule
     CHECK(shadow_count(m) == 1);
     CHECK(has_shadow(m, "dif.sig"));
 
-    // The single Preponed process still copies it exactly once per timestep --
+    // The single Preponed process (one scope holds the shadow) still copies it
+    // exactly once per timestep --
     // not once per asserting instance.
     const ir::Process* preponed = nullptr;
     for (const ir::Process& proc : m.processes()) {
         if (proc.activation == ir::Activation::Preponed) {
-            REQUIRE(preponed == nullptr); // one process for the whole top
+            REQUIRE(preponed == nullptr); // one process for the one scope
             preponed = &proc;
         }
     }
@@ -2980,6 +2981,26 @@ module t;
   end
 endmodule
 )") == "5 15");
+}
+
+// An instance whose only process is the Preponed copy of a variable another
+// instance samples (an interface with no initializer) places nothing: its
+// siblings stay where the body declares them, ahead of the parent's own initial.
+TEST_CASE("a scope holding only a sampling copy does not move its siblings") {
+    CHECK(sva_run_capture(R"(
+interface bus_if; logic sig; endinterface
+module watcher(bus_if b, input bit clk);
+  a: assert property (@(posedge clk) !b.sig);
+  initial $display("watcher %m");
+endmodule
+module top;
+  bit clk;
+  bus_if b();
+  watcher w1(b, clk);
+  watcher w2(b, clk);
+  initial $display("top");
+endmodule
+)") == "watcher top.w1\nwatcher top.w2\ntop\n");
 }
 
 TEST_CASE("$past on a hierarchically-referenced signal is the previous tick, cross-scope") {

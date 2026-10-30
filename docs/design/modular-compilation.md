@@ -333,9 +333,11 @@ Each of these makes lowered IR depend on something outside the unit:
 - A package or `$unit` class lowered once per Lowerer that reaches it, so its
   synthesized functions exist once per top and take an ordinal in their import
   name (`own_function`).
-- One Preponed process per top, and resolvers with no scope for nets driven from
-  several scopes other than through inout ports (hierarchical drivers, interface
-  nets).
+- Resolvers with no scope for nets driven from several scopes other than through
+  inout ports (hierarchical drivers, interface nets). A Preponed process belongs
+  to the scope that holds the variable it samples (its shadow's scope), so an
+  instance's sampling state is its own; only a package variable's shadow is
+  copied by a process of the top, which is never shared.
 - A top's own PreInit processes hold what is no child's: what Collect and
   Classify append (constant-table seeds, a function static a continuous driver
   reaches first) and what follows the walk (class statics, `$past` seeds). They

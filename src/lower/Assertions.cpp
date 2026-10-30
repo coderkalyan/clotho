@@ -1712,7 +1712,7 @@ void Lowerer::finalize_sva_history() {
 // expression is evaluated, so a capture is a plain copy with no operator in
 // it. One shadow per variable, shared by every assertion mentioning it --
 // including two assertions in different asserting scopes -- and copied by
-// the single Preponed process finalize_preponed emits.
+// the Preponed process of the scope that holds the variable (finalize_preponed).
 //
 // The shadow keeps the live signal's exact type -- full width, full 4-state.
 // Narrowing it to the one bit a boolean root needs would move operators into
@@ -1873,19 +1873,37 @@ void Lowerer::sva_sample_roots(const sva::Result& lowered) {
     }
 }
 
-// Emit the Preponed process (LRM 4.4.2.1: it runs before any body of the time
-// step, and is equivalent to sampling the previous Postponed region): the copy
+// Emit the Preponed processes (LRM 4.4.2.1: they run before any body of the time
+// step, and are equivalent to sampling the previous Postponed region): the copy
 // of every sampled variable, and the clear of every per-step latch. One process
-// for the whole top, like the PreInit pass -- the copies are independent
-// whole-signal stores, so their order carries no meaning and one dispatch per
-// step beats one per scope. A design with no concurrent assertion and no
-// clocking block registers neither, and so gets no process and no state at all.
+// per scope that holds such state, owned by that instance, so the copy sits with
+// the signals it reads and writes; state of no instance (a package variable's
+// shadow) goes to one process of the top. The copies are independent
+// whole-signal stores, so neither their order nor the processes' carries any
+// meaning. A design with no concurrent assertion and no clocking block registers
+// neither, and so gets no process and no state at all.
 void Lowerer::finalize_preponed() {
     if (sva_shadow_pairs_.empty() && preponed_clears_.empty()) {
         return;
     }
-    ir::Builder b(module_);
+    struct Body {
+        uint32_t                     scope;
+        std::unique_ptr<ir::Builder> b;
+    };
+    std::vector<Body>                              bodies;
+    ankerl::unordered_dense::map<uint32_t, size_t> at;
+    // The body of the scope that holds `owned`, in order of first appearance.
+    const auto body_of = [&](ir::Signal owned) -> ir::Builder& {
+        const auto     it    = signal_scope_.find(static_cast<uint32_t>(owned));
+        const uint32_t scope = it != signal_scope_.end() ? it->second : ir::Process::no_scope;
+        const auto [pos, fresh] = at.try_emplace(scope, bodies.size());
+        if (fresh) {
+            bodies.push_back(Body{ scope, std::make_unique<ir::Builder>(module_) });
+        }
+        return *bodies[pos->second].b;
+    };
     for (const auto& [live, shadow] : sva_shadow_pairs_) {
+        ir::Builder&        b   = body_of(shadow);
         const ir::SourceLoc l   = module_.signal(shadow).loc;
         const ir::Index     dst = b.signal(shadow, l);
         const ir::Index     val = b.unary(ir::Inst::Tag::Load, b.signal(live, l), l);
@@ -1895,12 +1913,15 @@ void Lowerer::finalize_preponed() {
     // 14.11's `##0`, and the maturation window of a drive): set in Observed,
     // and false again from the top of the next step, which is here.
     for (const ir::Signal sig : preponed_clears_) {
+        ir::Builder&        b    = body_of(sig);
         const ir::SourceLoc l    = module_.signal(sig).loc;
         const ir::Index     dst  = b.signal(sig, l);
         const ir::Index     zero = zero_mask(1, b, l);
         b.binary(ir::Inst::Tag::Store, dst, zero, l);
     }
-    add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
+    for (Body& body : bodies) {
+        add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = body.b->finish(), .scope = body.scope });
+    }
     sva_shadow_pairs_.clear();
     preponed_clears_.clear();
 }

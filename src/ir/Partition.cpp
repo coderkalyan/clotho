@@ -744,14 +744,25 @@ private:
     }
 
     // Place each child instance in its parent's process sequence where the
-    // flat module had its first process, so flatten emits the same order.
+    // flat module had its first process, so flatten emits the same order. A
+    // Preponed process places nothing: it is made after the whole walk, for
+    // whichever instance holds the state a distant assertion samples, and where it
+    // sits in the sequence carries no meaning -- but as an instance's first process
+    // it would move the instance, and every sibling after it, behind the parent's
+    // own processes.
     void place_children() {
         // Smallest flat process index anywhere in each unit's subtree. Children
         // follow their parent in unit numbering, so a reverse sweep sees every
         // child before its parent.
         std::vector<uint32_t> first(d_.units.size(), kNone);
         for (uint32_t u = static_cast<uint32_t>(d_.units.size()); u-- > 0;) {
-            uint32_t best = unit_procs_(u).empty() ? kNone : unit_procs_(u).front();
+            uint32_t best = kNone;
+            for (const uint32_t p : unit_procs_(u)) {
+                if (m_.processes()[p].activation != Activation::Preponed) {
+                    best = p;
+                    break;
+                }
+            }
             for (const ChildSlot& c : d_.units[u].children) {
                 best = std::min(best, first[static_cast<uint32_t>(c.unit)]);
             }
