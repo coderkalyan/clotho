@@ -1400,3 +1400,118 @@ TEST_CASE("a case label calling a function that reads its own return variable") 
         endmodule
     )") == "second\n");
 }
+
+// An automatic variable "is initialized on each entry to the call" (LRM 6.21), to
+// the default of Table 6-7: `'0` for a 2-state integral, `'x` for a 4-state one,
+// 0.0 for a real, "" for a string, an empty queue, null for a class handle. That
+// holds for the implicit return variable of an automatic function or class method,
+// an `output` argument of an automatic task (13.3.2: "initialized to the default
+// initialization value whenever execution enters their scope") and an automatic
+// local, of every type. An unpacked struct or array powered up its 2-state and
+// real members from whatever the stack held: the typed fill wrote only the
+// 4-state and managed leaves and left the rest to the zero a signal starts from,
+// which a frame does not. `dirty` fills the stack with a pattern between the calls
+// so a read of leftover memory cannot pass for a zero; the output was the same
+// under every pattern tried.
+TEST_CASE("aggregate and scalar locals of an automatic subroutine start at their default on every entry") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } st_t;
+            typedef struct { logic [3:0] l; bit [3:0] b; real r; string s; int q[$]; st_t in; } mix_t;
+            typedef int arr_t [3];
+            typedef logic [3:0] la_t [2];
+            typedef real ra_t [2];
+            typedef int q_t[$];
+            class C; int v; endclass
+            function automatic int dirty(int d);
+                int big [64];
+                for (int i = 0; i < 64; i++) big[i] = 32'hdeadbeef + d;
+                return big[d];
+            endfunction
+            function automatic st_t  f_st(int x); f_st.a = f_st.a + x; endfunction
+            function automatic arr_t f_ar(int x); f_ar[1] = f_ar[1] + x; endfunction
+            function automatic la_t  f_la(int x); f_la[0] = f_la[0] + 1; endfunction
+            function automatic ra_t  f_ra(int x); f_ra[0] = f_ra[0] + 1.5; endfunction
+            function automatic string f_s(string t); f_s = {f_s, t}; endfunction
+            function automatic q_t   f_q(int x); f_q.push_back(f_q.size()); endfunction
+            function automatic C     f_c(int x); if (f_c == null) f_c = new; f_c.v = x; endfunction
+            function automatic logic [7:0] f_p(int x); f_p[0] = 1; endfunction
+            function automatic bit [7:0]   f_b(int x); f_b[0] = 1; endfunction
+            function automatic mix_t f_mx(int x);
+                f_mx.b = f_mx.b + 1; f_mx.r = f_mx.r + 2.5; f_mx.s = {f_mx.s, "z"};
+                f_mx.q.push_back(f_mx.q.size()); f_mx.in.b = f_mx.in.b + 1;
+            endfunction
+            class K;
+                function st_t  m_st(int x); m_st.a = m_st.a + x; endfunction
+                function arr_t m_ar(int x); m_ar[1] = m_ar[1] + x; endfunction
+                function logic [7:0] m_p(int x); m_p[0] = 1; endfunction
+                static function st_t sm_st(int x); sm_st.a = sm_st.a + x; endfunction
+            endclass
+            task automatic t_out(output st_t o, output arr_t a, input int x);
+                o.b = o.b + x; a[2] = a[2] + x;
+            endtask
+            task automatic t_loc(int x);
+                st_t l; arr_t a; mix_t mx;
+                l.a = l.a + x; a[0] = a[0] + x; mx.b = mx.b + 1; mx.s = {mx.s, "t"};
+                $display("t_loc %0d %0d %0d %s", l.a, a[0], mx.b, mx.s);
+            endtask
+            initial begin
+                st_t s1, s2; arr_t a1, a2; la_t l1, l2; ra_t r1, r2; string t1, t2; q_t q1, q2; C c1, c2;
+                logic [7:0] p1, p2; bit [7:0] b1, b2; mix_t m1, m2; K k = new; int d;
+                d = dirty(0);
+                s1 = f_st(3); d = dirty(1); s2 = f_st(4);
+                $display("st %0d %0d", s1.a, s2.a);
+                a1 = f_ar(3); d = dirty(2); a2 = f_ar(4);
+                $display("ar %0d %0d %0d %0d", a1[0], a1[1], a2[0], a2[1]);
+                l1 = f_la(0); d = dirty(3); l2 = f_la(0);
+                $display("la %b %b %b %b", l1[0], l1[1], l2[0], l2[1]);
+                r1 = f_ra(0); d = dirty(4); r2 = f_ra(0);
+                $display("ra %0f %0f %0f %0f", r1[0], r1[1], r2[0], r2[1]);
+                t1 = f_s("a"); d = dirty(5); t2 = f_s("b");
+                $display("s [%s] [%s]", t1, t2);
+                q1 = f_q(0); d = dirty(6); q2 = f_q(0);
+                $display("q %0d %0d", q1.size(), q2.size());
+                c1 = f_c(1); d = dirty(7); c2 = f_c(2);
+                $display("c %0d %0d %b", c1.v, c2.v, c1 == c2);
+                p1 = f_p(0); d = dirty(8); p2 = f_p(0);
+                $display("p %b %b", p1, p2);
+                b1 = f_b(0); d = dirty(9); b2 = f_b(0);
+                $display("b %b %b", b1, b2);
+                m1 = f_mx(0); d = dirty(10); m2 = f_mx(0);
+                $display("mx %b %b %0f %0f [%s] [%s] %0d %0d %0d %0d", m1.b, m2.b, m1.r, m2.r, m1.s, m2.s,
+                         m1.q.size(), m2.q.size(), m1.in.b, m2.in.b);
+                s1 = k.m_st(3); d = dirty(11); s2 = k.m_st(4);
+                a1 = k.m_ar(3); d = dirty(12); a2 = k.m_ar(4);
+                p1 = k.m_p(0);  d = dirty(13); p2 = k.m_p(0);
+                $display("k %0d %0d | %0d %0d | %b %b", s1.a, s2.a, a1[1], a2[1], p1, p2);
+                s1 = K::sm_st(3); d = dirty(14); s2 = K::sm_st(4);
+                $display("ksm %0d %0d", s1.a, s2.a);
+                t_out(s1, a1, 3); d = dirty(15); t_out(s2, a2, 4);
+                $display("tout %0d %0d %0d %0d", s1.b, a1[2], s2.b, a2[2]);
+                t_loc(1); d = dirty(16); t_loc(2);
+                for (int i = 0; i < 2; i++) begin
+                    automatic st_t l; automatic arr_t a; automatic string s; automatic q_t q;
+                    d = dirty(20 + i);
+                    l.a = l.a + 5; a[0] = a[0] + 5; s = {s, "p"}; q.push_back(q.size());
+                    $display("loop %0d %0d %0d [%s] %0d", i, l.a, a[0], s, q.size());
+                end
+            end
+        endmodule
+    )") == "st 3 4\n"
+           "ar 0 3 0 4\n"
+           "la xxxx xxxx xxxx xxxx\n"
+           "ra 1.500000 0.000000 1.500000 0.000000\n"
+           "s [a] [b]\n"
+           "q 1 1\n"
+           "c 1 2 0\n"
+           "p xxxxxxx1 xxxxxxx1\n"
+           "b 00000001 00000001\n"
+           "mx 0001 0001 2.500000 2.500000 [z] [z] 1 1 1 1\n"
+           "k 3 4 | 3 4 | xxxxxxx1 xxxxxxx1\n"
+           "ksm 3 4\n"
+           "tout 3 3 4 4\n"
+           "t_loc 1 1 1 t\n"
+           "t_loc 2 2 1 t\n"
+           "loop 0 5 5 [p] 1\n"
+           "loop 1 5 5 [p] 1\n");
+}

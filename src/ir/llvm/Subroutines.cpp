@@ -1092,6 +1092,13 @@ void Backend::init_frame() {
         }
         llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
         if (s.is_agg) {
+            // Zero the whole slot first, then the typed fill below. emit_agg_init
+            // leaves a 2-state or real leaf alone because a signal's storage is a
+            // zeroinitializer global, but a frame is an alloca: without this a
+            // 2-state member powers up as whatever the stack held (LRM 6.21: an
+            // automatic variable is initialized on each entry; Table 6-7: 0).
+            const llvm::DataLayout& dl = env_->llmod.getDataLayout();
+            b_.CreateMemSet(slot, b_.getInt8(0), dl.getTypeAllocSize(s.storage_ty), dl.getABITypeAlign(s.storage_ty));
             // Recursive fill (X into 4-state leaves, init string leaves); an
             // input formal's slot is then overwritten by copy-in.
             std::vector<llvm::Value*> path;
