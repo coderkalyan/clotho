@@ -567,9 +567,9 @@ bool Lowerer::is_global_scope(const Scope* s) {
     return s != nullptr && enclosing_instance_scope(s) == nullptr;
 }
 
-// True for a subroutine declared directly in a package or `$unit` scope, or in
-// a class declared there: LRM 6.8's "no instance multiplicity" applies to these
-// exactly as it does to a variable.
+// True for a subroutine declared directly in a package or `$unit` scope, or in a
+// class declared there that is not specialized with a module's own type: its
+// static storage has no instance multiplicity (LRM 8.9, 6.21), as for a variable.
 bool Lowerer::is_global_subroutine(const SubroutineSymbol& sub) {
     return is_global_scope(sub.getParentScope());
 }

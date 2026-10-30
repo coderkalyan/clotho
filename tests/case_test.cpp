@@ -1552,7 +1552,8 @@ TEST_CASE("priority case on a real reports a no-match") {
 // <= 32), keyed a negative label on its sign-extended 64-bit value instead of its
 // bits, so `-1` never equalled the selector. Widths straddle that boundary
 // (31/32 use it, 33 and up fall back to the compare chain). Expectations are the
-// LRM text; Icarus Verilog 13 and Verilator 5.050 agree.
+// LRM text; Verilator 5.050 agrees on every form, Icarus Verilog 13 on all but
+// `case ... inside`, which it cannot parse.
 TEST_CASE("case on a negative 4-state signed value matches a signed label (LRM 12.5)") {
     constexpr int widths[] = { 2, 3, 8, 16, 31, 32, 33, 64, 65 };
     std::string   src;
@@ -1563,7 +1564,7 @@ TEST_CASE("case on a negative 4-state signed value matches a signed label (LRM 1
         src += std::format(R"(
         module m{0};
             logic signed [{0}-1:0] s;
-            bit c1, c2, c3, c4, c5, c6, c7, c8;
+            bit c1, c2, c3, c4, c5, c6, c7, c8, c9, c10;
             initial begin
                 #{1};
                 s = -1;
@@ -1573,16 +1574,18 @@ TEST_CASE("case on a negative 4-state signed value matches a signed label (LRM 1
                 unique case (s) 1, -1: c4 = 1; 2: c4 = 0; default: c4 = 0; endcase
                 casez (s) -1: c5 = 1; default: c5 = 0; endcase
                 casex (s) -1: c6 = 1; default: c6 = 0; endcase
+                unique0 case (s) 1: c9 = 0; -1: c9 = 1; default: c9 = 0; endcase
+                priority case (s) -1: c10 = 1; default: c10 = 0; endcase
                 s = 1;
                 case (s) 1: c7 = 1; default: c7 = 0; endcase
                 case (s) -1: c8 = 1; default: c8 = 0; endcase
-                $display("{0}: %b%b%b%b%b%b%b%b", c1, c2, c3, c4, c5, c6, c7, c8);
+                $display("{0}: %b%b%b%b%b%b%b%b%b%b", c1, c2, c3, c4, c5, c6, c7, c8, c9, c10);
             end
         endmodule
         )",
                            n,
                            t);
-        expected += std::format("{}: 11111110\n", n);
+        expected += std::format("{}: 1111111011\n", n);
     }
     src += "module top;\n";
     for (const int n : widths) {
@@ -1633,4 +1636,25 @@ TEST_CASE("case compares at the longest width, signed only if all operands are")
             end
         endmodule
     )") == "A match\nB NO\nC match\nD match\nE NO\nF match\nG match\nH match\nI match\nJ match\n");
+}
+
+// An unsized `'bx` / `'bz` label is extended with x / z to the width every case
+// expression is compared at (LRM 5.7.1, 12.5), so against a 64-bit selector it is
+// 64 x bits, not 32 x bits under 32 zeros. A plain case then needs an exact match
+// (x is not z), and casez / casex read the label's z / x as do-not-care. Icarus
+// Verilog 13 agrees.
+TEST_CASE("an unsized x or z case label takes the width of the selector") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [63:0] x64 = 64'bx, z64 = 64'bz, v = 64'h1234;
+            initial begin
+                case (x64) 'bx: $display("x match"); default: $display("x none"); endcase
+                case (z64) 'bx: $display("zx match"); default: $display("zx none"); endcase
+                case (z64) 'bz: $display("z match"); default: $display("z none"); endcase
+                case (v) 'bx: $display("v bx"); default: $display("v none"); endcase
+                casez (v) 'bz: $display("casez any"); default: $display("casez none"); endcase
+                casex (v) 'bx: $display("casex any"); default: $display("casex none"); endcase
+            end
+        endmodule
+    )") == "x match\nzx none\nz match\nv none\ncasez any\ncasex any\n");
 }

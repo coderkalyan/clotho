@@ -286,3 +286,20 @@ TEST_CASE("a cast to an enum sizes its operand by the enum's base type") {
     )") == "xxxxxxxxxx zzzzzzzzz3 xxxxxxxxxx\n"
            "7 4 1\n");
 }
+
+// A port connection is an assignment-like context (LRM 10.8), so an unsized x or z
+// literal connected to a port wider than 32 bits fills the port. Icarus Verilog 13
+// is not followed: it warns "Padding 68 high bits of the port" and zero-pads them.
+TEST_CASE("an unsized x or z literal connected to a wide port fills the port") {
+    CHECK(run_capture(R"(
+        module sub(input logic [99:0] in, output logic [99:0] o);
+            assign o = in;
+        endmodule
+        module m;
+            logic [99:0] o1, o2;
+            sub s1(.in('bx), .o(o1));
+            sub s2(.in('hz), .o(o2));
+            initial #1 $display("%h %h", o1, o2);
+        endmodule
+    )") == "xxxxxxxxxxxxxxxxxxxxxxxxx zzzzzzzzzzzzzzzzzzzzzzzzz\n");
+}
