@@ -428,9 +428,11 @@ private:
                 if (u.functions[h].import != kLocal) {
                     continue;
                 }
-                const Function& src  = u.functions[h].fn;
-                Function        copy = signature_of(src);
-                copy.ir              = src.ir.rebased(mapper);
+                const Function& src = u.functions[h].fn;
+                assert(src.scope == Process::no_scope && "a unit function carries no scope; flatten assigns it");
+                Function copy = signature_of(src);
+                copy.ir       = src.ir.rebased(mapper);
+                copy.scope    = fi.scope;
                 if (src.takes_iface_ctx) {
                     copy.ctx_member =
                       static_cast<Signal>(mapper.map(HandleFamily::Layout, static_cast<uint32_t>(src.ctx_member)));
@@ -653,6 +655,7 @@ Function signature_of(const Function& f) {
         .dpi_ret_ctype       = f.dpi_ret_ctype,
         .dpi_arg_elem_ctypes = f.dpi_arg_elem_ctypes,
         .span                = f.span,
+        .scope               = f.scope,
     };
 }
 

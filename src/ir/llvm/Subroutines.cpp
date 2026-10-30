@@ -75,7 +75,8 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
 
     // Per-member table setup, run before lowering anything of that member.
     const auto select_member = [&](uint32_t m) {
-        ir_            = &all[m].ir;
+        ir_             = &all[m].ir;
+        cur_proc_scope_ = all[m].scope;
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<Guarded>{});

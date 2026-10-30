@@ -669,6 +669,12 @@ struct Function {
     // Full source extent of the subroutine declaration. Empty for a
     // compiler-synthesized body (a $strobe/$monitor thunk, a fork child).
     SourceSpan span;
+    // InstanceScope::id of the instance whose definition declared this body, which is
+    // what Inst::Tag::InstPath names inside it; Process::no_scope for a body that
+    // belongs to no instance (package / `$unit` code). The frontend leaves it unset:
+    // a unit's functions are its instance's by position, and flatten, which makes
+    // one copy per instance, assigns it.
+    uint32_t scope = Process::no_scope;
     // The lowered body.
     Ir ir;
 

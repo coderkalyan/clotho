@@ -589,6 +589,7 @@ Ir Ir::rebased(HandleMapper& m) const {
             }
             case T::Constant:
             case T::EventNew:
+            case T::InstPath:
             case T::Arg:
             case T::Local:
             case T::EventTrigger:

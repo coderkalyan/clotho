@@ -2877,6 +2877,10 @@ private:
 
     void lower_string_constant(Index i, Ref ref);
 
+    void lower_inst_path(Index i);
+
+    uint32_t body_scope() const;
+
     void lower_string_concat(Index i);
 
     Plane lower_string_relation(Inst::Tag tag, Index l, Index r);
@@ -4395,6 +4399,10 @@ private:
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
     bool                    cur_is_task_ = false;
+    // The instance (InstanceScope::id) the process being lowered belongs to, as
+    // Process::scope says: what an InstPath inside it names. Set per member by
+    // lower_group; a function or task body names its own instead (body_scope).
+    uint32_t cur_proc_scope_ = Process::no_scope;
     // LLVM arg index of each of the current function/task's formals (see
     // param_indices) — string formals make the stride non-uniform.
     std::vector<uint32_t> param_llvm_index_;

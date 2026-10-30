@@ -137,6 +137,8 @@ const char* tag_name(Inst::Tag tag) {
             return "signal";
         case T::Local:
             return "local";
+        case T::InstPath:
+            return "inst_path";
         case T::BitSelect:
             return "bit_select";
         case T::PartSelect:

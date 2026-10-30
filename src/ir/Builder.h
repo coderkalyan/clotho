@@ -48,6 +48,9 @@ public:
     // A function-frame local slot (lvalue leaf); `index` selects the slot, `type`
     // gives its storage width / domain.
     Index local(uint32_t index, Ref type, SourceLoc loc);
+    // The hierarchical path of the instance the body belongs to, as a string value
+    // (Inst::Tag::InstPath).
+    Index inst_path(SourceLoc loc);
 
     // -- Named events (LRM 15.5) --
     // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.

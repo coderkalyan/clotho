@@ -180,6 +180,7 @@ bool Backend::produces_string_temp(Index i) {
         case Inst::Tag::StrLower:
         case Inst::Tag::StrSubstr:
         case Inst::Tag::StrFromPacked:
+        case Inst::Tag::InstPath:
         case Inst::Tag::Sformatf:
         case Inst::Tag::EnumName:
         case Inst::Tag::ContainerFmtP:
@@ -2178,6 +2179,10 @@ void Backend::lower_inst(Index i) {
             lower_sformatf(i);
             return;
 
+        case Inst::Tag::InstPath:
+            lower_inst_path(i);
+            return;
+
         case Inst::Tag::Ferror:
             lower_ferror(i);
             return;
@@ -2435,6 +2440,29 @@ void Backend::lower_string_constant(Index i, Ref ref) {
       llvm::StringRef(reinterpret_cast<const char*>(bytes.data()), bytes.size()), "str.lit");
     b_.CreateCall(str_assign_bytes_fn(), { str_of(i), glob, b_.getInt64(bytes.size()),
                                            alloc_site_global(loc_text(i), "string") });
+}
+
+// The scope whose instance an InstPath in the body being lowered names: a function
+// or task body's own, otherwise the process member's.
+uint32_t Backend::body_scope() const {
+    return cur_fn_ != nullptr ? cur_fn_->scope : cur_proc_scope_;
+}
+
+// An instance path: the flat module knows each instance's hierarchical name (the
+// anchor of its scope, which is how its state global is named), so for now the path
+// is a constant, copied into this instruction's string temp like a string literal.
+// Compiling units directly will read it from the instance's own record instead,
+// which is why the instruction exists at all.
+void Backend::lower_inst_path(Index i) {
+    const uint32_t scope = body_scope();
+    if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
+        anchor_of_scope_[scope] == SignalSlot::no_anchor) {
+        throw BackendError{ "internal: inst_path in a body that belongs to no instance" };
+    }
+    const std::string& path = anchors_[anchor_of_scope_[scope]].name;
+    llvm::Value*       glob = b_.CreateGlobalString(path, "inst.path");
+    b_.CreateCall(str_assign_bytes_fn(),
+                  { str_of(i), glob, b_.getInt64(path.size()), alloc_site_global(loc_text(i), "string") });
 }
 
 // String concatenation: gather the part handles into a stack array and hand

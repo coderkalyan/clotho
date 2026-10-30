@@ -505,3 +505,51 @@ TEST_CASE("partition merges the identical instances of a specialization and no o
     auto flat = flatten(std::move(*d));
     CHECK(run_capture(*flat) == "4 4 9\n");
 }
+
+// Where an instance's name is written into a body, instances of one specialization
+// stop being identical, so the name is read instead (Inst::Tag::InstPath). The
+// path then has to come out as the path of the instance the process or function
+// was flattened into, for a unit shared by two instances like any other.
+TEST_CASE("inst_path names the instance its process or function is flattened into") {
+    auto        m    = std::make_unique<Module>();
+    InternPool& pool = m->pool;
+
+    Attribution         a{ .scope_specs = { 0, 1, 1 } };
+    InstanceScope       top{ .id = m->alloc_scope_id(), .name = "top", .def_name = "top" };
+    for (const char* name : { "u0", "u1" }) {
+        InstanceScope u{ .id = m->alloc_scope_id(), .name = name, .def_name = "leaf" };
+
+        const FunctionId who = m->reserve_function(pool.void_type);
+        Builder          fb(*m);
+        const FmtArg     fp{ fb.inst_path(kLoc) };
+        fb.display("fn %s", true, { &fp, 1 }, kLoc);
+        fb.ret_void(kLoc);
+        m->set_function(who, Function{ .name = "who", .return_type = pool.void_type, .ir = fb.finish() });
+        a.functions.push_back(Owner{ .kind = Owner::Kind::Scope, .index = u.id });
+        a.function_names.push_back("who");
+
+        Builder      b(*m);
+        const FmtArg p{ b.inst_path(kLoc) };
+        b.display("proc %s", true, { &p, 1 }, kLoc);
+        b.call(who, {}, kLoc);
+        m->add_process(Process{ .activation = Activation::Initial, .ir = b.finish(), .scope = u.id });
+        top.children.push_back(std::move(u));
+    }
+    m->add_top(std::move(top));
+
+    auto d = partition(*m, a);
+    // Glue, top, and ONE leaf for both instances: no path is baked into either body.
+    CHECK(d->units.size() == 3);
+
+    auto flat = flatten(std::move(*d));
+    // The two instances start at the same time, so only the set of lines is fixed.
+    std::vector<std::string> lines;
+    const std::string        out = run_capture(*flat);
+    for (size_t at = 0; at < out.size();) {
+        const size_t eol = out.find('\n', at);
+        lines.push_back(out.substr(at, eol - at));
+        at = eol + 1;
+    }
+    std::ranges::sort(lines);
+    CHECK(lines == std::vector<std::string>{ "fn top.u0", "fn top.u1", "proc top.u0", "proc top.u1" });
+}

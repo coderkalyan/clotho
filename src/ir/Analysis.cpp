@@ -235,6 +235,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::ClassIsA:
         case Inst::Tag::ClassImplements:
         case Inst::Tag::IfaceRef:
+        case Inst::Tag::InstPath:
         case Inst::Tag::IfaceSignal:
         case Inst::Tag::DynArrayNew:
         case Inst::Tag::DynArrayNewInit:
@@ -1210,6 +1211,9 @@ struct ValueSweep {
                     break;
                 case Inst::Tag::EventNew:
                     // A fresh event handle is a definite 2-state 64-bit word.
+                    break;
+                case Inst::Tag::InstPath:
+                    // A string: no x or z planes.
                     break;
                 case Inst::Tag::EventTriggerNbEvent:
                     // A statement: no value.

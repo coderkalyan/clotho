@@ -155,6 +155,8 @@ struct UnitSignal {
 
 // A unit's function table entry.
 struct UnitFunction {
+    // Function::scope is unused here, like Process::scope: a unit's functions
+    // belong to its instance, and flatten assigns the scope.
     Function fn;
     // The name other units import this function by: its declaration's path
     // relative to the unit ("C::new", "g[0].f"). Distinct from fn.name, which is

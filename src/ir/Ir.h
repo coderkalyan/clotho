@@ -1399,6 +1399,16 @@ struct Inst {
         // lifetime) rather than the persistent state buffer. Holds formals, the
         // return variable, and body-local declarations of a function.
         Local,
+        // The hierarchical path of the instance this body belongs to ("top.u1"), as
+        // a string value (payload: none). An instance's name and place in the tree
+        // are per-instance DATA, so a body reads them here instead of carrying them
+        // as text: its IR then stays the same in every instance of one
+        // specialization. The flat module resolves it from the body's own instance
+        // (Process::scope, Function::scope) when it is flattened for the backend;
+        // compiling units directly will read it from a per-instance record. A body
+        // that belongs to no instance (a package or `$unit` subroutine) never holds
+        // one.
+        InstPath,
 
         // -- Lvalue derivation --
         // Single-bit select base[index] (payload: binary).
@@ -2599,6 +2609,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Signal:
             return K::Signal;
         case T::EventNew:
+        case T::InstPath:
             return K::None;
         case T::Arg:
             return K::Arg;
