@@ -1685,6 +1685,10 @@ private:
         uint64_t elem_lo, elem_hi; // linearized unpacked-element ordinals
         uint32_t bit_lo, bit_hi;   // packed bit range within one element
         bool     operator==(const NetRegion&) const = default;
+        // Two regions share a bit iff their element bands and their bit ranges intersect.
+        bool overlaps(const NetRegion& o) const {
+            return elem_lo <= o.elem_hi && o.elem_lo <= elem_hi && bit_lo <= o.bit_hi && o.bit_lo <= bit_hi;
+        }
     };
 
     static constexpr NetRegion kWholeNet{ 0, UINT64_MAX, 0, UINT32_MAX };

@@ -680,3 +680,85 @@ TEST_CASE("two inout ports bound to one internal net connect the same parent net
     )");
     CHECK(out == "b=1 u.a=1\n");
 }
+
+// An output port the module reads is a coercion case only when its net has another
+// driver that can reach the same bits (docs/LRM_NOTES.md note 42). The instances of
+// a generate loop that each drive their own constant slice of one net are disjoint,
+// whatever form the slice takes: an element of a packed multi-dimensional net, an
+// element of an unpacked net array, or an indexed part select. BlackParrot's
+// bsg_wormhole_concentrator_in has this shape (`.data_o(fifo_data_lo[i])`).
+// Expected values from iverilog 13.
+TEST_CASE("generate instances driving disjoint slices of one net are not a port coercion") {
+    const std::string out = run_capture(R"(
+        module fifo #(parameter w = 4) (input [w-1:0] d, output [w-1:0] q);
+            assign q = d;
+            wire [w-1:0] r;
+            assign r = ~q;
+        endmodule
+        module top;
+            localparam n = 3;
+            reg [3:0] din0 = 4'h1, din1 = 4'h2, din2 = 4'h3;
+            wire [3:0] din [0:n-1];
+            assign din[0] = din0; assign din[1] = din1; assign din[2] = din2;
+            wire [n-1:0][3:0] lo;
+            wire [3:0] arr [0:n-1];
+            wire [n*4-1:0] v;
+            genvar i;
+            for (i = 0; i < n; i = i + 1) begin : g
+                fifo #(4) a (.d(din[i]), .q(lo[i]));
+                fifo #(4) b (.d(din[i]), .q(arr[i]));
+                fifo #(4) c (.d(din[i]), .q(v[i*4 +: 4]));
+            end
+            initial #1 $display("lo=%h,%h,%h arr=%h,%h,%h v=%h", lo[0], lo[1], lo[2], arr[0], arr[1], arr[2], v);
+        endmodule
+    )");
+    CHECK(out == "lo=1,2,3 arr=1,2,3 v=321\n");
+}
+
+// The slices that do overlap are still the coercion case: two instances on one
+// slice, overlapping part selects, and an assignment to the whole net. (A net's
+// continuous drivers cannot be indexed at run time, which slang rejects, so there is
+// no run-time slice to test; its region would be the whole net.)
+TEST_CASE("overlapping drivers of an output port's net are a port coercion") {
+    constexpr std::string_view msg  = "output port 'q' is read inside the module while its net has other drivers";
+    constexpr std::string_view fifo = R"(
+        module fifo (input [3:0] d, output [3:0] q);
+            assign q = d;
+            wire [3:0] r;
+            assign r = ~q;
+        endmodule
+    )";
+    SUBCASE("two instances on one slice") {
+        const LowerResult r = lower_text(std::string(fifo) + R"(
+            module top;
+                wire [1:0][3:0] lo;
+                fifo a (.d(4'h1), .q(lo[0]));
+                fifo b (.d(4'h2), .q(lo[0]));
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find(msg) != std::string::npos);
+    }
+    SUBCASE("overlapping part selects") {
+        const LowerResult r = lower_text(std::string(fifo) + R"(
+            module top;
+                wire [7:0] v;
+                fifo a (.d(4'h1), .q(v[3:0]));
+                assign v[4:2] = 3'b0;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find(msg) != std::string::npos);
+    }
+    SUBCASE("an assignment to the whole net") {
+        const LowerResult r = lower_text(std::string(fifo) + R"(
+            module top;
+                wire [1:0][3:0] lo;
+                fifo a (.d(4'h1), .q(lo[0]));
+                assign lo = 8'h0;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find(msg) != std::string::npos);
+    }
+}

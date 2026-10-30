@@ -111,8 +111,7 @@ void Lowerer::record_net_driver_region(const ValueSymbol& raw, const NetRegion& 
     auto&      regions  = net_driven_[net];
     bool       resolve  = has_pull;
     for (const NetRegion& p : regions) {
-        if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi && reg.bit_lo <= p.bit_hi &&
-            p.bit_lo <= reg.bit_hi) {
+        if (reg.overlaps(p)) {
             // Emit routes every driver of a resolved net to its own slot and
             // folds them through the net-kind's reducer (wire -> X on
             // conflict, wand/wor -> wired-AND/OR), then applies any pull.
