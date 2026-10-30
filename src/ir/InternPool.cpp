@@ -37,6 +37,12 @@ Ref InternPool::put(const Item& item) {
 }
 
 Ref InternPool::put_value(Ref type, std::span<const uint8_t> bytes) {
+    // Every producer of a plane-sized value must lay its planes out the way
+    // layout() does: a constant built at another stride is read back wrong by
+    // every consumer. A type with no pooled plane layout (string, handle
+    // aggregate) reports 0 bytes and takes any length.
+    assert((layout(type).byte_count == 0 || bytes.size() == layout(type).byte_count) &&
+           "pooled value size disagrees with its type's layout");
     // Probe by content before touching the store — a duplicate mutates nothing.
     const ItemView probe{ .is_type = false, .value_type = type, .value_bytes = bytes };
     if (auto it = set_.find(probe); it != set_.end()) {

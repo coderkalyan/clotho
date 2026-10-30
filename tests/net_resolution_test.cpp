@@ -338,6 +338,53 @@ TEST_CASE("a partial driver on a tri0 vector pulls the undriven bits") {
     CHECK(out == "0000\n0011\n");
 }
 
+// The Z background of a partial driver and the tri0/tri1 pull are pooled
+// 4-state constants, and a pooled constant's planes are `ir::plane_bytes(w)`
+// apart (1, 2, 4, 8 bytes, then whole 64-bit words), not `(w + 7) / 8`. The two
+// differ for w = 17..24, 33..56 and every w above 64 that is not a multiple of
+// 64, where a misplaced xz plane turned the high bits of the constant into a
+// definite 0 (or the pull value). Each net below has a Z or pull segment of such
+// a width. Oracle: iverilog 13 prints these lines for this source.
+TEST_CASE("Z and pull constants of every plane stride keep their z bits") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [31:0] w;
+          assign w      = 32'hffffffff;
+          assign w[20]  = 1'b0;          // only bit 20 conflicts: 1 vs 0
+          tri1 [19:0] p;                 // driverless: all pulled up
+          tri0 [39:0] q;                 // driverless: all pulled down
+          tri1 [23:0] c;
+          assign c[3:0] = 4'b0;          // [23:4] pulled up
+          wire [17:0] d;
+          assign d[0]   = 1'b1;
+          assign d[0]   = 1'b1;          // two drivers on bit 0, the rest z
+          wire [71:0] e;
+          assign e      = 72'bz;
+          assign e[40]  = 1'b1;          // z segments of 40 and 31 bits
+          wand [23:0] a;
+          assign a      = 24'hffffff;
+          assign a[3:0] = 4'h0;          // 1 & 0 in [3:0], 1 & z above
+          initial begin
+            #1;
+            $display("%b", w);
+            $display("%b", p);
+            $display("%b", q);
+            $display("%b", c);
+            $display("%b", d);
+            $display("%b", e);
+            $display("%h", a);
+          end
+        endmodule
+    )");
+    CHECK(out == "11111111111x11111111111111111111\n"
+                 "11111111111111111111\n"
+                 "0000000000000000000000000000000000000000\n"
+                 "111111111111111111110000\n"
+                 "zzzzzzzzzzzzzzzzz1\n"
+                 "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n"
+                 "fffff0\n");
+}
+
 // A gate primitive driving a multiply-driven net stages into a per-driver slot
 // and folds through the wire resolver, like a continuous assign (ivtest
 // many_drivers). A buf treats a z input as x (LRM Table 28-3), so an all-z input

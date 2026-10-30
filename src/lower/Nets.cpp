@@ -491,30 +491,22 @@ ir::Signal Lowerer::alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t 
     return slot;
 }
 
-// An all-Z constant of `width` bits (VPI planes: val = 0, xz = 1 for every
-// bit). Used as the resolution identity in the undriven bits of a partial
-// driver's slot value.
 // A definite (2-state, z-free) all-0 or all-1 constant of `width` bits, in the
 // 4-state plane encoding. Used to inject a tri0/tri1 pull as a synthetic
 // Pull-strength driver into the strength fold.
 ir::Ref Lowerer::def_constant_ref(uint32_t width, bool one) {
-    const uint32_t       pb = (width + 7) / 8;
-    std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // xz plane = 0 (no z/x)
+    slang::SVInt v(width, 0, /*isSigned=*/false);
     if (one) {
-        for (uint32_t bit = 0; bit < width; ++bit) {
-            bytes[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // val plane = 1
-        }
+        v.setAllOnes();
     }
-    return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false), bytes);
+    return svint_to_ref(v, make_int_type(width, /*is_four=*/true, /*is_signed=*/false));
 }
 
+// An all-Z constant of `width` bits. Used as the resolution identity in the
+// undriven bits of a partial driver's slot value.
 ir::Ref Lowerer::z_constant_ref(uint32_t width) {
-    const uint32_t       pb = (width + 7) / 8;
-    std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // val plane = 0
-    for (uint32_t bit = 0; bit < width; ++bit) {
-        bytes[pb + bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // xz plane = 1 (Z)
-    }
-    return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false), bytes);
+    return svint_to_ref(slang::SVInt::createFillZ(width, /*isSigned=*/false),
+                        make_int_type(width, /*is_four=*/true, /*is_signed=*/false));
 }
 
 // The full-width value one driver stages into its slot: for a whole-net
