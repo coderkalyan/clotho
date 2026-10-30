@@ -1859,7 +1859,7 @@ void Backend::lower_inst(Index i) {
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.unpack");
             b_.CreateCall(str_to_packed_fn(), { str_of(p.op_type.op), buf, b_.getInt32(to.width) });
             llvm::Value* v = b_.CreateAlignedLoad(int_ty(to.width), buf, llvm::Align(1));
-            set_value(i, two_val(v));
+            set_value(i, known_plane(v, to.four_state));
             return;
         }
         case Inst::Tag::StrAppendPacked: {

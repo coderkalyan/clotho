@@ -547,6 +547,29 @@ TEST_CASE("string casts pack and unpack characters per LRM 6.16") {
     CHECK(run_capture(src) == "2\n1 [A]\n00004142\n445\n");
 }
 
+// The cast's IR type is the vector's, so a 4-state vector gets a 4-state value (with
+// no x or z in it), not the 2-state encoding the bit and int casts above take.
+TEST_CASE("a string cast to a 4-state vector is a definite 4-state value") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            typedef logic [31:0] v32_t;
+            typedef logic [55:0] v56_t;
+            v32_t v;
+            v56_t w;
+            initial begin
+                s = "ABCD";
+                v = v32_t'(s);
+                $display("%h %0d", v, v === 32'h41424344);
+                s = "0123456";
+                w = v56_t'(s);
+                $display("%h %0d", w, w === 56'h30313233343536);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "41424344 1\n30313233343536 1\n");
+}
+
 TEST_CASE("strings pass to functions by value and return from them") {
     constexpr std::string_view src = R"(
         module m;
