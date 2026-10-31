@@ -2405,7 +2405,9 @@ TEST_CASE("gc: a fresh object stored into a promoted object survives a young col
     // region boundary rather than one per spent nursery.
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
-    CHECK(st.remembered > 0u);
+    // `remembered` is not asserted here: with a collection at every allocation the owner
+    // is found on the stack and re-logged by the collector before the store, so the
+    // barrier finds it logged. The young-only leg above is the barrier's own test.
 }
 
 // The same edge through a QUEUE property, which is the shape UVM has: a component
@@ -2475,7 +2477,7 @@ TEST_CASE("gc: a fresh object pushed into a queue property of a promoted object 
     CHECK(yg.remembered > 0u);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
-    CHECK(st.remembered > 0u);
+    // No `remembered` assertion under stress; see the first of these cases.
 }
 
 // And through an ASSOCIATIVE ARRAY property -- the config-DB shape, and the one
@@ -2558,7 +2560,7 @@ TEST_CASE("gc: a fresh object mapped into an assoc property of a promoted object
     CHECK(yg.remembered > 0u);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
-    CHECK(st.remembered > 0u);
+    // No `remembered` assertion under stress; see the first of these cases.
 }
 
 // The container shape where the value path proves nothing: an assoc PROPERTY whose
@@ -2641,7 +2643,7 @@ TEST_CASE("gc: an object held only as an assoc KEY inside a promoted object surv
     CHECK(yg.remembered > 0u);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
-    CHECK(st.remembered > 0u);
+    // No `remembered` assertion under stress; see the first of these cases.
 }
 
 // The generational case for the key TABLE rather than for its one-entry form: the
@@ -2740,7 +2742,7 @@ TEST_CASE("gc: a struct assoc KEY holding a handle inside a promoted object surv
     CHECK(yg.remembered > 0u);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
-    CHECK(st.remembered > 0u);
+    // No `remembered` assertion under stress; see the first of these cases.
 }
 
 // The store site that is not a store: `first(k)` WRITES the found key into `k`
@@ -2833,7 +2835,7 @@ TEST_CASE("gc: a key read back into a property of a promoted object survives") {
     CHECK(yg.remembered > 0u);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
-    CHECK(st.remembered > 0u);
+    // No `remembered` assertion under stress; see the first of these cases.
 }
 
 // The owner not being present at the store site at all. `ref Cell r[$]` bound to
@@ -3785,4 +3787,122 @@ TEST_CASE("gc: a plain nonblocking write after a delayed struct assignment fired
     check_both_cadences(src, "a=9 h.x=43\n");
     const rt_gc_stats st = run_stats(src, "a=9 h.x=43\n", cadence_stress);
     CHECK(st.collections > 0);
+}
+
+// -- Collection from inside an allocation, and the buffers objects own ----------
+//
+// Both memory-growth holes the design doc names (§6.1, §6.5). A design that allocates
+// in a loop that never suspends reaches no region boundary, and a design whose objects
+// own large strings is charged only for the objects.
+
+// A delay-free loop of 200,000 32-byte objects is 6.4 MB against a 32 KiB nursery.
+// Before allocation could collect, the whole run was one collection at the end and the
+// heap held every object. Now it collects from inside the loop, so the heap stays near
+// the budget times the emergency factor, one 4 MiB chunk here.
+TEST_CASE("gc: a delay-free allocation loop is collected from inside the loop") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; int a; int b; int c; int d; endclass
+            C keep;
+            initial begin
+                for (int i = 0; i < 200000; i++) keep = new;
+                $display("done");
+            end
+        endmodule
+    )";
+    const rt_gc_stats st = run_stats(src, "done\n", cadence_ordinary);
+    CHECK(st.emergency_collections > 10u);
+    CHECK(st.blocks_total <= 128u);
+}
+
+// What an emergency collection must find without a frame to look in: a list head held
+// only by a function's local, in a register or on the native stack, while thousands of
+// poisoned filler objects recycle every line the collector frees. A root the stack scan
+// missed reads back as 0x5A5A5A5A or faults.
+TEST_CASE("gc: a list held only by a function's locals survives collection inside the loop") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Node; int v; string tag; Node next; endclass
+            class Junk; int v; string tag; endclass
+            Junk sink;
+            function automatic int build_and_sum(int n);
+                Node head = null;
+                int  sum  = 0;
+                for (int i = 0; i < n; i++) begin
+                    Node x = new;
+                    x.v    = i;
+                    x.tag  = "node";
+                    x.next = head;
+                    head   = x;
+                    sink   = new;
+                    sink.v = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+                for (Node p = head; p != null; p = p.next) sum += p.v;
+                return sum;
+            endfunction
+            initial $display("%0d", build_and_sum(20000));
+        endmodule
+    )";
+    const std::string expected = "199990000\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+    CHECK(ss.owned_bytes == 0u);
+}
+
+// Dead objects that own megabyte strings. Each object costs the nursery budget 48
+// bytes, so before buffers were charged nothing ever ran out and every string stayed
+// until exit. The strings are 1 MiB each and the run is 64 of them, one per time step:
+// with the buffers charged, collections run and most are freed before the end.
+TEST_CASE("gc: dead objects owning large strings are collected by the budget") {
+    constexpr std::string_view src = R"(
+        module m;
+            class S;
+                string s;
+                function new();
+                    s = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                    repeat (14) s = {s, s};
+                endfunction
+            endclass
+            S o;
+            initial begin
+                for (int i = 0; i < 64; i++) begin
+                    o = new();
+                    #1;
+                end
+                $display("%0d", o.s.len());
+            end
+        endmodule
+    )";
+    const rt_gc_stats st = run_stats(src, "1048576\n", cadence_ordinary);
+    CHECK(st.collections > 4u);
+    CHECK(st.finalized > 32u);
+    CHECK(st.owned_bytes == 0u);
+}
+
+// The same, without a time step: the collection that frees the strings has to run from
+// inside the allocation, since nothing else is coming.
+TEST_CASE("gc: dead objects owning large strings are collected inside a delay-free loop") {
+    constexpr std::string_view src = R"(
+        module m;
+            class S;
+                string s;
+                function new();
+                    s = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                    repeat (14) s = {s, s};
+                endfunction
+            endclass
+            S o;
+            initial begin
+                for (int i = 0; i < 64; i++) o = new();
+                $display("%0d", o.s.len());
+            end
+        endmodule
+    )";
+    const rt_gc_stats st = run_stats(src, "1048576\n", cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    CHECK(st.finalized > 16u);
+    CHECK(st.owned_bytes == 0u);
 }

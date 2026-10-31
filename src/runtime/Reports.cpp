@@ -828,6 +828,8 @@ void* alloc_bytes(uint64_t size, const rt_alloc_site* site, uint64_t now, bool z
                     fmt::format("out of memory for this {}: the system refused {}",
                                 site_noun(site), bytes_text(size)));
     }
+    // The one place every string and container buffer is born (GcBuffers.h).
+    buffer_charge(size);
     return p;
 }
 

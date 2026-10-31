@@ -239,7 +239,7 @@ struct SimulationConfig {
     // Stop the simulation at this absolute simulation time, in femtoseconds
     // (`--stop-time`); unset runs until $finish or until no event remains.
     std::optional<uint64_t> stop_time_fs;
-    // Collect at every safepoint (`--gc-stress`). Not a performance mode: it
+    // Collect at every safepoint and at every allocation (`--gc-stress`). Not a performance mode: it
     // turns a latent missing root into a deterministic failure on the first
     // collection instead of a rare corruption much later, and it is the
     // differential partner for the ordinary cadence now that there is no
@@ -254,12 +254,12 @@ struct SimulationConfig {
     // (garbage-collection.md §6.1). 8 MiB is a starting point, to be replaced by
     // whatever the §11 measurements argue for, not a derived constant.
     uint64_t gc_nursery_bytes = 8ull << 20;
-    // Soft ceiling on the collected heap in bytes (`--gc-heap-max=<bytes>`);
-    // 0 = no ceiling, which is the default. Soft because a process may allocate
-    // without bound between suspensions and so reach no safepoint (the
-    // unsuspended-allocation hole, garbage-collection.md §6.1): crossing it is
-    // reported through the stats line, never a refused allocation, since the
-    // loop that crossed it is legal SV.
+    // Ceiling on the class heap in bytes (`--gc-heap-max=<bytes>`); 0 = no ceiling, which
+    // is the default. An allocation that would pass it first collects everything the
+    // design can no longer reach, and ends the run with a located fatal if the objects
+    // still do not fit (garbage-collection.md §6.1). The heap grows in 4 MiB chunks, so
+    // the ceiling is the largest whole number of them that fits, and at least one. It
+    // bounds the objects, not the strings and containers they own.
     uint64_t gc_heap_bytes_max = 0;
     // One full collection per N collections (`--gc-full-every=N`); 0 = let the
     // runtime decide from heap growth, which is the default. Only a full

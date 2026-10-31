@@ -812,14 +812,17 @@ void Backend::lower_inst(Index i) {
             // (gc_mutator_cur), and it stays a LOADED pointer rather than a
             // link-time constant address so that multi-threaded simulation stays
             // possible.
-            const Ref    class_ref = p.ref;
-            llvm::Value* body      = nullptr;
+            const Ref       class_ref = p.ref;
+            llvm::Value*    body      = nullptr;
+            // The statement, for the allocator's located fatal (--gc-heap-max, or the
+            // system refusing memory). Only the cold slow path reads it.
+            llvm::Constant* site = alloc_site_global(loc_text(i), "class object");
             if (gc_alloc_is_inline(class_ref)) {
-                body = emit_gc_alloc_fast(class_ref);
+                body = emit_gc_alloc_fast(class_ref, site);
             } else {
                 body = b_.CreateCall(gc_alloc_fn(),
                                      { gc_mutator_cur(), b_.getInt64(gc_object_bytes(class_ref)),
-                                       class_gc_map_global(class_ref) });
+                                       class_gc_map_global(class_ref), site });
             }
             emit_class_body_init(class_ref, body);
             // Install the descriptor pointer at the object header (field 0), so
@@ -854,13 +857,18 @@ void Backend::lower_inst(Index i) {
             // statics or frame locals" holds by construction (§7).
             //
             // The one exemption is the same fact the null check just used: a handle
-            // straight out of ClassNew names an object rt_gc_alloc zeroed a few
-            // instructions ago, whose GC word therefore has mark bits 0 and OLD
-            // clear (Gc.cpp:985). Only a collection sets OLD, and no safepoint can
-            // intervene inside a statement -- the sole poll site is the drain
-            // loop's quiescent edge (:11542) -- so the barrier's test provably
-            // cannot fire and the store needs none. This is exactly the "a `new` in
-            // the same statement" case, decided rather than assumed.
+            // straight out of ClassNew names an object the allocator returned a few
+            // instructions ago, whose GC word has mark bits 0 and OLD clear (Gc.cpp,
+            // alloc_object), so the barrier's test would not fire and the store needs none.
+            //
+            // That used to hold because nothing could collect between the `new` and the
+            // store. An allocation can now (design §6.1): a property initializer or a
+            // constructor argument in the same statement is itself a `new`, and may run an
+            // emergency collection with this object live. It still holds, for a different
+            // reason. The fresh handle is used after that allocation, so it is live across
+            // it, the collection finds it on the stack, promotes it, and
+            // relog_conservative_roots() puts it in the remembered set -- so the object is
+            // already logged when the store lands, which is all the barrier would have done.
             if (!fresh) {
                 lv.gc_owner = lv.base;
             }
@@ -1011,9 +1019,9 @@ void Backend::lower_inst(Index i) {
             // owner test already proves a handle can land here, and a `obj.h = null`
             // that logs its owner costs a scan, never a miss. Placed BEFORE the
             // store only because a guarded store may branch away; the
-            // remembered set is consulted at the next collection either way, and no
-            // safepoint can intervene (the sole poll site is the drain loop's
-            // quiescent edge, :11542).
+            // remembered set is consulted at the next collection either way, and
+            // nothing between the barrier and the store allocates, so no collection
+            // can run between them.
             emit_gc_barrier_for(lv);
             if (deferred) {
                 // Assoc elements are guarded out of sensitivity lists, so no wait

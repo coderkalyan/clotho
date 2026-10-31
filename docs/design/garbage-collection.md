@@ -636,15 +636,67 @@ is exceeded — a nursery budget in bytes plus a heap-size threshold, both
 benchmarked (§11), with `--gc-stress`
 collecting at every safepoint. No polls are emitted in generated code.
 
-**The unsuspended-allocation hole.** A process may allocate without bound between
-suspensions; `for (int i = 0; i < 1_000_000; i++) obj = new C();` is legal and
-reaches no region boundary. The allocator's block-acquisition path sets a request
-flag and continues; the heap grows to the next boundary. If a hard cap is crossed
-first, an **emergency collection** runs at the allocation site, with the sim
-thread's native stack (base recorded at `rt_sim_run` entry; current extent plus
-callee-saved registers captured with `setjmp`) scanned conservatively in addition
-to the registry, and everything it finds pinned. Failing loudly instead was
-rejected: the loop is legal SV.
+**The unsuspended-allocation hole, and its answer.** A process may allocate without
+bound between suspensions; `for (int i = 0; i < 1_000_000; i++) obj = new C();` is
+legal and reaches no region boundary. Crossing the budget raises the request flag,
+which a boundary would answer; when none comes, an **emergency collection** runs at
+the allocation slow path (`rt_gc_alloc_slow`, once per hole, so the inlined fast path
+is untouched) after `kEmergencyFactor` (4) budgets have been charged with no
+collection in between. It runs *before* the allocation, so no half-built object
+exists, and it is a young or full collection by the ordinary policy. Failing loudly
+was rejected: the loop is legal SV. `rt_sim_run` records the address of one of its
+locals as the stack base (`rt_gc_run_enter`); with none recorded -- static
+initialization, a test calling the allocator -- allocation never collects.
+
+**`--gc-heap-max` is enforced here.** When the heap would have to grow past the
+ceiling (in whole 4 MiB chunks, at least one), the allocation runs a full emergency
+collection, retries, and ends the run with a located fatal (the `new` statement, via
+the `rt_alloc_site` the backend now passes to `rt_gc_alloc*`) if the objects still do
+not fit. The ceiling counts the object heap only, not owned buffers (§6.5).
+
+**Why collecting inside an allocation is sound.** The collection runs with JIT frames
+live, so beyond the registered roots it scans the native stack and the callee-saved
+registers conservatively (`emergency_collect` spills them with `__builtin_unwind_init`
+into a frame above the one whose address starts the scan; the scan runs to the base
+`rt_sim_run` recorded). The argument:
+
+1. *Handles.* A value generated code uses after the allocation call is live across a
+   call, hence in a callee-saved register or a stack slot, hence found. Every word is
+   validated by `rt_gc_find_object` like a frame word, interior pointers included, and
+   pinned; the heap is non-moving, so a pin is retention and nothing else.
+2. *The barrier-exempt fresh object.* A store into a handle straight out of `new`
+   carries no barrier because the object is young. An emergency collection may now
+   intervene (a property initializer or constructor argument that is itself a `new`),
+   but the fresh handle is live across it, so it is found, promoted, and re-logged by
+   `relog_conservative_roots`: it is in the remembered set when the store lands, which
+   is all the barrier would have done. The same re-logging covers a `ref`/`out` callee
+   in a *function*, which the call-site barrier used to cover only because a function
+   could not suspend; function calls now register a `ref` into a class-owned container
+   exactly as task calls do.
+3. *Pointers into owned buffers.* A pointer into a malloc'd payload (a container
+   element computed before the allocation) cannot be resolved to its owner. A finalizer
+   run by an emergency collection therefore does not free a buffer that a word of the
+   stack lies in (`buffers_park`): it is parked and re-tested at the next collection.
+4. *Not a root:* a buffer pointer held only in a suspended frame is the existing task
+   case, unchanged.
+5. ASan: the scan loop is `no_sanitize("address")` since it must read redzones.
+
+`--gc-stress` extends to "every opportunity": with a stack base recorded, every
+allocation empties the hole so the next `new` takes the slow path and collects. That
+makes the existing stress runs a dense test of items 1-3.
+
+### 6.5 Buffers owned by objects
+
+A `string`, dynamic array, queue or associative array inside an object owns malloc'd
+memory the collector frees only by finalizing the object, yet the budget counted only
+the object. `GcBuffers.h` is the whole mechanism: `rt_alloc_checked` charges each
+buffer, every free site credits the size it allocated (so the count is exact: it is
+zero after a run that frees what it allocates, asserted in `gc_test`), and growth of
+the count by a budget since the last collection raises the request flag, by
+`kEmergencyFactor` budgets makes the next `new` take the slow path where the emergency
+collection runs. The kind policy applies its heap-growth rule to owned bytes too,
+otherwise a young collection never frees an old dead object's strings. An associative
+array's key strings and hash buckets use `std::allocator` and are not counted.
 
 ### 6.2 Under MT: a rendezvous the scheduler already needs
 

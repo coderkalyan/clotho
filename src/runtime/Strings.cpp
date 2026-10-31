@@ -36,7 +36,7 @@ void str_reserve(rt_string* s, uint64_t n, const rt_alloc_site* site) {
     char*          buf = static_cast<char*>(rt_alloc_checked(cap + 1, site, rt_diag_now()));
     std::memcpy(buf, h.ptr, h.len);
     buf[h.len] = 0;
-    std::free(h.ptr);
+    buffer_free(h.ptr, h.cap + 1);
     str_set_heap(s, StrHeap{ buf, h.len, cap });
 }
 
@@ -65,16 +65,21 @@ char str_ascii_upper(char c) {
 // Scratch buffer for building concat/repl results before the alias-safe final
 // assign: stack storage for small results, heap beyond.
 struct StrScratch {
-    char  stack[256];
-    char* buf;
+    char     stack[256];
+    char*    buf;
+    uint64_t heap_bytes = 0;
 
     explicit StrScratch(uint64_t n, const rt_alloc_site* site) {
-        buf = n <= sizeof(stack) ? stack
-                                 : static_cast<char*>(rt_alloc_checked(n, site, rt_diag_now()));
+        if (n <= sizeof(stack)) {
+            buf = stack;
+            return;
+        }
+        buf        = static_cast<char*>(rt_alloc_checked(n, site, rt_diag_now()));
+        heap_bytes = n;
     }
     ~StrScratch() {
         if (buf != stack) {
-            std::free(buf);
+            buffer_free(buf, heap_bytes);
         }
     }
     StrScratch(const StrScratch&)            = delete;
@@ -90,7 +95,8 @@ extern "C" void rt_string_init(rt_string* s) {
 
 extern "C" void rt_string_deinit(rt_string* s) {
     if (str_is_heap(s)) {
-        std::free(str_heap(s).ptr);
+        const StrHeap h = str_heap(s);
+        buffer_free(h.ptr, h.cap + 1);
     }
     s->storage[0]  = 0;
     s->storage[31] = str_inline_cap;

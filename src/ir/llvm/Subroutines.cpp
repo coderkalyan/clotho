@@ -2021,6 +2021,10 @@ void Backend::lower_call_common(Index               i,
     // its wait queue must be serviced with the call's net old -> new transition.
     // Snapshot each before the (atomic, zero-time) function call; service after.
     std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
+    // Outer containers registered as roots for this call, as lower_task_call_inst does for a
+    // task: a function can now allocate -- and so collect -- between the barrier below and
+    // the callee's store (design §6.1), exactly the window a task's suspension always opened.
+    std::vector<llvm::Value*> ref_containers;
     size_t k = 0;
     for (Index a : ir_->region(arg_slice)) {
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
@@ -2037,12 +2041,20 @@ void Backend::lower_call_common(Index               i,
             // frame_may_hold_gc_ref's door 3 and design §8's prerequisite 2 are
             // about. So the barrier goes HERE, at the one place the owner is known.
             //
-            // Airtight for a function: a function cannot suspend and the only
-            // safepoint is the drain loop's quiescent edge (:11542), so no collection
-            // can consume the remembered-set entry between this barrier and the
-            // callee's store. lower_task_call_inst has the same barrier for the same
-            // reason, where that argument is weaker -- see the note there.
+            // A function cannot suspend, but it can allocate, and an allocation that has
+            // outrun its budget collects (design §6.1), so a collection can consume the
+            // remembered-set entry between this barrier and the callee's store, as it can
+            // across a task's suspension. What closes that is the same thing: the callee
+            // needs the actual after the allocation, so it holds it -- an interior pointer
+            // into the object, or the container epoch pointer that is -- the collection
+            // finds it on the stack and re-logs the owner (relog_conservative_roots). See
+            // lower_task_call_inst for the full argument.
             emit_gc_barrier_for(lv);
+            // And the payload-interior case the stack cannot resolve, registered exactly
+            // as for a task.
+            if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
+                ref_containers.push_back(root);
+            }
             const RefBinding rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             push_ref_epochs(argv, rb, ref_epoch_depth(f, k));
@@ -2124,6 +2136,9 @@ void Backend::lower_call_common(Index               i,
         }
         argv.push_back(tmp);
         b_.CreateCall(fnty, callee, argv);
+        for (llvm::Value* root : ref_containers) {
+            b_.CreateCall(gc_container_remove_fn(), { root });
+        }
         LValue lv{};
         lv.base    = tmp;
         lv.root_ty = st;
@@ -2136,6 +2151,9 @@ void Backend::lower_call_common(Index               i,
         // trailing out-param); str_of(i) was pre-set by build_str_temps.
         argv.push_back(str_of(i));
         b_.CreateCall(fnty, callee, argv);
+        for (llvm::Value* root : ref_containers) {
+            b_.CreateCall(gc_container_remove_fn(), { root });
+        }
         for (auto& [lv, snap] : ref_svc) {
             service_after_write(lv, snap);
         }
@@ -2153,12 +2171,18 @@ void Backend::lower_call_common(Index               i,
         set_lvalue(i, lv);
         argv.push_back(temp);
         b_.CreateCall(fnty, callee, argv);
+        for (llvm::Value* root : ref_containers) {
+            b_.CreateCall(gc_container_remove_fn(), { root });
+        }
         for (auto& [lv2, snap] : ref_svc) {
             service_after_write(lv2, snap);
         }
         return;
     }
     llvm::Value* r = b_.CreateCall(fnty, callee, argv);
+    for (llvm::Value* root : ref_containers) {
+        b_.CreateCall(gc_container_remove_fn(), { root });
+    }
     for (auto& [lv, snap] : ref_svc) {
         service_after_write(lv, snap);
     }

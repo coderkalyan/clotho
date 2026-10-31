@@ -231,7 +231,7 @@ extern "C" void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops) {
             rt_elem_deinit(ops, data + i * ops->stride);
         }
     }
-    std::free(h->data);
+    buffer_free(h->data, h->len * ops->stride);
     h->data = nullptr;
     h->len  = 0;
     // Advanced, never zeroed, so an epoch is never reused within a run. new,
@@ -565,7 +565,7 @@ extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
             ops->destroy(q_elem(h, ops->stride, i));
         }
     }
-    std::free(h->base);
+    buffer_free(h->base, h->cap * ops->stride);
     h->base = nullptr;
     h->head = 0;
     h->len  = 0;
@@ -1069,7 +1069,7 @@ struct CheckedAlloc {
     T* allocate(std::size_t n) {
         return static_cast<T*>(rt_alloc_elems_checked(n, sizeof(T), g_assoc_site, rt_diag_now()));
     }
-    void deallocate(T* p, std::size_t /*n*/) noexcept { std::free(p); }
+    void deallocate(T* p, std::size_t n) noexcept { buffer_free(p, n * sizeof(T)); }
 
     template <class U>
     bool operator==(const CheckedAlloc<U>& /*other*/) const noexcept {
@@ -1137,7 +1137,7 @@ void assoc_free(AssocMap* m, const rt_elem_ops* ops) {
     // Matches assoc_new: the storage came from the checked allocator, so it is
     // destroyed by hand and returned to free() rather than to operator delete.
     m->~AssocMap();
-    std::free(m);
+    buffer_free(m, sizeof(AssocMap));
 }
 
 // Drop every entry but keep the map alive, so the pattern default survives.
