@@ -390,6 +390,9 @@ Milestones, in order; lower ones unblock higher ones:
   dynamic dimension, as in a queue of queues, is refused.
 - [ ] **Bounded queue `[$:N]` under whole assignment** — `qb = other` from a queue, dynamic array
   or fixed array keeps every source element instead of truncating to the bound.
+- [ ] **Dynamic-array, associative-array and string operations as linked bitcode (performance)**
+  (7.5, 7.8, 6.16) — only a queue's push, pop, insert, delete and range append are linked into
+  the design; the rest call the runtime through an interpreted element descriptor.
 - [ ] **`===` / `!==` over a container with a 4-state leaf** (11.4.5) — a 4-state integral, `real`
   or associative-array leaf is refused.
 - [ ] **Logical `==` / `!=` over an associative array with a 4-state value element** (11.4.5) —
