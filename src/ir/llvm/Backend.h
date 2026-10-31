@@ -2333,6 +2333,12 @@ private:
 
     llvm::StructType* null_site_ty();
     llvm::FunctionCallee null_handle_fn();
+    llvm::FunctionCallee encoding_violation_fn();
+
+    // Under CLOTHO_EXTRA_ASSERTS, check a 4-state value's invariants where it is
+    // stored, passed or returned (docs/design/kernel.md, Values); emits nothing
+    // otherwise. `at` locates the report.
+    void emit_encoding_check(Plane v, Index at);
 
     llvm::StructType* ref_site_ty();
     llvm::FunctionCallee ref_stale_fn();

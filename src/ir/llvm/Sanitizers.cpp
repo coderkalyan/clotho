@@ -301,6 +301,46 @@ void Backend::emit_null_handle_check(llvm::Value* handle, Index at, NullKind kin
     b_.SetInsertPoint(cont);
 }
 
+// The encoding's invariants for a 4-state value (docs/design/kernel.md, Values):
+// must & ~may == 0, and z only on unknown bits (z & ~(may & ~must) == 0). Bits
+// above the width need no check here: a value is an LLVM integer of exactly its
+// width, so there are none in SSA; the runtime decodes slots through shared helpers.
+//
+// Generated only when Clotho is built with CLOTHO_EXTRA_ASSERTS -- it costs two
+// compares per store -- and nothing is emitted otherwise. A violation is a Clotho
+// bug, reported with the location of the instruction that produced the store.
+void Backend::emit_encoding_check(Plane v, Index at) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (v.z == nullptr || v.fp != nullptr || v.mm == nullptr) {
+        return; // not a 4-state value
+    }
+    const uint32_t w       = v.mm->getType()->getIntegerBitWidth() / 2;
+    llvm::Value*   must    = must_of(v, true);
+    llvm::Value*   may     = may_of(v, true);
+    llvm::Value*   unknown = b_.CreateAnd(may, b_.CreateNot(must));
+    llvm::Value*   bad     = b_.CreateOr(b_.CreateAnd(must, b_.CreateNot(may)),
+                                         b_.CreateAnd(v.z, b_.CreateNot(unknown)));
+    auto*          fn      = b_.GetInsertBlock()->getParent();
+    auto*          fail    = llvm::BasicBlock::Create(ctx_, "encoding.bad", fn);
+    auto*          cont    = llvm::BasicBlock::Create(ctx_, "encoding.ok", fn);
+    auto*          br      = b_.CreateCondBr(b_.CreateICmpNE(bad, zero(w)), fail, cont);
+    br->setMetadata(llvm::LLVMContext::MD_prof,
+                    llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+    b_.SetInsertPoint(fail);
+    // rt_diag_now rather than the wheel: a function body has no wheel argument.
+    llvm::Value* now  = b_.CreateCall(rt_fn("rt_diag_now", b_.getInt64Ty(), {}), {});
+    auto*        call = b_.CreateCall(encoding_violation_fn(),
+                                      { null_site_global(loc_text(at), NullKind::Class), now });
+    call->addFnAttr(llvm::Attribute::NoReturn);
+    call->addFnAttr(llvm::Attribute::Cold);
+    b_.CreateUnreachable();
+    b_.SetInsertPoint(cont);
+#else
+    (void)v;
+    (void)at;
+#endif
+}
+
 // The zero word a `ref` through a STABLE place points its epoch at: a module
 // signal, a frame local, a fixed unpacked array element or a class property
 // never moves, so there is nothing to compare against.

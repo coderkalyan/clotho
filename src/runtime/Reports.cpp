@@ -401,6 +401,40 @@ extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
     std::exit(1);
 }
 
+// ---- A 4-state value that breaks the encoding's invariants ----
+
+extern "C" void rt_encoding_violation(const rt_null_site* site, uint64_t now) {
+    // Reached only from the check the backend plants under CLOTHO_EXTRA_ASSERTS
+    // (docs/design/kernel.md, Values). It is Clotho's own bug, not the design's:
+    // some operation produced a value with must & ~may != 0 or a z bit that is not
+    // an unknown bit. Fatal, like rt_null_handle, because the value is already
+    // stored or passed and nothing downstream can be trusted.
+    io_ensure_init();
+    std::fflush(stdout);
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    std::string           when;
+    append_finish_time(when, now);
+    fmt::print(stderr, label, "internal error:");
+    fmt::print(stderr, head, " a 4-state value violates the encoding invariants");
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body,
+               " at {}, must & ~may != 0 or z & ~(may & ~must) != 0; this is a bug in Clotho, "
+               "not in your design",
+               when);
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+    rt_vcd_close();
+    rt_finishing = 1;
+    std::exit(1);
+}
+
 // The design's epoch-to-name table, registered once before it runs.
 const rt_container_name* g_ref_names       = nullptr;
 uint64_t                 g_ref_names_count = 0;

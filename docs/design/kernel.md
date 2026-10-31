@@ -47,8 +47,12 @@ when it does.
   located error at the declaration or expression that introduces the width.
 - The constant pool keeps the frontend's encoding; the backend converts on read
   through one shared set of helpers.
-- The encoding's invariants are checked by assertions in debug builds at stores
-  and at call and runtime boundaries. **Not yet:** no checks.
+- The encoding's invariants (must & ~may == 0, z only on unknown bits) are checked
+  by assertions in debug builds (`CLOTHO_EXTRA_ASSERTS`) at stores to signals and
+  frames, call arguments and returns (`emit_encoding_check`); a violation is a
+  located internal error (`rt_encoding_violation`). Nothing is generated otherwise.
+  **Not yet:** NBA staging records and the values handed to runtime routines
+  are not checked, and no test can provoke a violation.
 - Reals are native floating point everywhere: SSA, storage, arguments and
   results. **Not yet:** stored and passed as integer bit patterns.
 - Handles (class, event, chandle, virtual interface) are a pointer plus a

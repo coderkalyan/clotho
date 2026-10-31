@@ -629,6 +629,7 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
+    emit_encoding_check(pl, cur_inst_);
     argv.push_back(pl.mm);
     if (four) {
         argv.push_back(pl.z);
@@ -1892,6 +1893,7 @@ void Backend::lower_ret(Index value) {
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
+    emit_encoding_check(pl, cur_inst_);
     if (!abi_four_state(cur_fn_->return_type)) {
         deinit_body_strings();
         b_.CreateRet(pl.mm);
