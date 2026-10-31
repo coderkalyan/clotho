@@ -1512,6 +1512,28 @@ TEST_CASE("instances of a unit that finishes run the same code") {
     CHECK(run_capture(src) == "hits=2\n");
 }
 
+// A declaration initializer's stores generate no event (LRM 6.8), and that is a
+// property of the process being lowered, not of whatever is lowered after it. A
+// comb chain through three instances fuses into one group whose members are
+// functions of their own, and it is lowered after the initializer of the other
+// top ahead of it: every member store has to wake its reader all the same.
+TEST_CASE("a fused group lowered after a declaration initializer still wakes its readers") {
+    constexpr std::string_view src = R"(
+        module early; logic q = 1; endmodule
+        module leaf(input logic [7:0] v, output logic [7:0] o); assign o = v; endmodule
+        module mid(input logic [7:0] v, output logic [7:0] o); leaf l(v, o); endmodule
+        module top;
+            logic [7:0] x;
+            wire  [7:0] y;
+            mid m(x, y);
+            initial begin x = 5; #1 $display("y=%0d", y); x = 7; #1 $display("y=%0d", y); end
+        endmodule
+    )";
+    const std::string expected = "y=5\ny=7\n";
+    CHECK(run_capture(src) == expected);
+    CHECK(run_capture(src, { .fuse = false }) == expected);
+}
+
 TEST_CASE("$time and $stime read the simulation clock") {
     // With no timescale the wheel tick count is the time-unit-scaled value, so
     // $time returns the raw clock and $stime mirrors it (truncated to 32 bits).
