@@ -618,6 +618,33 @@ TEST_CASE("cli: --stat=unit-code counts the functions emitted for the groups of 
     }
 }
 
+TEST_CASE("cli: --stat=unit-code shows the groups of twin instances that use events shared") {
+    // Each instance of leaf declares events, triggers them (`->`, `->>`), waits
+    // on them (`@e`, `always @(e)`) and takes event ports bound to different
+    // events of the parent: the unit's four groups (three processes and the
+    // instance's own PreInit) are one function each, run by both instances.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf(input event go, output event done);
+            event e, f;
+            int n = 0;
+            always @(e) n++;
+            initial forever begin @(f); n++; end
+            initial forever begin @(go); -> e; ->> f; #1 -> done; end
+        endmodule
+        module top;
+            event g0, g1, d0, d1;
+            leaf u0(g0, d0);
+            leaf u1(g1, d1);
+            initial begin #1 -> g0; #1 -> g1; end
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "4 groups of multi-instance units over 8 instances' groups, 4 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

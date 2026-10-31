@@ -326,6 +326,12 @@ of a fixed-trip array scan. Both are measurable and both are small; if the table
 base load shows up, it is loadable once per function into a register, since the
 table only ever grows and never moves the *slots* (see §9 note on reallocation).
 
+Under modular compilation (docs/design/modular-compilation.md, step 3c) a
+declared event of an instance is no longer an immediate: unit code is shared
+by the unit's instances, so the slot is the handle the variable's storage holds
+(the instance's own, or an event port's through its binding), and only an event
+of no instance (a package's) keeps the constant.
+
 Non-monomorphic events pay the full path: load the handle word, split
 `{slot, gen}`, bounds+generation check, deref. That is the price of
 `evq[i]`/`obj.e`/`ref event`, and it is paid only there.

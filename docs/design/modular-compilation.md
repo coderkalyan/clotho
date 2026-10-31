@@ -402,7 +402,8 @@ code go.
      whose entry (a dispatcher in root, or in the unit module for one row)
      owns the flag, runs the rows and re-arms. Each group is lowered once, from
      the first instance whose imports are alike (`code_key`: which bindings
-     alias, and the owner and position of what each names), and every other
+     alias, and the owner and position of what each names, except an event
+     port, which is only its declaration), and every other
      instance gets a row of that function with its own record, plus NBA blocks
      of its own signals; a coroutine ramp takes the record as its first argument
      too. `merge_twin_bodies`, `share_twin_groups` and
@@ -415,6 +416,23 @@ code go.
      stopped sharing. Comb fusion stays within one instance (combchain
      regresses; accepted until fusion across instances is revisited). Functions
      and tasks are still emitted once per instance, in root.
+
+     An event object is instance data reached through its variable: a declared
+     event powers on holding the handle of its own object (a slot of
+     `clotho.events`, numbered design-wide in signal order, handles being
+     design-wide), so code reads the slot from the variable's storage -- the
+     instance's own through its record, an event port's through its binding --
+     and indexes `clotho.events` with it, as it already did for an event that is
+     reassigned. A variable no store reaches (`event_mono_`) is the declared
+     object for the whole run, which is what lets waits link without reading the
+     handle a second time and unlink without recording the owner; the fact is
+     joined over a unit's instances, and over what each instance binds an event
+     port to, since the code is shared. The object's VCD index is a field of the
+     object and a trigger id of an event is its slot, so neither is code. Only
+     the dump of an event
+     that is reassigned names its declared object by number, and so keeps its
+     instance's own lowering. An event of no instance (a package's) is one
+     object for everyone and keeps its constant address.
 
      The taint list is a claim that the lowering of one instance is the lowering
      of all, and the frontend's equivalent (partition merging) compares, so the

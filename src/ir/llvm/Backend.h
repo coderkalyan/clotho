@@ -1988,6 +1988,10 @@ private:
     // the node must come off that object, not off whatever `a` names on resume.
     static constexpr uint32_t kNodeOwner  = 4;
 
+    // The slot of the object an event variable names, and the object of a
+    // monomorphic one (see Events.cpp).
+    llvm::Value* event_slot_value(Signal sig);
+
     llvm::Value* event_obj(Signal sig);
 
     llvm::Value* event_obj_of(llvm::Value* handle);

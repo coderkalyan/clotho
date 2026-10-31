@@ -639,6 +639,46 @@ TEST_CASE("an event port shares one object across the boundary") {
     }
 }
 
+// Two instances of one module each declare events, trigger them every way
+// (`->`, `->>`), wait on them (`@e`, `always @(e)`) and take event ports bound to
+// different events of their parent: each keeps its own objects, though the
+// module's code is compiled once (cli_test: --stat=unit-code).
+TEST_CASE("twin instances keep their own events") {
+    const std::string out = run_capture(R"(
+        module leaf(input event go, output event done);
+          event e, f;
+          int n = 0, m = 0, k = 0;
+          always @(e) n++;
+          initial forever begin @(f); m++; $display("f t=%0t trig=%0d m=%0d", $time, f.triggered, m); end
+          initial forever begin
+            @(go);
+            k++;
+            -> e;
+            ->> f;
+            #1 -> done;
+          end
+        endmodule
+        module top;
+          event g0, g1, d0, d1;
+          leaf u0(g0, d0);
+          leaf u1(g1, d1);
+          initial forever begin @(d0); $display("d0 t=%0t", $time); end
+          initial forever begin @(d1); $display("d1 t=%0t", $time); end
+          initial begin
+            #1 -> g0;
+            #2 -> g1;
+            #2 ->> g0;
+            #2 -> g0;
+            #3 -> g1;
+            #5 $display("u0 n=%0d m=%0d k=%0d u1 n=%0d m=%0d k=%0d", u0.n, u0.m, u0.k, u1.n, u1.m, u1.k);
+          end
+        endmodule
+    )");
+    CHECK(out == "f t=1 trig=1 m=1\nd0 t=2\nf t=3 trig=1 m=1\nd1 t=4\nf t=5 trig=1 m=2\nd0 t=6\n"
+                 "f t=7 trig=1 m=3\nd0 t=8\nf t=10 trig=1 m=2\nd1 t=11\n"
+                 "u0 n=3 m=3 k=3 u1 n=2 m=2 k=2\n");
+}
+
 // LRM 15.5.5's own example: pass a handle, and the callee triggers the caller's
 // event. Every direction works, because the handle is an ordinary scalar.
 TEST_CASE("an event passes as a subroutine argument") {

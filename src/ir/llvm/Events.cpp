@@ -464,20 +464,34 @@ llvm::StructType* Backend::event_node_ty() {
     return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, ptr });
 }
 
-// The object of a statically-declared event, as a folded constant GEP into
-// clotho.events. Slot 0 is the reserved null object, so a real event's slot is
-// always >= 1.
-//
-// A compile-time slot is only sound because a module definition that declares
-// an event is never body-shared by module dedup: the event signal registers as
-// an instance-specific hint (`extra-sig`), so each instance keeps its own
-// signal, its own slot, and its own object. The previous per-event named
-// globals relied on exactly the same property.
+// The slot of the object an event variable names, as an IR value. A declared
+// event powers on holding the handle of its own object (Aggregates.cpp), so the
+// handle read from the variable's storage -- the instance's own, or the one a
+// binding names (an event port) -- is the slot, and it stays the declared one
+// where the variable is monomorphic. Shared code thereby names no slot and no
+// event of the instance it was lowered for. Only an event of no instance (a
+// package's), one object for everyone, folds to a constant while monomorphic.
+llvm::Value* Backend::event_slot_value(Signal sig) {
+    const auto i = static_cast<uint32_t>(sig);
+    if (slots_[i].anchor == SignalSlot::no_anchor && event_is_mono(sig)) {
+        return b_.getInt32(event_slot_[i]);
+    }
+    return b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+}
+
+// The object of a monomorphic declared event: clotho.events at its slot. A
+// variable that is assigned names another object later, so what is wanted of
+// it (the dump watches the declared one) is the object it powered on with,
+// which only its instance's own lowering can name.
 llvm::Value* Backend::event_obj(Signal sig) {
-    taint("names an event object of its instance");
-    const auto slot = event_slot_[static_cast<uint32_t>(sig)];
-    return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_),
-                                { b_.getInt32(0), b_.getInt32(slot) });
+    llvm::Value* slot = nullptr;
+    if (event_is_mono(sig)) {
+        slot = event_slot_value(sig);
+    } else {
+        taint("names the declared object of a reassigned event of its instance");
+        slot = b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]);
+    }
+    return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_), { b_.getInt32(0), slot });
 }
 
 // The object a runtime event HANDLE names. The handle is { u32 slot, u32 gen }
@@ -601,6 +615,59 @@ void Backend::analyze_event_monomorphism() {
     }
     for (uint32_t i = 0; i < mod_.function_count(); ++i) {
         visit(mod_.function(static_cast<FunctionId>(i)).ir);
+    }
+    // The code of a unit is shared by its instances, so a variable it names is
+    // one object for the run only if it is in every instance: the declaration at
+    // one def-local position, and what each instance binds one import to, are
+    // monomorphic only when all of them are. Signals that must agree are joined,
+    // and a class is monomorphic when none of its members is stored to.
+    std::vector<uint32_t> up(event_slot_.size());
+    for (uint32_t s = 0; s < up.size(); ++s) {
+        up[s] = s;
+    }
+    const auto find = [&](uint32_t s) {
+        while (up[s] != s) {
+            up[s] = up[up[s]];
+            s     = up[s];
+        }
+        return s;
+    };
+    const auto join = [&](uint32_t a, uint32_t b) { up[find(a)] = find(b); };
+    std::map<std::tuple<llvm::StructType*, uint32_t, uint32_t>, uint32_t> owned;   // (type, unit, position)
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t>                      imported; // (unit, extern)
+    for (uint32_t s = 0; s < event_slot_.size(); ++s) {
+        if (event_slot_[s] == 0 || slots_[s].anchor == SignalSlot::no_anchor) {
+            continue;
+        }
+        const Anchor& a = anchors_[slots_[s].anchor];
+        const auto [it, fresh] = owned.try_emplace({ a.ty, a.unit, slots_[s].path.back() }, s);
+        if (!fresh) {
+            join(s, it->second);
+        }
+    }
+    for (const Anchor& a : anchors_) {
+        if (a.unit == InstanceScope::no_unit) {
+            continue;
+        }
+        for (uint32_t k = 0; k < a.externs.size(); ++k) {
+            const auto s = static_cast<uint32_t>(a.externs[k]);
+            if (event_slot_[s] == 0) {
+                continue;
+            }
+            const auto [it, fresh] = imported.try_emplace({ a.unit, k }, s);
+            if (!fresh) {
+                join(s, it->second);
+            }
+        }
+    }
+    std::vector<bool> stored(event_slot_.size(), false);
+    for (uint32_t s = 0; s < event_slot_.size(); ++s) {
+        if (!event_mono_[s]) {
+            stored[find(s)] = true;
+        }
+    }
+    for (uint32_t s = 0; s < event_slot_.size(); ++s) {
+        event_mono_[s] = !stored[find(s)];
     }
 }
 

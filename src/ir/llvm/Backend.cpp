@@ -328,15 +328,7 @@ llvm::Value* Backend::intra_id_value(Signal sig) {
 // executes), which is what emit_event_fire counts down.
 llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
     if (event_slot_[static_cast<uint32_t>(sig)] != 0) {
-        llvm::Value* slot = nullptr;
-        if (event_is_mono(sig)) {
-            // The slot is a design-wide number of this instance's event object.
-            // TODO: a record field at a def-local ordinal, like the NBA ids.
-            taint("an event's slot number");
-            slot = b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]);
-        } else {
-            slot = b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
-        }
+        llvm::Value* slot = event_slot_value(sig);
         return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
     }
     return id_value(sig, static_cast<IdFamily>(static_cast<uint32_t>(IdFamily::TrigPos) + edge),
@@ -356,7 +348,11 @@ void Backend::taint(const char* why) {
 // def-local position of the signal it names, whose layout the code addresses
 // the owner's record and wake buckets by. Bindings that name the same member of
 // the same owner (a child's port) agree in every instance; a port the parent
-// binds to a net of its own choosing (an inout, a driver slot) does not.
+// binds to a net of its own choosing (an inout, a driver slot) does not. An
+// event port is keyed by its declaration alone: the code reads the event's
+// object from the handle in its storage and addresses nothing of the owner's
+// record or buckets, so instances bound to different events of their parents
+// still share.
 std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
     const Anchor&         a = anchors_[anchor];
     std::vector<uint64_t> key;
@@ -364,6 +360,9 @@ std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
     for (uint32_t k = 0; k < a.externs.size(); ++k) {
         const SignalSlot& s = slot_of(a.externs[k]);
         key.push_back(a.bind_of.at(static_cast<uint32_t>(a.externs[k])));
+        if (mod_.signal(a.externs[k]).is_event) {
+            continue;
+        }
         key.push_back(s.anchor == SignalSlot::no_anchor
                         ? ~uint64_t{ 0 }
                         : reinterpret_cast<uintptr_t>(anchors_[s.anchor].ctx_ty));
