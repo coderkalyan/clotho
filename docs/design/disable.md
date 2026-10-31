@@ -239,7 +239,7 @@ close.
    The two are different shapes, and V2 wants the second: `defer.gen` is a flat
    per-group `i64` global with no anchor, whereas the per-instance anchored
    array is `build_sched_flags` (`:793-829`) — dense def-local ordinals,
-   per-anchor `clotho.inst.<hier>.sched` arrays, a root array for unowned
+   the wake pairs in each instance's record (`Anchor::ctx_sched_base`), a root array for unowned
    (package / `$unit`) processes, and a constant-GEP accessor `sched_flag_ptr`
    (`:832-838`) valid in any block. A `build_disable_epochs` /
    `disable_epoch_ptr` pair is a near-literal transcription of that with `i32`

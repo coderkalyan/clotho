@@ -20,11 +20,10 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
     // A group of an instance addresses everything of that instance through its
-    // record. A coroutine group's flag is its own slot in the instance's sched
-    // array -- the record's sched base plus the def-local ordinal, the same slot
-    // as &clotho.inst.<hier>.sched[ordinal] (materialize_group_ctx) -- while a
-    // thunk row touches no flag but the wake word it is handed. An unscoped
-    // group has no record and keeps the folded constant.
+    // record. A coroutine group's flag is its own wake word in the instance's
+    // record (ctx_sched_base plus the def-local ordinal, materialize_group_ctx)
+    // -- while a thunk row touches no flag but the wake word it is handed. An
+    // unscoped group has no record and keeps the folded constant.
     const uint32_t g_ = group_of_[proc_index];
     own_anchor_       = group_unit_anchor_[g_];
     own_ctx_          = nullptr;
@@ -275,9 +274,13 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     }
     wheel_ = fn_->getArg(1);
     wheel_->setName("wheel");
-    // The state pointer is the sole module memory the process touches; noalias
-    // lets the allocator rematerialize signal loads instead of spilling them.
-    fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+    // The state pointer is the sole module memory a root process touches; noalias
+    // lets the allocator rematerialize signal loads instead of spilling them. An
+    // instance's ramp reaches its wake word through the record, which wakers
+    // write through pointers of their own, so its record cannot claim it.
+    if (own_anchor_ == SignalSlot::no_anchor) {
+        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+    }
     awaiter_          = nullptr;
     record_           = nullptr;
     fork_record_      = nullptr;

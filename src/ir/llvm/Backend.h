@@ -933,6 +933,18 @@ enum class IdFamily : uint32_t { Arr, Agg, Handle, Str, Intra, TrigPos, TrigNeg,
 inline constexpr uint32_t kIdFamilies = 8;
 inline constexpr uint32_t no_id       = ~0u;
 
+// The fixed leading fields of an instance record (Anchor, "Instance context");
+// every field after them is addressed through its Anchor::ctx_*_base. The first
+// is the one a body reads least: a group's entry is handed the address of its
+// wake pair and reaches the record at a constant offset from it, so a field
+// at offset 0 would be a use of the record's own address, a value tier-0 code
+// generation computes once and spills where it folds every other access into
+// the pair-relative displacement.
+inline constexpr uint32_t kCtxFirstVcd = 0;
+inline constexpr uint32_t kCtxShadow   = 1;
+inline constexpr uint32_t kCtxState    = 2;
+inline constexpr uint32_t kCtxFixed    = 3;
+
 // One instance-scope occurrence: the addressing anchor for every signal the
 // scope declares. Each scope owns its own state global
 // (@clotho.inst.<hier>.state, own signals only — children own theirs), so a
@@ -953,13 +965,9 @@ struct Anchor {
     std::string name;
     // Lowest process index owned by this scope (~0 when it owns none).
     uint32_t first_proc = ~0u;
-    // This scope's own scheduled-flag array (@clotho.inst.<hier>.sched,
-    // [n_own x i32]) and its type; null when the scope owns no processes. An
-    // owned group's flag is `sched_gv + def-local dense ordinal` — a real
-    // symbol plus a def-content addend (relocatable), or ctx field 2 + the
-    // same ordinal in a shareable reused-definition body.
-    llvm::GlobalVariable* sched_gv = nullptr;
-    llvm::ArrayType*      sched_ty = nullptr;
+    // How many processes the scope owns; each has a wake pair in the record
+    // (ctx_sched_base), at its dense def-local ordinal.
+    uint32_t n_owned = 0;
     // This scope's NBA shadow: the per-def staging struct type (null when
     // the scope has no NBA shadow fields), its own global
     // (@clotho.inst.<hier>.shadow), and the opaque base-pointer global
@@ -981,10 +989,9 @@ struct Anchor {
     // twin instances load identical field constants. It is the record a thunk
     // group's function takes as its first parameter. Filled by main at startup.
     // Layout:
-    //   0             ptr  state base (the scope's storage)
+    //   0             i32  first_vcd
     //   1             ptr  shadow sub-struct base (null when no NBA shadows)
-    //   2             ptr  the scope's sched-flag array base (Anchor::sched_gv)
-    //   3             i32  first_vcd
+    //   2             ptr  state base (the scope's storage)
     //   ctx_blk_base  i32  first NBA block id, one per process the instance
     //                      owns, at its def-local process ordinal: a group's
     //                      field is its front process's
@@ -994,6 +1001,13 @@ struct Anchor {
     //   ctx_cap_base  i32  each static bucket's subscriber count, in the
     //                      instance's static-bucket order (wait_sta_ord_)
     //   ctx_trig_base i64  each static bucket's trigger bits, same order
+    //   ctx_sched_base [n x { i64, ptr }] one wake pair per owned process, at its
+    //                      def-local ordinal (a group's is its front process's):
+    //                      the wake word (the scheduled flag and the trigger
+    //                      bits) and the entry a thunk handle runs. A thunk
+    //                      group's handle is the address of its pair, so the
+    //                      entry is handed the pair and finds the record, and
+    //                      its own wake word, at constant offsets from it
     //   ctx_mmask_base i64 one per owned process, at its def-local ordinal: the
     //                      trigger bits of the process's own events, which its
     //                      member guard tests (0 unless it is a member of a
@@ -1020,6 +1034,7 @@ struct Anchor {
     uint32_t              ctx_wait_base = 0;
     uint32_t              ctx_cap_base  = 0;
     uint32_t              ctx_trig_base = 0;
+    uint32_t              ctx_sched_base = 0;
     uint32_t              ctx_mmask_base = 0;
     uint32_t              ctx_gmask_base = 0;
     // Def-local count of owned processes (sizes the blk fields), and the length
@@ -1250,7 +1265,18 @@ public:
 
     uint64_t member_mask(uint32_t g, size_t i) const;
 
+    // Constant pointer to a field of process k's wake pair: 0 the wake word
+    // (what sched_flag_ptr returns), 1 the entry its thunk handle runs.
+    llvm::Constant* sched_wake_ptr(uint32_t k, uint32_t member);
+
     llvm::Constant* sched_flag_ptr(uint32_t k);
+
+    // The `{ i64 wake word, ptr entry }` pair of one process.
+    llvm::StructType* wake_ty();
+
+    // Byte offset of the wake pair of owned process `ord` inside its instance's
+    // record: what a group's entry subtracts from the pair it is handed.
+    uint64_t wake_offset(const Anchor& a, uint32_t ord);
 
 private:
     // -- Cross-unit symbol references --
@@ -1744,6 +1770,9 @@ private:
     llvm::GlobalVariable* ensure_ctx(Anchor& a);
 
     llvm::Value* ctx_field(Anchor& a, uint32_t field, llvm::Type* ty);
+
+    // The address of a field of the instance record ctx_field reads.
+    llvm::Value* ctx_field_ptr(Anchor& a, uint32_t field);
 
     // The record of the instance a store to `s` lands in (see record_ptr).
     llvm::Value* record_ptr(const SignalSlot& s, llvm::Value* vif_ctx);
@@ -2281,6 +2310,8 @@ private:
     void build_sched_groups(const std::vector<uint32_t>& pos);
 
     std::vector<llvm::Function*> emit_sched_entries(const std::vector<llvm::Function*>& group_fns);
+
+    llvm::Function* emit_unit_entry(llvm::Function* row, uint32_t g0);
 
     void emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask);
 
@@ -4962,8 +4993,8 @@ private:
     // addresses everything absolutely (functions, tasks, commit code, startup).
     // own_ctx_ is the record itself when the body takes it as a parameter (a
     // member); null reads the instance's record global. own_ordinal_ is the
-    // def-local ordinal of the function's (front) process: its flag index in
-    // the instance's sched array (materialize_group_ctx) and its block-id field
+    // def-local ordinal of the function's (front) process: its flag's index
+    // among the record's flags (materialize_group_ctx) and its block-id field
     // in the record (block_register).
     uint32_t     own_anchor_  = SignalSlot::no_anchor;
     llvm::Value* own_ctx_     = nullptr;

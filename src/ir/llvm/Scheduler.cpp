@@ -913,15 +913,12 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         if (a.ctx_gv == nullptr) {
             continue;
         }
-        b_.CreateStore(sym(a.state_gv), ctx_ptr(a, 0));
+        b_.CreateStore(sym(a.state_gv), ctx_ptr(a, kCtxState));
         if (a.shadow_ty != nullptr) {
-            b_.CreateStore(sym(a.shadow_gv), ctx_ptr(a, 1));
-        }
-        if (a.sched_gv != nullptr) {
-            b_.CreateStore(sym(a.sched_gv), ctx_ptr(a, 2));
+            b_.CreateStore(sym(a.shadow_gv), ctx_ptr(a, kCtxShadow));
         }
         if (a.first_vcd >= 0) {
-            b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, 3));
+            b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, kCtxFirstVcd));
         }
         // The instance's name, which its code reads for `%m` and banners.
         b_.CreateStore(sym(inst_path_global(static_cast<uint32_t>(&a - anchors_.data()))), ctx_ptr(a, a.ctx_name_base));
@@ -960,7 +957,7 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
             }
             const auto si = static_cast<uint32_t>(sj);
             for (uint32_t f = 0; f < kIdFamilies; ++f) {
-                if (id_ord_[si][f] != no_id) {
+                if (id_ord_[si][f] != no_id && id_val_[si][f] != no_id) {
                     b_.CreateStore(b_.getInt32(id_val_[si][f]), ctx_ptr(a, a.ctx_id_base + id_ord_[si][f]));
                 }
             }
@@ -1014,6 +1011,14 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         for (size_t i = 0; i < groups_[g].size(); ++i) {
             b_.CreateStore(b_.getInt64(member_mask(g, i)),
                            ctx_ptr(a, a.ctx_mmask_base + proc_sched_ord_[groups_[g][i]]));
+        }
+    }
+    // The entry each thunk group's handle runs, beside its wake word: the handle
+    // is the address of the pair (the seed loop) and the drain calls what it
+    // finds there.
+    for (uint32_t g = 0; g < procs.size(); ++g) {
+        if (sched_[g].thunk) {
+            b_.CreateStore(sym(procs[g]), sched_wake_ptr(sched_[g].front, 1));
         }
     }
     // The trigger bits of a static bucket no record describes (a signal of no
@@ -1770,15 +1775,14 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         if (p.activation == Activation::Final) {
             continue; // deferred to emit_finals_run at end of simulation
         }
-        // A thunk group is not ramped (no frame): its "handle" is the thunk
-        // function pointer with the low bit set, so the drain calls it
-        // directly instead of resuming a coroutine. Function addresses are
-        // aligned, so bit 0 is a free tag; coro handles (rt_alloc) leave it
-        // clear. The tagged pointer flows through subscription / self_start
-        // push unchanged.
+        // A thunk group is not ramped (no frame): its "handle" is the address of
+        // its wake pair with the low bit set, so the drain calls the entry stored
+        // there directly instead of resuming a coroutine. Pairs are aligned, so
+        // bit 0 is a free tag; coro handles (rt_alloc) leave it clear. The tagged
+        // pointer flows through subscription / self_start push unchanged.
         llvm::Value* hdl = sched_[g].thunk
           ? b_.CreateIntToPtr(
-              b_.CreateOr(b_.CreatePtrToInt(sym(procs[g]), b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
+              b_.CreateOr(b_.CreatePtrToInt(sched_flag_ptr(k), b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
           : b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         hdls[g]          = hdl;
         if (p.activation == Activation::Always && !p.wait_events.empty()) {
@@ -1988,8 +1992,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateCondBr(b_.CreateTrunc(addr, b_.getInt1Ty()), thunk_bb, coro_bb);
 
         b_.SetInsertPoint(thunk_bb);
-        auto* fnp = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
-        b_.CreateCall(thunk_fnty, fnp, { state, wheel });
+        auto* wake  = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
+        auto* entry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), wake, 1));
+        b_.CreateCall(thunk_fnty, entry, { wake, wheel });
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(coro_bb);
@@ -2194,8 +2199,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             b_.CreateCondBr(b_.CreateTrunc(raddr, b_.getInt1Ty()), rthunk, rcoro);
 
             b_.SetInsertPoint(rthunk);
-            auto* rfnp = b_.CreateIntToPtr(b_.CreateAnd(raddr, ~static_cast<uint64_t>(1)), ptr_ty);
-            b_.CreateCall(thunk_fnty, rfnp, { state, wheel });
+            auto* rwake  = b_.CreateIntToPtr(b_.CreateAnd(raddr, ~static_cast<uint64_t>(1)), ptr_ty);
+            auto* rentry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), rwake, 1));
+            b_.CreateCall(thunk_fnty, rentry, { rwake, wheel });
             b_.CreateBr(rcont);
 
             b_.SetInsertPoint(rcoro);

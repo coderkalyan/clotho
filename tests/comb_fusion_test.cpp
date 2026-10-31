@@ -247,7 +247,7 @@ endmodule
     // No fused comb unit is emitted: a `.fN` symbol exists only for a group of
     // N > 1. Before the call edge reached `BodyFacts::calls` this design emitted
     // exactly one `.f2` (measured), so this is the assertion that flips.
-    CHECK(count_substr(emit(src), ".f2.thunk(ptr noalias %state") == 0);
+    CHECK(count_substr(emit(src), ".f2.entry(ptr %wake") == 0);
     CHECK(count_substr(emit(src, { .thunk = false }), ".f2(ptr %state") == 0);
 
     // And the loop still settles, identically under every lowering — excluding
@@ -322,6 +322,6 @@ TEST_CASE("an assign and always_comb cone still fuses, and starts after the init
             end
         endmodule
     )";
-    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
+    CHECK(count_substr(emit(src), ".f3.entry(ptr %wake") == 1);
     check_all_lowerings(src, "10 80 90 89\n");
 }

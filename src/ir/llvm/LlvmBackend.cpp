@@ -2,8 +2,12 @@
 
 #include "ir/llvm/Backend.h"
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/PassManager.h>
 
 #include "ir/Verify.h"
 #include "ir/llvm/RuntimeBitcode.h"
@@ -123,6 +127,58 @@ void clamp_unproven_align(llvm::Module& m) {
     }
 }
 
+// Tier-0 code generation (FastISel, the fast register allocator) folds an address
+// computation into the load or store that uses it only inside one basic block. An
+// address EarlyCSE computed once for several blocks is a value live across them:
+// the allocator spills it where it is made and reloads it in each block that uses
+// it, a store and a load a constant displacement on the base would have cost
+// nothing. A GEP with constant indices is free to compute where it is used, so
+// give each block that uses one its own copy and let the access fold it. The
+// base is then what each block reloads, once, however many fields it touches --
+// the whole difference between code addressed through an instance record
+// (everything one displacement off the record, which the entry of a group holds
+// in one argument) and code addressed through absolute symbols, which never
+// needed a register.
+struct RematAddressPass : llvm::PassInfoMixin<RematAddressPass> {
+    llvm::PreservedAnalyses run(llvm::Function& f, llvm::FunctionAnalysisManager& /*fam*/) {
+        llvm::SmallVector<llvm::GetElementPtrInst*, 32> geps;
+        for (llvm::BasicBlock& bb : f) {
+            for (llvm::Instruction& inst : bb) {
+                if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst); gep != nullptr && gep->hasAllConstantIndices()) {
+                    geps.push_back(gep);
+                }
+            }
+        }
+        bool changed = false;
+        for (llvm::GetElementPtrInst* gep : geps) {
+            // The uses outside the GEP's own block, a copy per block. A phi use is
+            // read on the edge, not in its block, and keeps the original.
+            llvm::SmallVector<llvm::Use*, 8> outside;
+            for (llvm::Use& use : gep->uses()) {
+                auto* user = llvm::cast<llvm::Instruction>(use.getUser());
+                if (user->getParent() != gep->getParent() && !llvm::isa<llvm::PHINode>(user)) {
+                    outside.push_back(&use);
+                }
+            }
+            llvm::SmallDenseMap<llvm::BasicBlock*, llvm::Instruction*, 4> copy;
+            for (llvm::Use* use : outside) {
+                llvm::BasicBlock* const bb = llvm::cast<llvm::Instruction>(use->getUser())->getParent();
+                llvm::Instruction*&     c  = copy[bb];
+                if (c == nullptr) {
+                    c = gep->clone();
+                    c->insertBefore(bb->getFirstInsertionPt());
+                }
+                use->set(c);
+                changed = true;
+            }
+            if (gep->use_empty()) {
+                gep->eraseFromParent();
+            }
+        }
+        return changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
+    }
+};
+
 } // namespace
 
 // Lower the coroutine intrinsics emitted for each process and clean up the
@@ -165,13 +221,17 @@ bool optimize_module(llvm::Module& m, bool o3) {
         // CoroCleanup) plus the loop/GVN/vectorizer stack tier 0 omits.
         mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     }
-    else if (auto err = pb.parsePassPipeline(mpm,
-                                        std::string("coro-early,"
-                                        "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
-                                        "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
-                                        "coro-cleanup") + (linked ? ",globaldce" : ""))) {
-        llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
-        return false;
+    else {
+        if (auto err = pb.parsePassPipeline(mpm,
+                                            std::string("coro-early,"
+                                            "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
+                                            "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
+                                            "coro-cleanup") + (linked ? ",globaldce" : ""))) {
+            llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
+            return false;
+        }
+        // Last, so nothing merges the copies again.
+        mpm.addPass(llvm::createModuleToFunctionPassAdaptor(RematAddressPass()));
     }
     mpm.run(m, mam);
     return true;

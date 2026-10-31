@@ -292,7 +292,11 @@ unit, which is also what the no-IR-rewriting rule asks
   that wait on the same events are the rows -- (unit function, instance
   record) pairs -- of one schedule group, run by one dispatcher, with no
   member-count caps. Merged cross-instance bodies can return in a flattening,
-  LTO-style `-O` mode without changing units.
+  LTO-style `-O` mode without changing units. A group of one row is run by its
+  unit's entry directly: the scheduler's handle for it is the address of the
+  process's wake pair inside the instance's record, and the entry, which is
+  handed that address, finds the record a constant below it, so no code of root
+  is per instance (see "The instance record").
 - Function and task signatures are uniform: the process-control and home
   parameters are always present and `ref` epoch handling never depends on
   callers, so no other unit's code changes a unit's signatures.
@@ -305,7 +309,9 @@ Every instance of a unit, a static unit's single instance included, has a
 record the unit's code receives as its first argument. It holds what differs
 between instances:
 
-- bases of the instance's state, NBA shadow and scheduling flags;
+- bases of the instance's state and NBA shadow, and one wake pair per process it
+  owns -- the wake word (the scheduled flag and the trigger bits it carries) and
+  the entry a thunk handle runs;
 - bases of its ids in design-wide spaces (VCD variables, NBA blocks and
   buffers, triggers, RNG seeds), so code adds a unit-local ordinal;
 - its hierarchical name (`%m`, banners, covergroup scope), held as a borrowed
@@ -551,23 +557,39 @@ code go.
   - **3e, root as link glue (partly landed).** Landed: one LLVM module per
     Design unit, named by the unit's key (`InstanceScope::unit_key`: the
     definition name, plus a body hash when several units share it) and holding
-    only that unit's code under unit-key symbols; instance storage, records, the
-    per-instance trampoline of a one-row schedule group (the entry itself is
-    unit code taking the record), dispatchers, the shared queues and the wheel's
-    trampolines are defined in root whichever unit asked first; a unit's
-    declarations of root globals carry no size. Gate (tests/modular_gate_test.cpp,
-    `ir::emit_llvm_modules`, `clotho build --emit llvm-units`): compiling a
-    design of several modules with several instances each, and a package,
-    twice with one definition's body edited changes that unit's module and no
-    other unit's; every unit module names no instance. Still open: NBA block
-    commit functions live in root (block ids are already record base plus
-    ordinal; the commit function would take a block descriptor and sit in the
-    writer's unit), the seed loop and record fills are root code rather than
-    tables built from the instance table, and flatten still copies bodies per
-    instance. What still makes a unit module depend on outside it: lowerings the
-    taint list keeps per instance (they name `clotho.inst.<hier>.*` globals),
-    `clotho.expect<monitor>` queue names, and the intern pool's type and class
-    numbers (step 5).
+    only that unit's code under unit-key symbols; instance storage, records,
+    dispatchers, the shared queues and the wheel's trampolines are defined in
+    root whichever unit asked first; the entry of a one-row schedule group is
+    unit code handed the address of its process's wake pair (a field of the
+    instance's record) and finding the record at a constant offset from it; a
+    unit's declarations of root globals carry no size. Gate
+    (tests/modular_gate_test.cpp, `ir::emit_llvm_modules`, `clotho build --emit
+    llvm-units`): compiling a design of several modules with several instances
+    each, and a package, twice with one definition's body edited changes that
+    unit's module and no other unit's; every unit module names no instance.
+    Still open: NBA block commit functions live in root (block ids are already
+    record base plus ordinal; the commit function would take a block descriptor
+    and sit in the writer's unit), the seed loop and record fills are root code
+    rather than tables built from the instance table, and flatten still copies
+    bodies per instance. What still makes a unit module depend on outside it:
+    lowerings the taint list keeps per instance (they name
+    `clotho.inst.<hier>.*` globals), `clotho.expect<monitor>` queue names, and
+    the intern pool's type and class numbers (step 5).
+
+    What the entry costs at tier 0. A root trampoline per instance (`lea
+    ctx,%rdi; jmp entry`) and an entry that spilled the record's addresses and
+    reloaded them per block made a thunk activation of `thunk_comb` 26
+    instructions where the absolute-addressing thunk is 19 (+6.3% of the run,
+    callgrind: the whole difference was in the 256 per-process thunks). Handing
+    the entry the wake pair removes the trampoline, putting the state base at a
+    fixed offset off the pair takes the record's own address out of every
+    access (the record leads with the fields a body reads least), and
+    RematAddressPass (backend, last in the tier-0 pipeline) gives each basic
+    block its own copy of a constant-index GEP so FastISel folds it into the
+    access instead of spilling the address across blocks. What is left over the
+    absolute form is the entry's incoming pointer, spilled and reloaded once
+    (21 instructions, +1.8% on thunk_comb); a record-relative body cannot be
+    cheaper at tier 0.
 4. **Summaries and the link step** replace the whole-design `analyze()`.
 5. **Caches and parallelism.** Per-unit intern pools (cross-unit types match by
    structure, nominal types by unit and name), content keys, an object cache,

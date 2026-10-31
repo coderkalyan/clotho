@@ -830,23 +830,29 @@ void Backend::emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask) {
 // The function the scheduler holds for each schedule group: the coroutine ramp
 // of a coroutine group, and for a thunk group the entry that runs its rows.
 //
-//   entry(state, wheel):
+//   entry(wake, wheel):
 //     [guarded group: the fail-safe on its trigger bits]
-//     row_1(record_1, wheel [, flag]) ... row_n(record_n, wheel [, flag])
-//     flag = 0                                  re-arm: ready to be woken
+//     row_1(record_1, wheel [, wake]) ... row_n(record_n, wheel [, wake])
+//     wake word = 0                             re-arm: ready to be woken
 //
-// The entry owns the group's scheduled flag, held across every row, so a store
-// of any row finds the group queued and cannot re-enqueue it; that is the
-// timeline a fused body has always had. A row is a group function taking its
-// instance's record, which addresses everything of its own instance through it.
+// A thunk group's handle is the address of its wake pair (the wake word, then
+// the entry: StateLayout.cpp, build_sched_flags), which the drain hands the entry
+// it finds beside it, so the entry owns the group's scheduled flag, held across
+// every row: a store of any row finds the group queued and cannot re-enqueue it;
+// that is the timeline a fused body has always had. A row is a group function
+// taking its instance's record, which addresses everything of its own instance
+// through it, and the wake word through the pointer it is passed.
 //
-// A group of one row is the unit's code: its entry takes the instance's record
-// like the row does (the flag and the fail-safe's mask are record fields) and
-// sits in the row's unit module, once per row function however many instances
-// run it, next to a body the inliner may fold into it. What is per instance is
-// a trampoline in root that hands the entry its record. Several rows span
-// units: the dispatcher is link glue in root, and its calls are the cost of
+// A group of one row is the unit's code: its entry sits in the row's unit
+// module, once per row function however many instances run it, next to a body
+// the inliner may fold into it, and finds its instance's record a constant
+// below the pair it is handed. No code of root is per instance. Several rows
+// span units: the dispatcher is link glue in root, and its calls are the cost of
 // having no code of one unit inline in another.
+//
+// No entry is noalias on its pair: wakers write the wake word through pointers
+// of their own. A row's `ctx` is noalias all the same, because the word reaches
+// the row as a parameter of its own and never through `ctx`.
 std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm::Function*>& group_fns) {
     auto*                        ptr_ty = llvm::PointerType::getUnqual(ctx_);
     auto*                        fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
@@ -862,73 +868,28 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
         const uint32_t g0  = sg.rows.front();
         const uint32_t ua  = group_unit_anchor_[g0];
         const bool     one = sg.rows.size() == 1;
-        size_t         procs = 0;
+        if (one && ua != SignalSlot::no_anchor) {
+            llvm::Function*& entry = unit_entry[group_fns[g0]];
+            if (entry == nullptr) {
+                entry = emit_unit_entry(group_fns[g0], g0);
+            }
+            fns[s] = entry;
+            continue;
+        }
+        size_t procs = 0;
         for (const uint32_t r : sg.rows) {
             procs += groups_[r].size();
         }
-        std::string name = one && ua != SignalSlot::no_anchor
-                             ? "clotho.inst." + anchors_[ua].name + ".p" + std::to_string(proc_sched_ord_[sg.front])
-                             : std::string(kRootSymbol) + ".p" + std::to_string(sg.front);
+        std::string name = std::string(kRootSymbol) + ".p" + std::to_string(sg.front);
         if (procs > 1) {
             name += ".f" + std::to_string(procs);
         }
-        if (one && ua != SignalSlot::no_anchor) {
-            Anchor&         a    = anchors_[ua];
-            llvm::Function* row  = group_fns[g0];
-            llvm::Function*& entry = unit_entry[row];
-            if (entry == nullptr) {
-                env_   = &unit_env(a);
-                entry  = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, row->getName() + ".entry",
-                                                env_->llmod);
-                fn_    = entry;
-                wheel_ = fn_->getArg(1);
-                wheel_->setName("wheel");
-                own_ctx_ = fn_->getArg(0);
-                own_ctx_->setName("ctx");
-                fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-                b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-                own_anchor_  = ua;
-                own_ordinal_ = proc_sched_ord_[groups_[g0].front()];
-                sched_ptr_   = nullptr;
-                materialize_group_ctx();
-                llvm::Value* const flag = sched_ptr_;
-                if (group_guarded_[g0]) {
-                    emit_trigger_failsafe(
-                      flag, ctx_field(a, a.ctx_gmask_base + proc_sched_ord_[groups_[g0].front()], b_.getInt64Ty()));
-                }
-                std::vector<llvm::Value*> args{ own_ctx_, wheel_ };
-                if (group_guarded_[g0]) {
-                    args.push_back(flag);
-                }
-                b_.CreateCall(row->getFunctionType(), row, args);
-                b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
-                b_.CreateRetVoid();
-                own_anchor_ = SignalSlot::no_anchor;
-                own_ctx_    = nullptr;
-                sched_ptr_  = nullptr;
-            }
-            // Root's part: the instance's record is the one thing the entry lacks.
-            env_ = root_env_.get();
-            fn_  = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
-            fn_->getArg(0)->setName("state");
-            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-            fn_->getArg(1)->setName("wheel");
-            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-            // A tail call: the tier-0 code generator would otherwise keep a frame
-            // and a return for what is one jump per activation.
-            auto* call = b_.CreateCall(fnty, sym(entry), { ensure_ctx(a), fn_->getArg(1) });
-            call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-            b_.CreateRetVoid();
-            fns[s] = fn_;
-            continue;
-        }
-        env_ = root_env_.get();
-        fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
-        state_ = fn_->getArg(0);
-        state_->setName("state");
+        env_   = root_env_.get();
+        fn_    = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
+        state_ = sym(state_global_);
+        fn_->getArg(0)->setName("wake");
         wheel_ = fn_->getArg(1);
         wheel_->setName("wheel");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
         own_anchor_ = SignalSlot::no_anchor;
         own_ctx_    = nullptr;
@@ -960,6 +921,46 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
     }
     env_ = root_env_.get();
     return fns;
+}
+
+// The entry of a group of one row, in the row's unit module: `entry(wake, wheel)`
+// for the instance whose record holds the pair `wake` points into. The record is
+// a constant below it, so the entry is the same code for every instance of the
+// unit and names none.
+llvm::Function* Backend::emit_unit_entry(llvm::Function* row, uint32_t g0) {
+    const uint32_t ua  = group_unit_anchor_[g0];
+    Anchor&        a   = anchors_[ua];
+    auto*          ptr = llvm::PointerType::getUnqual(ctx_);
+    auto*          fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+    env_   = &unit_env(a);
+    fn_    = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, row->getName() + ".entry", env_->llmod);
+    wheel_ = fn_->getArg(1);
+    wheel_->setName("wheel");
+    llvm::Value* const flag = fn_->getArg(0);
+    flag->setName("wake");
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+    own_anchor_  = ua;
+    own_ordinal_ = proc_sched_ord_[groups_[g0].front()];
+    own_ctx_     = b_.CreateInBoundsGEP(
+      b_.getInt8Ty(), flag, { b_.getInt64(static_cast<uint64_t>(-static_cast<int64_t>(wake_offset(a, own_ordinal_)))) },
+      "ctx");
+    sched_ptr_ = flag;
+    if (group_guarded_[g0]) {
+        emit_trigger_failsafe(flag, ctx_field(a, a.ctx_gmask_base + own_ordinal_, b_.getInt64Ty()));
+    }
+    std::vector<llvm::Value*> args{ own_ctx_, wheel_ };
+    if (group_guarded_[g0]) {
+        args.push_back(flag);
+    }
+    b_.CreateCall(row->getFunctionType(), row, args);
+    b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
+    b_.CreateRetVoid();
+    llvm::Function* const entry = fn_;
+    own_anchor_ = SignalSlot::no_anchor;
+    own_ctx_    = nullptr;
+    sched_ptr_  = nullptr;
+    env_        = root_env_.get();
+    return entry;
 }
 
 } // namespace clotho::ir::backend

@@ -229,15 +229,15 @@ TEST_CASE("alu emits verifiable llvm ir") {
 
     // One process per @<module>.p<index>: two combinational assigns + one
     // sequential always block. All three are suspension-free, so by default they
-    // lower to plain per-activation thunks — void, taking the state ptr plus the
-    // timing-wheel ptr, no coroutine. Under --no-thunk each is instead a
-    // switched-resume coroutine ramp returning the handle (CoroSplit then emits
-    // .resume/.destroy/.cleanup parts, which don't match "define ptr @alu.p").
-    CHECK(count_substr(ir, "define void @clotho.inst.alu.p") == 3);
-    // Definitions only: the root module's seed loop re-declares each thunk
-    // (split emission), and declarations print without argument names.
-    CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 3);
-    CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
+    // lower to plain per-activation thunks -- the entry of each process's schedule
+    // group, in the module of its unit: void, taking the address of the process's
+    // wake pair plus the timing-wheel ptr, no coroutine. Under --no-thunk each is
+    // instead a switched-resume coroutine ramp returning the handle (CoroSplit
+    // then emits .resume/.destroy/.cleanup parts, which don't match "define ptr
+    // @alu.p").
+    CHECK(count_substr(ir, "define dso_local void @alu.p") == 3);
+    // Definitions only: declarations print without argument names.
+    CHECK(count_substr(ir, ".entry(ptr %wake, ptr %wheel)") == 3);
     const std::string co = emit(kAlu, { .thunk = false });
     CHECK(count_substr(co, "define ptr @alu.") == 3);
     CHECK(co.find("(ptr %ctx, ptr %wheel)") != std::string::npos);
@@ -1289,7 +1289,7 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     const std::string raw = emit_raw(src);
     CHECK(raw.find("sta.head") != std::string::npos);
     CHECK(raw.find("dyn.head") != std::string::npos);
-    CHECK(count_substr(raw, ".thunk(ptr noalias %state") == 2);
+    CHECK(count_substr(raw, ".entry(ptr %wake") == 2);
     CHECK(raw.find("always.loop") == std::string::npos);
     CHECK(emit_raw(src, { .thunk = false }).find("always.loop") != std::string::npos);
 }
@@ -2150,13 +2150,15 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     // (cnt). The two clk input-port copies share the identical sensitivity
     // (@top clk) and fuse into one unit (`.f2`); the clocked always blocks watch
     // per-instance clk locals and stay separate. 6 processes emit as 5 distinct
-    // @top.p<N> units. All are suspension-free, so by default they are thunks
-    // (the fused pair is `.f2.thunk`); under --no-thunk they are coroutine ramps.
+    // @top.p<N> units. All are suspension-free, so by default they are thunks, the
+    // entries of their schedule groups, which sit in the module of their unit: the
+    // two counters' always blocks are one entry named by their unit, and the fused
+    // pair is `top.p0.f2.entry`; under --no-thunk they are coroutine ramps.
     // Definitions only (split emission re-declares cross-module symbols;
     // declarations and calls print without argument names).
-    CHECK(count_substr(ir, "define void @clotho.inst.top.") == 5);
-    CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 5);
-    CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
+    CHECK(count_substr(ir, "define dso_local void @top.") == 3);
+    CHECK(count_substr(ir, "define dso_local void @counter.") == 1);
+    CHECK(count_substr(ir, ".f2.entry(ptr %wake") == 1);
     const std::string co = emit(src, { .thunk = false });
     // The two counters run one ramp of their unit, named by it.
     CHECK(count_substr(co, "define ptr @top.") == 3);
@@ -2219,7 +2221,7 @@ TEST_CASE("a coroutine fusion group stays inside one instance") {
         )";
         const std::string ir = emit(src);
         CHECK(count_substr(ir, ".f4(ptr %state") == 0);
-        CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
+        CHECK(count_substr(ir, ".f2.thunk(ptr %wake") == 1);
         CHECK(run_capture(src) == "2 2\n");
     }
 }
@@ -2254,7 +2256,7 @@ TEST_CASE("members of a group spanning instances address their own instance") {
         endmodule
     )";
     const std::string expected = "leaf1 q=2\nleaf10 q=11\nleaf1 q=4\nleaf10 q=22\nn 2 2 v 2 20\n";
-    CHECK(count_substr(emit(src), ".f2.thunk(ptr noalias %state") == 1);
+    CHECK(count_substr(emit(src), ".f2.thunk(ptr %wake") == 1);
     CHECK(run_capture(src) == expected);
     CHECK(run_capture(src, { .fuse = false }) == expected);
     CHECK(run_capture(src, { .thunk = false }) == expected);
@@ -2285,7 +2287,7 @@ TEST_CASE("a group spanning instances dispatches whatever its size and layout") 
     CHECK(run_capture(src, { .split = false }) == out);
     for (const bool split : { true, false }) {
         const std::string ir = emit(src, { .split = split });
-        CHECK(count_substr(ir, ".f20.thunk(ptr noalias %state") == 1);
+        CHECK(count_substr(ir, ".f20.thunk(ptr %wake") == 1);
         // The twenty instances run one row function of their unit, each with its
         // own record.
         CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == 1);
@@ -5342,7 +5344,7 @@ TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
     CHECK(run_capture(src) == "211 112 121\n");
     // All three lower into one fused unit: a thunk by default (suspension-free),
     // a coroutine under --no-thunk.
-    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
+    CHECK(count_substr(emit(src), ".f3.entry(ptr %wake") == 1);
     CHECK(count_substr(emit(src, { .thunk = false }), ".f3(ptr %ctx") == 1);
 }
 
@@ -5364,10 +5366,10 @@ TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {
     )";
     // Exactly the two simple always blocks become thunks; the two non-elidable
     // always blocks and the initial stay coroutines.
-    CHECK(count_substr(emit(src), ".thunk(ptr noalias %state") == 2);
+    CHECK(count_substr(emit(src), ".entry(ptr %wake") == 2);
     // Under --no-thunk nothing elides, and there are strictly more coroutine
     // frames (the two simple procs are coroutines again).
-    CHECK(count_substr(emit(src, { .thunk = false }), ".thunk(") == 0);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".entry(") == 0);
     CHECK(count_substr(emit_raw(src), "call ptr @llvm.coro.begin")
           < count_substr(emit_raw(src, { .thunk = false }), "call ptr @llvm.coro.begin"));
     // Elision is behavior-preserving: the same design produces byte-identical

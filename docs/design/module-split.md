@@ -21,9 +21,8 @@ hash of the unit's body when several units share the name.
 - `M_unit`: the groups of the unit's instances, lowered once per family of
   instances that lower alike and run with the instance's record; the functions
   and tasks of the unit, once per family; the entry of a schedule group of one
-  row (it takes the record).
-- `M_root`: everything else -- instance storage, records, wait queues, the
-  trampoline each instance's one-row group hands the entry its record through,
+  row (it takes the address of its process's wake pair, a field of the record).
+- `M_root`: everything else -- instance storage, records, wait queues,
   dispatchers of schedule groups spanning instances, NBA block commit functions
   (not yet in the writer's unit), `clotho_main` / `sim_drain` / finals, the seed
   loop, DPI export thunks, package/`$unit` processes, and the lazily created

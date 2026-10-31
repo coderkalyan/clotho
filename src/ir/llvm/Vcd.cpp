@@ -145,10 +145,10 @@ llvm::Value* Backend::vcd_index_value(Signal sig, int32_t base) {
         Anchor&      a  = anchors_[s.anchor];
         llvm::Value* b0 = nullptr;
         if (def_relative_for(s)) {
-            b0 = ctx_field(a, 3, b_.getInt32Ty());
+            b0 = ctx_field(a, kCtxFirstVcd, b_.getInt32Ty());
         } else if (llvm::Value* rec = bound_record(s); rec != nullptr) {
             b0 = b_.CreateLoad(b_.getInt32Ty(),
-                               b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(3) }));
+                               b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(kCtxFirstVcd) }));
         }
         if (b0 != nullptr) {
             return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));

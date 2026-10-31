@@ -18,13 +18,14 @@ namespace clotho::ir::backend {
 // zero to re-arm -- so the queued/not-queued discipline is unchanged by the
 // trigger bits riding above it.
 //
-// Words live in one array per owning instance scope
-// (@clotho.inst.<hier>.sched, indexed by a dense def-local ordinal -- twin
-// instances lower identical ordinals) plus a root @clotho.proc_sched for
-// unowned (package / `$unit`) processes.
+// Words live in the record of the instance that owns the process (Anchor,
+// ctx_sched_base), at a dense def-local ordinal -- twin instances lower
+// identical ordinals -- plus a root @clotho.proc_sched for unowned (package /
+// `$unit`) processes. Each is the first field of a wake pair `{ word, entry }`:
+// the entry is what a thunk group's handle runs, and the handle is the address
+// of the pair, so the drain finds the code beside the word it was woken by.
 void Backend::build_sched_flags() {
     const auto procs = mod_.processes();
-    auto*      word  = llvm::Type::getInt64Ty(ctx_);
     proc_sched_anchor_.assign(std::max<size_t>(procs.size(), 1), ~0u);
     proc_sched_ord_.assign(std::max<size_t>(procs.size(), 1), 0);
     std::vector<uint32_t> owned(anchors_.size(), 0);
@@ -38,17 +39,9 @@ void Backend::build_sched_flags() {
         }
     }
     for (uint32_t a = 0; a < anchors_.size(); ++a) {
-        if (owned[a] == 0) {
-            continue;
-        }
-        Anchor& an  = anchors_[a];
-        an.sched_ty = llvm::ArrayType::get(word, owned[a]);
-        an.sched_gv = new llvm::GlobalVariable(env_->llmod, an.sched_ty, false,
-                                               llvm::GlobalValue::InternalLinkage,
-                                               llvm::ConstantAggregateZero::get(an.sched_ty),
-                                               "clotho.inst." + an.name + ".sched");
+        anchors_[a].n_owned = owned[a];
     }
-    sched_arr_ty_ = llvm::ArrayType::get(word, std::max<uint32_t>(n_root, 1));
+    sched_arr_ty_ = llvm::ArrayType::get(wake_ty(), std::max<uint32_t>(n_root, 1));
     sched_gv_     = new llvm::GlobalVariable(env_->llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                              llvm::ConstantAggregateZero::get(sched_arr_ty_), "clotho.proc_sched");
 }
@@ -60,11 +53,21 @@ uint32_t Backend::process_anchor(const Process& p) const {
                                                                               : SignalSlot::no_anchor;
 }
 
-// The LLVM type of a wake word. One place, because materialize_group_ctx
-// uses it as a GEP STRIDE: get it wrong there and a deduped instance
-// addresses another process's word.
+// The LLVM type of a wake word. One place, so a wake pair and every use of its
+// first field agree.
 llvm::IntegerType* Backend::sched_word_ty() {
     return llvm::Type::getInt64Ty(ctx_);
+}
+
+// A process's wake pair: its wake word and the entry its thunk handle runs.
+llvm::StructType* Backend::wake_ty() {
+    return llvm::StructType::get(ctx_, { sched_word_ty(), llvm::PointerType::getUnqual(ctx_) });
+}
+
+// Where the wake pair of owned process `ord` sits inside its instance's record.
+uint64_t Backend::wake_offset(const Anchor& a, uint32_t ord) {
+    const llvm::DataLayout& dl = root_env_->llmod.getDataLayout();
+    return dl.getStructLayout(a.ctx_ty)->getElementOffset(a.ctx_sched_base) + ord * dl.getTypeAllocSize(wake_ty());
 }
 
 // Bits a wake site sets when it cannot name the (signal, edge) it fired
@@ -83,13 +86,25 @@ uint64_t Backend::member_mask(uint32_t g, size_t i) const {
     return g < group_member_mask_.size() && i < group_member_mask_[g].size() ? group_member_mask_[g][i] : 0;
 }
 
-// Constant pointer to process k's scheduled flag in its owner's array.
-llvm::Constant* Backend::sched_flag_ptr(uint32_t k) {
-    const uint32_t aid  = proc_sched_anchor_[k];
-    auto*          base = aid != ~0u ? sym(anchors_[aid].sched_gv) : sym(sched_gv_);
-    auto*          ty   = aid != ~0u ? anchors_[aid].sched_ty : sched_arr_ty_;
+// Constant pointer to a field of process k's wake pair: in its owner's record,
+// or in the root array.
+llvm::Constant* Backend::sched_wake_ptr(uint32_t k, uint32_t member) {
+    const uint32_t aid = proc_sched_anchor_[k];
+    if (aid == SignalSlot::no_anchor) {
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(
+          sched_arr_ty_, sym(sched_gv_),
+          llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_sched_ord_[k]), b_.getInt32(member) });
+    }
+    Anchor& a = anchors_[aid];
     return llvm::ConstantExpr::getInBoundsGetElementPtr(
-      ty, base, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_sched_ord_[k]) });
+      a.ctx_ty, ensure_ctx(a),
+      llvm::ArrayRef<llvm::Constant*>{
+        b_.getInt32(0), b_.getInt32(a.ctx_sched_base), b_.getInt32(proc_sched_ord_[k]), b_.getInt32(member) });
+}
+
+// Constant pointer to process k's scheduled flag.
+llvm::Constant* Backend::sched_flag_ptr(uint32_t k) {
+    return sched_wake_ptr(k, 0);
 }
 
 // The `{ i(2W) must|may, iW z }` slot struct for a 4-state value of the given
@@ -645,7 +660,7 @@ llvm::Value* Backend::storage_ptr(const SignalSlot& s) {
         return b_.CreateInBoundsGEP(state_ty_, sym(state_global_), idx);
     }
     Anchor&      a    = anchors_[s.anchor];
-    llvm::Value* base = def_relative_for(s) ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+    llvm::Value* base = def_relative_for(s) ? ctx_field(a, kCtxState, llvm::PointerType::getUnqual(ctx_))
                                             : static_cast<llvm::Value*>(sym(a.state_gv));
     for (const uint32_t f : s.path) {
         idx.push_back(b_.getInt32(f));
@@ -667,7 +682,7 @@ llvm::Value* Backend::vif_head_ptr(Signal sig, uint32_t edge) {
     Anchor&      a    = anchors_[s.anchor];
     // Exactly storage_ptr's base rule: an instance's own group loads its
     // instance base rather than bake the instance's symbol.
-    llvm::Value* base = def_relative_for(s) ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+    llvm::Value* base = def_relative_for(s) ? ctx_field(a, kCtxState, llvm::PointerType::getUnqual(ctx_))
                                             : static_cast<llvm::Value*>(sym(a.state_gv));
     return b_.CreateInBoundsGEP(a.ty, base,
                                 { b_.getInt32(0), b_.getInt32(a.vif_head_base + ord) });
@@ -715,7 +730,7 @@ llvm::Value* Backend::shadow_ptr(const SignalSlot& owner, uint32_t field) {
         // An NBA target's anchor always carries a shadow struct (the
         // fields were assigned per anchor in build_state_types).
         Anchor&      a    = anchors_[owner.anchor];
-        llvm::Value* base = def_relative_for(owner) ? ctx_field(a, 1, ptr) : b_.CreateLoad(ptr, anchor_shadow_base(a));
+        llvm::Value* base = def_relative_for(owner) ? ctx_field(a, kCtxShadow, ptr) : b_.CreateLoad(ptr, anchor_shadow_base(a));
         return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
     }
     llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
@@ -802,14 +817,13 @@ llvm::GlobalVariable* Backend::ensure_ctx(Anchor& a) {
     return sym(a.ctx_gv);
 }
 
-// A def-relative load of one instance-record field. The record is the one
-// body being emitted was handed (own_ctx_: a member function's first
-// parameter) or, for a single-scope group, the instance's record global.
-// `ctx_override_` redirects it to an instance chosen at run time -- a virtual
-// interface access, whose whole point is that the def-local field constants
-// stay while the record they are read from is whichever instance the handle
-// names (LRM 25.9).
-llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
+// The address of one instance-record field. The record is the one the body being
+// emitted was handed (own_ctx_: a member function's first parameter) or, for a
+// single-scope group, the instance's record global. `ctx_override_` redirects it
+// to an instance chosen at run time -- a virtual interface access, whose whole
+// point is that the def-local field constants stay while the record they are
+// read from is whichever instance the handle names (LRM 25.9).
+llvm::Value* Backend::ctx_field_ptr(Anchor& a, uint32_t field) {
     // An installed context describes ONE instance; a field of any other
     // instance's record (the own instance's, while it writes through a binding)
     // comes from that record.
@@ -821,11 +835,15 @@ llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
         rec = own_ctx_;
     }
     if (rec != nullptr) {
-        return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(field) }));
+        return b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(field) });
     }
-    auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
+    return llvm::ConstantExpr::getInBoundsGetElementPtr(
       a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
-    return b_.CreateLoad(ty, gep);
+}
+
+// A def-relative load of one instance-record field.
+llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
+    return b_.CreateLoad(ty, ctx_field_ptr(a, field));
 }
 
 // The record of the instance a deferred store to `s` lands in, which its
@@ -862,15 +880,15 @@ bool Backend::ctx_override_for(const SignalSlot& owner) const {
 
 // Materialize a single-scope group's deferred sched-flag pointer at the
 // current insert point (a function entry, so it dominates every use): the
-// instance's sched base (record field 2) plus the group's def-local ordinal.
+// group's wake word in the instance's record, at its def-local ordinal.
 // No-op when lower_group chose the absolute constant.
 void Backend::materialize_group_ctx() {
     if (sched_ptr_ != nullptr) {
         return;
     }
-    Anchor&      a    = anchors_[own_anchor_];
-    llvm::Value* base = ctx_field(a, 2, llvm::PointerType::getUnqual(ctx_));
-    sched_ptr_ = b_.CreateInBoundsGEP(sched_word_ty(), base, b_.getInt32(own_ordinal_));
+    Anchor& a  = anchors_[own_anchor_];
+    sched_ptr_ = b_.CreateInBoundsGEP(llvm::ArrayType::get(wake_ty(), a.n_blk), ctx_field_ptr(a, a.ctx_sched_base),
+                                      { b_.getInt32(0), b_.getInt32(own_ordinal_), b_.getInt32(0) });
 }
 
 // Global holding &state->shadow; created on first use, initialized in
@@ -1118,20 +1136,103 @@ void Backend::assign_id_fields() {
             }
         }
     }
+    // A member a handle writes (SignalSlot::vif_rec) is staged under the ids of the
+    // representative the code names, and the code reads them through the record of
+    // whichever instance of the definition the handle named, at the
+    // representative's ordinals. So the representative's ids are in every twin's
+    // record, in the same fields, whichever unit the twin is.
+    {
+        using Ids = std::array<uint32_t, kIdFamilies>;
+        Ids blank;
+        blank.fill(no_id);
+        ankerl::unordered_dense::map<std::string, std::vector<Ids>> rep_ids;
+        const auto collect = [&](auto&& self, const InstanceScope& sc) -> void {
+            auto& w = rep_ids[sc.def_name];
+            if (w.size() < sc.signals.size()) {
+                w.resize(sc.signals.size(), blank);
+            }
+            for (uint32_t k = 0; k < sc.signals.size(); ++k) {
+                const auto si = static_cast<uint32_t>(sc.signals[k]);
+                for (uint32_t f = 0; slots_[si].vif_rec && f < kIdFamilies; ++f) {
+                    if (id_val_[si][f] != no_id && w[k][f] == no_id) {
+                        w[k][f] = id_val_[si][f];
+                    }
+                }
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        const auto spread = [&](auto&& self, const InstanceScope& sc) -> void {
+            const auto& w = rep_ids[sc.def_name];
+            for (uint32_t k = 0; k < sc.signals.size(); ++k) {
+                const auto si = static_cast<uint32_t>(sc.signals[k]);
+                for (uint32_t f = 0; slots_[si].vif_rec && f < kIdFamilies; ++f) {
+                    if (id_val_[si][f] == no_id) {
+                        id_val_[si][f] = w[k][f];
+                    }
+                }
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        for (const InstanceScope& top : mod_.tops()) {
+            collect(collect, top);
+        }
+        for (const InstanceScope& top : mod_.tops()) {
+            spread(spread, top);
+        }
+    }
+    // The instances that share a state type (a definition) lay their id fields out
+    // alike: a field is there for a member if any of them has an id for it. Code
+    // lowered against one instance of a definition runs on another's record when a
+    // handle names it (CtxOverride), and the units of two instances of a definition
+    // can differ in which of their members have ids.
+    using Presence = std::vector<std::array<bool, kIdFamilies>>;
+    ankerl::unordered_dense::map<llvm::StructType*, Presence> present;
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
-        uint32_t next = 0;
-        for (const Signal sj : anchor_signals_[ai]) {
-            if (sj == Signal{ ~0u }) {
+        Presence&   p    = present[anchors_[ai].ty];
+        const auto& sigs = anchor_signals_[ai];
+        if (p.size() < sigs.size()) {
+            p.resize(sigs.size(), {});
+        }
+        for (uint32_t pos = 0; pos < sigs.size(); ++pos) {
+            if (sigs[pos] == Signal{ ~0u }) {
                 continue;
             }
-            const auto si = static_cast<uint32_t>(sj);
             for (uint32_t f = 0; f < kIdFamilies; ++f) {
-                if (id_val_[si][f] != no_id) {
-                    id_ord_[si][f] = next++;
+                p[pos][f] = p[pos][f] || id_val_[static_cast<uint32_t>(sigs[pos])][f] != no_id;
+            }
+        }
+    }
+    ankerl::unordered_dense::map<llvm::StructType*, std::pair<std::vector<std::array<uint32_t, kIdFamilies>>, uint32_t>>
+      layout;
+    for (const auto& [ty, p] : present) {
+        auto& [ords, n] = layout[ty];
+        ords.assign(p.size(), [] {
+            std::array<uint32_t, kIdFamilies> a;
+            a.fill(no_id);
+            return a;
+        }());
+        n = 0;
+        for (uint32_t pos = 0; pos < p.size(); ++pos) {
+            for (uint32_t f = 0; f < kIdFamilies; ++f) {
+                if (p[pos][f]) {
+                    ords[pos][f] = n++;
                 }
             }
         }
-        anchors_[ai].n_id = next;
+    }
+    for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
+        const auto& [ords, n] = layout.at(anchors_[ai].ty);
+        const auto& sigs      = anchor_signals_[ai];
+        for (uint32_t pos = 0; pos < sigs.size(); ++pos) {
+            if (sigs[pos] != Signal{ ~0u }) {
+                id_ord_[static_cast<uint32_t>(sigs[pos])] = ords[pos];
+            }
+        }
+        anchors_[ai].n_id = n;
     }
 }
 
@@ -1165,7 +1266,7 @@ void Backend::build_instance_ctx_layout() {
     ankerl::unordered_dense::map<llvm::StructType*, uint32_t> def_blk;
     for (const Anchor& a : anchors_) {
         auto& n = def_blk[a.ty];
-        n       = std::max(n, a.sched_ty != nullptr ? static_cast<uint32_t>(a.sched_ty->getNumElements()) : 0u);
+        n       = std::max(n, a.n_owned);
     }
 
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
@@ -1185,7 +1286,7 @@ void Backend::build_instance_ctx_layout() {
         a.n_defer      = any_defer_ ? a.n_blk : 0;
         a.n_proc       = design_uses_process_ || any_rng ? a.n_blk : 0;
         a.n_prog       = has_program_initial() ? 1 : 0;
-        a.ctx_blk_base = 4;
+        a.ctx_blk_base = kCtxFixed;
         uint32_t nwait = 0;
         uint32_t nsta  = 0;
         for (const Signal sj : anchor_signals_[&a - anchors_.data()]) {
@@ -1202,7 +1303,8 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_wait_base        = a.ctx_blk_base + a.n_blk;
         a.ctx_cap_base         = a.ctx_wait_base + nwait;
         a.ctx_trig_base        = a.ctx_cap_base + nsta;
-        a.ctx_mmask_base       = a.ctx_trig_base + nsta;
+        a.ctx_sched_base       = a.ctx_trig_base + nsta;
+        a.ctx_mmask_base       = a.ctx_sched_base + 1; // the wake pairs are one array field
         a.ctx_gmask_base       = a.ctx_mmask_base + a.n_mask;
         a.ctx_bind_base        = a.ctx_gmask_base + a.n_mask;
         a.ctx_fbind_base       = a.ctx_bind_base + 2 * a.n_bind;
@@ -1216,11 +1318,14 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_subblk_base      = a.ctx_cov_base + static_cast<uint32_t>(a.cover_locals.size());
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
-            std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
+            std::vector<llvm::Type*> f{ i32, ptr, ptr };
+            static_assert(kCtxFixed == 3 && kCtxFirstVcd == 0 && kCtxShadow == 1 && kCtxState == 2,
+                          "the record's leading fields are first_vcd, shadow, state");
             f.insert(f.end(), a.n_blk, i32);
             f.insert(f.end(), nwait, ptr);
             f.insert(f.end(), nsta, i32);
             f.insert(f.end(), nsta, b_.getInt64Ty());
+            f.push_back(llvm::ArrayType::get(wake_ty(), a.n_blk)); // the wake pairs (ctx_sched_base)
             f.insert(f.end(), 2 * a.n_mask, b_.getInt64Ty());
             f.insert(f.end(), 2 * a.n_bind, ptr);
             f.insert(f.end(), a.n_fbind, ptr);
