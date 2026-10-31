@@ -209,6 +209,19 @@ if(WIN32)
   set(SLANG_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
 endif()
 
+# CMake reruns a FetchContent patch step only when its command changes, so a new or
+# edited patch would never reach an existing build's slang checkout. The command
+# therefore carries a hash of the whole patch set; ApplySlangPatch.cmake ignores it.
+file(GLOB clotho_slang_patches "${CMAKE_CURRENT_SOURCE_DIR}/patches/slang-*.patch")
+list(SORT clotho_slang_patches)
+set(clotho_slang_patch_text "")
+foreach(p IN LISTS clotho_slang_patches)
+  file(READ "${p}" clotho_patch_body)
+  string(APPEND clotho_slang_patch_text "${p}\n${clotho_patch_body}")
+endforeach()
+string(SHA256 clotho_slang_patch_hash "${clotho_slang_patch_text}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${clotho_slang_patches})
+
 FetchContent_Declare(
   slang
   GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
@@ -284,6 +297,7 @@ FetchContent_Declare(
   # Compilation::addSystemSubroutine keeps the subroutine already registered under
   # a name. Not upstream.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
+                 "-DPATCH_SET_HASH=${clotho_slang_patch_hash}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
 )
 FetchContent_MakeAvailable(slang)
