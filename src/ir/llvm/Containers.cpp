@@ -909,12 +909,12 @@ void Backend::lower_queue_push(Index i, bool front) {
     if (e.is_string) {
         // A string value is already an rt_string handle pointer; the runtime
         // deep-copies it into the new slot, so it is passed directly.
-        b_.CreateCall(queue_push_fn(front),
-                      { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
-                        ops,
-                        bound,
-                        str_of(qa.arg),
-                        alloc_site_global(loc_text(i), "queue") });
+        queue_engine_call(queue_push_fn(front),
+                          { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
+                            ops,
+                            bound,
+                            str_of(qa.arg),
+                            alloc_site_global(loc_text(i), "queue") });
         return;
     }
     if (e.is_agg || e.is_handle) {
@@ -926,22 +926,22 @@ void Backend::lower_queue_push(Index i, bool front) {
         // canonical aggregate temp when needed.
         llvm::Value* src = e.is_agg ? agg_read_ptr(lvalue_of(qa.arg), e.elem_type)
                                     : lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read);
-        b_.CreateCall(queue_push_fn(front),
-                      { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
-                        ops,
-                        bound,
-                        src,
-                        alloc_site_global(loc_text(i), "queue") });
+        queue_engine_call(queue_push_fn(front),
+                          { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
+                            ops,
+                            bound,
+                            src,
+                            alloc_site_global(loc_text(i), "queue") });
         return;
     }
     auto* scratch = entry_alloca(e.slot_ty, "q.elem");
     lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
-    b_.CreateCall(queue_push_fn(front),
-                  { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
-                    ops,
-                    bound,
-                    scratch,
-                    alloc_site_global(loc_text(i), "queue") });
+    queue_engine_call(queue_push_fn(front),
+                      { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
+                        ops,
+                        bound,
+                        scratch,
+                        alloc_site_global(loc_text(i), "queue") });
 }
 
 void Backend::lower_queue_pop(Index i, bool front) {
@@ -959,7 +959,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
         llvm::Value* out = str_of(i);
         b_.CreateCall(str_deinit_fn(), { out });
         b_.CreateCall(str_init_fn(), { out });
-        b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+        queue_engine_call(queue_pop_fn(front), { handle, ops, out });
         return;
     }
     if (e.is_agg) {
@@ -976,7 +976,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
             emit_agg_deinit(e.elem_type, out, path, e.agg_ty);
         }
         emit_agg_proto_fill(out, e);
-        b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+        queue_engine_call(queue_pop_fn(front), { handle, ops, out });
         LValue lv{};
         lv.base    = out;
         lv.root_ty = e.agg_ty;
@@ -991,7 +991,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
         // for), then hand its lvalue back as a handle.
         llvm::Value* out = agg_elem_ret_[static_cast<uint32_t>(i)];
         emit_handle_delete(out, e.elem_type);
-        b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+        queue_engine_call(queue_pop_fn(front), { handle, ops, out });
         LValue lv{};
         lv.base        = out;
         lv.slot_ty     = e.slot_ty;
@@ -1004,7 +1004,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
     // Pre-fill with the default: the runtime leaves an empty-queue pop
     // untouched, so the load below then reads the element default.
     b_.CreateStore(elem_default_const(e), scratch);
-    b_.CreateCall(queue_pop_fn(front), { handle, ops, scratch });
+    queue_engine_call(queue_pop_fn(front), { handle, ops, scratch });
     Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
     const ValueType t = type_of(i);
     if (t.is_real) {
@@ -1027,20 +1027,21 @@ void Backend::lower_queue_insert(Index i) {
     // Inserting AT the size is an append, so the legal range is [0, size].
     emit_queue_bounds_check(i, handle, qi.idx, qlv, /*allow_append=*/true);
     if (e.is_string) {
-        b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val),
-                                           alloc_site_global(loc_text(i), "queue") });
+        queue_engine_call(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val),
+                                               alloc_site_global(loc_text(i), "queue") });
         return;
     }
     if (e.is_agg || e.is_handle) {
         llvm::Value* src = e.is_agg ? agg_read_ptr(lvalue_of(qi.val), e.elem_type)
                                     : lv_handle_ptr(lvalue_of(qi.val), HandleUse::Read);
-        b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
+        queue_engine_call(queue_insert_fn(),
+                          { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
         return;
     }
     auto* scratch = entry_alloca(e.slot_ty, "q.elem");
     lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-    b_.CreateCall(queue_insert_fn(),
-                  { handle, ops, bound, idx, scratch, alloc_site_global(loc_text(i), "queue") });
+    queue_engine_call(queue_insert_fn(),
+                      { handle, ops, bound, idx, scratch, alloc_site_global(loc_text(i), "queue") });
 }
 
 void Backend::lower_queue_delete_idx(Index i) {
@@ -1050,7 +1051,7 @@ void Backend::lower_queue_delete_idx(Index i) {
     const Guarded& qlv   = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     emit_queue_bounds_check(i, handle, qa.arg, qlv, /*allow_append=*/false);
-    b_.CreateCall(queue_delete_idx_fn(), { handle, elem_ops_global(qa.queue_type), idx });
+    queue_engine_call(queue_delete_idx_fn(), { handle, elem_ops_global(qa.queue_type), idx });
 }
 
 void Backend::lower_queue_delete_all(Index i) {
@@ -1094,14 +1095,14 @@ void Backend::lower_queue_append_range(Index i) {
     llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
     // A slice append copies a range of elements in. See lower_queue_push.
     emit_gc_barrier_for(lvalue_of(p.op));
-    b_.CreateCall(queue_append_range_fn(),
-                  { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
-                    lv_handle_ptr(lvalue_of(qs.src), HandleUse::Read),
-                    elem_ops_global(qs.queue_type),
-                    bound,
-                    lo,
-                    hi,
-                    alloc_site_global(loc_text(i), "queue") });
+    queue_engine_call(queue_append_range_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
+                        lv_handle_ptr(lvalue_of(qs.src), HandleUse::Read),
+                        elem_ops_global(qs.queue_type),
+                        bound,
+                        lo,
+                        hi,
+                        alloc_site_global(loc_text(i), "queue") });
 }
 
 // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants

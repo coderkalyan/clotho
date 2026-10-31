@@ -743,6 +743,18 @@ llvm::FunctionCallee Backend::queue_append_range_fn() {
                    b_.getInt64Ty(), raw_ptr_ty() });
 }
 
+// A call of one of the queue engine's element operations. A site that runs at most once
+// is marked cold, and the runtime bitcode link (ir/llvm/RuntimeBitcode.cpp) leaves it a
+// call into the runtime: inlining the engine there is code that is compiled and never
+// pays for itself.
+llvm::CallInst* Backend::queue_engine_call(llvm::FunctionCallee callee, llvm::ArrayRef<llvm::Value*> args) {
+    llvm::CallInst* call = b_.CreateCall(callee, args);
+    if (runs_once_ && loop_targets_.empty()) {
+        call->addFnAttr(llvm::Attribute::Cold);
+    }
+    return call;
+}
+
 // void rt_queue_reverse(rt_queue*, const rt_elem_ops*)  (LRM 7.12.2)
 llvm::FunctionCallee Backend::queue_reverse_fn() {
     return rt_fn("rt_queue_reverse", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });

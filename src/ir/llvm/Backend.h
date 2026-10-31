@@ -1039,6 +1039,9 @@ struct ModuleEnv {
     // The descriptors a queue is handed for an element that owns heap: the same
     // initializer with its copy / destroy kernels filled in (queue_elem_ops).
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops_kernels;
+    // The same descriptors keyed by layout (ElemKernels.cpp append_layout), so that
+    // element types that lay out alike share one.
+    std::map<std::vector<uint64_t>, llvm::Constant*> elem_ops_layouts;
     llvm::GlobalVariable* str_sink  = nullptr;
     // The read-only empty-string image an ambiguous string ternary yields
     // (str_empty_global).
@@ -2477,6 +2480,7 @@ private:
     llvm::FunctionCallee queue_assign_fn();
     llvm::FunctionCallee queue_move_fn();
     llvm::FunctionCallee queue_append_range_fn();
+    llvm::CallInst*      queue_engine_call(llvm::FunctionCallee callee, llvm::ArrayRef<llvm::Value*> args);
     llvm::FunctionCallee queue_reverse_fn();
     llvm::FunctionCallee queue_sort_fn();
     llvm::FunctionCallee queue_shuffle_fn();
@@ -4222,6 +4226,10 @@ private:
     // Set while lowering a PreInit process: its stores apply variable declaration
     // initializers and must generate no events, so wait-queue servicing is skipped.
     bool                    silent_stores_ = false;
+    // Set while lowering the body of a process that starts once and ends (an
+    // `initial`, a program `initial`, a `final`): what it runs outside a loop runs
+    // at most once. Subroutines are not it, whoever calls them.
+    bool                    runs_once_ = false;
     // Compile/simulation knobs (z elision, ...); see SimConfig.h.
     SimulationConfig        config_;
     // Renders a SourceLoc for a sanitizer report baked into the emitted code.

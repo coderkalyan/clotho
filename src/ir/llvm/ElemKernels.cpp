@@ -111,6 +111,88 @@ bool any_leaf(uint32_t /*kind*/) {
     return true;
 }
 
+// A constant as numbers appended to `key`: the same bytes in the same shape give the
+// same numbers, whatever the (nominal) LLVM type they are written in. A prefix code,
+// so two constants that differ in shape cannot give one sequence. What it does not
+// know it keys by identity, which only ever separates.
+void append_constant(const llvm::Constant* c, const llvm::DataLayout& dl, std::vector<uint64_t>& key) {
+    if (const auto* number = llvm::dyn_cast<llvm::ConstantInt>(c)) {
+        key.push_back(1);
+        key.push_back(number->getBitWidth());
+        const llvm::APInt& value = number->getValue();
+        for (unsigned w = 0; w < value.getNumWords(); ++w) {
+            key.push_back(value.getRawData()[w]);
+        }
+    } else if (llvm::isa<llvm::ConstantAggregateZero>(c) || llvm::isa<llvm::ConstantPointerNull>(c) ||
+               llvm::isa<llvm::UndefValue>(c)) {
+        key.push_back(2 + 4 * static_cast<uint64_t>(llvm::isa<llvm::UndefValue>(c)));
+        key.push_back(dl.getTypeAllocSize(c->getType()));
+    } else if (const auto* data = llvm::dyn_cast<llvm::ConstantDataSequential>(c)) {
+        key.push_back(3);
+        key.push_back(data->getNumElements());
+        key.push_back(dl.getTypeAllocSize(data->getElementType()));
+        for (const char byte : data->getRawDataValues()) {
+            key.push_back(static_cast<unsigned char>(byte));
+        }
+    } else if (const auto* aggregate = llvm::dyn_cast<llvm::ConstantStruct>(c)) {
+        const llvm::StructLayout* layout = dl.getStructLayout(aggregate->getType());
+        key.push_back(4);
+        key.push_back(aggregate->getNumOperands());
+        key.push_back(layout->getSizeInBytes());
+        for (unsigned i = 0; i < aggregate->getNumOperands(); ++i) {
+            key.push_back(layout->getElementOffset(i));
+            append_constant(aggregate->getOperand(i), dl, key);
+        }
+    } else if (const auto* array = llvm::dyn_cast<llvm::ConstantArray>(c)) {
+        key.push_back(5);
+        key.push_back(array->getNumOperands());
+        key.push_back(dl.getTypeAllocSize(array->getType()->getElementType()));
+        for (unsigned i = 0; i < array->getNumOperands(); ++i) {
+            append_constant(array->getOperand(i), dl, key);
+        }
+    } else {
+        key.push_back(6);
+        key.push_back(reinterpret_cast<uintptr_t>(c));
+    }
+}
+
+// Everything an element descriptor says that the engine and the kernels read, as
+// numbers appended to `key`: two descriptors with the same numbers describe one
+// layout, and what the kernels do is a function of the layout alone. A container's
+// element and an aggregate's leaves are descriptors in their own right and are
+// walked. The kernels' own pointers are not part of it: they follow from the rest.
+void append_layout(const llvm::Constant* ops, const llvm::DataLayout& dl, std::vector<uint64_t>& key) {
+    const auto* global = llvm::dyn_cast<llvm::GlobalVariable>(ops);
+    const auto* init   = llvm::cast<llvm::ConstantStruct>(global != nullptr ? global->getInitializer() : ops);
+    assert(init->getNumOperands() == kFieldCount && "a descriptor has every rt_elem_ops field");
+    for (unsigned f = 0; f < kFieldCount; ++f) {
+        if (f == kFieldCopy || f == kFieldDestroy) {
+            continue;
+        }
+        const llvm::Constant* field = init->getOperand(f);
+        if (const auto* number = llvm::dyn_cast<llvm::ConstantInt>(field)) {
+            key.push_back(number->getZExtValue());
+            continue;
+        }
+        const auto* target = llvm::dyn_cast<llvm::GlobalVariable>(field);
+        if (target == nullptr) {
+            key.push_back(0); // a null pointer: no inner descriptor, no leaves, no handles
+        } else if (f == kFieldInner) {
+            key.push_back(1);
+            append_layout(target, dl, key);
+        } else if (f == kFieldLeaves) {
+            const auto* leaves = llvm::cast<llvm::ConstantArray>(target->getInitializer());
+            for (unsigned i = 0; i < leaves->getNumOperands(); ++i) {
+                const auto* leaf = llvm::cast<llvm::ConstantStruct>(leaves->getOperand(i));
+                key.push_back(llvm::cast<llvm::ConstantInt>(leaf->getOperand(0))->getZExtValue());
+                append_layout(llvm::cast<llvm::GlobalVariable>(leaf->getOperand(1)), dl, key);
+            }
+        } else {
+            append_constant(target->getInitializer(), dl, key); // the prototype image, the handle tables
+        }
+    }
+}
+
 } // namespace
 
 llvm::Value* Backend::elem_byte_ptr(llvm::Value* base, uint64_t offset) {
@@ -417,6 +499,14 @@ llvm::Constant* Backend::queue_elem_ops(Ref elem_type) {
     if (const auto it = env_->elem_ops_kernels.find(key); it != env_->elem_ops_kernels.end()) {
         return it->second;
     }
+    // Two element types of one layout are one descriptor with one pair of kernels:
+    // what the kernels do is a function of the layout alone.
+    std::vector<uint64_t> layout_key;
+    append_layout(init, env_->llmod.getDataLayout(), layout_key);
+    if (const auto it = env_->elem_ops_layouts.find(layout_key); it != env_->elem_ops_layouts.end()) {
+        env_->elem_ops_kernels.emplace(key, it->second);
+        return it->second;
+    }
     std::vector<llvm::Constant*> fields;
     for (unsigned f = 0; f < kFieldCount; ++f) {
         fields.push_back(init->getOperand(f));
@@ -438,6 +528,7 @@ llvm::Constant* Backend::queue_elem_ops(Ref elem_type) {
                                                      llvm::ConstantStruct::get(elem_ops_ty(), fields),
                                                      "clotho.elem.ops");
     env_->elem_ops_kernels.emplace(key, kernels);
+    env_->elem_ops_layouts.emplace(std::move(layout_key), kernels);
     return kernels;
 }
 

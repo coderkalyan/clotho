@@ -81,6 +81,15 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         lvals_.assign(n, std::optional<Guarded>{});
         types_ = value_types(mod_, *ir_);
     };
+    // Lower the body of the selected member. A process that starts once and ends
+    // (an `initial`, a program `initial`, a `final`) runs what is outside its loops
+    // at most once; the others are woken again, so none of it is.
+    const auto lower_member_body = [&](uint32_t m) {
+        const Activation a = all[m].activation;
+        runs_once_         = a == Activation::Initial || a == Activation::Reactive || a == Activation::Final;
+        lower_region(ir_->root());
+        runs_once_ = false;
+    };
     // Open the guarded region of a group: returns true when its members are
     // guarded, having ensured the wake word carries at least one of the
     // group's bits.
@@ -218,7 +227,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_str_temps();
             build_dynarr_temps();
             build_agg_elem_temps();
-            lower_region(ir_->root());
+            lower_member_body(m);
             deinit_body_strings();
             b_.CreateRetVoid();
             member_fns.push_back(fn_);
@@ -287,7 +296,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_dynarr_temps();
             build_agg_elem_temps();
             llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
-            lower_region(ir_->root());
+            lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
         }
@@ -566,7 +575,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         str_vals_     = member_strs.front();
         dynarr_ret_   = member_dynarr.front();
         agg_elem_ret_ = member_agg_elem.front();
-        lower_region(ir_->root());
+        lower_member_body(proc_index);
     }
 
     // Final suspend: the default edge returns the (now-done) handle to the
@@ -1216,6 +1225,7 @@ void Backend::lower_function(FunctionId id) {
     body_home_is_runtime_ = is_shared_home_fn(id) || ir_has_expect_wait(f.ir);
     home_ptr_         = nullptr;
     cur_is_task_      = false;
+    runs_once_        = false; // a function runs as often as it is called
     param_llvm_index_ = param_indices(f);
     build_frame_layout(f);
 
@@ -1352,6 +1362,7 @@ void Backend::lower_task(FunctionId id) {
     body_home_is_runtime_ = is_shared_home_fn(id) || ir_has_expect_wait(f.ir);
     home_ptr_         = nullptr;
     cur_is_task_      = true;
+    runs_once_        = false; // and a task
     param_llvm_index_ = param_indices(f);
     build_frame_layout(f);
 

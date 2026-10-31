@@ -2360,9 +2360,11 @@ TEST_CASE("push and pop are inlined and growing or truncating the ring is a call
             int q[$], b[$:2];
             int v;
             initial begin
-                q.push_back(1); q.push_front(2);
-                v = q.pop_back(); v = q.pop_front();
-                b.push_back(3);
+                for (int i = 0; i < 3; i++) begin
+                    q.push_back(1); q.push_front(2);
+                    v = q.pop_back(); v = q.pop_front();
+                    b.push_back(3);
+                end
                 $display("%0d", v);
             end
         endmodule
@@ -2390,9 +2392,11 @@ TEST_CASE("insert and delete are one out-of-line copy per element type") {
             int          q[$];
             logic [20:0] w[$];
             initial begin
-                q.push_back(1); q.push_back(2); q.push_back(3);
-                q.insert(1, 4); q.insert(0, 5); q.delete(2); q.delete(0);
-                w.push_back(1); w.insert(0, 2); w.delete(1);
+                for (int i = 0; i < 3; i++) begin
+                    q.push_back(1); q.push_back(2); q.push_back(3);
+                    q.insert(1, 4); q.insert(0, 5); q.delete(2); q.delete(0);
+                    w.push_back(1); w.insert(0, 2); w.delete(1);
+                end
                 $display("%0d %0d", q.size(), w.size());
             end
         endmodule
@@ -2413,14 +2417,96 @@ TEST_CASE("insert and delete are one out-of-line copy per element type") {
     }
 }
 
+// An `initial` block outside its loops runs once, and an engine function inlined or
+// copied there is compile time that never pays for itself: the call stays a call of the
+// runtime's function, and a design whose queue operations are all like that links no
+// engine code at all.
+TEST_CASE("a queue operation that runs once is a call into the runtime") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            string s[$];
+            int v;
+            initial begin
+                q.push_back(1); q.push_front(2); q.insert(1, 3);
+                s.push_back("a");
+                v = q.pop_back(); v = q.pop_front();
+                q.delete(0);
+                $display("%0d %0d", v, q.size());
+            end
+        endmodule
+    )";
+    const std::string ir = emit_ir(src);
+    CHECK(count_of(ir, "call void @rt_queue_push_back(") == 2);
+    CHECK(count_of(ir, "call void @rt_queue_push_front(") == 1);
+    CHECK(count_of(ir, "call void @rt_queue_pop_back(") == 1);
+    CHECK(count_of(ir, "call void @rt_queue_pop_front(") == 1);
+    CHECK(count_of(ir, "call void @rt_queue_insert(") == 1);
+    CHECK(count_of(ir, "call void @rt_queue_delete_idx(") == 1);
+    CHECK(count_of(ir, "define internal void @rt_queue_") == 0);
+    CHECK(count_of(ir, "@rt_queue_grow") == 0);
+}
+
+// What runs more than once is inlined or copied, and what runs once in the same module
+// is still the runtime's call: the engine's functions do not come into the module under
+// the runtime's names, where the optimizer would inline them there too.
+TEST_CASE("a module with queue operations that run once and ones that repeat links the engine for the latter") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            int v;
+            initial begin
+                q.push_back(1);
+                for (int i = 0; i < 3; i++) q.push_back(i);
+                v = q.pop_front();
+                $display("%0d", v);
+            end
+        endmodule
+    )";
+    const std::string ir = emit_ir(src);
+    if (ir::runtime_bitcode_available()) {
+        CHECK(count_of(ir, "call void @rt_queue_push_back(") == 1);
+        CHECK(count_of(ir, "define internal void @rt_queue_push_back") == 0);
+        CHECK(count_of(ir, "call void @rt_queue_pop_front(") == 1);
+        CHECK(count_of(ir, "call void @rt_queue_grow") >= 1);
+    } else {
+        CHECK(count_of(ir, "call void @rt_queue_push_back(") == 2);
+    }
+}
+
+// A subroutine and an `always` block run again whoever calls or wakes them, and a
+// `forever` loop in an `initial` block does too.
+TEST_CASE("queue operations in a subroutine, an always block and a forever loop are inlined") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], r[$], t[$];
+            bit clk = 0;
+            function automatic void put(int x); q.push_back(x); endfunction
+            always @(posedge clk) r.push_back(1);
+            initial begin
+                put(1);
+                forever begin t.push_back(2); #1 clk = ~clk; end
+            end
+        endmodule
+    )";
+    const std::string ir = emit_ir(src);
+    if (ir::runtime_bitcode_available()) {
+        CHECK(count_of(ir, "@rt_queue_push_back") == 0);
+    } else {
+        CHECK(count_of(ir, "call void @rt_queue_push_back(") == 3);
+    }
+}
+
 TEST_CASE("a string element is copied by a direct call to the string runtime") {
     constexpr std::string_view src = R"(
         module m;
             string q[$];
             string t;
             initial begin
-                q.push_back("hello");
-                t = q.pop_front();
+                for (int i = 0; i < 3; i++) begin
+                    q.push_back("hello");
+                    t = q.pop_front();
+                end
                 $display("%s", t);
             end
         endmodule
