@@ -368,6 +368,12 @@ typedef struct rt_null_site {
 // diagnostic and ends the simulation with a nonzero status. Never returns.
 [[noreturn]] void rt_null_handle(const rt_null_site* site, uint64_t now);
 
+// A 2-state divide or modulo by zero, found by `--sanitize=divzero`. LRM 11.4.3 makes
+// the result x, which a 2-state result makes 0 (LRM 6.3.1): the operation still gives 0
+// and this only makes that silent outcome audible. Non-fatal. Like rt_bounds_report it
+// goes quiet after a few reports from one site. The site's `kind` is unused.
+void rt_divzero_report(const rt_null_site* site, uint64_t now);
+
 // A 4-state value whose planes break the encoding's invariants (must & ~may == 0,
 // z only on unknown bits), caught by a check generated only under
 // CLOTHO_EXTRA_ASSERTS. A Clotho bug, not the design's: prints a located internal

@@ -825,12 +825,13 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b, bool four) {
     // The IR has one domain for both operands (ir::verify: operand-domain), so `four`
     // is the domain of both.
     if (!four) {
+        llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
+        emit_divzero_check(dz);
         if (w > wide_arith_bits) {
             // The routine gives 0 for a zero divisor and wraps MIN / -1 itself, so the
             // operands go in as they are.
             return two_val(wide_arith(wide_routine, a.mm, b.mm));
         }
-        llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
         llvm::Value* r;
         if (!sign) {
             llvm::Value* safe = b_.CreateSelect(dz, ones(w), b.mm);
@@ -843,6 +844,16 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b, bool four) {
                        : b_.CreateSelect(neg1, zero(w), b_.CreateSRem(a.mm, safe));
         }
         return two_val(b_.CreateSelect(dz, zero(w), r));
+    }
+
+    // A 2-state divide of the source (`int / int`) reaches here with both operands lifted
+    // by ToFour, and its result is converted back: it cannot have an x operand, so a zero
+    // divisor is the only way to an x, which the 2-state result makes 0. That is what
+    // --sanitize=divzero reports; a divide with a 4-state operand shows its x instead.
+    const auto& operands = ir_->payload(cur_inst_).binary;
+    if (sanitizer_on(config_.sanitizers, Sanitizer::DivZero) && ir_->tag(operands.l) == Inst::Tag::ToFour &&
+        ir_->tag(operands.r) == Inst::Tag::ToFour) {
+        emit_divzero_check(b_.CreateICmpEQ(must_of(b, four), zero(w)));
     }
 
     // Width-1: index the truth table instead of branching. DIV1/MOD1 bake in

@@ -327,6 +327,46 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
     std::fflush(stderr);
 }
 
+// ---- --sanitize=divzero reports ----
+
+extern "C" void rt_divzero_report(const rt_null_site* site, uint64_t now) {
+    uint32_t& hits = g_bounds_hits[reinterpret_cast<uint64_t>(site) * 2];
+    if (hits >= bounds_report_cap) {
+        return;
+    }
+    ++hits;
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+
+    std::string when;
+    append_finish_time(when, now);
+    fmt::print(stderr, label, "warning:");
+    fmt::print(stderr, head, " division by zero in a 2-state operation");
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        print_snippet(snippet_text(site->line), site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } }, loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " the result is 0, the x of LRM 11.4.3 made 0 by a 2-state result (LRM 6.3.1), at {}", when);
+    fmt::print(stderr, "\n");
+    if (hits == bounds_report_cap) {
+        fmt::print(stderr, tag, "  note:");
+        fmt::print(stderr, body, " further reports from this operation are suppressed");
+        fmt::print(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
 // ---- Null class-handle dereference (LRM 8.4) ----
 
 extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {

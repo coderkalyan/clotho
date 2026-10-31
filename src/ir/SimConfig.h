@@ -87,6 +87,12 @@ enum class Sanitizer : uint32_t {
     // before the read -- neither of which clotho models yet, so reporting now
     // would be a false-positive machine. It wants its own check, not this one.
     Bounds = 1u << 1,
+    // Report a 2-state divide or modulo whose divisor is zero. The LRM makes the
+    // result x (11.4.3), which a 2-state result turns into 0 (6.3.1), so the
+    // design sees a plain 0 where a 4-state one sees x; this reports where that
+    // happened. The result is still 0. 4-state operations are not reported: their
+    // x is visible in the result.
+    DivZero = 1u << 2,
 };
 
 [[nodiscard]] inline bool sanitizer_on(uint32_t sanitizers, Sanitizer s) {

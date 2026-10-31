@@ -2377,6 +2377,7 @@ private:
     llvm::FunctionCallee defer_flush_final_fn();
     llvm::StructType* bounds_site_ty();
     llvm::FunctionCallee bounds_report_fn();
+    llvm::FunctionCallee divzero_report_fn();
 
     llvm::FunctionCallee wide_sel_fn();
     llvm::FunctionCallee wide_ins_fn();
@@ -3273,6 +3274,10 @@ private:
     void emit_ref_name_table();
 
     void emit_ref_epoch_check(const RefBinding& rb);
+
+    // `--sanitize=divzero`: report, then fall through, when the i1 `divisor_zero` holds
+    // for the divide or modulo being lowered. Nothing is emitted when it is off.
+    void emit_divzero_check(llvm::Value* divisor_zero);
 
     void lower_tagged_check(Index i);
 

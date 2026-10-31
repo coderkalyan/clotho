@@ -302,6 +302,25 @@ void Backend::emit_null_handle_check(llvm::Value* handle, Index at, NullKind kin
     b_.SetInsertPoint(cont);
 }
 
+// One --sanitize=divzero check: a cold block that reports and falls through, so the
+// 2-state divide still gives 0. The branch exists only under the sanitizer.
+void Backend::emit_divzero_check(llvm::Value* divisor_zero) {
+    if (!sanitizer_on(config_.sanitizers, Sanitizer::DivZero)) {
+        return;
+    }
+    auto* fn   = b_.GetInsertBlock()->getParent();
+    auto* bad  = llvm::BasicBlock::Create(ctx_, "divzero.bad", fn);
+    auto* cont = llvm::BasicBlock::Create(ctx_, "divzero.ok", fn);
+    auto* br   = b_.CreateCondBr(divisor_zero, bad, cont);
+    br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+    b_.SetInsertPoint(bad);
+    llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+    b_.CreateCall(divzero_report_fn(), { null_site_global(loc_text(cur_inst_), NullKind::Class), now });
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+}
+
 // Check a 4-state value's encoding invariants (EncodingCheck.h) where it is stored,
 // passed, returned or handed to the runtime. `four` is the domain of the IR type the
 // value came from; a 2-state value has no invariants to break.
