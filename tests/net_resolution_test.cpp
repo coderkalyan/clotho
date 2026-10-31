@@ -1,6 +1,6 @@
 // Multi-driver net resolution (LRM 6.6.1, wire/tri, no drive strengths): the
 // lattice join z ⊑ {0,1} ⊑ x. Whole-net overlapping drivers each stage into a
-// private slot and a WireRes resolver folds them into the net. Every expected
+// private slot and a WireRes resolver resolves them at once. Every expected
 // value below was cross-checked against iverilog 13 (a full net-resolution
 // oracle) on the same source.
 
@@ -77,7 +77,7 @@ TEST_CASE("tri-state bus: z identity, agreement, conflict") {
     CHECK(out == "zzzz\n0101\n1010\nxxxx\n1x00\n");
 }
 
-TEST_CASE("three tri-state drivers fold left through WireRes") {
+TEST_CASE("three tri-state drivers resolve at once through WireRes") {
     const std::string out = run_capture(R"(
         module top;
           logic [1:0] sel;
@@ -957,4 +957,53 @@ TEST_CASE("disjoint partial continuous assigns to a 2-state variable") {
         endmodule
     )");
     CHECK(out == "v=a5\n");
+}
+
+// -- N-ary resolution against the LRM tables --
+
+namespace {
+
+// LRM Tables 6-2, 6-3 and 6-4, rows and columns in the order 0 1 x z.
+constexpr std::string_view kWireTable = "0xx0" "x1x1" "xxxx" "01xz";
+constexpr std::string_view kWandTable = "0000" "01x1" "0xxx" "01xz";
+constexpr std::string_view kWorTable  = "01x0" "1111" "x1xx" "01xz";
+
+size_t value_index(char v) {
+    return std::string_view("01xz").find(v);
+}
+
+} // namespace
+
+// Every 4-state combination of 2, 3 and 4 drivers on one net bit, for each net
+// type that resolves by value: bit c of the net is driven by digit k of c (base
+// 4) from driver k. The expected value is the table folded left over the
+// drivers; the tables are associative, so that is their value for any order.
+TEST_CASE("N-ary resolution matches LRM tables 6-2 to 6-4 for every driver combination") {
+    struct Kind {
+        const char*      name;
+        std::string_view table;
+    };
+    for (const Kind kind : { Kind{ "wire", kWireTable }, Kind{ "wand", kWandTable }, Kind{ "wor", kWorTable } }) {
+        for (size_t n = 2; n <= 4; ++n) {
+            const size_t bits = size_t{ 1 } << (2 * n);
+            std::string  src  = "module top;\n  " + std::string(kind.name) + " [" + std::to_string(bits - 1) + ":0] w;\n";
+            std::string  expected;
+            for (size_t k = 0; k < n; ++k) {
+                src += "  assign w = " + std::to_string(bits) + "'b";
+                for (size_t c = bits; c-- > 0;) {
+                    src += "01xz"[(c >> (2 * k)) & 3];
+                }
+                src += ";\n";
+            }
+            for (size_t c = bits; c-- > 0;) {
+                char acc = "01xz"[c & 3];
+                for (size_t k = 1; k < n; ++k) {
+                    acc = kind.table[value_index(acc) * 4 + value_index("01xz"[(c >> (2 * k)) & 3])];
+                }
+                expected += acc;
+            }
+            src += "  initial begin #1; $display(\"%b\", w); end\nendmodule\n";
+            CHECK_MESSAGE(run_capture(src) == expected + "\n", kind.name, " with ", n, " drivers");
+        }
+    }
 }

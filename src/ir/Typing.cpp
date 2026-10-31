@@ -266,10 +266,10 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::WireRes:
         case Inst::Tag::WandRes:
         case Inst::Tag::WorRes: {
-            // Net resolution always yields a 4-state result at the operand
-            // (net) width — a driver conflict is X, an all-high-Z net is Z —
-            // even when the driver slots feeding it are 2-state.
-            const ValueType lt = ty(p.binary.l);
+            // Net resolution always yields a 4-state result at the driver (net)
+            // width — a driver conflict is X, an all-high-Z net is Z — even
+            // when the driver slots feeding it are 2-state.
+            const ValueType lt = ty(ir.region(ir.extra_data<ExtraSlice>(p.extra))[0]);
             return { lt.width, true };
         }
         case Inst::Tag::StrengthRes: {

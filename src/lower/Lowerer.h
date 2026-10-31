@@ -1714,9 +1714,10 @@ private:
     // A net that Classify found to have >= 2 overlapping drivers is "resolved":
     // Emit routes each of its drivers to a private full-width slot signal
     // (alloc_driver_slot) instead of storing the net directly, and
-    // emit_wire_resolvers folds all the slots through WireRes into the net at the
-    // end of lowering. A single-driver net is never in resolved_nets_ and keeps
-    // the plain-store fast path untouched. V1 supports whole-net drivers only.
+    // emit_wire_resolvers resolves all the slots at once (WireRes / WandRes /
+    // WorRes) into the net at the end of lowering. A single-driver net is never
+    // in resolved_nets_ and keeps the plain-store fast path untouched. V1
+    // supports whole-net drivers only.
 
     static bool is_whole_net_lvalue(const Expression& e);
 

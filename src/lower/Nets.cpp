@@ -718,11 +718,11 @@ void Lowerer::store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::B
     b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
 }
 
-// Fold every resolved net's driver slots through WireRes and store the
-// resolved value into the net. One self-starting process per net, sensitive
-// to all its slots; the net is written only here, so its readers wake on the
-// resolved value. Runs once per top after Emit, when every driver has
-// registered its slot.
+// Resolve every resolved net's driver slots at once (WireRes / WandRes / WorRes /
+// StrengthRes) and store the resolved value into the net. One self-starting
+// process per net, sensitive to all its slots; the net is written only here, so
+// its readers wake on the resolved value. Runs once per top after Emit, when
+// every driver has registered its slot.
 void Lowerer::emit_wire_resolvers() {
     // Every net that needs a resolver: the ones with >= 2 (or, for tri0/tri1,
     // >= 1) drivers, plus driverless tri0/tri1 nets that still pull to 0/1.
@@ -762,8 +762,8 @@ void Lowerer::emit_wire_resolvers() {
         const ir::Inst::Tag op = net_resolve_op_.contains(net_u) ? net_resolve_op_[net_u] : ir::Inst::Tag::WireRes;
 
         // A net resolves through the strength-weighted fold when any driver
-        // has a non-default (not Strong/Strong) drive strength; otherwise the
-        // cheaper strengthless pairwise fold (WireRes / WandRes / WorRes).
+        // has a non-default (not Strong/Strong) drive strength; otherwise one
+        // strengthless resolution over all its drivers (WireRes / WandRes / WorRes).
         const auto                      st_it     = resolved_strengths_.find(net_u);
         const std::span<const uint16_t> strengths = st_it != resolved_strengths_.end()
                                                       ? std::span<const uint16_t>(st_it->second)
@@ -814,11 +814,13 @@ void Lowerer::emit_wire_resolvers() {
             }
             acc = b.strength_res(slot_vals, str_vec, l);
         } else {
-            acc = b.unary(ir::Inst::Tag::Load, b.signal(slots[0], l), l);
-            for (size_t k = 1; k < slots.size(); ++k) {
-                const ir::Index next = b.unary(ir::Inst::Tag::Load, b.signal(slots[k], l), l);
-                acc                  = b.binary(op, acc, next, l);
+            std::vector<ir::Index> drivers;
+            drivers.reserve(slots.size());
+            for (const ir::Signal s : slots) {
+                drivers.push_back(b.unary(ir::Inst::Tag::Load, b.signal(s, l), l));
             }
+            // One driver (a tri0/tri1, forced or delayed net) needs no resolution.
+            acc = drivers.size() == 1 ? drivers[0] : b.net_res(op, drivers, l);
         }
         if (pi != net_pull_.end() && !pull_injected) {
             acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);

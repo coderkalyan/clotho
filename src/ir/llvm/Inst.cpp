@@ -1382,8 +1382,7 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::WireRes:
         case Inst::Tag::WandRes:
         case Inst::Tag::WorRes:
-            set_value(i, lower_net_res(ir_->tag(i), value_of(p.binary.l), type_of(p.binary.l).four_state,
-                                       value_of(p.binary.r), type_of(p.binary.r).four_state));
+            set_value(i, lower_net_res(i));
             return;
         case Inst::Tag::StrengthRes:
             set_value(i, lower_strength_res(i));

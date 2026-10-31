@@ -1624,20 +1624,19 @@ struct Inst {
         // Bitwise invert ~ (payload: unary).
         Bnot,
 
-        // Strong wire/tri multi-driver resolution of two driver values (LRM
-        // 6.6.1, no drive strengths), the lattice join z ⊑ {0,1} ⊑ x: a
-        // high-Z operand contributes nothing (identity), two operands that
-        // agree keep the value, a 0-vs-1 (or any x) conflict is x, all-z is z.
-        // Associative + commutative, so K drivers fold left through this.
-        // Result is always 4-state at the operand width (payload: binary).
-        // Emitted only by the multi-driver-net resolver (lower/Nets.cpp
-        // emit_wire_resolvers); single-driver nets never use it.
+        // Multi-driver net resolution without drive strengths (LRM 6.6) over all
+        // of a net's driver values at once (payload: extra -> ExtraSlice, the
+        // driver values in driver order). One pass accumulates three masks over
+        // the drivers, per bit: driven-0, driven-1 and driven-x (a high-Z driver
+        // adds to none); one final step resolves them. The tag is the net type:
+        //   WireRes  wire/tri/uwire: x if x, or both 0 and 1; else 0 / 1 / z.
+        //   WandRes  wand/triand:    0 if any 0; else x if x; else 1 / z.
+        //   WorRes   wor/trior:      1 if any 1; else x if x; else 0 / z.
+        // (Tables 6-2, 6-3, 6-4.) Result is always 4-state at the driver width,
+        // even when every driver slot is 2-state. Emitted only by the
+        // multi-driver-net resolver (lower/Nets.cpp emit_wire_resolvers);
+        // single-driver nets never use it.
         WireRes,
-        // Wired-AND / wired-OR multi-driver resolution (LRM 6.6.2 / 6.6.3) for
-        // wand/triand and wor/trior nets. Same slot machinery and z-identity as
-        // WireRes, only a different per-bit reducer: wand forces 0 on any 0
-        // driver, wor forces 1 on any 1 driver, else x on any x, else z. Both
-        // associative + commutative, so K drivers fold left (payload: binary).
         WandRes,
         WorRes,
         // Drive-strength wire/tri multi-driver resolution (LRM 6.6.1, 28.11):
@@ -2626,9 +2625,6 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Bor:
         case T::Bxor:
         case T::Bxnor:
-        case T::WireRes:
-        case T::WandRes:
-        case T::WorRes:
         case T::Sll:
         case T::Srl:
         case T::Sra:
@@ -2733,6 +2729,9 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Repl:
             return K::Repl;
         case T::Concat:
+        case T::WireRes:
+        case T::WandRes:
+        case T::WorRes:
         case T::IfaceRef:
         case T::StrengthRes:
         case T::Loop:
@@ -2921,6 +2920,9 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
     using S = ExtraOperandShape;
     switch (tag) {
         case T::Concat:
+        case T::WireRes:
+        case T::WandRes:
+        case T::WorRes:
             return S::SliceIsOperands;
         case T::StrengthRes:
             return S::StrengthResValues;

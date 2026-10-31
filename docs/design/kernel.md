@@ -137,7 +137,7 @@ when it does.
 ## Nets
 
 - A multiply-driven net without strengths accumulates driven-0, driven-1 and x
-  masks over all drivers and resolves once. **Not yet:** a pairwise fold.
+  masks over all drivers and resolves once.
 - Drive strengths are per-driver compile-time constants, resolved by per-level
   mask arithmetic. An x/z driver with asymmetric strengths contributes a strength
   range (LRM 28.12.3). Strength is carried with the value only on nets connected

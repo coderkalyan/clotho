@@ -398,12 +398,15 @@ TEST_CASE("extra_operand_shape classifies exactly the Extra-payload tags") {
     }
 }
 
-// Concat is the only tag whose extra IS the operand run; everything else in the
-// family either has a named slice inside its record or no operands at all.
-// Getting this wrong is precisely the MonitorSet bug.
-TEST_CASE("only concat's extra payload is itself an operand run") {
+// Concat and the net-resolution tags are the only tags whose extra IS the operand
+// run; everything else in the family either has a named slice inside its record
+// or no operands at all. Getting this wrong is precisely the MonitorSet bug.
+TEST_CASE("only concat's and net resolution's extra payload is itself an operand run") {
     using S = ir::ExtraOperandShape;
     CHECK(ir::extra_operand_shape(ir::Inst::Tag::Concat) == S::SliceIsOperands);
+    for (const ir::Inst::Tag t : { ir::Inst::Tag::WireRes, ir::Inst::Tag::WandRes, ir::Inst::Tag::WorRes }) {
+        CHECK(ir::extra_operand_shape(t) == S::SliceIsOperands);
+    }
     CHECK(ir::extra_operand_shape(ir::Inst::Tag::StrengthRes) == S::StrengthResValues);
     // fork: its record holds BOTH a FunctionId run (the children) and an operand
     // run (the frame lvalues the children capture by reference), so the named

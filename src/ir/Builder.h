@@ -132,6 +132,9 @@ public:
     // Resistive pull of a resolved tri0/tri1 net value: a still-Z bit becomes
     // `pull` (0 or 1), everything else is unchanged (LRM 6.6.4). Keeps op's width.
     Index net_pull(Index op, uint32_t pull, SourceLoc loc);
+    // Strengthless multi-driver resolution (LRM 6.6) of every driver value of a
+    // net at once; `tag` is WireRes, WandRes or WorRes. See Inst::Tag::WireRes.
+    Index net_res(Inst::Tag tag, std::span<const Index> drivers, SourceLoc loc);
     // Drive-strength multi-driver resolution: fold `slots` (driver values) by
     // per-driver strength (`strengths`, packed strength0<<8 | strength1, parallel
     // to slots) into one 4-state net value. See Inst::Tag::StrengthRes.

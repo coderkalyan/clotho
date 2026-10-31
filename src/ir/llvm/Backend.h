@@ -3373,7 +3373,7 @@ private:
 
     llvm::Value* xz_mask(Plane a, Plane b, uint32_t w);
 
-    Plane lower_net_res(Inst::Tag tag, Plane a, bool a_four, Plane b, bool b_four);
+    Plane lower_net_res(Index i);
 
     Plane lower_strength_res(Index i);
 
