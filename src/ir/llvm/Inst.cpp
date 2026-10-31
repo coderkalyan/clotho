@@ -89,16 +89,16 @@ void Backend::set_value(Index i, Plane p) {
 // diagnostic at all. A call whose actuals did not line up with its signature was
 // how that happened; lower_call_common rejects that shape up front now, and this
 // backstops every other route to it.
-const LValue& Backend::lvalue_of(Index i) const {
-    const std::optional<LValue>& lv = lvals_[static_cast<uint32_t>(i)];
+const Guarded& Backend::lvalue_of(Index i) const {
+    const std::optional<Guarded>& lv = lvals_[static_cast<uint32_t>(i)];
     if (!lv.has_value()) {
         throw BackendError{ "internal: operand used as a place was lowered as a value" };
     }
     return *lv;
 }
 
-void Backend::set_lvalue(Index i, LValue lv) {
-    lvals_[static_cast<uint32_t>(i)] = lv;
+void Backend::set_lvalue(Index i, Guarded lv) {
+    lvals_[static_cast<uint32_t>(i)] = std::move(lv);
 }
 
 // rt_string handle pointer of a string-valued instruction (parallel to
@@ -119,33 +119,32 @@ void Backend::set_str(Index i, llvm::Value* handle) {
 // a `Write` here must sit inside a str_chg_snapshot / str_chg_after bracket;
 // that is checked rather than trusted, because a missing notify is a silent
 // permanent park and the check can only fire for a property someone waits on.
-llvm::Value* Backend::lv_string_ptr(const LValue& lv, StringUse use) {
-    if (use == StringUse::Write && lv.chg != nullptr && str_chg_open_ == 0) {
+llvm::Value* Backend::lv_string_ptr(const Guarded& g, StringUse use) {
+    if (use == StringUse::Write && g.chg != nullptr && str_chg_open_ == 0) {
         throw BackendError{ "internal: write to a waited-on string class property "
                             "outside a change-notify bracket (LRM 9.4.2)" };
     }
-    llvm::Value* ptr = nullptr;
-    if (lv.array_ty != nullptr) {
-        llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
-        ptr = b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
-    } else if (lv.is_agg) {
-        // A string leaf inside an aggregate (struct member / class property)
-        // is reached through the aggregate GEP path, not the bare base.
-        ptr = agg_slot_ptr(lv);
-    } else {
-        ptr = lv.base;
-    }
-    if (lv.dyn_inrange != nullptr) {
-        // Out-of-range dynamic-array / queue string element: redirect to the
-        // writable sink handle, reset to owned-empty right here — an OOB
-        // read yields "" (Table 7-1 string default) and an OOB write /
-        // mutating method lands in the sink and is discarded (LRM 7.5.1).
-        llvm::Value* sink = str_sink_global();
-        b_.CreateCall(str_deinit_fn(), { sink });
-        b_.CreateCall(str_init_fn(), { sink });
-        ptr = b_.CreateSelect(lv.dyn_inrange, ptr, sink);
-    }
-    return ptr;
+    const auto form = [&](const LValue& lv) -> llvm::Value* {
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        }
+        // A string leaf inside an aggregate (struct member / class property) is
+        // reached through the aggregate GEP path, not the bare base.
+        return lv.is_agg ? agg_slot_ptr(lv) : lv.base;
+    };
+    // An invalid element (an out-of-range or x/z index of a fixed array, dynamic
+    // array or queue, an absent associative key) redirects to the writable sink
+    // handle, reset to owned-empty right here: an invalid read yields "" (Table 7-1
+    // string default) and an invalid write / mutating method lands in the sink and
+    // is discarded (LRM 7.4.5, 7.5.1).
+    const auto sink = [&]() -> llvm::Value* {
+        llvm::Value* s = str_sink_global();
+        b_.CreateCall(str_deinit_fn(), { s });
+        b_.CreateCall(str_init_fn(), { s });
+        return s;
+    };
+    return g.pointer_or(b_, form, sink);
 }
 
 // The shared out-of-range string-element sink: a writable rt_string handle
@@ -312,7 +311,7 @@ void Backend::lower_inst(Index i) {
             set_lvalue(i, local_lvalue(p.local.index));
             return;
         case Inst::Tag::BitSelect: {
-            LValue lv = lvalue_of(p.binary.l);
+            Guarded lv = lvalue_of(p.binary.l);
             if (lv.is_string) {
                 // String indexing lowers to StrGetc / StrPutc in the frontend.
                 throw BackendError{ "internal: string value in bit_select" };
@@ -335,7 +334,7 @@ void Backend::lower_inst(Index i) {
             return;
         }
         case Inst::Tag::PartSelect: {
-            LValue             lv          = lvalue_of(p.op_extra.op);
+            Guarded            lv          = lvalue_of(p.op_extra.op);
             const auto         ps          = ir_->extra_data<PartSelect>(p.op_extra.extra);
             llvm::Value* const cbase       = lv.bit_off;
             const uint32_t     outer_width = lv.width;
@@ -368,7 +367,7 @@ void Backend::lower_inst(Index i) {
             // Bounds-checked against its container (LRM 11.5.1): bits of the
             // selection that fall outside read x / are not written; a wholly
             // out-of-range or x/z offset makes the whole select out of range.
-            LValue             lv     = lvalue_of(p.op_extra.op);
+            Guarded            lv     = lvalue_of(p.op_extra.op);
             const auto         dps    = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
             const Plane        offp   = value_of(dps.offset);
             llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
@@ -391,7 +390,7 @@ void Backend::lower_inst(Index i) {
             // slot_ty and store_width already describe a leaf element (set by
             // the array's signal slot), so this only shifts to the element and
             // resets any inherited bit offset.
-            LValue         lv     = lvalue_of(p.op_extra.op);
+            Guarded        lv     = lvalue_of(p.op_extra.op);
             const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
             const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
             const bool     inner_container = at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue;
@@ -419,9 +418,9 @@ void Backend::lower_inst(Index i) {
                 // Dynamic array (LRM 7.5): the base lvalue addresses the
                 // { data, len } handle. Load the heap data pointer and length,
                 // and build a fresh element lvalue over `[0 x elemslot]` at the
-                // 0-based index, carrying the in-range predicate so the shared
-                // load/store applies bounds (out-of-range read -> default,
-                // write -> no-op; the heap is never touched past `len`).
+                // 0-based index, valid only where the index is in range (an
+                // out-of-range read yields the default, a write is a no-op; the
+                // heap is never touched past `len`).
                 const DynElem e       = dynarr_elem(es.array_type);
                 // `d[i] = v` mutates the property's contents, so a for-write
                 // select of a waited-on container notifies here -- the store the
@@ -439,7 +438,7 @@ void Backend::lower_inst(Index i) {
                   dynarr_slot_ty(), handle, handle_epoch_field(es.array_type));
                 // LRM 7.4.5 covers "an unpacked array of any kind": an x/z
                 // index is invalid exactly like one past the end, so the
-                // unknown term belongs in the gate and not only in the report.
+                // unknown term belongs in the verdict and not only in the report.
                 const Plane     idxp    = value_of(es.index);
                 const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
                 llvm::Value*    idx64   = ei.idx64;
@@ -456,21 +455,18 @@ void Backend::lower_inst(Index i) {
                     sel.elem_idx      = cast(idx64, 32, false);
                     sel.is_signal     = lv.is_signal;
                     sel.sig           = lv.sig;
-                    sel.dyn_inrange   = inrange;
                     sel.bounds_checks = lv.bounds_checks;
                     sel.epoch_chain   = lv.epoch_chain;
                     sel.epoch_chain.push_back(epoch);
-                    add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
-                    set_lvalue(i, sel);
+                    set_lvalue(i, element_select(sel, lv, i, es.index, inrange, unknown, len));
                     return;
                 }
                 if (e.is_agg || e.is_handle) {
-                    LValue sel      = dyn_agg_elem_lvalue(lv, e, dataptr, idx64, inrange);
+                    LValue sel      = dyn_agg_elem_lvalue(lv, e, dataptr, idx64);
                     sel.epoch_chain = lv.epoch_chain;
                     sel.epoch_chain.push_back(epoch);
                     note_gc_container_root(sel, lv, handle, es.array_type);
-                    add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
-                    set_lvalue(i, sel);
+                    set_lvalue(i, element_select(sel, lv, i, es.index, inrange, unknown, len));
                     return;
                 }
                 LValue       el;
@@ -489,10 +485,8 @@ void Backend::lower_inst(Index i) {
                 el.width         = e.width;
                 el.is_signal     = lv.is_signal;
                 el.sig           = lv.sig;
-                el.dyn_inrange   = inrange;
                 el.bounds_checks = lv.bounds_checks;
-                add_elem_bounds_check(el, i, lv, es.index, inrange, unknown, len);
-                set_lvalue(i, el);
+                set_lvalue(i, element_select(el, lv, i, es.index, inrange, unknown, len));
                 return;
             }
             if (at.kind == Type::Kind::Queue) {
@@ -518,7 +512,7 @@ void Backend::lower_inst(Index i) {
                 llvm::Value* epoch = b_.CreateStructGEP(
                   queue_slot_ty(), handle, handle_epoch_field(es.array_type));
                 // An x/z index is invalid for an unpacked array of any kind
-                // (LRM 7.4.5), so it gates the access, not just the report.
+                // (LRM 7.4.5), so it is part of the verdict, not just the report.
                 const Plane     idxp    = value_of(es.index);
                 const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
                 llvm::Value*    idx64   = ei.idx64;
@@ -534,21 +528,18 @@ void Backend::lower_inst(Index i) {
                     sel.elem_idx      = cast(phys, 32, false);
                     sel.is_signal     = lv.is_signal;
                     sel.sig           = lv.sig;
-                    sel.dyn_inrange   = inrange;
                     sel.bounds_checks = lv.bounds_checks;
                     sel.epoch_chain   = lv.epoch_chain;
                     sel.epoch_chain.push_back(epoch);
-                    add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
-                    set_lvalue(i, sel);
+                    set_lvalue(i, element_select(sel, lv, i, es.index, inrange, unknown, len));
                     return;
                 }
                 if (e.is_agg || e.is_handle) {
-                    LValue sel    = dyn_agg_elem_lvalue(lv, e, baseptr, phys, inrange);
+                    LValue sel      = dyn_agg_elem_lvalue(lv, e, baseptr, phys);
                     sel.epoch_chain = lv.epoch_chain;
                     sel.epoch_chain.push_back(epoch);
                     note_gc_container_root(sel, lv, handle, es.array_type);
-                    add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
-                    set_lvalue(i, sel);
+                    set_lvalue(i, element_select(sel, lv, i, es.index, inrange, unknown, len));
                     return;
                 }
                 LValue       el;
@@ -563,14 +554,12 @@ void Backend::lower_inst(Index i) {
                 el.width         = e.width;
                 el.is_signal     = lv.is_signal;
                 el.sig           = lv.sig;
-                el.dyn_inrange   = inrange;
                 el.bounds_checks = lv.bounds_checks;
                 el.epoch_chain   = lv.epoch_chain;
                 el.epoch_chain.push_back(epoch);
                 el.gc_owner      = lv.gc_owner;
                 note_gc_container_root(el, lv, handle, es.array_type);
-                add_elem_bounds_check(el, i, lv, es.index, inrange, unknown, len);
-                set_lvalue(i, el);
+                set_lvalue(i, element_select(el, lv, i, es.index, inrange, unknown, len));
                 return;
             }
             // A variable index into a fixed-size unpacked array has no static
@@ -578,18 +567,17 @@ void Backend::lower_inst(Index i) {
             // index is itself out of range (Table 7-1 draws no distinction
             // between an unknown index and one that misses the declared
             // bound -- both read the element default / no-op the write).
-            // Normalize to a 0-based position and gate the element with the
-            // same dyn_inrange machinery a dynamic-array/queue element uses:
-            // out-of-range read yields the element default, write is a
-            // no-op, the storage itself is never addressed out-of-bounds. The
-            // index is compared at its own width and signedness, not as its
-            // low 32 bits zero-extended (fixed_elem_pos).
+            // Normalize to a 0-based position and require the verdict of the
+            // element, as a dynamic-array/queue element does: an out-of-range read
+            // yields the element default, a write is a no-op, and the storage
+            // itself is never addressed out of bounds. The index is compared at
+            // its own width and signedness, not as its low 32 bits zero-extended
+            // (fixed_elem_pos).
             const Plane   idxp    = value_of(es.index);
             const ElemPos pos     = fixed_elem_pos(idxp, type_of(es.index), at.left, at.right);
             llvm::Value*  norm    = pos.pos;
             llvm::Value*  inrange = b_.CreateAnd(pos.in_range, b_.CreateNot(any_unknown(es.index)));
-            lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
-                                                       : inrange;
+            lv.require(b_, inrange);
             add_elem_bounds_check(lv, i, lv, es.index, inrange, any_unknown(es.index), nullptr,
                                   static_cast<int32_t>(at.left), static_cast<int32_t>(at.right));
             if (lv.is_agg) {
@@ -597,8 +585,8 @@ void Backend::lower_inst(Index i) {
                 // flattened): push a nested-GEP index step. A runtime element
                 // index makes the path non-static (deferred nonblocking path).
                 // The GEP step itself still uses the raw (unclamped) norm --
-                // an out-of-range dimension is caught by dyn_inrange above,
-                // which gates the eventual leaf load/store, not the GEP path.
+                // an out-of-range dimension is caught by the verdict above,
+                // which guards the eventual leaf load/store, not the GEP path.
                 lv.agg_path.push_back(norm);
                 lv.agg_static = false;
                 lv.agg_leaf   = is_leaf_type(at.element);
@@ -630,8 +618,8 @@ void Backend::lower_inst(Index i) {
             // resolved before its map handle can be read, and the direction is
             // this access's (AssocArg::for_write) -- resolving a READ with
             // put_ptr created the outer entry, which LRM 7.8.6 forbids.
-            const LValue raw_hlv = lvalue_of(p.op_extra.op);
-            const LValue hlv =
+            const Guarded raw_hlv = lvalue_of(p.op_extra.op);
+            const Guarded hlv =
               raw_hlv.is_assoc ? assoc_elem_lvalue(raw_hlv, aa.for_write != 0) : raw_hlv;
             LValue el;
             el.is_assoc          = true;
@@ -710,7 +698,7 @@ void Backend::lower_inst(Index i) {
             LValue        el;
             el.is_assoc         = true;
             el.assoc_default    = true;
-            const LValue& dlv   = lvalue_of(pt.op);
+            const Guarded& dlv  = lvalue_of(pt.op);
             el.assoc_handle     = lv_handle_ptr(dlv, HandleUse::Place);
             // Same as a[k]: writing the pattern-default slot changes what an
             // absent key reads back, so it is a mutation of the property.
@@ -760,7 +748,7 @@ void Backend::lower_inst(Index i) {
             // (position 0). Downstream elem_select / agg_elem then index the
             // slice relative to this anchor. Flat-storage arrays only -- an
             // aggregate-element (array-of-struct) slice is frontend-guarded.
-            LValue     lv = lvalue_of(p.op_extra.op);
+            Guarded    lv = lvalue_of(p.op_extra.op);
             const auto as = ir_->extra_data<ArrSlice>(p.op_extra.extra);
             const Type& st = std::get<Type>(mod_.pool.get(as.slice_type));
             if (lv.is_agg) {
@@ -936,7 +924,7 @@ void Backend::lower_inst(Index i) {
         }
 
         case Inst::Tag::Load: {
-            const LValue& raw = lvalue_of(p.unary);
+            const Guarded& raw = lvalue_of(p.unary);
             // A place reached through a virtual interface resolves every
             // def-relative base against the instance the handle named.
             CtxOverride ov(*this, raw.vif_ctx, lvalue_ctx_anchor(raw));
@@ -948,7 +936,7 @@ void Backend::lower_inst(Index i) {
             // work -- `a[k].name` where `name` is a string reaches here with both
             // is_assoc and is_string set, and the leaf pointer cannot be formed
             // until the entry's slot is known.
-            const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/false) : raw;
+            const Guarded lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/false) : raw;
             if (lv.is_handle) {
                 // Defense in depth: a container handle has no plane value; every
                 // legal consumer goes through the dedicated ops (frontend
@@ -965,9 +953,9 @@ void Backend::lower_inst(Index i) {
                 return;
             }
             const ValueType t = type_of(i);
-            // A gated place (an out-of-range element index, or an absent assoc
-            // key) reads the element default rather than its storage.
-            Plane v = lv.dyn_inrange != nullptr ? dyn_elem_load(lv) : lower_load(lv);
+            // A place that may be invalid (an out-of-range or x/z element index, an
+            // absent assoc key) reads the element default rather than its storage.
+            Plane v = load_guarded(lv);
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
             }
@@ -979,16 +967,16 @@ void Backend::lower_inst(Index i) {
             // wait queue: any process waiting for an edge this store produced
             // is woken. Snapshot the old value first so the transition can be
             // detected from old -> new.
-            const LValue& raw = lvalue_of(p.binary.l);
-            CtxOverride   ov(*this, raw.vif_ctx, lvalue_ctx_anchor(raw));
+            const Guarded& raw = lvalue_of(p.binary.l);
+            CtxOverride    ov(*this, raw.vif_ctx, lvalue_ctx_anchor(raw));
             emit_bounds_reports(raw, /*is_write=*/true);
             // As in Load, an assoc element resolves its base before anything
             // dispatches on the place's storage class -- put_ptr here, which
             // creates and proto-inits the entry (LRM 7.8: a write to a
             // nonexistent element adds it). Resolving first is what makes a
             // managed LEAF of an aggregate value writable.
-            const bool   deferred = raw.is_assoc;
-            const LValue lv       = deferred ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
+            const bool    deferred = raw.is_assoc;
+            const Guarded lv       = deferred ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
             if (lv.is_handle) {
                 throw BackendError{ "plane store to a container handle" };
             }
@@ -1011,47 +999,35 @@ void Backend::lower_inst(Index i) {
                 str_chg_after(lv, snap);
                 return;
             }
-            // The generational write barrier (§7). One site covers all three store
-            // paths below -- a deferred assoc element, a bounds-gated dynamic
-            // element, and a plain leaf -- because gc_owner is non-null for exactly
-            // the places whose storage a young collection does not scan: a class
-            // property, an interior aggregate of one, or an element of a container
-            // one owns. The string path returned above: a string leaf can never
-            // hold a handle, so it never carries an owner.
+            // The generational write barrier (§7). One site covers both store
+            // paths below -- a deferred assoc element and a plain or guarded leaf
+            // -- because gc_owner is non-null for exactly the places whose storage
+            // a young collection does not scan: a class property, an interior
+            // aggregate of one, or an element of a container one owns. The string
+            // path returned above: a string leaf can never hold a handle, so it
+            // never carries an owner.
             //
             // Emitted unconditionally rather than only for a class-typed RHS: the
             // owner test already proves a handle can land here, and a `obj.h = null`
             // that logs its owner costs a scan, never a miss. Placed BEFORE the
-            // store only because a bounds-gated store may branch away; the
+            // store only because a guarded store may branch away; the
             // remembered set is consulted at the next collection either way, and no
             // safepoint can intervene (the sole poll site is the drain loop's
             // quiescent edge, :11542).
             emit_gc_barrier_for(lv);
             if (deferred) {
                 // Assoc elements are guarded out of sensitivity lists, so no wait
-                // servicing. An aggregate leaf reached through a runtime element
-                // index into a fixed-array member carries a bounds gate; an
-                // out-of-range write is a no-op (LRM 7.4.5), as is a write under
-                // an invalid (x/z) key (7.8.6).
-                if (lv.dyn_inrange != nullptr) {
-                    dyn_elem_store(lv, value_of(p.binary.r));
-                } else {
-                    lower_store(lv, value_of(p.binary.r));
-                }
-                return;
-            }
-            if (lv.dyn_inrange != nullptr) {
-                // Out-of-range write is a no-op (LRM 7.5.1): guard the store
-                // (and its wait servicing) behind the in-range predicate.
-                dyn_elem_store(lv, value_of(p.binary.r));
+                // servicing. A write to an invalid element is a no-op: an element
+                // index outside the fixed-array member of the entry (LRM 7.4.5), an
+                // invalid (x/z) key (7.8.6).
+                lv.when_valid(b_, [&](const LValue& v) { lower_store(v, value_of(p.binary.r)); });
                 return;
             }
             // The snapshot covers the selected storage (whole signal, or one
             // array element) so an element write wakes Any-edge waiters on a
-            // change to that element rather than always reading element 0.
-            const ServiceSnapshot old = service_snapshot(lv);
-            lower_store(lv, value_of(p.binary.r));
-            service_after_write(lv, old);
+            // change to that element rather than always reading element 0. An
+            // invalid element is a no-op (LRM 7.5.1), wait servicing included.
+            store_guarded(lv, value_of(p.binary.r));
             return;
         }
         // A nonblocking assignment samples its RHS now but defers the write: it
@@ -1059,7 +1035,7 @@ void Backend::lower_inst(Index i) {
         // the NBA update region (see emit_nba_region), which commits shadow ->
         // live and services wait queues only after every active process has run.
         case Inst::Tag::StoreNb: {
-            const LValue& lv  = lvalue_of(p.binary.l);
+            const Guarded& lv = lvalue_of(p.binary.l);
             CtxOverride   ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
             emit_bounds_reports(lv, /*is_write=*/true);
             if (lv.is_string) {
@@ -1067,13 +1043,16 @@ void Backend::lower_inst(Index i) {
                 // and moves it into the target in the NBA region. Must precede
                 // value_of below: a string operand has no plane form. No GC
                 // barrier — a string can never hold a class handle.
-                emit_string_whole_nba(lv, p.binary.r);
+                lv.when_valid(b_, [&](const LValue& v) { emit_string_whole_nba(v, p.binary.r); });
                 return;
             }
             Plane         rhs = value_of(p.binary.r);
             if (type_of(p.binary.r).is_real) {
                 rhs = real_to_planes(fp_of(rhs));
             }
+            // Every nonblocking route below stages the value in a shadow or a record
+            // the NBA region replays by copy, so this is the one place to check it.
+            emit_encoding_check(rhs, type_of(p.binary.r).four_state, i);
             // The barrier for a nonblocking write into a class property (§7). It is
             // emitted at the STAGING site, not at the commit, because the commit is
             // the runtime's own memcpy out of a staging pool and carries no owner
@@ -1088,20 +1067,21 @@ void Backend::lower_inst(Index i) {
             // typed record; an aggregate leaf reached through a runtime array
             // index defers a memcpy record; everything else (a plain signal,
             // scalar select, or aggregate static leaf) uses the block shadow.
-            const bool agg_partial =
-              lv.is_agg && lv.agg_leaf && !selects_whole(lv);
-            if (lv.is_signal && (slot_of(lv.sig).is_array || slot_of(lv.sig).vif_rec)) {
-                emit_array_nba(lv, rhs);
-            } else if (lv.is_agg && (!lv.agg_static || agg_partial)) {
-                emit_agg_nba(lv, rhs);
-            } else {
-                lower_store_nb(lv, rhs);
-            }
-            // A signal that also takes timed NBAs keeps this write behind the deferred
-            // updates that were already released (emit_intra_nba_ordered).
-            if (lv.is_signal && is_intra_target(lv.sig)) {
-                emit_intra_nba_ordered(lv, rhs);
-            }
+            lv.when_valid(b_, [&](const LValue& v) {
+                const bool agg_partial = v.is_agg && v.agg_leaf && !selects_whole(v);
+                if (v.is_signal && (slot_of(v.sig).is_array || slot_of(v.sig).vif_rec)) {
+                    emit_array_nba(v, rhs);
+                } else if (v.is_agg && (!v.agg_static || agg_partial)) {
+                    emit_agg_nba(v, rhs);
+                } else {
+                    lower_store_nb(v, rhs);
+                }
+                // A signal that also takes timed NBAs keeps this write behind the deferred
+                // updates that were already released (emit_intra_nba_ordered).
+                if (v.is_signal && is_intra_target(v.sig)) {
+                    emit_intra_nba_ordered(v, rhs);
+                }
+            });
             return;
         }
         case Inst::Tag::AggCopy: {
@@ -1109,65 +1089,37 @@ void Backend::lower_inst(Index i) {
             // frontend emits this only for a trivially copyable object, so the byte
             // image is the value (no heap-owning leaf to deep-copy).
             const auto info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
-            LValue     dlv  = lvalue_of(p.op_extra.op);
-            LValue     slv  = lvalue_of(info.src);
+            Guarded    dlv  = lvalue_of(p.op_extra.op);
+            Guarded    slv  = lvalue_of(info.src);
             emit_bounds_reports(dlv, /*is_write=*/true);
             emit_bounds_reports(slv, /*is_write=*/false);
             // A whole (trivially-copyable) aggregate value of an associative
             // array: resolve the deferred slot to its map storage. The dst
-            // put_ptr creates the entry; the src get_ptr may miss, redirecting
-            // the copy source to the element x-init default (absent-key read).
-            llvm::Value* src_override = nullptr;
+            // put_ptr creates the entry; the src get_ptr may miss, which reads
+            // as the element's power-on image (an absent-key read).
             if (dlv.is_assoc) {
                 dlv = assoc_elem_lvalue(dlv, /*for_write=*/true);
             }
             if (slv.is_assoc) {
-                slv                  = assoc_elem_lvalue(slv, /*for_write=*/false);
-                llvm::Value* slot    = agg_slot_ptr(slv);
-                llvm::Value* proto   = agg_proto_global(info.type);
-                src_override         = b_.CreateSelect(slv.dyn_inrange, slot, proto);
+                slv = assoc_elem_lvalue(slv, /*for_write=*/false);
             }
             // A trivially copyable aggregate is exactly where a class handle hides
             // in a whole-object assignment: a handle IS trivially copyable (F4, a
             // bare i64 word), so `obj.rec = other.rec` memcpys handles into the
             // owner's image with no per-leaf store to instrument. Emitted after the
-            // assoc resolution so `dlv` is the final destination, and before both
-            // exits below so the bounds-gated path is covered too. gc_owner is
+            // assoc resolution so `dlv` is the final destination, and before the
+            // guard so the guarded path is covered too. gc_owner is
             // non-null only when the destination's type can reach a handle, so a
             // handle-free record copy emits nothing (§7).
             emit_gc_barrier_for(dlv);
             // A variable element index on either side (`dst = arr[i]`,
             // `arr[i] = src`) can miss the array. LRM 7.4.5: reading an
             // invalid element yields the Table 7-1 image of its type, and
-            // writing one performs no operation. Both sides used to be GEPed
-            // and memcpy'd regardless, which walks off the array -- a wild
-            // index segfaults.
-            //
-            // Source: substitute the type's power-on image, exactly as the
-            // absent-key case above already does. Destination: skip the copy
-            // outright, which also has to cover the zdiff and wait-service
-            // paths below, so it gates the whole body.
-            if (src_override == nullptr && slv.dyn_inrange != nullptr) {
-                llvm::Value* slot = slv.is_agg ? agg_slot_ptr(slv) : flat_elem_ptr(slv);
-                src_override      = b_.CreateSelect(slv.dyn_inrange, slot,
-                                                    agg_copy_proto(info.type, slv));
-                slv.elem_idx      = nullptr; // the override is the whole source
-            }
-            if (dlv.dyn_inrange != nullptr) {
-                auto* fn   = b_.GetInsertBlock()->getParent();
-                auto* dobb = llvm::BasicBlock::Create(ctx_, "aggcopy.do", fn);
-                auto* cont = llvm::BasicBlock::Create(ctx_, "aggcopy.cont", fn);
-                b_.CreateCondBr(dlv.dyn_inrange, dobb, cont);
-                b_.SetInsertPoint(dobb);
-                LValue clean      = dlv;
-                clean.dyn_inrange = nullptr;
-                clean.bounds_checks.clear();
-                emit_agg_copy(info, clean, slv, src_override);
-                b_.CreateBr(cont);
-                b_.SetInsertPoint(cont);
-                return;
-            }
-            emit_agg_copy(info, dlv, slv, src_override);
+            // writing one performs no operation. The source reads as that
+            // image where its select is invalid (emit_agg_copy); the destination is
+            // not copied to at all, which also covers the zdiff and wait-service
+            // exits of the copy, so the guard wraps the whole body.
+            dlv.when_valid(b_, [&](const LValue& d) { emit_agg_copy(info, d, slv); });
             return;
         }
 
@@ -1177,7 +1129,7 @@ void Backend::lower_inst(Index i) {
         // it (emit_intra_commit).
         case Inst::Tag::StoreNbDelay: {
             const auto    info  = ir_->extra_data<StoreNbDelayInfo>(p.op_extra.extra);
-            const LValue& lv    = lvalue_of(p.op_extra.op);
+            const Guarded& lv   = lvalue_of(p.op_extra.op);
             emit_bounds_reports(lv, /*is_write=*/true);
             // No write barrier here, and the reason is structural rather than a
             // judgement: all three deferred stores take a whole-SIGNAL lvalue
@@ -1193,8 +1145,14 @@ void Backend::lower_inst(Index i) {
             // instead of silently missing a remembered-set entry (PRINCIPLES.md).
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane   rhs   = value_of(info.value);
+            emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
-            emit_intra_nba_arm(lv, rhs, ticks);
+            // A variable index outside the declared bound (LRM 7.4.5 / 11.5.1) is a
+            // no-op, so nothing is armed at all. Otherwise the record would carry an
+            // out-of-bounds destination pointer that the NBA region dereferences
+            // unconditionally when it replays -- and for a scalar select, an
+            // unrestricted mask.
+            lv.when_valid(b_, [&](const LValue& v) { emit_intra_nba_arm(v, rhs, ticks); });
             return;
         }
 
@@ -1205,12 +1163,13 @@ void Backend::lower_inst(Index i) {
         // region of the fired instant (emit_intra_commit), like `x <= #d`.
         case Inst::Tag::StoreInertialDelay: {
             const auto    info  = ir_->extra_data<StoreNbDelayInfo>(p.op_extra.extra);
-            const LValue& lv    = lvalue_of(p.op_extra.op);
+            const Guarded& lv   = lvalue_of(p.op_extra.op);
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane   rhs   = value_of(info.value);
+            emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
-            emit_inertial_arm(lv, rhs, ticks);
+            lv.when_valid(b_, [&](const LValue& v) { emit_inertial_arm(v, rhs, ticks); });
             return;
         }
 
@@ -1220,17 +1179,19 @@ void Backend::lower_inst(Index i) {
         // the NBA region commits (emit_intra_commit).
         case Inst::Tag::StoreNbEvent: {
             const auto    info  = ir_->extra_data<StoreNbEventInfo>(p.op_extra.extra);
-            const LValue& lv    = lvalue_of(p.op_extra.op);
+            const Guarded& lv   = lvalue_of(p.op_extra.op);
             emit_bounds_reports(lv, /*is_write=*/true);
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane  rhs   = value_of(info.value);
+            emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value* count = must_of(info.count);
             llvm::SmallVector<llvm::Value*, 4> ids;
             for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
                 ids.push_back(trigger_id_value(tr.signal, tr.edge));
             }
-            emit_intra_event_arm(lv, rhs, count, ids);
+            // Out-of-range variable index: register nothing (see StoreNbDelay).
+            lv.when_valid(b_, [&](const LValue& v) { emit_intra_event_arm(v, rhs, count, ids); });
             return;
         }
 
@@ -1664,7 +1625,7 @@ void Backend::lower_inst(Index i) {
         }
         case Inst::Tag::StrPutc: {
             const auto    sp = ir_->extra_data<StrPutcInfo>(p.op_extra.extra);
-            const LValue& lv = lvalue_of(p.op_extra.op);
+            const Guarded& lv = lvalue_of(p.op_extra.op);
             emit_bounds_reports(lv, /*is_write=*/true);
             llvm::Value*  snap = str_chg_snapshot(lv);
             llvm::Value*  str  = lv_string_ptr(lv, StringUse::Write);
@@ -1705,7 +1666,7 @@ void Backend::lower_inst(Index i) {
                               : tag == T::StrHextoa   ? str_hextoa_fn()
                               : tag == T::StrOctoa    ? str_octtoa_fn()
                                                       : str_bintoa_fn();
-            const LValue& lv = lvalue_of(p.binary.l);
+            const Guarded& lv = lvalue_of(p.binary.l);
             llvm::Value*  v        = cast(must_of(p.binary.r), 32, true);
             llvm::Value* snap = str_chg_snapshot(lv);
             b_.CreateCall(
@@ -1714,7 +1675,7 @@ void Backend::lower_inst(Index i) {
             return;
         }
         case Inst::Tag::StrRealtoa: {
-            const LValue& lv = lvalue_of(p.binary.l);
+            const Guarded& lv = lvalue_of(p.binary.l);
             llvm::Value*  v  = fp_of(value_of(p.binary.r));
             llvm::Value* snap = str_chg_snapshot(lv);
             b_.CreateCall(str_realtoa_fn(), { lv_string_ptr(lv, StringUse::Write), v,
@@ -1889,7 +1850,7 @@ void Backend::lower_inst(Index i) {
             const uint32_t pb  = plane_bytes(t.width);
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.append");
             b_.CreateAlignedStore(must_of(p.binary.r), buf, llvm::Align(1));
-            const LValue& alv  = lvalue_of(p.binary.l);
+            const Guarded& alv = lvalue_of(p.binary.l);
             llvm::Value*  snap = str_chg_snapshot(alv);
             b_.CreateCall(str_append_packed_fn(),
                           { lv_string_ptr(alv, StringUse::Write), buf, b_.getInt32(t.width),
@@ -2340,7 +2301,7 @@ void Backend::lower_inst(Index i) {
             // creating thread that seeds it is a real Urandom the frontend
             // emits beside the ClassNew, so the frame machinery already
             // accounts for every draw that touches a process stream.
-            llvm::Value* rng = agg_slot_ptr(lvalue_of(ir_->payload(i).unary));
+            llvm::Value* rng = agg_slot_ptr(lvalue_of(ir_->payload(i).unary).unguarded());
             set_value(i, lower_urandom(rng));
             return;
         }
@@ -2350,7 +2311,7 @@ void Backend::lower_inst(Index i) {
             // the object's own state. The same runtime entry as the
             // per-process reseed -- only the state pointer differs.
             const auto&  p    = ir_->payload(i).binary;
-            llvm::Value* rng  = agg_slot_ptr(lvalue_of(p.l));
+            llvm::Value* rng  = agg_slot_ptr(lvalue_of(p.l).unguarded());
             llvm::Value* seed = cast(must_of(p.r), 64, false);
             b_.CreateCall(urandom_seed_fn(), { rng, seed });
             return;
@@ -2363,8 +2324,8 @@ void Backend::lower_inst(Index i) {
             // bit selection stays out of the JIT.
             const auto&  p    = ir_->payload(i).op_extra;
             const auto   info = ir_->extra_data<RandcInfo>(p.extra);
-            llvm::Value* seen = agg_slot_ptr(lvalue_of(p.op));
-            llvm::Value* rng  = agg_slot_ptr(lvalue_of(info.rng));
+            llvm::Value* seen = agg_slot_ptr(lvalue_of(p.op).unguarded());
+            llvm::Value* rng  = agg_slot_ptr(lvalue_of(info.rng).unguarded());
             set_value(i, two_val(b_.CreateCall(randc_next_fn(),
                                                { seen, b_.getInt32(info.nvals), rng })));
             return;
@@ -2531,17 +2492,19 @@ LValue Backend::signal_lvalue(Signal sig) {
         lv.sig       = sig;
         return lv;
     }
-    return LValue{ .base        = storage_ptr(s),
-                   .slot_ty     = s.slot_ty,
-                   .four_state  = s.four_state,
-                   .has_z       = s.has_z,
-                   .array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr,
-                   .store_width = s.width,
-                   .bit_off     = b_.getInt32(0),
-                   .width       = s.width,
-                   .is_signal   = true,
-                   .sig         = sig,
-                   .is_string   = s.is_string };
+    LValue lv;
+    lv.base        = storage_ptr(s);
+    lv.slot_ty     = s.slot_ty;
+    lv.four_state  = s.four_state;
+    lv.has_z       = s.has_z;
+    lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
+    lv.store_width = s.width;
+    lv.bit_off     = b_.getInt32(0);
+    lv.width       = s.width;
+    lv.is_signal   = true;
+    lv.sig         = sig;
+    lv.is_string   = s.is_string;
+    return lv;
 }
 
 // Whole-storage lvalue for a function-frame local (per-call frame struct). A ref
@@ -2569,16 +2532,18 @@ LValue Backend::local_lvalue(uint32_t index) {
     if (base == nullptr) {
         base = b_.CreateStructGEP(frame_ty_, frame_, index);
     }
-    return LValue{ .base        = base,
-                   .slot_ty     = s.slot_ty,
-                   .four_state  = s.four_state,
-                   .has_z       = s.four_state,
-                   .store_width = s.width,
-                   .bit_off     = b_.getInt32(0),
-                   .width       = s.width,
-                   .is_signal   = false,
-                   .sig         = Signal{ 0 },
-                   .is_string   = s.is_string };
+    LValue lv;
+    lv.base        = base;
+    lv.slot_ty     = s.slot_ty;
+    lv.four_state  = s.four_state;
+    lv.has_z       = s.four_state;
+    lv.store_width = s.width;
+    lv.bit_off     = b_.getInt32(0);
+    lv.width       = s.width;
+    lv.is_signal   = false;
+    lv.sig         = Signal{ 0 };
+    lv.is_string   = s.is_string;
+    return lv;
 }
 
 Plane Backend::lower_load(const LValue& lv) {
@@ -2698,8 +2663,11 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
     if (!lv.four_state) {
         return two_val(must);
     }
-    return packed(must, cast(b_.CreateLoad(bt, oy), n, false),
-                  cast(b_.CreateLoad(bt, oz), n, false));
+    const Plane got = packed(must, cast(b_.CreateLoad(bt, oy), n, false),
+                             cast(b_.CreateLoad(bt, oz), n, false));
+    // What rt_wide_sel hands back is a value entering generated code.
+    emit_encoding_check(got, true, cur_inst_);
+    return got;
 }
 
 // Write a runtime-offset selection into one wide slot's planes: the runtime merges
@@ -2721,6 +2689,8 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
         return buf;
     };
 
+    // The value crosses into the runtime here, whichever store brought it.
+    emit_encoding_check(rhs, four, cur_inst_);
     std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width, four);
     if (!four) {
         auto* zbuf = sel_plane_buf(n, "wins.zero");
@@ -2743,65 +2713,26 @@ void Backend::wide_dyn_store(const LValue& lv, Plane rhs) {
                           lv.four_state, rhs);
 }
 
-// Bounds-checked load of a dynamic-array element (LRM 7.5.1): in range, load
-// from the heap buffer; out of range, yield the element default (X for
-// 4-state, 0 for 2-state). The heap is only dereferenced on the in-range
-// path, so an out-of-range or negative index never touches memory. Returns
-// the same Plane shape lower_load would (2-state -> two_val; else { i2W, iW }),
-// so the caller's real / domain handling is unchanged.
-Plane Backend::dyn_elem_load(const LValue& lv) {
-    auto* fn    = b_.GetInsertBlock()->getParent();
-    auto* inbb  = llvm::BasicBlock::Create(ctx_, "dyn.load.in", fn);
-    auto* defbb = llvm::BasicBlock::Create(ctx_, "dyn.load.def", fn);
-    auto* cont  = llvm::BasicBlock::Create(ctx_, "dyn.load.cont", fn);
-    b_.CreateCondBr(lv.dyn_inrange, inbb, defbb);
-
-    b_.SetInsertPoint(inbb);
-    LValue clean       = lv;
-    clean.dyn_inrange  = nullptr;
-    clean.bounds_checks.clear();
-    const Plane vin    = lower_load(clean);
-    auto*       inend  = b_.GetInsertBlock();
-    b_.CreateBr(cont);
-
-    b_.SetInsertPoint(defbb);
-    b_.CreateBr(cont);
-
-    b_.SetInsertPoint(cont);
-    if (!lv.four_state) {
-        auto* phi = b_.CreatePHI(int_ty(lv.width), 2);
-        phi->addIncoming(vin.mm, inend);
-        phi->addIncoming(zero(lv.width), defbb);
-        return two_val(phi);
-    }
-    auto* mmphi = b_.CreatePHI(int_ty(2 * lv.width), 2);
-    mmphi->addIncoming(vin.mm, inend);
-    mmphi->addIncoming(x_mm(lv.width), defbb);
-    auto* zphi = b_.CreatePHI(int_ty(lv.width), 2);
-    zphi->addIncoming(z_of(vin, true), inend);
-    zphi->addIncoming(zero(lv.width), defbb);
-    return { mmphi, zphi };
+// A read of a place that may be invalid (LRM 7.4.5, 7.5.1, 7.8.6, 7.10.1): where
+// the select is valid, load from the storage; where not, yield the element default
+// (X for 4-state, 0 for 2-state). The storage is only dereferenced on the valid
+// path, so a wild or x/z index never touches memory. Returns the same Plane shape
+// lower_load would (2-state -> two_val; else { i2W, iW }), so the caller's real /
+// domain handling is unchanged.
+Plane Backend::load_guarded(const Guarded& g) {
+    const Plane otherwise = g.four_state ? Plane{ x_mm(g.width), zero(g.width) }
+                                         : two_val(zero(g.width));
+    return g.read_or(b_, [&](const LValue& lv) { return lower_load(lv); }, otherwise);
 }
 
-// Bounds-checked store of a dynamic-array element (LRM 7.5.1): the store and
-// its wait-queue servicing run only when the index is in [0, len); an
-// out-of-range write is a no-op.
-void Backend::dyn_elem_store(const LValue& lv, Plane rhs) {
-    auto* fn   = b_.GetInsertBlock()->getParent();
-    auto* dobb = llvm::BasicBlock::Create(ctx_, "dyn.store.do", fn);
-    auto* cont = llvm::BasicBlock::Create(ctx_, "dyn.store.cont", fn);
-    b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
-
-    b_.SetInsertPoint(dobb);
-    LValue clean              = lv;
-    clean.dyn_inrange         = nullptr;
-    clean.bounds_checks.clear();
-    const ServiceSnapshot old = service_snapshot(clean);
-    lower_store(clean, rhs);
-    service_after_write(clean, old);
-    b_.CreateBr(cont);
-
-    b_.SetInsertPoint(cont);
+// A blocking store to a place that may be invalid: the store and its wait-queue
+// servicing run only where the select is valid; an invalid write is a no-op.
+void Backend::store_guarded(const Guarded& g, Plane rhs) {
+    g.when_valid(b_, [&](const LValue& lv) {
+        const ServiceSnapshot old = service_snapshot(lv);
+        lower_store(lv, rhs);
+        service_after_write(lv, old);
+    });
 }
 
 void Backend::lower_cond(Index i) {

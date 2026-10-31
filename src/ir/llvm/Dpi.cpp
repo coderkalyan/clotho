@@ -285,7 +285,7 @@ llvm::Value* Backend::build_dpi_open_array_desc(Index                       a,
                                                 DpiCType                    elem_ct,
                                                 ArgDir                      dir,
                                                 std::vector<OaMarshalBack>& backs) {
-    const LValue lv = lvalue_of(a);
+    const LValue lv = lvalue_of(a).unguarded();
     const Ref    arr_ref = open_array_type_ref(a);
     const Type&  at      = std::get<Type>(mod_.pool.get(arr_ref));
     if (at.kind == Type::Kind::DynArray) {
@@ -516,23 +516,29 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
             // value; output leaves it empty for the C to fill; inout copies in.
             llvm::Value* scratch = dpi_vec_alloca(ct, dpi_nchunks(w));
             if (dir == ArgDir::In) {
+                emit_encoding_check(value_of(a), type_of(a).four_state, i);
                 dpi_vec_copyin(ct, value_of(a), type_of(a).four_state, w, scratch);
             } else if (dir == ArgDir::Inout) {
-                const LValue& alv = lvalue_of(a);
-                dpi_vec_copyin(ct, lower_load(alv), alv.four_state, w, scratch);
+                const LValue alv = lvalue_of(a).unguarded();
+                const Plane in = lower_load(alv);
+                emit_encoding_check(in, alv.four_state, i);
+                dpi_vec_copyin(ct, in, alv.four_state, w, scratch);
             }
             argv.push_back(scratch);
             if (dir != ArgDir::In) {
                 outs.push_back({ a, ct, scratch, nullptr, w });
             }
         } else if (dir == ArgDir::In) {
+            emit_encoding_check(value_of(a), type_of(a).four_state, i);
             argv.push_back(dpi_arg_to_c(ct, value_of(a), type_of(a).four_state));
         } else {
             llvm::Type*  cty     = dpi_c_llvm_ty(ct);
             llvm::Value* scratch = entry_alloca(cty, "dpi.out");
             if (dir == ArgDir::Inout) {
-                const LValue& alv = lvalue_of(a);
-                b_.CreateStore(dpi_arg_to_c(ct, lower_load(alv), alv.four_state), scratch);
+                const LValue alv = lvalue_of(a).unguarded();
+                const Plane in = lower_load(alv);
+                emit_encoding_check(in, alv.four_state, i);
+                b_.CreateStore(dpi_arg_to_c(ct, in, alv.four_state), scratch);
             }
             argv.push_back(scratch);
             outs.push_back({ a, ct, scratch, cty, w });
@@ -553,7 +559,7 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
         const Plane pl = is_dpi_vec(o.ct)
                            ? dpi_vec_copyout(o.ct, o.scratch, o.w)
                            : dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch));
-        lower_store(lvalue_of(o.temp), pl);
+        lower_store(lvalue_of(o.temp).unguarded(), pl);
     }
     // Marshalled open-array output/inout: unpack the C-written svVecVal scratch
     // back into the design element storage (inline IR, native iW/i2W). A

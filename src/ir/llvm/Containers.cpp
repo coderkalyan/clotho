@@ -418,27 +418,30 @@ llvm::Value* Backend::handle_sink_global(Ref elem_type) {
 // what keeps the mutation surface closed: a call site added later cannot omit
 // the answer, and a mutation miscategorised as a read is a permanent park --
 // the bug class the notifier mechanism exists to remove.
-llvm::Value* Backend::lv_handle_ptr(const LValue& lv, HandleUse use) {
-    if (lv.is_assoc) {
+llvm::Value* Backend::lv_handle_ptr(const Guarded& g, HandleUse use) {
+    if (g.is_assoc) {
         // The deferred assoc entry resolves first; a for-write resolution of a
         // waited-on map fires there, so this recursion must not fire again for
         // the element it produced.
-        const LValue el = assoc_elem_lvalue(lv, use != HandleUse::Read);
+        const Guarded el = assoc_elem_lvalue(g, use != HandleUse::Read);
         return lv_handle_ptr(el, use == HandleUse::Mutate ? HandleUse::Place : use);
     }
     if (use == HandleUse::Mutate) {
-        notify_container_mutation(lv);
+        notify_container_mutation(g);
     }
-    llvm::Value* ptr = lv.is_agg ? agg_slot_ptr(lv) : lv.base;
-    if (lv.dyn_inrange == nullptr || !lv.is_handle) {
-        return ptr;
-    }
-    if (lv.handle_type == Ref::Invalid) {
+    const auto form = [&](const LValue& lv) { return lv.is_agg ? agg_slot_ptr(lv) : lv.base; };
+    // A handle reached through an invalid element (`q[i]` where the element is itself
+    // a container, an absent associative key) redirects to the sink, so the heap
+    // buffer is never addressed past its live length.
+    const auto sink = [&]() -> llvm::Value* {
+        llvm::Value* s = handle_sink_global(g.handle_type);
+        emit_handle_delete(s, g.handle_type);
+        return s;
+    };
+    if (g.valid() != nullptr && (!g.is_handle || g.handle_type == Ref::Invalid)) {
         throw BackendError{ "internal: bounds-checked handle lvalue with no element type" };
     }
-    llvm::Value* sink = handle_sink_global(lv.handle_type);
-    emit_handle_delete(sink, lv.handle_type);
-    return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
+    return g.pointer_or(b_, form, sink);
 }
 
 // Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or
@@ -460,7 +463,7 @@ llvm::Value* Backend::lv_handle_ptr(const LValue& lv, HandleUse use) {
 // completes its mutation with no intervening suspend; the two that cannot -- a
 // container bound to a `ref`/`inout` formal of a task -- use `Place` here and
 // fire from the call's own after-write bracket instead.
-void Backend::notify_container_mutation(const LValue& lv) {
+void Backend::notify_container_mutation(const LValueInfo& lv) {
     if (lv.chg == nullptr) {
         // A container living in a SIGNAL -- a module-level queue / dynamic /
         // associative array, or a static class property's shared slot -- has
@@ -517,7 +520,7 @@ void Backend::service_signal_container_mutation(Signal sig) {
 // same object, so its slot is the object body's GEP past the class header, and
 // it is minted by emit_class_body_init at `new`, so the handle is always live
 // and needs no null guard (as a plain `-> e` on a declared event needs none).
-void Backend::fire_prop_notifier(const LValue& lv, Edge edge) {
+void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
     const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)];
     llvm::Value*   slot =
       b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
@@ -539,7 +542,7 @@ void Backend::fire_prop_notifier(const LValue& lv, Edge edge) {
 // scratch handle is an ENTRY-block alloca, so a bracket inside a loop reuses one
 // slot rather than growing the stack, and the init / deinit pair is balanced
 // across the bracket so each pass copies into a fresh handle.
-llvm::Value* Backend::str_chg_snapshot(const LValue& lv) {
+llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
     if (lv.chg == nullptr) {
         return nullptr;
     }
@@ -561,7 +564,7 @@ llvm::Value* Backend::str_chg_snapshot(const LValue& lv) {
 
 // Close a str_chg_snapshot bracket: fire the property's any-change notifier iff
 // the characters differ, then release the snapshot.
-void Backend::str_chg_after(const LValue& lv, llvm::Value* snap) {
+void Backend::str_chg_after(const Guarded& lv, llvm::Value* snap) {
     if (snap == nullptr) {
         return;
     }
@@ -788,21 +791,23 @@ void Backend::lower_dyn_array_shuffle(Index i) {
 // from `base` and ignores `elem_idx`. A following MemberSelect / ElemSelect then
 // descends it exactly as it descends a module signal's aggregate (agg_member /
 // agg_elem only push the GEP path, never touch the base), which is what makes
-// `q[i].f` and `q[i][j]` fall out with no container-specific code. `dyn_inrange`
-// carries LRM 7.4.5: an out-of-range leaf read yields the element default, a
-// write is dropped, and the heap is never addressed past the live length.
-LValue Backend::dyn_agg_elem_lvalue(const LValue&  container,
-                                    const DynElem& e,
-                                    llvm::Value*   data,
-                                    llvm::Value*   slot_index,
-                                    llvm::Value*   inrange) {
+// `q[i].f` and `q[i][j]` fall out with no container-specific code.
+//
+// The lvalue is valid by construction. A select with an index that can be invalid
+// (the ElemSelect arms) makes it a Guarded through element_select, which carries
+// LRM 7.4.5: an invalid leaf read yields the element default, a write is dropped,
+// and the heap is never addressed past the live length.
+LValue Backend::dyn_agg_elem_lvalue(const LValueInfo& container,
+                                    const DynElem&    e,
+                                    llvm::Value*      data,
+                                    llvm::Value*      slot_index) {
     LValue sel;
     sel.base = b_.CreateInBoundsGEP(b_.getInt8Ty(), data, b_.CreateMul(slot_index, b_.getInt64(dynarr_stride(e))));
     if (e.is_handle) {
         // A nested container element: the slot holds ITS handle, so the element
-        // lvalue is a handle lvalue whose base is that slot. Out-of-range access
-        // redirects to the sink (lv_handle_ptr), which is why the predicate has to
-        // travel with it.
+        // lvalue is a handle lvalue whose base is that slot. An invalid element
+        // redirects to the sink (lv_handle_ptr), which is why the verdict has to
+        // travel with it (element_select).
         sel.is_handle   = true;
         sel.handle_type = e.elem_type;
         sel.slot_ty     = e.slot_ty;
@@ -812,7 +817,6 @@ LValue Backend::dyn_agg_elem_lvalue(const LValue&  container,
     }
     sel.is_signal     = container.is_signal;
     sel.sig           = container.sig;
-    sel.dyn_inrange   = inrange;
     sel.bounds_checks = container.bounds_checks;
     // A handle written into a dynamic-array / queue element lands in the
     // container's malloc'd payload, reachable only through the owning object's
@@ -821,6 +825,19 @@ LValue Backend::dyn_agg_elem_lvalue(const LValue&  container,
     // exactly when its element does, so the owner is already null if it cannot.
     sel.gc_owner      = container.gc_owner;
     return sel;
+}
+
+// The element of a dynamic array or queue: valid where the index is inside the live
+// length. Nothing about the container place is required here, because that place has
+// already been opened: the element is rooted at the data pointer loaded through
+// lv_handle_ptr, which hands back the empty sink for an invalid container, so its
+// length is 0 and `inrange` is false whenever the container is invalid.
+Guarded Backend::element_select(const LValue& el, const LValueInfo& named, Index at, Index idx_expr,
+                                llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent) {
+    Guarded g(el);
+    g.require(b_, inrange);
+    add_elem_bounds_check(g, at, named, idx_expr, inrange, unknown, extent);
+    return g;
 }
 
 // An lvalue addressing a single element slot at raw pointer `ptr` (a scratch
@@ -907,8 +924,8 @@ void Backend::lower_queue_push(Index i, bool front) {
         // directly. The frontend guarantees an lvalue operand here
         // (lower_container_element_value), staging a '{...} pattern into a
         // canonical aggregate temp when needed.
-        llvm::Value* src =
-          e.is_agg ? agg_slot_ptr(lvalue_of(qa.arg)) : lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read);
+        llvm::Value* src = e.is_agg ? agg_read_ptr(lvalue_of(qa.arg), e.elem_type)
+                                    : lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read);
         b_.CreateCall(queue_push_fn(front),
                       { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                         ops,
@@ -931,7 +948,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
     const auto&   p      = ir_->payload(i).op_type;
     const DynElem e      = dynarr_elem(p.type);
     llvm::Value*  ops    = elem_ops_global(p.type);
-    const LValue& qlv    = lvalue_of(p.op);
+    const Guarded& qlv   = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     emit_empty_pop_bounds_check(i, handle, qlv);
     if (e.is_string) {
@@ -1003,7 +1020,7 @@ void Backend::lower_queue_insert(Index i) {
     llvm::Value*  ops   = elem_ops_global(qi.queue_type);
     llvm::Value*  idx   = cast(must_of(qi.idx), 64, false);
     llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
-    const LValue& qlv   = lvalue_of(p.op);
+    const Guarded& qlv  = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     // A new element, so a new reference. See lower_queue_push.
     emit_gc_barrier_for(qlv);
@@ -1015,8 +1032,8 @@ void Backend::lower_queue_insert(Index i) {
         return;
     }
     if (e.is_agg || e.is_handle) {
-        llvm::Value* src =
-          e.is_agg ? agg_slot_ptr(lvalue_of(qi.val)) : lv_handle_ptr(lvalue_of(qi.val), HandleUse::Read);
+        llvm::Value* src = e.is_agg ? agg_read_ptr(lvalue_of(qi.val), e.elem_type)
+                                    : lv_handle_ptr(lvalue_of(qi.val), HandleUse::Read);
         b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
         return;
     }
@@ -1030,7 +1047,7 @@ void Backend::lower_queue_delete_idx(Index i) {
     const auto&   p      = ir_->payload(i).op_extra;
     const auto    qa     = ir_->extra_data<QueueArg>(p.extra);
     llvm::Value*  idx    = cast(must_of(qa.arg), 64, false);
-    const LValue& qlv    = lvalue_of(p.op);
+    const Guarded& qlv   = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     emit_queue_bounds_check(i, handle, qa.arg, qlv, /*allow_append=*/false);
     b_.CreateCall(queue_delete_idx_fn(), { handle, elem_ops_global(qa.queue_type), idx });
@@ -1136,7 +1153,7 @@ llvm::Value* Backend::queue_ring_slot(llvm::Value* head, llvm::Value* idx, llvm:
     return b_.CreateSelect(b_.CreateICmpUGE(sum, cap), b_.CreateSub(sum, cap), sum);
 }
 
-// The lvalue of logical element `idx` of a container, with no bounds predicate:
+// The lvalue of logical element `idx` of a container, with no verdict:
 // for callers that already walk within the live length. A queue's logical index
 // wraps through its ring (queue_ring_slot).
 LValue Backend::container_elem_lvalue(llvm::Value*   handle,
@@ -1151,10 +1168,10 @@ LValue Backend::container_elem_lvalue(llvm::Value*   handle,
         phys              = queue_ring_slot(head, idx, cap);
     }
     if (e.is_agg || e.is_handle) {
-        return dyn_agg_elem_lvalue(LValue{}, e, data, phys, /*inrange=*/nullptr);
+        return dyn_agg_elem_lvalue(LValueInfo{}, e, data, phys);
     }
     // A plane element: the same `[0 x slot]` shape the ElemSelect arms build, with
-    // no bounds predicate (the caller walks within the live length).
+    // no verdict (the caller walks within the live length).
     LValue el;
     el.base        = data;
     el.slot_ty     = e.slot_ty;
@@ -1176,7 +1193,7 @@ LValue Backend::container_elem_lvalue(llvm::Value*   handle,
 // container_elem_lvalue's `type` parameter exists only to select.
 LValue Backend::tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx) {
     if (e.is_agg || e.is_handle) {
-        return dyn_agg_elem_lvalue(LValue{}, e, data, idx, /*inrange=*/nullptr);
+        return dyn_agg_elem_lvalue(LValueInfo{}, e, data, idx);
     }
     LValue el;
     el.base        = data;
@@ -1200,7 +1217,7 @@ LValue Backend::tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value
 // also what gives a queue of queues (or of structs holding queues) a compare at
 // all. The must / may accumulators live in allocas so the loop needs no PHI
 // plumbing; LLVM promotes them.
-Plane Backend::emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e) {
+Plane Backend::emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e) {
     llvm::Value* ha      = lv_handle_ptr(lhs, HandleUse::Read);
     llvm::Value* hb      = lv_handle_ptr(rhs, HandleUse::Read);
     const auto [la, ba]  = container_len_base(ha, type);

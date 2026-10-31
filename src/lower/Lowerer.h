@@ -407,7 +407,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
 //
 // Deliberately SAFE, because each has an LRM-defined value and no trap: an
 // out-of-range index into a fixed / dynamic array or queue (x, or the element
-// default -- LValue::dyn_inrange), a read of a missing associative-array key (the
+// default -- backend Guarded), a read of a missing associative-array key (the
 // element default), integer divide / modulo by zero (all-x -- lower_divmod guards
 // the divisor), real divide by zero (IEEE inf / NaN), and a string index out of
 // range (0).

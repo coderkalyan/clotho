@@ -159,7 +159,7 @@ llvm::Value* Backend::vcd_index_value(Signal sig, int32_t base) {
 // normalized element index (a whole-array store touches the range). A no-op for
 // a non-dumped signal or a PreInit store (before $dumpvars, subsumed by the
 // initial dump).
-void Backend::vcd_touch_lvalue(const LValue& lv) {
+void Backend::vcd_touch_lvalue(const LValueInfo& lv) {
     if (!design_uses_vcd_ || silent_stores_ || !lv.is_signal) {
         return;
     }

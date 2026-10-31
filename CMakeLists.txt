@@ -1060,6 +1060,8 @@ set(CLOTHO_TEST_SOURCES
   tests/data_model_test.cpp
   tests/dynamic_array_test.cpp
   tests/memory_bounds_test.cpp
+  tests/invalid_index_test.cpp
+  tests/encoding_check_test.cpp
   tests/queue_test.cpp
   tests/associative_array_test.cpp
   tests/array_ordering_test.cpp

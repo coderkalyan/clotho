@@ -47,8 +47,13 @@ when it does.
   located error at the declaration or expression that introduces the width.
 - The constant pool keeps the frontend's encoding; the backend converts on read
   through one shared set of helpers.
-- The encoding's invariants are checked by assertions in debug builds at stores
-  and at call and runtime boundaries. **Not yet:** no checks.
+- The encoding's invariants (must & ~may == 0, z only on unknown bits) are checked
+  by assertions in debug builds (`CLOTHO_EXTRA_ASSERTS`) wherever a value is stored
+  to a signal or frame, staged for a nonblocking update, passed or returned, handed
+  to a runtime routine (format operands, wide selects, DPI arguments) or taken back
+  from one (`emit_encoding_check`); a violation is a located internal error
+  (`rt_encoding_violation`). Nothing is generated otherwise. Bits above a value's
+  width cannot exist: it is an LLVM integer of exactly that width.
 - Reals are native floating point everywhere: SSA, storage, arguments and
   results. **Not yet:** stored and passed as integer bit patterns.
 - Handles (class, event, chandle, virtual interface) are a pointer plus a
@@ -115,8 +120,10 @@ when it does.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.
 - An element access with an invalid index is guarded so only valid paths touch
-  memory. The select itself is safe by construction; no consumer can bypass it.
-  **Not yet:** each consumer applies a carried validity flag.
+  memory. The select itself is safe by construction; no consumer can bypass it:
+  a place whose select may be invalid is a `Guarded`, not an `LValue`, with its
+  storage pointer private, so no raw primitive accepts it and the guards
+  (`when_valid`, `read_or`, `pointer_or`) are the only way to an address.
 - Change detection after a blocking store compares the whole slot before and
   after; through the wide-select path it compares only the words the store
   touches.

@@ -66,7 +66,7 @@ llvm::Value* Backend::smax(llvm::Value* a, llvm::Value* b) {
 // Returns the verdict --sanitize=bounds reports on. It is read off the
 // UNCLAMPED offsets rather than by counting mask bits, so it is three
 // compares and cannot disagree with the mask the access then uses.
-Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
+Backend::SelectVerdict Backend::set_select_bounds(LValueInfo&  lv,
                                                   llvm::Value* cbase,
                                                   uint32_t     cwidth,
                                                   uint32_t     selw,
@@ -199,7 +199,7 @@ bool Backend::wide_dyn_storage(uint32_t sw) {
 // A wide dynamic select never reaches here: both the blocking store and the NBA
 // staging route to rt_wide_ins, which addresses words instead of needing a mask
 // this wide -- building one is the O(width^2) legalization that path avoids.
-llvm::Value* Backend::store_mask(const LValue& lv, uint32_t sw) {
+llvm::Value* Backend::store_mask(const LValueInfo& lv, uint32_t sw) {
     if (lv.range_mask != nullptr) {
         if (lv.range_mask_outer) {
             // A constant part-select inside a dynamic select's window writes
@@ -214,7 +214,7 @@ llvm::Value* Backend::store_mask(const LValue& lv, uint32_t sw) {
 
 // Align a select's iW value to its storage bit position (poison-free for a
 // bounds-checked select, a plain left shift otherwise).
-llvm::Value* Backend::place_val(const LValue& lv, llvm::Value* v_iw, uint32_t sw) {
+llvm::Value* Backend::place_val(const LValueInfo& lv, llvm::Value* v_iw, uint32_t sw) {
     llvm::Value* vW = cast(v_iw, sw, false);
     if (lv.range_mask != nullptr) {
         return align_shl(vW, lv.bit_off, sw);
@@ -225,11 +225,11 @@ llvm::Value* Backend::place_val(const LValue& lv, llvm::Value* v_iw, uint32_t sw
 // Merge one plane of a partial store: (old & ~mask) | (aligned ins & mask),
 // with the alignment poison-free and the mask range-restricted for a
 // bounds-checked dynamic select. `mask` is the shared store_mask(lv, sw).
-llvm::Value* Backend::merge_sel(llvm::Value*  old,
-                                llvm::Value*  ins_iw,
-                                const LValue& lv,
-                                uint32_t      sw,
-                                llvm::Value*  mask) {
+llvm::Value* Backend::merge_sel(llvm::Value*      old,
+                                llvm::Value*      ins_iw,
+                                const LValueInfo& lv,
+                                uint32_t          sw,
+                                llvm::Value*      mask) {
     llvm::Value* placed = b_.CreateAnd(place_val(lv, ins_iw, sw), mask);
     return b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), placed);
 }
@@ -239,7 +239,7 @@ llvm::Value* Backend::merge_sel(llvm::Value*  old,
 // the whole storage's width and offset 0 whatever its index is, so the mask
 // decides: a constant x index (`v1[PX]`) leaves it zero and the access is
 // invalid (LRM 11.5.1), while a constant in-range index folds to all ones.
-bool Backend::selects_whole(const LValue& lv) {
+bool Backend::selects_whole(const LValueInfo& lv) {
     if (lv.width != lv.store_width || !is_zero_const(lv.bit_off)) {
         return false;
     }
@@ -1393,7 +1393,7 @@ bool Backend::agg_eq_four(Ref type) {
 // 0, else X if any member is unknown, else 1 — the Land reduction carries
 // LRM 11.4.5 X-propagation exactly (docs/LRM_NOTES.md, note 13). The answer is in
 // the domain agg_eq_four(type) says.
-Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
+Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         const auto fields = mod_.pool.struct_fields(t.fields_id);
@@ -1496,11 +1496,9 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
     // A leaf reached through a deferred associative-array element (`a[k] == x`
     // over an aggregate value) resolves its map slot here -- lower_agg_eq
     // reads leaves inline, bypassing the Load dispatch. An absent key reads
-    // the leaf default (dyn_elem_load's out-of-range path).
-    Plane pa = lhs.is_assoc ? dyn_elem_load(assoc_elem_lvalue(lhs, /*for_write=*/false))
-                            : lower_load(lhs);
-    Plane pb = rhs.is_assoc ? dyn_elem_load(assoc_elem_lvalue(rhs, /*for_write=*/false))
-                            : lower_load(rhs);
+    // the leaf default (load_guarded's invalid path).
+    Plane pa = load_guarded(lhs.is_assoc ? assoc_elem_lvalue(lhs, /*for_write=*/false) : lhs);
+    Plane pb = load_guarded(rhs.is_assoc ? assoc_elem_lvalue(rhs, /*for_write=*/false) : rhs);
     if (vt.is_real) {
         // A real leaf needs the FLOAT compare. `lower_compare` is the integer
         // one: handed a real plane it read the `double` bit pattern as an

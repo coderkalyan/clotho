@@ -15,6 +15,7 @@
 #include "Lower.h"
 #include "Subprocess.h"
 #include "ir/Jit.h"
+#include "runtime/Runtime.h"
 
 namespace {
 
@@ -45,11 +46,28 @@ int run_design(const char* path) {
                                clotho::loc_resolver(r));
 }
 
+// Encoding-violation mode: call the report the extra-asserts check reaches, as the
+// generated code would, from line 7 column 12 of a file whose text is the file's
+// first line. See encoding_check_test.cpp.
+int report_encoding_violation(const char* path) {
+    std::string line = clotho::test::detail::read_file(path);
+    const rt_null_site site{ .where      = "design.sv:7:12",
+                             .line       = line.c_str(),
+                             .line_no    = 7,
+                             .column     = 12,
+                             .end_column = 15,
+                             .kind       = RT_NULL_CLASS };
+    rt_encoding_violation(&site, 42);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc == 3 && clotho::test::run_design_flag == argv[1]) {
         return run_design(argv[2]);
+    }
+    if (argc == 3 && clotho::test::encoding_violation_flag == argv[1]) {
+        return report_encoding_violation(argv[2]);
     }
 
     std::error_code ec;

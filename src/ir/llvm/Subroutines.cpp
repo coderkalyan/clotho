@@ -78,7 +78,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         ir_            = &all[m].ir;
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
-        lvals_.assign(n, std::optional<LValue>{});
+        lvals_.assign(n, std::optional<Guarded>{});
         types_ = value_types(mod_, *ir_);
     };
     // Open the guarded region of a group: returns true when its members are
@@ -629,6 +629,7 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
+    emit_encoding_check(pl, four, cur_inst_);
     argv.push_back(pl.mm);
     if (four) {
         argv.push_back(pl.z);
@@ -1221,7 +1222,7 @@ void Backend::lower_function(FunctionId id) {
     fn_            = fn_decls_[static_cast<uint32_t>(id)];
     const size_t n = ir_->inst_count();
     values_.assign(n, Plane{});
-    lvals_.assign(n, std::optional<LValue>{});
+    lvals_.assign(n, std::optional<Guarded>{});
     types_ = value_types(mod_, *ir_);
     str_vals_.assign(n, nullptr);
 
@@ -1357,7 +1358,7 @@ void Backend::lower_task(FunctionId id) {
     fn_            = fn_decls_[static_cast<uint32_t>(id)];
     const size_t n = ir_->inst_count();
     values_.assign(n, Plane{});
-    lvals_.assign(n, std::optional<LValue>{});
+    lvals_.assign(n, std::optional<Guarded>{});
     types_ = value_types(mod_, *ir_);
     str_vals_.assign(n, nullptr);
 
@@ -1892,6 +1893,7 @@ void Backend::lower_ret(Index value) {
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
+    emit_encoding_check(pl, abi_four_state(cur_fn_->return_type), cur_inst_);
     if (!abi_four_state(cur_fn_->return_type)) {
         deinit_body_strings();
         b_.CreateRet(pl.mm);
@@ -2007,7 +2009,7 @@ void Backend::lower_call_common(Index               i,
     // A ref actual that is a signal with waiters: the callee writes it live, so
     // its wait queue must be serviced with the call's net old -> new transition.
     // Snapshot each before the (atomic, zero-time) function call; service after.
-    std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
+    std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
     size_t k = 0;
     for (Index a : ir_->region(arg_slice)) {
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
@@ -2016,7 +2018,7 @@ void Backend::lower_call_common(Index               i,
             // epoch now, and the site the callee reports a stale ref through.
             // Every storage class goes through here — a plane slot, a managed
             // handle, an aggregate image — so `ref` has one shape.
-            const LValue&    lv = lvalue_of(a);
+            const Guarded&   lv = lvalue_of(a);
             // A `ref` formal is a raw interior pointer into the actual's storage that
             // the CALLEE writes through, and the callee has no owner identity to
             // remember: a `ref` bound to a class property is exactly the "reference
@@ -2030,7 +2032,7 @@ void Backend::lower_call_common(Index               i,
             // callee's store. lower_task_call_inst has the same barrier for the same
             // reason, where that argument is weaker -- see the note there.
             emit_gc_barrier_for(lv);
-            const RefBinding rb = ref_actual_arg(lv);
+            const RefBinding rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             push_ref_epochs(argv, rb, ref_epoch_depth(f, k));
             if (!is_handle_type(f.param_types[k])) {
@@ -2048,7 +2050,7 @@ void Backend::lower_call_common(Index               i,
             // A dynamic array / queue / associative array passes one handle
             // pointer (the actual) in every by-value direction; the callee
             // copies in / out through it.
-            const LValue& alv = lvalue_of(a);
+            const Guarded& alv = lvalue_of(a);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             // An out / inout container actual is filled BY THE CALLEE through this
             // handle pointer, so the owner acquires whatever references the callee's
@@ -2075,13 +2077,13 @@ void Backend::lower_call_common(Index               i,
             // and to its z word when 4-state; the callee copies out through them
             // (the caller copies the temp back to the actual after the call —
             // frontend emit_call_copyouts).
-            push_scalar_out_arg(argv, lvalue_of(a), abi_four_state(f.param_types[k]));
+            push_scalar_out_arg(argv, lvalue_of(a).unguarded(), abi_four_state(f.param_types[k]));
         } else if (is_agg_abi(f.param_types[k])) {
             // An aggregate actual passes its storage pointer, one per formal in
             // every direction (the frontend emitted it as an lvalue): In copies
             // it in, a struct-bearing out / inout copies the frame Local back
             // out through the same pointer.
-            argv.push_back(agg_arg_ptr(lvalue_of(a)));
+            argv.push_back(agg_arg_ptr(lvalue_of(a), f.param_types[k], dir));
             // A struct-bearing out / inout formal is copied back out through THIS
             // pointer by the callee itself (emit_copyout, :5706-5708), so if the
             // actual is a class property the callee writes handles into an object it
@@ -2224,7 +2226,7 @@ void Backend::lower_task_call_inst(Index i) {
     // written in one time step (the common case) and for functions (atomic).
     // Per-write mid-suspend waking needs callee-side servicing (a generic
     // runtime wake keyed by signal id); TODO once that exists.
-    std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
+    std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
     // Outer containers registered as dynamically-scoped roots for this call, removed
     // at cont_bb. Empty unless a ref actual aims inside a container a class object
     // owns, which is the one shape neither the barrier nor the frame scan covers.
@@ -2235,7 +2237,7 @@ void Backend::lower_task_call_inst(Index i) {
             // container epoch, that epoch now, and the report site. A task is
             // where the epoch earns its keep — it can suspend, and the container
             // can be restructured by another process while the ref stays live.
-            const LValue&    lv = lvalue_of(args[k]);
+            const Guarded&   lv = lvalue_of(args[k]);
             // The same barrier lower_call_common emits, for the same reason: the
             // callee writes through a raw interior pointer and cannot name the owner.
             //
@@ -2274,7 +2276,7 @@ void Backend::lower_task_call_inst(Index i) {
             if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
                 ref_containers.push_back(root);
             }
-            const RefBinding rb = ref_actual_arg(lv);
+            const RefBinding rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
             push_ref_epochs(argv, rb, ref_epoch_depth(tf, k));
             if (!is_handle_type(tf.param_types[k])) {
@@ -2289,7 +2291,7 @@ void Backend::lower_task_call_inst(Index i) {
         } else if (is_handle_type(tf.param_types[k])) {
             // One handle pointer for every by-value direction; callee copies
             // in / out through it.
-            const LValue& alv = lvalue_of(args[k]);
+            const Guarded& alv = lvalue_of(args[k]);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
                 emit_gc_barrier_for(alv);
@@ -2306,7 +2308,7 @@ void Backend::lower_task_call_inst(Index i) {
             // output / inout back at completion, so the caller must keep the
             // storage alive across the task's suspends: both shapes are frame
             // Locals / signals, never a short-lived alloca.
-            argv.push_back(agg_arg_ptr(lvalue_of(args[k])));
+            argv.push_back(agg_arg_ptr(lvalue_of(args[k]), tf.param_types[k], tf.arg_dirs[k]));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
                 emit_gc_barrier_for(lvalue_of(args[k]));
             }
@@ -2325,7 +2327,7 @@ void Backend::lower_task_call_inst(Index i) {
         } else {
             // An output / inout temp: pass the pointer to its value word, and to
             // its z word when 4-state.
-            push_scalar_out_arg(argv, lvalue_of(args[k]), abi_four_state(tf.param_types[k]));
+            push_scalar_out_arg(argv, lvalue_of(args[k]).unguarded(), abi_four_state(tf.param_types[k]));
         }
     }
     argv.push_back(record);
@@ -2450,6 +2452,9 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
             store_field(sty, elt, 4, null);
             continue;
         }
+        // The runtime receives these planes translated to val / xz / z, so a value
+        // that breaks the invariants would print as something it is not.
+        emit_encoding_check(p, t.four_state, cur_inst_);
         // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
         // subset. The runtime distinguishes them per bit.
         llvm::Value* must = must_of(p, t.four_state);

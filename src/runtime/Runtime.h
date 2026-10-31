@@ -368,6 +368,12 @@ typedef struct rt_null_site {
 // diagnostic and ends the simulation with a nonzero status. Never returns.
 [[noreturn]] void rt_null_handle(const rt_null_site* site, uint64_t now);
 
+// A 4-state value whose planes break the encoding's invariants (must & ~may == 0,
+// z only on unknown bits), caught by a check generated only under
+// CLOTHO_EXTRA_ASSERTS. A Clotho bug, not the design's: prints a located internal
+// error and ends the simulation with a nonzero status. Never returns.
+[[noreturn]] void rt_encoding_violation(const rt_null_site* site, uint64_t now);
+
 // -- A `ref` whose actual's container was restructured under it (LRM 13.5.2) --
 
 // The site of one guarded `ref` dereference, emitted by the backend as a

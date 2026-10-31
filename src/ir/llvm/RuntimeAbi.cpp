@@ -200,6 +200,12 @@ llvm::FunctionCallee Backend::null_handle_fn() {
     return rt_fn("rt_null_handle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
+// void rt_encoding_violation(ptr site, i64 now) — a located internal error; never
+// returns (see Runtime.h).
+llvm::FunctionCallee Backend::encoding_violation_fn() {
+    return rt_fn("rt_encoding_violation", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+}
+
 // -- A `ref` whose actual's container was restructured under it (LRM 13.5.2) --
 
 // The rt_ref_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
