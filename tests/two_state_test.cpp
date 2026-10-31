@@ -498,11 +498,14 @@ TEST_CASE("a 2-state formal and result cross a call as one native iW") {
     // a: i8, b: i32, o: one pointer, io: one pointer; the result is a bare i8. The
     // parameters before them are the ones every subroutine takes: its instance's
     // record, rng, proc and home.
-    CHECK(ir.find("i8 @m.fn.f2(ptr noalias %ctx, ptr %rng, ptr %proc, i8 %home, i8 %0, i32 %1, ptr %2, ptr "
+    // (`m.<unit key>.fn.f2`: a unit's symbols lead with its key.)
+    CHECK(ir.find("i8 @m.") != std::string::npos);
+    CHECK(ir.find(".fn.f2(ptr noalias %ctx, ptr %rng, ptr %proc, i8 %home, i8 %0, i32 %1, ptr %2, ptr "
                   "%3)") != std::string::npos);
     // A 4-state formal is the i8 plane pair (i4 -> i8 packed, i4 z), an output its
     // (ptr, ptr), the 2-state inout one pointer; the result is the plane struct.
-    CHECK(ir.find("{ i8, i4 } @m.fn.f4(ptr noalias %ctx, ptr %rng, ptr %proc, i8 %home, i8 %0, i4 %1, ptr "
+    CHECK(ir.find("{ i8, i4 } @m.") != std::string::npos);
+    CHECK(ir.find(".fn.f4(ptr noalias %ctx, ptr %rng, ptr %proc, i8 %home, i8 %0, i4 %1, ptr "
                   "%2, ptr %3, ptr %4)") != std::string::npos);
 }
 

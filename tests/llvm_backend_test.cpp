@@ -164,18 +164,28 @@ size_t count_substr(const std::string& hay, std::string_view needle) {
     return n;
 }
 
-// The argument count of the one call `ir` makes to `callee` (e.g.
-// "@m.fn.f"), or ~0 when it makes none or several.
+// The argument count of the one call `ir` makes to a function whose symbol ends
+// with `callee` (e.g. ".fn.f"; a unit's symbols lead with its key), or ~0 when it
+// makes none or several.
 size_t call_arity(const std::string& ir, std::string_view callee) {
-    const std::string head = "call void " + std::string(callee) + "(";
-    const size_t      at   = ir.find(head);
-    if (at == std::string::npos || ir.find(head, at + head.size()) != std::string::npos) {
+    const std::string head  = "call void @";
+    size_t            found = std::string::npos;
+    size_t            n     = 0;
+    for (size_t at = ir.find(head); at != std::string::npos; at = ir.find(head, at + head.size())) {
+        const size_t           open = ir.find('(', at);
+        const std::string_view name(ir.data() + at + head.size() - 1, open - (at + head.size() - 1));
+        if (name.ends_with(callee)) {
+            found = open;
+            ++n;
+        }
+    }
+    if (n != 1) {
         return ~size_t{ 0 };
     }
-    const size_t open  = at + head.size();
-    const size_t close = ir.find(')', open);
-    return 1 + static_cast<size_t>(std::count(
-                 ir.begin() + static_cast<std::ptrdiff_t>(open), ir.begin() + static_cast<std::ptrdiff_t>(close), ','));
+    const size_t close = ir.find(')', found);
+    return 1 + static_cast<size_t>(std::count(ir.begin() + static_cast<std::ptrdiff_t>(found),
+                                              ir.begin() + static_cast<std::ptrdiff_t>(close),
+                                              ','));
 }
 
 constexpr std::string_view kAlu = R"(
@@ -229,7 +239,7 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 3);
     CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
     const std::string co = emit(kAlu, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @clotho.inst.alu.p") == 3);
+    CHECK(count_substr(co, "define ptr @alu.") == 3);
     CHECK(co.find("(ptr %ctx, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
@@ -274,7 +284,7 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(raw.find("@clotho.state = ") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
-    CHECK(ir.find("define ptr @clotho.inst.m.p") != std::string::npos);
+    CHECK(ir.find("define ptr @m.") != std::string::npos);
 }
 
 TEST_CASE("instance state structs replicate per instantiation as per-scope globals") {
@@ -962,7 +972,7 @@ TEST_CASE("delay suspends and reschedules on the wheel") {
     CHECK(ir.find("call void @rt_wheel_schedule_rel") != std::string::npos);
     // The timer callback that wakes the suspended coroutine by pushing its handle
     // onto the active queue.
-    CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
+    CHECK(!define_params(ir, "@clotho.enqueue_timer").empty());
     // main drains the wheel: advance while timers are pending (the pending-check
     // is folded into the tick, one ABI crossing per timestep).
     CHECK(ir.find("call i32 @rt_wheel_advance") != std::string::npos);
@@ -1230,7 +1240,7 @@ TEST_CASE("delay inside a conditional splits cleanly") {
     // The conditional's branch and both delays' schedules survive lowering.
     CHECK(ir.find("br i1") != std::string::npos);
     CHECK(count_substr(ir, "call void @rt_wheel_schedule") == 2);
-    CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
+    CHECK(!define_params(ir, "@clotho.enqueue_timer").empty());
 }
 
 TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
@@ -2148,7 +2158,9 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 5);
     CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
     const std::string co = emit(src, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @clotho.inst.top.") == 4);
+    // The two counters run one ramp of their unit, named by it.
+    CHECK(count_substr(co, "define ptr @top.") == 3);
+    CHECK(count_substr(co, "define ptr @counter.") == 1);
     CHECK(count_substr(co, ".f2(ptr %ctx") == 1);
 }
 
@@ -5429,7 +5441,7 @@ TEST_CASE("a ref to a place that cannot move passes no witness chain") {
     )";
     const std::string ir = emit_raw(src);
     // state, rng, proc, home, the storage pointer and the chain.
-    CHECK(call_arity(ir, "@m.fn.f") == 6);
+    CHECK(call_arity(ir, ".fn.f") == 6);
     CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
     CHECK(run_capture(src) == "6\n");
 }
@@ -5445,7 +5457,7 @@ TEST_CASE("a ref to a whole container handle passes no witness chain") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(call_arity(ir, "@m.fn.f") == 6);
+    CHECK(call_arity(ir, ".fn.f") == 6);
     CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
 }
 
@@ -5460,7 +5472,7 @@ TEST_CASE("a ref to a container element passes the epoch it was formed at") {
             initial begin q.push_back(5); f(q[0]); $display("%0d", q[0]); end
         endmodule
     )");
-    CHECK(call_arity(ir, "@m.fn.f") == 6);
+    CHECK(call_arity(ir, ".fn.f") == 6);
     CHECK(ir.find("i64 %ref.epoch.at.call") != std::string::npos);
     // The site record is the callee's, built at the guard, so it is not an operand
     // of the call; the container's name reaches the report through the epoch table.

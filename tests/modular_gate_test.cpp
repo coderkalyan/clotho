@@ -103,10 +103,40 @@ std::pair<std::vector<std::string>, std::vector<std::string>> differing(const st
 
 } // namespace
 
+TEST_CASE("an edit to one module's body changes that unit's module and no other") {
+    const auto base   = modules_of(instantiate("d + 8'(N)", "t2"));
+    const auto edited = modules_of(instantiate("d + 8'(N) + 8'd2", "t2"));
+    const auto [gone, fresh] = differing(base, edited);
+    REQUIRE(gone.size() == 1);
+    REQUIRE(fresh.size() == 1);
+    CHECK(gone[0].starts_with("leaf"));
+    CHECK(fresh[0].starts_with("leaf"));
+}
+
+TEST_CASE("an edit to the module that instantiates others leaves theirs alone") {
+    const auto base   = modules_of(instantiate("d + 8'(N)", "t2"));
+    const auto edited = modules_of(instantiate("d + 8'(N)", "t2 ^ pk::bump(t1)"));
+    const auto [gone, fresh] = differing(base, edited);
+    REQUIRE(gone.size() == 1);
+    REQUIRE(fresh.size() == 1);
+    CHECK(gone[0].starts_with("pair"));
+    CHECK(fresh[0].starts_with("pair"));
+}
+
 TEST_CASE("compiling the same design twice gives the same modules") {
     const auto a = modules_of(instantiate("d + 8'(N)", "t2"));
     const auto b = modules_of(instantiate("d + 8'(N)", "t2"));
     const auto [gone, fresh] = differing(a, b);
     CHECK(gone.empty());
     CHECK(fresh.empty());
+}
+
+TEST_CASE("a unit's module names no instance") {
+    // Instance storage, records and entries are root's; a unit's code reaches its
+    // instance through the record it is handed.
+    for (const auto& [name, text] : modules_of(instantiate("d + 8'(N)", "t2"))) {
+        INFO("module ", name);
+        CHECK(text.find("clotho.inst.") == std::string::npos);
+        CHECK(text.find("top.p") == std::string::npos); // an instance path of the design
+    }
 }

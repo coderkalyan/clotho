@@ -134,7 +134,6 @@ void Backend::run() {
             if (config_.verify_shared_code) {
                 verify_shared_group(g, rep);
             }
-            rep.fn->addFnAttr(llvm::Attribute::NoInline);
             group_fns.push_back(rep.fn);
             shared_instances_.emplace_back(ua, group_unit_anchor_[rep.g]);
             const auto base = static_cast<uint32_t>(block_commits_.size());
@@ -438,17 +437,23 @@ void Backend::note_blocks(SharedSubroutine& s, uint32_t block_lo, size_t fill_lo
     s.fill_hi  = ctx_blk_fills_.size();
 }
 
-// The definition unit's env for an anchored scope, created (with its
-// llvm::Module) on first use. Units are keyed by definition state-struct
-// identity: twin instances of one definition land in one unit.
+// The unit's env for an anchored scope, created (with its llvm::Module) on first
+// use: one module per Design unit, named by the unit's key. A scope built without
+// a unit is a unit of its own, keyed by its definition state type.
 ModuleEnv& Backend::unit_env(const Anchor& a) {
-    auto [it, inserted] = unit_env_of_.try_emplace(a.ty, nullptr);
+    auto [it, inserted] = unit_env_of_.try_emplace(
+      a.unit != InstanceScope::no_unit ? std::pair{ a.unit, static_cast<llvm::StructType*>(nullptr) }
+                                       : std::pair{ InstanceScope::no_unit, a.ty },
+      nullptr);
     if (inserted) {
-        std::string name = a.ty->getName().str();
-        if (name.ends_with(".state")) {
-            name.resize(name.size() - 6);
+        std::string name = a.unit_key;
+        if (name.empty()) {
+            name = a.ty->getName().str();
+            if (name.ends_with(".state")) {
+                name.resize(name.size() - 6);
+            }
         }
-        auto m = std::make_unique<llvm::Module>("clotho.def." + name, ctx_);
+        auto m = std::make_unique<llvm::Module>(name, ctx_);
         m->setTargetTriple(root_env_->llmod.getTargetTriple());
         m->setDataLayout(root_env_->llmod.getDataLayout());
         unit_envs_.push_back(std::make_unique<ModuleEnv>(*m));
@@ -456,6 +461,10 @@ ModuleEnv& Backend::unit_env(const Anchor& a) {
         it->second = unit_envs_.back().get();
     }
     return *it->second;
+}
+
+std::string Backend::unit_symbol(const Anchor& a) const {
+    return a.unit_key.empty() ? "clotho.inst." + a.name : a.unit_key;
 }
 
 // Every value's width reaches here through the frontend's check against this limit, so the

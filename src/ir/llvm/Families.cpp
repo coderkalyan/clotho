@@ -127,7 +127,7 @@ ModuleEnv* Backend::subroutine_env(FunctionId id) {
 // two functions of one name (a package's and an instance's, say) get a count.
 std::string Backend::subroutine_symbol(const Function& f, std::string_view kind) {
     const uint32_t a    = subroutine_anchor(f);
-    std::string    base = a != SignalSlot::no_anchor ? anchors_[a].name : mod_.name;
+    std::string    base = a != SignalSlot::no_anchor ? unit_symbol(anchors_[a]) : mod_.name;
     base += kind;
     base += f.name;
     if (verifying_) {

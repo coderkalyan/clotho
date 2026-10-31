@@ -3,9 +3,12 @@
 #include <cassert>
 #include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <utility>
 
 #include <ankerl/unordered_dense.h>
+
+#include "Printer.h"
 
 namespace clotho::ir {
 
@@ -45,11 +48,37 @@ struct FlatInstance {
     std::vector<uint32_t> cover_types;
 };
 
+// Each unit's key (InstanceScope::unit_key): its definition name and a hash of its
+// printed body, children by definition name, so the key is a function of the
+// unit's own content. Units that print alike without being merged (the same body
+// over different subtrees) take a count, in unit order, so keys stay unique.
+std::vector<std::string> name_units(const Design& design) {
+    std::vector<std::string>                            keys(design.units.size());
+    ankerl::unordered_dense::map<std::string, uint32_t> seen;
+    for (uint32_t u = 0; u < design.units.size(); ++u) {
+        std::ostringstream os;
+        print_unit(design, UnitId{ u }, os);
+        uint64_t h = 1469598103934665603ull; // FNV-1a
+        for (const char c : os.str()) {
+            h = (h ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+        }
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string           key      = design.units[u].def_name + ".";
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            key += digits[((h ^ (h >> 32)) >> shift) & 0xf];
+        }
+        const uint32_t n = seen[key]++;
+        keys[u]          = n == 0 ? key : key + "." + std::to_string(n);
+    }
+    return keys;
+}
+
 class Flattener {
 public:
-    Flattener(Design& design, Module& module)
+    Flattener(Design& design, Module& module, std::vector<std::string> unit_keys)
       : d_(design)
-      , m_(module) {}
+      , m_(module)
+      , unit_keys_(std::move(unit_keys)) {}
 
     void run() {
         expand();
@@ -586,6 +615,7 @@ private:
             s.id       = fi.scope;
             s.name     = fi.name;
             s.def_name = u.def_name;
+            s.unit_key = unit_keys_[static_cast<uint32_t>(fi.unit)];
             s.unit     = static_cast<uint32_t>(fi.unit);
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
                 const uint32_t imp = u.signals[h].import;
@@ -667,6 +697,7 @@ private:
     Design&                             d_;
     Module&                             m_;
     std::vector<FlatInstance>           insts_;
+    std::vector<std::string>            unit_keys_;
     std::vector<uint32_t>               root_inst_;
     std::vector<std::vector<uint32_t>>  instances_of_;
     std::vector<std::optional<NameMap>> signal_names_;
@@ -710,8 +741,10 @@ Function signature_of(const Function& f) {
 }
 
 std::unique_ptr<Module> flatten(Design&& design) {
+    // Before the module takes the design's pool: printing a unit reads it.
+    auto keys   = name_units(design);
     auto module = std::make_unique<Module>(std::move(design.pool));
-    Flattener(design, *module).run();
+    Flattener(design, *module, std::move(keys)).run();
     return module;
 }
 

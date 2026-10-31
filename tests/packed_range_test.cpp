@@ -750,7 +750,7 @@ std::string process_body(std::string_view source) {
     std::string              ir;
     llvm::raw_string_ostream os(ir);
     REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false }));
-    const size_t at = ir.find("define ptr @clotho.inst.m.p");
+    const size_t at = ir.find("define ptr @m.p");
     REQUIRE(at != std::string::npos);
     return ir.substr(at, ir.find("\n}\n", at) - at);
 }

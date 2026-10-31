@@ -181,10 +181,10 @@ std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*> Backend::expect_queue(ui
     ensure_reactive_queue();
     auto*             i32  = llvm::Type::getInt32Ty(ctx_);
     const std::string base = "clotho.expect" + std::to_string(monitor);
-    auto*             arr  = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
+    auto*             arr  = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantAggregateZero::get(queue_arr_ty_), base);
-    auto*             top  = new llvm::GlobalVariable(env_->llmod, i32, false,
+    auto*             top  = new llvm::GlobalVariable(root_env_->llmod, i32, false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantInt::get(i32, 0), base + "_top");
     const std::pair   entry{ arr, top };
@@ -304,7 +304,7 @@ void Backend::lower_expect_wake(Index i) {
 llvm::Value* Backend::pend_record_slot() {
     if (pend_record_gv_ == nullptr) {
         auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-        pend_record_gv_ = new llvm::GlobalVariable(env_->llmod,
+        pend_record_gv_ = new llvm::GlobalVariable(root_env_->llmod,
                                                    ptr_ty,
                                                    false,
                                                    llvm::GlobalValue::InternalLinkage,

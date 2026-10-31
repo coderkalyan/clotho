@@ -103,6 +103,12 @@ struct InstanceScope {
     // The Design unit this instance expands (flatten), or no_unit for a module
     // built without one, whose every scope is a unit of its own.
     uint32_t unit = no_unit;
+    // What the unit's LLVM module and the symbols of its code are named, the
+    // same for every instance of the unit: the definition name and a hash of
+    // the unit's own content (flatten), so an edit to another unit renames
+    // nothing here and no instance name or design-wide number appears in it.
+    // Empty when `unit` is no_unit.
+    std::string unit_key;
     // Every signal the instance defines, in its unit's signal order: `signals`
     // and the storage the compiler adds to the unit without declaring it in the
     // scope (driver slots, constant tables, assertion state). Empty when

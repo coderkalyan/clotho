@@ -71,17 +71,19 @@ llvm::Value* Backend::awaiter() {
 // same working footing: the address materialized into the timer is a local
 // symbol, and reaching the runtime is an ordinary call.
 llvm::Function* Backend::native_cb_trampoline(const char* name, llvm::FunctionCallee target, llvm::Function*& cache) {
-    if (cache != nullptr) {
-        return sym(cache);
-    }
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
-    cache      = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
+    if (cache == nullptr) {
+        InRoot in_root(*this);
+        auto*  ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto*  fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        cache       = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
 
-    llvm::IRBuilder<> tb(ctx_);
-    tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", cache));
-    tb.CreateCall(target, { cache->getArg(0), cache->getArg(1) });
-    tb.CreateRetVoid();
+        llvm::IRBuilder<> tb(ctx_);
+        tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", cache));
+        // `target` was declared in the module that asked; root declares its own.
+        tb.CreateCall(env_->llmod.getOrInsertFunction(target.getCallee()->getName(), target.getFunctionType()),
+                      { cache->getArg(0), cache->getArg(1) });
+        tb.CreateRetVoid();
+    }
     return sym(cache);
 }
 
@@ -98,9 +100,14 @@ llvm::Function* Backend::inertial_cb_trampoline() {
 // timer in the design, so the region cannot be baked in here -- a program
 // `initial` and an ordinary always block both come through this function.
 llvm::Function* Backend::enqueue_trampoline() {
-    if (enqueue_fn_ != nullptr) {
-        return sym(enqueue_fn_);
+    if (enqueue_fn_ == nullptr) {
+        InRoot in_root(*this);
+        build_enqueue_trampoline();
     }
+    return sym(enqueue_fn_);
+}
+
+void Backend::build_enqueue_trampoline() {
     auto* ptr   = llvm::PointerType::getUnqual(ctx_);
     auto* fnty  = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
     enqueue_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.enqueue_timer", env_->llmod);
@@ -112,7 +119,7 @@ llvm::Function* Backend::enqueue_trampoline() {
         llvm::Value* hdl = tb.CreateLoad(ptr, hp);
         emit_wake_push(tb, hdl);
         tb.CreateRetVoid();
-        return sym(enqueue_fn_);
+        return;
     }
     // A design with a remote `disable` owns each record on the heap, and a
     // `disable` may already have claimed this park to wake the activation early.
@@ -139,7 +146,6 @@ llvm::Function* Backend::enqueue_trampoline() {
     tb.SetInsertPoint(done);
     tb.CreateCall(free_fn(), { rec });
     tb.CreateRetVoid();
-    return sym(enqueue_fn_);
 }
 
 // Suspend the coroutine and continue in a fresh resume block named `label`.
@@ -382,7 +388,7 @@ bool Backend::is_reactive_fn(FunctionId id) const {
 llvm::Constant* Backend::program_live_ptr() {
     if (program_live_gv_ == nullptr) {
         auto* i32        = llvm::Type::getInt32Ty(ctx_);
-        program_live_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false,
+        program_live_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false,
                                                     llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantInt::get(i32, program_proc_count_),
                                                     "clotho.program_live");
@@ -1137,19 +1143,19 @@ void Backend::ensure_active_queue() {
     active_mask_   = static_cast<uint32_t>(cap - 1);
 
     queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
-    active_gv_    = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+    active_gv_    = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                              llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.active");
     // Ring indices: pop at head, push at tail, empty iff equal. Monotone
     // u32s (masked on access), so u32 wraparound is harmless.
-    active_head_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    active_head_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                llvm::ConstantInt::get(i32, 0), "clotho.active_head");
-    active_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    active_tail_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                llvm::ConstantInt::get(i32, 0), "clotho.active_tail");
     // Count of process activations at the current time instant. Reset when the
     // wheel advances time; a runaway count means a zero-delay oscillation the
     // scheduler cannot converge, caught in the drain loop (rt_oscillation_abort).
     auto* i64      = llvm::Type::getInt64Ty(ctx_);
-    osc_count_gv_  = new llvm::GlobalVariable(env_->llmod, i64, false, llvm::GlobalValue::InternalLinkage,
+    osc_count_gv_  = new llvm::GlobalVariable(root_env_->llmod, i64, false, llvm::GlobalValue::InternalLinkage,
                                               llvm::ConstantInt::get(i64, 0), "clotho.osc_count");
 }
 
@@ -1162,9 +1168,9 @@ void Backend::ensure_inactive_queue() {
     }
     ensure_active_queue(); // queue_arr_ty_ is shared by both queues
     auto* i32    = llvm::Type::getInt32Ty(ctx_);
-    inactive_gv_ = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+    inactive_gv_ = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                             llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.inactive");
-    inactive_top_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    inactive_top_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                 llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
 }
 
@@ -1293,13 +1299,13 @@ void Backend::ensure_reactive_queue() {
     }
     ensure_active_queue(); // queue_arr_ty_ and active_mask_ are shared
     auto* i32         = llvm::Type::getInt32Ty(ctx_);
-    reactive_gv_      = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
+    reactive_gv_      = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false,
                                                  llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(queue_arr_ty_),
                                                  "clotho.reactive");
-    reactive_head_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    reactive_head_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_head");
-    reactive_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    reactive_tail_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_tail");
 }
 
@@ -1325,19 +1331,19 @@ void Backend::ensure_reactive_cont_queue() {
     }
     ensure_reactive_queue(); // queue_arr_ty_ and active_mask_ are shared
     auto* i32              = llvm::Type::getInt32Ty(ctx_);
-    reactive_cont_gv_      = new llvm::GlobalVariable(env_->llmod,
+    reactive_cont_gv_      = new llvm::GlobalVariable(root_env_->llmod,
                                                       queue_arr_ty_,
                                                       false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantAggregateZero::get(queue_arr_ty_),
                                                       "clotho.reactive_cont");
-    reactive_cont_head_gv_ = new llvm::GlobalVariable(env_->llmod,
+    reactive_cont_head_gv_ = new llvm::GlobalVariable(root_env_->llmod,
                                                       i32,
                                                       false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantInt::get(i32, 0),
                                                       "clotho.reactive_cont_head");
-    reactive_cont_tail_gv_ = new llvm::GlobalVariable(env_->llmod,
+    reactive_cont_tail_gv_ = new llvm::GlobalVariable(root_env_->llmod,
                                                       i32,
                                                       false,
                                                       llvm::GlobalValue::InternalLinkage,
@@ -1354,11 +1360,11 @@ void Backend::ensure_re_inactive_queue() {
     }
     ensure_reactive_queue(); // queue_arr_ty_ is shared by every queue
     auto* i32           = llvm::Type::getInt32Ty(ctx_);
-    re_inactive_gv_     = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
+    re_inactive_gv_     = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false,
                                                    llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantAggregateZero::get(queue_arr_ty_),
                                                    "clotho.re_inactive");
-    re_inactive_top_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    re_inactive_top_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantInt::get(i32, 0), "clotho.re_inactive_top");
 }
 

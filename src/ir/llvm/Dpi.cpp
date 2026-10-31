@@ -395,7 +395,7 @@ llvm::Value* Backend::build_dpi_open_array_desc(Index                       a,
 // thunk. Created on first use, so a design with no DPI tasks emits none.
 llvm::GlobalVariable* Backend::dpi_caller_gv(llvm::GlobalVariable*& slot, llvm::Type* ty, const char* name) {
     if (slot == nullptr) {
-        slot = new llvm::GlobalVariable(env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
+        slot = new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
                                         llvm::Constant::getNullValue(ty), name);
     }
     return sym(slot);

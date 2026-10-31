@@ -1118,7 +1118,7 @@ TEST_CASE("a constant select of a wide vector addresses no word it does not cove
           end
         endmodule
     )");
-    const size_t      at = ir.find("define ptr @clotho.inst.m.p");
+    const size_t      at = ir.find("define ptr @m.p");
     REQUIRE(at != std::string::npos);
     const std::string body = ir.substr(at, ir.find("\n}\n", at) - at);
     for (const std::string_view whole : { "load i1024", "store i1024", "load i512", "store i512" }) {

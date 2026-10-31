@@ -53,19 +53,17 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // instance record after lowering, once the ids are known (ctx_blk_fills_).
     group_first_block_ = -1;
 
-    // Name a process by its owner: a definition-unit group (split mode) is
-    // @clotho.inst.<hier>.p<def-local ordinal> — instance-qualified (twin
-    // instances land in one module, so a bare def-local name would
-    // collide) with a def-local index, keeping the unit module's bytes
-    // independent of whole-design process numbering (cache-stability
-    // prep). Everything else keeps @<module>.p<flat index>; source-offset
-    // naming would collide across instances of one module (processes
-    // share the AST location); proc.loc still carries the source mapping.
-    // A fused group is named by its first member plus its size.
+    // Name a process by its owner: a group of an instance is
+    // <unit key>.p<def-local ordinal>, so its symbol is a function of its unit
+    // alone -- no instance name, no design-wide process number -- and the unit's
+    // module does not change when instances come or go. A group of no instance
+    // keeps @<module>.p<flat index>; source-offset naming would collide across
+    // instances of one module (processes share the AST location); proc.loc still
+    // carries the source mapping. A fused group is named by its first member
+    // plus its size.
     const uint32_t ua   = group_unit_anchor_[g_];
-    std::string    name = config_.split && ua != SignalSlot::no_anchor
-                            ? "clotho.inst." + anchors_[ua].name + ".p" +
-                                std::to_string(proc_sched_ord_[proc_index])
+    std::string    name = ua != SignalSlot::no_anchor
+                            ? unit_symbol(anchors_[ua]) + ".p" + std::to_string(proc_sched_ord_[proc_index])
                             : mod_.name + ".p" + std::to_string(proc_index);
     if (members.size() > 1) {
         name += ".f" + std::to_string(members.size());

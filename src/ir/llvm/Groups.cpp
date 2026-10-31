@@ -840,14 +840,19 @@ void Backend::emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask) {
 // timeline a fused body has always had. A row is a group function taking its
 // instance's record, which addresses everything of its own instance through it.
 //
-// One row's entry sits in its row's unit module, next to a body the inliner may
-// fold into it, so a group that shares nothing costs what a function of its own
-// always cost. Several rows span units: the dispatcher is link glue in root, and
-// its calls are the cost of having no code of one unit inline in another.
+// A group of one row is the unit's code: its entry takes the instance's record
+// like the row does (the flag and the fail-safe's mask are record fields) and
+// sits in the row's unit module, once per row function however many instances
+// run it, next to a body the inliner may fold into it. What is per instance is
+// a trampoline in root that hands the entry its record. Several rows span
+// units: the dispatcher is link glue in root, and its calls are the cost of
+// having no code of one unit inline in another.
 std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm::Function*>& group_fns) {
     auto*                        ptr_ty = llvm::PointerType::getUnqual(ctx_);
     auto*                        fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
     std::vector<llvm::Function*> fns(sched_.size(), nullptr);
+    // The entry of each row function that has one.
+    std::map<llvm::Function*, llvm::Function*> unit_entry;
     for (uint32_t s = 0; s < sched_.size(); ++s) {
         const SchedGroup& sg = sched_[s];
         if (!sg.thunk) {
@@ -861,13 +866,60 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
         for (const uint32_t r : sg.rows) {
             procs += groups_[r].size();
         }
-        env_ = config_.split && one && ua != SignalSlot::no_anchor ? &unit_env(anchors_[ua]) : root_env_.get();
         std::string name = one && ua != SignalSlot::no_anchor
                              ? "clotho.inst." + anchors_[ua].name + ".p" + std::to_string(proc_sched_ord_[sg.front])
                              : mod_.name + ".p" + std::to_string(sg.front);
         if (procs > 1) {
             name += ".f" + std::to_string(procs);
         }
+        if (one && ua != SignalSlot::no_anchor) {
+            Anchor&         a    = anchors_[ua];
+            llvm::Function* row  = group_fns[g0];
+            llvm::Function*& entry = unit_entry[row];
+            if (entry == nullptr) {
+                env_   = &unit_env(a);
+                entry  = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, row->getName() + ".entry",
+                                                env_->llmod);
+                fn_    = entry;
+                wheel_ = fn_->getArg(1);
+                wheel_->setName("wheel");
+                own_ctx_ = fn_->getArg(0);
+                own_ctx_->setName("ctx");
+                fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+                b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+                own_anchor_  = ua;
+                own_ordinal_ = proc_sched_ord_[groups_[g0].front()];
+                sched_ptr_   = nullptr;
+                materialize_group_ctx();
+                llvm::Value* const flag = sched_ptr_;
+                if (group_guarded_[g0]) {
+                    emit_trigger_failsafe(
+                      flag, ctx_field(a, a.ctx_gmask_base + proc_sched_ord_[groups_[g0].front()], b_.getInt64Ty()));
+                }
+                std::vector<llvm::Value*> args{ own_ctx_, wheel_ };
+                if (group_guarded_[g0]) {
+                    args.push_back(flag);
+                }
+                b_.CreateCall(row->getFunctionType(), row, args);
+                b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
+                b_.CreateRetVoid();
+                own_anchor_ = SignalSlot::no_anchor;
+                own_ctx_    = nullptr;
+                sched_ptr_  = nullptr;
+            }
+            // Root's part: the instance's record is the one thing the entry lacks.
+            env_ = root_env_.get();
+            fn_  = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
+            fn_->getArg(0)->setName("state");
+            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+            fn_->getArg(1)->setName("wheel");
+            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            b_.CreateCall(fnty, sym(entry), { ensure_ctx(a), fn_->getArg(1) });
+            b_.CreateRetVoid();
+            fns[s] = fn_;
+            continue;
+        }
+        env_ = root_env_.get();
         fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
         state_ = fn_->getArg(0);
         state_->setName("state");
@@ -882,15 +934,7 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
 
         // Only a single-row group is ever guarded.
         if (group_guarded_[g0]) {
-            llvm::Value* mask = nullptr;
-            if (ua != SignalSlot::no_anchor) {
-                Anchor& a = anchors_[ua];
-                mask      = ctx_field(a, a.ctx_gmask_base + proc_sched_ord_[groups_[g0].front()], b_.getInt64Ty());
-            }
-            else {
-                mask = b_.getInt64(group_trig_mask_[g0]);
-            }
-            emit_trigger_failsafe(flag, mask);
+            emit_trigger_failsafe(flag, b_.getInt64(group_trig_mask_[g0]));
         }
         for (const uint32_t r : sg.rows) {
             const uint32_t aid = group_unit_anchor_[r];
@@ -899,6 +943,11 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
             std::vector<llvm::Value*> args{ rec, wheel_ };
             if (group_guarded_[r]) {
                 args.push_back(flag);
+            }
+            // One function serves every row of its unit: called from here once per
+            // instance, it stays a call (inlined it would be copied into each).
+            if (!one) {
+                group_fns[r]->addFnAttr(llvm::Attribute::NoInline);
             }
             b_.CreateCall(group_fns[r]->getFunctionType(), sym(group_fns[r]), args);
         }

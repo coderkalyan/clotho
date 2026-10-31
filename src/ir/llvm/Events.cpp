@@ -1536,14 +1536,18 @@ llvm::StructType* Backend::event_timer_ty() {
 // firing the event here would wake the waiter in the Active region; pending it
 // leaves the wake to the NBA drain, exactly as for `->> e`.
 //
-// Defined in whichever module first needs it and reached from every other one
-// through sym(), like enqueue_trampoline: returning the bare definition to a
-// second module is a cross-module global reference, which LLVM rejects
-// (docs/design/module-split.md).
+// Defined in root and reached from every unit through sym(), like
+// enqueue_trampoline: returning the bare definition to a second module is a
+// cross-module global reference, which LLVM rejects.
 llvm::Function* Backend::event_delay_thunk() {
-    if (event_delay_thunk_ != nullptr) {
-        return sym(event_delay_thunk_);
+    if (event_delay_thunk_ == nullptr) {
+        InRoot in_root(*this);
+        build_event_delay_thunk();
     }
+    return sym(event_delay_thunk_);
+}
+
+void Backend::build_event_delay_thunk() {
     auto*             ptr  = raw_ptr_ty();
     auto*             fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
     llvm::IRBuilder<> save(ctx_);
@@ -1561,7 +1565,6 @@ llvm::Function* Backend::event_delay_thunk() {
     if (saved_bb != nullptr) {
         b_.SetInsertPoint(saved_bb, saved_pt);
     }
-    return sym(event_delay_thunk_);
 }
 
 // Link an event object onto the NBA pending chain (LRM 15.5.1), unless it is

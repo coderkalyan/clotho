@@ -255,11 +255,13 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
     return built;
 }
 
-// The built modules, each moved into `ctx` by a bitcode round trip: a module
-// reloaded alone names its types as its own text says, where modules still
-// sharing the building context suffix a type name another module holds.
-static bool reload_modules(BuiltDesign& built, llvm::LLVMContext& ctx,
-                           std::vector<std::unique_ptr<llvm::Module>>& out) {
+// The built modules, each moved by a bitcode round trip into `shared` -- or, with
+// none, into a context of its own, kept in `owned` -- so a module reloaded alone
+// names its types as its own text says, where modules still sharing the building
+// context suffix a type name another module holds.
+static bool reload_modules(BuiltDesign& built, llvm::LLVMContext* shared,
+                           std::vector<std::unique_ptr<llvm::LLVMContext>>& owned,
+                           std::vector<std::unique_ptr<llvm::Module>>&      out) {
     std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
     std::vector<std::string>                names;
     for (size_t i = 0; i < built.modules.size(); ++i) {
@@ -270,7 +272,11 @@ static bool reload_modules(BuiltDesign& built, llvm::LLVMContext& ctx,
     built.modules.clear();
     for (size_t i = 0; i < bitcode.size(); ++i) {
         const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
-        auto                        parsed = llvm::parseBitcodeFile(buf, ctx);
+        llvm::LLVMContext*          ctx = shared;
+        if (ctx == nullptr) {
+            ctx = owned.emplace_back(std::make_unique<llvm::LLVMContext>()).get();
+        }
+        auto parsed = llvm::parseBitcodeFile(buf, *ctx);
         if (!parsed) {
             llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
             return false;
@@ -309,9 +315,10 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     // gives the linked copies no name -- `%0 = type { %1, %1 }` for what was
     // `%alu.state` -- which is the readable part of this output. In a fresh
     // context the names are free.
-    llvm::LLVMContext                           linked_ctx;
-    std::vector<std::unique_ptr<llvm::Module>> reloaded;
-    if (!reload_modules(built, linked_ctx, reloaded)) {
+    llvm::LLVMContext                               linked_ctx;
+    std::vector<std::unique_ptr<llvm::LLVMContext>> no_owned;
+    std::vector<std::unique_ptr<llvm::Module>>      reloaded;
+    if (!reload_modules(built, &linked_ctx, no_owned, reloaded)) {
         return false;
     }
     std::unique_ptr<llvm::Module> root = std::move(reloaded.front());
@@ -347,9 +354,9 @@ bool emit_llvm_modules(const Module& m, std::vector<ModuleIr>& out, const Simula
     if (built.modules.empty()) {
         return false;
     }
-    llvm::LLVMContext                          fresh;
-    std::vector<std::unique_ptr<llvm::Module>> reloaded;
-    if (!reload_modules(built, fresh, reloaded)) {
+    std::vector<std::unique_ptr<llvm::LLVMContext>> owned;
+    std::vector<std::unique_ptr<llvm::Module>>      reloaded;
+    if (!reload_modules(built, nullptr, owned, reloaded)) {
         return false;
     }
     for (const auto& mod : reloaded) {

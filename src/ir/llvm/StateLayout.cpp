@@ -180,7 +180,7 @@ bool Backend::is_assoc_type(Ref type) const {
 // storage_ptr addresses signals anchor-relative.
 void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier) {
     const auto aid = static_cast<uint32_t>(anchors_.size());
-    anchors_.push_back(Anchor{ .name = hier, .unit = scope.unit });
+    anchors_.push_back(Anchor{ .name = hier, .unit = scope.unit, .unit_key = scope.unit_key });
     if (scope.id >= anchor_of_scope_.size()) {
         anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
     }
@@ -728,7 +728,7 @@ llvm::Value* Backend::shadow_ptr(const SignalSlot& owner, uint32_t field) {
 llvm::GlobalVariable* Backend::anchor_shadow_base(Anchor& a) {
     if (a.shadow_base_gv == nullptr) {
         auto* ptr        = llvm::PointerType::getUnqual(ctx_);
-        a.shadow_base_gv = new llvm::GlobalVariable(env_->llmod, ptr, false,
+        a.shadow_base_gv = new llvm::GlobalVariable(root_env_->llmod, ptr, false,
                                                     llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantPointerNull::get(ptr),
                                                     "clotho.inst." + a.name + ".shadow_base");
@@ -794,7 +794,7 @@ void Backend::emit_state_global() {
 // their record materialize a global (and a fill in main).
 llvm::GlobalVariable* Backend::ensure_ctx(Anchor& a) {
     if (a.ctx_gv == nullptr) {
-        a.ctx_gv = new llvm::GlobalVariable(env_->llmod, a.ctx_ty, false,
+        a.ctx_gv = new llvm::GlobalVariable(root_env_->llmod, a.ctx_ty, false,
                                             llvm::GlobalValue::InternalLinkage,
                                             llvm::ConstantAggregateZero::get(a.ctx_ty),
                                             "clotho.inst." + a.name + ".ctx");
@@ -878,7 +878,7 @@ void Backend::materialize_group_ctx() {
 llvm::GlobalVariable* Backend::shadow_base_gv() {
     if (shadow_base_gv_ == nullptr) {
         auto* ptr       = llvm::PointerType::getUnqual(ctx_);
-        shadow_base_gv_ = new llvm::GlobalVariable(env_->llmod, ptr, false, llvm::GlobalValue::InternalLinkage,
+        shadow_base_gv_ = new llvm::GlobalVariable(root_env_->llmod, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantPointerNull::get(ptr), "clotho.nba.shadow_base");
     }
     return sym(shadow_base_gv_);

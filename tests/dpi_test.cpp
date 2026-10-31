@@ -703,7 +703,7 @@ TEST_CASE("DPI export: the exported-task thunk drives a coroutine and guards bot
         endmodule)";
     const std::string thunk = llvm_definition(emit_llvm_text(src), "sv_note");
     CHECK(thunk.find("define i32 @sv_note(") != std::string::npos);
-    CHECK(thunk.find("m.task.sv_note") != std::string::npos);
+    CHECK(thunk.find(".task.sv_note") != std::string::npos);
     CHECK(thunk.find("dpi.task.done") != std::string::npos);
     CHECK(thunk.find("dpi.task.suspended") != std::string::npos);
     CHECK(thunk.find("dpi.task.no_frame") != std::string::npos);

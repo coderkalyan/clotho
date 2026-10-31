@@ -1103,6 +1103,9 @@ struct Anchor {
     std::vector<uint8_t> bind_used;
     // The Design unit the scope expands (InstanceScope::unit).
     uint32_t unit = InstanceScope::no_unit;
+    // InstanceScope::unit_key: the name of the unit's module and of its code's
+    // symbols. Empty for a scope built without a unit.
+    std::string unit_key;
 };
 
 // One function-frame local: its slot type and width / domain. A 2-state local is
@@ -1279,6 +1282,32 @@ private:
     void assign_id_fields();
 
     ModuleEnv& unit_env(const Anchor& a);
+
+    // Makes root the active module for its scope: what is created for every unit
+    // to share (a singleton global, a trampoline) is defined in root whichever
+    // unit's code asked for it first, and its body refers to symbols as root's.
+    class InRoot {
+    public:
+        explicit InRoot(Backend& b)
+          : b_(b)
+          , saved_(b.env_) {
+            b.env_ = b.root_env_.get();
+        }
+        ~InRoot() {
+            b_.env_ = saved_;
+        }
+        InRoot(const InRoot&)            = delete;
+        InRoot& operator=(const InRoot&) = delete;
+
+    private:
+        Backend&   b_;
+        ModuleEnv* saved_;
+    };
+
+    // What names the code of the instance of `a` in its unit's module: the
+    // unit's key, or the instance's own name for a scope built without a unit,
+    // which is a unit of its own.
+    std::string unit_symbol(const Anchor& a) const;
 
     // -- LLVM type helpers --
 
@@ -1935,6 +1964,7 @@ private:
     llvm::Function* inertial_cb_trampoline();
 
     llvm::Function* enqueue_trampoline();
+    void build_enqueue_trampoline();
 
     void emit_suspend(const char* label);
 
@@ -2398,6 +2428,7 @@ private:
     llvm::StructType* event_timer_ty();
 
     llvm::Function* event_delay_thunk();
+    void build_event_delay_thunk();
 
     void emit_event_pend_guarded(llvm::Value* handle);
 
@@ -4478,7 +4509,7 @@ private:
     // initializer. A fork child's block comes from the runtime pool instead.
     llvm::GlobalVariable*   proc_pcb_gv_      = nullptr;
     llvm::ArrayType*        proc_pcb_arr_ty_  = nullptr;
-    ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
+    std::map<std::pair<uint32_t, llvm::StructType*>, ModuleEnv*> unit_env_of_;
     // Per flat signal and id family: the signal's ordinal among its instance's id
     // fields (Anchor::ctx_id_base + ordinal), or no_id when it has none.
     std::vector<std::array<uint32_t, kIdFamilies>> id_ord_;
