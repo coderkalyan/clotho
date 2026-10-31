@@ -332,9 +332,25 @@ bool slot_less(const uint8_t* a, const uint8_t* b, uint64_t stride, uint32_t kin
     if (kind == sort_real) {
         double da = 0.0;
         double db = 0.0;
-        std::memcpy(&da, a, sizeof(double));
-        std::memcpy(&db, b, sizeof(double));
-        return da < db;
+        if (width == 32) {
+            // A shortreal slot holds a float; reading it as a double compared the
+            // element with its neighbour's bits.
+            float fa = 0.0F;
+            float fb = 0.0F;
+            std::memcpy(&fa, a, sizeof(float));
+            std::memcpy(&fb, b, sizeof(float));
+            da = fa;
+            db = fb;
+        } else {
+            std::memcpy(&da, a, sizeof(double));
+            std::memcpy(&db, b, sizeof(double));
+        }
+        // `<` is false whenever an operand is NaN, so a NaN is equivalent to every
+        // number and the relation is not a strict weak order: std::sort over it is
+        // undefined and mis-orders the numbers around a NaN. NaN is placed after
+        // every number, all NaNs equal (docs/LRM_NOTES.md, 7.12.2); rsort reverses
+        // the ascending result, so it puts NaN first.
+        return !std::isnan(da) && (std::isnan(db) || da < db);
     }
     uint64_t ua = slot_word(a, stride);
     uint64_t ub = slot_word(b, stride);

@@ -856,7 +856,7 @@ private:
                         << info.kind;
                     break;
                 }
-                if (tag == Inst::Tag::StrobePend || tag == Inst::Tag::ReactivePend) {
+                if (tag == Inst::Tag::StrobePend || tag == Inst::Tag::ReactivePend || tag == Inst::Tag::MonitorSet) {
                     const auto info = ir_.extra_data<StrobePendInfo>(p.extra);
                     os_ << "fn" << static_cast<uint32_t>(info.func);
                     break;

@@ -974,7 +974,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
     if (t.is_real) {
         v = real_plane(planes_to_real(v, t.width));
     }
-    set_value(i, in_type_domain(v, t));
+    set_value(i, v);
 }
 
 void Backend::lower_queue_insert(Index i) {

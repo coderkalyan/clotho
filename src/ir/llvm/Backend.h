@@ -110,10 +110,8 @@ struct Plane {
     // 2-state value never carries the redundant may/z half. For an instruction's
     // value the encoding is its IR type's domain, the single source of truth:
     // set_value asserts they agree and an operator never converts its operands.
-    // Where storage or an ABI decides the encoding the tag is not the domain: a
-    // 2-state signal is stored packed when a task's pointer ABI or the may-z
-    // analysis gives it a z word (StateLayout), so a plane read from storage or
-    // returned by a call crosses into the type's domain in in_type_domain.
+    // Storage and the call ABI hold a value in the encoding of its type's domain
+    // too: a 2-state signal, local, member or element is the native iW slot.
     bool two = false;
     // Real / shortreal value (double / float). Exactly one of fp and mm is set:
     // a real SSA value carries fp only; its storage form is the raw bit pattern
@@ -814,7 +812,8 @@ struct Anchor {
     uint32_t n_groups = 0;
 };
 
-// One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
+// One function-frame local: its slot type and width / domain. A 2-state local is
+// `{ iW }`, a 4-state one `{ i(2W), iW }`.
 // The frame is an LLVM struct with one field per local, in Local-handle order,
 // so the local's index IS its GEP field index. No wait-queue / NBA machinery
 // (frame locals have neither).
@@ -822,8 +821,8 @@ struct FrameSlot {
     llvm::StructType* slot_ty    = nullptr;
     uint32_t          width      = 0;
     bool              four_state = false;
-    // A genuine single-iW 2-state local (`{ iW }`). The ABI wire is still the
-    // packed word, so copy-in projects into the iW slot and copy-out lifts back.
+    // A 2-state local, the native single-iW slot (`{ iW }`), which the call ABI
+    // addresses and passes as it is.
     bool narrow = false;
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
@@ -1280,8 +1279,6 @@ private:
 
     void scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier);
 
-    bool const_image_has_z(const SignalInfo& info) const;
-
     void compute_vif_reachable();
 
     void collect_vif_nba();
@@ -1317,15 +1314,6 @@ private:
     void nba_classify_ir(const Ir& ir);
 
     void nba_classify();
-
-    // Signals passed by pointer as a non-In (output / inout / ref) actual anywhere
-    // in the design, in a function `call` or a `task_call`. The pointer ABI reads /
-    // writes the signal's `{ i(2W), iW }` slot (copy-out stores through `&signal.z`;
-    // a ref aliases it live), so such a signal must keep its z word and packed form
-    // even when proven never-z. A storage/ABI constraint, not a may-z fact, hence
-    // separate from compute_may_z. (An alternative — a caller-stack z scratch word
-    // for elided targets — is sound but adds a second mechanism for a rare
-    // construct.)
 
     const SignalSlot& slot_of(Signal s) const;
 
@@ -1408,16 +1396,25 @@ private:
     // -- Functions --
     //
     // Each ir::Function becomes a plain (non-coroutine) LLVM function
-    //   { i(2Wr), iWr } @<mod>.fn.<name>(ptr state, <arg mm/z pairs...>)
-    // (void return / no result for a void function). Locals live in a per-call
-    // stack frame buffer, so recursion and `automatic` lifetime are just ordinary
-    // stack frames; module signals are still reached through `state`.
+    //   <result> @<mod>.fn.<name>(ptr state, ptr rng, <formals...>)
+    // where a scalar formal or result crosses by domain: a 2-state one as one iW
+    // (one pointer to the iW slot for an out / inout), a 4-state one as the
+    // (i(2W), iW) plane pair ((ptr, ptr) for an out / inout; `{ i(2W), iW }` for a
+    // result). Void return / no result for a void function. Locals live in a
+    // per-call stack frame buffer, so recursion and `automatic` lifetime are just
+    // ordinary stack frames; module signals are still reached through `state`.
 
     uint32_t width_of(Ref type) const;
 
     bool is_void(Ref type) const;
 
     llvm::Type* fn_return_ty(Ref return_type);
+
+    bool abi_four_state(Ref type) const;
+
+    void push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool four);
+
+    void push_scalar_out_arg(std::vector<llvm::Value*>& argv, const LValue& lv, bool four);
 
     llvm::Type* dpi_c_llvm_ty(DpiCType t);
 
@@ -1440,8 +1437,6 @@ private:
     std::vector<uint32_t> param_indices(const Function& f) const;
 
     uint32_t task_record_param(const Function& f) const;
-
-    std::vector<bool> frame_out_targets(const Function& f) const;
 
     void build_frame_layout(const Function& f);
 
@@ -2337,6 +2332,7 @@ private:
     llvm::FunctionCallee proc_adopt_fn();
     llvm::FunctionCallee proc_thread_done_fn();
     llvm::FunctionCallee proc_obj_retain_fn();
+    llvm::FunctionCallee proc_obj_release_fn();
     llvm::FunctionCallee proc_await_self_fn();
     llvm::FunctionCallee proc_randstate_get_fn();
     llvm::FunctionCallee proc_randstate_set_fn();
@@ -2352,6 +2348,7 @@ private:
     llvm::FunctionCallee wheel_advance_fn();
 
     llvm::FunctionCallee intra_alloc_fn();
+    llvm::FunctionCallee intra_alloc_rooted_fn();
     llvm::FunctionCallee intra_cb_fn();
     llvm::FunctionCallee intra_now_fn();
     llvm::Constant*      intra_total_gv();
@@ -2359,6 +2356,7 @@ private:
     llvm::FunctionCallee intra_ready_count_fn();
     llvm::FunctionCallee intra_any_fn();
     llvm::FunctionCallee intra_release_fn();
+    llvm::FunctionCallee intra_release_rooted_fn();
     llvm::FunctionCallee intra_reset_fn();
 
     llvm::FunctionCallee inertial_buf_fn();
@@ -2457,6 +2455,8 @@ private:
     uint32_t intra_rec_z_ptr(const SignalSlot& s) const;
     uint32_t intra_rec_ctx(const SignalSlot& s) const;
     uint32_t intra_rec_trigs(const SignalSlot& s) const;
+    bool intra_rec_rooted(const SignalSlot& s);
+    uint32_t intra_agg_payload(const SignalSlot& s);
 
     uint32_t arr_idx(Signal sig) const;
     llvm::StructType* arr_rec_ty(const SignalSlot& s);
@@ -3276,17 +3276,17 @@ private:
 
     llvm::Type* dpi_export_c_param_ty(DpiCType ct, ArgDir dir);
 
-    void dpi_push_plane_arg(std::vector<llvm::Value*>& argv, Plane pl);
-
     // One `output` / `inout` formal of an export thunk, recorded during the
-    // argument marshal and copied back after the callee returns: the (mm, z) plane
-    // cells the exported subroutine wrote, plus the C pointer to store through.
+    // argument marshal and copied back after the callee returns: the cells the
+    // exported subroutine wrote (the value cell, and the z cell of a 4-state
+    // formal), plus the C pointer to store through.
     struct ExpOut {
-        llvm::Value* c_ptr;   // the C output pointer (scalar*) or svVecVal*
-        llvm::Value* mm_ptr;  // SV out ABI: i(2W) cell
-        llvm::Value* z_ptr;   // SV out ABI: iW cell
+        llvm::Value* c_ptr;  // the C output pointer (scalar*) or svVecVal*
+        llvm::Value* mm_ptr; // SV out ABI: the iW cell, or i(2W) when 4-state
+        llvm::Value* z_ptr;  // SV out ABI: iW cell, null when 2-state
         DpiCType     ct;
         uint32_t     w;
+        bool         four; // the formal's domain
     };
 
     void emit_dpi_export_copyout(const std::vector<ExpOut>&       outs,

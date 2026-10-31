@@ -507,7 +507,8 @@ void Backend::denormalize_assoc_key(llvm::Value*  kptr,
         }
         return;
     }
-    lower_store(key_lv, two_val(denormalize_key_word(kptr, 0, info.W, info.is_signed, key_lv.store_width)));
+    lower_store(key_lv, known_plane(denormalize_key_word(kptr, 0, info.W, info.is_signed, key_lv.store_width),
+                                    !key_lv.narrow));
 }
 
 // Rebuild one leaf value from `nbytes` big-endian key bytes at `off`: reassemble,
@@ -561,7 +562,7 @@ void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr,
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, two_val(denormalize_key_word(kptr, off, W, is_signed, leaf.store_width)));
+    lower_store(leaf, known_plane(denormalize_key_word(kptr, off, W, is_signed, leaf.store_width), !leaf.narrow));
     off += (W + 7) / 8;
 }
 
@@ -717,7 +718,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, two_val(denormalize_key_word(leafptr, 0, W, is_signed, leaf.store_width)));
+    lower_store(leaf, known_plane(denormalize_key_word(leafptr, 0, W, is_signed, leaf.store_width), !leaf.narrow));
     off = b_.CreateAdd(off, b_.getInt32((W + 7) / 8));
 }
 
