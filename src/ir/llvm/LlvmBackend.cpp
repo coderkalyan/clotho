@@ -255,6 +255,31 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
     return built;
 }
 
+// The built modules, each moved into `ctx` by a bitcode round trip: a module
+// reloaded alone names its types as its own text says, where modules still
+// sharing the building context suffix a type name another module holds.
+static bool reload_modules(BuiltDesign& built, llvm::LLVMContext& ctx,
+                           std::vector<std::unique_ptr<llvm::Module>>& out) {
+    std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
+    std::vector<std::string>                names;
+    for (size_t i = 0; i < built.modules.size(); ++i) {
+        llvm::raw_svector_ostream bits(bitcode[i]);
+        llvm::WriteBitcodeToFile(*built.modules[i], bits);
+        names.push_back(built.modules[i]->getModuleIdentifier());
+    }
+    built.modules.clear();
+    for (size_t i = 0; i < bitcode.size(); ++i) {
+        const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
+        auto                        parsed = llvm::parseBitcodeFile(buf, ctx);
+        if (!parsed) {
+            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
+            return false;
+        }
+        out.push_back(std::move(*parsed));
+    }
+    return true;
+}
+
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config,
                Timings* timings, const LocResolver& resolve) {
     const auto t_llvm = std::chrono::steady_clock::now();
@@ -284,36 +309,54 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     // gives the linked copies no name -- `%0 = type { %1, %1 }` for what was
     // `%alu.state` -- which is the readable part of this output. In a fresh
     // context the names are free.
-    std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
-    std::vector<std::string>                names;
-    for (size_t i = 0; i < built.modules.size(); ++i) {
-        llvm::raw_svector_ostream bits(bitcode[i]);
-        llvm::WriteBitcodeToFile(*built.modules[i], bits);
-        names.push_back(built.modules[i]->getModuleIdentifier());
+    llvm::LLVMContext                           linked_ctx;
+    std::vector<std::unique_ptr<llvm::Module>> reloaded;
+    if (!reload_modules(built, linked_ctx, reloaded)) {
+        return false;
     }
-    built.modules.clear();
-    llvm::LLVMContext             linked_ctx;
-    std::unique_ptr<llvm::Module> root;
-    for (size_t i = 0; i < bitcode.size(); ++i) {
-        const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
-        auto                        parsed = llvm::parseBitcodeFile(buf, linked_ctx);
-        if (!parsed) {
-            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
-            return false;
-        }
-        if (i == 0) {
-            root = std::move(*parsed);
-            continue;
-        }
+    std::unique_ptr<llvm::Module> root = std::move(reloaded.front());
+    for (size_t i = 1; i < reloaded.size(); ++i) {
         // Reports its own diagnostic through the context's handler.
         llvm::Linker linker(*root);
-        if (linker.linkInModule(std::move(*parsed))) {
+        if (linker.linkInModule(std::move(reloaded[i]))) {
             return false;
         }
     }
     root->print(os, nullptr);
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
+    }
+    return true;
+}
+
+bool emit_llvm_modules(const Module& m, std::vector<ModuleIr>& out, const SimulationConfig& config,
+                       const LocResolver& resolve) {
+    auto host = host_target();
+    if (!host) {
+        llvm::errs() << "llvm backend: cannot detect host target: " << llvm::toString(host.takeError())
+                     << "\n";
+        return false;
+    }
+    auto tm = host->createTargetMachine();
+    if (!tm) {
+        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
+        return false;
+    }
+    llvm::LLVMContext ctx;
+    auto              built = build_modules(m, ctx, **tm, config, resolve);
+    if (built.modules.empty()) {
+        return false;
+    }
+    llvm::LLVMContext                          fresh;
+    std::vector<std::unique_ptr<llvm::Module>> reloaded;
+    if (!reload_modules(built, fresh, reloaded)) {
+        return false;
+    }
+    for (const auto& mod : reloaded) {
+        ModuleIr& entry = out.emplace_back();
+        entry.name      = mod->getModuleIdentifier();
+        llvm::raw_string_ostream os(entry.ir);
+        mod->print(os, nullptr);
     }
     return true;
 }

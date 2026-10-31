@@ -363,6 +363,7 @@ enum class Emit : uint8_t {
     Obj,     // a native object file for this machine
     Ir,      // Clotho process IR
     Llvm,    // LLVM IR after the coroutine-lowering pipeline
+    LlvmUnits, // one file of LLVM IR per module (post-pipeline), into the directory of -o
     LlvmRaw, // LLVM IR straight from the backend, llvm.coro.* intact
 };
 
@@ -427,8 +428,9 @@ void register_options(Registry& r, Options& o) {
           o.emit,
           "What to write: exe (an executable that runs the simulation without clotho, the default), "
           "obj (an object file that defines clotho_main, for linking against Clotho's runtime "
-          "library), llvm (LLVM IR for the design), ir (Clotho's own intermediate form), llvm-raw "
-          "(LLVM IR before the coroutine passes; for working on clotho)",
+          "library), llvm (LLVM IR for the design), llvm-units (the LLVM IR of each unit's module and "
+          "of the link glue, one file each, in the directory -o names), ir (Clotho's own intermediate "
+          "form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
           "<target>");
     r.add(bit(Command::Build),
           "--cpu",
@@ -1098,6 +1100,32 @@ bool write_artifact(const clotho::LowerResult&                result,
         }
         return clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve);
     }
+    if (emit == Emit::LlvmUnits) {
+        if (to_stdout) {
+            std::println(stderr, "clotho: --emit llvm-units writes a directory; pass -o <dir>");
+            return false;
+        }
+        std::vector<clotho::ir::ModuleIr> modules;
+        if (!clotho::ir::emit_llvm_modules(*result.module, modules, config, resolve)) {
+            return false;
+        }
+        if (const std::error_code ec = llvm::sys::fs::create_directories(out)) {
+            std::println(stderr, "clotho: cannot create '{}': {}", out, ec.message());
+            return false;
+        }
+        for (const clotho::ir::ModuleIr& m : modules) {
+            llvm::SmallString<128> path(out);
+            llvm::sys::path::append(path, m.name + ".ll");
+            std::error_code      ec;
+            llvm::raw_fd_ostream os(path, ec);
+            if (ec) {
+                std::println(stderr, "clotho: cannot open '{}': {}", std::string_view(path), ec.message());
+                return false;
+            }
+            os << m.ir;
+        }
+        return true;
+    }
     if (to_stdout) {
         return clotho::ir::emit_llvm(*result.module, llvm::outs(), config, timings, resolve);
     }
@@ -1246,13 +1274,15 @@ int main(int argc, char** argv) {
             emit = Emit::Obj;
         } else if (target == "llvm") {
             emit = Emit::Llvm;
+        } else if (target == "llvm-units") {
+            emit = Emit::LlvmUnits;
         } else if (target == "llvm-raw") {
             emit = Emit::LlvmRaw;
         } else if (target == "ir") {
             emit = Emit::Ir;
         } else {
             return usage_error(
-              std::format("unknown --emit target '{}'; expected exe, obj, llvm, ir or llvm-raw", target));
+              std::format("unknown --emit target '{}'; expected exe, obj, llvm, llvm-units, ir or llvm-raw", target));
         }
     }
     if (refuses_terminal_artifact(command, emit, options.out.has_value(), stdout_is_terminal())) {

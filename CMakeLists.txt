@@ -1074,6 +1074,7 @@ set(CLOTHO_TEST_SOURCES
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
+  tests/modular_gate_test.cpp
   tests/code_text_test.cpp
   tests/two_state_test.cpp
   tests/real_test.cpp

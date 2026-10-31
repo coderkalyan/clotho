@@ -89,6 +89,20 @@ bool optimize_module(llvm::Module& m, bool o3);
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {},
                Timings* timings = nullptr, const LocResolver& resolve = {});
 
+// One built module as text, named by its module identifier. The first entry is
+// the root module.
+struct ModuleIr {
+    std::string name;
+    std::string ir;
+};
+
+// Build the design as emit_llvm does and append each module's IR to `out`
+// separately (root first), without linking them: what one unit's code is is
+// what its own text says. Returns false (reason on llvm::errs()) on a backend
+// error. Exposed for `--emit llvm-units` and the modular-compilation gate test.
+bool emit_llvm_modules(const Module& m, std::vector<ModuleIr>& out, const SimulationConfig& config = {},
+                       const LocResolver& resolve = {});
+
 // Compile the design for `target`'s triple, CPU and features and write it to
 // `os` as one relocatable object file. The object defines `clotho_main`, the
 // entry rt_run takes, and `clotho_design`, the rt_design an executable's main
