@@ -1204,9 +1204,21 @@ llvm::Value* Backend::defer_gen_ptr() {
 
 // The same counter named by GROUP rather than by "the one being lowered", which
 // is what a `disable` of another procedure's outermost scope needs (LRM 16.4.4):
-// the bump has to land on the TARGET's counter. Created in the root unit so
-// either side can be lowered first and still get the same global.
+// the bump has to land on the TARGET's counter. A group of the instance whose code
+// is being lowered keeps its counter in that instance's record, at the def-local
+// ordinal of its front process, so the code names no counter; one of another
+// instance (a hierarchical disable) or of no instance is a global of root, created
+// there so either side can be lowered first and still get the same global.
 llvm::Value* Backend::defer_gen_ptr_for(uint32_t g) {
+    const uint32_t ga = group_unit_anchor_[g];
+    if (ga != SignalSlot::no_anchor && ga == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[ga];
+        return b_.CreateInBoundsGEP(a.ctx_ty, own_ctx_,
+                                    { b_.getInt32(0), b_.getInt32(a.ctx_defer_base + proc_sched_ord_[groups_[g].front()]) });
+    }
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        taint("names the deferred-assertion counter of another instance's process");
+    }
     if (defer_gen_gv_.size() <= g) {
         defer_gen_gv_.resize(g + 1, nullptr);
     }

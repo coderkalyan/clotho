@@ -1063,6 +1063,14 @@ struct Anchor {
     // filled at startup, so code of the unit reads its instance's name and bakes
     // none. It follows the id fields; later fields append after it.
     uint32_t ctx_name_base = 0;
+    // Deferred-assertion generation counters (LRM 16.4.2): one i64 per owned
+    // process at ctx_defer_base + its def-local ordinal (that of the front process
+    // of a group), n_defer of them (n_blk when the design has a deferred
+    // assertion, else 0). The counter is the field itself: a group bumps it at
+    // each activation and tags its queued reports with it, so no counter is named
+    // by unit code.
+    uint32_t ctx_defer_base = 0;
+    uint32_t n_defer        = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -4655,7 +4663,11 @@ private:
     // Current group's deferred-assertion generation-counter group id (-1 = none);
     // set per group in lower_group. Per-group generation globals, created lazily.
     int32_t                            cur_defer_group_ = -1;
+    // Per-group generation globals of a group that belongs to no instance, created
+    // lazily; an instance's groups keep theirs in its record (Anchor::ctx_defer_base).
     std::vector<llvm::GlobalVariable*> defer_gen_gv_;
+    // Whether any process of the design holds a deferred assertion (sizes the records).
+    bool any_defer_ = false;
     std::vector<int32_t>  vcd_index_;
     llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 

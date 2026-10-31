@@ -36,17 +36,13 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // Deferred immediate assertion (LRM 16.4): a group carrying one gets a
     // per-process generation counter, bumped at each activation, that tags
     // its queued reports so a superseded activation's reports are dropped at
-    // maturation (the flush of LRM 16.4.2). Such a group is a forced coroutine
-    // (is_simple_always is false for a deferred Severity) and coroutines are
-    // never shared across instances (only thunk groups dedup), so every
-    // instance of a reused definition is its own group with its own gen
-    // global keyed by the per-instance group id — per-instance correct with
-    // no extra machinery. The counter is a plain per-group global.
+    // maturation (the flush of LRM 16.4.2). The counter of a group of an
+    // instance is a field of the instance's record (defer_gen_ptr_for), so the
+    // group is the same code in every instance of its unit.
     cur_defer_group_ = -1;
     if (std::any_of(members.begin(), members.end(),
                     [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
         cur_defer_group_ = static_cast<int32_t>(g_);
-        taint("holds deferred assertions");
     }
 
     // Same-eligibility NBA prep: the function's block registrations pass

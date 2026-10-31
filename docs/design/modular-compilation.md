@@ -307,7 +307,15 @@ between instances:
 - bases of the instance's state, NBA shadow and scheduling flags;
 - bases of its ids in design-wide spaces (VCD variables, NBA blocks and
   buffers, triggers, RNG seeds), so code adds a unit-local ordinal;
-- its hierarchical name (`%m`, banners, covergroup scope);
+- its hierarchical name (`%m`, banners, covergroup scope), held as a borrowed
+  string handle: `inst_path` reads it at no cost and nothing owns the value, so
+  consumers read it in place (a display argument, a banner piece the runtime
+  joins when it reports, a concatenation part) and copy only where they need a
+  string of their own;
+- its deferred-assertion generation counters, one per process it owns: a group
+  bumps its counter at each activation and tags the reports it queues with it
+  (LRM 16.4.2), so the counter is a field of the instance, not a global of the
+  group;
 - one binding per extern declaration: the address of an imported signal and the
   record of the instance that owns it, and the record of an imported function's
   instance (landed); the record of an instance an interface port or `inst_refs`

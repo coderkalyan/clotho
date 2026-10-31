@@ -783,6 +783,31 @@ TEST_CASE("cli: --stat=unit-code shows subroutines that read their instance's na
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code shows the groups of twin instances with deferred assertions shared") {
+    // The generation counter that drops a pending report is a field of the
+    // instance's record, so the unit's two coroutine groups are one function each.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module chk(input int k);
+            int x;
+            initial begin : whole
+                #1;
+                x = 0;
+                assert #0 (x == 1) else $error("k=%0d", k);
+                if (k == 2) disable whole;
+            end
+            always @(k) assert #0 (x == 7) else $warning("w k=%0d", k);
+        endmodule
+        module top;
+            chk c1(.k(1)); chk c2(.k(2)); chk c3(.k(3));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "2 groups of multi-instance units over 6 instances' groups, 2 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);
