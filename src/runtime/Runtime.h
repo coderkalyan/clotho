@@ -496,6 +496,25 @@ void rt_ref_stale(const rt_ref_site* site, const void* epoch, uint64_t expect, u
 [[noreturn]] void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
                                        uint64_t expect, uint64_t actual, uint64_t now);
 
+// One level of the witness chain a `ref` to a place inside a container's heap
+// buffer carries: the container's relocation epoch and its value when the ref
+// was formed. The levels are outermost first, because level n's epoch lives in
+// level n-1's buffer and may be read only once level n-1 is known current; a
+// level whose `epoch` is null ends the chain. Field order and types mirror the
+// LLVM struct the backend builds: { ptr, i64 }.
+typedef struct rt_ref_witness {
+    const uint64_t* epoch;
+    uint64_t        expect;
+} rt_ref_witness;
+
+// The slow path of the guard in front of every dereference of a `ref` formal,
+// reached when the outermost level no longer matches or there is a deeper level
+// to check. Walks the chain outermost first and stops at the first level that
+// moved: rt_ref_epoch_regress for an epoch below the expected one, otherwise
+// rt_ref_stale, which in warn mode returns. `wheel` supplies the time a report
+// stamps.
+void rt_ref_check(const rt_ref_site* site, const rt_ref_witness* chain, const void* wheel);
+
 // -- Tagged-union member access inconsistent with the current tag (LRM 11.9) --
 
 // The site of one guarded tagged-union member access, emitted by the backend as
@@ -1190,11 +1209,11 @@ void rt_assoc_visit(const struct rt_assoc* h,
 // replacement. Writing an existing element does NOT bump it.
 //
 // Its purpose is `ref` safety (docs/design/data-model.md §3). A `ref` whose
-// actual is a container element is a fat pointer carrying `&handle->epoch` plus
-// the epoch observed when the ref was formed; every dereference in the callee
-// re-reads the field and compares. A mismatch means the container was
-// restructured while the ref was live, so the interior pointer is dangling —
-// reported as a located fatal instead of corrupting memory.
+// actual is a container element carries a witness chain: `&handle->epoch` plus
+// the epoch observed when the ref was formed, one pair per container level;
+// every dereference in the callee re-reads the field and compares. A mismatch
+// means the container was restructured while the ref was live, so the interior
+// pointer is dangling — reported as a located fatal instead of corrupting memory.
 //
 // The epoch belongs to the handle rather than a side table so that it survives
 // assign / move correctly: the destination's epoch ADVANCES, and is never
@@ -1203,11 +1222,8 @@ void rt_assoc_visit(const struct rt_assoc* h,
 //
 // A stable (non-relocatable) place — a module signal, a frame local, a fixed
 // unpacked array element, a class property — has no epoch to check, so a ref
-// formed through one points at a compile-time zero word and expects 0. That
-// keeps the callee's check unconditional rather than paying a null test, means
-// such a ref can never be reported stale, and lets the optimizer fold the check
-// away entirely when it can see the caller. That zero word is emitted by the
-// backend (`clotho.ref.noepoch`) rather than exported from here.
+// formed through one passes no chain at all (a null pointer) and the callee's
+// guard is one compare against it.
 
 // NOTE: the element lifecycle helpers (init / deinit / copy over an
 // rt_elem_ops descriptor) are internal to runtime/Containers.cpp — the backend inlines

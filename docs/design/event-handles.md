@@ -174,9 +174,9 @@ Why `{slot, gen}` and not a bare pointer:
 
 The generation half is what makes "strictly managed lifetimes" enforceable rather
 than aspirational. Releasing a slot bumps its generation, so every stale handle
-is *detected*. The precedent is exact: the fat `ref` ABI already carries
-`{ptr, epoch, expect}` (`RefBinding`, `ir/llvm/Backend.h`) to catch a
-container reference invalidated by relocation, and `rt_null_handle`
+is *detected*. The precedent is exact: the `ref` ABI already carries a witness
+chain of `{epoch, expect}` pairs (`ref_witness_chain`, `ir/llvm/StateLayout.cpp`) to
+catch a container reference invalidated by relocation, and `rt_null_handle`
 (`Runtime.h:312`) is the located-fatal shape to copy.
 
 ### 3.2 The object
@@ -261,8 +261,8 @@ word. The fat-ref ABI comment already anticipates this:
 > aggregate image — so `ref` has one shape.
 > — `src/ir/llvm/Subroutines.cpp, lower_call_common`
 
-`ref_needs_epoch` is false for a stable place, so a `ref event` costs one pointer
-argument and no epoch words.
+A `ref` to a stable place passes a null witness chain, so a `ref event` costs its
+pointer and one null word.
 
 ### 4.1 Ports
 

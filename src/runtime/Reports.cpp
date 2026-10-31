@@ -699,6 +699,28 @@ extern "C" void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
     std::exit(1);
 }
 
+extern "C" void rt_ref_check(const rt_ref_site* site, const rt_ref_witness* chain, const void* wheel) {
+    // Outermost first: level n's epoch lives in level n-1's buffer, so it may be
+    // read only once level n-1 is proven current. The first level that moved is
+    // reported and ends the walk -- in warn mode rt_ref_stale returns, and the
+    // deeper witnesses live in storage the reported restructuring may have
+    // released.
+    for (; chain->epoch != nullptr; ++chain) {
+        const uint64_t actual = *chain->epoch;
+        if (actual == chain->expect) {
+            continue;
+        }
+        const uint64_t now = rt_wheel_now(static_cast<const rt_wheel*>(wheel));
+        // Epochs only ever advance, so a current value BELOW the expected one means
+        // the epoch plumbing itself is wrong, not the design.
+        if (actual < chain->expect) {
+            rt_ref_epoch_regress(site, chain->epoch, chain->expect, actual, now);
+        }
+        rt_ref_stale(site, chain->epoch, chain->expect, actual, now);
+        return;
+    }
+}
+
 extern "C" void rt_tagged_access(const rt_tagged_site* site, uint64_t tag, uint32_t tag_unknown,
                                  uint64_t now) {
     // Reached only from the guard the backend plants ahead of every tagged-union

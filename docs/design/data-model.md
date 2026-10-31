@@ -117,13 +117,13 @@ out, writes visible live across a `#delay`. That forces a pointer, and a pointer
 into a relocatable root is a dangling-pointer hazard the previous design avoided
 only by refusing every interesting actual.
 
-**A `ref` formal is one pointer, plus two epoch words when — and only when — some
-call site binds it inside a container's heap buffer:**
+**A `ref` formal is two pointers: the place, and a witness chain that is null
+unless the place is inside a container's heap buffer:**
 
 ```
-{ ptr   slot     // the place's byte pointer: plane slot, handle, or agg image
-, ptr   epoch    // &container.epoch  -- heap-rooted formals only
-, i64   expect } // the epoch observed when the ref was formed   -- ditto
+{ ptr slot     // the place's byte pointer: plane slot, handle, or agg image
+, ptr chain }  // null, or the caller's array of { &container.epoch, i64 expect }
+               // pairs, outermost first, ended by a pair whose epoch is null
 ```
 
 Nothing about the *report* is passed. Both facts a staleness diagnostic needs are
@@ -138,9 +138,9 @@ in the callee, one per dereference, and costs nothing per call.
 - **Aggregate** ref → `slot` is the image pointer. Identical to the existing
   by-pointer aggregate ABI, minus the copy-in/copy-out.
 
-### 3.0 Which formals are fat, and why the epoch cannot be derived
+### 3.0 Which refs carry a chain, and why the epoch cannot be derived
 
-The natural question is why `epoch` is passed at all, when the callee knows the
+The natural question is why an epoch is passed at all, when the callee knows the
 formal's type: can it not GEP to the epoch field from `slot`? The answer is the
 reason the whole scheme works, so it is worth stating exactly. Two cases:
 
@@ -161,68 +161,49 @@ validity is in question would be the one used to check it.
 handle — and with it the epoch word — lives *inside the map's payload*, so that
 witness is itself destructible: `a.delete(k)` frees it. One pair per container level
 travels with the ref, outermost first, and the callee checks them in that order,
-short-circuiting on the first mismatch. Level n's witness is read only once level
-n-1 is proven current, which is exactly what makes reading it safe. A call site that
-binds shallower than the formal's declared depth pads with the `clotho.ref.noepoch`
-zero word.
+stopping at the first mismatch. Level n's witness is read only once level n-1 is
+proven current, which is exactly what makes reading it safe.
 
 A single field forced the opposite: each element select OVERWROTE the witness, so a
 two-level place kept the inner one — the only one that can die — and a restructuring
 of the outer container went unreported while the check read freed memory.
 
-Which formals need it, and how deep, is therefore a property of the ACTUALS, and
-`Analysis::call_actuals` already visits every one. `heap_depth()` walks the select
-chain of each `ref` actual and COUNTS the relocatable levels: each `ElemSelect` over
-a dynamic array or queue, and each `AssocSelect`, at any depth (a further member or
-bit step off such a place stays at the same depth, so the walk continues to the
-root). A ref to a variable, a fixed-array element, a struct member, a class
-property or a whole container handle counts zero and stays one plain pointer.
-`DesignFacts::ref_epoch_formals` holds the answer keyed `(fid << 32) | formal`,
-mapping to that depth, maxed over call sites.
+**The signature never depends on a caller.** Which actuals are heap-rooted, and how
+deep, is a property of the call sites, and an earlier design let it decide the
+callee's parameter list (one `(epoch, expect)` pair per level the deepest caller
+nested, unioned across each vtable slot, so one unit's call changed the signature
+of a function in another). A function compiled once for every unit that calls it
+cannot take that: the chain is the one shape. The caller that binds a place that
+cannot move — a variable, a fixed-array element, a struct member, a class property
+or a whole container handle — passes null; one that binds a place inside a
+container's heap buffer (each `ElemSelect` over a dynamic array or queue, and each
+`AssocSelect`, at any depth; `Analysis`' `in_heap_buffer` walks the select chain)
+builds the array of pairs in its own frame, which outlives the call, and passes its
+address. Nothing about how it binds is known to the callee until it runs.
 
-Two obligations, both discharged in `analyze()`:
+**Epoch checking.** Every dereference of the formal is guarded:
 
-- **Conservative on absence.** A formal narrows only when every call site was seen
-  and none was heap-rooted; `ref_needs_epoch` also treats an unknown function as
-  fat. The fact is per FORMAL, never per call site, so a formal reached by both
-  shapes stays fat everywhere and the variable actual passes the `noepoch`
-  sentinel rather than a shorter argument list.
-- **Virtual dispatch agrees.** A `CallVirtual` reaches whichever override occupies
-  the vtable slot, so the answer is unioned across each slot index: one override
-  bound to a queue element widens every sibling in that slot. Were this wrong, an
-  indirect call would write arguments the callee never declared — memory
-  corruption, not a visible failure, which is why
-  `llvm_backend_test.cpp` asserts the emitted parameter lists of both bodies
-  directly and in both directions.
+- `chain == null` → proceed. One compare and a not-taken branch, which is the whole
+  cost of a `ref` through a place that cannot move.
+- otherwise the outermost pair is checked inline: load its epoch, compare with the
+  expected one, and look at whether the chain goes deeper. One load and compare
+  more, with the cold path weighted out of line. A mismatch, or a deeper level,
+  calls `rt_ref_check`, which walks the chain outermost first and stops at the first
+  level that moved:
+  - `*epoch > expect` → the container was restructured under a live ref. Located
+    fatal `rt_ref_stale`, naming the ref formal, the actual, and both epochs.
+    `--loose-stale-ref` downgrades it to a one-shot warning and continues.
+  - `*epoch < expect` → impossible without a codegen bug (epochs are monotone).
+    Assert trip: `rt_ref_epoch_regress` aborts unconditionally, even under
+    `--loose-stale-ref`.
 
-**Epoch checking**, for the formals that carry it. Every deref loads `*epoch` and
-compares it to `expect`:
-
-- equal → proceed. One load, one compare, one not-taken branch.
-- `*epoch > expect` → the container was restructured under a live ref. Located
-  fatal `rt_ref_stale`, naming the ref formal, the actual, and both epochs.
-  `--loose-stale-ref` downgrades it to a one-shot warning and continues.
-- `*epoch < expect` → impossible without a codegen bug (epochs are monotone).
-  Assert trip: `rt_ref_epoch_regress` aborts unconditionally, even under
-  `--loose-stale-ref`.
-
-A fat formal whose actual at *this* site is stable (the mixed case above) points
-`epoch` at `clotho.ref.noepoch`, an internal constant zero global, and passes
-`expect == 0`, so it is never reported stale.
-
-**Cost.** For the common shapes — a variable, a struct member, a fixed-array
-element, a class property, a whole handle — a `ref` is exactly one pointer and the
-dereference is a plain load: no epoch, no compare, no branch, nothing for the
-optimizer to have to see through. Only a container-element ref pays, and there it
-buys the difference between a located diagnostic and silent corruption.
-
-This replaces an earlier claim in this document that the check "folds away" for a
-stable actual. It does not fold: the argument is an opaque `ptr` parameter nothing
-specializes, and a task's coroutine split spills it. Rather than pay it everywhere
-and hope, the shape is decided per formal up front. What the folding argument does
-still buy, for the fat formals, is that `rt_ref_stale` is declared
-`inaccessiblememonly`, so GVN collapses repeated dereferences of one formal within
-a block to a single load and compare instead of one per access.
+**Cost.** A `ref` is two pointers instead of one. Through a place that cannot move
+the dereference is a plain load behind one compare of the chain; only a
+container-element ref pays the epoch load, and there it buys the difference between
+a located diagnostic and silent corruption. (The narrow form this replaces paid
+nothing at all for the common shapes, because the callee knew no caller bound the
+formal inside a container; that knowledge is what a function shared by every unit
+that calls it cannot have. docs/design/modular-compilation.md, "Code generation".)
 
 ### 3.1 The relocation epoch
 
@@ -310,8 +291,8 @@ of. Reading the diagnostic back disproves the premise. It needs exactly two name
   run, immediately before printing.
 
 So the site record moved into the callee, one per *dereference* — and the fourth
-word went away entirely. The table is emitted only for a design that has a fat ref
-formal at all.
+word went away entirely. The table is emitted only for a design that has a ref
+actual inside a container's buffer at all.
 
 Two consequences, both deliberate:
 
@@ -365,10 +346,10 @@ one is total, deterministic, and stable for a run.
 
 One table, derived rather than enumerated. `in` is a deep copy into the callee's
 frame; `out` a deep copy back; `inout` both; `ref` the pointer of §3. The `ref`
-column is the *storage* it aliases; whether the formal also carries the three
-epoch words is orthogonal to the storage class and decided per formal from its
-actuals (§3.0) — a `ref int` is fat when bound to `q[i]` and narrow when bound to
-a variable, though both are Plane.
+column is the *storage* it aliases; whether a call also passes a witness chain is
+orthogonal to the storage class and decided by the actual at each call (§3.0) —
+a `ref int` passes one when bound to `q[i]` and null when bound to a variable,
+though both are Plane.
 
 | Storage class | in | out / inout | ref | return | module port |
 |---|---|---|---|---|---|

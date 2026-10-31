@@ -1448,11 +1448,12 @@ size_t Backend::fork_ring_slots() const {
 //      formal's slot holds a pointer instead of the value, so both lists are
 //      walked rather than assuming one covers the other;
 //   3. a `ref` formal, whose ACTUAL the callee cannot see. A `ref` bound to a
-//      class property is a raw interior pointer into an object body carrying
-//      clotho.ref.noepoch (:3587-3606) -- a reference the frame holds with no
-//      class-typed value anywhere in sight, and one rt_gc_find_object resolves
-//      back to its object precisely so it needs no epoch machinery
-//      (Gc.h:281-287). Unconditional, because the direction is caller-chosen:
+//      class property is a raw interior pointer into an object body that passes
+//      no witness chain (StateLayout.cpp, ref_actual_arg) -- a reference the frame
+//      holds with no class-typed value anywhere in sight, and one
+//      rt_gc_find_object resolves back to its object precisely so it needs no
+//      epoch machinery (Gc.h:281-287). Unconditional, because the direction is
+//      caller-chosen:
 //      that includes a fork child, whose every formal is an ArgDir::Ref capture
 //      of an enclosing frame slot (lower/Statements.cpp, lower_fork) and which may capture a
 //      formal that is itself a `ref` bound to an object interior;

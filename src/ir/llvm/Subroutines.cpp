@@ -740,12 +740,11 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     params.push_back(ptr); // rng
     // The calling THREAD's process control block (LRM 9.7), so
     // `process::self()` inside a subroutine names the caller rather than the
-    // callee -- a task or function is not a thread. Present only in a design
-    // that names `process`, and uniform across the design for the same reason
-    // `rng` is unconditional: one FunctionType per vtable slot.
-    if (design_uses_process_) {
-        params.push_back(ptr); // proc
-    }
+    // callee -- a task or function is not a thread. Always present, null where
+    // the design has no control blocks: a signature that depended on whether
+    // some other unit names `process` would make a unit's code change with
+    // its callers' (docs/design/modular-compilation.md, "Code generation").
+    params.push_back(ptr); // proc
     // The calling THREAD's scheduling home region (LRM 24.3.1): "a section of
     // sequential code anywhere in the design or testbench inherits the
     // scheduling region of the thread that calls it". A FUNCTION cannot suspend
@@ -753,24 +752,20 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     // spawn a `fork ... join_none` child, and that child is a thread whose park
     // sites need the answer. Sits beside `proc` because it is the same kind of
     // thing: the second of the two facts a callee inherits from its caller's
-    // thread rather than from its own declaration. Gated design-wide, on the
-    // same uniformity argument as `proc` (see home_param_index).
-    if (design_uses_home_arg_) {
-        params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
-    }
+    // thread rather than from its own declaration. Always present, for the
+    // reason `proc` is.
+    params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         const Ref     pt  = f.param_types[k];
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
         if (dir == ArgDir::Ref) {
-            // The actual's storage pointer, plus -- only when some call site
-            // binds this formal to a place inside a container's heap buffer --
-            // the relocation epoch of that container, its value at the call, and
-            // the site record for the staleness report (§3.0).
-            params.push_back(ptr);                 // &actual storage
-            for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
-                params.push_back(ptr);             // &epoch, outermost first
-                params.push_back(b_.getInt64Ty()); // expected epoch
-            }
+            // The actual's storage pointer and its witness chain: null for a
+            // place that cannot move, else the caller's array of (&epoch,
+            // expected epoch) pairs, one per container level, ended by a null
+            // epoch (§3.0). One shape for every caller, so the callee's
+            // signature never depends on how any of them binds the formal.
+            params.push_back(ptr); // &actual storage
+            params.push_back(ptr); // witness chain, or null
             continue;
         }
         // A dynamic array or queue is one handle pointer regardless of
@@ -818,8 +813,8 @@ llvm::Function* Backend::declare_function(FunctionId id) {
 }
 
 // A task is a switched-resume coroutine. Its signature is:
-//   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel,
-//                          [ptr proc,] [i8 home,] <per formal>, ptr record)
+//   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel, ptr proc,
+//                          i8 home, <per formal>, ptr record)
 // where each 2-state input formal contributes one iW and each 4-state one an
 // (i(2W) mm, iW z) pair, each output / inout formal one pointer to its caller
 // temp's slot (two, mm and z, when 4-state), and an unpacked aggregate formal
@@ -834,27 +829,20 @@ llvm::Function* Backend::declare_task(FunctionId id) {
     params.push_back(ptr); // state
     params.push_back(ptr); // rng
     params.push_back(ptr); // wheel
-    if (design_uses_process_) {
-        params.push_back(ptr); // proc — the calling thread's control block
-    }
+    params.push_back(ptr); // proc — the calling thread's control block
     // The calling thread's home region, LRM 24.3.1's "inherits the scheduling
     // region of the thread that calls it". This is the load-bearing one: a task
     // reached from both a program `initial` and an ordinary process is lowered
     // ONCE, so its park sites cannot fold a home, and the only authority on
     // which region the running thread belongs to is the caller. See
-    // build_shared_home_fns for who actually reads it, and home_param_index for
-    // why it is gated design-wide rather than per callee.
-    if (design_uses_home_arg_) {
-        params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
-    }
+    // build_shared_home_fns for who actually reads it. Present in every
+    // signature, like `proc`, whether or not the design has a body that reads it.
+    params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         if (f.arg_dirs[k] == ArgDir::Ref) {
-            // The same shape declare_function builds, narrow or fat.
-            params.push_back(ptr);                 // &actual storage
-            for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
-                params.push_back(ptr);             // &epoch, outermost first
-                params.push_back(b_.getInt64Ty()); // expected epoch
-            }
+            // The same shape declare_function builds.
+            params.push_back(ptr); // &actual storage
+            params.push_back(ptr); // witness chain, or null
         } else if (is_handle_type(f.param_types[k])) {
             params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
         } else if (is_agg_abi(f.param_types[k])) {
@@ -893,32 +881,15 @@ llvm::Function* Backend::declare_task(FunctionId id) {
 }
 
 // How many LLVM parameters formal k occupies:
-//   4 — a `ref` fat pointer { &storage, &epoch, expect, site }
+//   2 — a `ref`: the aliased storage pointer and the witness chain
 //   1 — an aggregate storage pointer, a container handle pointer, a string
 //       handle (each one pointer in every direction), or a 2-state scalar (one
 //       iW, or the one pointer to its slot for an out / inout)
 //   2 — a 4-state scalar: the (must|may, z) plane pair, or the (&mm, &z)
 //       out / inout pointer pair
-// How many relocation-epoch witness PAIRS ref formal k of `f` carries: one per
-// container level some call site nests its actual inside, 0 for a ref to a
-// variable, a fixed-array element, a struct member, a class property or a whole
-// container HANDLE — storage that cannot move, so the callee emits no check
-// (docs/design/data-model.md §3.0).
-uint32_t Backend::ref_epoch_depth(const Function& f, size_t k) const {
-    const auto it = fn_ids_.find(&f);
-    // A function the map has not seen cannot be reasoned about; keep the guard,
-    // and keep it at the one level every heap place has at minimum.
-    return it == fn_ids_.end() ? 1u : facts_.ref_epoch_depth(it->second, k);
-}
-
-bool Backend::ref_needs_epoch(const Function& f, size_t k) const {
-    return ref_epoch_depth(f, k) != 0;
-}
-
 uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-        // slot, plus (ptr epoch, i64 expect) per level.
-        return 1u + 2u * ref_epoch_depth(f, k);
+        return 2;
     }
     // An aggregate is one storage pointer, in every direction (function or task).
     if (is_agg_abi(f.param_types[k])) {
@@ -938,27 +909,22 @@ uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     return abi_four_state(f.param_types[k]) ? 2 : 1;
 }
 
-// LLVM arg index of the gated `home` parameter (declare_function /
-// declare_task): right after the gated `proc`, which is right after the fixed
-// head -- `state, rng` for a function, `state, rng, wheel` for a task.
-//
-// Gated DESIGN-WIDE rather than per callee, exactly as `proc` is and for the
-// same reason: a virtual call reaches its callee through one vtable slot, so
-// every body that can occupy that slot must share one FunctionType, and no
-// per-callee bit can vary it. The design-wide bit costs one i8 register on
-// calls that ignore it, and only in a design that has a shared body at all.
+// LLVM arg index of the `home` parameter (declare_function / declare_task),
+// right after `proc`, which is right after the fixed head -- `state, rng` for a
+// function, `state, rng, wheel` for a task. Both are in every signature, so no
+// body's position of a formal depends on what the rest of the design does: a
+// virtual call reaches its callee through one vtable slot, and a unit's code is
+// the same whoever calls it.
 uint32_t Backend::home_param_index(bool is_task) const {
-    return (is_task ? 3u : 2u) + (design_uses_process_ ? 1u : 0u);
+    return is_task ? 4u : 3u;
 }
 
 // LLVM arg index of each formal's first parameter for `f`'s signature shape:
-// functions start after `state, rng`, tasks after `state, rng, wheel`. The
-// record slot follows all formals.
+// functions start after `state, rng, proc, home`, tasks after `state, rng,
+// wheel, proc, home`. The record slot follows all formals.
 std::vector<uint32_t> Backend::param_indices(const Function& f) const {
     std::vector<uint32_t> idx(f.param_types.size());
-    // ... plus the gated `proc` and `home` parameters, which sit right after
-    // them, in that order.
-    uint32_t cur = home_param_index(f.is_task) + (design_uses_home_arg_ ? 1u : 0u);
+    uint32_t              cur = home_param_index(f.is_task) + 1;
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         idx[k] = cur;
         cur += formal_param_count(f, k);
@@ -970,7 +936,7 @@ std::vector<uint32_t> Backend::param_indices(const Function& f) const {
 uint32_t Backend::task_record_param(const Function& f) const {
     const auto idx = param_indices(f);
     if (idx.empty()) {
-        return home_param_index(/*is_task=*/true) + (design_uses_home_arg_ ? 1u : 0u);
+        return home_param_index(/*is_task=*/true) + 1;
     }
     return idx.back() + formal_param_count(f, f.param_types.size() - 1);
 }
@@ -1211,11 +1177,12 @@ void Backend::lower_function(FunctionId id) {
     rng_slot_ = fn_->getArg(1);
     rng_slot_->setName("rng");
     // A function is not a thread either: `process::self()` inside one names the
-    // caller, so the block travels as a parameter (LRM 9.7).
+    // caller, so the block travels as a parameter (LRM 9.7). The parameter is
+    // in every signature; a design with no control blocks never reads it.
     pcb_ = nullptr;
+    fn_->getArg(2)->setName("proc");
     if (design_uses_process_) {
         pcb_ = fn_->getArg(2);
-        pcb_->setName("proc");
     }
     // Nor does it have a home region of its own: a function cannot suspend, so
     // it only carries the calling thread's home onward -- to a `fork ...
@@ -1223,9 +1190,9 @@ void Backend::lower_function(FunctionId id) {
     // Straight from the parameter, with no frame slot: there is no suspend for
     // the value to have to survive.
     home_arg_ = nullptr;
+    fn_->getArg(home_param_index(/*is_task=*/false))->setName("home");
     if (design_uses_home_arg_) {
         home_arg_ = fn_->getArg(home_param_index(/*is_task=*/false));
-        home_arg_->setName("home");
     }
     // A function takes no wheel parameter, but the clock is a global, so event
     // ops and any other time read resolve here exactly as they do in a task.
@@ -1437,9 +1404,9 @@ void Backend::lower_task(FunctionId id) {
     // A plain task activation is NOT a thread: it runs in its caller's, so it
     // carries the caller's block through unchanged (LRM 13.3).
     pcb_ = nullptr;
+    fn_->getArg(3)->setName("proc");
     if (design_uses_process_) {
         llvm::Value* caller = fn_->getArg(3);
-        caller->setName("proc");
         pcb_ = f.is_fork_child ? b_.CreateCall(proc_alloc_fn(), { caller }) : caller;
         // A fork child owns its state (it was reseeded above), so it publishes its
         // own; a plain task activation publishes nothing -- the thread's block
@@ -1456,9 +1423,9 @@ void Backend::lower_task(FunctionId id) {
     // of task enables. A fork child inherits the same way: it is spawned with
     // the spawning thread's current home (lower_fork), not with a lexical one.
     home_arg_ = nullptr;
+    fn_->getArg(home_param_index(/*is_task=*/true))->setName("home");
     if (design_uses_home_arg_) {
         home_arg_ = fn_->getArg(home_param_index(/*is_task=*/true));
-        home_arg_->setName("home");
     }
     acts_node_ = nullptr;
     fork_live_ = nullptr;
@@ -1684,21 +1651,18 @@ void Backend::lower_task(FunctionId id) {
     task_epilogue_bb_ = nullptr;
 }
 
-// Record each ref formal's fat pointer into ref_ptr_ (Local k == formal k), so
-// local_lvalue aliases the actual's storage live and can check the actual's
-// container epoch on every access. Called in the callee prologue of both
-// functions and tasks. A ref formal takes no copy-in / copy-out.
+// Record each ref formal's pointer and witness chain into ref_ptr_ (Local k ==
+// formal k), so local_lvalue aliases the actual's storage live and can check the
+// actual's container epochs on every access. Called in the callee prologue of
+// both functions and tasks. A ref formal takes no copy-in / copy-out.
 void Backend::bind_ref_formals(const Function& f) {
     for (uint32_t k = 0; k < f.param_types.size(); ++k) {
         if (f.arg_dirs.empty() || f.arg_dirs[k] != ArgDir::Ref) {
             continue;
         }
-        const uint32_t p = param_llvm_index_[k];
-        ref_ptr_[k].slot = fn_->getArg(p);
-        for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
-            ref_ptr_[k].epochs.push_back(fn_->getArg(p + 1 + 2 * lvl));
-            ref_ptr_[k].expects.push_back(fn_->getArg(p + 2 + 2 * lvl));
-        }
+        const uint32_t p  = param_llvm_index_[k];
+        ref_ptr_[k].slot  = fn_->getArg(p);
+        ref_ptr_[k].chain = fn_->getArg(p + 1);
         // `formal` names the binding in a staleness report. It is a property of
         // the CALLEE, so it is held here rather than shipped per call.
         ref_ptr_[k].formal = f.name + " argument " + std::to_string(k + 1);
@@ -1973,15 +1937,11 @@ void Backend::lower_call_common(Index               i,
     argv.push_back(rng_slot_);
     // A function runs in its caller's thread, so `process::self()` inside one
     // names the caller (LRM 9.7).
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // ... and its scheduling region, for the same reason (LRM 24.3.1). A
     // function cannot suspend, so this only matters for a `fork ... join_none`
     // child it spawns.
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(callee_home());
     // A ref actual that is a signal with waiters: the callee writes it live, so
     // its wait queue must be serviced with the call's net old -> new transition.
     // Snapshot each before the (atomic, zero-time) function call; service after.
@@ -1994,8 +1954,9 @@ void Backend::lower_call_common(Index               i,
     for (Index a : ir_->region(arg_slice)) {
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
         if (dir == ArgDir::Ref) {
-            // The fat ref: aliased storage, the actual's container epoch, that
-            // epoch now, and the site the callee reports a stale ref through.
+            // The ref: aliased storage, and the chain of the actual's container
+            // epochs as they are now (null when it cannot move), which the
+            // callee reports a stale ref through.
             // Every storage class goes through here — a plane slot, a managed
             // handle, an aggregate image — so `ref` has one shape.
             const Guarded&   lv = lvalue_of(a);
@@ -2020,9 +1981,9 @@ void Backend::lower_call_common(Index               i,
             if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
                 ref_containers.push_back(root);
             }
-            const RefBinding rb = ref_actual_arg(lv, f.param_types[k]);
+            const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
-            push_ref_epochs(argv, rb, ref_epoch_depth(f, k));
+            argv.push_back(ref_witness_chain(rb));
             if (!is_handle_type(f.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
@@ -2207,17 +2168,13 @@ void Backend::lower_task_call_inst(Index i) {
     argv.push_back(rng_slot_);
     argv.push_back(wheel_);
     // A task runs in its caller's thread too, so it carries the caller's block.
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // ... and its home region, which is the whole of LRM 24.5: "when a task
     // within a design module is called from a program, it shall use the reactive
     // region set for its scheduling activities". callee_home() is this thread's
     // answer at this call, so a task calling a task passes on what it inherited
     // rather than what its own declaration would say.
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(callee_home());
     // Snapshot each ref-actual signal with waiters before the call; the wait
     // queue is serviced at the continuation with the net old -> new transition.
     // NOTE: a task that writes the same ref signal across a #delay (multiple time
@@ -2233,8 +2190,8 @@ void Backend::lower_task_call_inst(Index i) {
     std::vector<llvm::Value*> ref_containers;
     for (uint32_t k = 0; k < args.size(); ++k) {
         if (tf.arg_dirs[k] == ArgDir::Ref) {
-            // The fat ref, as at a function call: aliased storage, the actual's
-            // container epoch, that epoch now, and the report site. A task is
+            // The ref, as at a function call: aliased storage and the chain of
+            // the actual's container epochs as they are now. A task is
             // where the epoch earns its keep — it can suspend, and the container
             // can be restructured by another process while the ref stays live.
             const Guarded&   lv = lvalue_of(args[k]);
@@ -2276,9 +2233,9 @@ void Backend::lower_task_call_inst(Index i) {
             if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
                 ref_containers.push_back(root);
             }
-            const RefBinding rb = ref_actual_arg(lv, tf.param_types[k]);
+            const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
-            push_ref_epochs(argv, rb, ref_epoch_depth(tf, k));
+            argv.push_back(ref_witness_chain(rb));
             if (!is_handle_type(tf.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||

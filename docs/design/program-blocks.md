@@ -706,12 +706,13 @@ union is taken from the ordinary roots too, over-approximation is safe — a slo
 both kinds of code dispatch on marks all its overrides *shared*, and a shared body
 asks its caller rather than folding anything.
 
-The home reaches the callee as a **conditional trailing-of-the-prologue `i8`
-parameter**, `home`, sitting immediately after the gated `proc` pointer in both
-`declare_function` and `declare_task` (`home_param_index`). Gated design-wide on
-`design_uses_home_arg_` (= "some body is shared"), for the same reason `proc` is:
-one vtable slot, one `FunctionType`, no per-callee bit may vary it. A design with
-no shared body emits exactly the signatures it did before.
+The home reaches the callee as a **trailing-of-the-prologue `i8` parameter**,
+`home`, sitting immediately after the `proc` pointer in both `declare_function` and
+`declare_task` (`home_param_index`). It is in every signature, whether or not the
+design has a shared body (`design_uses_home_arg_`, = "some body is shared", only
+says whether any body reads it): one vtable slot, one `FunctionType`, and a unit's
+code that cannot change with what other units call it or are called by
+(modular-compilation.md, "Code generation").
 
 Not in the task record. That record's single pointer slot is the caller's *parked
 handle* and is deliberately null until the async path — `lower_task_call_inst`

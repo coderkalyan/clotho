@@ -130,12 +130,8 @@ void Backend::lower_strobe_pend(Index i) {
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
     std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(proc_arg());
+    argv.push_back(callee_home());
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     b_.CreateCall(strobe_pend_fn(), { hdl });
@@ -157,17 +153,13 @@ void Backend::lower_reactive_pend(Index i) {
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
     std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // NOT the pending body's home. LRM 4.4.2.5 hands an action block to the
     // Reactive region of this time slot no matter which region decided the
     // verdict -- the pend below pushes straight onto the reactive ring -- so the
     // thread this ramp starts is reactive-home by construction rather than by
     // inheritance from the Observed process that pended it.
-    if (design_uses_home_arg_) {
-        argv.push_back(b_.getInt8(kReactiveHomeTag));
-    }
+    argv.push_back(b_.getInt8(kReactiveHomeTag));
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     emit_reactive_push(b_, hdl);

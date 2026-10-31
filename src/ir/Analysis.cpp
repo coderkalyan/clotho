@@ -643,10 +643,6 @@ struct Structural {
     std::vector<bool> driven;  // any driver at all (inverted into `undriven`)
     std::vector<bool> ptr_arg; // passed as a non-In actual somewhere
     std::vector<bool> ref_arg; // passed as a `ref` actual somewhere (aliased, not copied)
-    // `(fid << 32) | formal` -> heap nesting depth, for every ref formal that some
-    // call site binds to a place inside a container's heap buffer. See
-    // DesignFacts::ref_epoch_formals.
-    ankerl::unordered_dense::map<uint64_t, uint32_t> ref_epoch_formals;
     // Partial-undriven bookkeeping, per candidate signal only.
     std::vector<bool>                  partial_candidate;
     std::vector<uint32_t>              partial_width;
@@ -724,32 +720,25 @@ struct Structural {
         }
     }
 
-    // How many relocatable container buffers an lvalue's storage sits inside: one per
-    // element select over a dynamic array or queue and one per associative-array
-    // entry, anywhere in the select chain. 0 means design state, a frame, or a class
-    // body — storage that cannot move.
-    //
-    // The COUNT, not just the fact, because each level needs its own staleness
-    // witness: level n's epoch lives in level n-1's buffer, so the witnesses form a
-    // chain that must be checked outermost-first (DesignFacts::ref_epoch_formals).
-    // A further member / bit step off such a place stays at the same depth, so the
-    // walk continues to the root rather than stopping at the first select.
+    // Whether an lvalue's storage sits inside a relocatable container buffer: an
+    // element select over a dynamic array or queue, or an associative-array
+    // entry, anywhere in the select chain. False means design state, a frame, or
+    // a class body — storage that cannot move. A further member / bit step off
+    // such a place stays inside the buffer, so the walk continues to the root
+    // rather than stopping at the first select.
     //
     // Deliberately its own walk, not ir::lvalue_root: that one stops at
     // AssocSelect (it is not in its switch) and answers a different question.
-    uint32_t heap_depth(const Ir& ir, Index lv) const {
-        uint32_t depth = 0;
+    bool in_heap_buffer(const Ir& ir, Index lv) const {
         for (;;) {
             switch (ir.tag(lv)) {
                 case Inst::Tag::AssocSelect:
-                    ++depth;
-                    lv = ir.payload(lv).op_extra.op;
-                    break;
+                    return true;
                 case Inst::Tag::ElemSelect: {
                     const auto       es = ir.extra_data<ElemSelect>(ir.payload(lv).op_extra.extra);
                     const Type::Kind k  = std::get<Type>(m.pool.get(es.array_type)).kind;
                     if (k == Type::Kind::DynArray || k == Type::Kind::Queue) {
-                        ++depth;
+                        return true;
                     }
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -763,13 +752,10 @@ struct Structural {
                 case Inst::Tag::BitSelect:
                     lv = ir.payload(lv).binary.l;
                     break;
-                case Inst::Tag::HandleDeref:
-                    // A class body is heap storage, but it never moves and is never
-                    // freed, so a place inside one cannot go stale. Levels reached
-                    // THROUGH it still count — a queue in a property is still a queue.
-                    return depth;
                 default:
-                    return depth;
+                    // A class body is heap storage, but it never moves and is never
+                    // freed, so a place inside one cannot go stale.
+                    return false;
             }
         }
     }
@@ -782,18 +768,11 @@ struct Structural {
             if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
                 continue;
             }
-            // A ref formal earns the fat (epoch-checked) form from its ACTUALS: only
-            // a place inside a container's heap buffer can be moved out from under
-            // the alias, and how MANY buffers it sits inside decides how many
-            // witnesses travel with it. Recorded before the Signal-root filter below,
-            // because the root of `q[i]` is the queue's own signal but the root of a
-            // frame-local container's element is a Local, and both are heap-rooted.
-            if (callee.arg_dirs[a] == ArgDir::Ref) {
-                if (const uint32_t d = heap_depth(ir, args[a]); d != 0) {
-                    const uint64_t key = (static_cast<uint64_t>(fid) << 32) | a;
-                    uint32_t&      cur = ref_epoch_formals[key];
-                    cur                = std::max(cur, d);
-                }
+            // Recorded before the Signal-root filter below, because the root of
+            // `q[i]` is the queue's own signal but the root of a frame-local
+            // container's element is a Local, and both are heap-rooted.
+            if (callee.arg_dirs[a] == ArgDir::Ref && in_heap_buffer(ir, args[a])) {
+                uses.ref_epoch = true;
             }
             const Index root = lvalue_root(ir, args[a]).root;
             if (ir.tag(root) != Inst::Tag::Signal) {
@@ -2041,58 +2020,6 @@ DesignFacts analyze(const Module& m) {
     facts.undriven.flip();
     facts.ptr_arg = std::move(st.ptr_arg);
     facts.ref_arg = std::move(st.ref_arg);
-    // Virtual dispatch picks the body out of a vtable SLOT at run time, so every
-    // function that can occupy a slot must agree with its callers about the ref ABI.
-    // Max across each slot index: one override bound to a container element makes
-    // that formal fat for every sibling in that slot — and to the same DEPTH, since
-    // the signature carries one (epoch, expect) pair per level. A sibling bound
-    // shallower pads the unused levels with the never-stale zero witness.
-    facts.ref_epoch_formals = std::move(st.ref_epoch_formals);
-    {
-        // slot index -> formal index -> epoch depth. TWO numbering spaces, run
-        // independently: the ordinary per-hierarchy vtable slots, and the
-        // design-wide interface-method indices an interface-handle dispatch uses
-        // (LRM 8.26, docs/design/interface-classes.md §5.4). A call site names one
-        // or the other, never both, so unioning them together would be sound but
-        // needlessly coarse.
-        const auto unify = [&](std::vector<FunctionId> ClassDesc::*table) {
-            std::vector<std::vector<uint32_t>> slot_depth;
-            const auto                         note = [&](size_t slot, size_t k, uint32_t v) {
-                if (slot_depth.size() <= slot) {
-                    slot_depth.resize(slot + 1);
-                }
-                if (slot_depth[slot].size() <= k) {
-                    slot_depth[slot].resize(k + 1, 0);
-                }
-                slot_depth[slot][k] = std::max(slot_depth[slot][k], v);
-            };
-            for (const ClassDesc& vt : m.class_descs()) {
-                const std::vector<FunctionId>& entries = vt.*table;
-                for (size_t slot = 0; slot < entries.size(); ++slot) {
-                    const auto      fid = static_cast<uint32_t>(entries[slot]);
-                    const Function& f   = m.function(entries[slot]);
-                    for (size_t k = 0; k < f.param_types.size(); ++k) {
-                        note(slot, k, facts.ref_epoch_depth(fid, k));
-                    }
-                }
-            }
-            for (const ClassDesc& vt : m.class_descs()) {
-                const std::vector<FunctionId>& entries = vt.*table;
-                for (size_t slot = 0; slot < entries.size(); ++slot) {
-                    const auto      fid = static_cast<uint32_t>(entries[slot]);
-                    const Function& f   = m.function(entries[slot]);
-                    for (size_t k = 0; k < f.param_types.size() && k < slot_depth[slot].size(); ++k) {
-                        if (slot_depth[slot][k] != 0 && !f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-                            uint32_t& cur = facts.ref_epoch_formals[(static_cast<uint64_t>(fid) << 32) | k];
-                            cur           = std::max(cur, slot_depth[slot][k]);
-                        }
-                    }
-                }
-            }
-        };
-        unify(&ClassDesc::slots);
-        unify(&ClassDesc::iface_slots);
-    }
     facts.uses = st.uses;
 
     // Flatten the per-signal partial masks. A signal gets a mask only when it is a

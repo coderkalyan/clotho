@@ -1082,23 +1082,30 @@ struct FrameSlot {
     bool is_ref = false;
 };
 
-// A `ref` formal's fat pointer, as bound from the callee's parameters
-// (docs/design/data-model.md §3). `slot` aliases the actual's storage — a plane
-// slot, a managed handle, or an aggregate image. `epochs` addresses the relocation
-// epoch of each container the actual was nested inside, OUTERMOST FIRST, paired
-// with that epoch's value at the call in `expects`; an unused level (a call site
-// bound shallower than the formal's declared depth) passes the
-// `clotho.ref.noepoch` zero word, which never compares stale. Every dereference
-// re-checks the pairs in order and reports through `site`; the order is what makes
-// a nested witness safe to read, since level n's epoch lives in level n-1's buffer.
+// What a call passes for a `ref` actual (docs/design/data-model.md §3). `slot`
+// aliases the actual's storage — a plane slot, a managed handle, or an aggregate
+// image. `epochs` addresses the relocation epoch of each container the actual was
+// nested inside, OUTERMOST FIRST, paired with that epoch's value at the call in
+// `expects`; a place that cannot move has none.
+struct RefActual {
+    llvm::Value*              slot = nullptr;
+    std::vector<llvm::Value*> epochs;
+    std::vector<llvm::Value*> expects;
+};
+
+// A `ref` formal as bound from the callee's parameters. `slot` is the aliased
+// storage; `chain` is null for a place that cannot move, else the array of
+// (&epoch, expected epoch) pairs the caller built, outermost first and ended by a
+// null epoch. Every dereference re-checks the pairs in order and reports through
+// a site of its own; the order is what makes a nested witness safe to read, since
+// level n's epoch lives in level n-1's buffer.
 //
 // `formal` is the callee's own name for the binding, used to build the
 // per-dereference site record a staleness report prints (§3.3).
 struct RefBinding {
-    llvm::Value*              slot = nullptr;
-    std::vector<llvm::Value*> epochs;
-    std::vector<llvm::Value*> expects;
-    std::string               formal;
+    llvm::Value* slot  = nullptr;
+    llvm::Value* chain = nullptr;
+    std::string  formal;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level and
@@ -1150,9 +1157,6 @@ struct ModuleEnv {
     // Writable images of an aggregate type that an out-of-range aggregate `ref` / `out`
     // actual is bound to, keyed by the type Ref (agg_sink_global).
     ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> agg_sinks;
-    // The shared zero word a `ref` through a stable place aims its epoch at
-    // (no_epoch_global).
-    llvm::GlobalVariable* no_epoch = nullptr;
     // The borrowed string handle of each instance's path, keyed by the instance's
     // anchor index (inst_path_handle). Per module like the other internal constants:
     // every unit module that reads an instance's path holds its own.
@@ -1717,9 +1721,9 @@ private:
     llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
                                        bool has_z);
 
-    RefBinding ref_actual_arg(const Guarded& raw, Ref type);
+    RefActual ref_actual_arg(const Guarded& raw, Ref type);
 
-    void push_ref_epochs(std::vector<llvm::Value*>& argv, const RefBinding& rb, uint32_t depth);
+    llvm::Value* ref_witness_chain(const RefActual& ra);
 
     llvm::Value* ref_actual_ptr(const Guarded& lv, Ref type);
 
@@ -1763,9 +1767,6 @@ private:
 
     llvm::Function* declare_task(FunctionId id);
 
-    uint32_t ref_epoch_depth(const Function& f, size_t k) const;
-
-    bool ref_needs_epoch(const Function& f, size_t k) const;
 
     uint32_t formal_param_count(const Function& f, size_t k) const;
 
@@ -2559,8 +2560,8 @@ private:
     void emit_encoding_check(Plane v, bool four, Index at);
 
     llvm::StructType* ref_site_ty();
-    llvm::FunctionCallee ref_stale_fn();
-    llvm::FunctionCallee ref_epoch_regress_fn();
+    llvm::StructType* ref_witness_ty();
+    llvm::FunctionCallee ref_check_fn();
     llvm::StructType* ref_name_ty();
 
     llvm::StructType* tagged_site_ty();
@@ -3552,7 +3553,6 @@ private:
 
     void emit_null_handle_check(llvm::Value* handle, Index at, NullKind kind = NullKind::Class);
 
-    llvm::Constant* no_epoch_global();
 
     llvm::Constant* ref_site_global(const SourceText& at, std::string_view formal);
 
@@ -4421,9 +4421,9 @@ private:
     // force-wake, the post-suspend poll, and the ring-overflow guard's second
     // reason to exist.
     bool design_uses_disable_  = false;
-    // Any `process` class op (LRM 9.7). Gates the control-block machinery: the ABI
-    // argument carrying the calling thread's block, the pooled block a fork child
-    // takes, the status stores at every park, and the completion hook.
+    // Any `process` class op (LRM 9.7). Gates the control-block machinery: the
+    // value the ABI's `proc` argument carries (null otherwise), the pooled block a
+    // fork child takes, the status stores at every park, and the completion hook.
     bool design_uses_process_  = false;
     // Any ReactivePend, or any process that runs in Observed. Gates the entire
     // reactive region set: both queues, the drain blocks, and the Observed run.
@@ -4451,10 +4451,9 @@ private:
     // thread's instead (LRM 24.3.1).
     std::vector<bool> reactive_home_fns_;
     std::vector<bool> shared_home_fns_;
-    // Whether ANY body is shared, i.e. whether the `home` ramp parameter exists.
-    // Design-wide for the same reason `proc` is (home_param_index): one vtable slot,
-    // one FunctionType. False for every design with no shared body, which then emits
-    // exactly the signatures it did before this existed.
+    // Whether ANY body is shared, i.e. whether some body reads the `home` ramp
+    // parameter instead of folding its lexical home. The parameter itself is in
+    // every signature (home_param_index); this only says whether a body reads it.
     bool design_uses_home_arg_ = false;
     // Whether the body currently lowering is a program block's `initial`. Drives
     // the LRM 24.3 implicit finish; false for everything else, so no other design
@@ -4520,8 +4519,6 @@ private:
     // against it. Set by lower_inst, read only by emit_ref_epoch_check.
     Index cur_inst_ = Index{ 0 };
     std::vector<llvm::Function*> fn_decls_;
-    // &Function -> FunctionId, for the ABI helpers that only receive a reference.
-    ankerl::unordered_dense::map<const Function*, uint32_t> fn_ids_;
     // Set while lowering a function or task body (null during a process). `frame_`
     // is the current call's frame; `frame_slots_` / `frame_ty_` its layout.
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.

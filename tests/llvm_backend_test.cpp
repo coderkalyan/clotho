@@ -5408,38 +5408,33 @@ TEST_CASE("time-zero stores do not overflow the active queue via self-start re-w
     CHECK(out == "y=1\n");
 }
 
-// ---- The `ref` ABI shape: narrow by default, fat only where it is load-bearing.
+// ---- The `ref` ABI: one shape, whoever the callers are.
 
-// Matching the four-word form to the actual is a silent-corruption seam: a caller
-// and callee disagreeing about the arity write past each other's arguments, and no
-// test that only checks values would notice. So these assert the emitted shape
-// directly, in both directions, alongside the behaviour.
+// A callee's signature must not depend on any caller, or a unit's code would
+// change with the units that call it. A `ref` formal is its storage pointer and a
+// witness chain, null for a place that cannot move; these assert the emitted
+// shape directly, alongside the behaviour, because a caller and callee that
+// disagree about the arity write past each other's arguments and no test that
+// only checks values would notice.
 
-TEST_CASE("a ref to a place that cannot move is one pointer, with no epoch check") {
-    // A ref formal carries the relocation epoch only when some call site binds it
-    // inside a container's heap buffer (docs/design/data-model.md §3). A plain
-    // variable's storage never moves, so the fat form would be three dead words and
-    // a branch that can never be taken.
-    const std::string ir = emit_raw(R"(
+TEST_CASE("a ref to a place that cannot move passes no witness chain") {
+    // A plain variable's storage never moves, so there is nothing to witness: the
+    // chain is a null pointer and the callee's guard is one compare against it.
+    constexpr std::string_view src = R"(
         module m;
             int v;
             function automatic void f(ref int r); r = r + 1; endfunction
             initial begin v = 5; f(v); $display("%0d", v); end
         endmodule
-    )");
-    // state, rng, the one-pointer ref.
-    CHECK(call_arity(ir, "@m.fn.f") == 3);
-    CHECK(count_substr(ir, "rt_ref_stale") == 0);
-    CHECK(run_capture(R"(
-        module m;
-            int v;
-            function automatic void f(ref int r); r = r + 1; endfunction
-            initial begin v = 5; f(v); $display("%0d", v); end
-        endmodule
-    )") == "6\n");
+    )";
+    const std::string ir = emit_raw(src);
+    // state, rng, proc, home, the storage pointer and the chain.
+    CHECK(call_arity(ir, "@m.fn.f") == 6);
+    CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
+    CHECK(run_capture(src) == "6\n");
 }
 
-TEST_CASE("a ref to a whole container handle is one pointer") {
+TEST_CASE("a ref to a whole container handle passes no witness chain") {
     // The handle POD is design state: it never moves, only the buffer it points at
     // does. So a `ref` to the WHOLE queue needs no epoch even though a ref to one of
     // its elements does -- the two cases differ by which allocation is aliased.
@@ -5450,11 +5445,12 @@ TEST_CASE("a ref to a whole container handle is one pointer") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(call_arity(ir, "@m.fn.f") == 3);
+    CHECK(call_arity(ir, "@m.fn.f") == 6);
+    CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
 }
 
-TEST_CASE("a ref to a container element keeps the epoch words") {
-    // The one shape that earns them: `slot` is an interior pointer into the heap
+TEST_CASE("a ref to a container element passes the epoch it was formed at") {
+    // The one shape that earns a chain: `slot` is an interior pointer into the heap
     // ring, and the epoch it is checked against lives in the handle -- a different
     // allocation, which is exactly why a stale pointer cannot reach its own witness.
     const std::string ir = emit_raw(R"(
@@ -5464,6 +5460,7 @@ TEST_CASE("a ref to a container element keeps the epoch words") {
             initial begin q.push_back(5); f(q[0]); $display("%0d", q[0]); end
         endmodule
     )");
+    CHECK(call_arity(ir, "@m.fn.f") == 6);
     CHECK(ir.find("i64 %ref.epoch.at.call") != std::string::npos);
     // The site record is the callee's, built at the guard, so it is not an operand
     // of the call; the container's name reaches the report through the epoch table.
@@ -5471,27 +5468,33 @@ TEST_CASE("a ref to a container element keeps the epoch words") {
     CHECK(ir.find("@clotho.ref.site") != std::string::npos);
 }
 
-TEST_CASE("one ref formal reached by both actual shapes stays fat at every call") {
-    // The fact is per FORMAL, not per call site: one heap-rooted actual anywhere
-    // makes the formal fat, and the variable call site then passes the no-epoch
-    // sentinel rather than a shorter argument list.
-    constexpr std::string_view src = R"(
+TEST_CASE("a ref formal's signature is the same whatever its callers bind it to") {
+    // The callee takes the same parameters whether every caller passes a variable,
+    // every caller a container element, or both. (It used to widen to the deepest
+    // caller's depth, so one unit's call changed another unit's signature.)
+    const auto sig = [](std::string_view call) {
+        const std::string src = std::string(R"(
+            module m;
+                int q[$]; int v;
+                function automatic void f(ref int r); r = r + 1; endfunction
+                initial begin q.push_back(5); v = 1; )") + std::string(call) + R"( $display("%0d %0d", v, q[0]); end
+            endmodule
+        )";
+        const std::vector<std::string> sigs = define_params(emit_raw(src), "fn.f");
+        REQUIRE(sigs.size() == 1);
+        return sigs[0];
+    };
+    const std::string by_var = sig("f(v);");
+    CHECK(by_var == "(ptr noalias %state, ptr %rng, ptr %proc, i8 %home, ptr %0, ptr %1)");
+    CHECK(sig("f(q[0]);") == by_var);
+    CHECK(sig("f(v); f(q[0]);") == by_var);
+    CHECK(run_capture(R"(
         module m;
             int q[$]; int v;
             function automatic void f(ref int r); r = r + 1; endfunction
-            initial begin
-                q.push_back(5); v = 1;
-                f(v); f(q[0]);
-                $display("%0d %0d", v, q[0]);
-            end
+            initial begin q.push_back(5); v = 1; f(v); f(q[0]); $display("%0d %0d", v, q[0]); end
         endmodule
-    )";
-    const std::string          ir  = emit_raw(src);
-    // The sentinel appears as a call OPERAND (the global's own definition line
-    // matches the bare name too, hence the surrounding argument text).
-    CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0)") == 1);
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 0);
-    CHECK(run_capture(src) == "2 6\n");
+    )") == "2 6\n");
 }
 
 TEST_CASE("twin instances calling their own tasks and functions keep their statics apart") {
@@ -5637,10 +5640,8 @@ TEST_CASE("an interface task's statics are per instance, however the instance wa
 
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     // Dispatch picks the body at run time, so the caller cannot know which override
-    // it reaches. If one sibling took the fat form and another the narrow one, an
-    // indirect call would write three arguments the callee never declared. The
-    // analysis unions the answer across the slot: here only D::g is passed a queue
-    // element, and that must widen B::g too.
+    // it reaches: every override of a slot takes the same parameter list, with no
+    // analysis to keep them so, whichever of them is passed a queue element.
     constexpr std::string_view src = R"(
         class B; virtual function void g(ref int r); r = r + 1; endfunction endclass
         class D extends B; virtual function void g(ref int r); r = r + 2; endfunction endclass
@@ -5656,36 +5657,17 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
             end
         endmodule
     )";
-    const std::string          ir  = emit_raw(src);
-    // Both bodies take the SAME parameter list: state, rng, the object handle (one
-    // i64: a 2-state scalar crosses as one word), then the three ref words.
+    const std::string ir = emit_raw(src);
     // Compared as lists rather than as whole symbol names -- LLVM's uniquing suffix
     // on the second `g` shifts as the module gains unrelated functions, and that is
     // not what this case is about.
     const std::vector<std::string> sigs = define_params(ir, "fn.g");
     REQUIRE(sigs.size() == 2);
     CHECK(sigs[0] == sigs[1]);
-    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1, ptr %2, i64 %3)");
+    // state, rng, proc, home, the object handle (one i64: a 2-state scalar crosses
+    // as one word), then the storage pointer and the witness chain.
+    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, ptr %proc, i8 %home, i64 %0, ptr %1, ptr %2)");
     CHECK(run_capture(src) == "2 7\n");
-
-    // And with no heap-rooted actual at either site, the whole slot narrows.
-    const std::string narrow = emit_raw(R"(
-        class B; virtual function void g(ref int r); r = r + 1; endfunction endclass
-        class D extends B; virtual function void g(ref int r); r = r + 2; endfunction endclass
-        module m;
-            int v;
-            initial begin
-                B b; D d;
-                v = 1; b = new; d = new;
-                b.g(v); d.g(v);
-                $display("%0d", v);
-            end
-        endmodule
-    )");
-    const std::vector<std::string> nsigs = define_params(narrow, "fn.g");
-    REQUIRE(nsigs.size() == 2);
-    CHECK(nsigs[0] == nsigs[1]);
-    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1)");
 }
 
 TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {

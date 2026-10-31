@@ -1441,13 +1441,13 @@ bool Backend::in_coroutine_body() const {
 
 // The home region to hand a callee: whatever this thread's is at the call, so a
 // task that calls a task passes its own CURRENT answer down rather than its
-// lexical one. That is what makes 24.3.1's "inherits the scheduling region of
-// the thread that calls it" transitive -- by induction over the call chain, and
+// lexical one. That is what makes 24.3.1's "inherits the scheduling region of the
+// thread that calls it" transitive -- by induction over the call chain, and
 // over an `expect` too, since the store lands before any later call reads it.
-// Null when the parameter is not in the signature, which is every design with
-// no shared body.
+// Always an i8, folded to the lexical answer in a body that does not carry its
+// home: the parameter is in every signature.
 llvm::Value* Backend::callee_home() {
-    return design_uses_home_arg_ ? current_home(b_) : nullptr;
+    return current_home(b_);
 }
 
 // The value to record when parking this coroutine for a later wake. Folded at
@@ -2265,8 +2265,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // suspends (timing controls in the arg list are rejected), so one resume
     // runs it to completion. Ramping is indirect: rt_monitor_active_ramp yields
     // the registered body's ramp function pointer (or null), which we call with
-    // the task ABI (state, rng, wheel, record). There is no calling process
-    // here, so the body seeds its own state from the module-wide one.
+    // the task ABI (state, rng, wheel, proc, home, record). There is no calling
+    // process here, so the body seeds its own state from the module-wide one.
     if (design_uses_monitor_) {
         auto* fn      = b_.GetInsertBlock()->getParent();
         auto* run_bb  = llvm::BasicBlock::Create(ctx_, "monitor.run", fn);
@@ -2280,31 +2280,14 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
         // Reconstructed rather than read off a declaration, because the callee
         // arrives as an opaque pointer from the runtime -- so it MUST track
-        // declare_task's gated parameters exactly. It did not: `proc` was pushed
-        // into margv but never into this type, so a design with both $monitor
-        // and process control built a call whose argument count did not match
-        // its signature (an assert in a debug LLVM, malformed IR in a release
-        // one). Both gates are honoured below now.
-        std::vector<llvm::Type*> rampparams{ ptr_ty, ptr_ty, ptr_ty }; // state, rng, wheel
-        if (design_uses_process_) {
-            rampparams.push_back(ptr_ty); // proc
-        }
-        if (design_uses_home_arg_) {
-            rampparams.push_back(llvm::Type::getInt8Ty(ctx_)); // home
-        }
-        rampparams.push_back(ptr_ty); // record
-        auto*                     rampty = llvm::FunctionType::get(ptr_ty, rampparams, false);
-        std::vector<llvm::Value*> margv{ state, sym(rng_global_), wheel };
-        if (design_uses_process_) {
-            margv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
-        }
+        // declare_task's parameters exactly.
+        auto* rampty = llvm::FunctionType::get(
+          ptr_ty, { ptr_ty, ptr_ty, ptr_ty, ptr_ty, llvm::Type::getInt8Ty(ctx_), ptr_ty }, false);
         // No calling thread on this path either (the Postponed drain ramps the
-        // registered body from main), so the region it would inherit is the
-        // default Active one.
-        if (design_uses_home_arg_) {
-            margv.push_back(b_.getInt8(0));
-        }
-        margv.push_back(record);
+        // registered body from main), so it names no control block and the region
+        // it would inherit is the default Active one.
+        std::vector<llvm::Value*> margv{ state, sym(rng_global_), wheel,
+                                         llvm::ConstantPointerNull::get(ptr_ty), b_.getInt8(0), record };
         llvm::Value* hdl = b_.CreateCall(rampty, ramp, margv);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });

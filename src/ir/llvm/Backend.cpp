@@ -89,13 +89,6 @@ void Backend::run() {
     // including recursion and forward references), then lower their bodies. A
     // task is a coroutine (lower_task); a function is a plain call.
     const size_t nf = mod_.function_count();
-    // Identify functions by address: the ABI helpers below take a `const
-    // Function&` and need its id to ask the analysis about a formal. The
-    // function table is a deque, so these addresses are stable.
-    fn_ids_.reserve(nf);
-    for (uint32_t i = 0; i < nf; ++i) {
-        fn_ids_.emplace(&mod_.function(static_cast<FunctionId>(i)), i);
-    }
     fn_decls_.assign(nf, nullptr);
     for (uint32_t i = 0; i < nf; ++i) {
         fn_decls_[i] = declare_function(static_cast<FunctionId>(i));

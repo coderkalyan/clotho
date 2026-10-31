@@ -516,8 +516,8 @@ void rt_gc_get_stats(rt_gc_stats* out);
 // The validation predicate behind conservative scanning: the address must land in
 // a live block, be RT_GC_ALIGN-aligned once walked back, and have its
 // object-start bit set. Also resolves interior pointers, which is what makes a
-// `ref` into a class property (a raw interior pointer carrying
-// clotho.ref.noepoch, ir/llvm/StateLayout.cpp, ref_actual_arg) safe with no epoch machinery.
+// `ref` into a class property (a raw interior pointer that passes no witness
+// chain, ir/llvm/StateLayout.cpp, ref_actual_arg) safe with no epoch machinery.
 void* rt_gc_find_object(const void* addr);
 
 // Walk the heap asserting every live object's descriptor, size and handle fields

@@ -362,23 +362,6 @@ void Backend::emit_encoding_check(Plane v, bool four, Index at) {
 #endif
 }
 
-// The zero word a `ref` through a STABLE place points its epoch at: a module
-// signal, a frame local, a fixed unpacked array element or a class property
-// never moves, so there is nothing to compare against.
-//
-// Internal and constant rather than a runtime export, so that where the
-// optimizer can see the caller it constant-folds the callee's load to 0, the
-// compare to true, and deletes the check outright. A ref through such a place
-// therefore costs nothing once inlined or argument-specialized.
-llvm::Constant* Backend::no_epoch_global() {
-    if (env_->no_epoch == nullptr) {
-        env_->no_epoch = new llvm::GlobalVariable(
-          env_->llmod, b_.getInt64Ty(), /*isConstant=*/true,
-          llvm::GlobalValue::InternalLinkage, b_.getInt64(0), "clotho.ref.noepoch");
-    }
-    return env_->no_epoch;
-}
-
 // The site record for one dereference of a ref formal, built in the CALLEE:
 // where the stale access is, and the callee's name for the formal. The
 // container's name is not here — the runtime resolves it from the epoch pointer
@@ -405,9 +388,9 @@ llvm::Constant* Backend::ref_site_global(const SourceText& at, std::string_view 
 // buffer has none to key on and is reported unnamed.
 //
 // Emitted only for a design that can actually produce a report -- one with a
-// ref formal carrying an epoch -- so the ordinary design pays nothing.
+// ref actual inside a container's buffer -- so the ordinary design pays nothing.
 void Backend::emit_ref_name_table() {
-    if (facts_.ref_epoch_formals.empty()) {
+    if (!facts_.uses.ref_epoch) {
         return;
     }
     auto* const                  rec = ref_name_ty();
@@ -450,64 +433,48 @@ void Backend::emit_ref_name_table() {
 // both of its fields are callee knowledge (the formal's name, and where the
 // stale access happens), so no site travels with the call.
 //
-// Hot path is one load, one compare and a not-taken branch weighted so both
-// cold blocks sink out of line; repeated accesses through the same formal
-// within a block fold to one check, and a ref through a stable place folds
-// away entirely (no_epoch_global). rt_ref_stale may return (warn mode), so
-// the stale block rejoins rather than trapping.
+// A place that cannot move passes no chain, and that is nearly every `ref`, so
+// the whole guard is one compare of the chain pointer against null. Behind it
+// the outermost witness is checked inline -- one load, one compare and a
+// not-taken branch, weighted so the cold block sinks out of line -- and a
+// mismatch, or a deeper level to check, goes to rt_ref_check, which walks the
+// chain outermost first: level n's witness lives in level n-1's buffer, so it is
+// only safe to load once level n-1 has been proven current. rt_ref_stale may
+// return (warn mode), so the slow block rejoins rather than trapping.
 void Backend::emit_ref_epoch_check(const RefBinding& rb) {
-    if (rb.epochs.empty()) {
-        // A stable place, or a fork child's captured formal — bound before any
-        // actual exists. Nothing to check.
+    if (rb.chain == nullptr) {
+        // Not a bound formal: nothing to check.
         return;
     }
+    auto* const fn   = b_.GetInsertBlock()->getParent();
+    auto* const ptr  = llvm::PointerType::getUnqual(ctx_);
+    auto* const null = llvm::ConstantPointerNull::get(ptr);
+    auto* const pair = ref_witness_ty();
+    auto* const i64  = b_.getInt64Ty();
+    auto* const check = llvm::BasicBlock::Create(ctx_, "ref.check", fn);
+    auto* const moved = llvm::BasicBlock::Create(ctx_, "ref.moved", fn);
+    auto* const done  = llvm::BasicBlock::Create(ctx_, "ref.ok", fn);
+    // Both guards are taken on a rare path: a ref that can move, and one that did.
+    const auto  rare_true = llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20);
+
+    auto* br = b_.CreateCondBr(b_.CreateICmpNE(rb.chain, null), check, done);
+    br->setMetadata(llvm::LLVMContext::MD_prof, rare_true);
+
+    b_.SetInsertPoint(check);
+    llvm::Value* const ep0  = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(pair, rb.chain, { b_.getInt32(0), b_.getInt32(0) }));
+    llvm::Value* const exp0 = b_.CreateLoad(i64, b_.CreateInBoundsGEP(pair, rb.chain, { b_.getInt32(0), b_.getInt32(1) }));
+    llvm::Value* const cur  = b_.CreateLoad(i64, ep0, "ref.epoch");
+    llvm::Value* const next = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(pair, rb.chain, { b_.getInt32(1), b_.getInt32(0) }));
+    llvm::Value* const bad  = b_.CreateOr(b_.CreateICmpNE(cur, exp0), b_.CreateICmpNE(next, null));
+    auto*              br2  = b_.CreateCondBr(bad, moved, done);
+    br2->setMetadata(llvm::LLVMContext::MD_prof, rare_true);
+
+    b_.SetInsertPoint(moved);
     llvm::Constant* const site = ref_site_global(loc_text(cur_inst_), rb.formal);
-    // The time each report stamps is read in its own cold block: reading it
-    // before the branch would put a wheel call on the hot path.
-    const auto report_now = [&] { return b_.CreateCall(wheel_now_fn(), { wheel_ }); };
+    b_.CreateCall(ref_check_fn(), { site, rb.chain, wheel_ })->addFnAttr(llvm::Attribute::Cold);
+    b_.CreateBr(done);
 
-    // One check per container level, OUTERMOST FIRST, each guarding the next:
-    // level n's witness lives in level n-1's buffer, so it is only safe to load
-    // once level n-1 has been proven current. A mismatch at any level reports and
-    // (in warn mode) rejoins WITHOUT reading the deeper witnesses, whose storage
-    // the reported restructuring may have released.
-    for (size_t lvl = 0; lvl < rb.epochs.size(); ++lvl) {
-        llvm::Value* const ep  = rb.epochs[lvl];
-        llvm::Value* const exp = rb.expects[lvl];
-        auto* fn      = b_.GetInsertBlock()->getParent();
-        auto* bad     = llvm::BasicBlock::Create(ctx_, "ref.moved", fn);
-        auto* regress = llvm::BasicBlock::Create(ctx_, "ref.regress", fn);
-        auto* stale   = llvm::BasicBlock::Create(ctx_, "ref.stale", fn);
-        auto* cont    = llvm::BasicBlock::Create(ctx_, "ref.ok", fn);
-        auto* done    = llvm::BasicBlock::Create(ctx_, "ref.done", fn);
-
-        llvm::Value* cur = b_.CreateLoad(b_.getInt64Ty(), ep, "ref.epoch");
-        auto*        br  = b_.CreateCondBr(b_.CreateICmpNE(cur, exp), bad, cont);
-        br->setMetadata(llvm::LLVMContext::MD_prof,
-                        llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
-
-        // Epochs only ever advance, so a current value BELOW the expected one
-        // means the epoch plumbing itself is wrong, not the design.
-        b_.SetInsertPoint(bad);
-        b_.CreateCondBr(b_.CreateICmpULT(cur, exp), regress, stale);
-
-        b_.SetInsertPoint(regress);
-        auto* rcall = b_.CreateCall(ref_epoch_regress_fn(), { site, ep, exp, cur, report_now() });
-        rcall->addFnAttr(llvm::Attribute::NoReturn);
-        rcall->addFnAttr(llvm::Attribute::Cold);
-        b_.CreateUnreachable();
-
-        b_.SetInsertPoint(stale);
-        b_.CreateCall(ref_stale_fn(), { site, ep, exp, cur, report_now() })
-          ->addFnAttr(llvm::Attribute::Cold);
-        // Warn mode returns: skip the deeper levels rather than dereference a
-        // witness the reported move may have freed.
-        b_.CreateBr(done);
-
-        b_.SetInsertPoint(cont);
-        b_.CreateBr(done);
-        b_.SetInsertPoint(done);
-    }
+    b_.SetInsertPoint(done);
 }
 
 // Guard one tagged-union member access against the union's current tag (LRM

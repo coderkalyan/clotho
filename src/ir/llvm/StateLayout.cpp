@@ -954,9 +954,9 @@ llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t 
 }
 
 // The words a `ref` actual passes (docs/design/data-model.md §3): the aliased
-// storage pointer, and — only for a formal bound somewhere to a container
-// element (§3.0) — the relocation epoch of the container the place is rooted in
-// and that epoch's value now.
+// storage pointer, and — for a place inside a container's heap buffer (§3.0) —
+// the relocation epoch of each container the place is rooted in and that
+// epoch's value now (ref_witness_chain).
 //
 // No site record. A staleness report needs the formal's name, which is the
 // callee's own, and the container's name, which the runtime recovers from the
@@ -967,36 +967,53 @@ llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t 
 // plane slot, a managed handle, or an aggregate image. A bit / part selection
 // is not a place a pointer can name, so it is rejected — the frontend guards
 // it too (is_whole_ref_actual), and this is the defensive backstop.
-RefBinding Backend::ref_actual_arg(const Guarded& raw, Ref type) {
+RefActual Backend::ref_actual_arg(const Guarded& raw, Ref type) {
     // An associative-array element is a DEFERRED place, and a `ref` is its third
     // consumer alongside Load and Store: it needs the address itself. Resolve it
     // with put_ptr, because LRM 13.5.2 binds the formal to a VARIABLE — there is
     // no variable to alias until the entry exists, so forming the ref creates it,
     // exactly as a mutating method on `a[k]` does.
     const Guarded g = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
-    RefBinding    rb;
+    RefActual     ra;
     // One witness per container level, outermost first, each sampled now. A
-    // stable place has none; the caller pads to the formal's declared depth with
-    // the compile-time zero word so the callee's unrolled check is uniform.
+    // stable place has none.
     for (llvm::Value* ep : g.epoch_chain) {
-        rb.epochs.push_back(ep);
-        rb.expects.push_back(b_.CreateLoad(b_.getInt64Ty(), ep, "ref.epoch.at.call"));
+        ra.epochs.push_back(ep);
+        ra.expects.push_back(b_.CreateLoad(b_.getInt64Ty(), ep, "ref.epoch.at.call"));
     }
-    rb.slot = ref_actual_ptr(g, type);
-    return rb;
+    ra.slot = ref_actual_ptr(g, type);
+    return ra;
 }
 
-// Push a ref binding's witness pairs into a call's argv, padded to the formal's
-// declared `depth`. A call site may bind SHALLOWER than the formal's deepest
-// caller (or bind a stable place through a formal some other site nests), and the
-// signature is fixed, so the unused levels get the compile-time zero word: it
-// never advances, so it never reports stale.
-void Backend::push_ref_epochs(std::vector<llvm::Value*>& argv, const RefBinding& rb, uint32_t depth) {
-    for (uint32_t lvl = 0; lvl < depth; ++lvl) {
-        const bool have = lvl < rb.epochs.size();
-        argv.push_back(have ? rb.epochs[lvl] : no_epoch_global());
-        argv.push_back(have ? rb.expects[lvl] : b_.getInt64(0));
+// The witness chain a `ref` call passes: null for a place that cannot move (a
+// module signal, a frame local, a fixed unpacked array element, a struct member,
+// a class property or a whole container handle, which the callee then never
+// checks), else a caller-frame array of (&epoch, expected epoch) pairs, outermost
+// first, ended by a pair whose epoch is null. One shape whatever the actual, so
+// the formal's signature does not depend on any caller.
+llvm::Value* Backend::ref_witness_chain(const RefActual& ra) {
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    if (ra.epochs.empty()) {
+        return llvm::ConstantPointerNull::get(ptr);
     }
+    auto* const pair  = ref_witness_ty();
+    auto* const arr   = llvm::ArrayType::get(pair, ra.epochs.size() + 1);
+    llvm::Value* chain = nullptr;
+    if (in_coroutine_body()) {
+        // Frame-resident, like the task-call record: a task's frame is what the
+        // callee reads through while the caller is suspended inside the call.
+        llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+        chain = ab.CreateAlloca(arr, nullptr, "ref.chain");
+    } else {
+        chain = entry_alloca(arr, "ref.chain");
+    }
+    for (size_t lvl = 0; lvl < ra.epochs.size(); ++lvl) {
+        b_.CreateStore(ra.epochs[lvl], b_.CreateInBoundsGEP(arr, chain, { b_.getInt32(0), b_.getInt32(static_cast<uint32_t>(lvl)), b_.getInt32(0) }));
+        b_.CreateStore(ra.expects[lvl], b_.CreateInBoundsGEP(arr, chain, { b_.getInt32(0), b_.getInt32(static_cast<uint32_t>(lvl)), b_.getInt32(1) }));
+    }
+    b_.CreateStore(llvm::ConstantPointerNull::get(ptr),
+                   b_.CreateInBoundsGEP(arr, chain, { b_.getInt32(0), b_.getInt32(static_cast<uint32_t>(ra.epochs.size())), b_.getInt32(0) }));
+    return chain;
 }
 
 // Pointer to a ref actual's storage: the aliased place the callee holds.

@@ -584,8 +584,8 @@ function is LEGAL per 13.4.4, that is the right answer — no exclusion, no refu
 Region is a property of the calling THREAD, not of the lowered body (LRM 24.3.1),
 and `build_shared_home_fns` classifies every subroutine accordingly: reached only
 by reactive-home code it folds Reactive, only by ordinary code it folds Active, and
-by both it takes its caller's answer through a gated `i8 home` ramp parameter
-(`docs/design/program-blocks.md` §6.1). A FUNCTION is covered on the same terms as
+by both it takes its caller's answer through the `i8 home` ramp parameter every
+signature has (`docs/design/program-blocks.md` §6.1). A FUNCTION is covered on the same terms as
 a task, which matters for V5 precisely because a function is likelier to be shared:
 it cannot suspend itself, but it passes its home on to a `join_none` child it
 spawns, and that child parks. This needs no change for V5.

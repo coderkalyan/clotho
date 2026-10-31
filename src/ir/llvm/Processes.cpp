@@ -204,14 +204,10 @@ void Backend::lower_fork_inst(Index i) {
     // The spawning thread's block: the child's ramp takes a pooled block of its
     // own and links itself in as a child of this one (LRM 9.6.3's descendant
     // relation).
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // ... and its home region: a child inherits the spawning thread's, which is
     // this body's CURRENT one, not its lexical one (LRM 24.3.1).
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(callee_home());
     // An `In` scalar formal crosses in its domain, exactly as an ordinary call
     // marshals one (lower_task_call_inst's In arm).
     for (const Index cap : caps) {
