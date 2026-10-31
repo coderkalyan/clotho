@@ -1122,11 +1122,26 @@ if(NOT WIN32)
   set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
 endif()
 
+# A --dpi-lib definition wins over a same-named libc symbol, under the JIT and
+# in a linked executable alike. getpid is the probe: libc defines it, LLVM never
+# synthesizes it, and the real value cannot be 31337.
+if(NOT WIN32)
+  add_library(clotho_dpi_shadow SHARED tests/dpi_shadow/shadow.c)
+  add_test(NAME dpi_shadows_libc
+           COMMAND clotho_cli run --dpi-lib $<TARGET_FILE:clotho_dpi_shadow>
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/dpi_shadow/shadow.sv")
+  set_tests_properties(dpi_shadows_libc PROPERTIES PASS_REGULAR_EXPRESSION "pid=31337")
+  clotho_exe_test(exe_dpi_shadow tests/dpi_shadow/shadow.sv DPI $<TARGET_FILE:clotho_dpi_shadow>
+                  DEPENDS clotho_dpi_shadow)
+  add_test(NAME exe_dpi_shadow COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shadow${CMAKE_EXECUTABLE_SUFFIX}")
+  set_tests_properties(exe_dpi_shadow PROPERTIES PASS_REGULAR_EXPRESSION "pid=31337")
+endif()
+
 # What `clotho build` links into an executable is not sanitized: the executable
 # carries no sanitizer runtime (docs/design/executables.md), so instrumented code
 # there could neither link nor load. The compiler that builds it is sanitized.
 if(CLOTHO_SANITIZE)
-  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared)
+  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared clotho_dpi_shadow)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -fno-sanitize=all)
       target_link_options(${target} PRIVATE -fno-sanitize=all)

@@ -940,13 +940,31 @@ void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
 // record for the same shape so the two read alike:
 //   scalar signal { iMM mm_val, [iW z_val], [iW mask] }
 //   array element { iMM mm_val, [iW z_val], [iW mask], ptr mm_ptr, [ptr z_ptr] }
-//   aggregate leaf { ptr dst, i32 nbytes, [maxb x i8] payload, [maxb x i8] mask }
+//   aggregate leaf { ptr dst, i32 nbytes, [i32 pad], [maxb x i8] payload, [maxb x i8] mask }
 // A scalar destination is re-derived at commit from storage_ptr (a link-time
 // constant); an array element or aggregate leaf must carry the pointer that
 // the select resolved to when the statement executed (LRM 9.4.5).
 uint32_t Backend::intra_idx(Signal sig) const {
     const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
     return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
+}
+
+// Whether this signal's intra records stage a class handle, which makes a record in flight a
+// GC root: until its delay elapses it may hold the only reference to the object it carries
+// (LRM 9.4.5 samples the right-hand side now and lets the program drop its own references).
+// Only an aggregate or an array gets here -- a scalar handle target is refused in the frontend --
+// and the answer is the type's, so a design that stages no handle emits exactly what it did.
+bool Backend::intra_rec_rooted(const SignalSlot& s) {
+    return (s.is_agg || s.is_array) && reaches_class_handle(s.ir_type);
+}
+
+// Index of an aggregate record's payload; the mask follows it. The payload is a byte image of
+// one leaf's slot, so a handle leaf sits at its start, and a rooted record is scanned by the
+// collector one aligned word at a time (rt_gc_range_add): after `i32 nbytes` the payload would
+// start 4 bytes off a word boundary and the handle would be invisible. A pad moves it there --
+// for a rooted site only, so every other aggregate record keeps its layout.
+uint32_t Backend::intra_agg_payload(const SignalSlot& s) {
+    return intra_rec_rooted(s) ? 9 : 8;
 }
 
 llvm::StructType* Backend::intra_rec_ty(const SignalSlot& s) {
@@ -962,6 +980,9 @@ llvm::StructType* Backend::intra_rec_ty(const SignalSlot& s) {
         auto* bytes = llvm::ArrayType::get(b_.getInt8Ty(), agg_max_leaf_bytes(s.ir_type));
         f.push_back(ptr);
         f.push_back(i32);
+        if (intra_rec_rooted(s)) {
+            f.push_back(i32); // see intra_agg_payload
+        }
         f.push_back(bytes);
         if (s.intra_masked) {
             f.push_back(bytes);
@@ -1106,8 +1127,9 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
         return;
     }
 
-    // The packed slot still holds i(2W); a 2-state RHS lifts to it.
-    rhs = to_four(rhs);
+    // A packed slot is a 4-state slot, and ir::verify's store-domain rule gives it a
+    // 4-state value.
+    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
 
     // Whole-storage store: the frontend context-sizes the RHS to the lvalue
     // width (via an inserted conversion), so rhs already matches the storage width
@@ -1154,7 +1176,8 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         if (m.narrow) {
             b_.CreateStore(must_of(rhs), shadow_ptr(s, m.sh_mm_field));
         } else {
-            const Plane f = to_four(rhs);
+            assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+            const Plane& f = rhs;
             b_.CreateStore(f.mm, shadow_ptr(s, m.sh_mm_field));
             if (m.has_z) {
                 b_.CreateStore(f.z, shadow_ptr(s, m.sh_z_field));
@@ -1194,7 +1217,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         return;
     }
 
-    rhs                  = to_four(rhs);
+    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     // A never-z target stages no z shadow (and its commit loop skips z).
     llvm::Value* zp = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
 
@@ -1618,7 +1641,8 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     if (lv.narrow) {
         put(payload, place_val(lv, must_of(rhs), W), 0);
     } else {
-        const Plane f  = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+        const Plane& f = rhs;
         llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
                                  place_val(lv, f.z, W)).mm;
         put(payload, mm, 0);
@@ -1751,7 +1775,7 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
     if (s.narrow) {
         mm_val = place_val(lv, must_of(rhs), W); // iW
     } else {
-        rhs               = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         llvm::Value* must = place_val(lv, must_of(rhs), W);
         llvm::Value* may  = place_val(lv, may_of(rhs), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
@@ -1808,7 +1832,7 @@ llvm::Value* Backend::intra_pack_mm(const SignalSlot& s, Plane& rhs) {
     if (s.narrow) {
         return must_of(rhs);
     }
-    rhs = to_four(rhs);
+    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     return rhs.mm;
 }
 
@@ -1852,7 +1876,7 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
     if (s.narrow) {
         mm_val = place_val(lv, must_of(rhs), W);
     } else {
-        rhs               = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         llvm::Value* must = place_val(lv, must_of(rhs), W);
         llvm::Value* may  = place_val(lv, may_of(rhs), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
@@ -1914,11 +1938,12 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
         llvm::Value* p = off == 0 ? region : b_.CreateInBoundsGEP(i8, region, { b_.getInt32(off) });
         b_.CreateAlignedStore(v, p, a1);
     };
-    llvm::Value* payload = b_.CreateStructGEP(rt, rec, 8);
+    llvm::Value* payload = b_.CreateStructGEP(rt, rec, intra_agg_payload(s));
     if (lv.narrow) {
         put(payload, place_val(lv, must_of(rhs), W), 0);
     } else {
-        const Plane  f  = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+        const Plane& f = rhs;
         llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
                                  place_val(lv, f.z, W))
                             .mm;
@@ -1931,7 +1956,7 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
     // destination slot's own padding, which is never read.
     if (s.intra_masked) {
         llvm::Value* mask   = store_mask(lv, W);
-        llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, 9);
+        llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, intra_agg_payload(s) + 1);
         if (lv.narrow) {
             put(mask_p, mask, 0);
         } else {
@@ -1970,7 +1995,8 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      idxv   = intra_id_value(lv.sig);
 
-    llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
+    llvm::Value* rec =
+      b_.CreateCall(intra_rec_rooted(s) ? intra_alloc_rooted_fn() : intra_alloc_fn(), { idxv, b_.getInt32(stride) });
     b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
     fill_intra_payload(lv, rhs, rt, rec);
 
@@ -2032,7 +2058,7 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     if (s.narrow) {
         mm_val = must_of(rhs);
     } else {
-        rhs    = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         mm_val = rhs.mm; // i2W: must | (may << W)
     }
     llvm::Value* z_val = s.has_z ? rhs.z : nullptr;
@@ -2160,7 +2186,8 @@ void Backend::emit_intra_event_arm(const LValue&                lv,
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      idxv   = intra_id_value(lv.sig);
 
-    llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
+    llvm::Value* rec =
+      b_.CreateCall(intra_rec_rooted(s) ? intra_alloc_rooted_fn() : intra_alloc_fn(), { idxv, b_.getInt32(stride) });
     b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2));
     b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
     fill_intra_payload(lv, rhs, rt, rec);
@@ -2352,7 +2379,7 @@ void Backend::emit_intra_commit(Signal sig) {
             });
         }
     }
-    b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
+    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx) });
     b_.CreateBr(skip);
 
     b_.SetInsertPoint(skip);
@@ -2396,7 +2423,7 @@ void Backend::emit_intra_agg_commit(Signal sig) {
     llvm::Value* recp    = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, k));
     llvm::Value* dest    = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, 6), a1);
     llvm::Value* nbytes  = b_.CreateAlignedLoad(i32, b_.CreateStructGEP(rt, recp, 7), a1);
-    llvm::Value* payload = b_.CreateStructGEP(rt, recp, 8);
+    llvm::Value* payload = b_.CreateStructGEP(rt, recp, intra_agg_payload(s));
     if (!s.intra_masked) {
         b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
     } else {
@@ -2404,7 +2431,7 @@ void Backend::emit_intra_agg_commit(Signal sig) {
         // Width-agnostic -- a mask byte of 0 leaves dest[j] unchanged, so an
         // unselected bit (or a garbage padding byte gating dest padding) is a
         // no-op.
-        llvm::Value* mask_r = b_.CreateStructGEP(rt, recp, 9);
+        llvm::Value* mask_r = b_.CreateStructGEP(rt, recp, intra_agg_payload(s) + 1);
         auto*        bh     = llvm::BasicBlock::Create(ctx_, "intraagg.bh", fn);
         auto*        bb     = llvm::BasicBlock::Create(ctx_, "intraagg.bb", fn);
         auto*        bd     = llvm::BasicBlock::Create(ctx_, "intraagg.bd", fn);
@@ -2431,7 +2458,7 @@ void Backend::emit_intra_agg_commit(Signal sig) {
     if (signal_has_waiters(sig)) {
         service_any_waiters(sig);
     }
-    b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
+    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx) });
     b_.CreateBr(skip);
 
     b_.SetInsertPoint(skip);

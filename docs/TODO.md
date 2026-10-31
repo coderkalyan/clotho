@@ -185,9 +185,15 @@ Milestones, in order; lower ones unblock higher ones:
   honour the force.
 - [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must
   be decided when the deferred update commits, but the deferred record carries no gate.
+- [ ] **Gate or switch output on a `force` target variable** (10.3, 10.6.2) — the gate's store
+  has no force gate, and 10.6.2 does not say whether a release restores a primitive output.
+- [ ] **Continuous assignment delay on a `force` target variable** (10.3.3, 10.6.2) — the
+  delayed commit has no force gate, and 10.6.2 leaves open how a release meets a pending delay.
 - [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
   bit/part-selects as the target.
 - [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
+- [ ] **`force` inside a task or function** (10.6.2) — a net force there, and a variable force
+  that no procedural block also holds, is refused: the scan reads procedural blocks only.
 
 ### Real numbers
 
@@ -220,8 +226,6 @@ Milestones, in order; lower ones unblock higher ones:
   task-call record slot that only a coroutine has.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
-- [ ] **Clotho IR dump of a design that calls `$monitor`** — `clotho build --emit ir`
-  crashes with a segmentation fault partway through printing.
 - [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
   suspended when a simulation ends are not freed, so a host running several leaks them.
 
@@ -323,8 +327,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Data types
 
-- [ ] **2-state formal in the call ABI (performance)** — a 2-state formal is still passed as a
-  4-state (mm, z) plane pair whose z plane is constant 0.
 - [ ] **Nonblocking assignment to a string character** (10.4.2) — `s[i] <= c` is refused; it needs
   a masked character record rather than a whole-string one.
 - [ ] **NBA to a class property** — `c.x <= v`, of any type including `string`, is refused; NBA
@@ -400,6 +402,8 @@ Milestones, in order; lower ones unblock higher ones:
   refused; X propagation differs from a byte compare.
 - [ ] **Associative-array key mixing a class handle with a variable-width component** (7.8) — a
   `string`, queue, dynamic-array or associative-array component beside the handle is refused.
+- [ ] **Wildcard `[*]` index wider than 64 bits** (7.8.1) — an index expression (including a
+  string literal of more than 8 characters) wider than 64 bits is refused.
 - [ ] **Assignment-pattern lvalue over a container or handle** (10.9) — a queue, dynamic-array or
   associative-array right-hand side, or a `string` / handle member, is refused.
 - [ ] **Bit-stream casting** (6.24.3) — `{<<{...}}` / `{>>{...}}` as cast operands.
@@ -483,8 +487,14 @@ Milestones, in order; lower ones unblock higher ones:
 ### Full object orientation
 
 - [~] **Garbage collection** (8.4) — collector coverage and policy still missing.
-  - [ ] **Collector tracing of event, `mailbox`, `semaphore`, `process` and
+  - [ ] **Collector tracing of event, `mailbox`, `semaphore` and
     `std::weak_reference` handles** (8.4) — not yet described to the collector.
+  - [ ] **Collection inside a delay-free loop** (8.4) — a loop that allocates and never
+    suspends grows the heap without bound; the collector runs only at time-step boundaries.
+  - [ ] **Collection trigger counts buffers owned by objects** (8.4) — the trigger sees only
+    object bytes, so objects owning large strings or containers can fill memory before one runs.
+  - [ ] **Covergroup instances are freed only at exit** (19.3) — an instance created in a loop
+    is never reclaimed during the run.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that

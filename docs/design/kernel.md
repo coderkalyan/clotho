@@ -20,9 +20,7 @@ when it does.
   2-state variable's storage, and the call ABI, use the native form too, so no
   boundary ever holds a 2-state value in the packed form. **Not yet:** the code
   generator tracks each value's encoding in a flag (`Plane::two`) that it asserts
-  against the type, because a 2-state variable is still stored packed when a
-  task's output argument or the may-z analysis gives it a z word (see the call
-  ABI and storage decisions below).
+  against the type.
 - An IR integer type is a width and a domain; it has no sign. Domains, signedness
   and extension are decided by the language, through slang's legalized AST, and the
   IR carries them explicitly: signed and unsigned opcodes (`SDiv`/`UDiv`,
@@ -83,8 +81,7 @@ when it does.
 
 - Each signal's slot has the best encoding known for it: a 2-state signal is one
   W-bit word, and a 4-state signal drops its z plane when the may-z analysis
-  proves it z-free. **Not yet:** a 2-state signal written from a z-capable source
-  keeps a z word.
+  proves it z-free.
 - Storage that aliases has one layout. A signal is narrowed only when every use,
   by-reference aliases included, allows it. **Not yet:** any signal passed by
   reference takes its type's default layout.
@@ -131,7 +128,7 @@ when it does.
 ## Calls and the runtime boundary
 
 - Scalar arguments and results pass by domain: a 2-state scalar is one native
-  word, a 4-state scalar the full form. **Not yet:** always the full form.
+  word, a 4-state scalar the full form.
 - A runtime routine receives a pointer to the value's own storage and a
   compile-time constant shape descriptor; the runtime decodes the planes through
   shared helpers. **Not yet:** values are translated per call into a separate

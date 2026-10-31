@@ -488,13 +488,11 @@ llvm::Value* Backend::z_of(Plane a) {
     return a.two ? zero(width_of(a)) : a.z;
 }
 
-// A plane from storage, an ABI return, a runtime helper or an aggregate walk, in
-// the encoding of the value an instruction of IR type `t` is. Those producers see
-// the representation they read: a 2-state signal is stored packed when a
-// pointer-ABI task writes it, every function ABI passes packed planes, and an
-// aggregate walk mixes its leaves. The IR type is what the VALUE is, so this is
-// the boundary between the two encodings, not a repair of an operand: set_value
-// asserts the result, and an operator never converts its operands.
+// The result of a whole-aggregate compare in the encoding of the domain its IR
+// type has: lower_agg_eq builds a 1-bit packed answer for an associative-array
+// compare whatever the leaves are, while the type of an `==` over 2-state leaves
+// is 2-state. This converts a producer's result; it is not a storage or ABI
+// boundary, and an operator never converts its operands.
 Plane Backend::in_type_domain(Plane p, ValueType t) {
     if (t.is_string || t.is_real) {
         return p;
