@@ -85,6 +85,16 @@ std::string emit_ir(std::string_view source) {
     return text;
 }
 
+// The IR as the backend emits it, before the optimizer has folded or removed any of
+// it: for a test of what the backend does, not of what is left.
+std::string emit_raw_ir(std::string_view source) {
+    const LowerResult        r = lower_ok(source);
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false }));
+    return text;
+}
+
 } // namespace
 
 TEST_CASE("a variable bit-select of a very wide vector reads and writes in place") {
@@ -477,12 +487,123 @@ struct KernelCase {
     uint32_t n;
 };
 
+// Whether storage bit `i` of a `width`-bit vector is one `c` can address: inside the
+// vector and inside the container (LRM 11.5.1). 128-bit arithmetic, so that no
+// extreme base or offset overflows in the statement the kernels are checked against.
+bool addressable(const KernelCase& c, uint32_t width, __int128 i) {
+    return i >= 0 && i < width && i >= c.base && i < static_cast<__int128>(c.base) + c.cwidth;
+}
+
+// Both kernels on one case of a `width`-bit slot, checked bit by bit against
+// LRM 11.5.1: a selection bit that is addressable is the storage bit, every other one
+// reads x (2-state: 0) and is not written, and an x/z index addresses nothing. The
+// slot has the planes `four` / `has_z` say (a null pointer for a plane it lacks), so
+// the kernel must not touch a plane it was not given.
+void check_kernels(uint32_t width, const KernelCase& c, bool four, bool has_z, bool unknown) {
+    CAPTURE(width);
+    CAPTURE(c.base);
+    CAPTURE(c.cwidth);
+    CAPTURE(c.off);
+    CAPTURE(c.n);
+    CAPTURE(four);
+    CAPTURE(has_z);
+    CAPTURE(unknown);
+
+    const auto in_range = [&](uint32_t k) {
+        return !unknown && addressable(c, width, static_cast<__int128>(c.off) + k);
+    };
+    const auto storage_bit = [&](uint32_t k) { return static_cast<uint64_t>(static_cast<__int128>(c.off) + k); };
+
+    // Read. The buffers start as all ones, so a word the kernel forgets to write shows.
+    Guarded               mm(four ? 2 * width : width, 1);
+    Guarded               z(width, 2);
+    const Guarded         mm_before = mm;
+    const Guarded         z_before  = z;
+    const uint32_t        words     = (c.n + 63) / 64;
+    std::vector<uint64_t> got_must(words, ~uint64_t{ 0 }), got_may(words, ~uint64_t{ 0 }), got_z(words, ~uint64_t{ 0 });
+    rt_wide_sel(mm.data(),
+                has_z ? z.data() : nullptr,
+                width,
+                c.base,
+                c.cwidth,
+                c.off,
+                c.n,
+                unknown,
+                got_must.data(),
+                four ? got_may.data() : nullptr,
+                has_z ? got_z.data() : nullptr);
+    std::vector<uint64_t> want_must(words, 0), want_may(words, 0), want_z(words, 0);
+    for (uint32_t k = 0; k < c.n; ++k) {
+        const auto put = [&](std::vector<uint64_t>& p, bool v) {
+            if (v) {
+                p[k >> 6] |= uint64_t{ 1 } << (k & 63);
+            }
+        };
+        if (in_range(k)) {
+            put(want_must, mm.bit(storage_bit(k)));
+            put(want_may, four && mm.bit(width + storage_bit(k)));
+            put(want_z, has_z && z.bit(storage_bit(k)));
+        } else {
+            put(want_may, four); // x for a 4-state slot, 0 for 2-state
+        }
+    }
+    CHECK(got_must == want_must);
+    if (four) {
+        CHECK(got_may == want_may);
+    }
+    if (has_z) {
+        CHECK(got_z == want_z);
+    }
+    CHECK(mm.words == mm_before.words); // a read changes nothing
+    CHECK(z.words == z_before.words);
+
+    // Write.
+    const std::vector<uint64_t> in_must = sel_plane(c.n, 3);
+    const std::vector<uint64_t> in_may  = sel_plane(c.n, 4);
+    const std::vector<uint64_t> in_z    = sel_plane(c.n, 5);
+    Guarded                     want_mm = mm;
+    Guarded                     want_zz = z;
+    for (uint32_t k = 0; k < c.n; ++k) {
+        if (!in_range(k)) {
+            continue;
+        }
+        want_mm.set(storage_bit(k), plane_bit(in_must, k));
+        if (four) {
+            want_mm.set(width + storage_bit(k), plane_bit(in_may, k));
+        }
+        if (has_z) {
+            want_zz.set(storage_bit(k), plane_bit(in_z, k));
+        }
+    }
+    rt_wide_ins(mm.data(),
+                has_z ? z.data() : nullptr,
+                width,
+                c.base,
+                c.cwidth,
+                c.off,
+                c.n,
+                unknown,
+                in_must.data(),
+                four ? in_may.data() : nullptr,
+                has_z ? in_z.data() : nullptr);
+    CHECK(mm.words == want_mm.words); // guards and padding included
+    CHECK(z.words == want_zz.words);
+}
+
+// Every plane combination a slot can have: 2-state, 4-state without z, 4-state.
+template<class Check>
+void for_each_slot_shape(Check&& check) {
+    check(false, false);
+    check(true, false);
+    check(true, true);
+}
+
 } // namespace
 
 TEST_CASE("the wide select kernels touch only bits inside the vector, whatever container and offset") {
     // The contract under the SV tests above: a nested select whose outer select
     // is out of range hands the kernels a container that lies outside the vector,
-    // and an offset is any i32. Neither may make them read or write a bit outside
+    // and an offset is any i64. Neither may make them read or write a bit outside
     // [0, width), nor outside the container; every other bit reads x (2-state: 0)
     // and is not written. LRM 11.5.1, checked bit by bit against that statement.
     constexpr uint32_t kWidth = 200; // the last word of a plane is partly padding
@@ -495,86 +616,52 @@ TEST_CASE("the wide select kernels touch only bits inside the vector, whatever c
         { -128, 128, -128, 128 },                  // the element just before the start
         { -1000, 100, -1000, 64 },                 // far below
         { 5000, 300, 5100, 90 },                   // far above
-        { INT32_MIN, UINT32_MAX, INT32_MIN, 130 }, // the most extreme container and offset
+        { INT32_MIN, UINT32_MAX, INT32_MIN, 130 }, // the most extreme i32 container and offset
         { INT32_MIN, UINT32_MAX, INT32_MAX - 20, 70 },
-        { 0, 200, 0, 200 },                        // the whole vector
+        { 0, 200, 0, 200 }, // the whole vector
+        // Any i64 base and offset: nothing in the arithmetic may overflow on the way to
+        // "addresses nothing", or to the few bits that are addressable.
+        { INT64_MIN, UINT32_MAX, INT64_MIN, 130 },
+        { INT64_MIN, UINT32_MAX, INT64_MAX, 70 },
+        { INT64_MAX, UINT32_MAX, INT64_MAX - 20, 70 },
+        { INT64_MAX, 100, 0, 100 },
+        { 0, 200, INT64_MAX, 64 },
+        { 0, 200, INT64_MIN, 64 },
+        { INT64_MIN, UINT32_MAX, -1, 3 },
     };
 
     for (const KernelCase& c : cases) {
-        for (uint32_t four = 0; four <= 1; ++four) {
-            for (uint32_t has_z = 0; has_z <= four; ++has_z) {
-                for (uint32_t unknown = 0; unknown <= 1; ++unknown) {
-                    CAPTURE(c.base);
-                    CAPTURE(c.cwidth);
-                    CAPTURE(c.off);
-                    CAPTURE(c.n);
-                    CAPTURE(four);
-                    CAPTURE(has_z);
-                    CAPTURE(unknown);
+        for (const bool unknown : { false, true }) {
+            for_each_slot_shape([&](bool four, bool has_z) { check_kernels(kWidth, c, four, has_z, unknown); });
+        }
+    }
+}
 
-                    const auto in_range = [&](int64_t i) {
-                        return unknown == 0 && i >= 0 && i < static_cast<int64_t>(kWidth) &&
-                               i >= c.base && i < c.base + static_cast<int64_t>(c.cwidth);
-                    };
+TEST_CASE("the wide select kernels agree with the per-bit statement at every word boundary") {
+    // A selection of each width that lies on or next to a word boundary, at every
+    // offset from wholly below the vector to wholly above it, for slots whose may
+    // plane starts mid-word (70, 200) and on a word boundary (256).
+    for (const uint32_t width : { 70u, 200u, 256u }) {
+        for (const uint32_t n : { 1u, 2u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 128u, 129u, 200u }) {
+            for (int64_t off = -int64_t{ n } - 1; off <= int64_t{ width } + 1; ++off) {
+                for_each_slot_shape(
+                  [&](bool four, bool has_z) { check_kernels(width, { 0, width, off, n }, four, has_z, false); });
+            }
+        }
+    }
+}
 
-                    // Read.
-                    Guarded mm(four != 0 ? 2 * kWidth : kWidth, 1);
-                    Guarded z(kWidth, 2);
-                    const Guarded mm_before = mm;
-                    const Guarded z_before  = z;
-                    const uint32_t words    = (c.n + 63) / 64;
-                    std::vector<uint64_t> got_must(words, ~uint64_t{ 0 }), got_may(words, ~uint64_t{ 0 }),
-                      got_z(words, ~uint64_t{ 0 });
-                    rt_wide_sel(mm.data(), has_z != 0 ? z.data() : nullptr, kWidth, c.base, c.cwidth,
-                                c.off, c.n, four, has_z, unknown, got_must.data(), got_may.data(),
-                                got_z.data());
-                    std::vector<uint64_t> want_must(words, 0), want_may(words, 0), want_z(words, 0);
-                    for (uint32_t k = 0; k < c.n; ++k) {
-                        const int64_t i = c.off + static_cast<int64_t>(k);
-                        const auto    put = [&](std::vector<uint64_t>& p, bool v) {
-                            if (v) {
-                                p[k >> 6] |= uint64_t{ 1 } << (k & 63);
-                            }
-                        };
-                        if (in_range(i)) {
-                            put(want_must, mm.bit(static_cast<uint64_t>(i)));
-                            put(want_may, four != 0 && mm.bit(kWidth + static_cast<uint64_t>(i)));
-                            put(want_z, four != 0 && has_z != 0 && z.bit(static_cast<uint64_t>(i)));
-                        } else {
-                            put(want_may, four != 0); // x for a 4-state slot, 0 for 2-state
-                        }
-                    }
-                    CHECK(got_must == want_must);
-                    CHECK(got_may == want_may);
-                    CHECK(got_z == want_z);
-                    CHECK(mm.words == mm_before.words); // a read changes nothing
-                    CHECK(z.words == z_before.words);
-
-                    // Write.
-                    const std::vector<uint64_t> in_must = sel_plane(c.n, 3);
-                    const std::vector<uint64_t> in_may  = sel_plane(c.n, 4);
-                    const std::vector<uint64_t> in_z    = sel_plane(c.n, 5);
-                    Guarded                     want_mm = mm;
-                    Guarded                     want_zz = z;
-                    for (uint32_t k = 0; k < c.n; ++k) {
-                        const int64_t i = c.off + static_cast<int64_t>(k);
-                        if (!in_range(i)) {
-                            continue;
-                        }
-                        const auto u = static_cast<uint64_t>(i);
-                        want_mm.set(u, plane_bit(in_must, k));
-                        if (four != 0) {
-                            want_mm.set(kWidth + u, plane_bit(in_may, k));
-                            if (has_z != 0) {
-                                want_zz.set(u, plane_bit(in_z, k));
-                            }
-                        }
-                    }
-                    rt_wide_ins(mm.data(), has_z != 0 ? z.data() : nullptr, kWidth, c.base, c.cwidth,
-                                c.off, c.n, four, has_z, unknown, in_must.data(), in_may.data(),
-                                in_z.data());
-                    CHECK(mm.words == want_mm.words); // guards and padding included
-                    CHECK(z.words == want_zz.words);
+TEST_CASE("the wide select kernels clamp to a container inside the vector at every word boundary") {
+    // A nested select reads a window of the vector: the container is that window,
+    // whose edges fall on, before and after the word boundaries.
+    constexpr uint32_t kWidth = 300;
+    for (const int64_t base : { -70, -1, 0, 1, 63, 64, 65, 127, 128, 129, 250 }) {
+        for (const uint32_t cwidth : { 1u, 63u, 64u, 65u, 128u, 130u }) {
+            for (const int64_t rel : { -65, -1, 0, 1, 63, 64, 65 }) {
+                for (const uint32_t n : { 1u, 64u, 65u, 130u }) {
+                    for_each_slot_shape([&](bool four, bool has_z) {
+                        check_kernels(kWidth, { base, cwidth, base + rel, n }, four, has_z, false);
+                    });
                 }
             }
         }
@@ -767,4 +854,189 @@ TEST_CASE("a constant-offset select of wide storage stays inline and a runtime o
     CHECK(runtime.find("@rt_wide_sel") != std::string::npos);
     CHECK(runtime.find("@rt_wide_ins") != std::string::npos);
     CHECK(run_capture(source("300")) == "2 ff\n");
+}
+
+TEST_CASE("a wide selection reads and writes runs that cross word boundaries, in every kind of slot") {
+    // The helpers move a selection a word at a time, so the runs that matter are the
+    // ones that start before a word boundary and end after it, and the planes that
+    // start mid-word: the may plane of a 300-bit 4-state slot starts at bit 300, in
+    // word 4 at bit 44. `a` has a z plane, `b` is 2-state, and `c` is 4-state but
+    // never z (its may plane starts on a word boundary, at bit 256). Checked against
+    // iverilog 13, which agrees on every line but the last (it gives a 2-state vector
+    // x for an out-of-range bit where LRM 11.5.1 says 0).
+    const std::string out = run_capture(R"(
+        module m;
+            logic [299:0] a;
+            bit   [299:0] b;
+            logic [255:0] c;
+            integer       i;
+            initial begin
+                a = 0; b = 0; c = 0;
+                i = 0;   a[i +: 64] = 64'hdeadbeefcafef00d; b[i +: 64] = 64'hdeadbeefcafef00d; c[i +: 64] = 64'hdeadbeefcafef00d;
+                i = 1;   $display("%h %h %h", a[i +: 64], b[i +: 64], c[i +: 64]);
+                i = 60;  a[i +: 64] = 64'h0123456789abcdef; b[i +: 64] = 64'h0123456789abcdef; c[i +: 64] = 64'h0123456789abcdef;
+                $display("%h %h %h", a[123:60], b[123:60], c[123:60]);
+                i = 63;  $display("%h %h %h", a[i +: 3], b[i +: 3], c[i +: 3]);
+                i = 64;  $display("%h %h %h", a[i +: 64], b[i +: 64], c[i +: 64]);
+                i = 100; a[i +: 130] = {2'b10, 64'hxxxxxxxx_zzzzzzzz, 64'hffffffff_00000000};
+                i = 100; $display("%h", a[i +: 130]);
+                i = 190; $display("%h", a[i +: 64]);
+                i = 128; c[i +: 128] = {64'hfedcba9876543210, 64'h0f0f0f0f0f0f0f0f};
+                $display("%h", c[255:128]);
+                i = 236; a[i +: 64] = 64'hffffffffffffffff;
+                $display("%h", a[299:236]);
+                i = 237; a[i +: 64] = 64'h0;
+                $display("%h", a[299:236]);
+                i = 290; $display("%h %h", a[i +: 16], b[i +: 16]);
+            end
+        endmodule
+    )");
+    CHECK(out == "6f56df77e57f7806 6f56df77e57f7806 6f56df77e57f7806\n"
+                 "0123456789abcdef 0123456789abcdef 0123456789abcdef\n"
+                 "5 5 5\n"
+                 "00123456789abcde 00123456789abcde 00123456789abcde\n"
+                 "2xxxxxxxxzzzzzzzzffffffff00000000\n"
+                 "000000XxxxxxxxXz\n"
+                 "fedcba98765432100f0f0f0f0f0f0f0f\n"
+                 "ffffffffffffffff\n"
+                 "0000000000000001\n"
+                 "xX00 0000\n");
+}
+
+TEST_CASE("nonblocking writes to a wide vector cross word boundaries and hang off either end") {
+    // The same slots, staged: a 70-bit run across a word boundary, one that hangs
+    // below the vector, one that hangs above it, a wholly outside one and one with an
+    // x index, whose staged bits (and dirty-mask bits) are only the in-range ones.
+    // Checked against iverilog 13 line for line.
+    const std::string out = run_capture(R"(
+        module m;
+            logic [299:0] a;
+            bit   [299:0] b;
+            logic [255:0] c;
+            integer       i;
+            reg [3:0]     xi;
+            initial begin
+                a = 0; b = 0; c = 0;
+                i = 60;
+                a[i +: 70] <= {6'b101xz1, 64'hf0f0f0f0f0f0f0f0};
+                b[i +: 70] <= {6'b101111, 64'hf0f0f0f0f0f0f0f0};
+                c[i +: 70] <= {6'b101011, 64'hf0f0f0f0f0f0f0f0};
+                #1 $display("%h %h %h", a[129:60], b[129:60], c[129:60]);
+                i = -3;
+                a[i +: 70] <= {6'b110011, 64'h123456789abcdef0};
+                b[i +: 70] <= {6'b110011, 64'h123456789abcdef0};
+                c[i +: 70] <= {6'b110011, 64'h123456789abcdef0};
+                #1 $display("%h %h %h", a[66:0], b[66:0], c[66:0]);
+                i = 250;
+                a[i +: 70] <= {6'b110011, 64'h123456789abcdef0};
+                b[i +: 70] <= {6'b110011, 64'h123456789abcdef0};
+                c[i +: 70] <= {6'b110011, 64'h123456789abcdef0};
+                #1 $display("%h %h %h", a[299:250], b[299:250], c[255:250]);
+                i = 400;
+                a[i +: 70] <= 70'h3fffffffffffffffff;
+                b[i +: 70] <= 70'h3fffffffffffffffff;
+                c[i +: 70] <= 70'h3fffffffffffffffff;
+                xi = 4'bx1x0;
+                a[xi +: 70] <= 70'h3fffffffffffffffff;
+                b[xi +: 70] <= 70'h3fffffffffffffffff;
+                c[xi +: 70] <= 70'h3fffffffffffffffff;
+                #1 $display("%b %b %b", a[299:296], b[299:296], c[255:252]);
+                $display("%h|%h", a[299:200], c[255:192]);
+            end
+        endmodule
+    )");
+    CHECK(out == "2Xf0f0f0f0f0f0f0f0 2ff0f0f0f0f0f0f0f0 2bf0f0f0f0f0f0f0f0\n"
+                 "662468acf13579bde 662468acf13579bde 662468acf13579bde\n"
+                 "056789abcdef0 056789abcdef0 30\n"
+                 "0001 0001 1100\n"
+                 "159e26af37bc0000000000000|c000000000000000\n");
+}
+
+namespace {
+
+// How many times `needle` occurs in `hay`.
+size_t count_of(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string_view::npos; at = hay.find(needle, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+// The one line of `ir` that calls `callee`, which the test's design makes exactly one of.
+std::string call_line(const std::string& ir, std::string_view callee) {
+    const std::string key = "call void @" + std::string(callee) + "(";
+    REQUIRE(count_of(ir, key) == 1);
+    const size_t at = ir.find(key);
+    return ir.substr(at, ir.find('\n', at) - at);
+}
+
+} // namespace
+
+TEST_CASE("a wide select gives the runtime only the planes its slot has") {
+    // kernel.md: the helper receives only the planes the destination needs. A null
+    // pointer stands for each plane the slot lacks, and no buffer is made for it: a
+    // 2-state slot is selected through one buffer, a 4-state one without a z field
+    // through two, and a 4-state one with z through three. Raw (unoptimized) IR, so
+    // that what is asserted is what the backend emits, not what the optimizer left.
+    const auto design = [](std::string_view type, std::string_view value) {
+        return "module m;\n  " + std::string(type) + " [511:0] v;\n  int i, acc;\n" +
+               "  initial begin\n    i = $urandom;\n    v = 0;\n    v[i] = " + std::string(value) + ";\n" +
+               "    acc = v[i];\n    $display(\"%0d\", acc);\n  end\nendmodule\n";
+    };
+    const std::string two  = emit_raw_ir(design("bit", "1'b1"));
+    const std::string four = emit_raw_ir(design("logic", "1'b1")); // no z is ever written
+    const std::string zed  = emit_raw_ir(design("logic", "1'bz"));
+
+    CHECK(four.find("%logic.nz.512") != std::string::npos); // the design is what the case says
+    CHECK(zed.find("%logic.512") != std::string::npos);
+
+    // The two helpers' calls: the slot's z pointer, then the three plane buffers.
+    const auto nulls = [](const std::string& ir, std::string_view callee) {
+        return count_of(call_line(ir, callee), "ptr null");
+    };
+    CHECK(nulls(two, "rt_wide_sel") == 3);
+    CHECK(nulls(two, "rt_wide_ins") == 3);
+    CHECK(nulls(four, "rt_wide_sel") == 2);
+    CHECK(nulls(four, "rt_wide_ins") == 2);
+    CHECK(nulls(zed, "rt_wide_sel") == 0);
+    CHECK(nulls(zed, "rt_wide_ins") == 0);
+
+    // Nor is a buffer made for a plane that is not passed.
+    for (const std::string_view name : { "wsel.may", "wsel.z", "wins.may", "wins.z" }) {
+        CHECK_MESSAGE(two.find(name) == std::string::npos, name);
+    }
+    for (const std::string_view name : { "wsel.z", "wins.z" }) {
+        CHECK_MESSAGE(four.find(name) == std::string::npos, name);
+    }
+    for (const std::string_view name : { "wsel.must", "wsel.may", "wsel.z", "wins.must", "wins.may", "wins.z" }) {
+        CHECK_MESSAGE(zed.find(name) != std::string::npos, name);
+    }
+}
+
+TEST_CASE("a nonblocking wide select stages its dirty mask through one plane") {
+    // The shadow takes the slot's planes, and the dirty mask is one 2-state plane of
+    // the signal's width, so its call carries a single buffer whatever the slot is.
+    const std::string ir = emit_raw_ir(R"(
+        module m;
+          logic [511:0] v;
+          int i;
+          initial begin
+            i = $urandom;
+            v = 0;
+            v[i] <= 1'bz;
+          end
+        endmodule
+    )");
+    REQUIRE(count_of(ir, "call void @rt_wide_ins(") == 2);
+    size_t with_z = 0, mask_only = 0;
+    for (size_t at = ir.find("call void @rt_wide_ins("); at != std::string::npos;
+         at        = ir.find("call void @rt_wide_ins(", at + 1)) {
+        const std::string line  = ir.substr(at, ir.find('\n', at) - at);
+        const size_t      nulls = count_of(line, "ptr null");
+        with_z += nulls == 0;
+        mask_only += nulls == 3;
+    }
+    CHECK(with_z == 1);    // the shadow: must, may and z
+    CHECK(mask_only == 1); // the dirty mask: must only
 }

@@ -285,10 +285,10 @@ struct BoundsCheck {
 
 // Storage width above which a runtime-offset bit / part select is done by the
 // runtime (word-indexed) instead of inline (whole-value variable shift). The inline
-// form costs O(width) instructions and the helper a flat 182-311 (2-/4-state, read /
-// write); they cross between 190 and 290 bits, so 256 puts the helper where it wins at
-// every width above it (wide_dyn_storage has the measurements). A select with a
-// constant offset never reaches the helper's call.
+// form costs O(width) instructions and the helper a flat 117-139 (2-/4-state, read /
+// write); they cross between 128 and 192 bits, and the helper wins at every width
+// above 256 (wide_dyn_storage has the measurements and why the threshold is not the
+// crossing). A select with a constant offset never reaches the helper's call.
 constexpr uint32_t wide_dyn_select_bits = 256;
 
 // Operand width above which multiply, divide and modulo are runtime calls
@@ -2835,10 +2835,7 @@ private:
 
     Plane lower_load(const LValue& lv);
 
-    std::vector<llvm::Value*> wide_dyn_args(const LValue& lv, llvm::Value* mmp, llvm::Value* zp,
-                                            uint32_t width, bool four);
-
-    std::vector<llvm::Value*> wide_dyn_args(const LValue& lv);
+    std::vector<llvm::Value*> wide_dyn_args(const LValue& lv, llvm::Value* mmp, llvm::Value* zp, uint32_t width);
 
     static uint32_t sel_buf_bits(uint32_t n);
 

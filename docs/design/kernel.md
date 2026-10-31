@@ -113,10 +113,9 @@ when it does.
   range; the mask path runs only otherwise. **Not yet:** a storage-wide mask on
   every access.
 - A runtime helper serves only runtime-indexed selects of storage above 256 bits,
-  where it costs less than the inline shift (it is flat at 180-310 instructions; the
-  inline form grows with the width). It works a 64-bit word at a time and receives
-  only the planes the destination needs. **Not yet:** it loops per bit, and all three
-  planes are always passed.
+  where it costs less than the inline shift (it is flat at 100-120 instructions for a
+  bit select; the inline form grows with the width). It works a 64-bit word at a time
+  and receives only the planes the destination needs.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.
 - An element access with an invalid index is guarded so only valid paths touch

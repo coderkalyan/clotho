@@ -281,28 +281,47 @@ void rt_bounds_report(const rt_bounds_site* site, int64_t index, int64_t extent,
 
 // Read (rt_wide_sel) or write (rt_wide_ins) the `n` bits at storage bit offset
 // `off` of a `width`-bit slot, clamped to the container [base, base+cwidth) the
-// select sits in. `four` selects the packed 4-state layout (must in bits [0,width),
-// may in [width,2*width) of `mm`, z a separate `width`-bit field); `has_z` says
-// whether the z field exists. `unknown` marks an x/z index, which 11.5.1 makes
-// wholly out of range: the read is all-x and the write a no-op. Bits outside the
-// container read x (2-state: 0) and are never written. The container is also
-// clamped to the vector [0, width): a nested select whose enclosing select is out
-// of range passes a container outside it, and no bit outside the slot is ever
-// read or written, whatever `base` and `off` are (both are i32 values).
+// select sits in. The planes a call has are told by its pointers: a non-null
+// `may` is the packed 4-state layout (must in bits [0,width), may in
+// [width,2*width) of `mm`), a null one a 2-state slot of `width` value bits; a
+// non-null `z` is the slot's separate `width`-bit z field, a null one a slot
+// without it. `unknown` marks an x/z index, which 11.5.1 makes wholly out of
+// range: the read is all-x and the write a no-op. Bits outside the container read
+// x (2-state: 0) and are never written. The container is also clamped to the
+// vector [0, width): a nested select whose enclosing select is out of range
+// passes a container outside it, and no bit outside the slot is ever read or
+// written, whatever `base` and `off` are (both are any i64).
 //
 // The selection's own planes are little-endian word buffers of ceil(n/64) words,
 // matching the in-memory layout of an i(n), so the JIT spills / reloads them
-// directly. Storage planes are the same layout at `width` / 2*`width` bits.
+// directly; a plane the slot lacks has no buffer. Storage planes are the same
+// layout at `width` / 2*`width` bits.
 //
-// These index the containing 64-bit word rather than shifting the whole vector,
-// which is what keeps a dynamic select on a 65 Kbit vector from taking O(width^2)
-// JIT time (see the comment on the definitions).
-void rt_wide_sel(const void* mm, const void* z, uint32_t width, int64_t base, uint32_t cwidth,
-                 int64_t off, uint32_t n, uint32_t four, uint32_t has_z, uint32_t unknown,
-                 uint64_t* out_must, uint64_t* out_may, uint64_t* out_z);
-void rt_wide_ins(void* mm, void* z, uint32_t width, int64_t base, uint32_t cwidth, int64_t off,
-                 uint32_t n, uint32_t four, uint32_t has_z, uint32_t unknown,
-                 const uint64_t* must, const uint64_t* may, const uint64_t* z_bits);
+// These work one 64-bit word of the selection at a time instead of shifting the
+// whole vector, which is what keeps a dynamic select on a 65 Kbit vector from
+// taking O(width^2) JIT time (see the comment on the definitions).
+void rt_wide_sel(const void* mm,
+                 const void* z,
+                 uint32_t    width,
+                 int64_t     base,
+                 uint32_t    cwidth,
+                 int64_t     off,
+                 uint32_t    n,
+                 uint32_t    unknown,
+                 uint64_t*   out_must,
+                 uint64_t*   out_may,
+                 uint64_t*   out_z);
+void rt_wide_ins(void*           mm,
+                 void*           z,
+                 uint32_t        width,
+                 int64_t         base,
+                 uint32_t        cwidth,
+                 int64_t         off,
+                 uint32_t        n,
+                 uint32_t        unknown,
+                 const uint64_t* must,
+                 const uint64_t* may,
+                 const uint64_t* z_bits);
 
 // -- Multiply, divide and modulo of very wide integers --
 

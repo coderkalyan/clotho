@@ -2602,18 +2602,14 @@ Plane Backend::lower_load(const LValue& lv) {
 
 // The shared leading arguments of the two wide-select helpers, for the planes of
 // one `width`-bit slot: where they live, the container the selection clamps to,
-// the signed storage offset, the selected width, and the plane layout facts.
-// `zp` null means the slot has no z plane; `four` false means it is 2-state (`mmp`
-// is `width` value bits, not the packed must|may pair).
+// the signed storage offset, the selected width, and whether the index is invalid.
+// `zp` null means the slot has no z plane; whether it is 2-state is told by the
+// buffers the caller adds after these (no may buffer), not here.
 //
 // Taking the planes as parameters is what lets the NBA path stage into the shadow
 // slot -- and its dirty mask, a 2-state plane of the same width -- with the same
 // two calls the live store uses.
-std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv,
-                                                 llvm::Value*  mmp,
-                                                 llvm::Value*  zp,
-                                                 uint32_t      width,
-                                                 bool          four) {
+std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv, llvm::Value* mmp, llvm::Value* zp, uint32_t width) {
     auto* null = llvm::Constant::getNullValue(raw_ptr_ty());
     return { mmp,
              zp != nullptr ? zp : null,
@@ -2622,15 +2618,7 @@ std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv,
              b_.getInt32(lv.sel_cwidth),
              b_.CreateSExt(lv.bit_off, b_.getInt64Ty()),
              b_.getInt32(lv.width),
-             b_.getInt32(four ? 1 : 0),
-             b_.getInt32(zp != nullptr ? 1 : 0),
              b_.CreateZExt(lv.sel_unknown, b_.getInt32Ty()) };
-}
-
-// The live storage planes of a select lvalue.
-std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv) {
-    return wide_dyn_args(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width,
-                         lv.four_state);
 }
 
 // A selection plane's spill width: `n` rounded up to whole 64-bit words, which is
@@ -2645,15 +2633,19 @@ llvm::AllocaInst* Backend::sel_plane_buf(uint32_t n, const char* name) {
     return entry_alloca(int_ty(sel_buf_bits(n)), name);
 }
 
-// Read a runtime-offset selection out of very wide storage.
+// Read a runtime-offset selection out of very wide storage. The helper is handed a
+// buffer for each plane the slot has and none for the others: a 2-state slot reads
+// back one plane, a 4-state slot without a z field two.
 Plane Backend::wide_dyn_load(const LValue& lv) {
-    const uint32_t n  = lv.width;
-    auto*          bt = int_ty(sel_buf_bits(n));
-    auto*          om = sel_plane_buf(n, "wsel.must");
-    auto*          oy = sel_plane_buf(n, "wsel.may");
-    auto*          oz = sel_plane_buf(n, "wsel.z");
+    const uint32_t n    = lv.width;
+    auto*          bt   = int_ty(sel_buf_bits(n));
+    llvm::Value*   null = llvm::Constant::getNullValue(raw_ptr_ty());
+    auto*          om   = sel_plane_buf(n, "wsel.must");
+    llvm::Value*   oy   = lv.four_state ? sel_plane_buf(n, "wsel.may") : null;
+    llvm::Value*   oz   = lv.has_z ? sel_plane_buf(n, "wsel.z") : null;
 
-    std::vector<llvm::Value*> args = wide_dyn_args(lv);
+    std::vector<llvm::Value*> args =
+      wide_dyn_args(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width);
     args.push_back(om);
     args.push_back(oy);
     args.push_back(oz);
@@ -2663,8 +2655,8 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
     if (!lv.four_state) {
         return two_val(must);
     }
-    const Plane got = packed(must, cast(b_.CreateLoad(bt, oy), n, false),
-                             cast(b_.CreateLoad(bt, oz), n, false));
+    const Plane got =
+      packed(must, cast(b_.CreateLoad(bt, oy), n, false), lv.has_z ? cast(b_.CreateLoad(bt, oz), n, false) : zero(n));
     // What rt_wide_sel hands back is a value entering generated code.
     emit_encoding_check(got, true, cur_inst_);
     return got;
@@ -2673,15 +2665,16 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
 // Write a runtime-offset selection into one wide slot's planes: the runtime merges
 // the bits into the containing words and drops the ones outside the container, so
 // there is no read-modify-write of the whole vector here either. `four` / `zp`
-// describe the target planes (the live slot, or an NBA shadow of the same shape).
+// describe the target planes (the live slot, or an NBA shadow of the same shape),
+// and the runtime is handed only the planes of `rhs` they have.
 void Backend::wide_dyn_store_planes(const LValue& lv,
                                     llvm::Value*  mmp,
                                     llvm::Value*  zp,
                                     uint32_t      width,
                                     bool          four,
                                     Plane         rhs) {
-    const uint32_t n  = lv.width;
-    auto*          bt = int_ty(sel_buf_bits(n));
+    const uint32_t n    = lv.width;
+    auto*          null = llvm::Constant::getNullValue(raw_ptr_ty());
     // Spill each plane zero-extended to the buffer's word count.
     const auto spill = [&](llvm::Value* v, const char* name) -> llvm::Value* {
         auto* buf = sel_plane_buf(n, name);
@@ -2691,19 +2684,10 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
 
     // The value crosses into the runtime here, whichever store brought it.
     emit_encoding_check(rhs, four, cur_inst_);
-    std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width, four);
-    if (!four) {
-        auto* zbuf = sel_plane_buf(n, "wins.zero");
-        b_.CreateStore(llvm::ConstantInt::get(bt, 0), zbuf);
-        args.push_back(spill(must_of(rhs, false), "wins.must"));
-        args.push_back(zbuf);
-        args.push_back(zbuf);
-    } else {
-        const Plane f = rhs;
-        args.push_back(spill(must_of(f, true), "wins.must"));
-        args.push_back(spill(may_of(f, true), "wins.may"));
-        args.push_back(spill(f.z != nullptr ? f.z : zero(n), "wins.z"));
-    }
+    std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width);
+    args.push_back(spill(must_of(rhs, four), "wins.must"));
+    args.push_back(four ? spill(may_of(rhs, true), "wins.may") : null);
+    args.push_back(zp != nullptr ? spill(rhs.z != nullptr ? rhs.z : zero(n), "wins.z") : null);
     b_.CreateCall(wide_ins_fn(), args);
 }
 
