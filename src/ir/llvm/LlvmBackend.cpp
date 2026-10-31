@@ -6,6 +6,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 
 #include "ir/Verify.h"
+#include "ir/llvm/RuntimeBitcode.h"
 
 namespace clotho::ir {
 
@@ -139,6 +140,13 @@ void clamp_unproven_align(llvm::Module& m) {
 // string is rejected. Exposed (not file-local) so Jit.cpp can run it per
 // module after a bitcode context migration (parallel compilation).
 bool optimize_module(llvm::Module& m, bool o3) {
+    // The runtime's own functions the module calls come in first, so the pipeline
+    // inlines them and folds what they are called with. A queue that is only pushed
+    // and popped inline can leave its descriptor, and the kernels it points at, with
+    // no reader, which tier 0 does not sweep on its own, so it ends with a global DCE
+    // exactly when something was linked.
+    const bool linked = link_runtime_bitcode(m);
+
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
     llvm::FunctionAnalysisManager fam;
@@ -158,10 +166,10 @@ bool optimize_module(llvm::Module& m, bool o3) {
         mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     }
     else if (auto err = pb.parsePassPipeline(mpm,
-                                        "coro-early,"
+                                        std::string("coro-early,"
                                         "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
                                         "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
-                                        "coro-cleanup")) {
+                                        "coro-cleanup") + (linked ? ",globaldce" : ""))) {
         llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
         return false;
     }

@@ -311,8 +311,9 @@ for scalars; arrays of handles get a runtime init loop like string arrays).
 - **Dynamic array**: `{ uint8_t* data; uint64_t len; }` (16 B). `len` inline ⇒
   `$size` / `foreach` bound needs no runtime call. Element access inline.
 - **Queue**: `{ uint8_t* base; uint64_t head; uint64_t len; uint64_t cap; }`
-  (32 B). `q[i]` inline via ring math; push/pop/insert/delete cross to the
-  runtime (may realloc/rebalance and write all four fields back).
+  (32 B). `q[i]` inline via ring math; push, pop, insert, delete and append run the
+  queue engine (§14), inlined into the design for push and pop and as one out-of-line
+  copy per element type for the rest. Growing the ring is the runtime's.
 - **Associative**: `{ void* impl; }` (opaque pointer to the ankerl map + its
   cached sorted index). Every op is a runtime call.
 
@@ -434,7 +435,10 @@ descriptor (stride + deinit/copy function pointers) threaded through every
 runtime function. This landed for dynarr/queue as `rt_elem_ops` (feat-compose);
 the POD path is the descriptor's trivial-copy fast case. Associative arrays
 reuse the same descriptor (§6), so managed-element assoc needs no new lifecycle
-machinery — only the assoc container itself.
+machinery — only the assoc container itself. A queue does not interpret the
+descriptor: it calls the `copy` and `destroy` kernels the backend generates into it
+(§14), and the dynamic and associative arrays still interpret it
+(`rt_elem_init` / `rt_elem_copy` / `rt_elem_deinit` in `runtime/Containers.cpp`).
 
 ## 10. NBA — landed for a queue, deferred for the rest
 
@@ -504,3 +508,66 @@ a `localparam` and comparing it with the runtime result.
 - Queue-bound overflow drop semantics vs iverilog (LRM 7.10.4).
 - `foreach` over an assoc binds the loop var to each key (LRM 7.9.4): the backend
   denormalizes each `first`/`next` result span into the key-typed loop var.
+
+## 14. The queue engine as linked bitcode
+
+A queue's element operations are written once, in `src/runtime/Queue.cpp`: push, pop,
+insert, delete and append a range over the ring of §4, plus the two calls they leave to
+the runtime, growing the ring (`rt_queue_grow`) and dropping a bounded queue's overflow
+(`rt_queue_drop_tail`). A design reaches them one of two ways that compute the same
+thing: it calls the runtime's build of the file, or it has the functions linked into its
+own LLVM module and optimized there. The second is the kernel decision (hot paths avoid
+the runtime, memory management calls it, `docs/design/kernel.md`): the descriptor each
+call passes is a constant, so the stride, the element kind and the call to the element's
+kernel fold away, and the ring arithmetic sits next to the code that uses it.
+
+**Build.** CMake compiles `Queue.cpp` with the clang that matches LLVM (as for the link
+kit, `executables.md`), with `-DCLOTHO_BITCODE_IMAGE`, and embeds the bitcode in clotho
+with `#embed`. The image has no globals and leaves only `rt_queue_grow` and
+`rt_queue_drop_tail` undefined (checked by `tests/queue_test.cpp`, on every platform CI
+builds). The flags are only what the file needs: whatever a distribution's clang adds by
+default arrives as function attributes and module flags, and the link step drops those.
+`CLOTHO_RT_BITCODE` is `AUTO`, `ON` or `OFF`. `AUTO` probes the compile at configure
+time and, when the toolchain cannot do it, builds clotho without the image: a design then
+calls the runtime's queue functions, which are the same code over the same kernels, so it
+is slower and nothing else. `ON` turns that into a configure error, and linux-x64 CI uses
+it, so a regression on the tested platform fails rather than degrades.
+
+**Link.** `optimize_module` calls `link_runtime_bitcode` before the pipeline. A module that
+declares none of the seven engine entry points is not touched and the image is not read.
+Otherwise the needed functions are linked lazily and internalized, their build attributes
+(CPU, stack protector, unwind table) and the module's named metadata removed so the
+inliner accepts them in functions that have none, and then:
+
+- push and pop are `alwaysinline`: one element, constant work, and every site gets it.
+  Out of line they keep most of the cost of the call (a loop of int push and pop runs in
+  0.46x the instructions of the runtime's own functions inlined, and 0.77x as a copy per
+  element type);
+- insert, delete and append_range loop over elements, so each is copied once per element
+  descriptor with the descriptor folded in (`CloneAndPruneFunctionInto`), once per stride
+  for plain bytes, and left `noinline`: the stride is then a constant in every loop and a
+  design with many sites or many element types pays for a few copies. It runs as fast as
+  inlining them at every site (the same instruction count at `-O`, 0.73x against 0.77x
+  at the default tier on insert and delete in the middle of an int queue) and compiles
+  faster: compile time follows the IR (about 34k host instructions per line through the
+  tier-0 pipeline), and a design with 56 queue element types in one module took 2.1x
+  what it does without the engine with insert and delete inlined at every site, 2.0x with
+  a copy per descriptor and 1.7x with the copies shared by stride;
+- `rt_queue_grow` and `rt_queue_drop_tail` stay calls into the runtime: allocation and
+  overflow are not the fast path, and leaving them out keeps what is inlined small.
+
+**Element kernels.** The engine does not interpret the element descriptor. For an
+element that owns heap, the backend generates the descriptor's `copy` (construct a copy
+of `src` in an uninitialized slot) and `destroy` (release what a slot owns) as functions,
+specialized from the descriptor itself (`ir/llvm/ElemKernels.cpp`), and stores them as
+constant pointers in it. After inlining the call through the pointer is a direct call, and
+a string element is a `memcpy` of the empty image and a call to `rt_string_assign`. A
+plain-bytes element has no kernels: the engine copies it with `memcpy`. A queue is only
+ever handed this form of the descriptor (`queue_elem_ops`), including by the runtime's
+own `rt_queue_assign` / `delete_all` / `move` and for the `inner` of a queue of queues,
+so there is one path. An aggregate with more than `kElemKernelLeavesUnrolledMax` heap
+leaves (`string tags[200]`) is walked by a loop over its leaf table, with one arm per
+distinct leaf type, so a kernel's size follows the number of leaf types, not of leaves.
+
+**Not yet.** Dynamic arrays, associative arrays and strings keep calling the runtime and
+its interpreter; the same mechanism is the way to move them (`docs/TODO.md`).

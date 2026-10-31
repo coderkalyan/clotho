@@ -1,15 +1,22 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <set>
+#include <span>
 #include <string>
 #include <string_view>
 
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
+#include "ir/llvm/RuntimeBitcode.h"
 
 using namespace clotho;
 
@@ -2122,4 +2129,285 @@ TEST_CASE("a signed narrow or very wide index into a queue is compared at its ow
         endmodule
     )";
     CHECK(run_capture(src) == "xx 00\n34 34\nxx 00\n32 32\n32 33\n");
+}
+
+// -- The runtime's queue engine as bitcode ---------------------------------------
+//
+// The rt_queue_* functions are linked into a design as bitcode when this build has it
+// (ir::runtime_bitcode_available): push and pop are inlined with the element
+// descriptor folded to constants, insert / delete / append_range are copied once per
+// descriptor and left out of line, and an element that owns heap is copied and
+// destroyed by kernels the backend generates, called directly. Without the bitcode a
+// design calls the runtime's own functions, which are the same code over the same
+// kernels, so these cases look at the IR both ways; what the queue computes is held
+// to the output main printed before the engine moved, on every element shape the
+// descriptor has.
+
+namespace {
+
+// How many times `needle` occurs in `text`.
+size_t count_of(const std::string& text, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+
+// Every element shape the descriptor has (plain bytes, 4-state, real, string, struct
+// with a string, a struct past the unrolled-kernel cap, nested container, event), on
+// a ring that wraps and a bound that truncates, and the whole-queue operations that
+// copy through the kernels (assign, to and from a dynamic array).
+constexpr std::string_view kShapesSource = R"(
+    typedef struct { int id; string name; } rec_t;
+    typedef struct { int id; string tags[20]; event ev[3]; int n; } big_t;
+    module m;
+        int   q[$], b[$:2], sl[$];
+        logic [20:0] w[$];
+        real  rq[$];
+        string s[$], s2[$], bs[$:1], sd[];
+        rec_t r[$];
+        big_t g[$], g2[$];
+        int   qq[$][$], inner[$];
+        event e[$];
+        event ev;
+        int    v;
+        string t;
+        rec_t  x;
+        big_t  bx;
+        initial begin
+            // Plain bytes: both ends, a wrapped ring, the middle.
+            for (int i = 0; i < 6; i++) begin q.push_back(i); q.push_front(100 + i); end
+            v = q.pop_front(); v = q.pop_back();
+            q.insert(3, 77); q.delete(1);
+            $display("q %0d %0d %0d %0d", q.size(), q[0], q[$], q[3]);
+            sl = q[1:3];
+            $display("slice %0d %0d %0d", sl.size(), sl[0], sl[$]);
+            // 4-state and real elements.
+            for (int i = 0; i < 5; i++) begin w.push_back(i); rq.push_front(i * 1.5); end
+            w.insert(2, 21'hx); w.delete(0);
+            $display("w %0d %h %h rq %0d %f", w.size(), w[0], w[1], rq.size(), rq[0]);
+            // A bound drops from the tail, whichever end pushed.
+            for (int i = 0; i < 5; i++) b.push_back(i);
+            b.push_front(9);
+            $display("b %0d %0d %0d %0d", b.size(), b[0], b[1], b[2]);
+            // Strings, long enough to live on the heap, bounded and not, copied whole.
+            for (int i = 0; i < 5; i++) s.push_back($sformatf("str-%0d-with-a-heap-tail-long-enough", i));
+            s.insert(2, "mid"); s.delete(0);
+            t = s.pop_front();
+            $display("s %0d %s %s %s", s.size(), t, s[0], s[$]);
+            for (int i = 0; i < 4; i++) bs.push_back($sformatf("bounded-%0d-heap-heap-heap-heap-heap-heap", i));
+            bs.push_front("front-element-that-lives-on-the-heap-too-long-string");
+            $display("bs %0d %s %s", bs.size(), bs[0], bs[1]);
+            s2 = s;
+            s2[0] = "changed-after-the-copy-so-it-must-not-reach-the-source";
+            sd = s2;
+            s = sd;
+            $display("s2 %0d %s s %s sd %0d", s2.size(), s2[0], s[0], sd.size());
+            // A struct with a string member.
+            for (int i = 0; i < 4; i++) begin
+                x.id = i; x.name = $sformatf("name-%0d-heap-heap-heap-heap-heap", i); r.push_back(x);
+            end
+            x.id = 9; x.name = "inserted"; r.insert(1, x); r.delete(0);
+            x = r.pop_back();
+            $display("r %0d %0d %s %s", r.size(), x.id, x.name, r[0].name);
+            // A struct with more heap leaves than a kernel unrolls: its leaf table is walked
+            // in a loop, string leaves and event leaves alike.
+            for (int i = 0; i < 3; i++) begin
+                bx.id = i; bx.n = 10 + i;
+                bx.tags[0]  = $sformatf("first-%0d-heap-heap-heap-heap-heap-heap", i);
+                bx.tags[19] = $sformatf("last-%0d-heap-heap-heap-heap-heap-heap", i);
+                g.push_back(bx);
+            end
+            bx.id = 7; g.insert(1, bx); g.delete(0);
+            g2 = g;
+            g2[0].tags[19] = "changed-after-the-copy";
+            bx = g.pop_back();
+            $display("g %0d %0d %0d %s %s g2 %0d %s %s", g.size(), bx.id, bx.n, bx.tags[0], bx.tags[19],
+                     g2.size(), g2[0].tags[19], g[0].tags[19]);
+            // Containers of containers.
+            for (int i = 0; i < 3; i++) begin inner.push_back(i); qq.push_back(inner); end
+            qq.insert(1, inner); qq.delete(0);
+            $display("qq %0d %0d %0d", qq.size(), qq[0].size(), qq[$].size());
+            // Events: a slot per push, one object across a copy.
+            e.push_back(ev); e.push_back(ev); e.insert(1, ev); e.delete(0);
+            $display("e %0d", e.size());
+            $finish;
+        end
+    endmodule
+)";
+
+} // namespace
+
+TEST_CASE("every queue element shape computes what it did before the engine was linked in") {
+    CHECK(run_capture(kShapesSource) ==
+          "q 10 104 4 101\n"
+          "slice 3 102 101\n"
+          "w 5 000001 xxxxxx rq 5 6.000000\n"
+          "b 3 9 0 1\n"
+          "s 4 str-1-with-a-heap-tail-long-enough mid str-4-with-a-heap-tail-long-enough\n"
+          "bs 2 front-element-that-lives-on-the-heap-too-long-string bounded-0-heap-heap-heap-heap-heap-heap\n"
+          "s2 4 changed-after-the-copy-so-it-must-not-reach-the-source s "
+          "changed-after-the-copy-so-it-must-not-reach-the-source sd 4\n"
+          "r 3 3 name-3-heap-heap-heap-heap-heap inserted\n"
+          "g 2 2 12 first-2-heap-heap-heap-heap-heap-heap last-2-heap-heap-heap-heap-heap-heap g2 3 "
+          "changed-after-the-copy last-2-heap-heap-heap-heap-heap-heap\n"
+          "qq 3 3 3\n"
+          "e 2\n");
+}
+
+TEST_CASE("push and pop are inlined and growing or truncating the ring is a call") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], b[$:2];
+            int v;
+            initial begin
+                q.push_back(1); q.push_front(2);
+                v = q.pop_back(); v = q.pop_front();
+                b.push_back(3);
+                $display("%0d", v);
+            end
+        endmodule
+    )";
+    const std::string ir = emit_ir(src);
+    if (ir::runtime_bitcode_available()) {
+        for (const char* name : { "@rt_queue_push_back", "@rt_queue_push_front", "@rt_queue_pop_back",
+                                  "@rt_queue_pop_front" }) {
+            CAPTURE(name);
+            CHECK(count_of(ir, name) == 0);
+        }
+        CHECK(count_of(ir, "call void @rt_queue_grow") >= 1);
+        // Only the bounded queue can overflow, so only it names the drop.
+        CHECK(count_of(ir, "call void @rt_queue_drop_tail") == 1);
+    } else {
+        CHECK(count_of(ir, "call void @rt_queue_push_back") >= 1);
+        CHECK(count_of(ir, "call void @rt_queue_pop_front") == 1);
+        CHECK(count_of(ir, "@rt_queue_grow") == 0);
+    }
+}
+
+TEST_CASE("insert and delete are one out-of-line copy per element type") {
+    constexpr std::string_view src = R"(
+        module m;
+            int          q[$];
+            logic [20:0] w[$];
+            initial begin
+                q.push_back(1); q.push_back(2); q.push_back(3);
+                q.insert(1, 4); q.insert(0, 5); q.delete(2); q.delete(0);
+                w.push_back(1); w.insert(0, 2); w.delete(1);
+                $display("%0d %0d", q.size(), w.size());
+            end
+        endmodule
+    )";
+    const std::string ir = emit_ir(src);
+    if (ir::runtime_bitcode_available()) {
+        // The generic functions are gone; each element type has its own copy, called
+        // from every site that names it.
+        CHECK(count_of(ir, "@rt_queue_insert(") == 0);
+        CHECK(count_of(ir, "@rt_queue_delete_idx(") == 0);
+        CHECK(count_of(ir, "define internal void @rt_queue_insert.") == 2);
+        CHECK(count_of(ir, "define internal void @rt_queue_delete_idx.") == 2);
+        CHECK(count_of(ir, "call void @rt_queue_insert.") == 3);
+        CHECK(count_of(ir, "call void @rt_queue_delete_idx.") == 3);
+    } else {
+        CHECK(count_of(ir, "call void @rt_queue_insert(") == 3);
+        CHECK(count_of(ir, "call void @rt_queue_delete_idx(") == 3);
+    }
+}
+
+TEST_CASE("a string element is copied by a direct call to the string runtime") {
+    constexpr std::string_view src = R"(
+        module m;
+            string q[$];
+            string t;
+            initial begin
+                q.push_back("hello");
+                t = q.pop_front();
+                $display("%s", t);
+            end
+        endmodule
+    )";
+    const std::string ir = emit_ir(src);
+    CHECK(count_of(ir, "call void @rt_string_assign") >= 1);
+    if (ir::runtime_bitcode_available()) {
+        // The kernel came through the descriptor, a constant pointer, and was inlined
+        // where the push was: nothing is called through a pointer loaded from it.
+        CHECK(count_of(ir, "@rt_queue_push_back") == 0);
+        CHECK(count_of(ir, "call void %") == 0);
+    } else {
+        CHECK(count_of(ir, "call void @rt_queue_push_back") == 1);
+    }
+}
+
+TEST_CASE("a struct with many heap leaves is copied and destroyed by a loop over its leaves") {
+    // `string tags[200]` is 200 leaves of one type: a statement each would make the
+    // kernel as long as the element is wide.
+    constexpr std::string_view big = R"(
+        typedef struct { int id; string tags[200]; int n; } big_t;
+        module m;
+            big_t q[$];
+            big_t x;
+            initial begin
+                x.id = 1; x.tags[199] = "last-tag-that-is-long-enough-for-the-heap";
+                q.push_back(x);
+                q.delete(0);
+                $display("%0d", q.size());
+            end
+        endmodule
+    )";
+    constexpr std::string_view small = R"(
+        typedef struct { int id; string a; string b; } small_t;
+        module m;
+            small_t q[$];
+            small_t x;
+            initial begin
+                x.id = 1; x.a = "first-string-that-is-long-enough-for-the-heap";
+                q.push_back(x);
+                q.delete(0);
+                $display("%0d", q.size());
+            end
+        endmodule
+    )";
+    const std::string many = emit_ir(big);
+    CHECK(count_of(many, "leaf.head") >= 2);
+    // A few leaves are straight-line code.
+    CHECK(count_of(emit_ir(small), "leaf.head") == 0);
+}
+
+TEST_CASE("a design with no queue links no runtime bitcode") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a;
+            initial begin a = 1; $display("%0d", a); end
+        endmodule
+    )";
+    CHECK(count_of(emit_ir(src), "rt_queue_") == 0);
+}
+
+// What the image leaves undefined is what a design that links it has to resolve, in
+// a JIT against the runtime and in an executable against its libc: two functions the
+// runtime defines, and nothing else. A toolchain that adds a call of its own (a
+// fortified memcpy, a stack-protector failure handler) is found here, on that
+// platform, and not by a design that fails to link.
+TEST_CASE("the runtime bitcode calls nothing but the runtime's growth and drop functions") {
+    if (!ir::runtime_bitcode_available()) {
+        MESSAGE("this build has no runtime bitcode; designs call the runtime's queue functions");
+        return;
+    }
+    const std::span<const unsigned char> image = ir::runtime_bitcode_image();
+    llvm::LLVMContext                    context;
+    auto parsed = llvm::parseBitcodeFile(
+      llvm::MemoryBufferRef(llvm::StringRef(reinterpret_cast<const char*>(image.data()), image.size()), "image"),
+      context);
+    REQUIRE_MESSAGE(bool(parsed), "the embedded runtime bitcode does not parse");
+    const llvm::Module&   module = **parsed;
+    std::set<std::string> undefined;
+    for (const llvm::Function& f : module) {
+        if (f.isDeclaration() && !f.isIntrinsic()) {
+            undefined.insert(f.getName().str());
+        }
+    }
+    CHECK(undefined == std::set<std::string>{ "rt_queue_drop_tail", "rt_queue_grow" });
+    // No data of its own, so there is nothing for two copies of the engine to disagree about.
+    CHECK(module.global_empty());
 }

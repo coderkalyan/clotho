@@ -200,7 +200,9 @@ std::vector<uint32_t> Backend::elem_handle_offsets(Ref elem_type, const DynElem&
     return out;
 }
 
-// The constant rt_elem_ops descriptor for one element type, memoized.
+// What the rt_elem_ops descriptor for one element type says, as a constant: its
+// initializer, memoized. elem_ops_for makes the global the interpreting containers are
+// handed from it, and queue_elem_ops the one a queue is handed.
 //
 // Nested containers chain through `inner` (finite: type nesting is a DAG). An
 // aggregate element is kind 0 (POD) when every leaf is plain bytes -- memcpy
@@ -218,8 +220,8 @@ std::vector<uint32_t> Backend::elem_handle_offsets(Ref elem_type, const DynElem&
 //   string / event / other POD -> nhandles 0
 //
 // and, for an associative array, its key-handle offsets in `keyhandles`.
-llvm::Constant* Backend::elem_ops_for(Ref elem_type) {
-    if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(elem_type)); it != env_->elem_ops.end()) {
+llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
+    if (const auto it = env_->elem_ops_inits.find(static_cast<uint32_t>(elem_type)); it != env_->elem_ops_inits.end()) {
         return it->second;
     }
     const DynElem   e       = elem_desc(elem_type);
@@ -251,7 +253,7 @@ llvm::Constant* Backend::elem_ops_for(Ref elem_type) {
         if (et.kind == Type::Kind::Assoc) {
             key_handle_offs = assoc_key_handle_offsets(elem_type);
         }
-        inner = elem_ops_for(et.element);
+        inner = elem_ops_global(elem_type);
     } else if (e.is_agg && (has_heap_leaf(elem_type) || types::has_ctor_leaf(mod_.pool, elem_type))) {
         std::vector<llvm::Constant*> table;
         collect_elem_leaves(elem_type, 0, e.agg_ty, table);
@@ -270,22 +272,40 @@ llvm::Constant* Backend::elem_ops_for(Ref elem_type) {
     auto* proto = new llvm::GlobalVariable(env_->llmod, proto_ty, /*isConstant=*/true,
                                            llvm::GlobalValue::InternalLinkage,
                                            elem_proto_const(e), "clotho.elem.proto");
-    auto*       init     = llvm::ConstantStruct::get(
+    // No field is all-zero (the stride and the prototype are not), so this is a
+    // ConstantStruct and not an aggregate of zeroes.
+    auto* init = llvm::cast<llvm::ConstantStruct>(llvm::ConstantStruct::get(
       elem_ops_ty(),
       { b_.getInt32(kind), b_.getInt32(nleaves), b_.getInt64(dynarr_stride(e)), proto, inner,
         leaves, b_.getInt32(static_cast<uint32_t>(handle_offs.size())),
         b_.getInt32(static_cast<uint32_t>(key_handle_offs.size())),
         gc_offsets_global(handle_offs, "clotho.elem.handles"),
-        gc_offsets_global(key_handle_offs, "clotho.elem.keyhandles") });
+        gc_offsets_global(key_handle_offs, "clotho.elem.keyhandles"),
+        llvm::Constant::getNullValue(raw_ptr_ty()), llvm::Constant::getNullValue(raw_ptr_ty()) }));
+    env_->elem_ops_inits.emplace(static_cast<uint32_t>(elem_type), init);
+    return init;
+}
+
+// The descriptor the containers that interpret it are handed, memoized. A queue is
+// not one of them (queue_elem_ops).
+llvm::Constant* Backend::elem_ops_for(Ref elem_type) {
+    if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(elem_type)); it != env_->elem_ops.end()) {
+        return it->second;
+    }
     auto* gv = new llvm::GlobalVariable(env_->llmod, elem_ops_ty(), /*isConstant=*/true,
-                                        llvm::GlobalValue::InternalLinkage, init,
+                                        llvm::GlobalValue::InternalLinkage, elem_ops_init(elem_type),
                                         "clotho.elem.ops");
     env_->elem_ops.emplace(static_cast<uint32_t>(elem_type), gv);
     return gv;
 }
 
+// The descriptor a container's own functions are handed: the one that describes its
+// ELEMENT. A queue's is the kernel-bearing form (queue_elem_ops), because the
+// rt_queue_* functions copy and destroy a managed element through its kernels; the
+// other containers still interpret the plain descriptor.
 llvm::Constant* Backend::elem_ops_global(Ref container_type) {
-    return elem_ops_for(std::get<Type>(mod_.pool.get(container_type)).element);
+    const Ref element = std::get<Type>(mod_.pool.get(container_type)).element;
+    return is_queue_type(container_type) ? queue_elem_ops(element) : elem_ops_for(element);
 }
 
 Backend::SortDesc Backend::dynarr_sort_desc(Ref array_type) const {

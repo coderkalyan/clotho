@@ -73,7 +73,8 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
                                       const SimulationConfig&    config  = {},
                                       const LocResolver&         resolve = {});
 
-// Run Clotho's coroutine-lowering pipeline (Tier 0 or, under `o3`, LLVM's
+// Link the runtime bitcode a module calls into it (ir/llvm/RuntimeBitcode.h), then run
+// Clotho's coroutine-lowering pipeline (Tier 0 or, under `o3`, LLVM's
 // default<O3>) on one module in place. Returns false (reason on errs()) only
 // if the pipeline string is rejected; see build_modules for the call sequence
 // (optimize_module then re-verify).

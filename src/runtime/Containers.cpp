@@ -17,7 +17,9 @@ namespace {
 // Generic recursion over the element descriptor. POD short-circuits to raw
 // byte moves, so the descriptor adds no cost to the plane-scalar fast paths.
 // Internal to the runtime — the backend inlines the element ops at call sites
-// and never emits a call to these, so they carry no C linkage.
+// and never emits a call to these, so they carry no C linkage. A queue does not use
+// them for its own elements: it calls the descriptor's generated kernels, as
+// Queue.cpp does.
 
 void rt_elem_init(const rt_elem_ops* o, void* p) {
     if (o->kind == rt_elem_event) {
@@ -542,7 +544,11 @@ namespace {
 //
 // A queue is a growable ring buffer: `base` holds `cap` element slots, the `len`
 // live elements at physical positions (head + i) mod cap, computed by
-// rt_queue_slot. All indexing is via q_elem; growth linearises to head == 0.
+// rt_queue_slot. All indexing is via q_elem. The operations that change a queue
+// one element at a time (push, pop, insert, delete, append a range) and the ring's
+// growth live in Queue.cpp, which is also built as bitcode for the backend to link
+// into a design; what is here works on a whole queue. Both copy and destroy a
+// managed element through the descriptor's kernels (rt_elem_ops::copy / destroy).
 
 // Address of logical element `i` (0-based) in the ring. Requires cap > 0 and
 // i < cap.
@@ -550,162 +556,13 @@ uint8_t* q_elem(const rt_queue* h, uint64_t stride, uint64_t i) {
     return static_cast<uint8_t*>(h->base) + rt_queue_slot(h, i) * stride;
 }
 
-// Ensure capacity for at least `need` elements, relocating the live elements to
-// a contiguous head == 0 layout when a larger buffer is allocated. Geometric
-// growth keeps repeated push amortised O(1).
-void q_reserve(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site* site) {
-    if (need <= h->cap) {
-        return;
-    }
-    uint64_t newcap = h->cap < 4 ? 4 : h->cap * 2;
-    if (newcap < need) {
-        newcap = need;
-    }
-    auto* buf = static_cast<uint8_t*>(rt_alloc_elems_checked(newcap, stride, site, rt_diag_now()));
-    for (uint64_t i = 0; i < h->len; ++i) {
-        std::memcpy(buf + i * stride, q_elem(h, stride, i), static_cast<size_t>(stride));
-    }
-    std::free(h->base);
-    h->base = buf;
-    h->head = 0;
-    h->cap  = newcap;
-}
-
 } // namespace
-
-// Drop elements past the bounded-queue limit, destroying managed ones
-// (LRM 7.10.4: keep the first `bound + 1` elements; bound == 0 is unbounded).
-//
-// Truncation is always from the TAIL, so the two push directions lose different
-// elements when a full bounded queue overflows:
-//   - push_front puts the new element at logical 0, so what gets dropped is the
-//     old tail -- the end opposite the push.
-//   - push_back puts the new element at logical len, so what gets dropped is the
-//     element just pushed, and the push has no visible effect.
-// Both fall out of "keep the first bound + 1"; neither direction is special-
-// cased below. LRM 7.10.4 does not pin the choice (docs/LRM_NOTES.md, note 6).
-static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
-    if (bound == 0 || h->len <= bound + 1) {
-        return;
-    }
-    if (ops->kind != rt_elem_pod) {
-        for (uint64_t i = bound + 1; i < h->len; ++i) {
-            rt_elem_deinit(ops, q_elem(h, ops->stride, i));
-        }
-    }
-    h->len = bound + 1;
-}
-
-// Append one element at the tail WITHOUT touching the epoch. The bump is left to
-// the caller so that appending a whole range costs one epoch step instead of one
-// per element: rt_queue_push_back bumps once, rt_queue_append_range bumps once
-// for the range it appended.
-static void q_push_back_raw(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem,
-                            const rt_alloc_site* site) {
-    const uint64_t stride = ops->stride;
-    q_reserve(h, stride, h->len + 1, site);
-    void* slot = q_elem(h, stride, h->len);
-    if (ops->kind == rt_elem_pod) {
-        std::memcpy(slot, elem, static_cast<size_t>(stride));
-    } else {
-        rt_elem_init(ops, slot);
-        rt_elem_copy(ops, slot, elem, site);
-    }
-    h->len += 1;
-    q_apply_bound_ops(h, ops, bound);
-}
-
-extern "C" void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
-                                   const void* elem, const rt_alloc_site* site) {
-    q_push_back_raw(h, ops, bound, elem, site);
-    // Bumped even when the ring did not have to grow: `len` changed, so q[$]
-    // names a different element than it did before.
-    ++h->epoch;
-}
-
-extern "C" void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
-                                    const void* elem, const rt_alloc_site* site) {
-    const uint64_t stride = ops->stride;
-    q_reserve(h, stride, h->len + 1, site);
-    h->head = h->head == 0 ? h->cap - 1 : h->head - 1;
-    void* slot = q_elem(h, stride, 0);
-    if (ops->kind == rt_elem_pod) {
-        std::memcpy(slot, elem, static_cast<size_t>(stride));
-    } else {
-        rt_elem_init(ops, slot);
-        rt_elem_copy(ops, slot, elem, site);
-    }
-    h->len += 1;
-    q_apply_bound_ops(h, ops, bound);
-    // Every live element's logical index shifted up by one, so this reindexes
-    // the whole queue even when the ring did not move.
-    ++h->epoch;
-}
-
-extern "C" void rt_queue_pop_back(rt_queue* h, const rt_elem_ops* ops, void* out) {
-    if (h->len == 0) {
-        return;
-    }
-    // Relocation: the element's bytes (and heap ownership) move to `out`; the
-    // vacated slot is not destroyed.
-    h->len -= 1;
-    std::memcpy(out, q_elem(h, ops->stride, h->len), static_cast<size_t>(ops->stride));
-    ++h->epoch;
-}
-
-extern "C" void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* out) {
-    if (h->len == 0) {
-        return;
-    }
-    std::memcpy(out, q_elem(h, ops->stride, 0), static_cast<size_t>(ops->stride));
-    h->head = h->head + 1 == h->cap ? 0 : h->head + 1;
-    h->len -= 1;
-    ++h->epoch;
-}
-
-extern "C" void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i,
-                                const void* elem, const rt_alloc_site* site) {
-    if (i > h->len) {
-        return;
-    }
-    const uint64_t stride = ops->stride;
-    q_reserve(h, stride, h->len + 1, site);
-    // Shift [i, len) up by one to open a slot at i (relocation, raw memcpy).
-    for (uint64_t j = h->len; j > i; --j) {
-        std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j - 1), static_cast<size_t>(stride));
-    }
-    void* slot = q_elem(h, stride, i);
-    if (ops->kind == rt_elem_pod) {
-        std::memcpy(slot, elem, static_cast<size_t>(stride));
-    } else {
-        rt_elem_init(ops, slot);
-        rt_elem_copy(ops, slot, elem, site);
-    }
-    h->len += 1;
-    q_apply_bound_ops(h, ops, bound);
-    ++h->epoch;
-}
-
-extern "C" void rt_queue_delete_idx(rt_queue* h, const rt_elem_ops* ops, uint64_t i) {
-    if (i >= h->len) {
-        return;
-    }
-    const uint64_t stride = ops->stride;
-    if (ops->kind != rt_elem_pod) {
-        rt_elem_deinit(ops, q_elem(h, stride, i));
-    }
-    // Shift (i, len) down by one over the removed slot (relocation).
-    for (uint64_t j = i; j + 1 < h->len; ++j) {
-        std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j + 1), static_cast<size_t>(stride));
-    }
-    h->len -= 1;
-    ++h->epoch;
-}
 
 extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
     if (ops->kind != rt_elem_pod) {
+        assert(ops->destroy != nullptr && "a managed queue element has a destroy kernel");
         for (uint64_t i = 0; i < h->len; ++i) {
-            rt_elem_deinit(ops, q_elem(h, ops->stride, i));
+            ops->destroy(q_elem(h, ops->stride, i));
         }
     }
     std::free(h->base);
@@ -736,9 +593,9 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
             std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
         }
     } else {
+        assert(ops->copy != nullptr && "a managed queue element has a copy kernel");
         for (uint64_t i = 0; i < src->len; ++i) {
-            rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, q_elem(src, stride, i), site);
+            ops->copy(buf + i * stride, q_elem(src, stride, i), site);
         }
     }
     dst->base = buf;
@@ -768,9 +625,9 @@ extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
     if (!elem_managed(ops)) {
         std::memcpy(buf, sdata, static_cast<size_t>(src->len * stride));
     } else {
+        assert(ops->copy != nullptr && "a managed queue element has a copy kernel");
         for (uint64_t i = 0; i < src->len; ++i) {
-            rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, sdata + i * stride, site);
+            ops->copy(buf + i * stride, sdata + i * stride, site);
         }
     }
     dst->base = buf;
@@ -811,31 +668,6 @@ extern "C" void rt_dynarr_assign_queue(rt_dynarr* dst, const rt_queue* src,
     }
     dst->data = buf;
     dst->len  = src->len;
-}
-
-extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
-                                      const rt_elem_ops* ops, uint64_t bound, int64_t lo,
-                                      int64_t hi, const rt_alloc_site* site) {
-    if (src->len == 0) {
-        return;
-    }
-    const int64_t last = static_cast<int64_t>(src->len) - 1;
-    if (lo < 0) {
-        lo = 0;
-    }
-    if (hi > last) {
-        hi = last;
-    }
-    // Each source element is deep-copied through the shared push body (which
-    // deinit/copy-constructs a managed element). dst never aliases src, so
-    // growing dst cannot relocate src's buffer mid-loop. The raw form is used so
-    // the whole append advances the epoch once rather than once per element.
-    for (int64_t i = lo; i <= hi; ++i) {
-        q_push_back_raw(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)), site);
-    }
-    if (lo <= hi) {
-        ++dst->epoch;
-    }
 }
 
 // Render a queue / dynamic array as `%p` assignment-pattern text `'{e0, ...}`
