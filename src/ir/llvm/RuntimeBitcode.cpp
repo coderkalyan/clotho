@@ -58,9 +58,30 @@ bool is_engine_entry(std::string_view name) {
            std::ranges::any_of(kSpecialized, [&](const Specialized& s) { return s.name == name; });
 }
 
-bool declares_engine_function(const llvm::Module& m) {
-    for (const llvm::Function& f : m) {
-        if (f.isDeclaration() && is_engine_entry(f.getName())) {
+// The module's own name for the engine's copy of `name`. It is not the runtime's name:
+// a call that runs at most once keeps calling the runtime's function of that name, and
+// both can be in one module.
+std::string engine_copy_name(std::string_view name) {
+    return std::string(name) + ".engine";
+}
+
+// The calls of `f` that may run more than once, which is all of them that the backend
+// has not marked cold (Backend::queue_engine_call).
+std::vector<llvm::CallBase*> repeated_calls(llvm::Function& f) {
+    std::vector<llvm::CallBase*> calls;
+    for (llvm::User* user : f.users()) {
+        if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+            call != nullptr && call->getCalledFunction() == &f && !call->hasFnAttr(llvm::Attribute::Cold)) {
+            calls.push_back(call);
+        }
+    }
+    return calls;
+}
+
+// Whether the module calls an engine function from somewhere that may run more than once.
+bool has_repeated_engine_call(llvm::Module& m) {
+    for (llvm::Function& f : m) {
+        if (f.isDeclaration() && is_engine_entry(f.getName()) && !repeated_calls(f).empty()) {
             return true;
         }
     }
@@ -93,18 +114,40 @@ void strip_build_attributes(llvm::Function& f) {
     }
 }
 
-// Whether the bitcode defines a function the module only declares.
-bool defines_declared_function(const llvm::Module& src, const llvm::Module& m) {
-    for (const llvm::Function& f : src) {
-        if (f.isDeclaration()) {
-            continue;
-        }
-        const llvm::Function* d = m.getFunction(f.getName());
-        if (d != nullptr && d->isDeclaration()) {
-            return true;
+// Give the engine's copy of every engine function the bitcode defines a name of its own
+// (engine_copy_name), and point the calls that may run more than once at it, with a
+// declaration in `m` for the link to resolve. A call that runs at most once stays a
+// call of the runtime's function, which the bitcode no longer defines under that name,
+// so the link cannot resolve it either. Returns whether any call was pointed there.
+bool route_repeated_calls(llvm::Module& m, llvm::Module& src) {
+    for (llvm::Function& f : src) {
+        if (!f.isDeclaration() && is_engine_entry(f.getName())) {
+            f.setName(engine_copy_name(f.getName()));
         }
     }
-    return false;
+    std::vector<llvm::Function*> entries;
+    for (llvm::Function& f : m) {
+        if (f.isDeclaration() && is_engine_entry(f.getName())) {
+            entries.push_back(&f);
+        }
+    }
+    bool routed = false;
+    for (llvm::Function* runtime : entries) {
+        const std::string name = engine_copy_name(runtime->getName());
+        const std::vector<llvm::CallBase*> calls = repeated_calls(*runtime);
+        if (calls.empty() || src.getFunction(name) == nullptr) {
+            continue;
+        }
+        auto* copy = llvm::Function::Create(runtime->getFunctionType(), llvm::GlobalValue::ExternalLinkage, name, &m);
+        for (llvm::CallBase* call : calls) {
+            call->setCalledFunction(copy);
+        }
+        if (runtime->use_empty()) {
+            runtime->eraseFromParent();
+        }
+        routed = true;
+    }
+    return routed;
 }
 
 // `generic` with its descriptor parameter replaced by the constant `ops`, as a new
@@ -208,12 +251,12 @@ void specialize_on_descriptor(llvm::Function& generic, unsigned descriptor_param
 // What the engine functions linked into `m` are to become (header comment).
 void apply_inlining_policy(llvm::Module& m) {
     for (const std::string_view name : kInlined) {
-        if (llvm::Function* f = m.getFunction(name); f != nullptr && !f->isDeclaration()) {
+        if (llvm::Function* f = m.getFunction(engine_copy_name(name)); f != nullptr && !f->isDeclaration()) {
             f->addFnAttr(llvm::Attribute::AlwaysInline);
         }
     }
     for (const Specialized& s : kSpecialized) {
-        if (llvm::Function* f = m.getFunction(s.name); f != nullptr && !f->isDeclaration()) {
+        if (llvm::Function* f = m.getFunction(engine_copy_name(s.name)); f != nullptr && !f->isDeclaration()) {
             specialize_on_descriptor(*f, s.descriptor_param);
         }
     }
@@ -222,7 +265,7 @@ void apply_inlining_policy(llvm::Module& m) {
 } // namespace
 
 bool link_runtime_bitcode(llvm::Module& m) {
-    if (!declares_engine_function(m)) {
+    if (!has_repeated_engine_call(m)) {
         return false;
     }
     const std::span<const unsigned char> image = runtime_bitcode_image();
@@ -239,7 +282,7 @@ bool link_runtime_bitcode(llvm::Module& m) {
                                  llvm::toString(parsed.takeError()));
     }
     std::unique_ptr<llvm::Module> src = std::move(*parsed);
-    if (!defines_declared_function(*src, m)) {
+    if (!route_repeated_calls(m, *src)) {
         return false;
     }
 

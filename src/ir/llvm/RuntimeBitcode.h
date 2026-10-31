@@ -21,7 +21,7 @@ inline bool runtime_bitcode_available() {
     return !runtime_bitcode_image().empty();
 }
 
-// Link into `m` the engine functions it declares, as internal functions, so the
+// Link into `m` the engine functions it calls, as internal functions, so the
 // optimizer sees them with the element descriptor each call passes as a constant:
 //
 //   - push and pop are marked always-inline, so every call site gets the ring
@@ -34,10 +34,15 @@ inline bool runtime_bitcode_available() {
 //   - growing the ring and dropping a bounded queue's overflow stay calls into the
 //     runtime.
 //
-// Returns whether anything was linked. A module that calls none of them is not
-// touched, and does not even parse the image, and neither does a build without one.
-// An image that cannot be read or linked is a broken build, not bad input, so it
-// stops the process.
+// Only the calls that may run more than once are served. The backend marks a call cold
+// (Backend::queue_engine_call) when it is outside every loop of a process that starts
+// once and ends; it runs at most once, inlining or copying the engine there is compile
+// time that never pays for itself, and it stays a call of the runtime's function.
+//
+// Returns whether anything was linked. A module with no call that may run more than
+// once is not touched, and does not even parse the image, and neither does a build
+// without one. An image that cannot be read or linked is a broken build, not bad
+// input, so it stops the process.
 bool link_runtime_bitcode(llvm::Module& m);
 
 } // namespace clotho::ir
