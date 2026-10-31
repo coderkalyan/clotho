@@ -1930,7 +1930,7 @@ struct Inst {
         EventTriggered,
         // Nonblocking trigger of a named event `->> e` (payload: unary -> the event
         // handle). Unlike EventTrigger, the wake is deferred to the NBA region of
-        // the current time step (LRM 15.5.4): it links the object onto the pending
+        // the current time step (LRM 15.5.1): it links the object onto the pending
         // chain; the NBA region then stamps the trigger time and wakes the waiters.
         // The triggering process does not block.
         EventTriggerNb,
@@ -1944,7 +1944,7 @@ struct Inst {
         // Delayed nonblocking trigger `->> #d e` (payload: binary -> l is the delay
         // in wheel ticks, r is the event HANDLE value). Schedules a detached wheel
         // timer carrying the handle that, on expiry, stamps the trigger time and
-        // wakes the event's waiters (LRM 15.5.4). The triggering process does not
+        // wakes the event's waiters (LRM 15.5.1). The triggering process does not
         // block. The event-controlled form (`->> @(x) e`) is not lowered here.
         EventTriggerNbDelayed,
         // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that

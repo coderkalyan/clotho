@@ -953,7 +953,7 @@ void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
             emit_intra_commit(sig);
         }
     }
-    // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
+    // Nonblocking event triggers (`->> e`, LRM 15.5.1): for each pending
     // event, stamp the trigger time and wake its Any-edge waiters, then
     // clear the flag. Done in the NBA region so the wake lands after this
     // instant's nonblocking updates; the caller's loop-back then drains the

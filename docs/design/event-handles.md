@@ -398,7 +398,7 @@ wheel thunk (`->> #d e`) — the three forms converge here, as they converge on
 Resolve the target to an `rt_event*` (§8), then `call @clotho.event_fire(obj, wheel)`.
 For a monomorphic target this inlines to today's code plus the list walk.
 
-### 7.2 `->> e` (nonblocking, LRM 15.5.4)
+### 7.2 `->> e` (nonblocking, LRM 15.5.1)
 
 Today the NBA region scans a compile-time set `nb_event_sigs_`
 (`ir/llvm/Stores.cpp, nba_classify_ir`), which a runtime-identified

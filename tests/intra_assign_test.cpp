@@ -2207,6 +2207,64 @@ TEST_CASE("updates released by one change keep the order of their statements") {
     }
 }
 
+// An edge control on a select or an expression of a signal is waited on through a net
+// the lowering synthesizes and drives with a continuous process (`event_signal`,
+// `synth_event_net`), which changes one step after the signal. Its records are released in
+// a separate, later moment than those of the signal's own controls, so its update is
+// created last and commits last whichever statement was executed first (docs/LRM_NOTES.md,
+// note 51). A direct reference to the signal, hierarchical or not, is the signal's own
+// control and shares its moment. A guard of what the documented rule says, not a claim the
+// LRM makes. Oracle: iverilog 13 prints the same on every subcase.
+TEST_CASE("an edge control on a select is a later moment than the signal's own") {
+    SUBCASE("a bit-select, either statement order") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] c = 0, w = 0, u = 0;
+                initial begin
+                    w <= @(posedge c[0]) 8'd10;
+                    w <= @(posedge c) 8'd20;
+                    u <= @(posedge c) 8'd20;
+                    u <= @(posedge c[0]) 8'd10;
+                    #1 c = 1;
+                    #1 $display("w=%0d u=%0d", w, u);
+                    $finish;
+                end
+            endmodule)") == "w=10 u=10\n");
+    }
+    SUBCASE("an operator expression and a struct member") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                typedef struct packed { logic [3:0] hi; logic [3:0] lo; } s_t;
+                logic [7:0] c = 0, w = 0, v = 0;
+                s_t s = 0;
+                initial begin
+                    w <= @(posedge (c & 8'h01)) 8'd10;
+                    w <= @(posedge c) 8'd20;
+                    v <= @(posedge s.lo[0]) 8'd10;
+                    v <= @(posedge s) 8'd20;
+                    #1 c = 1; s = 8'h01;
+                    #1 $display("w=%0d v=%0d", w, v);
+                    $finish;
+                end
+            endmodule)") == "w=10 v=10\n");
+    }
+    SUBCASE("a hierarchical name of the signal is its own control and shares the moment") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] c = 0, w = 0, x = 0;
+                initial begin
+                    w <= @(posedge m.c) 8'd10;
+                    w <= @(posedge c) 8'd20;
+                    x <= @(posedge c) 8'd10;
+                    x <= @(posedge m.c) 8'd20;
+                    #1 c = 1;
+                    #1 $display("w=%0d x=%0d", w, x);
+                    $finish;
+                end
+            endmodule)") == "w=20 x=20\n");
+    }
+}
+
 // A `<= #d` update is created when its delay elapses, at the start of the instant before any
 // process runs, so it precedes an event-controlled update released in that instant whichever
 // statement was executed first. (4.6 b) alone would order the first case by execution; the

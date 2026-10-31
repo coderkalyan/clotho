@@ -593,9 +593,21 @@ an update is created when its statement executes (a plain NBA, a zero delay), wh
 delay elapses (at the start of that instant, before any process runs) or when its event
 occurs, and updates are performed in the order they were created. Updates created at one
 moment, which is one wheel tick, one occurrence of an event (for a signal, one value
-change, however many edge controls it satisfies) or the leaves of one statement, are
-performed in the order their statements were executed. The events that `->>` triggers in
-the NBA region are such updates too, and trigger in the order the `->>` statements ran.
+change, however many of that signal's own edge controls it satisfies) or the leaves of one
+statement, are performed in the order their statements were executed. The events that `->>`
+triggers in the NBA region are such updates too, and trigger in the order the `->>`
+statements ran.
+
+A signal's own controls share a moment; a control on a select or an expression of it does
+not. `@(posedge c[0])`, a struct member, an array element or an operator expression is
+waited on through a net that Clotho synthesizes for it and drives with a continuous
+process (`event_signal`, `synth_event_net`; the wait engine detects edges on whole signals),
+and that net changes one step after the signal. Its records are released in a separate,
+later moment than those of `@(c)` and `@(posedge c)`, so `w <= @(posedge c[0]) 10;
+w <= @(posedge c) 20; c = 1;` ends with `w` 10 (the control on `c` released first, and
+the one on `c[0]` was created last), whichever statement was executed first, while
+`v <= @(posedge c) 10; v <= @(c) 20;` ends with `v` 20. The clauses do not say how soon
+an expression is noticed to have changed. iverilog 13 prints 10 for the first design too.
 
 So a plain NBA executed after a timed update was created wins over it, and one executed
 before commits before it. Both are decided by every reading. Two cases are not, and the
@@ -617,4 +629,4 @@ occurrence or a `#d` update is involved. Verilator 5.050 orders by source positi
 the `initial` blocks of the first case and its answer changes) and does not support
 `repeat (n) @e`. Neither decides, so the choice is Clotho's, made once.
 
-Code: `src/runtime/Scheduler.cpp` (`intra_ready_push`, `rt_intra_now`, `rt_intra_moment`), `src/ir/llvm/Events.cpp` (`emit_release_moment`, `emit_event_fire`, `emit_event_pend_drain`), `src/ir/llvm/Stores.cpp` (`emit_intra_nba_ordered`, `emit_nba_service`). Tests: `tests/intra_assign_test.cpp` ("a plain NBA executed before the event commits before the update", "event-controlled updates commit in the order their events occurred", "a delayed update precedes an event-controlled one released in its instant", "updates released by one change keep the order of their statements", "nonblocking event triggers occur in the order they executed"). Oracle: none that decides; iverilog 13 and Verilator 5.050 differ as above, and iverilog 13 does not implement `->>`.
+Code: `src/runtime/Scheduler.cpp` (`intra_ready_push`, `rt_intra_now`, `rt_intra_moment`), `src/ir/llvm/Events.cpp` (`emit_release_moment`, `emit_event_fire`, `emit_event_pend_drain`), `src/ir/llvm/Stores.cpp` (`emit_intra_nba_ordered`, `emit_nba_service`), `src/lower/Timing.cpp` (`event_signal`, `synth_event_net`). Tests: `tests/intra_assign_test.cpp` ("a plain NBA executed before the event commits before the update", "event-controlled updates commit in the order their events occurred", "a delayed update precedes an event-controlled one released in its instant", "updates released by one change keep the order of their statements", "an edge control on a select is a later moment than the signal's own", "nonblocking event triggers occur in the order they executed"). Oracle: none that decides; iverilog 13 and Verilator 5.050 differ as above, and iverilog 13 does not implement `->>`.

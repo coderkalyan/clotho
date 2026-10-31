@@ -167,7 +167,7 @@ not expected new logic.
 
 ## Tier 2 — `->>` nonblocking trigger + general `wait` (landed)
 
-**`->> e` (nonblocking, no delay), LRM 15.5.4.** A distinct IR op
+**`->> e` (nonblocking, no delay), LRM 15.5.1.** A distinct IR op
 `EventTriggerNb` marks the event pending (an i8 `clotho.event_pending.<name>`)
 instead of waking now. The NBA region — after committing this instant's
 nonblocking updates — scans the events that are `->>` targets

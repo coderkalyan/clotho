@@ -405,7 +405,7 @@ llvm::StructType* Backend::wait_elem_ty() {
 //               VCD registers a raw pointer to the tick at $dumpvars time, so
 //               the object address and the tick address must coincide.
 //     waiters — head of the intrusive waiter list (event_node_ty), or null.
-//     pending — a `->> e` awaiting the NBA region (LRM 15.5.4).
+//     pending — a `->> e` awaiting the NBA region (LRM 15.5.1).
 //
 // An event owns a LIST rather than the fixed-capacity per-(signal, edge)
 // buckets a real signal uses, because a trigger has no value transition and
@@ -1417,7 +1417,7 @@ llvm::Function* Backend::event_delay_thunk() {
     return sym(event_delay_thunk_);
 }
 
-// Link an event object onto the NBA pending chain (LRM 15.5.4), unless it is
+// Link an event object onto the NBA pending chain (LRM 15.5.1), unless it is
 // already on it. The chain replaces the old compile-time list of `->>` target
 // signals, which a handle-reached event could not join; it also means the NBA
 // region visits exactly the events that fired rather than every `->>` target in

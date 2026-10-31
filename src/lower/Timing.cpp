@@ -938,7 +938,7 @@ uint32_t Lowerer::repeat_count_const(const Expression& e) {
     return static_cast<uint32_t>(*n);
 }
 
-// Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
+// Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.1).
 void Lowerer::lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
     if (ev.timing != nullptr) {
         // Only `->>` carries a timing control (grammar), so a delayed trigger

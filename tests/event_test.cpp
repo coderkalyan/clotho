@@ -277,7 +277,7 @@ TEST_CASE("wait(<level-expr>) blocks until the condition holds") {
     CHECK(out.find("reached at t=8") != std::string::npos);
 }
 
-// `->> e` (LRM 15.5.4) defers the wake to the NBA region: a blocking `-> e`
+// `->> e` (LRM 15.5.1) defers the wake to the NBA region: a blocking `-> e`
 // waiter wakes in the Active region and sees the pre-commit value, while a
 // nonblocking `->> e` waiter wakes after the NBA commit and sees the new value.
 // (iverilog implements neither `->>` nor `.triggered`; pinned to the LRM.)
@@ -301,7 +301,7 @@ TEST_CASE("->> e wakes in the NBA region, after nonblocking updates") {
     CHECK(out.find("nb=aa") != std::string::npos);
 }
 
-// `->> #d e` (LRM 15.5.4) is a nonblocking, *delayed* trigger: the process does
+// `->> #d e` (LRM 15.5.1) is a nonblocking, *delayed* trigger: the process does
 // not block, and the event fires `d` ticks later (unlike `#d -> e`, which sleeps
 // the process). iverilog implements no `->>`, so this is pinned to the LRM.
 TEST_CASE("->> #d e schedules a detached trigger without blocking") {
@@ -1792,7 +1792,7 @@ TEST_CASE("bare, parenthesized, this-qualified and other-object event property w
     CHECK(out.find("other woke at 5\n") != std::string::npos);
 }
 
-// `->>` triggers in the NBA region of the same time step (LRM 15.5.2), so the
+// `->>` triggers in the NBA region of the same time step (LRM 15.5.1), so the
 // waiter still wakes in that step. A queue element holding the property's
 // object (push_back copies the handle, LRM 15.5.5) parks on the same object.
 TEST_CASE("a nonblocking trigger wakes a bare event property wait in the same step") {

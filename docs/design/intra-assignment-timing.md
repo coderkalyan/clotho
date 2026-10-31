@@ -381,8 +381,21 @@ moment is
 
 - one wheel tick, for every `#d` update that elapses in it;
 - one occurrence of an event: one `-> e`, or for a signal one value change, however many
-  of its edge controls it satisfies (a 0 -> 1 releases `@(posedge c)` and `@(c)` together);
+  of that signal's own edge controls it satisfies (a 0 -> 1 releases `@(posedge c)` and
+  `@(c)` together);
 - one statement, for the leaves of a decomposed target.
+
+A control on a select or an expression of a signal is not one of that signal's own
+controls. `@(posedge c[0])`, a member, an array element or an operator expression cannot be
+watched directly -- the wait engine subscribes by whole-signal id and detects edges on its
+LSB -- so `event_signal` synthesizes a net for it, driven by a continuous process
+(`synth_event_net`, `lower/Timing.cpp`). That net changes one step after the signal, and
+its records are released in a separate, later moment than those of `@(c)` and
+`@(posedge c)`: `w <= @(posedge c[0]) 10; w <= @(posedge c) 20; c = 1;` ends with `w` 10
+whichever statement was executed first, because the update of the control on `c[0]` is
+created last. The clauses do not say how soon an expression is noticed to have changed;
+iverilog 13 also prints 10. A direct reference to the signal, including a hierarchical one,
+is the signal's own control and shares its moment.
 
 That is the only place the order of the arming statements survives, and it survives because
 the moment has no order of its own. It never reaches across moments: an update released by a
