@@ -1864,7 +1864,35 @@ private:
 
     ir::InstanceScope* scope_node(uint32_t id);
 
+    // The node of instance `id` in the tree of the top being lowered, or null when
+    // the instance is another top's.
+    ir::InstanceScope* find_node(uint32_t id);
+
     ir::Signal register_signal_in(ir::InstanceScope& node, ir::SignalInfo info);
+
+    // The instance a declaration belongs to, whoever lowers it first: where the
+    // storage it owns lives (a static local of a subroutine, a static class
+    // property) and what names it. LRM 13.3.1 and 13.4.2 give each instance of a
+    // module its own copy of a subroutine's statics, and 8.9 each class its own
+    // properties, so a body reached from another instance (`a.f()` from the
+    // parent) must not put them under the caller.
+    struct Home {
+        ir::InstanceScope* node = nullptr;
+        // The flat name prefix of the declaring scope: its instance's, then the
+        // generate blocks between.
+        std::string prefix;
+    };
+
+    // The home of a declaration made in `decl`; none for a declaration of no
+    // instance (a package's or `$unit`'s, which the globals Lowerer owns) and for
+    // one of another top's instances, which this Lowerer cannot reach (a
+    // hierarchical call across tops builds the callee's body under the caller's
+    // top, and its statics stay with the caller as they always have).
+    std::optional<Home> home_of(const Scope* decl);
+
+    // `register_signal` into the home's instance, or into the one being lowered
+    // without one.
+    ir::Signal register_declared_signal(const std::optional<Home>& home, ir::SignalInfo info);
 
     ir::Ref def_constant_ref(uint32_t width, bool one);
 
@@ -4905,6 +4933,34 @@ private:
         Restore<std::vector<OpenBlock>> blocks_;
         Restore<const Symbol*>          root_;
         Restore<uint32_t>               depth_;
+    };
+
+    // The PreInit segment of the instance that declares a static, while the
+    // lowering that declares it runs somewhere else. A subroutine body is built at
+    // its first call site, which can be in another instance (`a.f()`), and a static
+    // class property at its first access or at the end of the top; the open segment
+    // belongs to whoever is being lowered, so the declaration initializer would
+    // become code of that instance's unit and store into a neighbour's storage.
+    // While one of these is alive and `home` is not the instance being lowered,
+    // preinit_ is a segment of its own, which `commit` closes into a PreInit
+    // process of `home` -- ahead of the caller's open segment, so the initializer
+    // still runs before whatever first reads the static. Without `commit` (the
+    // lowering failed) the segment is dropped. Inactive, and the open segment kept,
+    // for a declaration of the instance being lowered and for one of no instance.
+    class HomePreInit {
+    public:
+        HomePreInit(Lowerer& l, const std::optional<Home>& home);
+        ~HomePreInit();
+        HomePreInit(const HomePreInit&)            = delete;
+        HomePreInit& operator=(const HomePreInit&) = delete;
+        void commit();
+
+    private:
+        Lowerer&                   l_;
+        uint32_t                   home_   = ir::Process::no_scope;
+        bool                       active_ = false;
+        // The caller's open segment, set aside while the home's is open.
+        std::optional<ir::Builder> saved_;
     };
 
     uint32_t fn_local(const ValueSymbol& vs);

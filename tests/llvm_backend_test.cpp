@@ -5232,6 +5232,70 @@ TEST_CASE("twin instances calling their own tasks and functions keep their stati
     )") == "top.a 1\ntop.a 2\ntop.a f 11\ntop.a f 12\ntop.b 10\ntop.b 20\ntop.b f 20\ntop.b f 30\n");
 }
 
+TEST_CASE("a subroutine its parent calls by hierarchical name keeps the statics of its own instance") {
+    // `a.bump` and `b.f` run in the parent's code but belong to the instances that
+    // declare them: each has its own `calls` / `fc` (LRM 13.3.1, 13.4.2), however
+    // the calls interleave, and neither lands in the parent.
+    CHECK(run_capture(R"(
+        module m (input logic clk);
+            task automatic bump(output int r);
+                static int calls = 0;
+                calls++;
+                r = calls;
+            endtask
+            function int f(int x);
+                static int fc = 0;
+                fc++;
+                return x + fc;
+            endfunction
+        endmodule
+        module top;
+            logic clk = 0;
+            m a (clk);
+            m b (clk);
+            initial begin
+                int r;
+                #1;
+                a.bump(r); $display("a.bump %0d", r);
+                a.bump(r); $display("a.bump %0d", r);
+                b.bump(r); $display("b.bump %0d", r);
+                $display("a.f %0d", a.f(10));
+                $display("a.f %0d", a.f(10));
+                $display("b.f %0d", b.f(10));
+                $finish;
+            end
+        endmodule
+    )") == "a.bump 1\na.bump 2\nb.bump 1\na.f 11\na.f 12\nb.f 11\n");
+}
+
+TEST_CASE("twin parents calling their own child's subroutine keep its statics and their initializers apart") {
+    // The child's static starts at its declared value in every instance, and each
+    // parent instance drives its own child's copy.
+    CHECK(run_capture(R"(
+        module m;
+            task automatic bump(output int r);
+                static int calls = 100;
+                calls++;
+                r = calls;
+            endtask
+        endmodule
+        module mid #(parameter int D = 1);
+            m c ();
+            initial begin
+                int r;
+                #D;
+                c.bump(r); $display("%m %0d", r);
+                c.bump(r); $display("%m %0d", r);
+            end
+        endmodule
+        module top;
+            mid #(.D(1)) x ();
+            mid #(.D(5)) y ();
+            initial #20 $finish;
+        endmodule
+    )") == "top.x 101\ntop.x 102\ntop.y 101\ntop.y 102\n");
+}
+
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     // Dispatch picks the body at run time, so the caller cannot know which override
     // it reaches. If one sibling took the fat form and another the narrow one, an

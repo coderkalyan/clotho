@@ -926,8 +926,11 @@ void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool forc
         // expression, so it needs no function frame; clear fn_ctx_ so a stray
         // non-constant reference fails loudly rather than mis-resolving to a
         // frame local.
-        const Restore<FnCtx*> no_frame(fn_ctx_, nullptr);
+        const Restore<FnCtx*>     no_frame(fn_ctx_, nullptr);
+        const std::optional<Home> home = home_of(vs.getParentScope());
+        HomePreInit               init(*this, home);
         lower_var_initializer(vs);
+        init.commit();
         return;
     }
     // An AUTOMATIC declaration is initialized on every entry to its block (LRM
@@ -1106,6 +1109,37 @@ void Lowerer::finalize_preinit(uint32_t scope) {
     }
     add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish(), .scope = scope });
     preinit_.reset();
+}
+
+Lowerer::HomePreInit::HomePreInit(Lowerer& l, const std::optional<Home>& home)
+  : l_(l) {
+    if (!home || home->node->id == l.cur_scope_id()) {
+        return;
+    }
+    home_   = home->node->id;
+    active_ = true;
+    if (l.preinit_) {
+        saved_.emplace(std::move(*l.preinit_));
+        l.preinit_.reset();
+    }
+}
+
+// The home's segment becomes its process, and the caller's segment is back before
+// anything else runs.
+void Lowerer::HomePreInit::commit() {
+    if (active_) {
+        l_.finalize_preinit(home_);
+    }
+}
+
+Lowerer::HomePreInit::~HomePreInit() {
+    if (!active_) {
+        return;
+    }
+    l_.preinit_.reset();
+    if (saved_) {
+        l_.preinit_.emplace(std::move(*saved_));
+    }
 }
 
 // for-loop. The initialization runs once in the enclosing region; the

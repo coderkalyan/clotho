@@ -312,7 +312,12 @@ unit, which is also what the no-IR-rewriting rule asks
      difference. On rocket-chip, 558 instances become 266 units with none
      split; the leaks below show up in constructs RTL like it does not use.
    - **2c, instance-independent bodies.** Remove the leaks below until no
-     specialization stays split.
+     specialization stays split. Landed: a subroutine's static locals and a
+     class's static properties belong to the instance whose body declares them
+     (`Lowerer::home_of`), whichever instance's code reaches them first
+     (`a.f()` from the parent), named under that instance; their declaration
+     initializers close into a PreInit process of it rather than of the
+     caller. A body reached across tops keeps them with the caller.
    - **2d, lower once.** The Lowerer lowers each specialization's canonical
      body only; per-instance lowering and the comparison go.
 3. **Backend per unit** (not on this branch; it is on `modular-ir`). Code is a function of (unit, inbound facts, config);
@@ -340,15 +345,14 @@ Each of these makes lowered IR depend on something outside the unit:
   instance's sampling state is its own; only a package variable's shadow is
   copied by a process of the top, which is never shared.
 - A top's own PreInit processes hold what is no child's: what Collect and
-  Classify append (constant-table seeds, a function static a continuous driver
-  reaches first) and what follows the walk (class statics, `$past` seeds). They
-  store into children's state by import; a root is never shared, so no
-  specialization splits on it, but the top's unit depends on its children's
-  internals. Every other declaration initializer is a PreInit process of the
-  instance that declares it, closed at each child boundary so the processes
-  run in elaboration order.
-- Function static locals and static class properties placed in the first
-  caller's scope.
+  Classify append (constant-table seeds, a function static of the instance
+  being lowered that a continuous driver reaches first) and what follows the
+  walk (the statics of the top's own classes, `$past` seeds). They store into
+  children's state by import; a root is never shared, so no specialization
+  splits on it, but the top's unit depends on its children's internals. Every
+  other declaration initializer is a PreInit process of the instance that
+  declares it, closed at each child boundary so the processes run in
+  elaboration order.
 - An instance's name in `%m` strings, severity banners, `$printtimescale` and
   covergroup instance names is read through `inst_path` (flat bridge: resolved
   from `Process::scope` / `Function::scope`; a covergroup takes it as an operand

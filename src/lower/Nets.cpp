@@ -740,14 +740,19 @@ ir::Signal Lowerer::alloc_slot_in(uint32_t scope, ir::Signal net, ir::SourceLoc 
 }
 
 // The node of instance `id` in the scope tree: an ancestor of the instance
-// being lowered in the common case, so the path is searched first.
-ir::InstanceScope* Lowerer::scope_node(uint32_t id) {
+// being lowered in the common case, so the path is searched first. Null for an
+// instance of another top, whose tree is not this Lowerer's.
+ir::InstanceScope* Lowerer::find_node(uint32_t id) {
     for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it) {
         if ((*it)->id == id) {
             return *it;
         }
     }
-    ir::InstanceScope* node = find_scope_node(top_scope_, id);
+    return find_scope_node(top_scope_, id);
+}
+
+ir::InstanceScope* Lowerer::scope_node(uint32_t id) {
+    ir::InstanceScope* node = find_node(id);
     if (node == nullptr) {
         fail("internal: an instance scope is missing from the scope tree");
     }

@@ -1651,18 +1651,22 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
 // A static-lifetime function local: it persists across calls (LRM 13.4.2), so
 // it gets persistent module-signal storage, initialized once at time zero —
 // not the per-call frame. Named with the function qualifier to avoid clashes.
+// It belongs to the instance that declares the subroutine, not to whichever
+// instance's code first calls it (`a.f()` from the parent): every instance has
+// its own copy (LRM 13.4.2), under its own name.
 ir::Signal Lowerer::declare_static_local(const ValueSymbol& vs) {
     const auto it = sigmap_.find(&vs);
     if (it != sigmap_.end()) {
         return it->second;
     }
-    ir::SignalInfo info;
-    info.name            = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
+    const std::optional<Home> home = home_of(vs.getParentScope());
+    ir::SignalInfo            info;
+    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(vs.name);
     info.loc             = to_source_loc(vs.location);
     info.type            = lower_type(vs.getType());
     info.is_event        = vs.getType().isEvent(); // see declare_local
     info.dir             = ir::SignalInfo::Direction::Internal;
-    const ir::Signal sig = register_signal(std::move(info));
+    const ir::Signal sig = register_declared_signal(home, std::move(info));
     sigmap_[&vs]         = sig;
 
     return sig;
@@ -1702,7 +1706,8 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
     }
     // The class's own rendering, which carries a specialization's arguments
     // (bind_class_type): each specialization has its own statics (LRM 8.25), and
-    // their signals need distinct names to be imported by name.
+    // their signals need distinct names to be imported by name. A class a module
+    // declares keeps its statics in that instance, whoever reaches them first.
     std::string cls;
     if (const slang::ast::Scope* sc = prop.getParentScope()) {
         const slang::ast::Symbol& owner = sc->asSymbol();
@@ -1710,20 +1715,22 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
                                                    : std::string(owner.name)) +
               "::";
     }
-    const ir::Ref  pty = lower_type(prop.getType());
-    ir::SignalInfo info;
-    info.name            = prefix_ + cls + std::string(prop.name);
+    const std::optional<Home> home = home_of(prop.getParentScope());
+    const ir::Ref             pty  = lower_type(prop.getType());
+    ir::SignalInfo            info;
+    info.name            = (home ? home->prefix : prefix_) + cls + std::string(prop.name);
     info.loc             = to_source_loc(prop.location);
     info.type            = pty;
     info.is_event        = prop.getType().isEvent(); // see declare_local
     info.dir             = ir::SignalInfo::Direction::Internal;
-    const ir::Signal sig = register_signal(std::move(info));
+    const ir::Signal sig = register_declared_signal(home, std::move(info));
     sigmap_[&prop]       = sig;
 
     // Queue the initializer once (this is the first-access path). LRM 8.9's own
     // example initializes a static property with `$fopen("data", "r")`, so this
     // is not restricted to constant expressions.
     if (const Expression* init = prop.getInitializer()) {
+        HomePreInit home_init(*this, home);
         if (!preinit_) {
             preinit_.emplace(module_);
         }
@@ -1759,6 +1766,7 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
             const ir::Index val = coerce(lower_expr(*init, pb), *init->type, pty, pb, il);
             pb.binary(ir::Inst::Tag::Store, dst, val, il);
         }
+        home_init.commit();
     }
     return sig;
 }

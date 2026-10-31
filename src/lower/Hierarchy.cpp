@@ -217,6 +217,34 @@ const UnitOwners::Entry& Lowerer::owner_in(const Scope* scope) const {
     return glue;
 }
 
+std::optional<Lowerer::Home> Lowerer::home_of(const Scope* decl) {
+    const Scope* body = enclosing_instance_scope(decl);
+    if (body == nullptr || body->asSymbol().kind != SymbolKind::InstanceBody) {
+        return std::nullopt;
+    }
+    const ir::Owner owner = owner_in(body).owner;
+    if (owner.kind != ir::Owner::Kind::Scope) {
+        return std::nullopt;
+    }
+    ir::InstanceScope* node = find_node(owner.index);
+    if (node == nullptr) {
+        return std::nullopt;
+    }
+    std::string prefix = scope_prefix_.at(owner.index);
+    if (const std::string blocks = generate_path(decl); !blocks.empty()) {
+        prefix.append(blocks, 1, std::string::npos);
+        prefix += '.';
+    }
+    return Home{ .node = node, .prefix = std::move(prefix) };
+}
+
+ir::Signal Lowerer::register_declared_signal(const std::optional<Home>& home, ir::SignalInfo info) {
+    if (home && home->node->id != cur_scope_id()) {
+        return register_signal_in(*home->node, std::move(info));
+    }
+    return register_signal(std::move(info));
+}
+
 std::string Lowerer::import_name(const Symbol& decl) const {
     const UnitOwners::Entry& e    = owner_in(decl.getParentScope());
     std::string              name = decl.getHierarchicalPath();

@@ -1552,11 +1552,12 @@ ir::Signal Lowerer::declare_static_return(const SubroutineSymbol& sub) {
     if (it != sigmap_.end()) {
         return it->second;
     }
-    ir::SignalInfo info;
-    info.name            = prefix_ + fn_ctx_->name_prefix + std::string(rv.name);
+    const std::optional<Home> home = home_of(sub.getParentScope());
+    ir::SignalInfo            info;
+    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(rv.name);
     info.type            = lower_type(rv.getType());
     info.dir             = ir::SignalInfo::Direction::Internal;
-    const ir::Signal sig = register_signal(std::move(info));
+    const ir::Signal sig = register_declared_signal(home, std::move(info));
     sigmap_[&rv]         = sig;
 
     return sig;
