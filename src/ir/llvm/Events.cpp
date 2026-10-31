@@ -478,7 +478,7 @@ llvm::Value* Backend::event_obj_of(llvm::Value* handle) {
 }
 
 // The 64-bit handle currently stored in an event variable's own signal slot.
-// An event signal is a narrow 2-state 64-bit plane, so this is a single load of
+// An event signal is a 2-state 64-bit plane, so this is a single load of
 // field 0 of its slot.
 llvm::Value* Backend::load_event_handle(Signal sig) {
     return b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(slot_of(sig).slot_ty,
@@ -856,10 +856,10 @@ llvm::Value* Backend::load_mm(Signal sig) {
 // signal for a plain target, or one element for an unpacked-array element.
 // Used to snapshot old / new state around a blocking store so wait-queue
 // servicing detects an element-level change, not just element 0.
-// Bit width of a slot's stored value word: iW for a narrow 2-state slot, the
-// packed i(2W) otherwise.
+// Bit width of a slot's stored value word: iW for a 2-state slot, the packed
+// i(2W) of a 4-state one.
 uint32_t Backend::slot_mm_bits(const LValue& lv) const {
-    return lv.narrow ? lv.store_width : 2 * lv.store_width;
+    return lv.four_state ? 2 * lv.store_width : lv.store_width;
 }
 
 llvm::Value* Backend::load_lv_mm(const LValue& lv) {
@@ -1044,14 +1044,14 @@ std::optional<Backend::WideWindow> Backend::wide_window_snapshot(const LValue& l
     const uint32_t W     = lv.store_width;
     const uint32_t K     = ((lv.width + 62) >> 6) + 1;
     const uint32_t nw    = (W + 63) / 64; // words of one W-bit plane
-    const uint32_t total = lv.narrow ? nw : (2 * W + 63) / 64;
+    const uint32_t total = lv.four_state ? (2 * W + 63) / 64 : nw;
     if (K > nw) {
         return std::nullopt;
     }
     WideWindow w;
     w.words     = K;
     w.width     = W;
-    w.four      = !lv.narrow;
+    w.four      = lv.four_state;
     w.need_any  = signal_has_bucket(lv.sig, Edge::Any);
     w.need_edge = signal_has_bucket(lv.sig, Edge::Positive) || signal_has_bucket(lv.sig, Edge::Negative);
 
@@ -1219,12 +1219,12 @@ void Backend::service_change_notify(const LValue& lv,
                                     llvm::Value*  new_z) {
     const ChangeNotify& cn   = *lv.chg;
     const auto          have = [&](Edge e) { return cn.field[static_cast<uint32_t>(e)] != kNoNotify; };
-    // `!narrow` is exactly "the mm word is the packed must|may pair", which is what
+    // `four_state` is "the mm word is the packed must|may pair", which is what
     // emit_edge_facts means by four_state (slot_mm_bits reads the same flag).
     const EdgeFacts                                    f         = emit_edge_facts(old_mm,
                                                                                    new_mm,
                                                                                    lv.store_width,
-                                                                                   !lv.narrow,
+                                                                                   lv.four_state,
                                                                                    old_z,
                                                                                    new_z,
                                                                                    have(Edge::Positive),

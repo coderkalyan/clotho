@@ -387,7 +387,7 @@ void Backend::emit_vcd_var(Signal sig) {
     }
     // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow,
     // real; the event bit is set on the branch above.
-    const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u)
+    const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (!s.four_state ? 4u : 0u)
                          | (s.is_real ? 8u : 0u);
     llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");
     llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));

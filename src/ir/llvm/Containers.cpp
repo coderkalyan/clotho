@@ -33,8 +33,7 @@ Backend::DynElem Backend::elem_desc(Ref elem_type) {
     e.width      = lay.width == 0 ? 1 : lay.width;
     e.four_state = lay.domain == Domain::Four;
     e.has_z      = e.four_state;
-    e.narrow     = !e.four_state; // 2-state / real element -> single iW slot
-    e.slot_ty    = slot_type(e.width, e.four_state, e.has_z, e.narrow);
+    e.slot_ty    = slot_type(e.width, e.four_state, e.has_z); // 2-state / real -> native iW
     return e;
 }
 
@@ -134,7 +133,7 @@ llvm::Constant* Backend::elem_proto_const(const DynElem& e) {
     if (e.is_handle) {
         return llvm::Constant::getNullValue(e.slot_ty);
     }
-    llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
+    llvm::Constant*              mm = e.four_state ? x_mm(e.width) : zero(e.width);
     std::vector<llvm::Constant*> fields{ mm };
     if (e.has_z) {
         fields.push_back(zero(e.width));
@@ -811,7 +810,7 @@ LValue Backend::elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
     lv.base        = ptr;
     lv.slot_ty     = e.slot_ty;
     lv.has_z       = e.has_z;
-    lv.narrow      = e.narrow;
+    lv.four_state  = e.four_state;
     lv.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     lv.elem_idx    = b_.getInt32(0);
     lv.store_width = e.width;
@@ -825,7 +824,7 @@ LValue Backend::elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
 // for 2-state / real), used to pre-fill a pop scratch so an empty-queue pop
 // yields the default.
 llvm::Constant* Backend::elem_default_const(const DynElem& e) {
-    llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
+    llvm::Constant*              mm = e.four_state ? x_mm(e.width) : zero(e.width);
     std::vector<llvm::Constant*> fields{ mm };
     if (e.has_z) {
         fields.push_back(zero(e.width));
@@ -1140,7 +1139,7 @@ LValue Backend::container_elem_lvalue(llvm::Value*   handle,
     el.base        = data;
     el.slot_ty     = e.slot_ty;
     el.has_z       = e.has_z;
-    el.narrow      = e.narrow;
+    el.four_state  = e.four_state;
     el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     el.elem_idx    = cast(phys, 32, false);
     el.store_width = e.width;
@@ -1163,7 +1162,7 @@ LValue Backend::tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value
     el.base        = data;
     el.slot_ty     = e.slot_ty;
     el.has_z       = e.has_z;
-    el.narrow      = e.narrow;
+    el.four_state  = e.four_state;
     el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     el.elem_idx    = cast(idx, 32, false);
     el.store_width = e.width;

@@ -310,12 +310,14 @@ struct LValue {
     llvm::Value* base = nullptr;
     // The leaf slot type `{ i(2W), iW }` of the addressed storage.
     llvm::StructType* slot_ty = nullptr;
-    // Whether the slot stores a z word (field 1). False for a never-z signal;
-    // loads then materialize a zero z plane and stores drop theirs.
+    // The domain of the addressed slot: a 4-state slot is `{ i(2W) must|may [, iW z] }`,
+    // a 2-state one the native `{ iW }`, whose loads yield a 2-state plane and whose
+    // stores write the iW value. It follows the IR type of the storage.
+    bool four_state = true;
+    // Whether the slot stores a z word (field 1): a 4-state slot the may-z analysis
+    // could not prove never-z. A never-z slot loads a zero z plane and its stores
+    // drop theirs.
     bool has_z = true;
-    // A genuine single-iW 2-state slot: the mm word is `iW`, not `i(2W)`, and
-    // there is no z word. Loads yield a two_val Plane; stores write the iW value.
-    bool narrow = false;
     // The `[N x slot]` storage type when `base` addresses a whole memory; null
     // for plain scalar storage.
     llvm::ArrayType* array_ty = nullptr;
@@ -443,8 +445,8 @@ struct LValue {
     // it fresh inside each resolution keeps every rt_keybuf_begin/append/span/end
     // call self-contained, so no span the backend hands to the runtime ever
     // outlives its one consuming call. `assoc_ops` is the value element's
-    // rt_elem_ops descriptor. The value element slot facts (slot_ty / has_z /
-    // narrow / width / store_width / bit_off / array_ty) are filled as for a dyn
+    // rt_elem_ops descriptor. The value element slot facts (slot_ty / four_state /
+    // has_z / width / store_width / bit_off / array_ty) are filled as for a dyn
     // element. A Load resolves via rt_assoc_get_ptr (absent -> element default); a
     // Store via rt_assoc_put_ptr.
     bool            is_assoc       = false;
@@ -587,7 +589,6 @@ struct AggLeaf {
     uint32_t              width      = 0;
     bool                  four_state = false;
     bool                  has_z      = false;
-    bool                  narrow     = false;
     bool                  is_string  = false;
     // Shadow-struct field indices for nonblocking staging (mm plane, and z plane
     // when has_z), assigned in build_state_layout when the aggregate is an NBA
@@ -608,16 +609,14 @@ struct SignalSlot {
     // GEP field indices from the root state struct to this signal's storage.
     std::vector<uint32_t> path;
     uint32_t width      = 0;
+    // The domain of the signal's type: a 2-state slot is the native `{ iW }`, a
+    // 4-state one packs must|may into `i(2W)`, with a z word unless proven never-z.
     bool     four_state = false;
-    // Whether the slot stores a z word: the signal may carry z (compute_may_z)
-    // or is a task out/inout target (the task ABI stores z through a pointer to
-    // it). A never-z slot is just `{ i(2W) }`.
+    // Whether the slot stores a z word: a 4-state signal that may carry z
+    // (compute_may_z), is passed by pointer (ptr_arg) or is reached through a
+    // virtual interface. A never-z 4-state slot is just `{ i(2W) }`; a 2-state
+    // slot never has one.
     bool has_z = true;
-    // A genuine single-iW 2-state slot (`{ iW }`): the packed must|may word is
-    // dropped. Set only for a 2-state signal proven decoupled from every path that
-    // still reads the packed form (ABI, NBA, arrays). Loads yield a two_val Plane;
-    // stores write the must plane as iW.
-    bool narrow = false;
     // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
     // has_z (undriven nets are a may-z seed).
     bool init_z = false;
@@ -820,10 +819,9 @@ struct Anchor {
 struct FrameSlot {
     llvm::StructType* slot_ty    = nullptr;
     uint32_t          width      = 0;
+    // Set for a 4-state local: `{ i(2W), iW }`. A 2-state one is the native
+    // single-iW slot (`{ iW }`), which the call ABI addresses and passes as it is.
     bool              four_state = false;
-    // A 2-state local, the native single-iW slot (`{ iW }`), which the call ABI
-    // addresses and passes as it is.
-    bool narrow = false;
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
     bool is_string = false;
@@ -973,7 +971,7 @@ private:
 
     // -- State types --
 
-    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z, bool narrow = false);
+    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z);
 
     llvm::StructType* str_slot_ty();
 
@@ -987,13 +985,12 @@ private:
 
     // Per-element slot facts for a dynamic array's element (a POD scalar in phase
     // 1). Mirrors the scalar-signal slot choice: 4-state keeps its z plane
-    // (`{ i2W, iW }`); 2-state and real take the narrow single-iW form.
+    // (`{ i2W, iW }`); 2-state and real take the native single-iW form.
     struct DynElem {
         llvm::StructType* slot_ty    = nullptr;
         uint32_t          width      = 0;
         bool              four_state = false;
         bool              has_z      = false;
-        bool              narrow     = false;
         // Managed element shapes: a string handle slot, or a nested container
         // (dynamic array / queue) handle slot. Width / domain fields are
         // meaningless for these.
@@ -1375,8 +1372,8 @@ private:
     llvm::GlobalVariable* shadow_base_gv();
 
     llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field);
-    llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
-                                       bool four_state, bool has_z);
+    llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
+                                       bool has_z);
 
     RefBinding ref_actual_arg(const LValue& raw);
 
@@ -2092,7 +2089,7 @@ private:
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
 
     void emit_nba_service(Signal sig, llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
-                          uint32_t width, bool narrow, llvm::Value* old_z, llvm::Value* new_z);
+                          uint32_t width, bool four_state, llvm::Value* old_z, llvm::Value* new_z);
 
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
@@ -2484,7 +2481,7 @@ private:
 
     llvm::Constant* scope_state_initializer(const Anchor& a);
 
-    llvm::Constant* const_leaf(llvm::StructType* slot_ty, uint32_t width, bool four_state, bool narrow,
+    llvm::Constant* const_leaf(llvm::StructType* slot_ty, uint32_t width, bool four_state,
                                bool has_z, std::span<const uint8_t> planes);
 
     llvm::Constant* const_slot(const SignalSlot& s, std::span<const uint8_t> planes);
@@ -2514,7 +2511,7 @@ private:
 
     void emit_array_convert_copy(llvm::Value* d_base, llvm::Value* s_base,
                                  llvm::StructType* d_slot, llvm::StructType* s_slot,
-                                 bool d_narrow, bool s_narrow, uint32_t leaf_width,
+                                 uint32_t leaf_width,
                                  uint32_t count, Signal dsig, bool service);
 
     void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base,
@@ -3774,8 +3771,8 @@ private:
     llvm::GlobalVariable* dpi_caller_proc_gv_ = nullptr; // ptr: calling thread's PCB
     llvm::GlobalVariable* dpi_caller_home_gv_ = nullptr; // i8: calling thread's home region
     llvm::GlobalVariable* dpi_caller_rng_gv_  = nullptr; // ptr: calling thread's RNG state
-    // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
-    std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
+    // Slot-type memo, one `{ iW }` / `{ i(2W)[, iW] }` per (width, domain, has_z).
+    std::vector<std::tuple<uint32_t, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).
     // Instances of one definition share the type; a same-named definition with
     // different fields (different parameterization) gets its own entry.

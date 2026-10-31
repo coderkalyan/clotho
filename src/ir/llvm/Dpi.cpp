@@ -113,8 +113,8 @@ void Backend::emit_dpi_oa_pack_ir(llvm::Value*      storage,
         aval       = b_.CreateAnd(may, b_.CreateNot(z));
         bval       = b_.CreateXor(must, may);
     } else {
-        // 2-state: the value is the low W bits of field 0 (narrow iW, or the must
-        // region of a non-narrow i2W) — mirrors the C pack_bit low-W read.
+        // 2-state: the value is the low W bits of field 0 (the native iW, or the
+        // must region of a 4-state i2W) — mirrors the C pack_bit low-W read.
         auto* raw = b_.CreateLoad(slot->getElementType(0), b_.CreateStructGEP(slot, slotptr, 0));
         aval      = b_.CreateZExtOrTrunc(raw, iW);
     }
@@ -258,7 +258,7 @@ llvm::Value* Backend::build_dpi_dynarray_desc(const LValue& lv, Ref arr_ref, Dpi
     const DynElem e            = dynarr_elem(arr_ref);
     const bool    named_scalar = elem_ct == DpiCType::Byte || elem_ct == DpiCType::Shortint ||
                               elem_ct == DpiCType::Int || elem_ct == DpiCType::Longint;
-    if (!named_scalar || !e.narrow) {
+    if (!named_scalar || e.four_state) {
         throw BackendError{ "DPI open-array over a dynamic array supports only "
                             "byte/shortint/int/longint (zero-copy) elements so far" };
     }
@@ -275,7 +275,7 @@ llvm::Value* Backend::build_dpi_dynarray_desc(const LValue& lv, Ref arr_ref, Dpi
 
 // Build the svOpenArrayHandle (rt_svopen*) for a DPI open-array argument
 // (LRM 35.5.6.2). Named-scalar (byte/shortint/int/longint) elements are zero-copy
-// — Clotho's narrow `[N x iW]` element storage is already a contiguous C array —
+// — Clotho's native `[N x iW]` element storage is already a contiguous C array —
 // so the descriptor points straight at the design array (the C reads and, for
 // output/inout, writes it directly). Packed bit/logic elements are marshalled in
 // inline LLVM IR into a contiguous svVecVal buffer: packed in for input/inout,
@@ -325,11 +325,11 @@ llvm::Value* Backend::build_dpi_open_array_desc(Index                       a,
         case DpiCType::Shortint:
         case DpiCType::Int:
         case DpiCType::Longint: {
-            // Zero-copy requires the narrow single-iW element slot (stride ==
-            // C element size). A never-narrow named scalar (its z word forced by
-            // a task out/inout use elsewhere) would not be C-layout — marshal it
-            // as a bit vector instead (the mm plane's low W bits are the value).
-            if (lv.narrow && stride == ew / 8) {
+            // Zero-copy requires the native single-iW element slot (stride ==
+            // C element size); a 4-state element would not be C-layout, so
+            // marshal it as a bit vector instead (the mm plane's low W bits are
+            // the value).
+            if (!lv.four_state && stride == ew / 8) {
                 // The C reads/writes the design array directly; an output/inout
                 // write lands in storage with no copy-back (and, per DPI, does not
                 // trigger wait/NBA scheduling on the array — a documented gap).

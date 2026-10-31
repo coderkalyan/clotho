@@ -485,7 +485,7 @@ void Backend::lower_inst(Index i) {
                 el.base          = dataptr;
                 el.slot_ty       = e.slot_ty;
                 el.has_z         = e.has_z;
-                el.narrow        = e.narrow;
+                el.four_state    = e.four_state;
                 el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
                 el.elem_idx      = cast(idx64, 32, false);
                 el.store_width   = e.width;
@@ -559,7 +559,7 @@ void Backend::lower_inst(Index i) {
                 el.base          = baseptr;
                 el.slot_ty       = e.slot_ty;
                 el.has_z         = e.has_z;
-                el.narrow        = e.narrow;
+                el.four_state    = e.four_state;
                 el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
                 el.elem_idx      = cast(phys, 32, false);
                 el.store_width   = e.width;
@@ -694,7 +694,7 @@ void Backend::lower_inst(Index i) {
             el.slot_ty     = e.slot_ty;
             el.handle_type = e.elem_type;
             el.has_z       = e.has_z;
-            el.narrow      = e.narrow;
+            el.four_state  = e.four_state;
             el.store_width = e.width;
             // A selection offset of zero, not a null one: a bit or part select
             // stacked on this deferred place ADDS to bit_off, and PartSelect's
@@ -743,7 +743,7 @@ void Backend::lower_inst(Index i) {
             el.slot_ty     = e.slot_ty;
             el.handle_type = e.elem_type;
             el.has_z       = e.has_z;
-            el.narrow      = e.narrow;
+            el.four_state  = e.four_state;
             el.store_width = e.width;
             // A selection offset of zero, not a null one: a bit or part select
             // stacked on this deferred place ADDS to bit_off, and PartSelect's
@@ -2518,8 +2518,8 @@ LValue Backend::signal_lvalue(Signal sig) {
     }
     return LValue{ .base        = storage_ptr(s),
                    .slot_ty     = s.slot_ty,
+                   .four_state  = s.four_state,
                    .has_z       = s.has_z,
-                   .narrow      = s.narrow,
                    .array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr,
                    .store_width = s.width,
                    .bit_off     = b_.getInt32(0),
@@ -2556,8 +2556,8 @@ LValue Backend::local_lvalue(uint32_t index) {
     }
     return LValue{ .base        = base,
                    .slot_ty     = s.slot_ty,
-                   .has_z       = !s.narrow,
-                   .narrow      = s.narrow,
+                   .four_state  = s.four_state,
+                   .has_z       = s.four_state,
                    .store_width = s.width,
                    .bit_off     = b_.getInt32(0),
                    .width       = s.width,
@@ -2576,8 +2576,8 @@ Plane Backend::lower_load(const LValue& lv) {
         return wide_dyn_load(lv);
     }
 
-    // Narrow 2-state slot: the stored word IS the iW value.
-    if (lv.narrow) {
+    // 2-state slot: the stored word IS the iW value.
+    if (!lv.four_state) {
         llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));
         if (selects_whole(lv)) {
             return two_val(v);
@@ -2650,7 +2650,7 @@ std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv,
 // The live storage planes of a select lvalue.
 std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv) {
     return wide_dyn_args(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width,
-                         !lv.narrow);
+                         lv.four_state);
 }
 
 // A selection plane's spill width: `n` rounded up to whole 64-bit words, which is
@@ -2680,7 +2680,7 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
     b_.CreateCall(wide_sel_fn(), args);
 
     llvm::Value* must = cast(b_.CreateLoad(bt, om), n, false);
-    if (lv.narrow) {
+    if (!lv.four_state) {
         return two_val(must);
     }
     return packed(must, cast(b_.CreateLoad(bt, oy), n, false),
@@ -2726,14 +2726,14 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
 // The live-storage form: what a blocking store to a wide dynamic select does.
 void Backend::wide_dyn_store(const LValue& lv, Plane rhs) {
     wide_dyn_store_planes(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width,
-                          !lv.narrow, rhs);
+                          lv.four_state, rhs);
 }
 
 // Bounds-checked load of a dynamic-array element (LRM 7.5.1): in range, load
 // from the heap buffer; out of range, yield the element default (X for
 // 4-state, 0 for 2-state). The heap is only dereferenced on the in-range
 // path, so an out-of-range or negative index never touches memory. Returns
-// the same Plane shape lower_load would (narrow -> two_val; else { i2W, iW }),
+// the same Plane shape lower_load would (2-state -> two_val; else { i2W, iW }),
 // so the caller's real / domain handling is unchanged.
 Plane Backend::dyn_elem_load(const LValue& lv) {
     auto* fn    = b_.GetInsertBlock()->getParent();
@@ -2754,7 +2754,7 @@ Plane Backend::dyn_elem_load(const LValue& lv) {
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(cont);
-    if (lv.narrow) {
+    if (!lv.four_state) {
         auto* phi = b_.CreatePHI(int_ty(lv.width), 2);
         phi->addIncoming(vin.mm, inend);
         phi->addIncoming(zero(lv.width), defbb);

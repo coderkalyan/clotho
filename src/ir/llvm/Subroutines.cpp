@@ -641,7 +641,7 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
 // the formal is 4-state. The temp is a whole cell of the formal's own type, so its
 // slot is the one its domain gives it.
 void Backend::push_scalar_out_arg(std::vector<llvm::Value*>& argv, const LValue& lv, bool four) {
-    assert(lv.narrow == !four && "an out / inout temp is the native slot of its domain");
+    assert(lv.four_state == four && "an out / inout temp is the native slot of its domain");
     argv.push_back(lv_mm_ptr(lv));
     if (four) {
         argv.push_back(lv_z_ptr(lv));
@@ -1061,9 +1061,8 @@ void Backend::build_frame_layout(const Function& f) {
         // type gets (agg_leaf_slot_ty), the one rule that makes both sides of an
         // alias agree without either side knowing the other (the actual is forced
         // to the same shape, see DesignFacts::ref_arg).
-        frame_slots_[i].narrow  = !frame_slots_[i].four_state;
         frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state,
-                                            frame_slots_[i].four_state, frame_slots_[i].narrow);
+                                            frame_slots_[i].four_state);
         fields[i]               = frame_slots_[i].slot_ty;
     }
     frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
@@ -1113,13 +1112,13 @@ void Backend::init_frame() {
             emit_gc_container_roots(GcRootOp::Add, s.ir_type, slot, s.slot_ty);
             continue;
         }
-        // A narrow 2-state local is a single iW field (comes up 0); a 4-state
-        // local is the packed word (X) plus a cleared z field.
-        if (s.narrow) {
+        // A 2-state local is a single iW field (comes up 0); a 4-state local is the
+        // packed word (X) plus a cleared z field.
+        if (!s.four_state) {
             b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 0));
             continue;
         }
-        llvm::Value*     mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
+        llvm::Value*     mm   = x_mm(s.width);
         b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
         b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
     }

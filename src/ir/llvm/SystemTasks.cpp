@@ -715,7 +715,7 @@ void Backend::lower_fgets(Index i) {
 
 // Resolve a whole packed-vector lvalue to (must|may plane ptr, z plane ptr, bit
 // width, runtime flags) for a string write-back ($fgets / $sformat / $ferror).
-// Flags bit0 marks a narrow 2-state slot, so the runtime writes only the iW
+// Flags bit0 marks a 2-state slot, so the runtime writes only the iW
 // value word. Part-select and non-byte-multiple targets loud-fail: the runtime
 // fills a whole byte-aligned vector. `who` names the caller.
 std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(Index dst, const char* who) {
@@ -741,7 +741,7 @@ std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(
     llvm::Value* mm = lv_mm_ptr(lv);
     llvm::Value* z =
       lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-    return { mm, z, lv.store_width, lv.narrow ? 1u : 0u };
+    return { mm, z, lv.store_width, !lv.four_state ? 1u : 0u };
 }
 
 Backend::FormatArg Backend::format_arg(Index i, Index fmt_value, ExtraIndex fmt, uint32_t fmt_len, TickScale scale) {
@@ -860,14 +860,14 @@ void Backend::lower_scanf(Index i) {
                 throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
             }
             // A never-z target (z elision) passes a null z pointer. Flags bit0
-            // marks a narrow 2-state slot: the runtime writes only the iW value
+            // marks a 2-state slot: the runtime writes only the iW value
             // word (parsed x/z digits drop to 0 per LRM 6.3.1).
             llvm::Value* mm = lv_mm_ptr(lv);
             llvm::Value* z  = lv.has_z ? lv_z_ptr(lv) : nul;
             b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
             b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
             b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
-            b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
+            b_.CreateStore(b_.getInt32(!lv.four_state ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
             b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 4));
             b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 5));
             olds[k] = service_snapshot(lv);
@@ -955,7 +955,7 @@ void Backend::lower_value_plusargs(Index i) {
     b_.CreateStore(mm, b_.CreateStructGEP(sty, arg, 0));
     b_.CreateStore(z, b_.CreateStructGEP(sty, arg, 1));
     b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, arg, 2));
-    b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
+    b_.CreateStore(b_.getInt32(!lv.four_state ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
 
     const ServiceSnapshot old = service_snapshot(lv);
     llvm::Value*           r   = b_.CreateCall(
@@ -998,7 +998,7 @@ void Backend::lower_fread_word(Index i) {
     if (lv.width != lv.store_width) {
         throw BackendError{ "$fread into a part-select target is not supported" };
     }
-    // A never-z target (z elision) passes a null z pointer; a narrow 2-state
+    // A never-z target (z elision) passes a null z pointer; a 2-state
     // slot sets flags bit2 so the runtime writes only the iW value word.
     llvm::Value* mm = lv_mm_ptr(lv);
     llvm::Value* z =
@@ -1006,7 +1006,7 @@ void Backend::lower_fread_word(Index i) {
     llvm::Value* fd = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
 
     const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
-    const uint32_t flags  = lv.narrow ? 4u : 0u;
+    const uint32_t flags  = !lv.four_state ? 4u : 0u;
     const ServiceSnapshot old = service_snapshot(lv);
     llvm::Value*   r      = b_.CreateCall(fread_fn(),
                                           { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
@@ -1043,7 +1043,7 @@ void Backend::lower_fread_mem(Index i) {
     const auto     i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
     llvm::Value*   start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
     llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
-    const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (s.narrow ? 4u : 0u);
+    const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (!s.four_state ? 4u : 0u);
 
     llvm::Value* r = b_.CreateCall(
       fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
@@ -1126,7 +1126,7 @@ void Backend::lower_readmem(Index i) {
 
     const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
                            (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
-                           (fname_is_str ? 16u : 0u) | (s.narrow ? 32u : 0u);
+                           (fname_is_str ? 16u : 0u) | (!s.four_state ? 32u : 0u);
 
     b_.CreateCall(readmem_fn(),
                   { path, path_len, mm_base, z_base, b_.getInt32(stride),

@@ -577,7 +577,7 @@ void Backend::emit_block_commit_body(uint32_t id) {
             continue;
         }
         const uint32_t    W       = s.width;
-        auto*             mmty     = int_ty(s.narrow ? W : 2 * W);
+        auto*             mmty     = int_ty(s.four_state ? 2 * W : W);
         auto*             zty      = int_ty(W);
         llvm::Value*      live     = storage_ptr(s);
         llvm::Value*      live_mm  = b_.CreateStructGEP(s.slot_ty, live, 0);
@@ -604,12 +604,12 @@ void Backend::emit_block_commit_body(uint32_t id) {
             llvm::Value* maskw = bs.dynamic
                                    ? static_cast<llvm::Value*>(b_.CreateLoad(zty, shadow_ptr(s, s.sh_mask_field)))
                                    : static_cast<llvm::Value*>(llvm::ConstantInt::get(zty, bs.mask));
-            // A narrow (iW) word masks directly; a packed (i2W) word replicates
+            // A 2-state (iW) word masks directly; a packed (i2W) word replicates
             // the W-bit mask into both must|may halves.
-            llvm::Value* mm_mask = s.narrow ? maskw
-                                            : b_.CreateOr(b_.CreateZExt(maskw, mmty),
-                                                          b_.CreateShl(b_.CreateZExt(maskw, mmty),
-                                                                       llvm::ConstantInt::get(mmty, W)));
+            llvm::Value* mm_mask = !s.four_state ? maskw
+                                                 : b_.CreateOr(b_.CreateZExt(maskw, mmty),
+                                                               b_.CreateShl(b_.CreateZExt(maskw, mmty),
+                                                                            llvm::ConstantInt::get(mmty, W)));
             llvm::Value* sh_mm_v = b_.CreateLoad(mmty, sh_mm);
             new_mm = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mm_mask)), b_.CreateAnd(sh_mm_v, mm_mask));
             b_.CreateStore(new_mm, live_mm);
@@ -626,7 +626,7 @@ void Backend::emit_block_commit_body(uint32_t id) {
         if (signal_has_waiters(bs.sig)) {
             llvm::Value* meta = b_.CreateInBoundsGEP(nba_meta_arr_ty_, sym(nba_meta_gv_),
                                                      { b_.getInt32(0), b_.getInt32(s.nba_id) });
-            emit_nba_service(bs.sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+            emit_nba_service(bs.sig, meta, old_mm, new_mm, W, s.four_state, old_z, new_z);
         }
         // Mark a dumped scalar target dirty in the VCD set (rt_vcd_touch ignores
         // the -1 index of a non-dumped signal). Commit is unconditional, so a
@@ -671,7 +671,7 @@ void Backend::emit_agg_commit(Signal sig, const llvm::APInt& mask) {
             continue;
         }
         const AggLeaf& m       = s.static_leaves[k];
-        auto*          mmty    = int_ty(m.narrow ? m.width : 2 * m.width);
+        auto*          mmty    = int_ty(m.four_state ? 2 * m.width : m.width);
         llvm::Value*   live_mm = agg_leaf_ptr(live, s.storage_ty, m.path, 0);
         llvm::Value*   old_mm  = b_.CreateLoad(mmty, live_mm);
         llvm::Value*   new_mm  = b_.CreateLoad(mmty, shadow_ptr(s, m.sh_mm_field));
@@ -763,19 +763,18 @@ void Backend::finalize_block_nba() {
 // per-edge queues are populated is not known at compile time here (the commit
 // loop is shared per bucket), so all three facts are computed. `width` is the
 // bucket's static width; old_z / new_z are null for a never-z bucket. A
-// narrow bucket's word is a single iW with no may plane, so it must take the
+// 2-state bucket's word is a single iW with no may plane, so it must take the
 // plain 0<->1 classifier — deriving `may` via LShr on the iW word would read
-// 0 and suppress every posedge. A packed 2-state target keeps must == may in
-// every stored word, so the 4-state classifier stays exact for it.
+// 0 and suppress every posedge.
 void Backend::emit_nba_service(Signal       sig,
                                llvm::Value* meta,
                                llvm::Value* old_mm,
                                llvm::Value* new_mm,
                                uint32_t     width,
-                               bool         narrow,
+                               bool         four_state,
                                llvm::Value* old_z,
                                llvm::Value* new_z) {
-    const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, /*four_state=*/!narrow, old_z,
+    const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, four_state, old_z,
                                         new_z, /*need_pos=*/true, /*need_neg=*/true,
                                         /*need_any=*/true);
     const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
@@ -989,7 +988,7 @@ llvm::StructType* Backend::intra_rec_ty(const SignalSlot& s) {
         }
         return llvm::StructType::get(ctx_, f);
     }
-    f.push_back(int_ty(s.narrow ? s.width : 2 * s.width));
+    f.push_back(int_ty(s.four_state ? 2 * s.width : s.width));
     if (s.has_z) {
         f.push_back(int_ty(s.width));
     }
@@ -1061,7 +1060,7 @@ uint32_t Backend::arr_idx(Signal sig) const {
 
 llvm::StructType* Backend::arr_rec_ty(const SignalSlot& s) {
     auto*                    ptr  = raw_ptr_ty();
-    std::vector<llvm::Type*> f    = { ptr, int_ty(s.narrow ? s.width : 2 * s.width) };
+    std::vector<llvm::Type*> f    = { ptr, int_ty(s.four_state ? 2 * s.width : s.width) };
     if (s.has_z) {
         f.push_back(ptr);
         f.push_back(int_ty(s.width));
@@ -1096,7 +1095,7 @@ uint32_t Backend::arr_rec_ctx(const SignalSlot& s) const {
 
 void Backend::lower_store(const LValue& lv, Plane rhs) {
     // A real RHS stores as its bit pattern; reals have no bit-selects, so
-    // a real store always takes a whole-storage path (narrow real slot:
+    // a real store always takes a whole-storage path (2-state real slot:
     // the single iW word below).
     if (rhs.fp != nullptr) {
         rhs = real_to_planes(fp_of(rhs));
@@ -1112,10 +1111,10 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     const uint32_t s_width = lv.store_width;
     llvm::Value*   mp      = lv_mm_ptr(lv);
 
-    // Narrow 2-state slot: store the single iW value (the must plane of a
-    // 4-state RHS drops any x/z to 0 per LRM 6.3.1; a 2-state RHS is the value
-    // itself). No z word.
-    if (lv.narrow) {
+    // 2-state slot: store the single iW value (the must plane of a 4-state RHS
+    // drops any x/z to 0 per LRM 6.3.1; a 2-state RHS is the value itself). No z
+    // word.
+    if (!lv.four_state) {
         llvm::Value* v = must_of(rhs);
         if (selects_whole(lv)) {
             b_.CreateStore(v, mp);
@@ -1173,7 +1172,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
     if (lv.is_agg) {
         const int      k = agg_static_leaf_index(s, lv.agg_field_path);
         const AggLeaf& m = s.static_leaves[static_cast<uint32_t>(k)];
-        if (m.narrow) {
+        if (!m.four_state) {
             b_.CreateStore(must_of(rhs), shadow_ptr(s, m.sh_mm_field));
         } else {
             assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -1194,7 +1193,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
     if (lv.wide_dyn) {
         wide_dyn_store_planes(lv, shadow_ptr(s, s.sh_mm_field),
                               s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr, s.width,
-                              !s.narrow, rhs);
+                              s.four_state, rhs);
         wide_dyn_stage_mask(lv, s);
         register_block_store(lv, s);
         return;
@@ -1202,8 +1201,8 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
 
     llvm::Value* mp = shadow_ptr(s, s.sh_mm_field);
 
-    // Narrow 2-state target: stage the single iW value into the iW shadow. No z.
-    if (s.narrow) {
+    // 2-state target: stage the single iW value into the iW shadow. No z.
+    if (!s.four_state) {
         llvm::Value* v = must_of(rhs);
         if (!s.nba_partial) {
             b_.CreateStore(v, mp);
@@ -1626,7 +1625,7 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 1), a1);
 
     // Byte offset of the leaf slot's z field (4-state leaves only).
-    const uint32_t zoff = (!lv.narrow && lv.has_z)
+    const uint32_t zoff = (lv.four_state && lv.has_z)
                             ? static_cast<uint32_t>(env_->llmod.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
                             : 0;
     // Write a plane value into the payload at the slot's field offset.
@@ -1638,7 +1637,7 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
     // The value, positioned at the leaf's bit offset (partial select), in slot
     // layout: mm plane at offset 0, z plane at zoff.
-    if (lv.narrow) {
+    if (!lv.four_state) {
         put(payload, place_val(lv, must_of(rhs), W), 0);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -1656,7 +1655,7 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     if (s.agg_masked) {
         llvm::Value* mask   = store_mask(lv, W);
         llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, 3);
-        if (lv.narrow) {
+        if (!lv.four_state) {
             put(mask_p, mask, 0);
         } else {
             put(mask_p, packed(mask, mask, zero(W)).mm, 0);
@@ -1772,7 +1771,7 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
     // all-ones and is elided (unmasked signals carry no mask field).
     llvm::Value* mask_w = s.arr_masked ? store_mask(lv, W) : nullptr;
     llvm::Value* mm_val;
-    if (s.narrow) {
+    if (!s.four_state) {
         mm_val = place_val(lv, must_of(rhs), W); // iW
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -1788,7 +1787,7 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
     b_.CreateAlignedStore(lv_mm_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
     b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 1), a1);
     if (s.has_z) {
-        // has_z implies a packed (non-narrow) element, so rhs is 4-state here.
+        // has_z implies a 4-state element, so rhs is 4-state here.
         b_.CreateAlignedStore(lv_z_ptr(lv), b_.CreateStructGEP(rt, rec, arr_rec_z_ptr(s)), a1);
         b_.CreateAlignedStore(place_val(lv, rhs.z, W), b_.CreateStructGEP(rt, rec, arr_rec_z_val(s)), a1);
     }
@@ -1821,15 +1820,15 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
 // of the fired instant commits the record (emit_intra_commit).
 // Pack a freshly-sampled intra-assignment RHS into the deferred record's mm
 // form for a whole-scalar target of slot `s`: a real rides as its IEEE-754 bit
-// pattern in the narrow slot, a narrow 2-state target as its must plane, and a
-// 4-state target as the packed must|may word. `rhs` may be widened in place
-// (to_four); z is stored by the caller under s.has_z (a real / narrow slot has
+// pattern in the native slot, a 2-state target as its value, and a 4-state
+// target as the packed must|may word. `rhs` is replaced in place by a real's bit
+// pattern; z is stored by the caller under s.has_z (a real / 2-state slot has
 // none). Shared by the delay (`<= #d`) and event (`<= @e`) arms.
 llvm::Value* Backend::intra_pack_mm(const SignalSlot& s, Plane& rhs) {
     if (rhs.fp != nullptr) {
         rhs = real_to_planes(fp_of(rhs));
     }
-    if (s.narrow) {
+    if (!s.four_state) {
         return must_of(rhs);
     }
     assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -1849,7 +1848,7 @@ llvm::Value* Backend::intra_pack_mm(const SignalSlot& s, Plane& rhs) {
 void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* rt, llvm::Value* rec) {
     const SignalSlot& s = slot_of(lv.sig);
     if (rhs.fp != nullptr) {
-        // A real rides as its IEEE-754 bit pattern in the narrow slot.
+        // A real rides as its IEEE-754 bit pattern in the native slot.
         rhs = real_to_planes(fp_of(rhs));
     }
     if (lv.wide_dyn) {
@@ -1873,7 +1872,7 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
     // dynamic select positions poison-free and restricts to the in-range bits
     // (LRM 11.5.1).
     llvm::Value* mm_val;
-    if (s.narrow) {
+    if (!s.four_state) {
         mm_val = place_val(lv, must_of(rhs), W);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -1884,7 +1883,7 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
     }
     b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
     if (s.has_z) {
-        // has_z implies a packed (non-narrow) target, so rhs is 4-state here.
+        // has_z implies a 4-state target, so rhs is 4-state here.
         b_.CreateAlignedStore(place_val(lv, rhs.z, W), b_.CreateStructGEP(rt, rec, 7), a1);
     }
     if (s.intra_masked) {
@@ -1930,7 +1929,7 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
 
     // Byte offset of the leaf slot's z field (4-state leaves only).
     const uint32_t zoff =
-      (!lv.narrow && lv.has_z)
+      (lv.four_state && lv.has_z)
         ? static_cast<uint32_t>(
             env_->llmod.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
         : 0;
@@ -1939,7 +1938,7 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
         b_.CreateAlignedStore(v, p, a1);
     };
     llvm::Value* payload = b_.CreateStructGEP(rt, rec, intra_agg_payload(s));
-    if (lv.narrow) {
+    if (!lv.four_state) {
         put(payload, place_val(lv, must_of(rhs), W), 0);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -1957,7 +1956,7 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
     if (s.intra_masked) {
         llvm::Value* mask   = store_mask(lv, W);
         llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, intra_agg_payload(s) + 1);
-        if (lv.narrow) {
+        if (!lv.four_state) {
             put(mask_p, mask, 0);
         } else {
             put(mask_p, packed(mask, mask, zero(W)).mm, 0);
@@ -2049,13 +2048,13 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      idxv   = intra_id_value(lv.sig);
     const uint32_t    W      = s.width;
-    auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
+    auto*             mmty   = int_ty(s.four_state ? 2 * W : W);
     auto*             zty    = int_ty(W);
 
     // Freshly-evaluated RHS planes for the decide compare below, unpositioned:
     // the record's own copy is filled (and positioned) by fill_intra_payload.
     llvm::Value* mm_val;
-    if (s.narrow) {
+    if (!s.four_state) {
         mm_val = must_of(rhs);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
@@ -2242,7 +2241,7 @@ void Backend::emit_intra_commit(Signal sig) {
     const uint32_t    W    = s.width;
     auto*             i32  = b_.getInt32Ty();
     auto*             ptr  = raw_ptr_ty();
-    auto*             mmty = int_ty(s.narrow ? W : 2 * W);
+    auto*             mmty = int_ty(s.four_state ? 2 * W : W);
     auto*             zty  = int_ty(W);
     auto*             rt   = intra_rec_ty(s);
     const llvm::Align a1{ 1 };
@@ -2311,10 +2310,10 @@ void Backend::emit_intra_commit(Signal sig) {
         // A partial write merges into the live word. The mask is one bit per
         // storage bit, so the packed must|may word needs it doubled.
         mask               = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, intra_rec_mask(s)), a1);
-        llvm::Value* mask2 = s.narrow ? mask
-                                      : b_.CreateOr(b_.CreateZExt(mask, mmty),
-                                                    b_.CreateShl(b_.CreateZExt(mask, mmty),
-                                                                 llvm::ConstantInt::get(mmty, W)));
+        llvm::Value* mask2 = !s.four_state ? mask
+                                           : b_.CreateOr(b_.CreateZExt(mask, mmty),
+                                                         b_.CreateShl(b_.CreateZExt(mask, mmty),
+                                                                      llvm::ConstantInt::get(mmty, W)));
         llvm::Value* old   = b_.CreateAlignedLoad(mmty, dst_mm, mm_al);
         b_.CreateAlignedStore(
           b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask2)), b_.CreateAnd(mm_val, mask2)), dst_mm,
@@ -2369,7 +2368,7 @@ void Backend::emit_intra_commit(Signal sig) {
             llvm::Value* new_z  = s.has_z ? b_.CreateAlignedLoad(zty, live_z, z_al) : nullptr;
             llvm::Value* meta   = b_.CreateInBoundsGEP(nba_meta_arr_ty_, sym(nba_meta_gv_),
                                                        { b_.getInt32(0), b_.getInt32(s.nba_id) });
-            emit_nba_service(sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+            emit_nba_service(sig, meta, old_mm, new_mm, W, s.four_state, old_z, new_z);
         }
         if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
             emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
@@ -2471,7 +2470,7 @@ void Backend::emit_array_commit(Signal sig, llvm::Value* state) {
     auto*             i32    = b_.getInt32Ty();
     auto*             ptr    = raw_ptr_ty();
     auto*             i8     = b_.getInt8Ty();
-    auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
+    auto*             mmty   = int_ty(s.four_state ? 2 * W : W);
     auto*             zty    = int_ty(W);
     auto*             rt     = arr_rec_ty(s);
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
@@ -2509,10 +2508,10 @@ void Backend::emit_array_commit(Signal sig, llvm::Value* state) {
     llvm::Value* mask   = nullptr;
     if (s.arr_masked) {
         mask = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, arr_rec_mask(s)), a1);
-        llvm::Value* mask2 = s.narrow ? mask
-                                      : b_.CreateOr(b_.CreateZExt(mask, mmty),
-                                                    b_.CreateShl(b_.CreateZExt(mask, mmty),
-                                                                 llvm::ConstantInt::get(mmty, W)));
+        llvm::Value* mask2 = !s.four_state ? mask
+                                           : b_.CreateOr(b_.CreateZExt(mask, mmty),
+                                                         b_.CreateShl(b_.CreateZExt(mask, mmty),
+                                                                      llvm::ConstantInt::get(mmty, W)));
         llvm::Value* old   = b_.CreateAlignedLoad(mmty, mm_ptr, mm_al);
         b_.CreateAlignedStore(
           b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask2)), b_.CreateAnd(mm_val, mask2)), mm_ptr, mm_al);
