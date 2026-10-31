@@ -101,8 +101,7 @@ when it does.
 ## Selects and stores
 
 - Constant indices are specialized in the backend: an in-range constant select
-  is the plain form, an out-of-range one is the default value or a no-op. **Not
-  yet:** one sequence for both, left to constant folding.
+  is the plain form, an out-of-range one is the default value or a no-op.
 - Constant selects touch only the 64-bit words they cover; part-select stores
   read and write only those words, plane by plane. **Not yet:** the whole slot.
 - Indices reach the backend as signed numbers of at least 64 bits, which the

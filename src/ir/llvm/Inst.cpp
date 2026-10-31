@@ -317,19 +317,20 @@ void Backend::lower_inst(Index i) {
                 throw BackendError{ "internal: string value in bit_select" };
             }
             // A bit-select is bounds-checked against its container (LRM
-            // 11.5.1): an out-of-range or x/z index reads x / writes nothing.
-            const Plane        idxp   = value_of(p.binary.r);
-            llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
-            const uint32_t     cwidth = lv.width;
-            llvm::Value*       idx    = select_index(idxp, type_of(p.binary.r));
+            // 11.5.1): an out-of-range or x/z index reads x / writes nothing. A
+            // constant index of a constant place is settled at compile time.
+            const Plane        idxp         = value_of(p.binary.r);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            const uint32_t     cwidth       = lv.width;
+            llvm::Value*       idx          = select_index(idxp, type_of(p.binary.r));
+            llvm::Value* const unknown      = any_unknown(p.binary.r);
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
             lv.width   = 1;
-            // A constant offset has no variable shift to legalize, so it stays inline on
-            // wide storage too; a base already on the runtime kernels keeps them.
-            const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
-            const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, 1, any_unknown(p.binary.r), constant_window);
-            add_select_bounds_check(lv, i, p.binary.r, sv, BoundsWhat::Bit, cwidth, 1);
+            std::optional<SelectVerdict> sv = resolve_constant_select(lv, cbase, cwidth, unknown);
+            if (!sv) {
+                sv = set_select_bounds(lv, cbase, cwidth, 1, unknown);
+            }
+            add_select_bounds_check(lv, i, p.binary.r, *sv, BoundsWhat::Bit, cwidth, 1);
             set_lvalue(i, lv);
             return;
         }
@@ -343,19 +344,20 @@ void Backend::lower_inst(Index i) {
             // A constant window that hangs over the vector it selects from (`v[11:8]`
             // of 8 bits, `v[1:-2]`, the element `a[5]` of `a[3:0]`) is out of range
             // in the bits outside it: they read x (0 for 2-state) and are not written
-            // (LRM 11.5.1). It takes the bounds machinery of a dynamic select; the
-            // window is a constant, so the mask folds and costs nothing at run time.
-            // `lsb` is the i32 the frontend wrapped into a uint32.
-            const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
-            if (first < 0 || first + lv.width > outer_width) {
-                // A base that already goes through the runtime kernels keeps them.
-                const bool constant_window = llvm::isa<llvm::ConstantInt>(cbase) && !lv.wide_dyn;
-                set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse(), constant_window);
-            } else if (lv.range_mask != nullptr && lv.width != outer_width) {
-                // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
-                // the inherited mask still covers the whole outer window, which a
-                // write must narrow (store_mask).
-                lv.range_mask_outer = true;
+            // (LRM 11.5.1). Over a constant place that is known now
+            // (resolve_constant_select); inside a dynamic select it takes the bounds
+            // machinery of one, the window being a constant. `lsb` is the i32 the
+            // frontend wrapped into a uint32.
+            if (!resolve_constant_select(lv, cbase, outer_width, b_.getFalse())) {
+                const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
+                if (first < 0 || first + lv.width > outer_width) {
+                    set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse());
+                } else if (lv.range_mask != nullptr && lv.width != outer_width) {
+                    // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
+                    // the inherited mask still covers the whole outer window, which a
+                    // write must narrow (store_mask).
+                    lv.range_mask_outer = true;
+                }
             }
             set_lvalue(i, lv);
             return;
@@ -366,19 +368,22 @@ void Backend::lower_inst(Index i) {
             // shared load/store path shifts/masks by the runtime bit_off.
             // Bounds-checked against its container (LRM 11.5.1): bits of the
             // selection that fall outside read x / are not written; a wholly
-            // out-of-range or x/z offset makes the whole select out of range.
-            Guarded            lv     = lvalue_of(p.op_extra.op);
-            const auto         dps    = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
-            const Plane        offp   = value_of(dps.offset);
-            llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
-            const uint32_t     cwidth = lv.width;
-            llvm::Value*       off    = select_index(offp, type_of(dps.offset));
+            // out-of-range or x/z offset makes the whole select out of range. A
+            // constant offset of a constant place is settled at compile time.
+            Guarded            lv           = lvalue_of(p.op_extra.op);
+            const auto         dps          = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
+            const Plane        offp         = value_of(dps.offset);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            const uint32_t     cwidth       = lv.width;
+            llvm::Value*       off          = select_index(offp, type_of(dps.offset));
+            llvm::Value* const unknown      = any_unknown(dps.offset);
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
             lv.width   = dps.width;
-            const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
-            const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(dps.offset), constant_window);
-            add_select_bounds_check(lv, i, dps.offset, sv, BoundsWhat::Part, cwidth, dps.width);
+            std::optional<SelectVerdict> sv = resolve_constant_select(lv, cbase, cwidth, unknown);
+            if (!sv) {
+                sv = set_select_bounds(lv, cbase, cwidth, dps.width, unknown);
+            }
+            add_select_bounds_check(lv, i, dps.offset, *sv, BoundsWhat::Part, cwidth, dps.width);
             set_lvalue(i, lv);
             return;
         }

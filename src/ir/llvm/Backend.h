@@ -331,11 +331,13 @@ struct LValueInfo {
     llvm::Value* bit_off = nullptr;
     // Selected width in bits (== store_width for a whole-storage target).
     uint32_t width = 0;
-    // Storage-width in-range mask for a bounds-checked dynamic bit/part select
-    // (LRM 11.5.1): 1 for each selected bit that is in range, at every level of a
-    // nested select. Null when no bounds check applies (whole storage, or a
-    // constant in-range select). A read forces x/0 outside it and a write is
-    // restricted to it.
+    // Storage-width in-range mask for a bit/part select that may hang outside its
+    // container or the vector (LRM 11.5.1): 1 for each selected bit that is in range,
+    // at every level of a nested select. For a dynamic select it is built at the
+    // select; for a constant one that hangs over (`v[11:8]` of 8 bits) it is a
+    // constant. Null when every selected bit is in range (whole storage, or a
+    // constant in-range select) and when none is (the place is then never valid, see
+    // Guarded). A read forces x/0 outside it and a write is restricted to it.
     llvm::Value* range_mask = nullptr;
     // `range_mask` was set by an enclosing dynamic select and this lvalue is a
     // constant part-select inside that select's window (`a[i][3:0]`, `sa[i].lo`),
@@ -555,6 +557,11 @@ struct LValue : LValueInfo {
 // what the primitives alone would. Nor can a producer drop a verdict it was
 // handed: it only ever narrows it (`require`). An LValue converts to a Guarded
 // implicitly and never back (`unguarded` asserts that no verdict is carried).
+//
+// A constant verdict is settled when it is required, not left to the optimizer: a
+// constant index inside its container adds no verdict and its place opens at no
+// cost, and one outside it makes the place never valid, which the openers then
+// answer with the default or with nothing, emitting no branch and no access.
 class Guarded : public LValueInfo {
 public:
     Guarded() = default;
@@ -568,15 +575,29 @@ public:
     // this and never assigns one. A null `ok` (an index that cannot be invalid)
     // changes nothing.
     void require(llvm::IRBuilder<>& b, llvm::Value* ok) {
-        if (ok != nullptr) {
-            valid_ = valid_ != nullptr ? b.CreateAnd(valid_, ok) : ok;
+        if (ok == nullptr || never_valid()) {
+            return;
         }
+        if (const auto* c = llvm::dyn_cast<llvm::ConstantInt>(ok)) {
+            if (c->isZero()) {
+                valid_ = ok;
+            }
+            return;
+        }
+        valid_ = valid_ != nullptr ? b.CreateAnd(valid_, ok) : ok;
     }
 
     // The i1 verdict, null for a place that cannot be invalid. Reading it opens
     // nothing; it is for a consumer deciding whether it needs a guard at all.
     llvm::Value* valid() const {
         return valid_;
+    }
+
+    // Whether the place is invalid whatever the run time holds (a constant index
+    // outside its container).
+    bool never_valid() const {
+        const auto* c = llvm::dyn_cast_or_null<llvm::ConstantInt>(valid_);
+        return c != nullptr && c->isZero();
     }
 
     // The same selection rooted at another pointer, verdict carried: an
@@ -601,6 +622,9 @@ public:
     // waiters, staging a deferred record).
     template <class Emit>
     void when_valid(llvm::IRBuilder<>& b, Emit&& emit) const {
+        if (never_valid()) {
+            return;
+        }
         const LValue lv = open();
         if (valid_ == nullptr) {
             emit(lv);
@@ -620,6 +644,9 @@ public:
     // read on the valid path only; the planes of `otherwise` are those `read` returns.
     template <class Read>
     Plane read_or(llvm::IRBuilder<>& b, Read&& read, const Plane& otherwise) const {
+        if (never_valid()) {
+            return otherwise;
+        }
         const LValue lv = open();
         if (valid_ == nullptr) {
             return read(lv);
@@ -658,6 +685,9 @@ public:
     // no sink.
     template <class Form, class Fallback>
     llvm::Value* pointer_or(llvm::IRBuilder<>& b, Form&& form, Fallback&& fallback) const {
+        if (never_valid()) {
+            return fallback();
+        }
         llvm::Value* ptr = form(open());
         return valid_ == nullptr ? ptr : b.CreateSelect(valid_, ptr, fallback());
     }
@@ -3128,19 +3158,28 @@ private:
     llvm::Value* smin(llvm::Value* a, llvm::Value* b);
     llvm::Value* smax(llvm::Value* a, llvm::Value* b);
 
-    // How much of a dynamic bit/part select landed inside its container. Both
-    // are i1; `partial` is only ever true for a part-select wide enough to
-    // straddle the boundary (LRM 11.5.1 keeps the in-range bits of one).
+    // How much of a bit/part select landed inside its container. Both are i1;
+    // `partial` is only ever true for a part-select wide enough to straddle the
+    // boundary (LRM 11.5.1 keeps the in-range bits of one).
     struct SelectVerdict {
         llvm::Value* fully   = nullptr;
         llvm::Value* partial = nullptr;
     };
 
-    // `constant_window`: the select is a compile-time window at a constant offset
-    // (a constant part-select hanging over its vector), so its mask folds to a
-    // constant and needs no runtime kernel even on storage too wide to shift.
-    SelectVerdict set_select_bounds(LValueInfo& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
-                                    llvm::Value* idx_unknown, bool constant_window = false);
+    // A select with a run-time index: sets the mask and the verdicts for it.
+    SelectVerdict set_select_bounds(LValueInfo&  lv,
+                                    llvm::Value* cbase,
+                                    uint32_t     cwidth,
+                                    uint32_t     selw,
+                                    llvm::Value* idx_unknown);
+
+    // A select with a compile-time index of a place with a compile-time offset: what
+    // is in range is known, so it is settled here with no runtime check. Nothing is
+    // done, and nullopt returned, for any other select.
+    std::optional<SelectVerdict> resolve_constant_select(Guarded&     lv,
+                                                         llvm::Value* cbase,
+                                                         uint32_t     cwidth,
+                                                         llvm::Value* idx_unknown);
 
     static bool wide_dyn_storage(uint32_t sw);
 

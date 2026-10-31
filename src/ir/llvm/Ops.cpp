@@ -32,7 +32,15 @@ llvm::Value* Backend::range_bits(uint32_t W, llvm::Value* lo, llvm::Value* hi) {
 // `v` shifted by the signed i32 `s`: left when s >= 0, right by |s| when
 // s < 0. Poison-free and saturating — |s| >= W yields 0 (every bit leaves the
 // W-bit word), the correct behavior when aligning an out-of-range selection.
+// A constant `s` is one shift, or nothing left of `v`.
 llvm::Value* Backend::align_shl(llvm::Value* v, llvm::Value* s, uint32_t W) {
+    if (const auto* c = llvm::dyn_cast<llvm::ConstantInt>(s)) {
+        const int64_t k = c->getSExtValue();
+        if (k <= -int64_t{ W } || k >= int64_t{ W }) {
+            return zero(W);
+        }
+        return k == 0 ? v : k > 0 ? b_.CreateShl(v, k) : b_.CreateLShr(v, -k);
+    }
     llvm::Value* neg  = b_.CreateICmpSLT(s, b_.getInt32(0));
     llvm::Value* amt  = b_.CreateSelect(neg, b_.CreateNeg(s), s);
     llvm::Value* ovf  = b_.CreateICmpUGE(amt, b_.getInt32(W));
@@ -50,7 +58,7 @@ llvm::Value* Backend::smax(llvm::Value* a, llvm::Value* b) {
     return b_.CreateSelect(b_.CreateICmpSGT(a, b), a, b);
 }
 
-// Set `lv.range_mask` for a dynamic bit/part select, per LRM 11.5.1. The
+// Set `lv.range_mask` for a select with a run-time index, per LRM 11.5.1. The
 // select covers storage bits [lv.bit_off, lv.bit_off + selw); the in-range
 // bits are that range clamped to the container [cbase, cbase + cwidth) (the
 // whole slot for a direct select, the inner select's span for a nested one).
@@ -70,8 +78,7 @@ Backend::SelectVerdict Backend::set_select_bounds(LValueInfo&  lv,
                                                   llvm::Value* cbase,
                                                   uint32_t     cwidth,
                                                   uint32_t     selw,
-                                                  llvm::Value* idx_unknown,
-                                                  bool         constant_window) {
+                                                  llvm::Value* idx_unknown) {
     const uint32_t sw    = lv.store_width;
     auto*          i64t  = int_ty(64);
     llvm::Value*   base  = b_.CreateSExt(cbase, i64t);
@@ -93,10 +100,9 @@ Backend::SelectVerdict Backend::set_select_bounds(LValueInfo&  lv,
         lv.nest_valid = v.fully;
     }
     // Storage too wide to shift inline: hand the container to the runtime helper
-    // (which clamps per bit) instead of building an sw-bit mask, whose own
-    // construction is the O(sw^2) legalization this path exists to avoid. A
-    // constant window has no variable shift to legalize: its mask is a constant.
-    if (wide_dyn_storage(sw) && !constant_window) {
+    // (which clamps per word) instead of building an sw-bit mask, whose own
+    // construction is the O(sw^2) legalization this path exists to avoid.
+    if (wide_dyn_storage(sw)) {
         lv.wide_dyn    = true;
         lv.sel_base    = base;
         lv.sel_cwidth  = cwidth;
@@ -118,6 +124,55 @@ Backend::SelectVerdict Backend::set_select_bounds(LValueInfo&  lv,
     v.partial =
       selw == 1 ? nullptr
                 : b_.CreateAnd(b_.CreateNot(v.fully), b_.CreateICmpNE(lv.range_mask, zero(sw)));
+    return v;
+}
+
+// Settle a select whose index and place are compile-time constants (`v[3]`,
+// `v[7:4]`, `a[2][5]`), which needs none of the run-time check set_select_bounds
+// builds: the bits of the container [cbase, cbase + cwidth) and of the vector
+// [0, sw) that the select covers are known now (LRM 11.5.1).
+//
+//   - All of them are in range: the plain form, with no range mask.
+//   - None is, or the index has an x/z bit: the place is never valid, so a read
+//     gives the default and a write does nothing, and no code is emitted for either
+//     (Guarded).
+//   - Some are: a constant mask of those, which a load and a store apply as they do
+//     a dynamic select's.
+//
+// Returns the verdict --sanitize=bounds reports on. A select with a run-time index,
+// or inside one, is not settled here: nothing is touched and nullopt returned.
+std::optional<Backend::SelectVerdict> Backend::resolve_constant_select(Guarded&     lv,
+                                                                       llvm::Value* cbase,
+                                                                       uint32_t     cwidth,
+                                                                       llvm::Value* idx_unknown) {
+    const auto* off     = llvm::dyn_cast<llvm::ConstantInt>(lv.bit_off);
+    const auto* base    = llvm::dyn_cast<llvm::ConstantInt>(cbase);
+    const auto* unknown = llvm::dyn_cast<llvm::ConstantInt>(idx_unknown);
+    if (off == nullptr || base == nullptr || unknown == nullptr || lv.nest_valid != nullptr || lv.wide_dyn) {
+        return std::nullopt;
+    }
+    const int64_t sw    = lv.store_width;
+    const int64_t first = off->getSExtValue();
+    const int64_t end   = first + lv.width;
+    const int64_t c0    = base->getSExtValue();
+    const int64_t lo    = std::max({ first, c0, int64_t{ 0 } });
+    const int64_t hi    = std::min({ end, c0 + cwidth, sw });
+    const bool    known = !unknown->isOne();
+    const bool    fully = known && first >= c0 && end <= c0 + cwidth;
+
+    SelectVerdict v;
+    v.fully   = b_.getInt1(fully);
+    v.partial = lv.width == 1 ? nullptr : b_.getInt1(known && !fully && lo < hi);
+
+    lv.range_mask       = nullptr;
+    lv.range_mask_outer = false;
+    if (!known || hi <= lo) {
+        lv.require(b_, b_.getFalse());
+    } else if (lo != first || hi != end) {
+        lv.range_mask = llvm::ConstantInt::get(
+          ctx_,
+          llvm::APInt::getBitsSet(static_cast<unsigned>(sw), static_cast<unsigned>(lo), static_cast<unsigned>(hi)));
+    }
     return v;
 }
 
