@@ -479,18 +479,14 @@ llvm::Value* Backend::event_slot_value(Signal sig) {
     return b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
 }
 
-// The object of a monomorphic declared event: clotho.events at its slot. A
-// variable that is assigned names another object later, so what is wanted of
-// it (the dump watches the declared one) is the object it powered on with,
-// which only its instance's own lowering can name.
+// The object of a declared event: clotho.events at its slot. A variable that is
+// assigned names another object later, so what is wanted of it (the dump watches
+// the declared one) is the object it powered on with, by number. Only the
+// whole-design dump registration asks, and that is code of root (vcd_register_fn),
+// which owns the design-wide numbering; no unit's code names a declared slot.
 llvm::Value* Backend::event_obj(Signal sig) {
-    llvm::Value* slot = nullptr;
-    if (event_is_mono(sig)) {
-        slot = event_slot_value(sig);
-    } else {
-        taint("names the declared object of a reassigned event of its instance");
-        slot = b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]);
-    }
+    llvm::Value* slot = event_is_mono(sig) ? event_slot_value(sig)
+                                           : static_cast<llvm::Value*>(b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]));
     return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_), { b_.getInt32(0), slot });
 }
 

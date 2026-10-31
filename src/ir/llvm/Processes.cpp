@@ -1727,15 +1727,30 @@ llvm::GlobalVariable* Backend::disable_table(llvm::GlobalVariable*& gv,
         const auto n  = static_cast<size_t>(mod_.disable_targets);
         auto*      ty = llvm::ArrayType::get(elem, n);
         // Defined in the root unit and referenced through sym(), like every
-        // other cross-unit global. A group holding either half of the remote
-        // form is forced to a real coroutine (is_simple_always), and only a
-        // thunk group is ever shared across instances, so a baked per-instance
-        // target id can never reach a shared body.
+        // other cross-unit global.
         gv = new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
                                       llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, init)),
                                       std::string("clotho.disable.") + name);
     }
     return gv;
+}
+
+// The flat id of `disable` target `t` as an IR value. A target the instance whose
+// code is being lowered declares is its unit's ordinal-th, whose id sits in the
+// instance's record, so the code names no target; one of no instance has the same
+// id in every instance and is the constant, and another instance's is that
+// instance's own, which a shared lowering cannot have.
+llvm::Value* Backend::disable_target_value(uint32_t t) {
+    const auto [owner, ordinal] = disable_owner_.at(t);
+    if (owner == SignalSlot::no_anchor) {
+        return b_.getInt32(t);
+    }
+    if (owner == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[owner];
+        return ctx_field(a, a.ctx_dis_base + ordinal, b_.getInt32Ty());
+    }
+    taint("names a disable target of another instance");
+    return b_.getInt32(t);
 }
 
 llvm::Value* Backend::disable_slot(llvm::IRBuilder<>&     b,
@@ -1744,10 +1759,9 @@ llvm::Value* Backend::disable_slot(llvm::IRBuilder<>&     b,
                                    llvm::Type*            elem,
                                    llvm::Constant*        init,
                                    uint32_t               target) {
-    taint("names a disable target of its instance");
     auto* ty = llvm::ArrayType::get(elem, static_cast<size_t>(mod_.disable_targets));
     return b.CreateInBoundsGEP(ty, sym(disable_table(gv, name, elem, init)),
-                               { b.getInt32(0), b.getInt32(target) });
+                               { b.getInt32(0), disable_target_value(target) });
 }
 
 // One live activation of a `disable`-targeted task (LRM 9.6.2), frame-resident

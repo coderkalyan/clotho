@@ -537,8 +537,26 @@ void Backend::lower_system(Index i) {
 // collector: a covergroup instance is runtime-owned storage that outlives the
 // design (LRM 19.11.3 aggregates dropped instances), so its handle is an
 // opaque 2-state 64-bit word and never a traced root.
+
+// The flat covergroup type `t` as an IR value: a type the instance whose code is
+// being lowered declares is its unit's ordinal-th, whose index sits in the
+// instance's record (so the code names no type); a type of no instance (a
+// package's, a class's) is the same in every instance and is the constant; another
+// instance's is that instance's own, which a shared lowering cannot have.
+llvm::Value* Backend::cover_type_value(uint32_t t) {
+    const auto [owner, ordinal] = cover_owner_.at(t);
+    if (owner == SignalSlot::no_anchor) {
+        return b_.getInt32(t);
+    }
+    if (owner == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[owner];
+        return ctx_field(a, a.ctx_cov_base + ordinal, b_.getInt32Ty());
+    }
+    taint("names a covergroup type of another instance");
+    return b_.getInt32(t);
+}
+
 void Backend::lower_cover_query(Index i) {
-    taint("uses a covergroup type index of its instance");
     const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
     const auto args = ir_->region(info.args);
     auto*      i32  = b_.getInt32Ty();
@@ -570,7 +588,7 @@ void Backend::lower_cover_query(Index i) {
                                                  : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(
                                                      llvm::PointerType::getUnqual(ctx_)));
             hval(b_.CreateCall(cover_new_fn(),
-                               { b_.getInt32(info.type_idx),
+                               { cover_type_value(info.type_idx),
                                  cast(must_of(args[0]), 64, false),
                                  path,
                                  b_.CreateGlobalString(text),
@@ -581,7 +599,7 @@ void Backend::lower_cover_query(Index i) {
             hval(b_.CreateCall(cover_ctx_fn(), { handle() }));
             return;
         case CoverOp::First:
-            hval(b_.CreateCall(cover_first_fn(), { b_.getInt32(info.type_idx) }));
+            hval(b_.CreateCall(cover_first_fn(), { cover_type_value(info.type_idx) }));
             return;
         case CoverOp::Next:
             hval(b_.CreateCall(cover_next_fn(), { handle() }));
@@ -612,13 +630,13 @@ void Backend::lower_cover_query(Index i) {
         case CoverOp::TypeCoverage:
             set_value(i,
                       real_plane(b_.CreateCall(cover_type_query_fn("rt_cover_type_coverage", dbl),
-                                               { b_.getInt32(info.type_idx) })));
+                                               { cover_type_value(info.type_idx) })));
             return;
         case CoverOp::TypeCovered:
-            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_covered", i32), { b_.getInt32(info.type_idx) }));
+            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_covered", i32), { cover_type_value(info.type_idx) }));
             return;
         case CoverOp::TypeTotal:
-            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { b_.getInt32(info.type_idx) }));
+            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { cover_type_value(info.type_idx) }));
             return;
         case CoverOp::DesignCoverage:
             set_value(i, real_plane(b_.CreateCall(cover_design_coverage_fn(), {})));
@@ -629,7 +647,6 @@ void Backend::lower_cover_query(Index i) {
 }
 
 void Backend::lower_cover_ctl(Index i) {
-    taint("uses a covergroup type index of its instance");
     const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
     const auto args = ir_->region(info.args);
     if (args.empty()) {

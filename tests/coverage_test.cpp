@@ -1052,3 +1052,31 @@ TEST_CASE("a package covergroup built by the package and by two instances") {
     CHECK(report.find("instance top.u1.pcg ") != std::string::npos);
     CHECK(report.find("instance top.u2.pcg") != std::string::npos);
 }
+
+// Twin instances of one module run one body (cli_test: --stat=unit-code), and each
+// builds, samples and queries the covergroup types of its own instance: the type
+// coverage of m0 is its own two instances' average, not m1's.
+TEST_CASE("twin instances keep their own covergroup types") {
+    const std::string out = run_capture(R"(
+        module m(input int k);
+          bit [1:0] v = 0;
+          covergroup cg;
+            cp: coverpoint v { bins b[] = {0,1,2,3}; }
+          endgroup
+          cg a = new;
+          cg b = new;
+          initial begin
+            #k;
+            v = k[1:0];
+            a.sample();
+            if (k == 2) b.sample();
+            $display("%m inst=%0f type=%0f", a.get_inst_coverage(), a.get_coverage());
+          end
+        endmodule
+        module t;
+          m m0(.k(1));
+          m m1(.k(2));
+        endmodule
+    )");
+    CHECK(out == "t.m0 inst=25.000000 type=12.500000\nt.m1 inst=25.000000 type=25.000000\n");
+}

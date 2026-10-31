@@ -318,6 +318,9 @@ between instances:
   group;
 - the design-wide index of each process it owns (its control block, its random
   stream's seed) and the index of its program instance (LRM 24.3, `$exit`);
+- the flat ids of the `disable` targets and covergroup types it declares, which a
+  unit's code names by position (a hierarchical `disable` of another instance's
+  block, or a covergroup of one, still names a symbol of that instance);
 - one binding per extern declaration: the address of an imported signal and the
   record of the instance that owns it, and the record of an imported function's
   instance (landed); the record of an instance an interface port or `inst_refs`
@@ -422,8 +425,8 @@ code go.
      too. `merge_twin_bodies`, `share_twin_groups` and
      `SimulationConfig::outline` are gone. A lowering that bakes something of the
      instance it ran for (a symbol of its storage or wait buckets, a call of a
-     function that is its instance's own, a covergroup index, a
-     disable target, nonblocking staging into another instance) taints itself and each
+     function that is its instance's own, a disable target or covergroup type of
+     another instance, nonblocking staging into another instance) taints itself and each
      instance lowers its own; `--stat=unit-code` reports unit groups, functions
      emitted and what stopped sharing. Comb fusion stays within one instance
      (combchain regresses; accepted until fusion across instances is revisited).
@@ -468,7 +471,7 @@ code go.
      shared is lowered as it was, into its unit's module like every other, and
      `--stat=unit-code` counts the subroutines of multi-instance units, the
      functions emitted for them and what kept each per instance: a
-     nonblocking write, a disable target, a covergroup, a call of such a
+     nonblocking write, a disable target or covergroup of another instance, a call of such a
      subroutine, a cycle. The instance a process, a control block, a random
      stream or a `$exit` names is a record field (process indices, the program
      instance) read by the instance's own code, so none of them splits a family; a
@@ -491,10 +494,12 @@ code go.
      handle a second time and unlink without recording the owner; the fact is
      joined over a unit's instances, and over what each instance binds an event
      port to, since the code is shared. The object's VCD index is a field of the
-     object and a trigger id of an event is its slot, so neither is code. Only
-     the dump of an event
-     that is reassigned names its declared object by number, and so keeps its
-     instance's own lowering. An event of no instance (a package's) is one
+     object and a trigger id of an event is its slot, so neither is code. The
+     dump of a reassigned event names its declared object by number, and so does
+     every other `$dumpvars` registration: `$dumpvars` in a body is a call of one
+     function of root (`vcd_register_fn`) that walks the design's scope tree, the
+     link glue that owns the design-wide numbering, so no unit's code names a
+     dumped signal of any instance. An event of no instance (a package's) is one
      object for everyone and keeps its constant address.
 
      The taint list is a claim that the lowering of one instance is the lowering

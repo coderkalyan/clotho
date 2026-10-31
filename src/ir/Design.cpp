@@ -608,6 +608,16 @@ private:
                 assert(u.imports[imp].kind == Import::Kind::Member && "a function is imported by member, never as a layout");
                 s.fn_externs.push_back(fi.functions[h]);
             }
+            for (uint32_t h = 0; h < u.disable_targets.size(); ++h) {
+                if (u.disable_targets[h].import == kLocal) {
+                    s.disable_locals.push_back(fi.targets[h]);
+                }
+            }
+            for (uint32_t h = 0; h < u.cover_types.size(); ++h) {
+                if (u.cover_types[h].import == kLocal) {
+                    s.cover_locals.push_back(fi.cover_types[h]);
+                }
+            }
             s.children.reserve(fi.children.size());
             for (const uint32_t ci : fi.children) {
                 s.children.push_back(std::move(*scopes[ci]));

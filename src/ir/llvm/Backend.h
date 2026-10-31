@@ -1083,6 +1083,14 @@ struct Anchor {
     // design has a program `initial` (n_prog 1, else 0).
     uint32_t ctx_prog_base = 0;
     uint32_t n_prog        = 0;
+    // The `disable` targets and covergroup types the instance declares (the unit's
+    // own, in its order: InstanceScope::disable_locals / cover_locals) and their
+    // flat ids, one i32 field each at ctx_dis_base / ctx_cov_base + ordinal, so code
+    // of the unit names a target or type by position and the id is data.
+    std::vector<uint32_t> disable_locals;
+    std::vector<uint32_t> cover_locals;
+    uint32_t              ctx_dis_base = 0;
+    uint32_t              ctx_cov_base = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -2005,6 +2013,13 @@ private:
     // the instance that owns it when that is the instance being lowered, else a
     // constant (which taints).
     llvm::Value* proc_index_value(uint32_t k);
+
+    // The flat id of `disable` target `t` / covergroup type `t` as an IR value: read
+    // from the own record when the instance being lowered declares it, a constant
+    // for one of no instance (a package's: the same in every instance), and a
+    // constant that taints for another instance's.
+    llvm::Value* disable_target_value(uint32_t t);
+    llvm::Value* cover_type_value(uint32_t t);
 
     void lower_program_exit(Index i);
 
@@ -3874,6 +3889,9 @@ private:
 
     void emit_vcd_var(Signal sig);
 
+    // The function of root that registers every dumped signal (lower_dump_vars).
+    llvm::Function* vcd_register_fn();
+
     void lower_dump_control(Inst::Tag tag);
 
     void lower_ret_void();
@@ -4582,6 +4600,8 @@ private:
     // one, when the owning instance is the one whose body is being emitted.
     llvm::Value* ctx_override_        = nullptr;
     uint32_t     ctx_override_anchor_ = SignalSlot::no_anchor;
+    // The root function that registers the design's dump variables, built on first use.
+    llvm::Function* vcd_register_fn_ = nullptr;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
@@ -4700,6 +4720,10 @@ private:
     std::vector<llvm::GlobalVariable*> defer_gen_gv_;
     // Whether any process of the design holds a deferred assertion (sizes the records).
     bool any_defer_ = false;
+    // Who declares each flat `disable` target and covergroup type: the anchor and
+    // the ordinal among its unit's own (no_anchor for none).
+    std::vector<std::pair<uint32_t, uint32_t>> disable_owner_;
+    std::vector<std::pair<uint32_t, uint32_t>> cover_owner_;
     std::vector<int32_t>  vcd_index_;
     llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 

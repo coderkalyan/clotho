@@ -129,6 +129,12 @@ struct InstanceScope {
     // code names its imported functions by position. Empty when `unit` is
     // no_unit.
     std::vector<FunctionId> fn_externs;
+    // The flat `disable` target (Module::disable_targets) and the flat covergroup
+    // type (Module::cover_types) each of the unit's own declarations is in this
+    // instance, in the unit's order (imported ones left out), so a unit's code
+    // names its own by position. Empty when `unit` is no_unit.
+    std::vector<uint32_t> disable_locals;
+    std::vector<uint32_t> cover_locals;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the

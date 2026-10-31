@@ -723,6 +723,35 @@ TEST_CASE("vcd: events in submodules dump in their own scope") {
     CHECK(body_of(vcd) == "#5\n1!\n#7\n1\"\n");
 }
 
+TEST_CASE("vcd: a $dumpvars in the body of twin instances dumps both instances' events") {
+    // The registration is one function of root, whichever instance's body calls it
+    // (cli_test: --stat=unit-code shows the twins share their code): the reassigned
+    // events of both instances are dumped in their own scopes and pulse at their own
+    // triggers, though only u0 runs the `$dumpvars`.
+    const std::string src = R"(
+        module leaf(input int k);
+          event e, f;
+          initial begin
+            #1;
+            f = e;
+            $dumpfile("OUT.vcd");
+            if (k == 1) $dumpvars;
+            #k -> e;
+            #1 -> f;
+          end
+        endmodule
+        module top;
+          leaf u0(.k(1));
+          leaf u1(.k(4));
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    CHECK(contains(vcd, "$scope module u0 $end\n$var reg 32 ! k $end\n$var event 1 \" e $end\n"
+                        "$var event 1 # f $end\n$upscope $end\n$scope module u1 $end\n"
+                        "$var reg 32 $ k $end\n$var event 1 % e $end\n$var event 1 & f $end\n"));
+    CHECK(body_of(vcd) == "#1\nb1 !\nb100 $\n#2\n1\"\n#3\n1\"\n#5\n1%\n#6\n1%\n");
+}
+
 TEST_CASE("vcd: a checkpoint with nothing to checkpoint writes no time marker") {
     // $dumpoff makes every dumped variable unknown, but an event has no value to
     // make unknown. When events are all there is, the checkpoint must write

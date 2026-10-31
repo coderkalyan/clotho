@@ -279,11 +279,50 @@ void Backend::lower_dump_limit(Index i) {
     b_.CreateCall(vcd_limit_fn(), { cast(must_of(n), 64, false) });
 }
 
-// $dumpvars (whole-design form): walk the design scope tree, registering every
-// dumpable signal with the runtime, then arm the dump.
+// $dumpvars (whole-design form): register every dumpable signal of the design
+// with the runtime, then arm the dump. The registration walks the whole design
+// scope tree and names the storage of every instance, so it is code of root
+// (vcd_register_fn) that the body calls, and the body of a unit that holds a
+// `$dumpvars` names nothing of any instance.
 void Backend::lower_dump_vars() {
     b_.CreateCall(vcd_begin_fn(),
                   { wheel_, b_.getInt64(mod_.tick_fs), b_.getInt32(mod_.timeformat_units) });
+    b_.CreateCall(sym(vcd_register_fn()), {});
+    b_.CreateCall(vcd_start_fn(), {});
+}
+
+// The function of root that registers the design's dumped signals, built on first
+// use whichever body asks: the walk of the scope tree emit_vcd_scope_tree makes,
+// addressing every instance absolutely (no record, no sharing watch), into root.
+llvm::Function* Backend::vcd_register_fn() {
+    if (vcd_register_fn_ != nullptr) {
+        return vcd_register_fn_;
+    }
+    auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), {}, false);
+    vcd_register_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.vcd.register",
+                                              root_env_->llmod);
+    // Everything the caller's lowering holds that the walk must not see.
+    const auto ip            = b_.saveIP();
+    ModuleEnv* const env     = env_;
+    llvm::Function* const fn = fn_;
+    llvm::Value* const state = state_;
+    const uint32_t own       = own_anchor_;
+    llvm::Value* const ctx   = own_ctx_;
+    llvm::Value* const ovr   = ctx_override_;
+    const uint32_t ovr_a     = ctx_override_anchor_;
+    const bool share         = share_active_;
+    const bool verifying     = verifying_;
+    env_                 = root_env_.get();
+    fn_                  = vcd_register_fn_;
+    state_               = sym(state_global_);
+    own_anchor_          = SignalSlot::no_anchor;
+    own_ctx_             = nullptr;
+    ctx_override_        = nullptr;
+    ctx_override_anchor_ = SignalSlot::no_anchor;
+    share_active_        = false;
+    verifying_           = false;
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", vcd_register_fn_));
+
     const auto tops = mod_.tops();
     if (tops.empty()) {
         emit_vcd_scope(mod_.name);
@@ -296,7 +335,19 @@ void Backend::lower_dump_vars() {
             emit_vcd_scope_tree(top);
         }
     }
-    b_.CreateCall(vcd_start_fn(), {});
+    b_.CreateRetVoid();
+
+    verifying_           = verifying;
+    share_active_        = share;
+    ctx_override_anchor_ = ovr_a;
+    ctx_override_        = ovr;
+    own_ctx_             = ctx;
+    own_anchor_          = own;
+    state_               = state;
+    fn_                  = fn;
+    env_                 = env;
+    b_.restoreIP(ip);
+    return vcd_register_fn_;
 }
 
 void Backend::emit_vcd_scope(std::string_view name) {

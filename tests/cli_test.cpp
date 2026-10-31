@@ -859,6 +859,69 @@ TEST_CASE("cli: --stat=unit-code shows twin program instances and their $exit ta
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code shows twin instances with remote disables and covergroups shared") {
+    // The flat id of a disable target or a covergroup type the instance declares is
+    // a field of its record, so the code that names one is the same in every instance.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module m(input int k);
+            bit [1:0] v = 0;
+            covergroup cg;
+                cp: coverpoint v { bins b[] = {0,1,2,3}; }
+            endgroup
+            cg a = new;
+            initial begin : P
+                #10 a.sample();
+            end
+            initial begin #5 if (k == 1) disable m.P; end
+            task automatic tk();
+                #20 $display("%m task done");
+            endtask
+            initial begin
+                fork tk(); join_none
+                #6;
+                if (k == 2) disable m.tk;
+            end
+        endmodule
+        module top;
+            m m0(.k(1));
+            m m1(.k(2));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "4 groups of multi-instance units over 8 instances' groups, 4 functions emitted"));
+    CHECK(contains(r.err, "3 subroutines of multi-instance units over 6 instances' subroutines, 3 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
+TEST_CASE("cli: --stat=unit-code shows twin instances that run $dumpvars sharing their code") {
+    // `$dumpvars` registers the whole design from one function of root, so the body
+    // that calls it names no instance's signals, events included.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf(input int k);
+            event e, f;
+            initial begin
+                #1;
+                f = e;
+                $dumpfile("OUT.vcd");
+                if (k == 1) $dumpvars;
+                #k -> e;
+                #1 -> f;
+            end
+        endmodule
+        module top;
+            leaf u0(.k(1));
+            leaf u1(.k(4));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 groups of multi-instance units over 2 instances' groups, 1 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

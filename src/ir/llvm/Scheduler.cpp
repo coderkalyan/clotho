@@ -919,6 +919,13 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         }
         // The instance's name, which its code reads for `%m` and banners.
         b_.CreateStore(sym(inst_path_global(static_cast<uint32_t>(&a - anchors_.data()))), ctx_ptr(a, a.ctx_name_base));
+        // The flat ids of the `disable` targets and covergroup types it declares.
+        for (uint32_t k = 0; k < a.disable_locals.size(); ++k) {
+            b_.CreateStore(b_.getInt32(a.disable_locals[k]), ctx_ptr(a, a.ctx_dis_base + k));
+        }
+        for (uint32_t k = 0; k < a.cover_locals.size(); ++k) {
+            b_.CreateStore(b_.getInt32(a.cover_locals[k]), ctx_ptr(a, a.ctx_cov_base + k));
+        }
         // The imports this instance's code reads: where each signal is and who
         // owns it (nobody, for a package's).
         for (uint32_t k = 0; k < a.bind_used.size(); ++k) {

@@ -2806,3 +2806,29 @@ TEST_CASE("foreach over an assoc of queues, reading each element") {
         endmodule
     )") == "3 2 1 size=3\n");
 }
+
+// Twin instances run one body (cli_test: --stat=unit-code), and a `disable` that names a
+// block or a task from another process finds the target of its own instance: m0 ends its
+// block before it prints and m1's prints; m1 ends its task activation and m0's runs on.
+TEST_CASE("a remote disable in twin instances ends the target of its own instance") {
+    CHECK(run_capture(R"(
+        module m(input int k);
+          initial begin : P
+            #10 $display("%m done");
+          end
+          initial begin #5 if (k == 1) disable m.P; end
+          task automatic tk();
+            #20 $display("%m task done");
+          endtask
+          initial begin
+            fork tk(); join_none
+            #6;
+            if (k == 2) disable m.tk;
+          end
+        endmodule
+        module t;
+          m m0(.k(1));
+          m m1(.k(2));
+        endmodule
+    )") == "t.m1.P done\nt.m0.tk task done\n");
+}

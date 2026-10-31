@@ -205,6 +205,8 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
         Anchor& an    = anchors_[aid];
         an.fn_locals  = scope.fn_locals;
         an.fn_externs = scope.fn_externs;
+        an.disable_locals = scope.disable_locals;
+        an.cover_locals   = scope.cover_locals;
         for (uint32_t k = 0; k < an.fn_externs.size(); ++k) {
             an.fn_bind_of.try_emplace(static_cast<uint32_t>(an.fn_externs[k]), k);
         }
@@ -1147,6 +1149,16 @@ void Backend::assign_id_fields() {
 // unit because every instance has the same groups.
 void Backend::build_instance_ctx_layout() {
     assign_id_fields();
+    disable_owner_.assign(mod_.disable_targets, { SignalSlot::no_anchor, 0 });
+    cover_owner_.assign(mod_.cover_types.size(), { SignalSlot::no_anchor, 0 });
+    for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
+        for (uint32_t k = 0; k < anchors_[ai].disable_locals.size(); ++k) {
+            disable_owner_.at(anchors_[ai].disable_locals[k]) = { ai, k };
+        }
+        for (uint32_t k = 0; k < anchors_[ai].cover_locals.size(); ++k) {
+            cover_owner_.at(anchors_[ai].cover_locals[k]) = { ai, k };
+        }
+    }
     // Twin instances own the same number of processes; size blk fields by the
     // definition-wide maximum so layouts agree even if one of them degenerated
     // (they should be equal by construction).
@@ -1199,6 +1211,8 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_defer_base       = a.ctx_name_base + 1;
         a.ctx_proc_base        = a.ctx_defer_base + a.n_defer;
         a.ctx_prog_base        = a.ctx_proc_base + a.n_proc;
+        a.ctx_dis_base         = a.ctx_prog_base + a.n_prog;
+        a.ctx_cov_base         = a.ctx_dis_base + static_cast<uint32_t>(a.disable_locals.size());
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1214,11 +1228,14 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), a.n_defer, b_.getInt64Ty());
             f.insert(f.end(), a.n_proc, i32);
             f.insert(f.end(), a.n_prog, i32);
+            f.insert(f.end(), a.disable_locals.size(), i32);
+            f.insert(f.end(), a.cover_locals.size(), i32);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
-        assert(a.ctx_ty->getNumElements() == a.ctx_prog_base + a.n_prog && "instances of one unit lay their records out alike");
+        assert(a.ctx_ty->getNumElements() == a.ctx_cov_base + a.cover_locals.size() &&
+               "instances of one unit lay their records out alike");
     }
 }
 
