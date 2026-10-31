@@ -934,18 +934,23 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         for (uint32_t k = 0; k < a.expect_locals.size(); ++k) {
             b_.CreateStore(sym(expect_queue(a.expect_locals[k])), ctx_ptr(a, a.ctx_expect_base + k));
         }
-        // The imports this instance's code reads: where each signal is and who
-        // owns it (nobody, for a package's).
+        // The imports this instance's code reads: where each signal is, who owns
+        // it (nobody, for a package's) and where its port is in the owner's record
+        // (nowhere, for a signal with no port).
         for (uint32_t k = 0; k < a.bind_used.size(); ++k) {
             if (a.bind_used[k] == 0) {
                 continue;
             }
             const SignalSlot& s = slot_of(a.externs[k]);
-            b_.CreateStore(storage_address(s), ctx_ptr(a, a.ctx_bind_base + 2 * k));
+            b_.CreateStore(storage_address(s), ctx_ptr(a, a.ctx_bind_base + 3 * k));
             b_.CreateStore(s.anchor != SignalSlot::no_anchor
                              ? static_cast<llvm::Value*>(sym(anchors_[s.anchor].ctx_gv))
                              : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)),
-                           ctx_ptr(a, a.ctx_bind_base + 2 * k + 1));
+                           ctx_ptr(a, a.ctx_bind_base + 3 * k + 1));
+            b_.CreateStore(port_of(s) != nullptr
+                             ? static_cast<llvm::Value*>(port_address(s))
+                             : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)),
+                           ctx_ptr(a, a.ctx_bind_base + 3 * k + 2));
         }
         // The functions this instance's code calls in other instances: whose
         // record each is passed.
@@ -960,27 +965,44 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
             if (sj == Signal{ ~0u }) {
                 continue;
             }
-            const auto si = static_cast<uint32_t>(sj);
+            const auto        si = static_cast<uint32_t>(sj);
+            const SignalSlot& s  = slots_[si];
+            const PortLayout* pl = port_of(s);
+            if (pl == nullptr) {
+                continue;
+            }
+            // The signal's port: its ids, dump-var index, shadow slots, wake buckets
+            // (with this instance's exact subscriber count: its slots are filled
+            // densely from 0, so its own scan needs no padding) and vif waiter heads.
+            const auto elem = [&](uint32_t e) { return b_.CreateStructGEP(pl->ty, port_address(s), e); };
             for (uint32_t f = 0; f < kIdFamilies; ++f) {
-                if (id_ord_[si][f] != no_id && id_val_[si][f] != no_id) {
-                    b_.CreateStore(b_.getInt32(id_val_[si][f]), ctx_ptr(a, a.ctx_id_base + id_ord_[si][f]));
+                if (pl->id[f] != no_port_elem && id_val_[si][f] != no_id) {
+                    b_.CreateStore(b_.getInt32(id_val_[si][f]), elem(pl->id[f]));
                 }
             }
+            if (pl->vcd != no_port_elem && vcd_index_[si] >= 0) {
+                b_.CreateStore(b_.getInt32(static_cast<uint32_t>(vcd_index_[si])), elem(pl->vcd));
+            }
+            for (uint32_t k = 0; k < s.sh_count && k < pl->n_shadow; ++k) {
+                b_.CreateStore(b_.CreateInBoundsGEP(a.shadow_ty, sym(a.shadow_gv), { b_.getInt32(0), b_.getInt32(s.sh_first + k) }),
+                               elem(pl->shadow + k));
+            }
             for (uint32_t e = 0; e < 3; ++e) {
-                if (wait_slot_sta_[si][e] != no_wait_slot) {
-                    b_.CreateStore(sym(wait_sta_gv_[si][e]),
-                                   ctx_ptr(a, a.ctx_wait_base + wait_slot_sta_[si][e]));
-                    // This instance's exact subscriber count: its slots are
-                    // filled densely from 0, so its own scan needs no padding.
-                    b_.CreateStore(b_.getInt32(wait_sta_true_[si][e]),
-                                   ctx_ptr(a, a.ctx_cap_base + wait_sta_ord_[si][e]));
-                    b_.CreateStore(b_.getInt64(trig_bits(sj, e)), ctx_ptr(a, a.ctx_trig_base + wait_sta_ord_[si][e]));
+                if (pl->sta[e].base != no_port_elem && wait_sta_gv_[si][e] != nullptr) {
+                    b_.CreateStore(sym(wait_sta_gv_[si][e]), elem(pl->sta[e].base));
+                    b_.CreateStore(b_.getInt64(trig_bits(sj, e)), elem(pl->sta[e].trig));
+                    b_.CreateStore(b_.getInt32(wait_sta_true_[si][e]), elem(pl->sta[e].cap));
                 }
-                if (wait_slot_dyn_[si][e] != no_wait_slot) {
-                    b_.CreateStore(sym(wait_dyn_gv_[si][e]),
-                                   ctx_ptr(a, a.ctx_wait_base + wait_slot_dyn_[si][e]));
-                    b_.CreateStore(sym(wait_dyn_len_gv_[si][e]),
-                                   ctx_ptr(a, a.ctx_wait_base + wait_slot_len_[si][e]));
+                if (pl->dyn[e].base != no_port_elem && wait_dyn_gv_[si][e] != nullptr) {
+                    b_.CreateStore(sym(wait_dyn_gv_[si][e]), elem(pl->dyn[e].base));
+                    b_.CreateStore(sym(wait_dyn_len_gv_[si][e]), elem(pl->dyn[e].len));
+                    b_.CreateStore(b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[si][e]->getNumElements())),
+                                   elem(pl->dyn[e].cap));
+                }
+                if (pl->vif[e] != no_port_elem && vif_head_ord_[si][e] != ~0u) {
+                    b_.CreateStore(b_.CreateInBoundsGEP(a.ty, sym(a.state_gv),
+                                                        { b_.getInt32(0), b_.getInt32(a.vif_head_base + vif_head_ord_[si][e]) }),
+                                   elem(pl->vif[e]));
                 }
             }
         }

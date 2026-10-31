@@ -328,12 +328,25 @@ between instances:
 - the flat ids of the `disable` targets and covergroup types it declares, which a
   unit's code names by position (a hierarchical `disable` of another instance's
   block, or a covergroup of one, still names a symbol of that instance);
-- one binding per extern declaration: the address of an imported signal and the
-  record of the instance that owns it, and the record of an imported function's
-  instance (landed); the record of an instance an interface port or `inst_refs`
-  entry names (not yet);
-- descriptors of wake buckets the instance's signals own (base, subscriber
-  count and trigger bits), and the trigger masks of the guarded groups it runs;
+- one binding per extern declaration: the address of an imported signal, the
+  record of the instance that owns it (only carried, into a deferred write's
+  record) and the address of the signal's **port** in that record, and the record
+  of an imported function's instance (landed); the record of an instance an
+  interface port or `inst_refs` entry names (not yet);
+- one **port** per signal that has anything for a writer: its wake buckets (base,
+  subscriber count and trigger bits of each static one; base, length cell and
+  capacity of each dynamic one), its ids in the design-wide id spaces, its
+  dump-var index, the address of each of its shadow fields and the heads of its
+  virtual-interface waiter lists. A port is a struct whose elements are a function
+  of the signal's facts alone, so code that writes a signal of another unit reads
+  the port through its binding and names no offset of the owner's record: what the
+  owner gains elsewhere (a process, an event, a covergroup, an assertion, another
+  signal) moves the port inside the record and changes no one else's code. The
+  ports of a state type are the same for every unit of it, which a virtual
+  interface relies on. What does still reach a parent's code is the set of
+  buckets a signal it writes has (a new waiter on an edge of a port): an inbound
+  fact, joined per unit until step 4;
+- the trigger masks of the guarded groups the instance runs;
 - the waiter queue of each `expect` its unit declares (LRM 16.17), as the address
   of a root global `{ count, parked handles }`: the wait and the wake of the
   statement are both unit code and read it here, so neither names a monitor's

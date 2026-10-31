@@ -240,7 +240,7 @@ std::string rich(const RichEdit& e) {
 // waiter to a signal another unit declares: that changes the declaring unit's code
 // (an edge of the parent's `clk` here), a fact the declaring unit still joins over
 // until step 4 (summaries).
-[[maybe_unused]] constexpr std::string_view kPairExtra =
+constexpr std::string_view kPairExtra =
   "logic extra; event ex; always_ff @(posedge s0) begin extra <= ~t0[0]; -> ex; end "
   "covergroup cg2 @(posedge s0); coverpoint t0; endgroup cg2 cgi2 = new;";
 constexpr std::string_view kTopExtra = R"(
@@ -282,12 +282,21 @@ TEST_CASE("a rich design: an edit to one definition changes its units' modules o
 
 TEST_CASE("a rich design: what an edit adds to the design's numbering changes no other unit") {
     const std::string base = rich({});
-    // TODO: the same in a middle module (kPairExtra) still changes the top's module:
-    // the parent's record layout and code depend on what its children add (block,
-    // event, covergroup, process counts). Found by this gate; needs those counts out
-    // of the parent's text (step 3e, record sizing).
     SUBCASE("the same in the top") {
         only_unit_changed(base, rich({ .top_extra = kTopExtra }), "top", 1);
+    }
+    // The top writes the ports of the module in the middle and services their wake
+    // buckets: what it finds there is the port's, not a place in the module's record,
+    // which what the module gains elsewhere moves.
+    SUBCASE("the same in a middle module") {
+        only_unit_changed(base, rich({ .pair_extra = kPairExtra }), "pair", 1);
+    }
+    SUBCASE("an assertion in a middle module") {
+        only_unit_changed(base, rich({ .pair_extra = "assert property (@(posedge s0) t0 != 8'hfe) else $error(\"t0\");" }),
+                          "pair", 1);
+    }
+    SUBCASE("a process in a middle module") {
+        only_unit_changed(base, rich({ .pair_extra = "logic [7:0] pc = 0; always #7 pc = pc + 1;" }), "pair", 1);
     }
     SUBCASE("a new instance is an edit of its parent (it owns the port copies) and of nothing else") {
         only_unit_changed(base, rich({ .top_insts = "  pair inst3 (.clk, .d, .q());" }), "top", 1);
@@ -300,5 +309,103 @@ TEST_CASE("a rich design: a unit's module names no instance") {
         CHECK(text.find("clotho.inst.") == std::string::npos);
         CHECK(text.find("top.inst") == std::string::npos);
         CHECK(text.find("clotho.expect") == std::string::npos); // a monitor's number is the design's
+    }
+}
+
+namespace {
+
+// A module whose parent writes its signals every way a unit's code can reach
+// another unit's: a blocking write that wakes its waiters, a nonblocking one
+// (block shadow, a partial select), a memory element, an event, and everything
+// dumped. The child already holds every kind of thing an edit adds, so an edit adds
+// to a design that has them (the first of a kind changes every unit's code).
+constexpr std::string_view kBound = R"(
+module child (input logic clk, input logic [7:0] d);
+@CPRE@
+  logic [7:0] v = 0;
+  logic [7:0] mem [0:3];
+  logic [7:0] w = 0;
+  event ev;
+  int seen = 0;
+  always @(v) seen = seen + 1;
+  always @(posedge clk) seen = seen + 2;
+  always @(ev) seen = seen + 3;
+  always @(w[0]) seen = seen + 4;
+  logic base_r; event base_e;
+  always_ff @(posedge clk) begin base_r <= ~d[0]; -> base_e; end
+  covergroup base_cg @(posedge clk); coverpoint d; endgroup
+  base_cg base_cgi = new;
+  assert property (@(posedge clk) d != 8'hfd) else $error("base");
+@CPOST@
+endmodule
+
+module top;
+  logic       clk = 0;
+  logic [7:0] d   = 1;
+  child c0 (.clk, .d);
+  child c1 (.clk, .d);
+  always #5 clk = ~clk;
+  always @(posedge clk) begin
+    c0.v = d;
+    c1.v <= d;
+    c0.mem[d[1:0]] <= d;
+    c1.w[0] <= d[0];
+    -> c0.ev;
+    d <= d + 1;
+  end
+  initial begin
+    $dumpvars(0, top);
+    #100 $display("%0d", c0.seen);
+    $finish;
+  end
+endmodule
+)";
+
+std::string bound(std::string_view pre, std::string_view post) {
+    std::string text(kBound);
+    const auto  put = [&](std::string_view key, std::string_view value) {
+        const size_t at = text.find(key);
+        REQUIRE(at != std::string::npos);
+        text.replace(at, key.size(), value);
+    };
+    put("@CPRE@", pre);
+    put("@CPOST@", post);
+    return text;
+}
+
+} // namespace
+
+TEST_CASE("a module that writes another unit's signals depends on the signals and not on the unit's body") {
+    const std::string base = bound("", "");
+    // The top is the only other unit: both children (the two differ in how the top
+    // uses them) change, and the top does not.
+    SUBCASE("a block, an event, a covergroup and an assertion after the signals") {
+        only_unit_changed(base,
+                          bound("",
+                                "logic extra; event ex; always_ff @(posedge clk) begin extra <= ~d[0]; -> ex; end "
+                                "covergroup cg2 @(posedge clk); coverpoint d; endgroup cg2 cgi2 = new; "
+                                "assert property (@(posedge clk) d != 8'hfe) else $error(\"d\");"),
+                          "child", 2);
+    }
+    SUBCASE("the same before them") {
+        only_unit_changed(base,
+                          bound("logic pre; logic [7:0] pre8 = 0; event pex; "
+                                "always_ff @(posedge clk) begin pre <= ~d[0]; pre8 <= pre8 + 1; -> pex; end",
+                                ""),
+                          "child", 2);
+    }
+    SUBCASE("a memory that is written nonblocking, before them") {
+        only_unit_changed(base, bound("logic [7:0] pm [0:1]; always_ff @(posedge clk) pm[d[0]] <= d;", ""), "child", 2);
+    }
+    SUBCASE("signals before them") {
+        only_unit_changed(base, bound("logic [7:0] ps0 = 0, ps1 = 0;", ""), "child", 2);
+    }
+}
+
+TEST_CASE("a module that writes another unit's signals names no instance") {
+    for (const auto& [name, text] : modules_of(bound("", ""))) {
+        INFO("module ", name);
+        CHECK(text.find("clotho.inst.") == std::string::npos);
+        CHECK(text.find("top.c") == std::string::npos); // an instance path of the design
     }
 }

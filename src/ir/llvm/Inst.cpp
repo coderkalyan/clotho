@@ -2581,10 +2581,10 @@ llvm::ConstantInt* Backend::const_from_bytes(std::span<const uint8_t> bytes, uin
 }
 
 // Whole-storage lvalue for a module signal (state struct). A signal the own
-// instance reaches through a binding carries the record of the instance that
-// owns it, which is what a virtual interface member carries too: every
-// def-relative base of the access (wake buckets, shadow, dump-var index) is then
-// read from the owner's record, at the owner's field constants.
+// instance reaches through a binding has its storage in the binding and every
+// other base of an access (wake buckets, shadow, dump-var index, ids) in its
+// port, which the binding names (port_elem_ptr); only a virtual interface member
+// carries an instance context, the record of the instance its handle names.
 LValue Backend::signal_lvalue(Signal sig) {
     const SignalSlot& s = slot_of(sig);
     LValue            lv{};
@@ -2610,7 +2610,6 @@ LValue Backend::signal_lvalue(Signal sig) {
         lv.sig         = sig;
         lv.is_string   = s.is_string;
     }
-    lv.vif_ctx = bound_record(s);
     return lv;
 }
 

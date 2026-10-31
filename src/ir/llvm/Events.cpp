@@ -106,14 +106,11 @@ void Backend::emit_delay_timer(llvm::Value* ticks) {
 
 // Store a { handle, flag_ptr } entry at a chosen slot of a queue array. The
 // edge is no longer stored per entry — it is encoded by which sub-queue the
-// entry lives in.
-void Backend::emit_entry(llvm::ArrayType* arr_ty,
-                         llvm::Value*     q,
-                         llvm::Value*     slot_idx,
-                         llvm::Value*     handle,
-                         llvm::Value*     flag_ptr) {
+// entry lives in. The slot is addressed by element, so a writer of another
+// unit's bucket names no capacity.
+void Backend::emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr) {
     llvm::StructType* elem = wait_elem_ty();
-    llvm::Value*      slot = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), slot_idx });
+    llvm::Value*      slot = b_.CreateInBoundsGEP(elem, q, slot_idx);
     b_.CreateStore(handle, b_.CreateStructGEP(elem, slot, 0));
     b_.CreateStore(flag_ptr, b_.CreateStructGEP(elem, slot, 1));
 }
@@ -139,7 +136,7 @@ void Backend::emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* hand
         return;
     }
     const uint32_t slot = sta_next_[i][edge]++;
-    emit_entry(wait_sta_ty_[i][edge], sym(wait_sta_gv_[i][edge]), b_.getInt32(slot), handle, flag_ptr);
+    emit_entry(sym(wait_sta_gv_[i][edge]), b_.getInt32(slot), handle, flag_ptr);
 }
 
 // One-shot (intra-body @(sig)) registration: append this coroutine to the
@@ -167,14 +164,21 @@ void Backend::emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* hand
 // still needs a growable bucket, and in a design without a fork it is
 // unguarded. Sizing it to a constant would only move the cliff.
 void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
-    const auto   i       = static_cast<uint32_t>(sig);
-    llvm::Value* len_ptr = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
-    llvm::Value* q       = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
-    auto*        i32     = b_.getInt32Ty();
-    llvm::Value* len     = b_.CreateLoad(i32, len_ptr);
-    emit_len_full_check(b_, len, b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements())),
-                        kRingWaitDynamic);
-    emit_entry(wait_dyn_ty_[i][edge], q, len, parked_handle(b_, hdl_), sched_ptr_);
+    const auto        i       = static_cast<uint32_t>(sig);
+    const SignalSlot& s       = slots_[i];
+    llvm::Value*      len_ptr = wait_base(WaitPart::DynamicLen, sig, edge);
+    llvm::Value*      q       = wait_base(WaitPart::Dynamic, sig, edge);
+    auto*             i32     = b_.getInt32Ty();
+    llvm::Value*      len     = b_.CreateLoad(i32, len_ptr);
+    // The bucket's capacity is every waiter of the signal's, the owner's own
+    // among them, so a signal of another unit's code reads it from the signal's
+    // port instead of baking it.
+    llvm::Value* cap =
+      port_reachable(s) && binding_of(s) != no_bind
+        ? static_cast<llvm::Value*>(b_.CreateLoad(i32, port_elem_ptr(s, port_of(s)->dyn[edge].cap)))
+        : b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()));
+    emit_len_full_check(b_, len, cap, kRingWaitDynamic);
+    emit_entry(q, len, parked_handle(b_, hdl_), sched_ptr_);
     b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_ptr);
 }
 
@@ -231,10 +235,6 @@ void Backend::lower_wait(ExtraIndex info) {
                             parked_handle(b_, hdl_), sched_ptr_,
                             /*record_owner=*/!event_is_mono(e.signal));
         } else {
-            std::optional<CtxOverride> ov;
-            if (llvm::Value* rec = bound_record(slot_of(e.signal)); rec != nullptr) {
-                ov.emplace(*this, rec, slot_of(e.signal).anchor);
-            }
             emit_dynamic_register(e.signal, e.edge);
         }
     }
@@ -263,10 +263,6 @@ void Backend::lower_wait(ExtraIndex info) {
             emit_event_unlink(event_wait_node(ev_k++),
                               event_is_mono(e.signal) ? event_obj(e.signal) : nullptr);
         } else if (remove_sigs) {
-            std::optional<CtxOverride> ov;
-            if (llvm::Value* rec = bound_record(slot_of(e.signal)); rec != nullptr) {
-                ov.emplace(*this, rec, slot_of(e.signal).anchor);
-            }
             emit_dynamic_remove(e.signal, e.edge);
         }
     }
@@ -869,37 +865,6 @@ void Backend::build_wait_queues() {
             }
         }
     }
-
-    // Def-local wait-bucket slots (module-dedup prep): for a reused
-    // definition, body-side queue access goes through a def-local slot in
-    // the instance context (ctx_wait_base + slot) instead of a per-instance
-    // queue global. Slot numbering follows the def-local signal walk and
-    // the (padded, so def-uniform) bucket existence — identical across
-    // twin instances by construction. main fills the pointers at startup.
-    wait_slot_sta_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    wait_sta_ord_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    for (uint32_t a = 0; a < anchors_.size(); ++a) {
-        uint32_t next = 0;
-        uint32_t sta  = 0;
-        for (const Signal sj : by_anchor[a]) {
-            if (sj == Signal{ ~0u }) {
-                continue;
-            }
-            const auto si = static_cast<uint32_t>(sj);
-            for (uint32_t e = 0; e < 3; ++e) {
-                if (wait_sta_gv_[si][e] != nullptr) {
-                    wait_slot_sta_[si][e] = next++;
-                    wait_sta_ord_[si][e]  = sta++;
-                }
-                if (wait_dyn_gv_[si][e] != nullptr) {
-                    wait_slot_dyn_[si][e] = next++;
-                    wait_slot_len_[si][e] = next++;
-                }
-            }
-        }
-    }
 }
 
 // The dense trigger id for a (signal, edge) that fires a `<= @e` deferred store,
@@ -1439,39 +1404,42 @@ void Backend::emit_trigger_fire(llvm::Value* trig_id) {
     b_.SetInsertPoint(done);
 }
 
-// Body-side base pointer of a wait bucket: loaded from the owning
-// instance's wait-pointer table when its definition is reused (def-local
-// slot constant — twin bodies stay identical), the absolute queue global
-// otherwise. Commit functions / the seed loop keep the globals directly.
-llvm::Value* Backend::wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig) {
-    if (slot == no_wait_slot || !def_relative_for(slots_[sig])) {
-        if (slots_[sig].anchor != SignalSlot::no_anchor) {
-            taint("names a wait bucket of one instance");
-        }
-        return sym(llvm::cast<llvm::GlobalVariable>(gv));
+// Body-side base pointer of a wait bucket piece: loaded from the signal's port
+// where the body reaches it (the own instance's record, or the port address a
+// binding holds for a signal of another instance), the bucket's own global
+// otherwise. Root's code (commit functions, the seed loop) keeps the globals
+// directly.
+llvm::Value* Backend::wait_base(WaitPart part, Signal sig, uint32_t edge) {
+    const auto        i = static_cast<uint32_t>(sig);
+    const SignalSlot& s = slots_[i];
+    if (port_reachable(s)) {
+        const PortLayout& pl   = *port_of(s);
+        const uint32_t    elem = part == WaitPart::Static    ? pl.sta[edge].base
+                                 : part == WaitPart::Dynamic ? pl.dyn[edge].base
+                                                             : pl.dyn[edge].len;
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
     }
-    Anchor& a = anchors_[slots_[sig].anchor];
-    return ctx_field(a, a.ctx_wait_base + slot, llvm::PointerType::getUnqual(ctx_));
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names a wait bucket of one instance");
+    }
+    llvm::GlobalVariable* gv = part == WaitPart::Static    ? wait_sta_gv_[i][edge]
+                               : part == WaitPart::Dynamic ? wait_dyn_gv_[i][edge]
+                                                           : wait_dyn_len_gv_[i][edge];
+    return sym(gv);
 }
 
 // The trigger bits a wake of (sig, edge) ORs into a subscriber's wake word, as
 // data: they are design-global colours (compute_trigger_masks), so no unit's
 // code may hold them as an immediate. The owner's code finds them in its own
-// record; any other writer reads the owner's record global (a design symbol,
-// like the bucket it scans), and a signal of no instance has a global of its
-// own per bucket.
+// record's port, a writer of another instance's signal in the port its binding
+// names, any other writer (root's) in the owner's record global (a design
+// symbol, like the bucket it scans), and a signal of no instance has a global of
+// its own per bucket.
 llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
-    const auto     i   = static_cast<uint32_t>(sig);
-    const uint32_t ord = wait_sta_ord_[i][edge];
-    if (ord != no_wait_slot && def_relative_for(slots_[i])) {
-        Anchor& a = anchors_[slots_[i].anchor];
-        return ctx_field(a, a.ctx_trig_base + ord, b_.getInt64Ty());
-    }
-    if (ord != no_wait_slot) {
-        Anchor& a   = anchors_[slots_[i].anchor];
-        auto*   gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
-          a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(a.ctx_trig_base + ord) });
-        return b_.CreateLoad(b_.getInt64Ty(), gep);
+    const auto        i = static_cast<uint32_t>(sig);
+    const SignalSlot& s = slots_[i];
+    if (s.anchor != SignalSlot::no_anchor && wait_sta_gv_[i][edge] != nullptr) {
+        return b_.CreateLoad(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
     }
     if (wait_sta_trig_gv_[i][edge] != nullptr) {
         return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
@@ -1487,17 +1455,18 @@ llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
 // still lets the optimizer unroll. Membership never changes — no compaction,
 // no length.
 //
-// The owner's own code reads the bucket's subscriber count from its instance
-// record, the exact count of that instance, so the scan needs no padding; any
-// other writer bakes the per-definition maximum (null-checked when twins
+// A body that reaches the signal's port (the owner's own code, or a writer of
+// another instance's signal through its binding) reads the bucket's subscriber
+// count from it, the exact count of that instance, so the scan needs no padding;
+// any other writer bakes the per-definition maximum (null-checked when twins
 // differ). The trigger bits are data for every writer (static_trig_bits).
 void Backend::service_static_queue(Signal sig, uint32_t edge) {
-    const auto     i    = static_cast<uint32_t>(sig);
-    const uint32_t ord  = wait_sta_ord_[i][edge];
-    llvm::Value*   base = wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i);
-    if (ord != no_wait_slot && def_relative_for(slots_[i])) {
-        Anchor& a = anchors_[slots_[i].anchor];
-        emit_static_scan_rt(base, ctx_field(a, a.ctx_cap_base + ord, b_.getInt32Ty()), false, static_trig_bits(sig, edge));
+    const auto        i    = static_cast<uint32_t>(sig);
+    const SignalSlot& s    = slots_[i];
+    llvm::Value*      base = wait_base(WaitPart::Static, sig, edge);
+    if (port_reachable(s)) {
+        emit_static_scan_rt(base, b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
+                            static_trig_bits(sig, edge));
         return;
     }
     emit_static_scan_rt(base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
@@ -1510,9 +1479,7 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
 // resets to 0); the firing process deregisters its stale entries from any
 // OTHER buckets itself on resume (eager removal in lower_wait).
 void Backend::service_dynamic_queue(Signal sig, uint32_t edge) {
-    const auto i = static_cast<uint32_t>(sig);
-    emit_dynamic_scan_rt(wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i),
-                         wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i));
+    emit_dynamic_scan_rt(wait_base(WaitPart::Dynamic, sig, edge), wait_base(WaitPart::DynamicLen, sig, edge));
 }
 
 // The detached timer node a `->> #d e` schedules: an rt_timer ({next,
@@ -1885,10 +1852,8 @@ Plane Backend::lower_event_triggered(llvm::Value* obj) {
 // `mine` is the PARKED form of this handle -- what emit_dynamic_register
 // wrote -- so the comparison matches for reactive code too.
 void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
-    const auto        i      = static_cast<uint32_t>(sig);
-    llvm::Value*      q      = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
-    auto*             arr_ty = wait_dyn_ty_[i][edge];
-    llvm::Value*      len_gv = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
+    llvm::Value*      q      = wait_base(WaitPart::Dynamic, sig, edge);
+    llvm::Value*      len_gv = wait_base(WaitPart::DynamicLen, sig, edge);
     llvm::StructType* elem   = wait_elem_ty();
     auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
     auto*             i32    = b_.getInt32Ty();
@@ -1911,14 +1876,14 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
     b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* src  = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
+    llvm::Value* src  = b_.CreateInBoundsGEP(elem, q, idx);
     llvm::Value* h    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
     llvm::Value* f    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
     llvm::Value* mine = b_.CreateICmpEQ(h, parked_handle(b_, hdl_));
     b_.CreateCondBr(mine, cont, keep); // ours -> drop; else -> keep
 
     b_.SetInsertPoint(keep);
-    llvm::Value* dst = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), w });
+    llvm::Value* dst = b_.CreateInBoundsGEP(elem, q, w);
     b_.CreateStore(h, b_.CreateStructGEP(elem, dst, 0));
     b_.CreateStore(f, b_.CreateStructGEP(elem, dst, 1));
     llvm::Value* w_keep = b_.CreateAdd(w, b_.getInt32(1));

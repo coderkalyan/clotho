@@ -135,23 +135,25 @@ void Backend::vcd_index_signal(Signal sig, uint32_t& next) {
 }
 
 // The rt_vcd_touch index of a dumped signal: the instance's dump-var base (a
-// record field) + the signal's def-local offset. The record is the own
-// instance's, or the one a binding or an installed context names for another
-// instance's signal; code outside a group, and a signal of no instance, keep the
-// folded constant.
+// record field) + the signal's def-local offset, for the own instance's signal
+// and one an installed context names; the index the signal's port holds for a
+// signal of another instance reached through a binding, so the code names no
+// ordinal of the owner's; code outside a group, and a signal of no instance,
+// keep the folded constant.
 llvm::Value* Backend::vcd_index_value(Signal sig, int32_t base) {
     const SignalSlot& s = slot_of(sig);
     if (s.anchor != SignalSlot::no_anchor && anchors_[s.anchor].first_vcd >= 0) {
-        Anchor&      a  = anchors_[s.anchor];
-        llvm::Value* b0 = nullptr;
+        Anchor& a = anchors_[s.anchor];
         if (def_relative_for(s)) {
-            b0 = ctx_field(a, kCtxFirstVcd, b_.getInt32Ty());
-        } else if (llvm::Value* rec = bound_record(s); rec != nullptr) {
-            b0 = b_.CreateLoad(b_.getInt32Ty(),
-                               b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(kCtxFirstVcd) }));
+            return b_.CreateAdd(ctx_field(a, kCtxFirstVcd, b_.getInt32Ty()),
+                                b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
         }
-        if (b0 != nullptr) {
-            return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
+        if (llvm::Value* port = bound_port(s); port != nullptr && port_of(s)->vcd != no_port_elem) {
+            llvm::Value* index = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(port_of(s)->ty, port, port_of(s)->vcd));
+            // Every caller names the signal's own first index; an element of an
+            // array is the caller's own addend.
+            assert(base == vcd_index_[static_cast<uint32_t>(sig)]);
+            return index;
         }
     }
     return b_.getInt32(static_cast<uint32_t>(base));

@@ -249,7 +249,7 @@ properly instead of avoiding it.
 
 **P4 is a separate feature.** The mechanics are local — staging has two entry
 points (`lower_store_nb`:18401, `register_block_store`:18546), commit is per
-`BlockSig`, and `nba_meta` needs no renumbering — but the qualification proof
+`BlockSig`, and no table of block metadata needs renumbering (the commit functions are code of the writer's unit) — but the qualification proof
 is wide. A scalar NBA target may be observed through the shadow/commit path by
 static and dynamic wait queues, virtual-interface waiters, `<= @e` triggers,
 intra-assignment record pools, VCD, `$strobe`/`$monitor`, Preponed sampling

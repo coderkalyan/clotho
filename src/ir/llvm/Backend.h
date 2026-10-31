@@ -866,6 +866,12 @@ struct SignalSlot {
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
     uint32_t sh_mask_field = 0;
+    // The signal's fields of the block shadow are contiguous in its instance's
+    // shadow struct: `sh_count` of them from `sh_first` (a scalar's mm plane, then
+    // its z plane and its dirty mask as it has them; an aggregate target's leaves'
+    // planes in order). 0 for a signal that stages nothing there.
+    uint32_t sh_first = 0;
+    uint32_t sh_count = 0;
     // A string (or array-of-string) signal: the slot is an opaque rt_string
     // handle (`clotho.string`), has_z is false, and `nba` is never set (the
     // frontend rejects nonblocking assignment to strings).
@@ -931,6 +937,54 @@ struct SignalSlot {
 enum class IdFamily : uint32_t { Arr, Agg, Handle, Str, Intra, TrigPos, TrigNeg, TrigAny };
 inline constexpr uint32_t kIdFamilies = 8;
 inline constexpr uint32_t no_id       = ~0u;
+
+// A signal's port: everything the code that WRITES the signal needs of the
+// signal's instance, kept in a struct of the signal's own, whose elements are a
+// function of the signal's facts alone (which wake buckets it has, which ids,
+// whether it is dumped, how many shadow fields): the signal's wake buckets (the
+// base of each static and dynamic one, a static one's subscriber count and
+// trigger bits, a dynamic one's length cell and capacity), its ids in the
+// design-wide id spaces, its dump-var index, the address of each of its shadow
+// fields and of the heads of its virtual-interface waiter lists. The instance's
+// record holds one port per signal that has any
+// of these, and a binding of another unit's signal holds that port's address, so
+// code that writes a signal of another instance reads its port and names
+// nothing of the owner's record layout: what the owner's unit gains elsewhere
+// (a process, an event, a covergroup, another signal) moves the port inside the
+// record and no one else's code.
+inline constexpr uint32_t no_port_elem = ~0u;
+struct PortLayout {
+    static constexpr std::array<uint32_t, kIdFamilies> none_ids = { no_port_elem, no_port_elem, no_port_elem, no_port_elem,
+                                                                    no_port_elem, no_port_elem, no_port_elem, no_port_elem };
+    // The struct, or null when nothing of the signal is reached from outside.
+    llvm::StructType* ty = nullptr;
+    // Element of each id family's i32.
+    std::array<uint32_t, kIdFamilies> id = none_ids;
+    // Element of the absolute dump-var index (i32) of a dumped signal.
+    uint32_t vcd = no_port_elem;
+    // Element of the first of `n_shadow` shadow slot addresses (ptr), one per
+    // field of the signal's shadow group (SignalSlot::sh_first + k).
+    uint32_t shadow   = no_port_elem;
+    uint32_t n_shadow = 0;
+    // Per edge (Edge::Any, Positive, Negative): a static bucket's base (ptr),
+    // trigger bits (i64) and subscriber count (i32); a dynamic bucket's base and
+    // length cell (ptr) and capacity (i32). no_port_elem for a bucket it lacks.
+    struct Static {
+        uint32_t base = no_port_elem;
+        uint32_t trig = no_port_elem;
+        uint32_t cap  = no_port_elem;
+    };
+    struct Dynamic {
+        uint32_t base = no_port_elem;
+        uint32_t len  = no_port_elem;
+        uint32_t cap  = no_port_elem;
+    };
+    std::array<Static, 3>  sta;
+    std::array<Dynamic, 3> dyn;
+    // Per edge, the element holding the address of the waiter-list head that
+    // `@(edge vif.sig)` waiters through a virtual interface park on.
+    std::array<uint32_t, 3> vif = { no_port_elem, no_port_elem, no_port_elem };
+};
 
 // The fixed leading fields of an instance record (Anchor, "Instance context");
 // every field after them is addressed through its Anchor::ctx_*_base. The first
@@ -998,11 +1052,6 @@ struct Anchor {
     //                      owns, at its def-local process ordinal: a group's
     //                      field is its front process's
     //                      (0 when the function registers none)
-    //   ctx_wait_base ptr  wait bucket bases (sta / dyn / dyn-len), def-local
-    //                      slot order from the bucket walk
-    //   ctx_cap_base  i32  each static bucket's subscriber count, in the
-    //                      instance's static-bucket order (wait_sta_ord_)
-    //   ctx_trig_base i64  each static bucket's trigger bits, same order
     //   ctx_sched_base [n x { i64, ptr }] one wake pair per owned process, at its
     //                      def-local ordinal (a group's is its front process's):
     //                      the wake word (the scheduled flag and the trigger
@@ -1010,6 +1059,12 @@ struct Anchor {
     //                      group's handle is the address of its pair, so the
     //                      entry is handed the pair and finds the record, and
     //                      its own wake word, at constant offsets from it
+    //   ctx_port_base PortLayout::ty  one port per signal of the definition that
+    //                      has anything for a writer (see PortLayout), in the
+    //                      definition's signal order and the same for every unit
+    //                      of one state type (a virtual interface names a member by
+    //                      its representative's field): wake bucket bases, counts
+    //                      and trigger bits, ids, dump-var index, shadow addresses
     //   ctx_mmask_base i64 one per owned process, at its def-local ordinal: the
     //                      trigger bits of the process's own events, which its
     //                      member guard tests (0 unless it is a member of a
@@ -1017,40 +1072,43 @@ struct Anchor {
     //   ctx_gmask_base i64 same indexing: for the front process of a guarded
     //                      group, the union of its members' bits, which the
     //                      group's fail-safe tests
-    //   ctx_bind_base ptr  two per binding (see n_bind): the address of an
-    //                      imported signal's storage, and the record of the
-    //                      instance that owns it (null for a signal of none)
+    //   ctx_bind_base ptr  three per binding (see n_bind): the address of an
+    //                      imported signal's storage, the record of the instance
+    //                      that owns it and the address of its port in that record
+    //                      (null for a signal of no instance, or with no port)
     //   ctx_fbind_base ptr one per function binding (see n_fbind): the record
     //                      of the instance that owns an imported function
     //                      (null for a function of none)
     // A writer in the instance's own code reads a bucket's base, count and
-    // trigger bits here, and a guarded group its masks, so none of them is
-    // baked into unit code: the buckets depend on who subscribes and the bits
+    // trigger bits from its port, and a guarded group its masks, so none of them
+    // is baked into unit code: the buckets depend on who subscribes and the bits
     // on the design-global colours (compute_trigger_masks), which are other
-    // units' business.
+    // units' business. A writer of another unit's signal reads the signal's port
+    // through its binding, never at an offset of the owner's record.
     // ctx_ty is shared across instances of one unit; the global is
     // created lazily by the first def-relative use.
-    llvm::StructType*     ctx_ty        = nullptr;
-    llvm::GlobalVariable* ctx_gv        = nullptr;
-    uint32_t              ctx_blk_base  = 0;
-    uint32_t              ctx_wait_base = 0;
-    uint32_t              ctx_cap_base  = 0;
-    uint32_t              ctx_trig_base = 0;
+    llvm::StructType*     ctx_ty         = nullptr;
+    llvm::GlobalVariable* ctx_gv         = nullptr;
+    uint32_t              ctx_blk_base   = 0;
     uint32_t              ctx_sched_base = 0;
+    uint32_t              ctx_port_base  = 0;
     uint32_t              ctx_mmask_base = 0;
     uint32_t              ctx_gmask_base = 0;
-    // Def-local count of owned processes (sizes the blk fields), and the length
-    // of each mask array (the same, or 0 when no group of the design is guarded).
+    // Def-local count of owned processes (sizes the blk fields), the length of
+    // each mask array (the same, or 0 when no group of the design is guarded) and
+    // the number of ports of the definition.
     uint32_t n_blk  = 0;
     uint32_t n_mask = 0;
+    uint32_t n_port = 0;
     // Bindings: one per extern signal declaration of the unit that names an
-    // instance's storage (InstanceScope::externs), in the unit's order, two
-    // record fields each at ctx_bind_base + 2 * ordinal -- the address of the
-    // imported signal's storage, and the record of the instance that owns it
-    // (null for a signal of no instance) -- so every instance of a unit has the
-    // same layout whatever its imports resolve to. `externs` is the flat signal
-    // each is bound to in THIS instance; bind_of is its inverse, which names a
-    // flat signal's binding while the code of this instance is lowered.
+    // instance's storage (InstanceScope::externs), in the unit's order, three
+    // record fields each at ctx_bind_base + 3 * ordinal -- the address of the
+    // imported signal's storage, the record of the instance that owns it and the
+    // address of the signal's port in that record (null for a signal of no
+    // instance) -- so every instance of a unit has the same layout whatever its
+    // imports resolve to. `externs` is the flat signal each is bound to in THIS
+    // instance; bind_of is its inverse, which names a flat signal's binding while
+    // the code of this instance is lowered.
     uint32_t ctx_bind_base = 0;
     // Function bindings: one per extern function declaration of the unit
     // (InstanceScope::fn_externs), in the unit's order, one record field each at
@@ -1071,14 +1129,10 @@ struct Anchor {
     // Which function bindings the lowered code of this instance reads (only
     // those are filled).
     std::vector<uint8_t> fbind_used;
-    // The signals' ids in design-wide spaces (see IdFamily), one i32 field per
-    // (signal, family) the unit's signals have, at ctx_id_base + Backend::id_ord_.
-    uint32_t ctx_id_base = 0;
-    uint32_t n_id        = 0;
     // The instance's hierarchical name (`%m`): one ptr field at ctx_name_base, the
     // address of the borrowed string handle of its path (Backend::inst_path_global),
     // filled at startup, so code of the unit reads its instance's name and bakes
-    // none. It follows the id fields; later fields append after it.
+    // none. It follows the bindings; later fields append after it.
     uint32_t ctx_name_base = 0;
     // Deferred-assertion generation counters (LRM 16.4.2): one i64 per owned
     // process at ctx_defer_base + its def-local ordinal (that of the front process
@@ -1311,8 +1365,9 @@ private:
 
     llvm::Value* trigger_id_value(Signal sig, uint32_t edge);
 
-    // Give every signal's ids their record fields, and record each id's value
-    // for the fill (build_instance_ctx_layout).
+    // Join which id families each signal has over the signals at one position of
+    // a state type, and record each id's value for the fill (build_ports,
+    // build_instance_ctx_layout).
     void assign_id_fields();
 
     ModuleEnv& unit_env(const Anchor& a);
@@ -1760,10 +1815,35 @@ private:
     // The constant address of a signal's storage, as a binding is filled with.
     llvm::Constant* storage_address(const SignalSlot& s);
 
+    // The constant address of `s`'s port in its owner's record, as a binding is
+    // filled with. `s` must have a port and an owner instance.
+    llvm::Constant* port_address(const SignalSlot& s);
+
     // The record of the instance that owns `s` when the code reaches it through a
     // binding, else null (the signal is addressed directly, or belongs to no
-    // instance).
+    // instance). Nothing but the record a deferred write saves (record_ptr)
+    // reads it: a writer finds what it needs of `s` in its port.
     llvm::Value* bound_record(const SignalSlot& s);
+
+    // The address of `s`'s port when the code reaches it through a binding, else
+    // null.
+    llvm::Value* bound_port(const SignalSlot& s);
+
+    // `s`'s port layout, or null when nothing of it is reached from outside.
+    const PortLayout* port_of(const SignalSlot& s) const;
+
+    // Whether the body being lowered reaches `s`'s port: through the own record,
+    // an installed instance context, or a binding.
+    bool port_reachable(const SignalSlot& s);
+
+    // The address of element `elem` of `s`'s port, wherever the body reaches it
+    // (the own record, an installed instance context, a binding, or -- outside
+    // any instance's code -- the owner's record global).
+    llvm::Value* port_elem_ptr(const SignalSlot& s, uint32_t elem);
+
+    // Lay out each definition's ports (see PortLayout) and give every signal its
+    // port and the record field that holds it.
+    void build_ports();
 
     llvm::Value* vif_head_ptr(Signal sig, uint32_t edge);
 
@@ -2009,8 +2089,7 @@ private:
 
     void emit_delay_timer(llvm::Value* ticks);
 
-    void emit_entry(llvm::ArrayType* arr_ty, llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle,
-                    llvm::Value* flag_ptr);
+    void emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr);
 
     void emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* handle, llvm::Value* flag_ptr);
 
@@ -2478,7 +2557,13 @@ private:
 
     void emit_release_moment(Signal sig, const EdgeFacts& f);
 
-    llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig);
+    // The pieces of a (signal, edge) wake bucket a writer addresses: the static
+    // subscribers' base, the dynamic waiters' base and their length cell.
+    enum class WaitPart : uint8_t { Static, Dynamic, DynamicLen };
+
+    // Where a bucket piece is for the body being lowered: read from the signal's
+    // port where the body reaches it, the bucket's own global otherwise.
+    llvm::Value* wait_base(WaitPart part, Signal sig, uint32_t edge);
 
     void service_static_queue(Signal sig, uint32_t edge);
 
@@ -4583,10 +4668,20 @@ private:
     llvm::GlobalVariable*   proc_pcb_gv_      = nullptr;
     llvm::ArrayType*        proc_pcb_arr_ty_  = nullptr;
     std::map<std::pair<uint32_t, llvm::StructType*>, ModuleEnv*> unit_env_of_;
-    // Per flat signal and id family: the signal's ordinal among its instance's id
-    // fields (Anchor::ctx_id_base + ordinal), or no_id when it has none.
-    std::vector<std::array<uint32_t, kIdFamilies>> id_ord_;
+    // Per flat signal and id family: whether the signal has an id there (joined
+    // over the signals at one position of a state type, so the layout of a port is
+    // the same wherever it is addressed), and its value for the fill.
+    std::vector<std::array<bool, kIdFamilies>>     id_has_;
     std::vector<std::array<uint32_t, kIdFamilies>> id_val_;
+    // Ports (see PortLayout), built by build_ports: the distinct layouts, and per
+    // flat signal the index of its layout (no_port when nothing of it is reached
+    // from outside) and the record field that holds its port.
+    static constexpr uint32_t no_port = ~0u;
+    std::vector<PortLayout>   port_layouts_;
+    std::vector<uint32_t>     port_idx_;
+    std::vector<uint32_t>     port_field_;
+    // Each state type's port field types, in the order of its record's port fields.
+    ankerl::unordered_dense::map<llvm::StructType*, std::vector<llvm::Type*>> ty_ports_;
     llvm::IRBuilder<>       b_;
     // Set while a group or a subroutine is lowered for sharing (taint); why it
     // cannot be.
@@ -5166,17 +5261,8 @@ private:
     // A signal of no instance has no record to hold its buckets' trigger bits:
     // each static bucket gets a global of its own, filled at startup.
     std::vector<std::array<llvm::GlobalVariable*, 3>> wait_sta_trig_gv_;
-    // Def-local wait-table slots per (signal, edge): ctx field ordinal (past
-    // ctx_wait_base) in the owning instance's context, or ~0 when the signal's
-    // owner is not a reused definition (body-side code then uses the absolute
-    // queue global).
-    static constexpr uint32_t no_wait_slot = ~0u;
-    std::vector<std::array<uint32_t, 3>> wait_slot_sta_;
-    std::vector<std::array<uint32_t, 3>> wait_slot_dyn_;
-    std::vector<std::array<uint32_t, 3>> wait_slot_len_;
-    // Ordinal of a (signal, edge)'s static bucket among its owning instance's
-    // static buckets (the cap and trig record fields), or no_wait_slot.
-    std::vector<std::array<uint32_t, 3>> wait_sta_ord_;
+    // Whether a bucket exists is `wait_*_gv_[signal][edge] != nullptr`; where a
+    // writer finds its pieces is the signal's port (PortLayout).
 
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;

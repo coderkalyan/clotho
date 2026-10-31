@@ -223,8 +223,8 @@ Two additions, both modelled on existing code:
    - **unpacked-array element**: the destination pointer is loaded from the record
      inside the loop. Wakes with the array path's unconditional Any-edge
      `service_any_waiters` and touches the whole element range for VCD — an array
-     signal is deliberately never an `nba` target, so it has no `nba_id` and the
-     `nba_meta` table must not be indexed by it (`docs/design/static-arr-nba.md`).
+     signal is deliberately never an `nba` target, so it has no shadow field and no block commit
+     names it (`docs/design/static-arr-nba.md`).
    - **aggregate leaf** (`emit_intra_agg_commit`): the record carries the leaf slot
      pointer plus a byte image, replayed by `memcpy` (or a byte-wise masked
      read-modify-write for a partial leaf write) exactly as

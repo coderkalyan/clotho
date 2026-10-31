@@ -274,26 +274,19 @@ llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
 }
 
 // A design-numbering id the code being lowered uses, as an IR value. The ids of
-// a signal's instance sit in that instance's record (assign_id_fields), so the
-// code that uses one names no number and the unit's code is the same whichever
-// instance it runs for: the own instance's record, or the record of the
-// instance a binding or an installed context names, at the signal's def-local
-// field. Where no record describes the signal -- code outside a group, a signal
-// of no instance -- the id is the immediate it has always been.
+// a signal's instance sit in the signal's port in that instance's record
+// (assign_id_fields), so the code that uses one names no number and the unit's
+// code is the same whichever instance it runs for: the own instance's record, the
+// port a binding names for a signal of another instance, or the record of the
+// instance an installed context names. Where no port describes the signal --
+// code outside a group, a signal of no instance -- the id is the immediate it has
+// always been.
 llvm::Value* Backend::id_value(Signal sig, IdFamily family, uint32_t id) {
     const SignalSlot& s = slot_of(sig);
-    if (s.anchor != SignalSlot::no_anchor && !id_ord_.empty()) {
-        const uint32_t ord = id_ord_[static_cast<uint32_t>(sig)][static_cast<uint32_t>(family)];
-        if (ord != no_id) {
-            Anchor& a = anchors_[s.anchor];
-            if (def_relative_for(s)) {
-                return ctx_field(a, a.ctx_id_base + ord, b_.getInt32Ty());
-            }
-            if (llvm::Value* rec = bound_record(s); rec != nullptr) {
-                return b_.CreateLoad(
-                  b_.getInt32Ty(),
-                  b_.CreateInBoundsGEP(a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(a.ctx_id_base + ord) }));
-            }
+    if (port_reachable(s)) {
+        const uint32_t elem = port_of(s)->id[static_cast<uint32_t>(family)];
+        if (elem != no_port_elem) {
+            return b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, elem));
         }
     }
     return b_.getInt32(id);

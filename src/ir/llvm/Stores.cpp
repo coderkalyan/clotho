@@ -679,12 +679,8 @@ void Backend::emit_block_commit_body(uint32_t id) {
     for (const BlockSig& bs : block_commits_[id].sigs) {
         const SignalSlot& s = slot_of(bs.sig);
         // A signal of another instance, which the writer reaches through a binding,
-        // resolves every def-relative base (storage, shadow, wait buckets, dump-var
-        // index) against the record of its owner, as the store that staged it did.
-        std::optional<CtxOverride> ov;
-        if (llvm::Value* rec = bound_record(s); rec != nullptr) {
-            ov.emplace(*this, rec, s.anchor);
-        }
+        // finds its storage in the binding and its shadow, wake buckets, ids and
+        // dump-var index in the signal's port, as the store that staged it did.
         if (s.nba_agg) {
             emit_agg_commit(bs.sig, bs.mask);
             continue;

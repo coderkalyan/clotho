@@ -505,7 +505,7 @@ void Backend::build_state_types() {
     // (shadow_ptr resolves the instance base). Root shadow layout is
     // otherwise as before — one struct behind the opaque shadow base.
     if (n_nba_ > 0) {
-        const auto add_fields = [&](SignalSlot& slot, std::vector<llvm::Type*>& sf) {
+        const auto add_slot_fields = [&](SignalSlot& slot, std::vector<llvm::Type*>& sf) {
             // An aggregate target shadows each static leaf's mm (and z, for a
             // 4-state leaf) plane; the commit selects leaves by the block's
             // static-leaf-set mask. A runtime-path-only aggregate (deferred
@@ -538,6 +538,13 @@ void Backend::build_state_types() {
                 slot.sh_mask_field = static_cast<uint32_t>(sf.size());
                 sf.push_back(int_ty(slot.width));
             }
+        };
+        // A signal's fields are contiguous: a writer of another unit finds each
+        // one's address in the signal's port, by its place in the group.
+        const auto add_fields = [&](SignalSlot& slot, std::vector<llvm::Type*>& sf) {
+            slot.sh_first = static_cast<uint32_t>(sf.size());
+            add_slot_fields(slot, sf);
+            slot.sh_count = static_cast<uint32_t>(sf.size()) - slot.sh_first;
         };
 
         std::vector<llvm::Type*> sf;
@@ -634,12 +641,64 @@ llvm::Constant* Backend::storage_address(const SignalSlot& s) {
     return llvm::ConstantExpr::getInBoundsGetElementPtr(a.ty, sym(a.state_gv), idx);
 }
 
+// The address of a signal's port in its owner's record as a link-time constant:
+// what a binding to the signal holds besides its storage.
+llvm::Constant* Backend::port_address(const SignalSlot& s) {
+    assert(s.anchor != SignalSlot::no_anchor && port_of(s) != nullptr);
+    const auto si = static_cast<size_t>(&s - slots_.data());
+    Anchor&    a  = anchors_[s.anchor];
+    return llvm::ConstantExpr::getInBoundsGetElementPtr(
+      a.ctx_ty, ensure_ctx(a),
+      llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(a.ctx_port_base + port_field_[si]) });
+}
+
 llvm::Value* Backend::bound_record(const SignalSlot& s) {
     const uint32_t k = binding_of(s);
     if (k == no_bind || s.anchor == SignalSlot::no_anchor) {
         return nullptr;
     }
-    return own_field(anchors_[own_anchor_].ctx_bind_base + 2 * k + 1, llvm::PointerType::getUnqual(ctx_));
+    return own_field(anchors_[own_anchor_].ctx_bind_base + 3 * k + 1, llvm::PointerType::getUnqual(ctx_));
+}
+
+llvm::Value* Backend::bound_port(const SignalSlot& s) {
+    if (s.anchor == SignalSlot::no_anchor || port_of(s) == nullptr) {
+        return nullptr;
+    }
+    const uint32_t k = binding_of(s);
+    if (k == no_bind) {
+        return nullptr;
+    }
+    return own_field(anchors_[own_anchor_].ctx_bind_base + 3 * k + 2, llvm::PointerType::getUnqual(ctx_));
+}
+
+const PortLayout* Backend::port_of(const SignalSlot& s) const {
+    const auto si = static_cast<size_t>(&s - slots_.data());
+    if (si >= port_idx_.size() || port_idx_[si] == no_port) {
+        return nullptr;
+    }
+    return &port_layouts_[port_idx_[si]];
+}
+
+bool Backend::port_reachable(const SignalSlot& s) {
+    return s.anchor != SignalSlot::no_anchor && port_of(s) != nullptr &&
+           (def_relative_for(s) || binding_of(s) != no_bind);
+}
+
+// An element of `s`'s port, wherever the body being lowered reaches it: through a
+// binding for a signal of another instance (the port's address is a field of the
+// own record, so the code names no field of the owner's), else a field of the
+// record the own instance, an installed instance context, or -- in root's code,
+// which names every instance -- the owner's record global supplies.
+llvm::Value* Backend::port_elem_ptr(const SignalSlot& s, uint32_t elem) {
+    const PortLayout* pl = port_of(s);
+    assert(pl != nullptr && elem != no_port_elem);
+    llvm::Value* port = bound_port(s);
+    if (port == nullptr) {
+        const auto si = static_cast<size_t>(&s - slots_.data());
+        Anchor&    a  = anchors_[s.anchor];
+        port          = ctx_field_ptr(a, a.ctx_port_base + port_field_[si]);
+    }
+    return b_.CreateStructGEP(pl->ty, port, elem);
 }
 
 // Pointer to a signal's whole storage (its slot struct, or its [N x slot]
@@ -654,7 +713,7 @@ llvm::Value* Backend::storage_ptr(const SignalSlot& s) {
         // Another instance's (or a package's) signal: its address is a binding
         // of the own instance, filled at startup, so the code names no storage
         // of a neighbour.
-        return own_field(anchors_[own_anchor_].ctx_bind_base + 2 * k, llvm::PointerType::getUnqual(ctx_));
+        return own_field(anchors_[own_anchor_].ctx_bind_base + 3 * k, llvm::PointerType::getUnqual(ctx_));
     }
     std::vector<llvm::Value*> idx;
     idx.push_back(b_.getInt32(0));
@@ -685,6 +744,12 @@ llvm::Value* Backend::vif_head_ptr(Signal sig, uint32_t edge) {
         throw BackendError{ "internal: no virtual-interface waiter head for this member" };
     }
     Anchor&      a    = anchors_[s.anchor];
+    // A member of another instance, reached through a binding: the head's address
+    // is an element of the signal's port.
+    if (llvm::Value* port = bound_port(s); port != nullptr && port_of(s)->vif[edge] != no_port_elem) {
+        const PortLayout& pl = *port_of(s);
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), b_.CreateStructGEP(pl.ty, port, pl.vif[edge]));
+    }
     // Exactly storage_ptr's base rule: an instance's own group loads its
     // instance base rather than bake the instance's symbol.
     llvm::Value* base = def_relative_for(s) ? ctx_field(a, kCtxState, llvm::PointerType::getUnqual(ctx_))
@@ -732,6 +797,14 @@ bool Backend::def_relative_for(const SignalSlot& owner) const {
 llvm::Value* Backend::shadow_ptr(const SignalSlot& owner, uint32_t field) {
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     if (owner.anchor != SignalSlot::no_anchor) {
+        // A signal of another instance, reached through a binding: the address of
+        // the shadow slot is an element of the signal's port, so the code names
+        // nothing of the owner's shadow struct.
+        if (llvm::Value* port = bound_port(owner); port != nullptr) {
+            const PortLayout& pl = *port_of(owner);
+            assert(field >= owner.sh_first && field - owner.sh_first < pl.n_shadow);
+            return b_.CreateLoad(ptr, b_.CreateStructGEP(pl.ty, port, pl.shadow + (field - owner.sh_first)));
+        }
         // An NBA target's anchor always carries a shadow struct (the
         // fields were assigned per anchor in build_state_types).
         Anchor&      a    = anchors_[owner.anchor];
@@ -855,8 +928,10 @@ llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
 // replay hands to the wait-queue service so it wakes the instance the value
 // actually reached: through a virtual interface handle the one the handle
 // named; inside a subroutine reached through one, the instance formal 0
-// named (the body-wide override); from a member function its own record; from
-// a single-scope group the instance's record global.
+// named (the body-wide override); from a member function its own record; for a
+// signal of another instance the record its binding holds (a value the code
+// only carries -- the replay is root's, which knows every layout); from a
+// single-scope group the instance's record global.
 llvm::Value* Backend::record_ptr(const SignalSlot& s, llvm::Value* vif_ctx) {
     if (vif_ctx != nullptr) {
         return vif_ctx;
@@ -866,6 +941,9 @@ llvm::Value* Backend::record_ptr(const SignalSlot& s, llvm::Value* vif_ctx) {
     }
     if (own_ctx_ != nullptr && s.anchor == own_anchor_) {
         return own_ctx_;
+    }
+    if (llvm::Value* rec = bound_record(s); rec != nullptr) {
+        return rec;
     }
     return ensure_ctx(anchors_[s.anchor]);
 }
@@ -1108,19 +1186,21 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
     return lv_field_ptr(lv, 1);
 }
 
-// Give every signal an instance owns a field in its record for each design-wide
-// id it has (IdFamily), in the signal's def-local order, so the ordinals are the
-// same in every instance of a unit, and remember the id each field holds for the
-// startup fill. Presence is uniform across a unit's instances because the sets
-// the ids index are joined over them (nba_classify).
+// Find each design-wide id (IdFamily) every signal has, and remember each id's
+// value for the startup fill: the ids are elements of the signal's port, so the
+// code that uses one names no number. Which families a signal has is joined over
+// the signals at one position of a state type (the instances of a definition lay
+// out one port), because the sets the ids index are joined over twins
+// (nba_classify) and a virtual interface runs code lowered against one instance
+// on another's record.
 void Backend::assign_id_fields() {
     const size_t n = mod_.signals().size();
-    id_ord_.assign(n, [] {
+    id_val_.assign(n, [] {
         std::array<uint32_t, kIdFamilies> a;
         a.fill(no_id);
         return a;
     }());
-    id_val_ = id_ord_;
+    id_has_.assign(n, {});
     const auto note = [&](const std::vector<Signal>& sigs, IdFamily f, uint32_t base) {
         for (uint32_t k = 0; k < sigs.size(); ++k) {
             id_val_[static_cast<uint32_t>(sigs[k])][static_cast<uint32_t>(f)] = base + k;
@@ -1189,11 +1269,11 @@ void Backend::assign_id_fields() {
             spread(spread, top);
         }
     }
-    // The instances that share a state type (a definition) lay their id fields out
-    // alike: a field is there for a member if any of them has an id for it. Code
-    // lowered against one instance of a definition runs on another's record when a
-    // handle names it (CtxOverride), and the units of two instances of a definition
-    // can differ in which of their members have ids.
+    // The instances that share a state type (a definition) lay their ports out
+    // alike: an id is there for a member if any of them has it. Code lowered
+    // against one instance of a definition runs on another's record when a handle
+    // names it (CtxOverride), and the units of two instances of a definition can
+    // differ in which of their members have ids.
     using Presence = std::vector<std::array<bool, kIdFamilies>>;
     ankerl::unordered_dense::map<llvm::StructType*, Presence> present;
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
@@ -1211,42 +1291,147 @@ void Backend::assign_id_fields() {
             }
         }
     }
-    ankerl::unordered_dense::map<llvm::StructType*, std::pair<std::vector<std::array<uint32_t, kIdFamilies>>, uint32_t>>
-      layout;
-    for (const auto& [ty, p] : present) {
-        auto& [ords, n] = layout[ty];
-        ords.assign(p.size(), [] {
-            std::array<uint32_t, kIdFamilies> a;
-            a.fill(no_id);
-            return a;
-        }());
-        n = 0;
-        for (uint32_t pos = 0; pos < p.size(); ++pos) {
-            for (uint32_t f = 0; f < kIdFamilies; ++f) {
-                if (p[pos][f]) {
-                    ords[pos][f] = n++;
-                }
+    for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
+        const Presence& p    = present.at(anchors_[ai].ty);
+        const auto&     sigs = anchor_signals_[ai];
+        for (uint32_t pos = 0; pos < sigs.size(); ++pos) {
+            if (sigs[pos] != Signal{ ~0u }) {
+                id_has_[static_cast<uint32_t>(sigs[pos])] = p[pos];
             }
         }
     }
+}
+
+// Lay out each definition's ports (see PortLayout): per state type and def-local
+// signal position, what any signal at that position has for a writer -- joined
+// over the instances of the type, so every record of the type holds the same
+// ports in the same fields and a virtual interface can name a member by its
+// representative's -- then give every signal its port and the field that holds
+// it (a rank among the type's ports; the record places the ports after its wake
+// pairs, Anchor::ctx_port_base).
+void Backend::build_ports() {
+    const size_t n = mod_.signals().size();
+    port_layouts_.clear();
+    ty_ports_.clear();
+    port_idx_.assign(n, no_port);
+    port_field_.assign(n, no_port);
+
+    struct Facts {
+        std::array<bool, 3>           sta{};
+        std::array<bool, 3>           dyn{};
+        std::array<bool, 3>           vif{};
+        std::array<bool, kIdFamilies> id{};
+        bool                          vcd      = false;
+        uint32_t                      n_shadow = 0;
+    };
+    ankerl::unordered_dense::map<llvm::StructType*, std::vector<Facts>> joined;
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
-        const auto& [ords, n] = layout.at(anchors_[ai].ty);
-        const auto& sigs      = anchor_signals_[ai];
+        std::vector<Facts>& facts = joined[anchors_[ai].ty];
+        const auto&         sigs  = anchor_signals_[ai];
+        if (facts.size() < sigs.size()) {
+            facts.resize(sigs.size());
+        }
         for (uint32_t pos = 0; pos < sigs.size(); ++pos) {
-            if (sigs[pos] != Signal{ ~0u }) {
-                id_ord_[static_cast<uint32_t>(sigs[pos])] = ords[pos];
+            if (sigs[pos] == Signal{ ~0u }) {
+                continue;
+            }
+            const auto si = static_cast<uint32_t>(sigs[pos]);
+            Facts&     f  = facts[pos];
+            for (uint32_t e = 0; e < 3; ++e) {
+                f.sta[e] = f.sta[e] || wait_sta_gv_[si][e] != nullptr;
+                f.dyn[e] = f.dyn[e] || wait_dyn_gv_[si][e] != nullptr;
+                f.vif[e] = f.vif[e] || vif_wait_[si][e];
+            }
+            for (uint32_t k = 0; k < kIdFamilies; ++k) {
+                f.id[k] = f.id[k] || id_has_[si][k];
+            }
+            f.vcd      = f.vcd || (design_uses_vcd_ && vcd_index_[si] >= 0);
+            f.n_shadow = std::max(f.n_shadow, slots_[si].sh_count);
+        }
+    }
+
+    auto* ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* i32 = b_.getInt32Ty();
+    auto* i64 = b_.getInt64Ty();
+    // The elements of a port are a function of the facts alone; a bucket's three
+    // pieces are adjacent, so a writer's scan reads one line.
+    const auto lay_out = [&](const Facts& f) {
+        PortLayout               pl;
+        std::vector<llvm::Type*> el;
+        const auto               add = [&](llvm::Type* t) {
+            el.push_back(t);
+            return static_cast<uint32_t>(el.size() - 1);
+        };
+        for (uint32_t e = 0; e < 3; ++e) {
+            if (f.sta[e]) {
+                pl.sta[e] = { .base = add(ptr), .trig = add(i64), .cap = add(i32) };
+            }
+            if (f.dyn[e]) {
+                pl.dyn[e] = { .base = add(ptr), .len = add(ptr), .cap = add(i32) };
             }
         }
-        anchors_[ai].n_id = n;
+        for (uint32_t k = 0; k < kIdFamilies; ++k) {
+            if (f.id[k]) {
+                pl.id[k] = add(i32);
+            }
+        }
+        for (uint32_t e = 0; e < 3; ++e) {
+            if (f.vif[e]) {
+                pl.vif[e] = add(ptr);
+            }
+        }
+        if (f.vcd) {
+            pl.vcd = add(i32);
+        }
+        if (f.n_shadow != 0) {
+            pl.shadow   = static_cast<uint32_t>(el.size());
+            pl.n_shadow = f.n_shadow;
+            for (uint32_t k = 0; k < f.n_shadow; ++k) {
+                add(ptr);
+            }
+        }
+        if (!el.empty()) {
+            pl.ty = llvm::StructType::get(ctx_, el);
+        }
+        return pl;
+    };
+
+    // (layout index, rank among the type's ports) per type and position.
+    ankerl::unordered_dense::map<llvm::StructType*, std::vector<std::pair<uint32_t, uint32_t>>> placed;
+    for (const auto& [ty, facts] : joined) {
+        auto& at = placed[ty];
+        for (const Facts& f : facts) {
+            PortLayout pl = lay_out(f);
+            if (pl.ty == nullptr) {
+                at.emplace_back(no_port, no_port);
+                continue;
+            }
+            auto& types = ty_ports_[ty];
+            at.emplace_back(static_cast<uint32_t>(port_layouts_.size()), static_cast<uint32_t>(types.size()));
+            types.push_back(pl.ty);
+            port_layouts_.push_back(std::move(pl));
+        }
+    }
+    for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
+        const auto& at   = placed.at(anchors_[ai].ty);
+        const auto& sigs = anchor_signals_[ai];
+        for (uint32_t pos = 0; pos < sigs.size(); ++pos) {
+            if (sigs[pos] == Signal{ ~0u }) {
+                continue;
+            }
+            const auto si  = static_cast<uint32_t>(sigs[pos]);
+            port_idx_[si]   = at[pos].first;
+            port_field_[si] = at[pos].second;
+        }
     }
 }
 
 // Compute each instance context's type (see Anchor): shared per unit, fields
 // sized from the instance's process count (one block-id field per owned
-// process, and when some group is guarded two trigger-mask fields each), wait
-// buckets, bindings and ids. Runs after fusion grouping, trigger colouring,
-// wait-queue sizing and build_sched_flags (the process ordinals), before
-// lowering.
+// process, and when some group is guarded two trigger-mask fields each), the
+// definition's ports, bindings and the rest. Runs after fusion grouping,
+// trigger colouring, wait-queue sizing and build_sched_flags (the process
+// ordinals), before lowering.
 //
 // The block-id field of a group function is indexed by the def-local ordinal of
 // its front process, the same ordinal that names the function and indexes its
@@ -1255,6 +1440,7 @@ void Backend::assign_id_fields() {
 // unit because every instance has the same groups.
 void Backend::build_instance_ctx_layout() {
     assign_id_fields();
+    build_ports();
     disable_owner_.assign(mod_.disable_targets, { SignalSlot::no_anchor, 0 });
     cover_owner_.assign(mod_.cover_types.size(), { SignalSlot::no_anchor, 0 });
     expect_owner_.assign(mod_.monitors.size(), { SignalSlot::no_anchor, 0 });
@@ -1288,58 +1474,43 @@ void Backend::build_instance_ctx_layout() {
     // things, and the record is as much a unit's as its code is.
     std::map<std::pair<llvm::StructType*, uint32_t>, llvm::StructType*> def_ctx;
     for (Anchor& a : anchors_) {
-        a.n_blk        = def_blk[a.ty];
-        a.n_mask       = any_guarded_ ? a.n_blk : 0;
-        a.n_bind       = static_cast<uint32_t>(a.externs.size());
-        a.n_fbind      = static_cast<uint32_t>(a.fn_externs.size());
-        a.n_defer      = any_defer_ ? a.n_blk : 0;
-        a.n_proc       = design_uses_process_ || any_rng ? a.n_blk : 0;
-        a.n_prog       = has_program_initial() ? 1 : 0;
-        a.ctx_blk_base = kCtxFixed;
-        uint32_t nwait = 0;
-        uint32_t nsta  = 0;
-        for (const Signal sj : anchor_signals_[&a - anchors_.data()]) {
-            if (sj == Signal{ ~0u }) {
-                continue;
-            }
-            const auto si = static_cast<uint32_t>(sj);
-            for (uint32_t e = 0; e < 3; ++e) {
-                nwait += wait_slot_sta_[si][e] != no_wait_slot ? 1 : 0;
-                nwait += wait_slot_dyn_[si][e] != no_wait_slot ? 2 : 0;
-                nsta += wait_slot_sta_[si][e] != no_wait_slot ? 1 : 0;
-            }
-        }
-        a.ctx_wait_base        = a.ctx_blk_base + a.n_blk;
-        a.ctx_cap_base         = a.ctx_wait_base + nwait;
-        a.ctx_trig_base        = a.ctx_cap_base + nsta;
-        a.ctx_sched_base       = a.ctx_trig_base + nsta;
-        a.ctx_mmask_base       = a.ctx_sched_base + 1; // the wake pairs are one array field
-        a.ctx_gmask_base       = a.ctx_mmask_base + a.n_mask;
-        a.ctx_bind_base        = a.ctx_gmask_base + a.n_mask;
-        a.ctx_fbind_base       = a.ctx_bind_base + 2 * a.n_bind;
-        a.ctx_id_base          = a.ctx_fbind_base + a.n_fbind;
-        a.ctx_name_base        = a.ctx_id_base + a.n_id;
-        a.ctx_defer_base       = a.ctx_name_base + 1;
-        a.ctx_proc_base        = a.ctx_defer_base + a.n_defer;
-        a.ctx_prog_base        = a.ctx_proc_base + a.n_proc;
-        a.ctx_dis_base         = a.ctx_prog_base + a.n_prog;
-        a.ctx_cov_base         = a.ctx_dis_base + static_cast<uint32_t>(a.disable_locals.size());
-        a.ctx_subblk_base      = a.ctx_cov_base + static_cast<uint32_t>(a.cover_locals.size());
-        a.ctx_expect_base      = a.ctx_subblk_base + static_cast<uint32_t>(a.fn_locals.size());
+        a.n_blk          = def_blk[a.ty];
+        a.n_mask         = any_guarded_ ? a.n_blk : 0;
+        a.n_bind         = static_cast<uint32_t>(a.externs.size());
+        a.n_fbind        = static_cast<uint32_t>(a.fn_externs.size());
+        a.n_defer        = any_defer_ ? a.n_blk : 0;
+        a.n_proc         = design_uses_process_ || any_rng ? a.n_blk : 0;
+        a.n_prog         = has_program_initial() ? 1 : 0;
+        a.n_port         = static_cast<uint32_t>(ty_ports_[a.ty].size());
+        a.ctx_blk_base   = kCtxFixed;
+        a.ctx_sched_base = a.ctx_blk_base + a.n_blk;
+        // The wake pairs are one array field, then the ports: the fields that lead
+        // are the ones every body reads, and the ports of a definition are the same
+        // for every unit of it.
+        a.ctx_port_base   = a.ctx_sched_base + 1;
+        a.ctx_mmask_base  = a.ctx_port_base + a.n_port;
+        a.ctx_gmask_base  = a.ctx_mmask_base + a.n_mask;
+        a.ctx_bind_base   = a.ctx_gmask_base + a.n_mask;
+        a.ctx_fbind_base  = a.ctx_bind_base + 3 * a.n_bind;
+        a.ctx_name_base   = a.ctx_fbind_base + a.n_fbind;
+        a.ctx_defer_base  = a.ctx_name_base + 1;
+        a.ctx_proc_base   = a.ctx_defer_base + a.n_defer;
+        a.ctx_prog_base   = a.ctx_proc_base + a.n_proc;
+        a.ctx_dis_base    = a.ctx_prog_base + a.n_prog;
+        a.ctx_cov_base    = a.ctx_dis_base + static_cast<uint32_t>(a.disable_locals.size());
+        a.ctx_subblk_base = a.ctx_cov_base + static_cast<uint32_t>(a.cover_locals.size());
+        a.ctx_expect_base = a.ctx_subblk_base + static_cast<uint32_t>(a.fn_locals.size());
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ i32, ptr, ptr };
             static_assert(kCtxFixed == 3 && kCtxFirstVcd == 0 && kCtxShadow == 1 && kCtxState == 2,
                           "the record's leading fields are first_vcd, shadow, state");
             f.insert(f.end(), a.n_blk, i32);
-            f.insert(f.end(), nwait, ptr);
-            f.insert(f.end(), nsta, i32);
-            f.insert(f.end(), nsta, b_.getInt64Ty());
             f.push_back(llvm::ArrayType::get(wake_ty(), a.n_blk)); // the wake pairs (ctx_sched_base)
+            f.insert(f.end(), ty_ports_[a.ty].begin(), ty_ports_[a.ty].end()); // the ports (ctx_port_base)
             f.insert(f.end(), 2 * a.n_mask, b_.getInt64Ty());
-            f.insert(f.end(), 2 * a.n_bind, ptr);
+            f.insert(f.end(), 3 * a.n_bind, ptr);
             f.insert(f.end(), a.n_fbind, ptr);
-            f.insert(f.end(), a.n_id, i32);
             f.push_back(ptr); // the instance's name handle (ctx_name_base)
             f.insert(f.end(), a.n_defer, b_.getInt64Ty());
             f.insert(f.end(), a.n_proc, i32);
