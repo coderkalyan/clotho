@@ -5485,7 +5485,7 @@ TEST_CASE("a ref formal's signature is the same whatever its callers bind it to"
         return sigs[0];
     };
     const std::string by_var = sig("f(v);");
-    CHECK(by_var == "(ptr noalias %state, ptr %rng, ptr %proc, i8 %home, ptr %0, ptr %1)");
+    CHECK(by_var == "(ptr noalias %ctx, ptr %rng, ptr %proc, i8 %home, ptr %0, ptr %1)");
     CHECK(sig("f(q[0]);") == by_var);
     CHECK(sig("f(v); f(q[0]);") == by_var);
     CHECK(run_capture(R"(
@@ -5636,6 +5636,92 @@ TEST_CASE("an interface task's statics are per instance, however the instance wa
             end
         endmodule
     )") == "122 1101\n108 108\n");
+}
+
+TEST_CASE("twin modules calling an interface task through their port keep each interface instance's state") {
+    // The task belongs to the interface instance the port names, and so do its
+    // statics (LRM 13.4.2): each parent drives its own bus, whichever instance's
+    // code runs.
+    CHECK(run_capture(R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+        endinterface
+        module drv #(parameter int D = 1, parameter int K = 1) (bus_if b);
+            initial begin
+                #D;
+                b.put(10 * K);
+                b.put(20 * K);
+                $display("%m last %0d", b.last);
+            end
+        endmodule
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            drv #(.D(1), .K(1)) d0 (b0);
+            drv #(.D(5), .K(2)) d1 (b1);
+            initial #20 $finish;
+        endmodule
+    )") == "top.d0 last 122\ntop.d1 last 142\n");
+}
+
+TEST_CASE("an interface task called through a virtual interface acts on the instance the handle names") {
+    // One body serves every handle; the instance it runs on comes from the handle,
+    // so twin interface instances keep their own variables.
+    CHECK(run_capture(R"(
+        interface bus_if;
+            int last;
+            int hits;
+            task automatic put(input int v);
+                last = v;
+                hits++;
+            endtask
+            function int twice();
+                return last * 2;
+            endfunction
+        endinterface
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            virtual bus_if vi0 = b0;
+            virtual bus_if vi1 = b1;
+            initial begin
+                vi0.put(10); vi0.put(20); vi1.put(300);
+                $display("%0d %0d %0d %0d %0d", b0.last, b0.hits, b1.last, b1.hits, vi1.twice());
+            end
+        endmodule
+    )") == "20 2 300 1 600\n");
+}
+
+TEST_CASE("a fork child of a task in a twin instance runs on its own instance") {
+    // Each child is a body of the instance that forked it: it adds to that
+    // instance's `total`, scaled by that instance's parameter.
+    CHECK(run_capture(R"(
+        module m #(parameter int D = 1, parameter int K = 1);
+            int total;
+            task automatic add(int v);
+                #1 total += v * K;
+            endtask
+            initial begin
+                #D;
+                fork
+                    add(1);
+                    add(2);
+                join_none
+                #5;
+                $display("%m total %0d", total);
+            end
+        endmodule
+        module top;
+            m #(.D(1), .K(1)) a ();
+            m #(.D(2), .K(10)) b ();
+            initial #20 $finish;
+        endmodule
+    )") == "top.a total 3\ntop.b total 30\n");
 }
 
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {

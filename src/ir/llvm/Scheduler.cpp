@@ -2265,7 +2265,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // suspends (timing controls in the arg list are rejected), so one resume
     // runs it to completion. Ramping is indirect: rt_monitor_active_ramp yields
     // the registered body's ramp function pointer (or null), which we call with
-    // the task ABI (state, rng, wheel, proc, home, record). There is no calling
+    // the task ABI (instance record, rng, wheel, proc, home, completion record). There is no calling
     // process here, so the body seeds its own state from the module-wide one.
     if (design_uses_monitor_) {
         auto* fn      = b_.GetInsertBlock()->getParent();
@@ -2286,7 +2286,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         // No calling thread on this path either (the Postponed drain ramps the
         // registered body from main), so it names no control block and the region
         // it would inherit is the default Active one.
-        std::vector<llvm::Value*> margv{ state, sym(rng_global_), wheel,
+        std::vector<llvm::Value*> margv{ b_.CreateCall(monitor_active_record_fn(), {}), sym(rng_global_), wheel,
                                          llvm::ConstantPointerNull::get(ptr_ty), b_.getInt8(0), record };
         llvm::Value* hdl = b_.CreateCall(rampty, ramp, margv);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });

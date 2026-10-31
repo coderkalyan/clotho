@@ -129,7 +129,7 @@ void Backend::lower_strobe_pend(Index i) {
     const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-    std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
+    std::vector<llvm::Value*> argv{ callee_record(info.func), rng_slot_, wheel_ };
     argv.push_back(proc_arg());
     argv.push_back(callee_home());
     argv.push_back(pend_record_slot());
@@ -152,7 +152,7 @@ void Backend::lower_reactive_pend(Index i) {
     const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-    std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
+    std::vector<llvm::Value*> argv{ callee_record(info.func), rng_slot_, wheel_ };
     argv.push_back(proc_arg());
     // NOT the pending body's home. LRM 4.4.2.5 hands an action block to the
     // Reactive region of this time slot no matter which region decided the

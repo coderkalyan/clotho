@@ -1767,6 +1767,43 @@ private:
 
     llvm::Function* declare_task(FunctionId id);
 
+    // -- The record of a subroutine's instance --
+    //
+    // A function or task of an instance takes that instance's record as its first
+    // argument and addresses the instance through it, as a group does: its own
+    // storage, ids, wake buckets and the rest from the record, other instances'
+    // signals through bindings. One of no instance (a package's, `$unit`'s, a
+    // virtual interface body) takes the root state, which nothing reads, and
+    // addresses absolutely.
+
+    // The anchor of the instance `f` belongs to, or no_anchor.
+    uint32_t subroutine_anchor(const Function& f) const;
+
+    // The first argument of a direct call of `fid`: the record of the instance it
+    // belongs to -- the caller's own when it is the same instance -- else the root
+    // state. A caller that names the record of another instance by its symbol
+    // cannot be shared (taint).
+    llvm::Value* callee_record(FunctionId fid);
+
+    // What a virtual dispatch passes: the callee is chosen at run time, so its
+    // record cannot be, and a vtable entry of an instance's method is a thunk
+    // that supplies it (vtable_entry). The root state, like any callee that
+    // belongs to no instance reads.
+    llvm::Value* dispatch_record();
+
+    // The pointer a vtable or an interface-method table holds for `fid`: the
+    // function itself, or for one of an instance a root thunk of the same
+    // signature that calls it with the instance's record.
+    llvm::Function* vtable_entry(FunctionId fid);
+
+    // The thunks of every vtable entry that needs one, made before any body so
+    // the records they name exist when main fills them.
+    void make_vtable_entries();
+
+    // The records of the instances that export a subroutine to C, created before
+    // main fills them: the export thunks come after it.
+    void reserve_export_records();
+
 
     uint32_t formal_param_count(const Function& f, size_t k) const;
 
@@ -2530,6 +2567,7 @@ private:
     llvm::FunctionCallee monitor_set_fn();
     llvm::FunctionCallee monitor_enable_fn();
     llvm::FunctionCallee monitor_active_ramp_fn();
+    llvm::FunctionCallee monitor_active_record_fn();
 
     llvm::FunctionCallee timeformat_init_fn();
     llvm::FunctionCallee timeformat_set_fn();
@@ -3736,7 +3774,7 @@ private:
     void lower_virtual_call_inst(Index i);
 
     void lower_call_common(Index i, const Function& f, llvm::FunctionType* fnty,
-                           llvm::Value* callee, ExtraSlice arg_slice);
+                           llvm::Value* callee, llvm::Value* record, ExtraSlice arg_slice);
 
     static uint32_t dpi_nchunks(uint32_t w);
 
@@ -4314,6 +4352,9 @@ private:
     // Declarations of the functions that belong to an instance (flatten copies
     // each function per instance), which a shared group cannot name.
     ankerl::unordered_dense::set<const llvm::Function*> instance_fns_;
+    // The root thunk of each vtable entry that belongs to an instance, by FunctionId
+    // (vtable_entry).
+    ankerl::unordered_dense::map<uint32_t, llvm::Function*> vtable_thunks_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;

@@ -585,7 +585,13 @@ void Backend::build_nba_state() {
 // LLVM insert block, so back-to-back fused members that share one block coalesce
 // into a single enqueue + commit.
 void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) {
-    if (own_anchor_ != SignalSlot::no_anchor && slot_of(sig).anchor != own_anchor_) {
+    // The record's block-id fields are indexed by a group's process ordinal, which
+    // a subroutine has none of: its blocks keep their absolute ids, which no other
+    // instance can run.
+    const bool in_group = own_anchor_ != SignalSlot::no_anchor && cur_fn_ == nullptr;
+    if (cur_fn_ != nullptr) {
+        taint("stages a nonblocking write from a subroutine");
+    } else if (own_anchor_ != SignalSlot::no_anchor && slot_of(sig).anchor != own_anchor_) {
         taint("stages a nonblocking write into another instance");
     }
     // Open a new block on the first NBA of a segment (the enqueue call is emitted
@@ -596,7 +602,7 @@ void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) 
         block_commits_.push_back({});
         cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
         llvm::Value* id  = b_.getInt32(cur_block_id_);
-        if (own_anchor_ != SignalSlot::no_anchor) {
+        if (in_group) {
             // Instance-relative: the instance record's field for this function
             // (a single-scope group, or a member of a group spanning instances)
             // holds its first block id, and a later block adds its local

@@ -266,7 +266,7 @@ llvm::GlobalVariable* Backend::class_desc_global(Ref class_ref) {
     std::vector<llvm::Constant*> entries;
     entries.reserve(cd->slots.size());
     for (const FunctionId fid : cd->slots) {
-        entries.push_back(sym(fn_decls_[static_cast<uint32_t>(fid)]));
+        entries.push_back(vtable_entry(fid));
     }
     std::vector<llvm::Constant*> disp(kMaxClassDepth, b_.getInt32(0));
     // Walk to the root filling the display back to front: `element` is the base
@@ -290,9 +290,9 @@ llvm::GlobalVariable* Backend::class_desc_global(Ref class_ref) {
         islots.reserve(mod_.iface_slot_count);
         for (uint32_t i = 0; i < mod_.iface_slot_count; ++i) {
             if (i < cd->iface_slots.size()) {
-                islots.push_back(sym(fn_decls_[static_cast<uint32_t>(cd->iface_slots[i])]));
+                islots.push_back(vtable_entry(cd->iface_slots[i]));
             } else if (mod_.iface_unreachable.has_value()) {
-                islots.push_back(sym(fn_decls_[static_cast<uint32_t>(*mod_.iface_unreachable)]));
+                islots.push_back(vtable_entry(*mod_.iface_unreachable));
             } else {
                 // The design declares an interface class but nothing implements
                 // one, so no dispatch can land in this table at all: the only

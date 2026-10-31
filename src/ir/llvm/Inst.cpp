@@ -2086,11 +2086,11 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::CoverCtl:
             lower_cover_ctl(i);
             return;
-        case Inst::Tag::MonitorSet:
-            b_.CreateCall(monitor_set_fn(),
-                          { sym(fn_decls_[static_cast<uint32_t>(
-                              ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra).func)]) });
+        case Inst::Tag::MonitorSet: {
+            const FunctionId body = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra).func;
+            b_.CreateCall(monitor_set_fn(), { sym(fn_decls_[static_cast<uint32_t>(body)]), callee_record(body) });
             return;
+        }
         case Inst::Tag::MonitorEmit: {
             const auto& p = ir_->payload(i).op_extra;
             emit_display_to(ir_->extra_data<DisplayInfo>(p.extra),

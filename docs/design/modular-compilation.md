@@ -414,8 +414,23 @@ code go.
      staging into another instance) taints itself and each instance lowers its
      own; `--stat=unit-code` reports unit groups, functions emitted and what
      stopped sharing. Comb fusion stays within one instance (combchain
-     regresses; accepted until fusion across instances is revisited). Functions
-     and tasks are still emitted once per instance, in root.
+     regresses; accepted until fusion across instances is revisited).
+
+     A function or task of an instance takes that instance's record as its
+     first argument and addresses the instance through it, as a group does:
+     its own storage, shadow, ids, wake buckets and dump-var index from the
+     record, another instance's signals through bindings. One that belongs to
+     no instance (a package's, `$unit`'s, a virtual interface body) takes the
+     root state, which nothing reads, and addresses absolutely. A direct call
+     passes the callee's record (the caller's own when it is the same
+     instance, else the callee instance's record global, which keeps the
+     caller from sharing); a virtual call cannot name it, so a vtable entry of
+     an instance's method is a root thunk of the same signature that does, and
+     a `$strobe` / reactive body, a fork child, an exported subroutine and the
+     `$monitor` body (`rt_monitor_set` takes it with the ramp) carry theirs.
+     A subroutine that stages a nonblocking write keeps its absolute block ids
+     (the record's id fields are indexed by a process ordinal) and taints.
+     Functions and tasks are still emitted once per instance, in root.
 
      An event object is instance data reached through its variable: a declared
      event powers on holding the handle of its own object (a slot of

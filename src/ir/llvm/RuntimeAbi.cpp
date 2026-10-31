@@ -53,10 +53,11 @@ llvm::FunctionCallee Backend::monitor_emit_fn() {
     return rt_fn("rt_monitor_emit", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
 }
 
-// rt_monitor_set(ptr ramp) — register the monitor body's ramp function pointer
-// as the single active monitor (enabled, output-primed reset).
+// rt_monitor_set(ptr ramp, ptr record) — register the monitor body's ramp function
+// pointer and the record of the instance it belongs to as the single active
+// monitor (enabled, output-primed reset).
 llvm::FunctionCallee Backend::monitor_set_fn() {
-    return rt_fn("rt_monitor_set", b_.getVoidTy(), { raw_ptr_ty() });
+    return rt_fn("rt_monitor_set", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // rt_monitor_enable(i32 on) — $monitoron / $monitoroff.
@@ -68,6 +69,12 @@ llvm::FunctionCallee Backend::monitor_enable_fn() {
 // active and enabled, else null (drives the Postponed-region per-instant run).
 llvm::FunctionCallee Backend::monitor_active_ramp_fn() {
     return rt_fn("rt_monitor_active_ramp", raw_ptr_ty(), {});
+}
+
+// ptr rt_monitor_active_record(void) — the record the registered body takes as its
+// first argument.
+llvm::FunctionCallee Backend::monitor_active_record_fn() {
+    return rt_fn("rt_monitor_active_record", raw_ptr_ty(), {});
 }
 
 // -- $timeformat / %t --

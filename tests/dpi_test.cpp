@@ -759,9 +759,8 @@ TEST_CASE("DPI export: an exported function's thunk is unchanged by the task pat
 
 // A multi-top design (LRM 23.3.1) may export from every top. slang hands Clotho one
 // entry per c_identifier, and each is collected by the Lowerer of the top that owns
-// it, so its thunk calls that top's own lowered function. Instance binding is baked
-// into the lowered body — each function addresses its own @clotho.inst.<top>.state
-// global — so nothing is resolved by scope at the C boundary.
+// it, so its thunk calls that top's own lowered function, handing it that instance's
+// record (@clotho.inst.<top>.ctx) -- nothing is resolved by scope at the C boundary.
 TEST_CASE("DPI export: multi-top design exports from each top") {
     constexpr std::string_view src = R"(
         module ta;
@@ -788,15 +787,13 @@ TEST_CASE("DPI export: multi-top design exports from each top") {
     CHECK(ir_text.find("@tb_get.1") == std::string::npos);
 
     const std::string ta_thunk = llvm_definition(ir_text, "ta_get");
-    CHECK((ta_thunk.find("clotho.inst.ta.state") != std::string::npos ||
-           ta_thunk.find(".fn.ta_get") != std::string::npos));
-    CHECK(ta_thunk.find("clotho.inst.tb.state") == std::string::npos);
+    CHECK((ta_thunk.find("clotho.inst.ta.") != std::string::npos || ta_thunk.find(".fn.ta_get") != std::string::npos));
+    CHECK(ta_thunk.find("clotho.inst.tb.") == std::string::npos);
     CHECK(ta_thunk.find(".fn.tb_get") == std::string::npos);
 
     const std::string tb_thunk = llvm_definition(ir_text, "tb_get");
-    CHECK((tb_thunk.find("clotho.inst.tb.state") != std::string::npos ||
-           tb_thunk.find(".fn.tb_get") != std::string::npos));
-    CHECK(tb_thunk.find("clotho.inst.ta.state") == std::string::npos);
+    CHECK((tb_thunk.find("clotho.inst.tb.") != std::string::npos || tb_thunk.find(".fn.tb_get") != std::string::npos));
+    CHECK(tb_thunk.find("clotho.inst.ta.") == std::string::npos);
     CHECK(tb_thunk.find(".fn.ta_get") == std::string::npos);
 }
 

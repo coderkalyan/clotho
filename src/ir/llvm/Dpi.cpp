@@ -693,7 +693,9 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
 
     auto*                     ptr_ty = llvm::PointerType::getUnqual(ctx_);
     std::vector<llvm::Value*> argv;
-    argv.push_back(sym(state_global_));
+    // The record of the instance that declares the subroutine (reserved before main
+    // filled it), or the root state for a package's.
+    argv.push_back(callee_record(ex.func));
     // The RNG stream the exported subroutine draws from (LRM 18.13). A FUNCTION
     // has no calling process -- native C drove the call -- so it draws from the
     // module-wide state main seeds at startup. A TASK does have one: it runs on

@@ -195,7 +195,7 @@ void Backend::lower_fork_inst(Index i) {
     const std::span<const Index> caps = ir_->region(fi.args);
     std::vector<llvm::Value*>    argv;
     argv.reserve(caps.size() + 4);
-    argv.push_back(state_);
+    argv.push_back(nullptr); // the child's record, set per child (ramp below)
     // The child seeds its OWN state from this one at its ramp (lower_task): a
     // join_none / join_any child can outlive this frame, so it must not hold a
     // pointer into it.
@@ -223,8 +223,10 @@ void Backend::lower_fork_inst(Index i) {
     const bool ramp_first =
       !kids.empty() && !mod_.function(static_cast<FunctionId>(static_cast<uint32_t>(kids[0]))).fork_targets.empty();
     const auto ramp = [&](Index kid) {
-        llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(kid)]);
-        return b_.CreateCall(cf->getFunctionType(), cf, argv);
+        llvm::Function*           cf = sym(fn_decls_[static_cast<uint32_t>(kid)]);
+        std::vector<llvm::Value*> args = argv;
+        args[0] = callee_record(static_cast<FunctionId>(static_cast<uint32_t>(kid)));
+        return b_.CreateCall(cf->getFunctionType(), cf, args);
     };
     std::vector<llvm::Value*> ramped;
     if (ramp_first) {

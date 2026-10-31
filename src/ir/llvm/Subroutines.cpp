@@ -880,6 +880,84 @@ llvm::Function* Backend::declare_task(FunctionId id) {
     return fn;
 }
 
+uint32_t Backend::subroutine_anchor(const Function& f) const {
+    return f.scope != Process::no_scope && f.scope < anchor_of_scope_.size() ? anchor_of_scope_[f.scope]
+                                                                              : SignalSlot::no_anchor;
+}
+
+llvm::Value* Backend::callee_record(FunctionId fid) {
+    const uint32_t callee = subroutine_anchor(mod_.function(fid));
+    if (callee == SignalSlot::no_anchor) {
+        return sym(state_global_);
+    }
+    if (callee == own_anchor_ && own_ctx_ != nullptr) {
+        return own_ctx_;
+    }
+    return ensure_ctx(anchors_[callee]);
+}
+
+llvm::Value* Backend::dispatch_record() {
+    return sym(state_global_);
+}
+
+llvm::Function* Backend::vtable_entry(FunctionId fid) {
+    if (subroutine_anchor(mod_.function(fid)) == SignalSlot::no_anchor) {
+        return sym(fn_decls_[static_cast<uint32_t>(fid)]);
+    }
+    return sym(vtable_thunks_.at(static_cast<uint32_t>(fid)));
+}
+
+// A virtual call cannot name the record of the instance its callee belongs to --
+// the callee is chosen at run time, from a vtable that can mix methods of a
+// package class and of a class an instance declares -- so a method of an instance
+// is entered through a thunk of the same signature that supplies it. The thunk is
+// root glue: the record it names is the only per-instance thing in it, and a
+// class an instance declares has that one instance.
+void Backend::make_vtable_entries() {
+    ModuleEnv* const real_env = env_;
+    env_                      = root_env_.get();
+    const auto make           = [&](FunctionId fid) {
+        const Function& f      = mod_.function(fid);
+        const uint32_t  anchor = subroutine_anchor(f);
+        if (anchor == SignalSlot::no_anchor || f.is_dpi || vtable_thunks_.contains(static_cast<uint32_t>(fid))) {
+            return;
+        }
+        llvm::Function* callee = fn_decls_[static_cast<uint32_t>(fid)];
+        auto*           thunk  = llvm::Function::Create(callee->getFunctionType(), llvm::Function::InternalLinkage,
+                                                        callee->getName() + ".vt", env_->llmod);
+        llvm::IRBuilder<> tb(llvm::BasicBlock::Create(ctx_, "entry", thunk));
+        std::vector<llvm::Value*> args;
+        for (llvm::Argument& arg : thunk->args()) {
+            args.push_back(&arg);
+        }
+        args[0]    = ensure_ctx(anchors_[anchor]);
+        auto* call = tb.CreateCall(callee->getFunctionType(), callee, args);
+        if (callee->getReturnType()->isVoidTy()) {
+            tb.CreateRetVoid();
+        } else {
+            tb.CreateRet(call);
+        }
+        vtable_thunks_.emplace(static_cast<uint32_t>(fid), thunk);
+    };
+    for (const ClassDesc& cd : mod_.class_descs()) {
+        for (const FunctionId fid : cd.slots) {
+            make(fid);
+        }
+        for (const FunctionId fid : cd.iface_slots) {
+            make(fid);
+        }
+    }
+    env_ = real_env;
+}
+
+void Backend::reserve_export_records() {
+    for (const DpiExport& e : mod_.dpi_exports) {
+        if (const uint32_t anchor = subroutine_anchor(mod_.function(e.func)); anchor != SignalSlot::no_anchor) {
+            ensure_ctx(anchors_[anchor]);
+        }
+    }
+}
+
 // How many LLVM parameters formal k occupies:
 //   2 — a `ref`: the aliased storage pointer and the witness chain
 //   1 — an aggregate storage pointer, a container handle pointer, a string
@@ -1129,7 +1207,6 @@ void Backend::deinit_body_strings() {
 // shared instruction lowering — Arg reads a parameter, Local addresses the
 // frame, Ret is a real return, Call invokes another function.
 void Backend::lower_function(FunctionId id) {
-    own_anchor_ = SignalSlot::no_anchor; // functions address every instance absolutely
     const Function& f = mod_.function(id);
     // A subroutine reached through a virtual interface handle addresses its
     // interface's signals through the instance formal 0 names, for the whole
@@ -1141,6 +1218,11 @@ void Backend::lower_function(FunctionId id) {
         // its body is native C, so there is nothing to lower.
         return;
     }
+    // A function of an instance addresses it through the record it is passed, like
+    // a group (own_ctx_, set at the entry below); one of no instance addresses
+    // absolutely.
+    own_anchor_ = subroutine_anchor(f);
+    own_ctx_    = nullptr;
     ir_ = &f.ir;
     cur_fn_           = &f;
     // The body's LEXICAL home region (LRM 24.3.1): Reactive when reactive code
@@ -1169,8 +1251,14 @@ void Backend::lower_function(FunctionId id) {
 
     auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
     b_.SetInsertPoint(entry);
-    state_ = fn_->getArg(0);
-    state_->setName("state");
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        own_ctx_ = fn_->getArg(0);
+        own_ctx_->setName("ctx");
+        state_ = sym(state_global_);
+    } else {
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+    }
     // A function body runs inside the caller's thread, so its $urandom draws
     // come from the caller's state (LRM 18.13). Unlike a task's, this pointer
     // cannot outlive the call: a function is atomic.
@@ -1234,6 +1322,8 @@ void Backend::lower_function(FunctionId id) {
     home_ptr_ = nullptr;
     home_arg_             = nullptr;
     frame_  = nullptr;
+    own_anchor_ = SignalSlot::no_anchor;
+    own_ctx_    = nullptr;
 }
 
 // Copy each aggregate input / inout formal's caller storage (passed by pointer)
@@ -1306,8 +1396,18 @@ void Backend::lower_task(FunctionId id) {
     str_vals_.assign(n, nullptr);
 
     auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-    state_       = fn_->getArg(0);
-    state_->setName("state");
+    own_anchor_  = subroutine_anchor(f);
+    own_ctx_     = nullptr;
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        // The record of the instance the task belongs to; the root state it
+        // replaces is read by nothing here.
+        own_ctx_ = fn_->getArg(0);
+        own_ctx_->setName("ctx");
+        state_ = sym(state_global_);
+    } else {
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+    }
     wheel_ = fn_->getArg(2);
     wheel_->setName("wheel");
     awaiter_ = nullptr;
@@ -1377,7 +1477,6 @@ void Backend::lower_task(FunctionId id) {
     // intra-body @event waits, exactly like a process's proc_sched slot.
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
-    own_anchor_        = SignalSlot::no_anchor;
     group_first_block_ = -1;
     // And, for a task some `disable` names, this activation's list node — same
     // placement and for the same reason: a `disable` reads it while we are parked.
@@ -1649,6 +1748,8 @@ void Backend::lower_task(FunctionId id) {
     cur_is_task_      = false;
     frame_            = nullptr;
     task_epilogue_bb_ = nullptr;
+    own_anchor_       = SignalSlot::no_anchor;
+    own_ctx_          = nullptr;
 }
 
 // Record each ref formal's pointer and witness chain into ref_ptr_ (Local k ==
@@ -1864,7 +1965,7 @@ void Backend::lower_call_inst(Index i) {
         return;
     }
     llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
-    lower_call_common(i, f, cf->getFunctionType(), cf, ci.args);
+    lower_call_common(i, f, cf->getFunctionType(), cf, callee_record(ci.func), ci.args);
     emit_finish_check(callee_may_finish(ci.func));
 }
 
@@ -1905,7 +2006,7 @@ void Backend::lower_virtual_call_inst(Index i) {
     const Function& f    = mod_.function(vci.func); // signature shared by all overrides
     llvm::FunctionType* fnty =
         fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
-    lower_call_common(i, f, fnty, load_vtable_callee(vci, i), vci.args);
+    lower_call_common(i, f, fnty, load_vtable_callee(vci, i), dispatch_record(), vci.args);
     emit_finish_check(virtual_call_may_finish());
 }
 
@@ -1918,6 +2019,7 @@ void Backend::lower_call_common(Index               i,
                                 const Function&     f,
                                 llvm::FunctionType* fnty,
                                 llvm::Value*        callee,
+                                llvm::Value*        record,
                                 ExtraSlice          arg_slice) {
     // Every arm of the marshaling loop indexes the signature by the actual's
     // position, so an actual list that is not exactly as long as `param_types`
@@ -1931,7 +2033,7 @@ void Backend::lower_call_common(Index               i,
                                         f.param_types.size()) };
     }
     std::vector<llvm::Value*> argv;
-    argv.push_back(state_);
+    argv.push_back(record);
     // A function body runs in the caller's thread, so $urandom inside one
     // continues the caller's stream (LRM 18.13, 18.14.1).
     argv.push_back(rng_slot_);
@@ -2164,7 +2266,7 @@ void Backend::lower_task_call_inst(Index i) {
                                         tf.name, args.size(), tf.param_types.size()) };
     }
     std::vector<llvm::Value*>    argv;
-    argv.push_back(state_);
+    argv.push_back(virt ? dispatch_record() : callee_record(fid));
     argv.push_back(rng_slot_);
     argv.push_back(wheel_);
     // A task runs in its caller's thread too, so it carries the caller's block.

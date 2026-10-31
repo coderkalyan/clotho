@@ -96,6 +96,10 @@ void Backend::run() {
             instance_fns_.insert(fn_decls_[i]);
         }
     }
+    // Before any body: a vtable thunk and an export thunk name the record of an
+    // instance, which main fills only if it exists by then.
+    make_vtable_entries();
+    reserve_export_records();
     for (uint32_t i = 0; i < nf; ++i) {
         if (mod_.function(static_cast<FunctionId>(i)).is_task) {
             lower_task(static_cast<FunctionId>(i));
