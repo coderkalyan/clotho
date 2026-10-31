@@ -423,6 +423,13 @@ extern "C" void rt_encoding_violation(const rt_null_site* site, uint64_t now) {
     fmt::print(stderr, "\n");
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+        print_snippet(snippet_text(site->line), site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
+    }
     fmt::print(stderr, tag, "  note:");
     fmt::print(stderr, body,
                " at {}, must & ~may != 0 or z & ~(may & ~must) != 0; this is a bug in Clotho, "

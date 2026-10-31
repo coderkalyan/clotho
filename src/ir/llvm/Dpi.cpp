@@ -516,23 +516,29 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
             // value; output leaves it empty for the C to fill; inout copies in.
             llvm::Value* scratch = dpi_vec_alloca(ct, dpi_nchunks(w));
             if (dir == ArgDir::In) {
+                emit_encoding_check(value_of(a), type_of(a).four_state, i);
                 dpi_vec_copyin(ct, value_of(a), type_of(a).four_state, w, scratch);
             } else if (dir == ArgDir::Inout) {
                 const LValue alv = lvalue_of(a).unguarded();
-                dpi_vec_copyin(ct, lower_load(alv), alv.four_state, w, scratch);
+                const Plane in = lower_load(alv);
+                emit_encoding_check(in, alv.four_state, i);
+                dpi_vec_copyin(ct, in, alv.four_state, w, scratch);
             }
             argv.push_back(scratch);
             if (dir != ArgDir::In) {
                 outs.push_back({ a, ct, scratch, nullptr, w });
             }
         } else if (dir == ArgDir::In) {
+            emit_encoding_check(value_of(a), type_of(a).four_state, i);
             argv.push_back(dpi_arg_to_c(ct, value_of(a), type_of(a).four_state));
         } else {
             llvm::Type*  cty     = dpi_c_llvm_ty(ct);
             llvm::Value* scratch = entry_alloca(cty, "dpi.out");
             if (dir == ArgDir::Inout) {
                 const LValue alv = lvalue_of(a).unguarded();
-                b_.CreateStore(dpi_arg_to_c(ct, lower_load(alv), alv.four_state), scratch);
+                const Plane in = lower_load(alv);
+                emit_encoding_check(in, alv.four_state, i);
+                b_.CreateStore(dpi_arg_to_c(ct, in, alv.four_state), scratch);
             }
             argv.push_back(scratch);
             outs.push_back({ a, ct, scratch, cty, w });

@@ -48,11 +48,12 @@ when it does.
 - The constant pool keeps the frontend's encoding; the backend converts on read
   through one shared set of helpers.
 - The encoding's invariants (must & ~may == 0, z only on unknown bits) are checked
-  by assertions in debug builds (`CLOTHO_EXTRA_ASSERTS`) at stores to signals and
-  frames, call arguments and returns (`emit_encoding_check`); a violation is a
-  located internal error (`rt_encoding_violation`). Nothing is generated otherwise.
-  **Not yet:** NBA staging records and the values handed to runtime routines
-  are not checked, and no test can provoke a violation.
+  by assertions in debug builds (`CLOTHO_EXTRA_ASSERTS`) wherever a value is stored
+  to a signal or frame, staged for a nonblocking update, passed or returned, handed
+  to a runtime routine (format operands, wide selects, DPI arguments) or taken back
+  from one (`emit_encoding_check`); a violation is a located internal error
+  (`rt_encoding_violation`). Nothing is generated otherwise. Bits above a value's
+  width cannot exist: it is an LLVM integer of exactly that width.
 - Reals are native floating point everywhere: SSA, storage, arguments and
   results. **Not yet:** stored and passed as integer bit patterns.
 - Handles (class, event, chandle, virtual interface) are a pointer plus a

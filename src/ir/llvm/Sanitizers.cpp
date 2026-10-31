@@ -1,6 +1,7 @@
 // Runtime checks: bounds, null handles, reference epochs, tagged unions and allocation sites.
 
 #include "ir/llvm/Backend.h"
+#include "ir/llvm/EncodingCheck.h"
 
 namespace clotho::ir::backend {
 
@@ -301,29 +302,29 @@ void Backend::emit_null_handle_check(llvm::Value* handle, Index at, NullKind kin
     b_.SetInsertPoint(cont);
 }
 
-// The encoding's invariants for a 4-state value (docs/design/kernel.md, Values):
-// must & ~may == 0, and z only on unknown bits (z & ~(may & ~must) == 0). Bits
-// above the width need no check here: a value is an LLVM integer of exactly its
-// width, so there are none in SSA; the runtime decodes slots through shared helpers.
+// Check a 4-state value's encoding invariants (EncodingCheck.h) where it is stored,
+// passed, returned or handed to the runtime. `four` is the domain of the IR type the
+// value came from; a 2-state value has no invariants to break.
 //
-// Generated only when Clotho is built with CLOTHO_EXTRA_ASSERTS -- it costs two
-// compares per store -- and nothing is emitted otherwise. A violation is a Clotho
-// bug, reported with the location of the instruction that produced the store.
-void Backend::emit_encoding_check(Plane v, Index at) {
+// Generated only when Clotho is built with CLOTHO_EXTRA_ASSERTS -- it costs a few
+// bit operations and a branch per value -- and nothing is emitted otherwise. A
+// constant that is well formed folds to no code. A violation is a Clotho bug,
+// reported with the location of the instruction being lowered.
+void Backend::emit_encoding_check(Plane v, bool four, Index at) {
 #ifdef CLOTHO_EXTRA_ASSERTS
-    if (v.z == nullptr || v.fp != nullptr || v.mm == nullptr) {
-        return; // not a 4-state value
+    if (!four || v.fp != nullptr) {
+        return;
     }
-    const uint32_t w       = v.mm->getType()->getIntegerBitWidth() / 2;
-    llvm::Value*   must    = must_of(v, true);
-    llvm::Value*   may     = may_of(v, true);
-    llvm::Value*   unknown = b_.CreateAnd(may, b_.CreateNot(must));
-    llvm::Value*   bad     = b_.CreateOr(b_.CreateAnd(must, b_.CreateNot(may)),
-                                         b_.CreateAnd(v.z, b_.CreateNot(unknown)));
-    auto*          fn      = b_.GetInsertBlock()->getParent();
-    auto*          fail    = llvm::BasicBlock::Create(ctx_, "encoding.bad", fn);
-    auto*          cont    = llvm::BasicBlock::Create(ctx_, "encoding.ok", fn);
-    auto*          br      = b_.CreateCondBr(b_.CreateICmpNE(bad, zero(w)), fail, cont);
+    // A value with no z plane (a never-z select, an elided slot) has none to violate.
+    llvm::Value* z   = v.z != nullptr ? v.z : zero(v.mm->getType()->getIntegerBitWidth() / 2);
+    llvm::Value* bad = encoding_violated(b_, v.mm, z);
+    if (const auto* folded = llvm::dyn_cast<llvm::ConstantInt>(bad); folded != nullptr && folded->isZero()) {
+        return;
+    }
+    auto* fn   = b_.GetInsertBlock()->getParent();
+    auto* fail = llvm::BasicBlock::Create(ctx_, "encoding.bad", fn);
+    auto* cont = llvm::BasicBlock::Create(ctx_, "encoding.ok", fn);
+    auto* br   = b_.CreateCondBr(bad, fail, cont);
     br->setMetadata(llvm::LLVMContext::MD_prof,
                     llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
     b_.SetInsertPoint(fail);
@@ -337,6 +338,7 @@ void Backend::emit_encoding_check(Plane v, Index at) {
     b_.SetInsertPoint(cont);
 #else
     (void)v;
+    (void)four;
     (void)at;
 #endif
 }

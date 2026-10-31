@@ -1100,16 +1100,17 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     if (rhs.fp != nullptr) {
         rhs = real_to_planes(fp_of(rhs));
     }
-    // Every store to a signal or a frame local passes here: the one place to check
-    // the value that is about to be written.
-    emit_encoding_check(rhs, cur_inst_);
     // A runtime-offset select on storage too wide to read-modify-write inline:
     // the runtime merges into the containing word (rt_wide_ins) and drops the
-    // bits outside the container (LRM 11.5.1).
+    // bits outside the container (LRM 11.5.1). wide_dyn_store_planes checks the
+    // value where it crosses into the runtime.
     if (lv.wide_dyn) {
         wide_dyn_store(lv, rhs);
         return;
     }
+    // Every other store to a signal or a frame local passes here: the one place to
+    // check the value that is about to be written.
+    emit_encoding_check(rhs, lv.four_state, cur_inst_);
 
     const uint32_t s_width = lv.store_width;
     llvm::Value*   mp      = lv_mm_ptr(lv);

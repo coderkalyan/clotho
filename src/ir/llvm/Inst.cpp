@@ -1050,6 +1050,9 @@ void Backend::lower_inst(Index i) {
             if (type_of(p.binary.r).is_real) {
                 rhs = real_to_planes(fp_of(rhs));
             }
+            // Every nonblocking route below stages the value in a shadow or a record
+            // the NBA region replays by copy, so this is the one place to check it.
+            emit_encoding_check(rhs, type_of(p.binary.r).four_state, i);
             // The barrier for a nonblocking write into a class property (§7). It is
             // emitted at the STAGING site, not at the commit, because the commit is
             // the runtime's own memcpy out of a staging pool and carries no owner
@@ -1137,6 +1140,7 @@ void Backend::lower_inst(Index i) {
             // instead of silently missing a remembered-set entry (PRINCIPLES.md).
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane   rhs   = value_of(info.value);
+            emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
             // A variable index outside the declared bound (LRM 7.4.5 / 11.5.1) is a
             // no-op, so nothing is armed at all. Otherwise the record would carry an
@@ -1158,6 +1162,7 @@ void Backend::lower_inst(Index i) {
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane   rhs   = value_of(info.value);
+            emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
             lv.when_valid(b_, [&](const LValue& v) { emit_inertial_arm(v, rhs, ticks); });
             return;
@@ -1174,6 +1179,7 @@ void Backend::lower_inst(Index i) {
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane  rhs   = value_of(info.value);
+            emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value* count = must_of(info.count);
             llvm::SmallVector<llvm::Value*, 4> ids;
             for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
@@ -2653,8 +2659,11 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
     if (!lv.four_state) {
         return two_val(must);
     }
-    return packed(must, cast(b_.CreateLoad(bt, oy), n, false),
-                  cast(b_.CreateLoad(bt, oz), n, false));
+    const Plane got = packed(must, cast(b_.CreateLoad(bt, oy), n, false),
+                             cast(b_.CreateLoad(bt, oz), n, false));
+    // What rt_wide_sel hands back is a value entering generated code.
+    emit_encoding_check(got, true, cur_inst_);
+    return got;
 }
 
 // Write a runtime-offset selection into one wide slot's planes: the runtime merges
@@ -2676,6 +2685,8 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
         return buf;
     };
 
+    // The value crosses into the runtime here, whichever store brought it.
+    emit_encoding_check(rhs, four, cur_inst_);
     std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width, four);
     if (!four) {
         auto* zbuf = sel_plane_buf(n, "wins.zero");

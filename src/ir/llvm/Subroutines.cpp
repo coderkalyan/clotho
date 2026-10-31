@@ -629,7 +629,7 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
-    emit_encoding_check(pl, cur_inst_);
+    emit_encoding_check(pl, four, cur_inst_);
     argv.push_back(pl.mm);
     if (four) {
         argv.push_back(pl.z);
@@ -1893,7 +1893,7 @@ void Backend::lower_ret(Index value) {
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
-    emit_encoding_check(pl, cur_inst_);
+    emit_encoding_check(pl, abi_four_state(cur_fn_->return_type), cur_inst_);
     if (!abi_four_state(cur_fn_->return_type)) {
         deinit_body_strings();
         b_.CreateRet(pl.mm);
@@ -2452,6 +2452,9 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
             store_field(sty, elt, 4, null);
             continue;
         }
+        // The runtime receives these planes translated to val / xz / z, so a value
+        // that breaks the invariants would print as something it is not.
+        emit_encoding_check(p, t.four_state, cur_inst_);
         // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
         // subset. The runtime distinguishes them per bit.
         llvm::Value* must = must_of(p, t.four_state);

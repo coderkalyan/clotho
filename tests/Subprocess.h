@@ -40,6 +40,11 @@ namespace clotho::test {
 // the path of the source file to simulate.
 inline constexpr std::string_view run_design_flag = "--clotho-run-design";
 
+// The argument that makes the test binary call rt_encoding_violation itself, with the
+// source file's text as the offending line. No design can reach that report -- it is
+// an internal error -- so the report is tested at the function.
+inline constexpr std::string_view encoding_violation_flag = "--clotho-encoding-violation";
+
 // Absolute path of the running test binary, captured by main() so a child can
 // be spawned from any working directory.
 inline std::string self_exe;
@@ -72,7 +77,8 @@ inline std::string read_file(const std::filesystem::path& p) {
 // Spawn the test binary in single-design mode against `source`, always
 // redirecting stdout to a temp file and stderr too when `capture_err`. `env`
 // holds space-separated `NAME=value` assignments that apply to the child only.
-inline DesignRun spawn_design(std::string_view source, bool capture_err, std::string_view env) {
+inline DesignRun spawn_design(std::string_view source, bool capture_err, std::string_view env,
+                              std::string_view flag = run_design_flag) {
     namespace fs = std::filesystem;
 
     const std::string stem = unique_stem();
@@ -100,7 +106,7 @@ inline DesignRun spawn_design(std::string_view source, bool capture_err, std::st
 #else
     prefix = std::string(env);
 #endif
-    std::string cmd = prefix + quote(self_exe) + " " + std::string(run_design_flag) + " " + quote(src.string()) +
+    std::string cmd = prefix + quote(self_exe) + " " + std::string(flag) + " " + quote(src.string()) +
                       " > " + quote(out.string());
     if (capture_err) {
         cmd += " 2> " + quote(err.string());
