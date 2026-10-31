@@ -1086,9 +1086,12 @@ void Backend::lower_inst(Index i) {
             // scalar select, or aggregate static leaf) uses the block shadow.
             lv.when_valid(b_, [&](const LValue& v) {
                 const bool agg_partial = v.is_agg && v.agg_leaf && !selects_whole(v);
-                if (v.is_signal && (slot_of(v.sig).is_array || slot_of(v.sig).vif_rec)) {
+                // An aggregate leaf is classified before a vif member is (nba_classify_ir), so it
+                // takes its own record here too: a vif struct member sent to the array queue
+                // staged a record nothing replayed, or one another queue's commit misread.
+                if (v.is_signal && !v.is_agg && (slot_of(v.sig).is_array || slot_of(v.sig).vif_rec)) {
                     emit_array_nba(v, rhs);
-                } else if (v.is_agg && (!v.agg_static || agg_partial)) {
+                } else if (v.is_agg && (!v.agg_static || agg_partial || slot_of(v.sig).vif_rec)) {
                     emit_agg_nba(v, rhs);
                 } else {
                     lower_store_nb(v, rhs);

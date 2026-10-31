@@ -327,8 +327,11 @@ void Backend::nba_classify_ir(const Ir& ir) {
             s.nba               = true;
             // A static whole-leaf write commits from the block shadow; a
             // runtime array index OR a partial (bit/part-select) leaf write
-            // defers (the partial one needs a masked read-modify-write).
-            if (runtime || partial) {
+            // defers (the partial one needs a masked read-modify-write). So does every
+            // write to a member some handle writes (SignalSlot::vif_rec): the block
+            // commit addresses the writer's own instance, and the destination here is
+            // whichever instance the handle named.
+            if (runtime || partial || s.vif_rec) {
                 if (std::find(agg_nba_sigs_.begin(), agg_nba_sigs_.end(), t.sig) == agg_nba_sigs_.end()) {
                     agg_nba_sigs_.push_back(t.sig);
                 }
@@ -1643,6 +1646,10 @@ uint32_t Backend::agg_rec_payload(const SignalSlot& s) {
     return agg_rec_rooted(s) ? 3 : 2;
 }
 
+uint32_t Backend::agg_rec_ctx(const SignalSlot& s) {
+    return agg_rec_payload(s) + 1 + (s.agg_masked ? 1 : 0);
+}
+
 llvm::StructType* Backend::agg_rec_ty(const SignalSlot& s) {
     const uint32_t maxb   = agg_max_leaf_bytes(s.ir_type);
     auto*          bytes  = llvm::ArrayType::get(b_.getInt8Ty(), maxb);
@@ -1653,6 +1660,9 @@ llvm::StructType* Backend::agg_rec_ty(const SignalSlot& s) {
     f.push_back(bytes);
     if (s.agg_masked) {
         f.push_back(bytes);
+    }
+    if (s.vif_rec) {
+        f.push_back(raw_ptr_ty());
     }
     return llvm::StructType::get(ctx_, f);
 }
@@ -1755,6 +1765,19 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
             }
         }
     }
+    if (s.vif_rec) {
+        // The instance the write landed in: through a handle the one it named, inside a
+        // subroutine reached through one the instance formal 0 named, else the member's
+        // own (the resolution order of emit_array_nba, which the two must share).
+        llvm::Value* ctx = lv.vif_ctx;
+        if (ctx == nullptr && ctx_override_for(s)) {
+            ctx = ctx_override_;
+        }
+        if (ctx == nullptr) {
+            ctx = ensure_ctx(anchors_[s.anchor]);
+        }
+        b_.CreateAlignedStore(ctx, b_.CreateStructGEP(rt, rec, agg_rec_ctx(s)), a1);
+    }
 }
 
 // Replay an aggregate's deferred records: memcpy each record's payload to its
@@ -1811,11 +1834,19 @@ void Backend::emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
         b_.CreateBr(bh);
         b_.SetInsertPoint(bd);
     }
+    // A member written through a virtual interface wakes the readers of the instance the
+    // record landed in, per record: the records of one pass may name different instances
+    // (emit_array_commit does the same for an array element).
+    if (s.vif_rec && signal_has_waiters(sig)) {
+        llvm::Value* rec_ctx = b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, agg_rec_ctx(s)));
+        CtxOverride  ov(*this, rec_ctx, s.anchor);
+        service_any_waiters(sig);
+    }
     k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
     b_.CreateBr(head);
     b_.SetInsertPoint(done);
 
-    if (signal_has_waiters(sig)) {
+    if (!s.vif_rec && signal_has_waiters(sig)) {
         auto* svc  = llvm::BasicBlock::Create(ctx_, "aggnba.svc", fn);
         auto* cont = llvm::BasicBlock::Create(ctx_, "aggnba.cont", fn);
         b_.CreateCondBr(b_.CreateICmpNE(count, b_.getInt32(0)), svc, cont);

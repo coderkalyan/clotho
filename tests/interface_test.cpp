@@ -1111,3 +1111,59 @@ TEST_CASE("virtual interface: an update released while its member commits is not
     )");
     CHECK(out == "d=0\n");
 }
+
+// An unpacked struct member written through a handle (LRM 25.9, 10.4.2) -- a leaf, a
+// whole struct, an element of an array of structs -- lands in the instance the handle
+// names, wakes that instance's waiters, and agrees with the same write made by a
+// hierarchical name. The backend classified such a member as an aggregate target but
+// lowered the write to the array queue's record, under an id that names no queue: the
+// value was silently dropped (a blocking write was not), and in a design with a second
+// queue the record was replayed by the wrong commit. Derived from the LRM: iverilog 13
+// has neither interfaces nor unpacked structs.
+TEST_CASE("virtual interface: a nonblocking write to a struct member through a handle") {
+    const std::string out = run_capture(R"(
+        typedef struct { int a; int b; logic [7:0] c; } S_t;
+        interface ibus; S_t s; S_t t; S_t sa[2]; bit hit; always @(s.b) hit = 1; endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus v1, v2;
+            S_t src;
+            initial begin
+                v1 = a; v2 = b;
+                src.a = 11; src.b = 12; src.c = 8'h5a;
+                v1.s.b <= 7;
+                v2.s.b <= 8;
+                v1.t <= src;
+                v2.sa[1].c <= 8'h33;
+                #1 $display("s.b %0d %0d t %0d %0d %h sa %h hit %0d %0d",
+                            a.s.b, b.s.b, a.t.a, a.t.b, a.t.c, b.sa[1].c, a.hit, b.hit);
+            end
+        endmodule
+    )");
+    CHECK(out == "s.b 7 8 t 11 12 5a sa 33 hit 1 1\n");
+}
+
+// Several kinds of deferred write through handles to twin instances in one loop: a struct
+// member and a whole queue. Each kind has its own record queue, so a record sent to the
+// wrong one was read back as the other's shape (a crash in the JIT'd commit).
+TEST_CASE("virtual interface: struct-member and whole-queue writes to twin instances") {
+    const std::string out = run_capture(R"(
+        typedef struct { int a; int b; } S_t;
+        interface ibus; S_t s; int q[$]; endinterface
+        module top;
+            ibus b0(), b1();
+            virtual ibus vifs[2];
+            int src[$];
+            initial begin
+                vifs[0] = b0; vifs[1] = b1;
+                src.push_back(5);
+                foreach (vifs[i]) begin
+                    vifs[i].s.a <= 7 + i;
+                    vifs[i].q <= src;
+                end
+                #1 $display("b0 %0d %0d b1 %0d %0d", b0.s.a, b0.q.size(), b1.s.a, b1.q.size());
+            end
+        endmodule
+    )");
+    CHECK(out == "b0 7 1 b1 8 1\n");
+}

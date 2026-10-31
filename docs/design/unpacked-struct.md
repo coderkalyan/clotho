@@ -79,6 +79,16 @@ including a 4-state leaf's mm+z planes — replays uniformly with no per-leaf
 monomorphization. A signal can take both paths at once (static field NBA via the
 shadow, array-indexed NBA via the queue).
 
+A leaf of a member written **through a virtual interface handle** (`SignalSlot::vif_rec`)
+takes the same deferred path whatever its select: the block commit addresses the
+writer's own instance, while the destination here is whichever instance the handle
+named (LRM 10.4.2). Such a record carries a trailing `ctx` pointer, the instance it
+landed in, and the commit wakes that instance's waiters per record
+(`emit_array_commit` does the same for an array element). Classification
+(`nba_classify_ir`) and the lowering dispatch (`lower_inst`, `StoreNb`) must agree on
+which queue a write belongs to; a vif member routed to the array queue's record while
+classified as an aggregate was dropped, or replayed by another queue's commit.
+
 A **partial** leaf write (`x.f[3:0] <= v`, `arr[i].f[2] <= v` — static or
 runtime) also defers, with an extra `mask` region in the record (positioned like
 the value). When any deferred site of an aggregate is partial (`agg_masked`) the

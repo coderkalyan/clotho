@@ -3134,6 +3134,8 @@ private:
 
     uint32_t agg_rec_payload(const SignalSlot& s);
 
+    uint32_t agg_rec_ctx(const SignalSlot& s);
+
     llvm::Value* agg_arg_ptr(const Guarded& lv, Ref type, ArgDir dir);
 
     llvm::Value* agg_slot_ptr(const LValue& lv);
