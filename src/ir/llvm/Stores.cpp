@@ -1148,6 +1148,12 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
         wide_dyn_store(lv, rhs);
         return;
     }
+    // A select that may be out of range writes plainly where it is in range and
+    // through the mask otherwise.
+    if (has_fast_path(lv)) {
+        select_paths(lv.nest_valid, [&] { lower_store(plain_of(lv), rhs); }, [&] { lower_store(slow_of(lv), rhs); });
+        return;
+    }
     // Every other store to a signal or a frame local passes here: the one place to
     // check the value that is about to be written.
     emit_encoding_check(rhs, lv.four_state, cur_inst_);
@@ -1264,48 +1270,62 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         }
     }
 
-    // 2-state target: stage the single iW value into the iW shadow. No z.
-    if (!s.four_state) {
-        llvm::Value* v = must_of(rhs, false);
-        if (!s.nba_partial) {
-            b_.CreateStore(v, mp);
-        } else {
-            llvm::Value* old   = b_.CreateLoad(int_ty(s.width), mp);
-            llvm::Value* bmask = store_mask(lv, s.width);
-            b_.CreateStore(merge_sel(old, v, lv, s.width, bmask), mp);
-            stage_dyn_mask(s, bmask);
-        }
+    // A select that may be out of range stages plainly where it is in range and
+    // through the mask otherwise. The signal is registered once, after either.
+    if (s.nba_partial && has_fast_path(lv)) {
+        select_paths(
+          lv.nest_valid, [&] { stage_partial(plain_of(lv), s, rhs); }, [&] { stage_partial(slow_of(lv), s, rhs); });
         register_block_store(lv, s);
         return;
     }
 
-    // A never-z target stages no z shadow (and its commit loop skips z).
-    llvm::Value* zp = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
+    // 2-state target: stage the single iW value into the iW shadow. No z.
+    if (!s.four_state) {
+        if (!s.nba_partial) {
+            b_.CreateStore(must_of(rhs, false), mp);
+        } else {
+            stage_partial(lv, s, rhs);
+        }
+        register_block_store(lv, s);
+        return;
+    }
 
     if (!s.nba_partial) {
         // Whole-signal target: the RHS is already signal-width (frontend conversion),
         // so the shadow planes store directly — no mask, no read-modify-write.
         b_.CreateStore(rhs.mm, mp);
         if (s.has_z) {
-            b_.CreateStore(rhs.z, zp);
+            b_.CreateStore(rhs.z, shadow_ptr(s, s.sh_z_field));
         }
     } else {
-        // Partial-capable target: merge the selected bits into the shadow. A
-        // whole-signal site here selects every bit, so it merges the full word.
-        const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp),
-                               s.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s.width), zp))
-                                       : zero(s.width) };
-        llvm::Value* bmask = store_mask(lv, s.width);
-        llvm::Value* must  = merge_sel(must_of(old, true), must_of(rhs, true), lv, s.width, bmask);
-        llvm::Value* may   = merge_sel(may_of(old, true), may_of(rhs, true), lv, s.width, bmask);
-        llvm::Value* z     = merge_sel(old.z, rhs.z, lv, s.width, bmask);
-        b_.CreateStore(packed(must, may, z).mm, mp);
-        if (s.has_z) {
-            b_.CreateStore(z, zp);
-        }
-        stage_dyn_mask(s, bmask);
+        stage_partial(lv, s, rhs);
     }
     register_block_store(lv, s);
+}
+
+// Merge the selected bits of a partial-capable target into its shadow (a whole-
+// signal site selects every bit, so it merges the full word) and record them in a
+// dynamic dirty mask. A never-z target stages no z shadow (and its commit loop skips z).
+void Backend::stage_partial(const LValue& lv, const SignalSlot& s, Plane rhs) {
+    llvm::Value* mp    = shadow_ptr(s, s.sh_mm_field);
+    llvm::Value* bmask = store_mask(lv, s.width);
+    if (!s.four_state) {
+        llvm::Value* old = b_.CreateLoad(int_ty(s.width), mp);
+        b_.CreateStore(merge_sel(old, must_of(rhs, false), lv, s.width, bmask), mp);
+        stage_dyn_mask(s, bmask);
+        return;
+    }
+    llvm::Value* zp   = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
+    const Plane  old  = { b_.CreateLoad(int_ty(2 * s.width), mp),
+                          s.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s.width), zp)) : zero(s.width) };
+    llvm::Value* must = merge_sel(must_of(old, true), must_of(rhs, true), lv, s.width, bmask);
+    llvm::Value* may  = merge_sel(may_of(old, true), may_of(rhs, true), lv, s.width, bmask);
+    llvm::Value* z    = merge_sel(old.z, rhs.z, lv, s.width, bmask);
+    b_.CreateStore(packed(must, may, z).mm, mp);
+    if (s.has_z) {
+        b_.CreateStore(z, zp);
+    }
+    stage_dyn_mask(s, bmask);
 }
 
 // For a dynamic-mask signal, OR this site's written bits into its runtime dirty

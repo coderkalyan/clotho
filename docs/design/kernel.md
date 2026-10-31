@@ -112,11 +112,14 @@ when it does.
   treated as out of range. **Not yet:** packed
   offsets are 32-bit, with indices that do not fit saturated out of range.
 - A dynamic select branches to a plain fast path when its index is known and in
-  range; the mask path runs only otherwise. **Not yet:** a storage-wide mask on
-  every access.
+  range; the mask path runs only otherwise. On storage of 64 bits or less too: the
+  branch costs 20-60% fewer instructions than the mask (an 8-bit 4-state read 150 ->
+  48, a 64-bit one 105 -> 47), and with an index that is invalid half the time at
+  random it costs 3% more cycles, against 23% fewer for one always in range.
 - A runtime helper serves only runtime-indexed selects of storage above 256 bits,
-  where it costs less than the inline shift (it is flat at 100-120 instructions for a
-  bit select; the inline form grows with the width). It works a 64-bit word at a time
+  where it costs less than the inline shift (it is flat at 117-141 instructions for a
+  bit select; the inline write costs more from 384 bits, the read from 1 Kbit, and the inline
+  form's compile time grows quadratically). It works a 64-bit word at a time
   and receives only the planes the destination needs.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.

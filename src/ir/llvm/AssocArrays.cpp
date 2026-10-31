@@ -923,6 +923,10 @@ Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
     el.width            = lv.width;
     el.range_mask       = lv.range_mask;
     el.range_mask_outer = lv.range_mask_outer;
+    el.dyn_sel          = lv.dyn_sel;
+    el.dyn_fast         = lv.dyn_fast;
+    el.sel_off          = lv.sel_off;
+    el.sel_width        = lv.sel_width;
     el.nest_valid       = lv.nest_valid;
     el.wide_dyn         = lv.wide_dyn;
     el.sel_base         = lv.sel_base;

@@ -352,7 +352,7 @@ void Backend::lower_inst(Index i) {
                 const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
                 if (first < 0 || first + lv.width > outer_width) {
                     set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse());
-                } else if (lv.range_mask != nullptr && lv.width != outer_width) {
+                } else if (lv.masked() && lv.width != outer_width) {
                     // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
                     // the inherited mask still covers the whole outer window, which a
                     // write must narrow (store_mask).
@@ -2561,6 +2561,13 @@ Plane Backend::lower_load(const LValue& lv) {
         return wide_dyn_load(lv);
     }
 
+    // A select that may be out of range reads plainly where it is in range and
+    // through the mask otherwise (LRM 11.5.1).
+    if (has_fast_path(lv)) {
+        return select_paths_read(
+          lv.nest_valid, [&] { return lower_load(plain_of(lv)); }, [&] { return lower_load(slow_of(lv)); });
+    }
+
     // A constant select reads the words that hold its bits, not the whole slot.
     if (!selects_whole(lv)) {
         if (const auto win = static_window(lv)) {
@@ -2576,9 +2583,9 @@ Plane Backend::lower_load(const LValue& lv) {
         }
         // A bounds-checked select aligns poison-free and reads 0 outside range
         // (LRM 11.5.1: an out-of-range read of a 2-state value is 0).
-        if (lv.range_mask != nullptr) {
+        if (lv.masked()) {
             llvm::Value* shifted = align_shl(v, b_.CreateNeg(lv.bit_off), w);
-            llvm::Value* valid   = align_shl(lv.range_mask, b_.CreateNeg(lv.bit_off), w);
+            llvm::Value* valid   = align_shl(window_mask(lv, w), b_.CreateNeg(lv.bit_off), w);
             return two_val(cast(b_.CreateAnd(shifted, valid), lv.width, false));
         }
         llvm::Value* off = cast(lv.bit_off, w, false);
@@ -2594,12 +2601,12 @@ Plane Backend::lower_load(const LValue& lv) {
     const Plane full = { mm, z };
     // A bounds-checked select aligns poison-free and forces x on the bits that
     // fall outside the vector (LRM 11.5.1: must=0, may=1, z=0).
-    if (lv.range_mask != nullptr) {
+    if (lv.masked()) {
         llvm::Value* down  = b_.CreateNeg(lv.bit_off);
         llvm::Value* must  = align_shl(must_of(full, true), down, w);
         llvm::Value* may   = align_shl(may_of(full, true), down, w);
         llvm::Value* zp    = align_shl(z, down, w);
-        llvm::Value* valid = align_shl(lv.range_mask, down, w);
+        llvm::Value* valid = align_shl(window_mask(lv, w), down, w);
         llvm::Value* oob   = b_.CreateNot(valid);
         return packed(cast(b_.CreateAnd(must, valid), lv.width, false),
                       cast(b_.CreateOr(may, oob), lv.width, false),

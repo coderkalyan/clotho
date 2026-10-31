@@ -897,3 +897,161 @@ TEST_CASE("a constant index outside a fixed array reads the default and writes n
     )") == "xx xx 00 xx 11\n"
            "x 0\n");
 }
+
+// kernel.md: a dynamic select branches to a plain fast path when its index is known
+// and in range, and the mask path runs only otherwise. The plain arm of a read and of
+// a write has no clamp, no `select i1` and no compare of its own.
+TEST_CASE("a dynamic select of storage shifted inline has a plain path and a masked one") {
+    const std::string body = process_body(R"(
+        module m;
+          logic [31:0] a;
+          bit   [31:0] b;
+          int i;
+          logic r;
+          initial begin
+            i = $urandom;
+            r = a[i];
+            b[i +: 4] = 4'hf;
+            a[i] = 1'b1;
+          end
+        endmodule
+    )");
+    CHECK(count_of(body, "sel.plain") >= 3);
+    CHECK(count_of(body, "sel.masked") >= 3);
+    size_t at = body.find("sel.plain:");
+    while (at != std::string::npos) {
+        const size_t end = body.find("sel.masked:", at);
+        REQUIRE(end != std::string::npos);
+        const std::string arm = body.substr(at, end - at);
+        CHECK_MESSAGE(arm.find("select i1") == std::string::npos, arm);
+        CHECK_MESSAGE(arm.find("icmp") == std::string::npos, arm);
+        at = body.find("sel.plain:", end);
+    }
+    // A select of constant index has no branch at all, and one of a very wide vector
+    // leaves the in-range case to its runtime helper.
+    CHECK(process_body("module m; logic [31:0] a; logic r; initial begin r = a[5]; a[7] = 1; end endmodule")
+            .find("sel.plain") == std::string::npos);
+}
+
+// Every kind of index a dynamic select can get, in 2-state and 4-state storage of
+// narrow, two-word and three-word width: in range at and across word boundaries,
+// partly out of range at either end, wholly outside, negative, x/z, by blocking and
+// nonblocking writes. The 4-state lines agree with iverilog 13; it gives a 2-state
+// vector x where LRM 11.5.1 says 0.
+TEST_CASE("a dynamic select agrees with LRM 11.5.1 at every kind of index") {
+    CHECK(run_capture(R"(
+module t;
+    logic [31:0]  a;
+    bit   [31:0]  b;
+    logic [129:0] c;
+    bit   [129:0] d;
+    logic [199:0] e;
+    logic [3:0][7:0] pk;
+    logic [7:0]   v8;
+    integer       i, j;
+    reg [3:0]     xi;
+    integer       idx [0:9];
+    integer       k;
+    initial begin
+        idx[0] = -33; idx[1] = -1; idx[2] = 0; idx[3] = 1; idx[4] = 31; idx[5] = 32; idx[6] = 63; idx[7] = 64; idx[8] = 129; idx[9] = 130;
+        for (k = 0; k < 10; k = k + 1) begin
+            i = idx[k];
+            a = 32'hA5A5A5A5; b = 32'hA5A5A5A5; c = {130{1'b1}}; d = {130{1'b1}}; e = '0;
+            $display("%0d: r %b %b %b %b %b", i, a[i], b[i], c[i], d[i], e[i]);
+            a[i] = 1'b0; b[i] = 1'b0; c[i] = 1'b0; d[i] = 1'b0; e[i] = 1'bz;
+            $display("%0d: w %h %h %h %h %h", i, a, b, c, d, e);
+            $display("%0d: p %b %b %b %b", i, a[i +: 6], b[i +: 6], c[i +: 70], d[i -: 70]);
+            a[i +: 6] = 6'b101101; b[i +: 6] = 6'b101101; c[i +: 70] = {6'bxz10xz, 64'h0123456789abcdef}; d[i -: 70] = {6'b110011, 64'hfedcba9876543210};
+            $display("%0d: q %h %h %h %h", i, a, b, c, d);
+            a = 0; b = 0; c = 0; d = 0;
+            a[i] <= 1'b1; b[i +: 3] <= 3'b111; c[i] <= 1'b1; c[i +: 66] <= {66{1'b1}}; d[i -: 3] <= 3'b111;
+            #1 $display("%0d: n %h %h %h %h", i, a, b, c, d);
+        end
+        // x and z indices
+        a = 32'hA5A5A5A5; xi = 4'bx010;
+        $display("%b %b %b", a[xi], a[xi +: 4], c[xi +: 70]);
+        a[xi] = 1'b0; a[xi +: 4] = 4'h0; a[xi] <= 1'b0;
+        #1 $display("%h", a);
+        // a signed and a narrow index
+        v8 = 8'hFF; begin : narrow
+            reg signed [3:0] s; s = -2;
+            $display("%b %b", v8[s], v8[s +: 4]);
+            v8[s +: 4] = 4'h0; $display("%h", v8);
+        end
+    end
+endmodule
+    )") == "-33: r x 0 x 0 x\n"
+           "-33: w a5a5a5a5 a5a5a5a5 3ffffffffffffffffffffffffffffffff 3ffffffffffffffffffffffffffffffff "
+           "00000000000000000000000000000000000000000000000000\n"
+           "-33: p xxxxxx 000000 1111111111111111111111111111111111111xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx "
+           "0000000000000000000000000000000000000000000000000000000000000000000000\n"
+           "-33: q a5a5a5a5 a5a5a5a5 3ffffffffffffffffffffffXXZ091a2b3 3ffffffffffffffffffffffffffffffff\n"
+           "-33: n 00000000 00000000 0000000000000000000000001ffffffff 000000000000000000000000000000000\n"
+           "-1: r x 0 x 0 x\n"
+           "-1: w a5a5a5a5 a5a5a5a5 3ffffffffffffffffffffffffffffffff 3ffffffffffffffffffffffffffffffff "
+           "00000000000000000000000000000000000000000000000000\n"
+           "-1: p 00101x 001010 111111111111111111111111111111111111111111111111111111111111111111111x "
+           "0000000000000000000000000000000000000000000000000000000000000000000000\n"
+           "-1: q a5a5a5b6 a5a5a5b6 3ffffffffffffffXXZ091a2b3c4d5e6f7 3ffffffffffffffffffffffffffffffff\n"
+           "-1: n 00000000 00000003 00000000000000001ffffffffffffffff 000000000000000000000000000000000\n"
+           "0: r 1 1 1 1 0\n"
+           "0: w a5a5a5a4 a5a5a5a4 3fffffffffffffffffffffffffffffffe 3fffffffffffffffffffffffffffffffe "
+           "0000000000000000000000000000000000000000000000000Z\n"
+           "0: p 100100 100100 1111111111111111111111111111111111111111111111111111111111111111111110 "
+           "0000000000000000000000000000000000000000000000000000000000000000000000\n"
+           "0: q a5a5a5ad a5a5a5ad 3ffffffffffffffXX0123456789abcdef 3ffffffffffffffffffffffffffffffff\n"
+           "0: n 00000001 00000007 00000000000000003ffffffffffffffff 000000000000000000000000000000001\n"
+           "1: r 0 0 1 1 0\n"
+           "1: w a5a5a5a5 a5a5a5a5 3fffffffffffffffffffffffffffffffd 3fffffffffffffffffffffffffffffffd "
+           "0000000000000000000000000000000000000000000000000Z\n"
+           "1: p 010010 010010 1111111111111111111111111111111111111111111111111111111111111111111110 "
+           "0100000000000000000000000000000000000000000000000000000000000000000000\n"
+           "1: q a5a5a5db a5a5a5db 3ffffffffffffffXX02468acf13579bdf 3ffffffffffffffffffffffffffffffff\n"
+           "1: n 00000002 0000000e 00000000000000007fffffffffffffffe 000000000000000000000000000000003\n"
+           "31: r 1 1 1 1 0\n"
+           "31: w 25a5a5a5 25a5a5a5 3ffffffffffffffffffffffff7fffffff 3ffffffffffffffffffffffff7fffffff "
+           "000000000000000000000000000000000000000000Z0000000\n"
+           "31: p xxxxx0 000000 1111111111111111111111111111111111111111111111111111111111111111111110 "
+           "0111111111111111111111111111111100000000000000000000000000000000000000\n"
+           "31: q a5a5a5a5 a5a5a5a5 3ffffffXXZ091a2b3c4d5e6f7ffffffff 3ffffffffffffffffffffffffcffb72ea\n"
+           "31: n 80000000 80000000 000000001ffffffffffffffff80000000 0000000000000000000000000e0000000\n"
+           "32: r x 0 1 1 0\n"
+           "32: w a5a5a5a5 a5a5a5a5 3fffffffffffffffffffffffeffffffff 3fffffffffffffffffffffffeffffffff "
+           "00000000000000000000000000000000000000000Z00000000\n"
+           "32: p xxxxxx 000000 1111111111111111111111111111111111111111111111111111111111111111111110 "
+           "0111111111111111111111111111111110000000000000000000000000000000000000\n"
+           "32: q a5a5a5a5 a5a5a5a5 3ffffffXX0123456789abcdefffffffff 3ffffffffffffffffffffffff9ff6e5d4\n"
+           "32: n 00000000 00000000 000000003ffffffffffffffff00000000 0000000000000000000000001c0000000\n"
+           "63: r x 0 1 1 0\n"
+           "63: w a5a5a5a5 a5a5a5a5 3ffffffffffffffff7fffffffffffffff 3ffffffffffffffff7fffffffffffffff "
+           "0000000000000000000000000000000000Z000000000000000\n"
+           "63: p xxxxxx 000000 xxx1111111111111111111111111111111111111111111111111111111111111111110 "
+           "0111111111111111111111111111111111111111111111111111111111111111000000\n"
+           "63: q a5a5a5a5 a5a5a5a5 XZ091a2b3c4d5e6f7ffffffffffffffff 3ffffffffffffffffcffb72ea61d950c8\n"
+           "63: n 00000000 00000000 1ffffffffffffffff8000000000000000 00000000000000000e000000000000000\n"
+           "64: r x 0 1 1 0\n"
+           "64: w a5a5a5a5 a5a5a5a5 3fffffffffffffffeffffffffffffffff 3fffffffffffffffeffffffffffffffff "
+           "000000000000000000000000000000000Z0000000000000000\n"
+           "64: p xxxxxx 000000 xxxx111111111111111111111111111111111111111111111111111111111111111110 "
+           "0111111111111111111111111111111111111111111111111111111111111111100000\n"
+           "64: q a5a5a5a5 a5a5a5a5 X0123456789abcdefffffffffffffffff 3ffffffffffffffff9ff6e5d4c3b2a190\n"
+           "64: n 00000000 00000000 3ffffffffffffffff0000000000000000 00000000000000001c000000000000000\n"
+           "129: r x 0 1 1 0\n"
+           "129: w a5a5a5a5 a5a5a5a5 1ffffffffffffffffffffffffffffffff 1ffffffffffffffffffffffffffffffff "
+           "00000000000000000Z00000000000000000000000000000000\n"
+           "129: p xxxxxx 000000 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0 "
+           "0111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "129: q a5a5a5a5 a5a5a5a5 3ffffffffffffffffffffffffffffffff 33fedcba9876543210fffffffffffffff\n"
+           "129: n 00000000 00000000 200000000000000000000000000000000 380000000000000000000000000000000\n"
+           "130: r x 0 x 0 0\n"
+           "130: w a5a5a5a5 a5a5a5a5 3ffffffffffffffffffffffffffffffff 3ffffffffffffffffffffffffffffffff "
+           "00000000000000000Z00000000000000000000000000000000\n"
+           "130: p xxxxxx 000000 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx "
+           "0111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "130: q a5a5a5a5 a5a5a5a5 3ffffffffffffffffffffffffffffffff 27fdb97530eca86421fffffffffffffff\n"
+           "130: n 00000000 00000000 000000000000000000000000000000000 300000000000000000000000000000000\n"
+           "x xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "a5a5a5a5\n"
+           "x 11xx\n"
+           "fc\n");
+}

@@ -285,10 +285,10 @@ struct BoundsCheck {
 
 // Storage width above which a runtime-offset bit / part select is done by the
 // runtime (word-indexed) instead of inline (whole-value variable shift). The inline
-// form costs O(width) instructions and the helper a flat 117-139 (2-/4-state, read /
-// write); they cross between 128 and 192 bits, and the helper wins at every width
-// above 256 (wide_dyn_storage has the measurements and why the threshold is not the
-// crossing). A select with a constant offset never reaches the helper's call.
+// form costs O(width) instructions and the helper a flat 117-141, so a write crosses
+// between 256 and 384 bits and a read only near 1 Kbit; wide_dyn_storage has the
+// measurements and why the threshold is where it is. A select with a constant offset
+// never reaches the helper's call.
 constexpr uint32_t wide_dyn_select_bits = 256;
 
 // Operand width above which multiply, divide and modulo are runtime calls
@@ -345,6 +345,16 @@ struct LValueInfo {
     // the selected bits and uses it as is; a write has to narrow it to its own
     // bits (store_mask), or it would clear the rest of the window (LRM 11.5.1).
     bool range_mask_outer = false;
+    // A select with a run-time index on storage shifted inline: the range mask is not
+    // built at the select but where it is used (window_mask), from the select's own
+    // offset and width and the container it was clamped to, which are recorded in
+    // `sel_off` / `sel_width` and the `sel_base` / `sel_cwidth` / `sel_unknown`
+    // below. `dyn_fast` says every level of it lies inside the vector, so that
+    // `nest_valid` alone tells an access whether it may skip the mask.
+    bool         dyn_sel   = false;
+    bool         dyn_fast  = false;
+    llvm::Value* sel_off   = nullptr;
+    uint32_t     sel_width = 0;
     // i1: every dynamic select on the way to here (`a[i][j]`, `sa[i].f[j]`) has a
     // known index and a window inside its container. A select nested in an invalid
     // one is invalid, so set_select_bounds folds this into its own verdict. Null
@@ -531,6 +541,11 @@ struct LValueInfo {
     // down the mm-snapshot path with a null base.
     bool   mut_sig_valid = false;
     Signal mut_sig{ 0 };
+
+    // Whether a range mask decides which of the selected bits are in range.
+    bool masked() const {
+        return range_mask != nullptr || dyn_sel;
+    }
 };
 
 // An lvalue that can be dereferenced: the pointer its selection is rooted at, plus
@@ -3225,6 +3240,74 @@ private:
     static bool is_zero_const(llvm::Value* v);
 
     static bool selects_whole(const LValueInfo& lv);
+
+    llvm::Value* window_mask(const LValueInfo& lv, uint32_t sw);
+
+    // A select with a run-time index whose every level may be out of range, on
+    // storage shifted inline, branches on `nest_valid`: the plain access where all are
+    // in range, the mask path otherwise. `plain_of` is the place as that access sees
+    // it, `slow_of` as the mask path does (it must not branch again).
+    static bool has_fast_path(const LValueInfo& lv) {
+        return lv.dyn_sel && lv.dyn_fast && lv.nest_valid != nullptr && !lv.wide_dyn;
+    }
+
+    static LValue plain_of(LValue lv) {
+        lv.dyn_sel          = false;
+        lv.range_mask_outer = false;
+        lv.nest_valid       = nullptr;
+        return lv;
+    }
+
+    static LValue slow_of(LValue lv) {
+        lv.dyn_fast = false;
+        return lv;
+    }
+
+    template<class Fast, class Slow>
+    void select_paths(llvm::Value* cond, Fast&& fast, Slow&& slow) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* yes  = llvm::BasicBlock::Create(ctx_, "sel.plain", fn);
+        auto* no   = llvm::BasicBlock::Create(ctx_, "sel.masked", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "sel.cont", fn);
+        b_.CreateCondBr(cond, yes, no);
+        b_.SetInsertPoint(yes);
+        fast();
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(no);
+        slow();
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
+
+    template<class Fast, class Slow>
+    Plane select_paths_read(llvm::Value* cond, Fast&& fast, Slow&& slow) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* yes  = llvm::BasicBlock::Create(ctx_, "sel.plain", fn);
+        auto* no   = llvm::BasicBlock::Create(ctx_, "sel.masked", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "sel.cont", fn);
+        b_.CreateCondBr(cond, yes, no);
+        b_.SetInsertPoint(yes);
+        const Plane a     = fast();
+        auto*       a_end = b_.GetInsertBlock();
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(no);
+        const Plane c     = slow();
+        auto*       c_end = b_.GetInsertBlock();
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+        const auto merge = [&](llvm::Value* x, llvm::Value* y) -> llvm::Value* {
+            if (x == nullptr) {
+                return nullptr;
+            }
+            auto* phi = b_.CreatePHI(x->getType(), 2);
+            phi->addIncoming(x, a_end);
+            phi->addIncoming(y, c_end);
+            return phi;
+        };
+        return { merge(a.mm, c.mm), merge(a.z, c.z), merge(a.fp, c.fp) };
+    }
+
+    void stage_partial(const LValue& lv, const SignalSlot& s, Plane rhs);
 
     // -- Constant selects touch only the words they cover --
     //
