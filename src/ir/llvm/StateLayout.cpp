@@ -198,6 +198,17 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
         an.bind_of.try_emplace(static_cast<uint32_t>(e), static_cast<uint32_t>(an.externs.size()));
         an.externs.push_back(e);
     }
+    // The functions the instance defines, and the ones its declarations import.
+    // As with signals, two declarations can name one function; the first stands
+    // for all of them.
+    {
+        Anchor& an    = anchors_[aid];
+        an.fn_locals  = scope.fn_locals;
+        an.fn_externs = scope.fn_externs;
+        for (uint32_t k = 0; k < an.fn_externs.size(); ++k) {
+            an.fn_bind_of.try_emplace(static_cast<uint32_t>(an.fn_externs[k]), k);
+        }
+    }
     const std::vector<Signal>& defined = scope.unit == InstanceScope::no_unit ? scope.signals : scope.locals;
     std::vector<llvm::Type*>   fields;
     for (uint32_t k = 0; k < defined.size(); ++k) {
@@ -1155,6 +1166,7 @@ void Backend::build_instance_ctx_layout() {
         a.n_blk        = def_blk[a.ty];
         a.n_mask       = any_guarded_ ? a.n_blk : 0;
         a.n_bind       = static_cast<uint32_t>(a.externs.size());
+        a.n_fbind      = static_cast<uint32_t>(a.fn_externs.size());
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;
         uint32_t nsta  = 0;
@@ -1175,7 +1187,8 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_mmask_base       = a.ctx_trig_base + nsta;
         a.ctx_gmask_base       = a.ctx_mmask_base + a.n_mask;
         a.ctx_bind_base        = a.ctx_gmask_base + a.n_mask;
-        a.ctx_id_base          = a.ctx_bind_base + 2 * a.n_bind;
+        a.ctx_fbind_base       = a.ctx_bind_base + 2 * a.n_bind;
+        a.ctx_id_base          = a.ctx_fbind_base + a.n_fbind;
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1185,6 +1198,7 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), nsta, b_.getInt64Ty());
             f.insert(f.end(), 2 * a.n_mask, b_.getInt64Ty());
             f.insert(f.end(), 2 * a.n_bind, ptr);
+            f.insert(f.end(), a.n_fbind, ptr);
             f.insert(f.end(), a.n_id, i32);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");

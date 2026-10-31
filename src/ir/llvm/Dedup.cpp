@@ -340,6 +340,7 @@ Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
     const auto                 block_lo = static_cast<std::ptrdiff_t>(block_commits_.size());
     const auto                 fill_lo  = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
     const std::vector<uint8_t> bound    = a.bind_used;
+    const std::vector<uint8_t> fbound   = a.fbind_used;
     verifying_                          = true;
     share_active_                       = true;
     taint_why_                          = nullptr;
@@ -354,7 +355,8 @@ Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
     block_commits_.erase(block_commits_.begin() + block_lo, block_commits_.end());
     own.fills.assign(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
     ctx_blk_fills_.erase(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
-    a.bind_used = bound;
+    a.bind_used  = bound;
+    a.fbind_used = fbound;
     return own;
 }
 

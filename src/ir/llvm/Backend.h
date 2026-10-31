@@ -1004,6 +1004,9 @@ struct Anchor {
     //   ctx_bind_base ptr  two per binding (see n_bind): the address of an
     //                      imported signal's storage, and the record of the
     //                      instance that owns it (null for a signal of none)
+    //   ctx_fbind_base ptr one per function binding (see n_fbind): the record
+    //                      of the instance that owns an imported function
+    //                      (null for a function of none)
     // A writer in the instance's own code reads a bucket's base, count and
     // trigger bits here, and a guarded group its masks, so none of them is
     // baked into unit code: the buckets depend on who subscribes and the bits
@@ -1032,6 +1035,25 @@ struct Anchor {
     // each is bound to in THIS instance; bind_of is its inverse, which names a
     // flat signal's binding while the code of this instance is lowered.
     uint32_t ctx_bind_base = 0;
+    // Function bindings: one per extern function declaration of the unit
+    // (InstanceScope::fn_externs), in the unit's order, one record field each at
+    // ctx_fbind_base + ordinal: the record of the instance that owns the
+    // function, which a call passes as the callee's first argument, so a unit's
+    // code names the function and never the instance it runs on. `fn_externs`
+    // is the flat function each is bound to in THIS instance; fn_bind_of is its
+    // inverse (the first declaration of a function stands for all that name it),
+    // which names a function's binding while the code of this instance is
+    // lowered.
+    uint32_t                                         ctx_fbind_base = 0;
+    uint32_t                                         n_fbind        = 0;
+    std::vector<FunctionId>                          fn_externs;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> fn_bind_of;
+    // The functions the instance defines, in the unit's order (InstanceScope::
+    // fn_locals): a function's position is its ordinal in the unit.
+    std::vector<FunctionId> fn_locals;
+    // Which function bindings the lowered code of this instance reads (only
+    // those are filled).
+    std::vector<uint8_t> fbind_used;
     // The signals' ids in design-wide spaces (see IdFamily), one i32 field per
     // (signal, family) the unit's signals have, at ctx_id_base + Backend::id_ord_.
     uint32_t ctx_id_base = 0;
@@ -1780,9 +1802,10 @@ private:
     uint32_t subroutine_anchor(const Function& f) const;
 
     // The first argument of a direct call of `fid`: the record of the instance it
-    // belongs to -- the caller's own when it is the same instance -- else the root
-    // state. A caller that names the record of another instance by its symbol
-    // cannot be shared (taint).
+    // belongs to -- the caller's own when it is the same instance, the one its
+    // function binding holds (Anchor::fn_externs) when the caller names it by an
+    // extern declaration -- else the root state. A caller that names the record
+    // of another instance by its symbol cannot be shared (taint).
     llvm::Value* callee_record(FunctionId fid);
 
     // What a virtual dispatch passes: the callee is chosen at run time, so its

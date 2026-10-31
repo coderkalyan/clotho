@@ -893,6 +893,18 @@ llvm::Value* Backend::callee_record(FunctionId fid) {
     if (callee == own_anchor_ && own_ctx_ != nullptr) {
         return own_ctx_;
     }
+    // An instance's code reaches another instance's function through the binding
+    // its extern declaration of the function holds (filled at startup), so the
+    // code names no record of a neighbour.
+    if (own_anchor_ != SignalSlot::no_anchor && own_ctx_ != nullptr) {
+        Anchor&    a  = anchors_[own_anchor_];
+        const auto it = a.fn_bind_of.find(static_cast<uint32_t>(fid));
+        if (it != a.fn_bind_of.end()) {
+            a.fbind_used.resize(a.fn_externs.size(), 0);
+            a.fbind_used[it->second] = 1;
+            return own_field(a.ctx_fbind_base + it->second, llvm::PointerType::getUnqual(ctx_));
+        }
+    }
     return ensure_ctx(anchors_[callee]);
 }
 

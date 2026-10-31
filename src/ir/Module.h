@@ -118,6 +118,17 @@ struct InstanceScope {
     // `unit` is no_unit.
     static constexpr Signal no_extern = static_cast<Signal>(UINT32_MAX);
     std::vector<Signal>     externs;
+    // The flat function each of the unit's own function declarations is in this
+    // instance, in the unit's function order: the unit's code names its
+    // functions by position (a function's ordinal), and the instances of one
+    // unit hold the same ones. Empty when `unit` is no_unit.
+    std::vector<FunctionId> fn_locals;
+    // The flat function each extern function declaration of the unit is bound
+    // to in this instance (a hierarchical call, a call through an interface
+    // port, a package subroutine), in the unit's function order, so a unit's
+    // code names its imported functions by position. Empty when `unit` is
+    // no_unit.
+    std::vector<FunctionId> fn_externs;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the

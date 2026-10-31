@@ -846,9 +846,9 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     const auto ctx_ptr = [&](Anchor& a, uint32_t field) {
         return b_.CreateInBoundsGEP(a.ctx_ty, sym(a.ctx_gv), { b_.getInt32(0), b_.getInt32(field) });
     };
-    // A binding names the record of the instance that owns its signal, so that
-    // record must exist before anything is filled; creating it can make the owner
-    // an instance with bindings of its own to fill.
+    // A binding names the record of the instance that owns its signal or its
+    // function, so that record must exist before anything is filled; creating it
+    // can make the owner an instance with bindings of its own to fill.
     for (bool grew = true; grew;) {
         grew = false;
         for (Anchor& a : anchors_) {
@@ -859,6 +859,13 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
                 const SignalSlot& s = slot_of(a.externs[k]);
                 if (a.bind_used[k] != 0 && s.anchor != SignalSlot::no_anchor && anchors_[s.anchor].ctx_gv == nullptr) {
                     ensure_ctx(anchors_[s.anchor]);
+                    grew = true;
+                }
+            }
+            for (uint32_t k = 0; k < a.fbind_used.size(); ++k) {
+                const uint32_t owner = subroutine_anchor(mod_.function(a.fn_externs[k]));
+                if (a.fbind_used[k] != 0 && owner != SignalSlot::no_anchor && anchors_[owner].ctx_gv == nullptr) {
+                    ensure_ctx(anchors_[owner]);
                     grew = true;
                 }
             }
@@ -890,6 +897,15 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
                              ? static_cast<llvm::Value*>(sym(anchors_[s.anchor].ctx_gv))
                              : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)),
                            ctx_ptr(a, a.ctx_bind_base + 2 * k + 1));
+        }
+        // The functions this instance's code calls in other instances: whose
+        // record each is passed.
+        for (uint32_t k = 0; k < a.fbind_used.size(); ++k) {
+            if (a.fbind_used[k] == 0) {
+                continue;
+            }
+            b_.CreateStore(sym(anchors_[subroutine_anchor(mod_.function(a.fn_externs[k]))].ctx_gv),
+                           ctx_ptr(a, a.ctx_fbind_base + k));
         }
         for (const Signal sj : anchor_signals_[static_cast<size_t>(&a - anchors_.data())]) {
             if (sj == Signal{ ~0u }) {

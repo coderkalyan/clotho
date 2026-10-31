@@ -599,6 +599,15 @@ private:
                     s.signals.push_back(fi.signals[h]);
                 }
             }
+            for (uint32_t h = 0; h < u.functions.size(); ++h) {
+                const uint32_t imp = u.functions[h].import;
+                if (imp == kLocal) {
+                    s.fn_locals.push_back(fi.functions[h]);
+                    continue;
+                }
+                assert(u.imports[imp].kind == Import::Kind::Member && "a function is imported by member, never as a layout");
+                s.fn_externs.push_back(fi.functions[h]);
+            }
             s.children.reserve(fi.children.size());
             for (const uint32_t ci : fi.children) {
                 s.children.push_back(std::move(*scopes[ci]));

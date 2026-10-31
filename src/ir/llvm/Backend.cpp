@@ -178,6 +178,10 @@ void Backend::run() {
         for (size_t k = 0; k < anchors_[ra].bind_used.size(); ++k) {
             a.bind_used[k] |= anchors_[ra].bind_used[k];
         }
+        a.fbind_used.resize(a.fn_externs.size(), 0);
+        for (size_t k = 0; k < anchors_[ra].fbind_used.size(); ++k) {
+            a.fbind_used[k] |= anchors_[ra].fbind_used[k];
+        }
     }
     env_ = root_env_.get();
     if (!shape_sets_.empty()) {
