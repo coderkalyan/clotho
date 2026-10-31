@@ -454,13 +454,19 @@ code go.
      is what lets a group that calls a function of its instance, or of the
      instance a binding names, share like any other; a call of a function that
      stayed one instance's own taints the group. A function that is not
-     shared is lowered where it always was, apart from living in its unit's
-     module, and `--stat=unit-code` counts the subroutines of multi-instance
-     units, the functions emitted for them and what kept each per instance: a
-     name read (`%m`), a nonblocking write, a disable target, a covergroup, a
-     process control block or a process-local random stream, a call of such a
+     shared is lowered as it was, into its unit's module like every other, and
+     `--stat=unit-code` counts the subroutines of multi-instance units, the
+     functions emitted for them and what kept each per instance: a name read
+     (`%m`), a nonblocking write, a disable target, a covergroup, a process
+     control block or a process-local random stream, a call of such a
      subroutine, a cycle. Two program instances' subroutines differ in the
-     program that `$exit` ends and are not one function either.
+     program that `$exit` ends and are not one function either. Measured:
+     rocket-chip has no function or task in a multi-instance unit (0 of 0; its
+     1021 groups of multi-instance units are as many functions as before), so
+     the suite's twin designs are what covers shared subroutines; the perf
+     corpus runs the same instructions as before, picorv32 1.2% fewer, since
+     its testbench's tasks now sit in the module of the code that calls them
+     and LLVM inlines them there.
 
      An event object is instance data reached through its variable: a declared
      event powers on holding the handle of its own object (a slot of
