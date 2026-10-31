@@ -194,6 +194,11 @@ llvm::StructType* Backend::null_site_ty() {
     return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, i32 });
 }
 
+// void rt_divzero_report(ptr site, i64 now) -- one warning to stderr; returns.
+llvm::FunctionCallee Backend::divzero_report_fn() {
+    return rt_fn("rt_divzero_report", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+}
+
 // void rt_null_handle(ptr site, i64 now) — prints the located fatal and ends
 // the simulation; never returns (see Runtime.h).
 llvm::FunctionCallee Backend::null_handle_fn() {

@@ -69,13 +69,16 @@ when it does.
   MIN / -1 are guarded off it, combined into as few branches as profiling
   supports.
 - 2-state divide and modulo are straight-line (zero divisor gives 0, MIN / -1
-  wraps). **Not yet:** a sanitizer that reports the zero divisor.
+  wraps); `--sanitize=divzero` adds a cold located report of a zero divisor and
+  nothing otherwise.
 - `**` calls one support-library routine. **Not yet:** an inline loop.
 - XOR and XNOR test for unknown bits and use one native XOR when all are known.
 - `->` and `<->` are IR operations lowered from their own three-valued rules.
 - Concatenation, replication and streaming reversal build independent
-  constant-offset terms, with pattern forms (bit-reverse, byte-swap, multiply by
-  a repeating constant). **Not yet:** a serial shift-and-OR chain.
+  constant-offset terms, with pattern forms (bit-reverse, byte-swap, sign
+  extension, multiply by a repeating constant). **Not yet:** concatenation,
+  which is still a serial shift-and-OR chain: independent terms measured
+  +6.6% instructions on tests/perf timers (a 32-operand 4-state concat).
 - `$clog2` of an argument with x or z bits: decided after checking what other
   simulators do. **Not yet:** all-x, checked against Icarus only.
 - Real math: the classic functions as LLVM intrinsics, the rest as C math calls.

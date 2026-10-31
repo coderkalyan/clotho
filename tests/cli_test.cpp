@@ -968,3 +968,47 @@ TEST_CASE("cli: --stop-time is refused where nothing simulates") {
     }
 }
 #endif // !defined(_WIN32)
+
+TEST_CASE("cli: --sanitize=divzero reports a 2-state divide by zero and leaves the result alone") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(module m;
+  int a, b, q, r;
+  integer ia, ib;
+  initial begin
+    a = 7; b = 0;
+    q = a / b;
+    r = a % b;
+    $display("%0d %0d", q, r);
+    ia = 7; ib = 0;
+    $display("%0d", ia / ib);
+    b = 2;
+    $display("%0d", a / b);
+  end
+endmodule
+)");
+    SUBCASE("on: a located report for each of the two operations, the same output") {
+        const Result r = s.run(std::format("run --sanitize=divzero \"{}\"", design.string()));
+        CHECK(r.code == 0);
+        CHECK(r.out == "0 0\nx\n3\n");
+        CHECK(contains(r.err, "warning: division by zero in a 2-state operation"));
+        CHECK(contains(r.err, "design.sv:6:"));
+        CHECK(contains(r.err, "design.sv:7:"));
+        // The 4-state divide shows its x in the result; it is not reported.
+        CHECK_FALSE(contains(r.err, "design.sv:10:"));
+        CHECK_FALSE(contains(r.err, "design.sv:12:"));
+    }
+    SUBCASE("off: the same output and no report") {
+        const Result r = s.run(std::format("run \"{}\"", design.string()));
+        CHECK(r.code == 0);
+        CHECK(r.out == "0 0\nx\n3\n");
+        CHECK_FALSE(contains(r.err, "division by zero"));
+    }
+    SUBCASE("off: no code for it; on: a call to the report") {
+        const Result off = s.run(std::format("build --emit=llvm -o - \"{}\"", design.string()));
+        const Result on  = s.run(std::format("build --emit=llvm --sanitize=divzero -o - \"{}\"", design.string()));
+        CHECK(off.code == 0);
+        CHECK(on.code == 0);
+        CHECK_FALSE(contains(off.out, "rt_divzero_report"));
+        CHECK(contains(on.out, "rt_divzero_report"));
+    }
+}

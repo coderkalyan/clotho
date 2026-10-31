@@ -2380,6 +2380,7 @@ private:
     llvm::FunctionCallee defer_flush_final_fn();
     llvm::StructType* bounds_site_ty();
     llvm::FunctionCallee bounds_report_fn();
+    llvm::FunctionCallee divzero_report_fn();
 
     llvm::FunctionCallee wide_sel_fn();
     llvm::FunctionCallee wide_ins_fn();
@@ -3278,6 +3279,10 @@ private:
 
     void emit_ref_epoch_check(const RefBinding& rb);
 
+    // `--sanitize=divzero`: report, then fall through, when the i1 `divisor_zero` holds
+    // for the divide or modulo being lowered. Nothing is emitted when it is off.
+    void emit_divzero_check(llvm::Value* divisor_zero);
+
     void lower_tagged_check(Index i);
 
     llvm::Constant* tagged_site_global(const SourceText& at, const TaggedCheckInfo& info);
@@ -3793,13 +3798,20 @@ private:
 
     Plane lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool four);
 
-    // -- Concat / Repl: first operand occupies the most-significant bits. --
+    // -- Concat / Repl / stream reversal: first operand occupies the most-significant bits.
+    // Each is built from independent terms (Ops.cpp). --
 
     Plane lower_concat(Index i);
+
+    // The bytes of `v` (a whole number of them) in reverse order.
+    llvm::Value* byte_reverse(llvm::Value* v, uint32_t w);
 
     llvm::Value* reverse_blocks(llvm::Value* v, uint32_t w, uint32_t slice);
 
     Plane lower_stream_reverse(Plane v, bool four, uint32_t slice);
+
+    // `count` copies of the `part_width`-bit value `v`, side by side, as one iW value.
+    llvm::Value* replicate(llvm::Value* v, uint32_t part_width, uint32_t count);
 
     Plane lower_repl(Plane v, bool four, uint32_t part_width, uint32_t count);
 

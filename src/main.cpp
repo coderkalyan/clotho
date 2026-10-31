@@ -407,9 +407,9 @@ struct Options {
 // silently reports nothing is worse than one the binary says it does not know.
 constexpr std::string_view kSanitizeList =
 #ifdef CLOTHO_XSAN
-  "bounds or xprov";
+  "bounds, divzero or xprov";
 #else
-  "bounds";
+  "bounds or divzero";
 #endif
 
 // Wording rule for everything a user reads: say what the option does for the
@@ -457,7 +457,7 @@ void register_options(Registry& r, Options& o) {
           "--sanitize",
           o.sanitizers,
           "Check the design for a class of bug while it runs, reporting when one "
-          "happens: bounds (an array index outside the array)"
+          "happens: bounds (an array index outside the array), divzero (a 2-state divide or modulo by zero, which gives 0)"
 #ifdef CLOTHO_XSAN
           ", xprov (where an x value decided something, and what made it x)"
 #endif
@@ -1325,6 +1325,8 @@ int main(int argc, char** argv) {
     for (const std::string& name : options.sanitizers) {
         if (name == "bounds") {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::Bounds);
+        } else if (name == "divzero") {
+            config.sanitizers |= static_cast<uint32_t>(Sanitizer::DivZero);
 #ifdef CLOTHO_XSAN
         } else if (name == "xprov") {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::XProv);

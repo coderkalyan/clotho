@@ -14,6 +14,9 @@
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
+
+#include <llvm/Support/raw_ostream.h>
 
 using namespace clotho;
 
@@ -381,4 +384,70 @@ TEST_CASE("an initializer on a select port of a separately declared variable fai
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("initializer on a select port of a variable declared apart from the port") !=
           std::string::npos);
+}
+
+
+// Replication is a sign
+// extension (one bit), one multiply by a repeating constant (a part of up to a word) or
+// a doubling (a wider part). Expected text is what the shift-and-OR chains these shapes
+// replaced printed (identical over 107 random designs, see the commit message).
+TEST_CASE("replication: values at every shape, in a concatenation") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic [7:0] a; bit [7:0] b; logic [199:0] big; logic [1023:0] huge;
+            logic [31:0] r4; logic [47:0] r8; logic [11:0] cc; logic [39:0] r5; bit [99:0] w100;
+            bit [299:0] wide; bit [199:0] part;
+            initial begin
+                a = 8'b1x0z_1010; b = 8'hA5;
+                r4 = {4{a}};                          $display("%b", r4);
+                r8 = {2{b, 4'b1x0z, 4'd3}};           $display("%b", r8);
+                $display("%b", {5{a[3:0]}});
+                $display("%b", {8{a[7]}});
+                big = {25{b}};                        $display("%h", big);
+                huge = {{64{b}}, {64{b}}};            $display("%b", huge == {128{b}});
+                cc = {a[7:4], {0{b}}, b[3:0], 4'b0};  $display("%b", cc);
+                r5 = {b, 3'bx01, a[3:0], b[6:0], 1'b1, 9'd0}; $display("%b", r5);
+                w100 = {10{b[4:0], b[7:3]}};          $display("%h", w100);
+                $display("%h", {100{b[0]}} + {3{b[6:0]}});
+                // A part wider than a word, a count that is not a power of two.
+                part = {3{66'h2_dead_beef_cafe_f00d}};  $display("%h", part);
+                wide = {5{60'h123456789abcdef}};        $display("%h", wide);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "1x0z10101x0z10101x0z10101x0z1010\n"
+          "0000000000000000101001011x0z0011101001011x0z0011\n"
+          "10101010101010101010\n"
+          "11111111\n"
+          "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5\n"
+          "1\n"
+          "1x0z01010000\n"
+          "0000000010100101x01101001001011000000000\n"
+          "2d0b42d0b42d0b42d0b42d0b4\n"
+          "00000000000000000000952a4\n"
+          "2deadbeefcafef00db7ab6fbbf2bfbc036deadbeefcafef00d\n"
+          "123456789abcdef123456789abcdef123456789abcdef123456789abcdef123456789abcdef\n");
+}
+
+TEST_CASE("replication code shapes") {
+    const auto ir = [](std::string_view decl, std::string_view expr) {
+        const LowerResult r = lower_text("module m(input " + std::string(decl) + " output " + std::string(expr) + "endmodule\n");
+        REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+        std::string              text;
+        llvm::raw_string_ostream os(text);
+        REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false }));
+        return text;
+    };
+    // One bit replicated: a sign extension.
+    CHECK(ir("bit a,", "bit [31:0] y); assign y = {32{a}};\n").find("sext i1") != std::string::npos);
+    // A part of up to a word: one multiply by the repeating constant 0x01010101.
+    const std::string mul = ir("bit [7:0] a,", "bit [255:0] y); assign y = {32{a}};\n");
+    CHECK(mul.find("mul i256") != std::string::npos);
+    // A wider part: doubling shifts, no multiply.
+    const std::string dbl = ir("bit [99:0] a,", "bit [799:0] y); assign y = {8{a}};\n");
+    CHECK(dbl.find("mul i800") == std::string::npos);
+    for (const char* shift : { "shl i800 ", ", 100", ", 200", ", 400" }) {
+        CHECK(dbl.find(shift) != std::string::npos);
+    }
 }
