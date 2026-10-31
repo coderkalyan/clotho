@@ -3,6 +3,7 @@
 #include "ir/llvm/Backend.h"
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -179,6 +180,50 @@ struct RematAddressPass : llvm::PassInfoMixin<RematAddressPass> {
     }
 };
 
+// Tier-0 code generation lays blocks out in the order the function holds them,
+// which is the order the backend created them in: a block's successor is rarely
+// the next one, so a branch is a conditional jump and a jump, and a hot path is
+// a chain of them. Put the blocks in reverse postorder of a walk that follows a
+// terminator's last successor first, so the first successor of a branch (the
+// "then" of a `br i1` the backend builds, the body of a loop test) is the block
+// that follows it and a straight-line sequence of blocks falls through.
+struct BlockLayoutPass : llvm::PassInfoMixin<BlockLayoutPass> {
+    llvm::PreservedAnalyses run(llvm::Function& f, llvm::FunctionAnalysisManager& /*fam*/) {
+        if (f.size() < 3) {
+            return llvm::PreservedAnalyses::all();
+        }
+        llvm::SmallVector<llvm::BasicBlock*, 32>                         post;
+        llvm::SmallPtrSet<llvm::BasicBlock*, 32>                         seen;
+        llvm::SmallVector<std::pair<llvm::BasicBlock*, unsigned>, 32> stack;
+        stack.emplace_back(&f.getEntryBlock(), 0);
+        seen.insert(&f.getEntryBlock());
+        while (!stack.empty()) {
+            auto& [bb, next] = stack.back();
+            const llvm::Instruction* term = bb->getTerminator();
+            const unsigned           n    = term->getNumSuccessors();
+            if (next < n) {
+                // The last successor first, so the first is finished last and comes
+                // first in reverse postorder.
+                llvm::BasicBlock* succ = term->getSuccessor(n - 1 - next++);
+                if (seen.insert(succ).second) {
+                    stack.emplace_back(succ, 0);
+                }
+            } else {
+                post.push_back(bb);
+                stack.pop_back();
+            }
+        }
+        // Reverse postorder, entry first; blocks the walk did not reach (none but a
+        // dead block the optimizer left) keep their place after the others.
+        llvm::BasicBlock* prev = &f.getEntryBlock();
+        for (auto it = post.rbegin() + 1; it != post.rend(); ++it) {
+            (*it)->moveAfter(prev);
+            prev = *it;
+        }
+        return llvm::PreservedAnalyses::all();
+    }
+};
+
 } // namespace
 
 // Lower the coroutine intrinsics emitted for each process and clean up the
@@ -232,6 +277,7 @@ bool optimize_module(llvm::Module& m, bool o3) {
         }
         // Last, so nothing merges the copies again.
         mpm.addPass(llvm::createModuleToFunctionPassAdaptor(RematAddressPass()));
+        mpm.addPass(llvm::createModuleToFunctionPassAdaptor(BlockLayoutPass()));
     }
     mpm.run(m, mam);
     return true;
