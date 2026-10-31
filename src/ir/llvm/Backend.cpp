@@ -56,6 +56,10 @@ void Backend::run() {
     // some, or a program block, whose `initial` procedures run in Reactive
     // (LRM 24.3). Everything it costs sits behind this one flag.
     design_uses_reactive_ = facts_.uses.reactive || has_observed() || has_program() || has_renba();
+    // A program's port copy, `assign` or net resolver (LRM 24.3.1) is what the
+    // reactive continuous ring and its tag exist for, so a design with only
+    // `initial`s or assertions in Reactive emits the two-ring scheduler it always did.
+    design_uses_reactive_cont_ = has_reactive_continuous();
     if (design_uses_reactive_) {
         // Before any body lowers: the classification decides which region a #0
         // inside reactive code parks in, both queues have to exist ahead of
@@ -68,6 +72,9 @@ void Backend::run() {
         build_program_instances();
         build_program_exit_owners(); // after build_program_instances: seeds from its partition
         ensure_reactive_queue();
+        if (design_uses_reactive_cont_) {
+            ensure_reactive_cont_queue();
+        }
         if (reactive_has_delay_) {
             ensure_re_inactive_queue();
         }

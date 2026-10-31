@@ -1531,6 +1531,8 @@ private:
 
     bool has_program_initial() const;
 
+    bool has_reactive_continuous() const;
+
     void emit_observed_run(llvm::Value* state, llvm::Value* wheel,
                            const std::vector<llvm::Function*>& procs);
 
@@ -1993,6 +1995,10 @@ private:
 
     void emit_re_inactive_push(llvm::IRBuilder<>& b, llvm::Value* handle);
 
+    void ensure_reactive_cont_queue();
+
+    void emit_reactive_cont_push(llvm::IRBuilder<>& b, llvm::Value* handle);
+
     // -- Where a parked coroutine comes back --
     //
     // A handle parked for a later wake carries its own destination region, in
@@ -2023,9 +2029,24 @@ private:
     // rt_alloc, whose low three bits are free.
     static constexpr uint64_t kReactiveHomeTag = 2;
 
+    // Bit 2 on top of bit 1: the handle of a reactive-home CONTINUOUS process -- a
+    // program's port copy, `assign` or net resolver -- as against program
+    // procedural code. emit_wake_push reads it back to pick the reactive
+    // CONTINUOUS ring, which the reactive drain empties ahead of the reactive ring,
+    // so a program thread never runs while a continuous process that feeds it is
+    // still queued (docs/design/program-blocks.md §3.1).
+    //
+    // A refinement of the home tag, not a third region: `(addr & 3) ==
+    // kReactiveHomeTag` is still true for it, and `(addr & 7) == kReactiveContTag`
+    // is false for a thunk pointer (bit 0) for the same reason the home test is.
+    // Set only on the static subscription of such a process (emit_active_run), and
+    // read only in a design that has one (design_uses_reactive_cont_), so every
+    // other design emits the wake path it always did.
+    static constexpr uint64_t kReactiveContTag = kReactiveHomeTag | 4;
+
     bool reactive_home() const;
 
-    llvm::Value* tag_reactive_home(llvm::IRBuilder<>& b, llvm::Value* handle, bool reactive);
+    llvm::Value* tag_reactive_home(llvm::IRBuilder<>& b, llvm::Value* handle, bool reactive, bool continuous = false);
 
     llvm::Value* home_ptr();
 
@@ -3852,6 +3873,11 @@ private:
     // reactive region set: both queues, the drain blocks, and the Observed run.
     // A design with neither emits none of it.
     bool design_uses_reactive_ = false;
+    // Any reactive-home CONTINUOUS process: a program's port copy, `assign` or net
+    // resolver. Gates the reactive continuous ring, its tag and its drain, so a design
+    // with reactive code but none of those (an assertion action block, a program
+    // that has only `initial`s) emits exactly the two-ring scheduler it always did.
+    bool design_uses_reactive_cont_ = false;
     // Functions reachable as reactive code, indexed by FunctionId
     // (build_reactive_fns). One of build_shared_home_fns' two seeds.
     std::vector<bool> reactive_fns_;
@@ -4148,6 +4174,12 @@ private:
     llvm::GlobalVariable*               reactive_tail_gv_  = nullptr;
     llvm::GlobalVariable*               re_inactive_gv_    = nullptr;
     llvm::GlobalVariable*               re_inactive_top_gv_ = nullptr;
+    // The reactive CONTINUOUS ring, the same shape as the reactive ring: where the
+    // reactive-home continuous processes wait, drained before it. Null unless
+    // design_uses_reactive_cont_.
+    llvm::GlobalVariable*               reactive_cont_gv_      = nullptr;
+    llvm::GlobalVariable*               reactive_cont_head_gv_ = nullptr;
+    llvm::GlobalVariable*               reactive_cont_tail_gv_ = nullptr;
     llvm::GlobalVariable*               pend_record_gv_     = nullptr;
     // Per-`expect` waiter queues (LRM 16.17), keyed by monitor index and created
     // on demand by expect_queue: {array of parked handles, count}. Same shape as
