@@ -2733,7 +2733,7 @@ private:
 
     AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
 
-    llvm::Value* integral_key_valid(Plane pl);
+    llvm::Value* integral_key_valid(Plane pl, bool four);
 
     AssocKeySpan normalize_assoc_key_value(Index key, Ref assoc_type);
 
@@ -3195,7 +3195,7 @@ private:
 
     llvm::Value* dpi_vec_alloca(DpiCType ct, uint32_t nchunks);
 
-    void dpi_vec_copyin(DpiCType ct, Plane pl, uint32_t w, llvm::Value* scratch);
+    void dpi_vec_copyin(DpiCType ct, Plane pl, bool four, uint32_t w, llvm::Value* scratch);
 
     Plane dpi_vec_copyout(DpiCType ct, llvm::Value* scratch, uint32_t w);
 
@@ -3284,7 +3284,7 @@ private:
 
     void emit_dpi_export(const DpiExport& ex);
 
-    llvm::Value* dpi_arg_to_c(DpiCType t, Plane p);
+    llvm::Value* dpi_arg_to_c(DpiCType t, Plane p, bool four);
 
     Plane dpi_c_to_plane(DpiCType t, llvm::Value* r);
 
@@ -3317,38 +3317,46 @@ private:
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v);
 
     // -- Plane helpers --
+    //
+    // A Plane is a bare pair of LLVM values and does not record its domain. The
+    // caller says which it is, from the IR type of the value (`type_of(i).four_state`)
+    // or of the storage it was read from: a 2-state plane is one iW, a 4-state one an
+    // i(2W) must|may word and an iW z. The overloads taking an Index read the domain
+    // from that instruction's IR type.
 
     static uint32_t bits_of(llvm::Value* v);
-    static uint32_t width_of(Plane a);
+    static uint32_t width_of(Plane a, bool four);
 
-    llvm::Value* must_of(Plane a);
-    llvm::Value* may_of(Plane a);
+    llvm::Value* must_of(Plane a, bool four);
+    llvm::Value* must_of(Index i);
+    llvm::Value* may_of(Plane a, bool four);
 
-    llvm::Value* z_of(Plane a);
+    llvm::Value* z_of(Plane a, bool four);
 
     Plane two_val(llvm::Value* v);
     Plane known_plane(llvm::Value* v, bool four_state);
-    Plane in_type_domain(Plane p, ValueType t);
 
-    Plane to_four(Plane a);
+    // The 4-state encoding of `a`: `a` itself when `four`, else must == may == a, z = 0.
+    Plane to_four(Plane a, bool four);
 
     Plane packed(llvm::Value* must, llvm::Value* may, llvm::Value* z);
 
-    llvm::Value* any_unknown(Plane a);
+    llvm::Value* any_unknown(Plane a, bool four);
+    llvm::Value* any_unknown(Index i);
 
     Plane bit_plane(llvm::Value* must_i1, llvm::Value* may_i1);
 
-    Plane cast_plane(Plane a, uint32_t to, bool sign);
+    Plane cast_plane(Plane a, bool four, uint32_t to, bool sign);
 
-    Plane lower_conversion(Inst::Tag tag, Plane a, ValueType to);
+    Plane lower_conversion(Inst::Tag tag, Plane a, ValueType from, ValueType to);
 
     llvm::Value* xz_mask(Plane a, Plane b, uint32_t w);
 
-    Plane lower_net_res(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_net_res(Inst::Tag tag, Plane a, bool a_four, Plane b, bool b_four);
 
     Plane lower_strength_res(Index i);
 
-    Plane lower_net_pull(Plane a, uint32_t pull);
+    Plane lower_net_pull(Plane a, bool four, uint32_t pull);
 
     // -- Real (floating point) helpers --
     //
@@ -3375,9 +3383,9 @@ private:
 
     Plane lower_ftoi(Inst::Tag tag, Plane v, ValueType to);
 
-    Plane lower_real_mux(Plane cond, Plane a, Plane b);
+    Plane lower_real_mux(Plane cond, bool cond_four, Plane a, Plane b);
 
-    llvm::Value* lower_string_mux(Plane cond, Index a, Index b);
+    llvm::Value* lower_string_mux(Plane cond, bool cond_four, Index a, Index b);
 
     llvm::Value* libm_call(const char* name, llvm::Value* x, llvm::Value* y = nullptr);
 
@@ -3398,9 +3406,9 @@ private:
     // while the hot block does a single W-bit add/sub/mul of the value and
     // duplicates it across both planes (known bits have must == may).
 
-    Plane lower_arith(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_arith(Inst::Tag tag, Plane a, Plane b, bool four);
 
-    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool four);
 
     // A multiply, divide or modulo of two iW values through the runtime routine `routine`
     // (rt_wide_mul, rt_wide_udiv, ...): spill both to word buffers, call, reload.
@@ -3409,36 +3417,36 @@ private:
     // a * b as iW, wrapping: LLVM's `mul` up to `wide_arith_bits`, rt_wide_mul above.
     llvm::Value* lower_mul(llvm::Value* a, llvm::Value* b);
 
-    Plane lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed);
+    Plane lower_pow(Plane a, bool a_four, Plane b, bool b_four, bool base_signed, bool exp_signed);
 
     // -- Bitwise: AND/OR are monotone, so one op on the packed planes does both;
     // the result is never Z, so z is cleared. --
 
     Plane single_bit_lut(uint32_t lut, Plane a, Plane b);
 
-    Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b, bool four);
 
-    Plane lower_bnot(Plane a);
+    Plane lower_bnot(Plane a, bool four);
 
     // -- Reductions -> 1-bit (chained AND/OR/XOR over the bits). --
 
-    Plane lower_reduce(Inst::Tag tag, Plane a);
+    Plane lower_reduce(Inst::Tag tag, Plane a, bool four);
 
-    Plane lower_bit_index(Inst::Tag tag, Plane a);
+    Plane lower_bit_index(Inst::Tag tag, Plane a, bool four);
 
-    llvm::Value* count_bits_pop(Plane a, uint32_t mask);
+    llvm::Value* count_bits_pop(Plane a, bool four, uint32_t mask);
 
-    Plane lower_count_bits(Plane a, uint32_t mask);
+    Plane lower_count_bits(Plane a, bool four, uint32_t mask);
 
-    Plane lower_onehot(Plane a, bool allow_zero);
+    Plane lower_onehot(Plane a, bool four, bool allow_zero);
 
-    Plane lower_isunknown(Plane a);
+    Plane lower_isunknown(Plane a, bool four);
 
-    Plane lower_clog2(Plane a);
+    Plane lower_clog2(Plane a, bool four);
 
     // -- Shifts: X/Z in the count makes the whole result X; value planes shift. --
 
-    Plane lower_shift(Inst::Tag tag, Plane a, Plane amt);
+    Plane lower_shift(Inst::Tag tag, Plane a, bool a_four, Plane amt, bool amt_four);
 
     // -- Comparisons -> 1-bit. X rules differ per operator class (see
     // lower_compare): ==/!= are X only when genuinely ambiguous (LRM 11.4.5),
@@ -3484,15 +3492,17 @@ private:
 
     Plane emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e);
 
+    bool agg_eq_four(Ref type);
+
     Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type);
 
-    Plane lower_compare(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 
-    Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 
     Plane lower_inside_set(Index i);
 
-    Plane lower_wildeq(Plane a, Plane b);
+    Plane lower_wildeq(Plane a, Plane b, bool four);
 
     // -- Logical and/or/not -> 1-bit, three-valued. --
 
@@ -3507,18 +3517,18 @@ private:
     // i1: whether a 2-state value is nonzero, its truth in a logical operator.
     llvm::Value* nonzero(Plane a);
 
-    Plane lower_logical(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_logical(Inst::Tag tag, Plane a, bool a_four, Plane b, bool b_four);
 
-    Plane lower_lnot(Plane a);
+    Plane lower_lnot(Plane a, bool four);
 
-    Plane lower_limplies(Plane a, Plane b);
+    Plane lower_limplies(Plane a, bool a_four, Plane b, bool b_four);
 
-    Plane lower_lequiv(Plane a, Plane b);
+    Plane lower_lequiv(Plane a, bool a_four, Plane b, bool b_four);
 
     // -- Select: known condition selects (one packed select); unknown merges bitwise
     // (X where the arms disagree). --
 
-    Plane lower_select(Plane cond, Plane a, Plane b);
+    Plane lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool four);
 
     // -- Concat / Repl: first operand occupies the most-significant bits. --
 
@@ -3526,9 +3536,9 @@ private:
 
     llvm::Value* reverse_blocks(llvm::Value* v, uint32_t w, uint32_t slice);
 
-    Plane lower_stream_reverse(Plane v, uint32_t slice);
+    Plane lower_stream_reverse(Plane v, bool four, uint32_t slice);
 
-    Plane lower_repl(Plane v, uint32_t part_width, uint32_t count);
+    Plane lower_repl(Plane v, bool four, uint32_t part_width, uint32_t count);
 
     // -- Control flow: if/else with two regions. X/Z condition takes else. --
 

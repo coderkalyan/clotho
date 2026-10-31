@@ -333,7 +333,7 @@ void Backend::lower_inst(Index i) {
             // wide storage too; a base already on the runtime kernels keeps them.
             const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
             const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp), constant_window);
+              set_select_bounds(lv, cbase, cwidth, 1, any_unknown(p.binary.r), constant_window);
             add_select_bounds_check(lv, i, p.binary.r, sv, BoundsWhat::Bit, cwidth, 1);
             set_lvalue(i, lv);
             return;
@@ -382,7 +382,7 @@ void Backend::lower_inst(Index i) {
             lv.width   = dps.width;
             const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
             const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(offp), constant_window);
+              set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(dps.offset), constant_window);
             add_select_bounds_check(lv, i, dps.offset, sv, BoundsWhat::Part, cwidth, dps.width);
             set_lvalue(i, lv);
             return;
@@ -447,7 +447,7 @@ void Backend::lower_inst(Index i) {
                 const Plane     idxp    = value_of(es.index);
                 const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
                 llvm::Value*    idx64   = ei.idx64;
-                llvm::Value*    unknown = any_unknown(idxp);
+                llvm::Value*    unknown = any_unknown(es.index);
                 llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
                 if (e.is_string) {
                     // String element: an rt_string handle slot in the heap
@@ -526,7 +526,7 @@ void Backend::lower_inst(Index i) {
                 const Plane     idxp    = value_of(es.index);
                 const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
                 llvm::Value*    idx64   = ei.idx64;
-                llvm::Value*    unknown = any_unknown(idxp);
+                llvm::Value*    unknown = any_unknown(es.index);
                 llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
                 llvm::Value* phys = queue_ring_slot(head, idx64, cap);
                 if (e.is_string) {
@@ -591,10 +591,10 @@ void Backend::lower_inst(Index i) {
             const Plane   idxp    = value_of(es.index);
             const ElemPos pos     = fixed_elem_pos(idxp, type_of(es.index), at.left, at.right);
             llvm::Value*  norm    = pos.pos;
-            llvm::Value*  inrange = b_.CreateAnd(pos.in_range, b_.CreateNot(any_unknown(idxp)));
+            llvm::Value*  inrange = b_.CreateAnd(pos.in_range, b_.CreateNot(any_unknown(es.index)));
             lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
                                                        : inrange;
-            add_elem_bounds_check(lv, i, lv, es.index, inrange, any_unknown(idxp), nullptr,
+            add_elem_bounds_check(lv, i, lv, es.index, inrange, any_unknown(es.index), nullptr,
                                   static_cast<int32_t>(at.left), static_cast<int32_t>(at.right));
             if (lv.is_agg) {
                 // Recursive storage is one ArrayType per dimension (not
@@ -798,7 +798,7 @@ void Backend::lower_inst(Index i) {
             // the instance those constants are resolved against, so this is the
             // ordinary signal lvalue with one substituted base.
             const auto   rep    = ir_->extra_data<IfaceMember>(p.op_extra.extra).signal;
-            llvm::Value* handle = must_of(value_of(p.op_extra.op));
+            llvm::Value* handle = must_of(p.op_extra.op);
             emit_null_handle_check(handle, i, NullKind::Iface);
             llvm::Value* ctx = b_.CreateIntToPtr(handle, raw_ptr_ty());
             CtxOverride  ov(*this, ctx, slot_of(rep).anchor);
@@ -850,7 +850,7 @@ void Backend::lower_inst(Index i) {
             // lvalue rooted at the object body. No copy — the handle IS the
             // object (reference semantics), unlike a value struct addressed
             // inline. A following MemberSelect addresses a property.
-            llvm::Value* handle = must_of(value_of(p.op_type.op));
+            llvm::Value* handle = must_of(p.op_type.op);
             // A handle straight out of ClassNew is the address the allocator just
             // returned, so the property default-initializer stores every `new`
             // emits need no guard -- and no runtime declaration carries a nonnull
@@ -898,7 +898,7 @@ void Backend::lower_inst(Index i) {
             if (cd == nullptr) {
                 throw BackendError{ "internal: class without a descriptor" };
             }
-            llvm::Value* handle = must_of(value_of(p.op_type.op));
+            llvm::Value* handle = must_of(p.op_type.op);
             llvm::Value* isnull = b_.CreateICmpEQ(handle, b_.getInt64(0));
             llvm::Value* obj =
               b_.CreateSelect(isnull, null_object_global(), b_.CreateIntToPtr(handle, raw_ptr_ty()));
@@ -924,7 +924,7 @@ void Backend::lower_inst(Index i) {
             if (!id.has_value()) {
                 throw BackendError{ "internal: interface class without an id" };
             }
-            llvm::Value* handle = must_of(value_of(p.op_type.op));
+            llvm::Value* handle = must_of(p.op_type.op);
             llvm::Value* isnull = b_.CreateICmpEQ(handle, b_.getInt64(0));
             llvm::Value* obj =
               b_.CreateSelect(isnull, null_object_global(), b_.CreateIntToPtr(handle, raw_ptr_ty()));
@@ -1192,7 +1192,7 @@ void Backend::lower_inst(Index i) {
             // instead of silently missing a remembered-set entry (PRINCIPLES.md).
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane   rhs   = value_of(info.value);
-            llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
+            llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
             emit_intra_nba_arm(lv, rhs, ticks);
             return;
         }
@@ -1208,7 +1208,7 @@ void Backend::lower_inst(Index i) {
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane   rhs   = value_of(info.value);
-            llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
+            llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
             emit_inertial_arm(lv, rhs, ticks);
             return;
         }
@@ -1224,7 +1224,7 @@ void Backend::lower_inst(Index i) {
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
             const Plane  rhs   = value_of(info.value);
-            llvm::Value* count = must_of(value_of(info.count));
+            llvm::Value* count = must_of(info.count);
             llvm::SmallVector<llvm::Value*, 4> ids;
             for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
                 ids.push_back(trigger_id_value(tr.signal, tr.edge));
@@ -1354,7 +1354,8 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::Add:
         case Inst::Tag::Sub:
         case Inst::Tag::Mul:
-            set_value(i, lower_arith(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_arith(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r),
+                                     type_of(p.binary.l).four_state));
             return;
 
         case Inst::Tag::UDiv:
@@ -1363,14 +1364,15 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::SMod:
             // Wide operands legalize to the 128-bit __udivti3 / __umodti3 (and signed
             // siblings) libcalls, resolved from compiler-rt/libgcc in the JIT (see run_jit).
-            set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r),
+                                      type_of(p.binary.l).four_state));
             return;
 
         case Inst::Tag::Pow: {
             // The exponent is self-determined; both signs feed Table 11-4's signed corners.
             const auto info = ir_->extra_data<PowInfo>(p.op_extra.extra);
-            set_value(
-              i, lower_pow(value_of(p.op_extra.op), value_of(info.exp), info.base_signed != 0, info.exp_signed != 0));
+            set_value(i, lower_pow(value_of(p.op_extra.op), type_of(p.op_extra.op).four_state, value_of(info.exp),
+                                   type_of(info.exp).four_state, info.base_signed != 0, info.exp_signed != 0));
             return;
         }
 
@@ -1378,57 +1380,60 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::Bor:
         case Inst::Tag::Bxor:
         case Inst::Tag::Bxnor:
-            set_value(i, lower_bitwise(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_bitwise(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r),
+                                       type_of(p.binary.l).four_state));
             return;
         case Inst::Tag::WireRes:
         case Inst::Tag::WandRes:
         case Inst::Tag::WorRes:
-            set_value(i, lower_net_res(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_net_res(ir_->tag(i), value_of(p.binary.l), type_of(p.binary.l).four_state,
+                                       value_of(p.binary.r), type_of(p.binary.r).four_state));
             return;
         case Inst::Tag::StrengthRes:
             set_value(i, lower_strength_res(i));
             return;
         case Inst::Tag::Bnot:
-            set_value(i, lower_bnot(value_of(p.unary)));
+            set_value(i, lower_bnot(value_of(p.unary), type_of(p.unary).four_state));
             return;
 
         case Inst::Tag::RedAnd:
         case Inst::Tag::RedOr:
         case Inst::Tag::RedXor:
-            set_value(i, lower_reduce(ir_->tag(i), value_of(p.unary)));
+            set_value(i, lower_reduce(ir_->tag(i), value_of(p.unary), type_of(p.unary).four_state));
             return;
 
         case Inst::Tag::Clog2:
-            set_value(i, lower_clog2(value_of(p.unary)));
+            set_value(i, lower_clog2(value_of(p.unary), type_of(p.unary).four_state));
             return;
 
         case Inst::Tag::Ctz:
         case Inst::Tag::Clz:
-            set_value(i, lower_bit_index(ir_->tag(i), value_of(p.unary)));
+            set_value(i, lower_bit_index(ir_->tag(i), value_of(p.unary), type_of(p.unary).four_state));
             return;
 
         case Inst::Tag::CountBits:
             set_value(i,
-                      lower_count_bits(value_of(p.op_extra.op),
+                      lower_count_bits(value_of(p.op_extra.op), type_of(p.op_extra.op).four_state,
                                        ir_->extra_data<CountBitsInfo>(p.op_extra.extra).mask));
             return;
 
         case Inst::Tag::OneHot:
-            set_value(i, lower_onehot(value_of(p.unary), /*allow_zero=*/false));
+            set_value(i, lower_onehot(value_of(p.unary), type_of(p.unary).four_state, /*allow_zero=*/false));
             return;
 
         case Inst::Tag::OneHot0:
-            set_value(i, lower_onehot(value_of(p.unary), /*allow_zero=*/true));
+            set_value(i, lower_onehot(value_of(p.unary), type_of(p.unary).four_state, /*allow_zero=*/true));
             return;
 
         case Inst::Tag::IsUnknown:
-            set_value(i, lower_isunknown(value_of(p.unary)));
+            set_value(i, lower_isunknown(value_of(p.unary), type_of(p.unary).four_state));
             return;
 
         case Inst::Tag::Sll:
         case Inst::Tag::Srl:
         case Inst::Tag::Sra:
-            set_value(i, lower_shift(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_shift(ir_->tag(i), value_of(p.binary.l), type_of(p.binary.l).four_state,
+                                     value_of(p.binary.r), type_of(p.binary.r).four_state));
             return;
 
         case Inst::Tag::Eq:
@@ -1445,24 +1450,28 @@ void Backend::lower_inst(Index i) {
                 set_value(i, lower_string_relation(ir_->tag(i), p.binary.l, p.binary.r));
                 return;
             }
-            set_value(i, lower_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r),
+                                       type_of(p.binary.l).four_state));
             return;
 
         case Inst::Tag::CaseEq:
         case Inst::Tag::CasezEq:
         case Inst::Tag::CasexEq:
-            set_value(i, lower_case_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_case_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r),
+                                            type_of(p.binary.l).four_state));
             return;
 
         case Inst::Tag::AggEq: {
-            const auto info = ir_->extra_data<AggEqInfo>(p.op_extra.extra);
-            set_value(
-              i, in_type_domain(lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type), type_of(i)));
+            const auto  info = ir_->extra_data<AggEqInfo>(p.op_extra.extra);
+            const Plane eq   = lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type);
+            // A leaf the runtime compares answers in a 4-state bit even where no leaf
+            // can be x or z, so the instruction's own type decides what is kept.
+            set_value(i, agg_eq_four(info.type) && !type_of(i).four_state ? two_val(must_of(eq, true)) : eq);
             return;
         }
 
         case Inst::Tag::WildEq:
-            set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.l).four_state));
             return;
 
         case Inst::Tag::InsideSet:
@@ -1493,7 +1502,7 @@ void Backend::lower_inst(Index i) {
             // The must half reads x/z bits as 0 (LRM 6.12.1); the opcode says
             // whether the integer is signed.
             const ValueType dt = value_type_of(mod_.pool, p.op_type.type);
-            llvm::Value*    iv = must_of(value_of(p.op_type.op));
+            llvm::Value*    iv = must_of(p.op_type.op);
             llvm::Value*    fv = ir_->tag(i) == Inst::Tag::SItoF ? b_.CreateSIToFP(iv, fp_ty(dt.width))
                                                                  : b_.CreateUIToFP(iv, fp_ty(dt.width));
             set_value(i, real_plane(fv));
@@ -1508,7 +1517,7 @@ void Backend::lower_inst(Index i) {
             const ValueType dt = value_type_of(mod_.pool, p.op_type.type);
             if (dt.is_real) {
                 // $bitstoreal / $bitstoshortreal: integral pattern -> float.
-                llvm::Value* pat = cast(must_of(value_of(p.op_type.op)), dt.width, false);
+                llvm::Value* pat = cast(must_of(p.op_type.op), dt.width, false);
                 set_value(i, real_plane(b_.CreateBitCast(pat, fp_ty(dt.width))));
             } else {
                 // $realtobits / $shortrealtobits: float -> integral pattern.
@@ -1539,26 +1548,32 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::Land:
         case Inst::Tag::Lor:
-            set_value(i, lower_logical(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_logical(ir_->tag(i), value_of(p.binary.l), type_of(p.binary.l).four_state,
+                                       value_of(p.binary.r), type_of(p.binary.r).four_state));
             return;
         case Inst::Tag::Lnot:
-            set_value(i, lower_lnot(value_of(p.unary)));
+            set_value(i, lower_lnot(value_of(p.unary), type_of(p.unary).four_state));
             return;
         case Inst::Tag::Limplies:
-            set_value(i, lower_limplies(value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_limplies(value_of(p.binary.l), type_of(p.binary.l).four_state,
+                                        value_of(p.binary.r), type_of(p.binary.r).four_state));
             return;
         case Inst::Tag::Lequiv:
-            set_value(i, lower_lequiv(value_of(p.binary.l), value_of(p.binary.r)));
+            set_value(i, lower_lequiv(value_of(p.binary.l), type_of(p.binary.l).four_state,
+                                      value_of(p.binary.r), type_of(p.binary.r).four_state));
             return;
 
         case Inst::Tag::Select: {
             const auto select = ir_->extra_data<Select>(p.op_extra.extra);
+            const bool cond_four = type_of(p.op_extra.op).four_state;
             if (type_of(select.a).is_string) {
-                set_str(i, lower_string_mux(value_of(p.op_extra.op), select.a, select.b));
+                set_str(i, lower_string_mux(value_of(p.op_extra.op), cond_four, select.a, select.b));
             } else if (type_of(select.a).is_real) {
-                set_value(i, lower_real_mux(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
+                set_value(i, lower_real_mux(value_of(p.op_extra.op), cond_four, value_of(select.a),
+                                            value_of(select.b)));
             } else {
-                set_value(i, lower_select(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
+                set_value(i, lower_select(value_of(p.op_extra.op), cond_four, value_of(select.a),
+                                          value_of(select.b), type_of(select.a).four_state));
             }
             return;
         }
@@ -1576,7 +1591,8 @@ void Backend::lower_inst(Index i) {
             if (type_of(p.repl.value).is_string) {
                 throw BackendError{ "internal: string value in repl" };
             }
-            set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
+            set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).four_state,
+                                    type_of(p.repl.value).width, p.repl.count));
             return;
         case Inst::Tag::StrRepl: {
             // {count{s}} with a RUNTIME count — the deliberate LRM 11.4.12.1
@@ -1587,13 +1603,12 @@ void Backend::lower_inst(Index i) {
             // because only the JIT still sees the planes — and only when the
             // count's plane is 4-state, so a 2-state count (`int m`, the UVM
             // shape) pays nothing.
-            const Plane     count = value_of(p.binary.r);
-            llvm::Constant* site  = alloc_site_global(loc_text(i), "string replication");
-            if (!count.two) {
+            llvm::Constant* site = alloc_site_global(loc_text(i), "string replication");
+            if (type_of(p.binary.r).four_state) {
                 auto* fn   = b_.GetInsertBlock()->getParent();
                 auto* bad  = llvm::BasicBlock::Create(ctx_, "strrepl.xz", fn);
                 auto* cont = llvm::BasicBlock::Create(ctx_, "strrepl.ok", fn);
-                auto* br   = b_.CreateCondBr(any_unknown(count), bad, cont);
+                auto* br   = b_.CreateCondBr(any_unknown(p.binary.r), bad, cont);
                 br->setMetadata(llvm::LLVMContext::MD_prof,
                                 llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
                 b_.SetInsertPoint(bad);
@@ -1605,15 +1620,15 @@ void Backend::lower_inst(Index i) {
                 b_.CreateUnreachable();
                 b_.SetInsertPoint(cont);
             }
-            llvm::Value* n = cast(must_of(count), 64, true);
+            llvm::Value* n = cast(must_of(p.binary.r), 64, true);
             b_.CreateCall(str_repl_fn(), { str_of(i), str_of(p.binary.l), n, site });
             return;
         }
         case Inst::Tag::StreamReverse:
-            set_value(i, lower_stream_reverse(value_of(p.op_imm.op), p.op_imm.imm));
+            set_value(i, lower_stream_reverse(value_of(p.op_imm.op), type_of(p.op_imm.op).four_state, p.op_imm.imm));
             return;
         case Inst::Tag::NetPull:
-            set_value(i, lower_net_pull(value_of(p.op_imm.op), p.op_imm.imm));
+            set_value(i, lower_net_pull(value_of(p.op_imm.op), type_of(p.op_imm.op).four_state, p.op_imm.imm));
             return;
         case Inst::Tag::ZExt:
         case Inst::Tag::SExt:
@@ -1628,7 +1643,7 @@ void Backend::lower_inst(Index i) {
             if (from.is_string || from.is_real || to.is_string || to.is_real) {
                 throw BackendError{ "internal: conversion of a string or a real value" };
             }
-            set_value(i, lower_conversion(ir_->tag(i), value_of(p.op_type.op), to));
+            set_value(i, lower_conversion(ir_->tag(i), value_of(p.op_type.op), from, to));
             return;
         }
 
@@ -1640,7 +1655,7 @@ void Backend::lower_inst(Index i) {
         }
         case Inst::Tag::StrGetc: {
             llvm::Value* str = str_of(p.binary.l);
-            llvm::Value* idx = cast(must_of(value_of(p.binary.r)), 32, true);
+            llvm::Value* idx = cast(must_of(p.binary.r), 32, true);
             emit_string_bounds_check(i, str, p.binary.r, "<string>", /*is_write=*/false);
             llvm::Value* c = b_.CreateCall(str_getc_fn(), { str, idx });
             llvm::Value* v = b_.CreateTrunc(c, int_ty(8));
@@ -1653,8 +1668,8 @@ void Backend::lower_inst(Index i) {
             emit_bounds_reports(lv, /*is_write=*/true);
             llvm::Value*  snap = str_chg_snapshot(lv);
             llvm::Value*  str  = lv_string_ptr(lv, StringUse::Write);
-            llvm::Value*  idx  = cast(must_of(value_of(sp.index)), 32, true);
-            llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
+            llvm::Value*  idx  = cast(must_of(sp.index), 32, true);
+            llvm::Value* ch = cast(must_of(sp.ch), 32, false);
             emit_string_bounds_check(i, str, sp.index, bounds_name(lv), /*is_write=*/true);
             b_.CreateCall(str_putc_fn(), { str, idx, ch });
             str_chg_after(lv, snap);
@@ -1691,7 +1706,7 @@ void Backend::lower_inst(Index i) {
                               : tag == T::StrOctoa    ? str_octtoa_fn()
                                                       : str_bintoa_fn();
             const LValue& lv = lvalue_of(p.binary.l);
-            llvm::Value*  v        = cast(must_of(value_of(p.binary.r)), 32, true);
+            llvm::Value*  v        = cast(must_of(p.binary.r), 32, true);
             llvm::Value* snap = str_chg_snapshot(lv);
             b_.CreateCall(
               fn, { lv_string_ptr(lv, StringUse::Write), v, alloc_site_global(loc_text(i), "string") });
@@ -1723,8 +1738,8 @@ void Backend::lower_inst(Index i) {
         }
         case Inst::Tag::StrSubstr: {
             const auto   ss = ir_->extra_data<StrSubstrInfo>(p.op_extra.extra);
-            llvm::Value* si = cast(must_of(value_of(ss.i)), 32, true);
-            llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, true);
+            llvm::Value* si = cast(must_of(ss.i), 32, true);
+            llvm::Value* sj = cast(must_of(ss.j), 32, true);
             b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj,
                                              alloc_site_global(loc_text(i), "string") });
             return;
@@ -1762,7 +1777,7 @@ void Backend::lower_inst(Index i) {
             // Spill the operand's must plane to a byte buffer for the compare.
             const uint32_t spill  = plane_bytes(type_of(p.op_extra.op).width);
             llvm::Value*   valbuf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(spill), "enum.val");
-            b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
+            b_.CreateAlignedStore(must_of(p.op_extra.op), valbuf, llvm::Align(1));
             b_.CreateCall(enum_name_fn(),
                           { str_of(i),
                             valbuf,
@@ -1853,7 +1868,7 @@ void Backend::lower_inst(Index i) {
             const ValueType t   = type_of(p.unary);
             const uint32_t pb  = plane_bytes(t.width);
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.pack");
-            b_.CreateAlignedStore(must_of(value_of(p.unary)), buf, llvm::Align(1));
+            b_.CreateAlignedStore(must_of(p.unary), buf, llvm::Align(1));
             b_.CreateCall(str_from_packed_fn(), { str_of(i), buf, b_.getInt32(t.width),
                                                   alloc_site_global(loc_text(i), "string") });
             return;
@@ -1873,7 +1888,7 @@ void Backend::lower_inst(Index i) {
             const ValueType t   = type_of(p.binary.r);
             const uint32_t pb  = plane_bytes(t.width);
             llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.append");
-            b_.CreateAlignedStore(must_of(value_of(p.binary.r)), buf, llvm::Align(1));
+            b_.CreateAlignedStore(must_of(p.binary.r), buf, llvm::Align(1));
             const LValue& alv  = lvalue_of(p.binary.l);
             llvm::Value*  snap = str_chg_snapshot(alv);
             b_.CreateCall(str_append_packed_fn(),
@@ -1970,13 +1985,13 @@ void Backend::lower_inst(Index i) {
             // `-> e` (LRM 15.5.2): resolve the handle, stamp the trigger time and
             // wake every waiter now. Zero-time — the current process does not
             // suspend, so it does not end the NBA segment.
-            emit_event_fire_guarded(must_of(value_of(p.unary)), wheel_);
+            emit_event_fire_guarded(must_of(p.unary), wheel_);
             return;
 
         case Inst::Tag::EventTriggerNb:
             // `->> e` (LRM 15.5.4): link the object onto the pending chain; the
             // NBA region stamps + wakes. The triggering process does not block.
-            emit_event_pend_guarded(must_of(value_of(p.unary)));
+            emit_event_pend_guarded(must_of(p.unary));
             return;
 
         case Inst::Tag::EventTriggerNbEvent: {
@@ -1986,7 +2001,7 @@ void Backend::lower_inst(Index i) {
             const auto info = ir_->extra_data<EventDetachInfo>(p.op_extra.extra);
             b_.CreateCall(event_detach_register_fn(),
                           { trigger_id_value(info.signal, info.edge),
-                            must_of(value_of(p.op_extra.op)), b_.getInt32(info.count) });
+                            must_of(p.op_extra.op), b_.getInt32(info.count) });
             return;
         }
 
@@ -2002,8 +2017,8 @@ void Backend::lower_inst(Index i) {
             // `->> e`: link it onto the pending chain instead. A constant delay
             // emits only the taken path; a runtime one branches on zero, as
             // emit_intra_nba_arm does for `x <= #d y`.
-            llvm::Value* handle   = must_of(value_of(p.binary.r));
-            llvm::Value* ticks    = cast(must_of(value_of(p.binary.l)), 64, false);
+            llvm::Value* handle   = must_of(p.binary.r);
+            llvm::Value* ticks    = cast(must_of(p.binary.l), 64, false);
             auto         schedule = [&] {
                 auto*        nty = event_timer_ty();
                 llvm::Value* node =
@@ -2084,7 +2099,7 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::MonitorEmit: {
             const auto& p = ir_->payload(i).op_extra;
             emit_display_to(ir_->extra_data<DisplayInfo>(p.extra),
-                            cast(must_of(value_of(p.op)), 32, true), monitor_emit_fn());
+                            cast(must_of(p.op), 32, true), monitor_emit_fn());
             return;
         }
         case Inst::Tag::MonitorOn:
@@ -2246,7 +2261,7 @@ void Backend::lower_inst(Index i) {
         }
 
         case Inst::Tag::EventTriggered:
-            set_value(i, lower_event_triggered(event_obj_of(must_of(value_of(p.unary)))));
+            set_value(i, lower_event_triggered(event_obj_of(must_of(p.unary))));
             return;
 
         case Inst::Tag::Random: {
@@ -2263,17 +2278,17 @@ void Backend::lower_inst(Index i) {
             // the frontend slices.
             const auto&  p    = ir_->payload(i).op_extra;
             const auto   info = ir_->extra_data<DistUnaryInfo>(p.extra);
-            llvm::Value* seed = cast(must_of(value_of(p.op)), 32, true);
-            llvm::Value* p1   = cast(must_of(value_of(info.p1)), 32, true);
+            llvm::Value* seed = cast(must_of(p.op), 32, true);
+            llvm::Value* p1   = cast(must_of(info.p1), 32, true);
             set_value(i, two_val(b_.CreateCall(dist_fn(dist_symbol(info.fn), 1), { seed, p1 })));
             return;
         }
         case Inst::Tag::DistBinary: {
             const auto&  p    = ir_->payload(i).op_extra;
             const auto   info = ir_->extra_data<DistBinaryInfo>(p.extra);
-            llvm::Value* seed = cast(must_of(value_of(p.op)), 32, true);
-            llvm::Value* p1   = cast(must_of(value_of(info.p1)), 32, true);
-            llvm::Value* p2   = cast(must_of(value_of(info.p2)), 32, true);
+            llvm::Value* seed = cast(must_of(p.op), 32, true);
+            llvm::Value* p1   = cast(must_of(info.p1), 32, true);
+            llvm::Value* p2   = cast(must_of(info.p2), 32, true);
             set_value(
               i, two_val(b_.CreateCall(dist_fn(dist_symbol(info.fn), 2), { seed, p1, p2 })));
             return;
@@ -2285,7 +2300,7 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::UrandomSeeded: {
             // $urandom(seed): reseed the process RNG from `seed`, then draw.
-            llvm::Value* seed = cast(must_of(value_of(ir_->payload(i).unary)), 64, false);
+            llvm::Value* seed = cast(must_of(ir_->payload(i).unary), 64, false);
             b_.CreateCall(urandom_seed_fn(), { rng_slot_, seed });
             set_value(i, lower_urandom());
             return;
@@ -2296,8 +2311,8 @@ void Backend::lower_inst(Index i) {
             // draw into [lo, hi]; swap when min > max (LRM §18.13.2). The
             // negligible bias of the un-rejected multiply-shift is acceptable
             // (the algorithm is LRM-unspecified).
-            llvm::Value* mx = cast(must_of(value_of(ir_->payload(i).binary.l)), 32, false);
-            llvm::Value* mn = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, false);
+            llvm::Value* mx = cast(must_of(ir_->payload(i).binary.l), 32, false);
+            llvm::Value* mn = cast(must_of(ir_->payload(i).binary.r), 32, false);
             llvm::Value* ge = b_.CreateICmpUGE(mx, mn);
             llvm::Value* hi = b_.CreateSelect(ge, mx, mn);
             llvm::Value* lo = b_.CreateSelect(ge, mn, mx);
@@ -2336,7 +2351,7 @@ void Backend::lower_inst(Index i) {
             // per-process reseed -- only the state pointer differs.
             const auto&  p    = ir_->payload(i).binary;
             llvm::Value* rng  = agg_slot_ptr(lvalue_of(p.l));
-            llvm::Value* seed = cast(must_of(value_of(p.r)), 64, false);
+            llvm::Value* seed = cast(must_of(p.r), 64, false);
             b_.CreateCall(urandom_seed_fn(), { rng, seed });
             return;
         }
@@ -2604,8 +2619,8 @@ Plane Backend::lower_load(const LValue& lv) {
     // fall outside the vector (LRM 11.5.1: must=0, may=1, z=0).
     if (lv.range_mask != nullptr) {
         llvm::Value* down  = b_.CreateNeg(lv.bit_off);
-        llvm::Value* must  = align_shl(must_of(full), down, w);
-        llvm::Value* may   = align_shl(may_of(full), down, w);
+        llvm::Value* must  = align_shl(must_of(full, true), down, w);
+        llvm::Value* may   = align_shl(may_of(full, true), down, w);
         llvm::Value* zp    = align_shl(z, down, w);
         llvm::Value* valid = align_shl(lv.range_mask, down, w);
         llvm::Value* oob   = b_.CreateNot(valid);
@@ -2615,8 +2630,8 @@ Plane Backend::lower_load(const LValue& lv) {
     }
     // Bit/part select: unpack, shift each plane down by the offset, re-pack.
     llvm::Value* off = cast(lv.bit_off, w, false);
-    return packed(cast(b_.CreateLShr(must_of(full), off), lv.width, false),
-                  cast(b_.CreateLShr(may_of(full), off), lv.width, false),
+    return packed(cast(b_.CreateLShr(must_of(full, true), off), lv.width, false),
+                  cast(b_.CreateLShr(may_of(full, true), off), lv.width, false),
                   cast(b_.CreateLShr(z, off), lv.width, false));
 }
 
@@ -2710,14 +2725,14 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
     if (!four) {
         auto* zbuf = sel_plane_buf(n, "wins.zero");
         b_.CreateStore(llvm::ConstantInt::get(bt, 0), zbuf);
-        args.push_back(spill(must_of(rhs), "wins.must"));
+        args.push_back(spill(must_of(rhs, false), "wins.must"));
         args.push_back(zbuf);
         args.push_back(zbuf);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         const Plane f = rhs;
-        args.push_back(spill(must_of(f), "wins.must"));
-        args.push_back(spill(may_of(f), "wins.may"));
+        args.push_back(spill(must_of(f, true), "wins.must"));
+        args.push_back(spill(may_of(f, true), "wins.may"));
         args.push_back(spill(f.z != nullptr ? f.z : zero(n), "wins.z"));
     }
     b_.CreateCall(wide_ins_fn(), args);
@@ -2764,7 +2779,7 @@ Plane Backend::dyn_elem_load(const LValue& lv) {
     mmphi->addIncoming(vin.mm, inend);
     mmphi->addIncoming(x_mm(lv.width), defbb);
     auto* zphi = b_.CreatePHI(int_ty(lv.width), 2);
-    zphi->addIncoming(z_of(vin), inend);
+    zphi->addIncoming(z_of(vin, true), inend);
     zphi->addIncoming(zero(lv.width), defbb);
     return { mmphi, zphi };
 }
@@ -2797,7 +2812,7 @@ void Backend::lower_cond(Index i) {
 
     // must=1 holds only for a definite 1 (invariant must => may), so X/Z fall
     // through to else automatically.
-    llvm::Value* take = b_.CreateICmpNE(must_of(cond), zero(1));
+    llvm::Value* take = b_.CreateICmpNE(must_of(cond, type_of(p.op_extra.op).four_state), zero(1));
 
     auto* then_bb = llvm::BasicBlock::Create(ctx_, "then", fn_);
     auto* else_bb = llvm::BasicBlock::Create(ctx_, "else", fn_);
@@ -2832,14 +2847,15 @@ void Backend::lower_switch(Index i) {
     const auto           info = ir_->extra_data<SwitchInfo>(p.op_extra.extra);
     const Plane          sel  = value_of(p.op_extra.op);
 
-    const uint32_t w    = width_of(sel);
-    llvm::Value*   must = must_of(sel);
+    const bool     four = type_of(p.op_extra.op).four_state;
+    const uint32_t w    = width_of(sel, four);
+    llvm::Value*   must = must_of(sel, four);
     llvm::Value*   key  = must;
     uint32_t       keyw = w;
-    if (!sel.two) {
+    if (four) {
         keyw            = 2 * w;
         llvm::Type* kty = int_ty(keyw);
-        llvm::Value* u  = b_.CreateXor(must, may_of(sel));
+        llvm::Value* u  = b_.CreateXor(must, may_of(sel, four));
         key = b_.CreateOr(b_.CreateZExt(must, kty), b_.CreateShl(b_.CreateZExt(u, kty), w));
     }
     llvm::Type* kty = int_ty(keyw);
@@ -2888,7 +2904,7 @@ void Backend::lower_select_lazy(Index i) {
     const auto           sel  = ir_->extra_data<SelectLazy>(p.op_extra.extra);
     const Plane          pred = value_of(p.op_extra.op);
 
-    llvm::Value* take = b_.CreateICmpNE(must_of(pred), zero(1));
+    llvm::Value* take = b_.CreateICmpNE(must_of(pred, type_of(p.op_extra.op).four_state), zero(1));
 
     auto* then_bb = llvm::BasicBlock::Create(ctx_, "sel.then", fn_);
     auto* else_bb = llvm::BasicBlock::Create(ctx_, "sel.else", fn_);
@@ -2984,7 +3000,7 @@ void Backend::lower_loop(Index i) {
     // definite 1, so an X/Z condition exits the loop.
     b_.SetInsertPoint(head_bb);
     lower_region(ir_->region(lp.cond));
-    llvm::Value* take = b_.CreateICmpNE(must_of(value_of(lp.pred)), zero(1));
+    llvm::Value* take = b_.CreateICmpNE(must_of(lp.pred), zero(1));
     b_.CreateCondBr(take, body_bb, exit_bb);
 
     b_.SetInsertPoint(body_bb);

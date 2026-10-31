@@ -264,7 +264,7 @@ void Backend::lower_dump_file(Index i) {
         const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
         path                  = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "dumpfile.path");
         len                   = b_.getInt32(fbytes);
-        b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        b_.CreateAlignedStore(must_of(fname), path, llvm::Align(1));
     }
     b_.CreateCall(vcd_open_fn(), { path, len, b_.getInt32(fwd) });
 }
@@ -273,7 +273,7 @@ void Backend::lower_dump_file(Index i) {
 // value; its known bits are widened to the runtime's 64-bit byte count.
 void Backend::lower_dump_limit(Index i) {
     const Index n = ir_->payload(i).unary;
-    b_.CreateCall(vcd_limit_fn(), { cast(must_of(value_of(n)), 64, false) });
+    b_.CreateCall(vcd_limit_fn(), { cast(must_of(n), 64, false) });
 }
 
 // $dumpvars (whole-design form): walk the design scope tree, registering every

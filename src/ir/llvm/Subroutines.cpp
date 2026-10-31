@@ -1941,7 +1941,7 @@ void Backend::lower_call_inst(Index i) {
 // illegal accesses, and the vtable load is the first thing that would fault.
 llvm::Value* Backend::load_vtable_callee(const VirtualCallInfo& vci, Index at) {
     const std::span<const Index> args   = ir_->region(vci.args);
-    llvm::Value*                 handle = must_of(value_of(args[0]));
+    llvm::Value*                 handle = must_of(args[0]);
     emit_null_handle_check(handle, at);
     llvm::Value* body = b_.CreateIntToPtr(handle, raw_ptr_ty());
     llvm::Value* vptr = b_.CreateLoad(
@@ -2455,13 +2455,13 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
         }
         // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
         // subset. The runtime distinguishes them per bit.
-        llvm::Value* must = must_of(p);
-        llvm::Value* xz   = b_.CreateXor(must, may_of(p));
+        llvm::Value* must = must_of(p, t.four_state);
+        llvm::Value* xz   = b_.CreateXor(must, may_of(p, t.four_state));
         store_field(sty, elt, 0, b_.getInt32(t.width));
         store_field(sty, elt, 1, b_.getInt32(signs[k] != 0 ? 1u : 0u));
         store_field(sty, elt, 2, put(must, words[k]));
         store_field(sty, elt, 3, put(xz, words[k]));
-        store_field(sty, elt, 4, put(z_of(p), words[k]));
+        store_field(sty, elt, 4, put(z_of(p, t.four_state), words[k]));
     }
     return arr;
 }

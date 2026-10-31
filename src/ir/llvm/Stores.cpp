@@ -1115,7 +1115,7 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     // drops any x/z to 0 per LRM 6.3.1; a 2-state RHS is the value itself). No z
     // word.
     if (!lv.four_state) {
-        llvm::Value* v = must_of(rhs);
+        llvm::Value* v = must_of(rhs, false);
         if (selects_whole(lv)) {
             b_.CreateStore(v, mp);
             return;
@@ -1148,8 +1148,8 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
                          lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s_width), zp))
                                   : zero(s_width) };
     llvm::Value* mask = store_mask(lv, s_width);
-    llvm::Value* must = merge_sel(must_of(old), must_of(rhs), lv, s_width, mask);
-    llvm::Value* may  = merge_sel(may_of(old), may_of(rhs), lv, s_width, mask);
+    llvm::Value* must = merge_sel(must_of(old, true), must_of(rhs, true), lv, s_width, mask);
+    llvm::Value* may  = merge_sel(may_of(old, true), may_of(rhs, true), lv, s_width, mask);
     llvm::Value* z    = merge_sel(old.z, rhs.z, lv, s_width, mask);
     b_.CreateStore(packed(must, may, z).mm, mp);
     if (lv.has_z) {
@@ -1173,7 +1173,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         const int      k = agg_static_leaf_index(s, lv.agg_field_path);
         const AggLeaf& m = s.static_leaves[static_cast<uint32_t>(k)];
         if (!m.four_state) {
-            b_.CreateStore(must_of(rhs), shadow_ptr(s, m.sh_mm_field));
+            b_.CreateStore(must_of(rhs, false), shadow_ptr(s, m.sh_mm_field));
         } else {
             assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
             const Plane& f = rhs;
@@ -1203,7 +1203,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
 
     // 2-state target: stage the single iW value into the iW shadow. No z.
     if (!s.four_state) {
-        llvm::Value* v = must_of(rhs);
+        llvm::Value* v = must_of(rhs, false);
         if (!s.nba_partial) {
             b_.CreateStore(v, mp);
         } else {
@@ -1234,8 +1234,8 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
                                s.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s.width), zp))
                                        : zero(s.width) };
         llvm::Value* bmask = store_mask(lv, s.width);
-        llvm::Value* must  = merge_sel(must_of(old), must_of(rhs), lv, s.width, bmask);
-        llvm::Value* may   = merge_sel(may_of(old), may_of(rhs), lv, s.width, bmask);
+        llvm::Value* must  = merge_sel(must_of(old, true), must_of(rhs, true), lv, s.width, bmask);
+        llvm::Value* may   = merge_sel(may_of(old, true), may_of(rhs, true), lv, s.width, bmask);
         llvm::Value* z     = merge_sel(old.z, rhs.z, lv, s.width, bmask);
         b_.CreateStore(packed(must, may, z).mm, mp);
         if (s.has_z) {
@@ -1638,11 +1638,11 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     // The value, positioned at the leaf's bit offset (partial select), in slot
     // layout: mm plane at offset 0, z plane at zoff.
     if (!lv.four_state) {
-        put(payload, place_val(lv, must_of(rhs), W), 0);
+        put(payload, place_val(lv, must_of(rhs, false), W), 0);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         const Plane& f = rhs;
-        llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
+        llvm::Value* mm = packed(place_val(lv, must_of(f, true), W), place_val(lv, may_of(f, true), W),
                                  place_val(lv, f.z, W)).mm;
         put(payload, mm, 0);
         if (lv.has_z) {
@@ -1772,11 +1772,11 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
     llvm::Value* mask_w = s.arr_masked ? store_mask(lv, W) : nullptr;
     llvm::Value* mm_val;
     if (!s.four_state) {
-        mm_val = place_val(lv, must_of(rhs), W); // iW
+        mm_val = place_val(lv, must_of(rhs, false), W); // iW
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
-        llvm::Value* must = place_val(lv, must_of(rhs), W);
-        llvm::Value* may  = place_val(lv, may_of(rhs), W);
+        llvm::Value* must = place_val(lv, must_of(rhs, true), W);
+        llvm::Value* may  = place_val(lv, may_of(rhs, true), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
         mm_val            = packed(must, may, zval).mm; // i2W: must | (may << W)
     }
@@ -1829,7 +1829,7 @@ llvm::Value* Backend::intra_pack_mm(const SignalSlot& s, Plane& rhs) {
         rhs = real_to_planes(fp_of(rhs));
     }
     if (!s.four_state) {
-        return must_of(rhs);
+        return must_of(rhs, false);
     }
     assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     return rhs.mm;
@@ -1873,11 +1873,11 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
     // (LRM 11.5.1).
     llvm::Value* mm_val;
     if (!s.four_state) {
-        mm_val = place_val(lv, must_of(rhs), W);
+        mm_val = place_val(lv, must_of(rhs, false), W);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
-        llvm::Value* must = place_val(lv, must_of(rhs), W);
-        llvm::Value* may  = place_val(lv, may_of(rhs), W);
+        llvm::Value* must = place_val(lv, must_of(rhs, true), W);
+        llvm::Value* may  = place_val(lv, may_of(rhs, true), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
         mm_val            = packed(must, may, zval).mm; // i2W: must | (may << W)
     }
@@ -1939,11 +1939,11 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
     };
     llvm::Value* payload = b_.CreateStructGEP(rt, rec, intra_agg_payload(s));
     if (!lv.four_state) {
-        put(payload, place_val(lv, must_of(rhs), W), 0);
+        put(payload, place_val(lv, must_of(rhs, false), W), 0);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         const Plane& f = rhs;
-        llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
+        llvm::Value* mm = packed(place_val(lv, must_of(f, true), W), place_val(lv, may_of(f, true), W),
                                  place_val(lv, f.z, W))
                             .mm;
         put(payload, mm, 0);
@@ -2055,7 +2055,7 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     // the record's own copy is filled (and positioned) by fill_intra_payload.
     llvm::Value* mm_val;
     if (!s.four_state) {
-        mm_val = must_of(rhs);
+        mm_val = must_of(rhs, false);
     } else {
         assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         mm_val = rhs.mm; // i2W: must | (may << W)

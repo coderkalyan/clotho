@@ -25,7 +25,7 @@ namespace clotho::ir::backend {
 // resumed in that slot's Reactive region -- which is where LRM 4.4.2.6 puts
 // it.
 void Backend::lower_delay(Index amount) {
-    llvm::Value* ticks = cast(must_of(value_of(amount)), 64, false);
+    llvm::Value* ticks = cast(must_of(amount), 64, false);
 
     if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
         if (c->isZero()) {
@@ -195,7 +195,7 @@ void Backend::lower_wait(ExtraIndex info) {
             // `@(edge vif.sig)`: park on the member's waiter list in the
             // instance the handle names. Frame-resident, so there is no
             // capacity to size -- the bucket path could not express this at all.
-            llvm::Value* ctx = b_.CreateIntToPtr(must_of(value_of(e.inst)), raw_ptr_ty());
+            llvm::Value* ctx = b_.CreateIntToPtr(must_of(e.inst), raw_ptr_ty());
             CtxOverride  ov(*this, ctx, slot_of(e.signal).anchor);
             emit_event_link(vif_head_ptr(e.signal, e.edge), event_wait_node(ev_k++),
                             parked_handle(b_, hdl_), sched_ptr_);
@@ -203,7 +203,7 @@ void Backend::lower_wait(ExtraIndex info) {
             // An event with no signal of its own -- an array element, a class
             // property, a formal. The frontend lowered its handle just before
             // this wait, so park on whatever object it names now.
-            emit_event_link(event_obj_of(must_of(value_of(e.handle))), event_wait_node(ev_k++),
+            emit_event_link(event_obj_of(must_of(e.handle)), event_wait_node(ev_k++),
                             parked_handle(b_, hdl_), sched_ptr_);
         } else if (mod_.signal(e.signal).is_event) {
             // Resolve the variable's CURRENT handle: after `a = b`, `@(a)` must
@@ -1660,7 +1660,7 @@ llvm::Value* Backend::next_static_event_node() {
 Plane Backend::lower_event_triggered(llvm::Value* obj) {
     llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_field(obj, kEventTrig));
     llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
-    return { b_.CreateICmpEQ(stamp, now), nullptr, true };
+    return two_val(b_.CreateICmpEQ(stamp, now));
 }
 
 // Compacting removal of this coroutine's entries from one (signal, edge)

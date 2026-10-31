@@ -107,9 +107,9 @@ llvm::Constant* Backend::cover_config_global() {
 // lowered earlier in this region, so their values are available.
 void Backend::lower_timeformat(Index i) {
     const auto   info  = ir_->extra_data<TimeFormatInfo>(ir_->payload(i).extra);
-    llvm::Value* units = cast(must_of(value_of(info.units)), 32, true);
-    llvm::Value* prec  = cast(must_of(value_of(info.precision)), 32, true);
-    llvm::Value* width = cast(must_of(value_of(info.min_width)), 32, true);
+    llvm::Value* units = cast(must_of(info.units), 32, true);
+    llvm::Value* prec  = cast(must_of(info.precision), 32, true);
+    llvm::Value* width = cast(must_of(info.min_width), 32, true);
 
     const std::string suffix  = ir_->extra_bytes(info.suffix, info.suffix_len);
     llvm::Value*      sfx_ptr = b_.CreateGlobalString(suffix);
@@ -273,7 +273,7 @@ void Backend::lower_expect_wake(Index i) {
 
     // must=1 holds only for a definite 1, so an x verdict bit cannot resolve
     // anybody -- the same reading lower_cond gives every condition.
-    b_.CreateCondBr(b_.CreateICmpNE(must_of(value_of(p.op)), zero(1)), drain, done);
+    b_.CreateCondBr(b_.CreateICmpNE(must_of(p.op), zero(1)), drain, done);
 
     b_.SetInsertPoint(drain);
     llvm::Value* n = b_.CreateLoad(i32, sym(top));
@@ -486,7 +486,7 @@ void Backend::lower_severity(Index i) {
 // Lower a $fflush: flush the descriptor operand's buffers (a constant 0 for the
 // no-argument form, which the runtime reads as "flush everything").
 void Backend::lower_fflush(Index i) {
-    llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+    llvm::Value* desc = cast(must_of(ir_->payload(i).unary), 32, true);
     b_.CreateCall(fflush_fn(), { desc });
 }
 
@@ -542,7 +542,7 @@ void Backend::lower_cover_query(Index i) {
         if (args.empty()) {
             throw BackendError{ "internal: cover_query with no handle operand" };
         }
-        return cast(must_of(value_of(args[0])), 64, false);
+        return cast(must_of(args[0]), 64, false);
     };
     const auto ival = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     const auto hval = [&](llvm::Value* v) { set_value(i, two_val(v)); };
@@ -553,7 +553,7 @@ void Backend::lower_cover_query(Index i) {
             // coverpoints name, and null otherwise.
             hval(b_.CreateCall(cover_new_fn(),
                                { b_.getInt32(info.type_idx),
-                                 args.empty() ? b_.getInt64(0) : cast(must_of(value_of(args[0])), 64, false) }));
+                                 args.empty() ? b_.getInt64(0) : cast(must_of(args[0]), 64, false) }));
             return;
         case CoverOp::Ctx:
             hval(b_.CreateCall(cover_ctx_fn(), { handle() }));
@@ -612,7 +612,7 @@ void Backend::lower_cover_ctl(Index i) {
     if (args.empty()) {
         throw BackendError{ "internal: cover_ctl with no handle operand" };
     }
-    llvm::Value* h = cast(must_of(value_of(args[0])), 64, false);
+    llvm::Value* h = cast(must_of(args[0]), 64, false);
     switch (info.op) {
         case CoverOp::Hit: {
             if (args.size() != 3) {
@@ -622,8 +622,8 @@ void Backend::lower_cover_ctl(Index i) {
             // consider 2-state values" a runtime test rather than a frontend
             // refusal: a sampled x/z matches no bin at all.
             b_.CreateCall(cover_hit_fn(),
-                          { h, b_.getInt32(info.point), cast(must_of(value_of(args[1])), 64, false),
-                            cast(must_of(value_of(args[2])), 64, false) });
+                          { h, b_.getInt32(info.point), cast(must_of(args[1]), 64, false),
+                            cast(must_of(args[2]), 64, false) });
             return;
         }
         case CoverOp::Start:
@@ -631,7 +631,7 @@ void Backend::lower_cover_ctl(Index i) {
                 throw BackendError{ "internal: cover_ctl start takes an enable" };
             }
             b_.CreateCall(cover_start_fn(),
-                          { h, cast(must_of(value_of(args[1])), 32, false) });
+                          { h, cast(must_of(args[1]), 32, false) });
             return;
         case CoverOp::SetName: {
             if (args.size() != 2) {
@@ -649,7 +649,7 @@ void Backend::lower_cover_ctl(Index i) {
 
 // Lower a $fclose: close the descriptor operand.
 void Backend::lower_fclose(Index i) {
-    llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+    llvm::Value* desc = cast(must_of(ir_->payload(i).unary), 32, true);
     b_.CreateCall(fclose_fn(), { desc });
 }
 
@@ -657,7 +657,7 @@ void Backend::lower_fclose(Index i) {
 // return i32; the results are always-known integers.
 // $fgetc / $feof / $ftell / $rewind: one descriptor operand.
 void Backend::lower_file_unary(Index i, const char* fn) {
-    llvm::Value* fd   = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+    llvm::Value* fd   = cast(must_of(ir_->payload(i).unary), 32, true);
     auto*        i32  = b_.getInt32Ty();
     auto*        fnty = llvm::FunctionType::get(i32, { i32 }, false);
     llvm::Value* r    = b_.CreateCall(env_->llmod.getOrInsertFunction(fn, fnty), { fd });
@@ -667,8 +667,8 @@ void Backend::lower_file_unary(Index i, const char* fn) {
 // $ungetc(c, fd).
 void Backend::lower_ungetc(Index i) {
     const auto&  p    = ir_->payload(i).binary;
-    llvm::Value* c    = cast(must_of(value_of(p.l)), 32, true);
-    llvm::Value* fd   = cast(must_of(value_of(p.r)), 32, true);
+    llvm::Value* c    = cast(must_of(p.l), 32, true);
+    llvm::Value* fd   = cast(must_of(p.r), 32, true);
     auto*        i32  = b_.getInt32Ty();
     auto*        fnty = llvm::FunctionType::get(i32, { i32, i32 }, false);
     llvm::Value* r = b_.CreateCall(env_->llmod.getOrInsertFunction("rt_ungetc", fnty), { c, fd });
@@ -679,9 +679,9 @@ void Backend::lower_ungetc(Index i) {
 void Backend::lower_fseek(Index i) {
     const auto&  p    = ir_->payload(i).op_extra;
     const auto   info = ir_->extra_data<FseekInfo>(p.extra);
-    llvm::Value* fd   = cast(must_of(value_of(p.op)), 32, true);
-    llvm::Value* off  = cast(must_of(value_of(info.offset)), 32, true);
-    llvm::Value* op   = cast(must_of(value_of(info.operation)), 32, true);
+    llvm::Value* fd   = cast(must_of(p.op), 32, true);
+    llvm::Value* off  = cast(must_of(info.offset), 32, true);
+    llvm::Value* op   = cast(must_of(info.operation), 32, true);
     auto*        i32  = b_.getInt32Ty();
     auto*        fnty = llvm::FunctionType::get(i32, { i32, i32, i32 }, false);
     llvm::Value* r = b_.CreateCall(env_->llmod.getOrInsertFunction("rt_fseek", fnty), { fd, off, op });
@@ -696,7 +696,7 @@ void Backend::lower_fseek(Index i) {
 // z plane, and returns the character count.
 void Backend::lower_fgets(Index i) {
     const Index  dst = ir_->payload(i).binary.l;
-    llvm::Value* fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+    llvm::Value* fd  = cast(must_of(ir_->payload(i).binary.r), 32, true);
     const LValue& lv = lvalue_of(dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
@@ -799,7 +799,7 @@ void Backend::lower_sformatf(Index i) {
 // the runtime writes the message and returns the error code.
 void Backend::lower_ferror(Index i) {
     const Index   dst = ir_->payload(i).binary.l;
-    llvm::Value*  fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+    llvm::Value*  fd  = cast(must_of(ir_->payload(i).binary.r), 32, true);
     const LValue& lv  = lvalue_of(dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
@@ -880,7 +880,7 @@ void Backend::lower_scanf(Index i) {
         const AsciiArg s = spill_ascii_arg(info.source, "sscanf.buf");
         r = b_.CreateCall(sscanf_fn(), { s.ptr, s.len, s.fwd, fmt_ptr, b_.getInt32(n), arr });
     } else {
-        llvm::Value* fd = cast(must_of(value_of(info.source)), 32, true);
+        llvm::Value* fd = cast(must_of(info.source), 32, true);
         r               = b_.CreateCall(fscanf_fn(), { fd, fmt_ptr, b_.getInt32(n), arr });
     }
     // Every conversion has landed; wake anything a written target changed
@@ -971,7 +971,7 @@ void Backend::lower_value_plusargs(Index i) {
 std::pair<llvm::Value*, uint32_t> Backend::spill_ascii(Index v, const char* name) {
     const uint32_t bytes = std::max<uint32_t>((type_of(v).width + 7) / 8, 1);
     llvm::Value*   buf   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(bytes), name);
-    b_.CreateAlignedStore(must_of(value_of(v)), buf, llvm::Align(1));
+    b_.CreateAlignedStore(must_of(v), buf, llvm::Align(1));
     return { buf, bytes };
 }
 
@@ -1003,7 +1003,7 @@ void Backend::lower_fread_word(Index i) {
     llvm::Value* mm = lv_mm_ptr(lv);
     llvm::Value* z =
       lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-    llvm::Value* fd = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+    llvm::Value* fd = cast(must_of(ir_->payload(i).binary.r), 32, true);
 
     const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
     const uint32_t flags  = !lv.four_state ? 4u : 0u;
@@ -1039,8 +1039,8 @@ void Backend::lower_fread_mem(Index i) {
     const auto  stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
     const Type& at     = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
 
-    llvm::Value*   fd     = cast(must_of(value_of(fdi)), 32, true);
-    const auto     i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
+    llvm::Value*   fd     = cast(must_of(fdi), 32, true);
+    const auto     i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
     llvm::Value*   start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
     llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
     const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (!s.four_state ? 4u : 0u);
@@ -1100,7 +1100,7 @@ void Backend::lower_readmem(Index i) {
         const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
         path                  = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
         path_len              = b_.getInt32(fbytes);
-        b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        b_.CreateAlignedStore(must_of(fname), path, llvm::Align(1));
     }
 
     // The runtime addresses element i's planes at base + i*stride, so hand it
@@ -1120,7 +1120,7 @@ void Backend::lower_readmem(Index i) {
 
     const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
 
-    const auto   i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
+    const auto   i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
     llvm::Value* start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
     llvm::Value* finish = info.has_finish ? i64_of(info.finish) : b_.getInt64(0);
 
@@ -1196,7 +1196,7 @@ void Backend::lower_display(Index i) {
 void Backend::lower_fdisplay(Index i) {
     // $fdisplay / $fwrite carry an explicit descriptor operand.
     const auto& p = ir_->payload(i).op_extra;
-    emit_display(ir_->extra_data<DisplayInfo>(p.extra), cast(must_of(value_of(p.op)), 32, true));
+    emit_display(ir_->extra_data<DisplayInfo>(p.extra), cast(must_of(p.op), 32, true));
 }
 
 void Backend::emit_display(const DisplayInfo& info, llvm::Value* desc) {
