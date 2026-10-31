@@ -2658,6 +2658,7 @@ private:
     llvm::FunctionCallee gc_mutator_fn();
     llvm::FunctionCallee gc_alloc_fn();
     llvm::FunctionCallee gc_roots_add_fn();
+    llvm::FunctionCallee gc_range_add_fn();
     llvm::FunctionCallee gc_containers_add_fn();
     llvm::FunctionCallee gc_container_add_fn();
     llvm::FunctionCallee gc_container_remove_fn();
@@ -2703,7 +2704,9 @@ private:
 
     void emit_gc_start_bits(llvm::Value* start, bool fin);
 
-    llvm::Value* emit_gc_alloc_fast(Ref class_ref);
+    // `site` is the allocation's rt_alloc_site global for the runtime's located fatal, or
+    // null for an allocation that has no statement to name.
+    llvm::Value* emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site);
 
     // -- Safepoints (docs/design/garbage-collection.md §2, F1) --------------------
 

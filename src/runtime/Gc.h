@@ -32,6 +32,9 @@ extern "C" {
 // element-lifecycle walkers, which live in runtime/Containers.cpp.
 struct rt_elem_leaf;
 struct rt_elem_ops;
+// rt_alloc_site, from Runtime.h: where an allocation came from, for the located
+// fatal. Null where the caller has no statement to name.
+struct rt_alloc_site;
 
 // -- Geometry -----------------------------------------------------------------
 //
@@ -246,11 +249,14 @@ typedef struct rt_gc_mutator {
 // -- Configuration and lifecycle ---------------------------------------------
 
 // `nursery_bytes`  bytes allocated between collections before one is requested.
-// `heap_bytes_max` soft ceiling reported through the stats line; the heap grows
-//                  past it between safepoints exactly as an uncollected heap
-//                  does today (see docs/design/garbage-collection.md §6.1 on the
-//                  unsuspended-allocation hole).
-// `stress`         collect at every safepoint.
+// `heap_bytes_max` ceiling on the class heap in bytes, 0 for none. An allocation
+//                  that would take the heap past it first runs an emergency
+//                  collection, and ends the run with a located fatal if the
+//                  objects still do not fit (docs/design/garbage-collection.md
+//                  §6.1). The heap grows in whole chunks, so the ceiling is the
+//                  largest number of them that fits, and never fewer than one.
+// `stress`         collect at every safepoint, and at every allocation once the
+//                  simulation is running.
 // `stats`          print a collection summary at shutdown.
 // `map_vptr_offset` the backend's own computation of the constant negative offset
 //                  from a vptr to its rt_gc_map pointer. rt_gc_init asserts it
@@ -299,13 +305,24 @@ rt_gc_mutator* rt_gc_mutator_current(void);
 // the GC word, and records the object as finalizable when map->finalize is
 // non-null. Never returns null: an unsatisfiable request takes the runtime's
 // located-fatal path, matching rt_alloc's contract at the ClassNew site
-// (ir/llvm/Inst.cpp elides the null guard on a fresh handle).
+// (ir/llvm/Inst.cpp elides the null guard on a fresh handle). `site` names the
+// statement for that fatal and is null where there is none.
 //
 // Generated code INLINES the bump-and-mark sequence against the mutator fields
 // above and reaches the runtime only when the current hole cannot satisfy the
 // request, so in a collected run this entry point serves large objects, the
 // runtime's own callers and the tests.
-void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map);
+//
+// This is also where a collection can happen in the middle of the design: when
+// the budget has been exceeded by a large factor with no safepoint reached, the
+// allocation collects before it allocates (§6.1, "The unsuspended-allocation
+// hole"). Everything the running code still needs is therefore found from the
+// native stack, the registers and the registered roots, so a caller must hold a
+// handle it is going to use in a register, on the stack or in a root across
+// this call -- which generated code does by construction, since a value used
+// after a call has to be somewhere.
+void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
+                  const struct rt_alloc_site* site);
 
 // The out-of-line half of the inlined fast path: the current hole is exhausted,
 // so refill (next hole, then a recycled or fresh block, then a new chunk) and
@@ -313,7 +330,8 @@ void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map);
 // `fin_bitmap` is this function's job, and the nursery budget is charged HERE, per
 // hole handed out, rather than per object -- which is what keeps the fast path free
 // of budget arithmetic while leaving the accounting exact in bytes made available.
-void* rt_gc_alloc_slow(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map);
+void* rt_gc_alloc_slow(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
+                       const struct rt_alloc_site* site);
 
 // sizeof(rt_gc_mutator), for the layout cross-check. Generated code loads mutator
 // fields at offsets it computes from its own mirror of the struct, so a size
@@ -381,9 +399,11 @@ void rt_gc_container_remove(void* handle);
 // -- Collection ---------------------------------------------------------------
 
 // Reasons, for the stats line.
-#define RT_GC_REASON_BUDGET   0u
-#define RT_GC_REASON_STRESS   1u
-#define RT_GC_REASON_EXPLICIT 2u
+#define RT_GC_REASON_BUDGET    0u
+#define RT_GC_REASON_STRESS    1u
+#define RT_GC_REASON_EXPLICIT  2u
+// A collection run from inside an allocation (§6.1), not at a region boundary.
+#define RT_GC_REASON_EMERGENCY 3u
 
 // Collection KIND, orthogonal to the reason above. A young collection marks from
 // the roots plus the remembered set and treats an OLD object as live without
@@ -418,6 +438,16 @@ void rt_gc_safepoint(void);
 // blocks. The mark phase is an explicit bounded worklist -- never recursion
 // (TigerStyle) -- because a testbench object graph is arbitrarily deep.
 void rt_gc_collect(uint32_t reason);
+
+// Bracket the span in which generated code runs under the scheduler: rt_sim_run
+// passes the address of one of its own locals, which is above every frame the
+// design's code can have on the native stack, and null on the way out. An
+// emergency collection scans the stack from where it is called up to this
+// address, so with none recorded -- static initialization before the run, a test
+// calling the allocator directly -- allocation never collects and the heap grows
+// to the next safepoint, as it did before emergency collection existed.
+void rt_gc_run_enter(const void* stack_base);
+void rt_gc_run_leave(void);
 
 // -- Introspection (tests, --gc-stats, the debug modes) -----------------------
 //
@@ -455,6 +485,14 @@ typedef struct rt_gc_stats {
     // prove the container-root path ran rather than a conservative frame word
     // having happened to pin the same object.
     uint64_t container_roots;
+    // Collections run from inside an allocation (RT_GC_REASON_EMERGENCY); they are
+    // also counted in `collections`.
+    uint64_t emergency_collections;
+    // Bytes of string and container buffers the design holds right now, as
+    // rt_internal::g_owned (GcBuffers.h) counts them. Zero after a run that frees
+    // everything it allocates, which every design ending by running out of events
+    // does, so a test can assert it to find a free site that does not report.
+    uint64_t owned_bytes;
 } rt_gc_stats;
 
 void rt_gc_get_stats(rt_gc_stats* out);

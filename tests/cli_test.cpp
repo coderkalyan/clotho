@@ -1012,3 +1012,30 @@ endmodule
         CHECK(contains(on.out, "rt_divzero_report"));
     }
 }
+
+// --gc-heap-max is a ceiling the run enforces: objects the design still holds after
+// an emergency collection stop it at the allocation that does not fit, and the report
+// names that statement. The same design without the ceiling completes.
+TEST_CASE("cli: --gc-heap-max stops a design whose live objects do not fit, at the allocation") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(module top;
+  class C; int a; int b; endclass
+  C q[$];
+  initial begin
+    for (int i = 0; i < 1000000; i++) begin
+      automatic C x = new();
+      q.push_back(x);
+    end
+    $display("done %0d", q.size());
+  end
+endmodule
+)");
+    const Result   capped = s.run(std::format("run --gc-heap-max=8388608 \"{}\"", design.string()));
+    CHECK(capped.code == 1);
+    CHECK(capped.out.empty());
+    CHECK(contains(capped.err, "fatal: the class heap would pass --gc-heap-max (8388608 bytes)"));
+    CHECK(contains(capped.err, "design.sv:6"));
+    const Result free_run = s.run(std::format("run \"{}\"", design.string()));
+    CHECK(free_run.code == 0);
+    CHECK(free_run.out == "done 1000000\n");
+}

@@ -718,6 +718,15 @@ void Backend::emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base, 
 // beside the handle offsets rather than an add / remove pair
 // (docs/design/garbage-collection.md §3.3). Static class properties are ordinary
 // SignalSlots, as above, so `static Cell q[$]` is covered here too.
+//
+// The third half is the NBA SHADOW of a target that can hold a handle (`h <= new C`,
+// `s.h <= x`): the value sits in the shadow from staging to the NBA commit, and no
+// signal holds it yet. Nothing separated staging from commit by a collection until an
+// allocation could collect (design §6.1), so shadows were never roots; now a handle
+// that exists only there would be freed. The shadow is registered as a conservatively
+// scanned range (rt_gc_range_add) rather than described by offsets: it is a flat
+// staging struct of masks and planes beside the handle, and a stale word in it is
+// retention at worst, which the validation of every candidate bounds.
 void Backend::emit_gc_root_tables() {
     const llvm::DataLayout& dl = env_->llmod.getDataLayout();
     // Anchor index -> offsets, with the root state buffer in the last bucket:
@@ -757,6 +766,21 @@ void Backend::emit_gc_root_tables() {
           r == root_region ? sym(state_global_) : sym(anchors_[r].state_gv);
         b_.CreateCall(gc_containers_add_fn(),
                       { gc_containers_global(base, cont_by_region[r], cont_emitted++) });
+    }
+    // NBA shadows that can stage a handle, one range per region that has any.
+    std::vector<bool> shadow_roots(anchors_.size() + 1, false);
+    for (const SignalSlot& s : slots_) {
+        if (s.nba && reaches_class_handle(s.ir_type)) {
+            shadow_roots[s.anchor == SignalSlot::no_anchor ? root_region : s.anchor] = true;
+        }
+    }
+    for (size_t r = 0; r < shadow_roots.size(); ++r) {
+        llvm::GlobalVariable* shadow = r == root_region ? shadow_global_ : anchors_[r].shadow_gv;
+        if (!shadow_roots[r] || shadow == nullptr) {
+            continue; // no handle staged here, or only through deferred records, which are roots
+        }
+        b_.CreateCall(gc_range_add_fn(),
+                      { sym(shadow), b_.getInt64(dl.getTypeAllocSize(shadow->getValueType())) });
     }
     assert(cont_emitted <= cont_by_region.size() && "one container table per region at most");
 }
@@ -1077,8 +1101,13 @@ void Backend::emit_gc_start_bits(llvm::Value* start, bool fin) {
 // The nursery budget is deliberately absent. rt_gc_alloc_slow charges it per HOLE
 // handed out rather than per object (Gc.h:243-253), which is what keeps this
 // sequence free of budget arithmetic while leaving the accounting exact in bytes
-// made available.
-llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref) {
+// made available. For the same reason the inlined path is also where nothing can
+// collect: only the slow call can, and it collects before it allocates, so what this
+// function returns is never an object a collection has seen half-built (Gc.h, rt_gc_alloc).
+//
+// `site` names the statement for the slow path's located fatal; the fast path never
+// reads it, so it costs the cold block one constant argument and nothing else.
+llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site) {
     assert(gc_alloc_is_inline(class_ref) && "a large object keeps the out-of-line call");
     const uint64_t  size = gc_object_bytes(class_ref);
     llvm::Constant* map  = class_gc_map_global(class_ref);
@@ -1136,7 +1165,9 @@ llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref) {
 
     b_.SetInsertPoint(slow);
     llvm::Value* slow_hdl =
-      b_.CreateCall(gc_alloc_slow_fn(), { gc_mutator_cur(), b_.getInt64(size), map },
+      b_.CreateCall(gc_alloc_slow_fn(),
+                    { gc_mutator_cur(), b_.getInt64(size), map,
+                      site != nullptr ? site : llvm::Constant::getNullValue(raw_ptr_ty()) },
                     "gc.slowhdl");
     b_.CreateBr(cont);
 
@@ -1348,9 +1379,10 @@ void Backend::note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, l
 // That makes the nested case behave exactly like a direct property container, where
 // the frame scan already pins and marks the owner off a body-interior pointer.
 //
-// Task calls only. A function cannot suspend, and the only safepoint is the drain
-// loop's quiescent edge (:11542), so no collection can occur inside a function call
-// and the call-site barrier alone covers it.
+// Task AND function calls. A task can suspend across a collection, and since an
+// allocation that has outrun its budget collects (design §6.1) a function can too: the
+// callee may allocate between the call-site barrier and its store, so the barrier alone
+// no longer covers it.
 llvm::Value* Backend::emit_gc_ref_container_add(const LValueInfo& lv) {
     if (lv.gc_container_root == nullptr) {
         return nullptr;

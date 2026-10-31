@@ -751,7 +751,8 @@ llvm::Value* Backend::emit_proc_object(llvm::Value* pcb, Ref class_ref) {
 
     b_.SetInsertPoint(make);
     llvm::Type*  body_ty = class_body_ty(class_ref);
-    llvm::Value* obj     = emit_gc_alloc_fast(class_ref);
+    // No statement to name: the object is minted by `process::self()`, which is not a `new`.
+    llvm::Value* obj     = emit_gc_alloc_fast(class_ref, nullptr);
     b_.CreateStore(class_vptr(class_ref), b_.CreateStructGEP(body_ty, obj, 0));
     // The one body field: the block this handle names (a chandle-shaped word, so
     // no collector ever follows it).

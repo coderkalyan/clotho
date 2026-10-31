@@ -493,9 +493,11 @@ void register_options(Registry& r, Options& o) {
     r.add_developer(kBuildRun,
                     "--gc-heap-max",
                     o.gc_heap_bytes_max,
-                    "Size in bytes the design's class objects should stay under: reaching it "
-                    "asks for a reclaim at the next opportunity, and passing it anyway is reported rather "
-                    "than refused, since a design is free to create objects without ever pausing. 0, the "
+                    "Size in bytes the design's class objects may occupy. An object that would pass "
+                    "it first makes the design reclaim everything it can no longer reach, and if the "
+                    "objects still do not fit the run stops with an error at that statement. The "
+                    "heap grows in 4 MiB steps, so the limit is the largest whole number of them "
+                    "that fits, and it does not count the strings and containers objects own. 0, the "
                     "default, sets no limit",
                     "<bytes>");
     r.add_developer(kBuildRun,

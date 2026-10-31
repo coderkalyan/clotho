@@ -29,6 +29,12 @@
 #include <cstdlib>
 #include <cstring>
 
+// The ring's growth is runtime-only (below), so the bitcode image never names the
+// accounting it reports to.
+#if !defined(CLOTHO_BITCODE_IMAGE)
+#include "GcBuffers.h"
+#endif
+
 namespace {
 
 // Address of logical element `i` (0-based) in the ring. Requires cap > 0 and
@@ -230,7 +236,7 @@ extern "C" void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const
     for (uint64_t i = 0; i < h->len; ++i) {
         std::memcpy(buf + i * stride, q_elem(h, stride, i), static_cast<size_t>(stride));
     }
-    std::free(h->base);
+    rt_internal::buffer_free(h->base, h->cap * stride);
     h->base = buf;
     h->head = 0;
     h->cap  = newcap;

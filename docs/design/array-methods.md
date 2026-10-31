@@ -155,11 +155,9 @@ Three semantics this fixes, none of which the clause states:
   held across the clause, since every access re-resolves through `elem_select`.
 
 On the GC: a container payload is `malloc`'d rather than GC-heap (`Gc.h:333`), so
-no collector relocates it; allocation only sets `mutator->request`
-(`Gc.cpp:1855`) and the sole poll site in emitted code is the drain loop's
-quiescent edge (`ir/llvm/Scheduler.cpp, emit_active_run`). A 400-element sort whose key allocates a
-string per evaluation reports one collection under `--gc-stress`, none of it
-inside the sort.
+no collector relocates it. A collection can run inside an allocation once a design has
+outrun its budget (garbage-collection.md §6.1), and the clause holds no pointer into
+the receiver across it, so nothing in the sort depends on where that happens.
 
 ### 2. Fixed-size unpacked-array receiver — landed
 

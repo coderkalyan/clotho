@@ -58,6 +58,7 @@
 #include <fmt/color.h>
 
 #include "Format.h"
+#include "GcBuffers.h"
 #include "Os.h"
 #include "Wheel.h"
 
@@ -287,7 +288,7 @@ inline void str_assign(rt_string* s, const char* p, uint64_t n, const rt_alloc_s
     char*          buf = static_cast<char*>(rt_alloc_checked(cap + 1, site, rt_diag_now()));
     std::memcpy(buf, p, n);
     buf[n] = 0;
-    std::free(h.ptr);
+    buffer_free(h.ptr, h.cap + 1);
     str_set_heap(s, StrHeap{ buf, n, cap });
 }
 

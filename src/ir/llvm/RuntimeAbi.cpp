@@ -1459,12 +1459,21 @@ llvm::FunctionCallee Backend::gc_mutator_fn() {
     return rt_fn("rt_gc_mutator_current", raw_ptr_ty(), {});
 }
 
+// (mutator, size, map, site): the site is the `new`'s rt_alloc_site, or null for an
+// allocation with no statement to name (Gc.h, rt_gc_alloc).
 llvm::FunctionCallee Backend::gc_alloc_fn() {
-    return rt_fn("rt_gc_alloc", raw_ptr_ty(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    return rt_fn("rt_gc_alloc", raw_ptr_ty(),
+                 { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 llvm::FunctionCallee Backend::gc_roots_add_fn() {
     return rt_fn("rt_gc_roots_add", b_.getVoidTy(), { raw_ptr_ty() });
+}
+
+// A runtime-owned or constant region scanned conservatively at every collection (Gc.h,
+// rt_gc_range_add): the NBA shadows that can stage a class handle.
+llvm::FunctionCallee Backend::gc_range_add_fn() {
+    return rt_fn("rt_gc_range_add", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
 // The container-root ABI (Gc.h:263-268). rt_gc_containers_add takes a constant
@@ -1490,7 +1499,7 @@ llvm::FunctionCallee Backend::gc_container_remove_fn() {
 // only on the cold edge emit_gc_alloc_fast branches to.
 llvm::FunctionCallee Backend::gc_alloc_slow_fn() {
     return rt_fn("rt_gc_alloc_slow", raw_ptr_ty(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                 { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // Only the slow half is ever emitted: generated code polls

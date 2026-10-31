@@ -1049,6 +1049,10 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // Publish the wheel so a cold diagnostic (an allocation failure) can report
     // the simulation time without every allocating call carrying one.
     g_diag_wheel = static_cast<const rt_wheel*>(wheel);
+    // Everything the design runs below this frame -- the drain and the final blocks -- may
+    // allocate a class object, and an allocation that has outrun its budget collects from
+    // inside itself, scanning the native stack up to here (garbage-collection.md §6.1).
+    rt_gc_run_enter(__builtin_frame_address(0));
     {
         const InterruptGuard sigint;
         drain(state, wheel);
@@ -1066,6 +1070,7 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
         }
         finals(state, wheel);
     }
+    rt_gc_run_leave();
     // Functional coverage (LRM 19.9: the database is written "at the end of a
     // simulation run"). Here rather than from a synthesized `final` process
     // because every exit path -- natural drain, $finish, interrupt, stop time --
