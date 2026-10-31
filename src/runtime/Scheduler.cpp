@@ -71,6 +71,9 @@ extern "C" void rt_nba_arr_reset(void) {
     }
     arr_total = 0;
 }
+extern "C" {
+uint32_t rt_intra_total = 0;
+}
 namespace {
 
 // One deferred nonblocking-intra-assignment site (a target signal). `pool` owns
@@ -89,11 +92,15 @@ struct IntraSite {
     // record would let the fill run off its end, so a changed stride retires the
     // pool (see rt_intra_alloc).
     uint32_t stride = 0;
+    // The batch at the end of `ready`: the records one release moment (rt_intra_moment)
+    // put there, from index `batch_start`. See intra_ready_push.
+    size_t   batch_start  = 0;
+    uint32_t batch_moment = 0;
 };
 
 std::vector<IntraSite> intra_sites; // indexed by dense intra-nba id
-uint32_t               intra_total = 0; // ready records across all sites
-uint32_t               intra_seq   = 0; // monotonic arm-order stamp
+uint32_t               intra_seq    = 0; // monotonic arm-order stamp
+uint32_t               intra_moment = 0; // release-moment counter (rt_intra_moment)
 
 // Per inertial continuous-assignment site (LRM 10.3.3): the current deschedule
 // epoch and whether a store is currently in flight (so a same-value change
@@ -170,17 +177,30 @@ void intra_event_drop(uint32_t trig_id, const void* rec) {
     list->resize(w);
 }
 
-// Move a fired record onto its target's ready list, keeping the list in ascending
-// seq so the commit applies same-instant updates last-executed-wins (LRM 10.4.2).
-// Same-instant counts are small, so the linear insert is cheap.
+// Move a record whose delay or event just completed onto its target's ready list. The
+// list is in the order its updates were created (LRM 4.6 b), 15.5.1; docs/LRM_NOTES.md,
+// note 51): the records one release moment puts there are a batch, and a batch goes
+// behind every earlier one, so a record released by a later occurrence never commits
+// before one released by an earlier occurrence, and never before a plain NBA copied there
+// in between (rt_intra_now). Inside a batch -- the records of one wheel tick, of one
+// occurrence of an event, the leaves of one statement -- the updates were created
+// together, and go in the order their statements executed (ascending seq; LRM 4.6 b),
+// 10.4.2 Examples 4 and 6). Same-moment counts are small, so the linear insert is cheap.
+// The wheel does not count moments: all of a tick's records are one batch, and the list
+// is empty when a tick begins.
 void intra_ready_push(rt_intra_rec* rec) {
-    std::vector<void*>& ready = intra_sites[rec->idx].ready;
-    size_t              pos   = ready.size();
-    while (pos > 0 && reinterpret_cast<rt_intra_rec*>(ready[pos - 1])->seq > rec->seq) {
+    IntraSite&          site  = intra_sites[rec->idx];
+    std::vector<void*>& ready = site.ready;
+    if (ready.empty() || site.batch_moment != intra_moment) {
+        site.batch_start  = ready.size();
+        site.batch_moment = intra_moment;
+    }
+    size_t pos = ready.size();
+    while (pos > site.batch_start && reinterpret_cast<rt_intra_rec*>(ready[pos - 1])->seq > rec->seq) {
         --pos;
     }
     ready.insert(ready.begin() + static_cast<std::ptrdiff_t>(pos), rec);
-    intra_total++;
+    rt_intra_total++;
 }
 
 } // namespace
@@ -198,8 +218,9 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
         // the drop safe. Without it, a run whose record is wider than the previous
         // run's silently writes past the end of a recycled block; an embedder that
         // runs two designs in one process (the test runner does) hits it.
-        intra_total -= static_cast<uint32_t>(site.ready.size());
+        rt_intra_total -= static_cast<uint32_t>(site.ready.size());
         site.ready.clear();
+        site.batch_start = 0;
         site.freelist.clear();
         site.pool.clear();
         site.stride = stride;
@@ -212,7 +233,7 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
         site.pool.push_back(std::make_unique<unsigned char[]>(stride));
         p = site.pool.back().get();
     }
-    // Stamp arm order so the commit applies same-instant updates last-executed-wins.
+    // Stamp arm order: it orders the records of one release batch (intra_ready_push).
     reinterpret_cast<rt_intra_rec*>(p)->seq = intra_seq++;
     return p;
 }
@@ -220,6 +241,21 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
 extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
     // The record base is the timer (timer at offset 0), so recover it by cast.
     intra_ready_push(reinterpret_cast<rt_intra_rec*>(timer));
+}
+
+extern "C" void rt_intra_now(void* rec) {
+    // The record's update is created by the statement that filled it, so it is later than
+    // everything already on the list (its seq is the newest stamp) and a batch of its own:
+    // whatever is released later goes behind it.
+    IntraSite& site = intra_sites[static_cast<rt_intra_rec*>(rec)->idx];
+    site.ready.push_back(rec);
+    site.batch_start  = site.ready.size();
+    site.batch_moment = intra_moment;
+    rt_intra_total++;
+}
+
+extern "C" void rt_intra_moment(void) {
+    intra_moment++;
 }
 
 extern "C" void* rt_inertial_buf(uint32_t idx, uint32_t nbytes) {
@@ -397,19 +433,32 @@ extern "C" uint32_t rt_intra_ready_count(uint32_t idx) {
 }
 
 extern "C" uint32_t rt_intra_any(void) {
-    return intra_total;
+    return rt_intra_total;
 }
 
-extern "C" void rt_intra_release(uint32_t idx) {
+// Return the first `n` records of site `idx`'s ready list -- the ones its commit loop has
+// just applied -- to the freelist. Records released after the loop took its count (the
+// commit's own wake can satisfy a `<= @` control of the same site) are an update created
+// in the NBA region: they stay for the next pass instead of being freed uncommitted.
+extern "C" void rt_intra_release(uint32_t idx, uint32_t n) {
     if (idx >= intra_sites.size()) {
         return;
     }
-    IntraSite& site = intra_sites[idx];
-    intra_total -= static_cast<uint32_t>(site.ready.size());
-    for (void* p : site.ready) {
-        site.freelist.push_back(p);
+    IntraSite&   site  = intra_sites[idx];
+    const size_t total = site.ready.size();
+    assert(n <= total && "a commit releases only what its loop applied");
+    rt_intra_total -= n;
+    void* const* recs = site.ready.data();
+    for (uint32_t i = 0; i < n; ++i) {
+        site.freelist.push_back(recs[i]);
     }
-    site.ready.clear();
+    if (n == total) { // the usual case: nothing was released during the commit
+        site.ready.clear();
+        site.batch_start = 0;
+        return;
+    }
+    site.ready.erase(site.ready.begin(), site.ready.begin() + static_cast<std::ptrdiff_t>(n));
+    site.batch_start = site.batch_start > n ? site.batch_start - n : 0;
 }
 
 // The pair for a site whose records stage a class handle (an aggregate or an array with a
@@ -426,13 +475,13 @@ extern "C" void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride) {
     return rec;
 }
 
-extern "C" void rt_intra_release_rooted(uint32_t idx) {
+extern "C" void rt_intra_release_rooted(uint32_t idx, uint32_t n) {
     if (idx < intra_sites.size()) {
-        for (void* rec : intra_sites[idx].ready) {
-            rt_gc_range_remove(rec);
+        for (uint32_t i = 0; i < n; ++i) {
+            rt_gc_range_remove(intra_sites[idx].ready[i]);
         }
     }
-    rt_intra_release(idx);
+    rt_intra_release(idx, n);
 }
 
 extern "C" void rt_intra_reset(void) {
@@ -444,6 +493,8 @@ extern "C" void rt_intra_reset(void) {
             site.freelist.push_back(rec.get());
         }
         site.ready.clear();
+        site.batch_start  = 0;
+        site.batch_moment = 0;
     }
     // `stride` is deliberately kept: it is what lets the next design's first
     // rt_intra_alloc notice that this site's pooled records are the wrong size and
@@ -458,8 +509,9 @@ extern "C" void rt_intra_reset(void) {
     for (InertialState& s : inertial_states) {
         s = {};
     }
-    intra_total = 0;
-    intra_seq   = 0;
+    rt_intra_total = 0;
+    intra_seq      = 0;
+    intra_moment   = 0;
 }
 
 extern "C" void rt_wheel_init(rt_wheel* wheel) {

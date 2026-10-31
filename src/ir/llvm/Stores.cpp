@@ -165,6 +165,30 @@ void Backend::classify_intra_target(const Ir& ir, Index lv_idx, const NbaTarget&
     }
 }
 
+// Classify the plain NBAs to signals that also take timed ones. Such a write copies
+// itself onto the ready list (emit_intra_nba_ordered), so the record has to be able to
+// encode its shape: classifying it as an intra site too sets the flags the record
+// type is built from (`intra_masked`, `intra_ptr`). The set of intra targets is
+// complete only after every body has been scanned, hence a second pass.
+void Backend::classify_ordered_plain(const Ir& ir) {
+    if (intra_nba_sigs_.empty()) {
+        return;
+    }
+    for (size_t k = 0; k < ir.inst_count(); ++k) {
+        const auto idx = static_cast<Index>(k);
+        if (ir.tag(idx) != Inst::Tag::StoreNb) {
+            continue;
+        }
+        const Index     lv_idx = ir.payload(idx).binary.l;
+        const NbaTarget t      = nba_target(ir, lv_idx);
+        // A string place stages an owned handle, which the record does not hold; its
+        // writes take the string path and are not copied.
+        if (is_intra_target(t.sig) && !lvalue_is_string_place(ir, lv_idx)) {
+            classify_intra_target(ir, lv_idx, t);
+        }
+    }
+}
+
 // Mark NBA-target signals reached by one IR body (a process or a task): set
 // `nba`, `nba_partial` (any bit/part-select site), `nba_dyn` (any runtime-indexed
 // select), and collect unpacked-array targets for the runtime deferred queue.
@@ -203,9 +227,11 @@ void Backend::nba_classify_ir(const Ir& ir) {
                 if (mod_.signals()[static_cast<uint32_t>(tr.signal)].is_event) {
                     // Waits on the event OBJECT (trigger_id_value), so it takes no
                     // dense id and needs no signal-edge detection.
-                    design_uses_event_triggers_ = true;
+                    design_uses_event_triggers_   = true;
+                    design_uses_intra_event_objs_ = true;
                     continue;
                 }
+                intra_trigger_edge_[static_cast<uint32_t>(tr.signal)][tr.edge] = true;
                 int32_t& tid = trigger_id_[static_cast<uint32_t>(tr.signal)][tr.edge];
                 if (tid < 0) {
                     tid = static_cast<int32_t>(n_triggers_++);
@@ -357,6 +383,7 @@ void Backend::nba_classify_ir(const Ir& ir) {
 // build_nba_state once widths are final.
 void Backend::nba_classify() {
     trigger_id_.assign(mod_.signals().size(), { -1, -1, -1 });
+    intra_trigger_edge_.assign(mod_.signals().size(), { false, false, false });
     for (const Process& p : mod_.processes()) {
         nba_classify_ir(p.ir);
     }
@@ -365,6 +392,12 @@ void Backend::nba_classify() {
     // signal's shadow. A subroutine with no NBA records nothing.
     for (uint32_t i = 0; i < mod_.function_count(); ++i) {
         nba_classify_ir(mod_.function(static_cast<FunctionId>(i)).ir);
+    }
+    for (const Process& p : mod_.processes()) {
+        classify_ordered_plain(p.ir);
+    }
+    for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+        classify_ordered_plain(mod_.function(static_cast<FunctionId>(i)).ir);
     }
     n_nba_          = 0;
     const auto sigs = mod_.signals();
@@ -777,6 +810,9 @@ void Backend::emit_nba_service(Signal       sig,
     const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, four_state, old_z,
                                         new_z, /*need_pos=*/true, /*need_neg=*/true,
                                         /*need_any=*/true);
+    // One change is one release moment for the `<= @` records it matures, however many
+    // of the buckets below it satisfies.
+    emit_release_moment(sig, f);
     const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
         std::make_pair(static_cast<uint32_t>(Edge::Any), f.changed),
         std::make_pair(static_cast<uint32_t>(Edge::Positive), f.pos),
@@ -917,7 +953,7 @@ void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
             emit_intra_commit(sig);
         }
     }
-    // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
+    // Nonblocking event triggers (`->> e`, LRM 15.5.1): for each pending
     // event, stamp the trigger time and wake its Any-edge waiters, then
     // clear the flag. Done in the NBA region so the wake lands after this
     // instant's nonblocking updates; the caller's loop-back then drains the
@@ -946,6 +982,10 @@ void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
 uint32_t Backend::intra_idx(Signal sig) const {
     const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
     return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
+}
+
+bool Backend::is_intra_target(Signal sig) const {
+    return std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig) != intra_nba_sigs_.end();
 }
 
 // Whether this signal's intra records stage a class handle, which makes a record in flight a
@@ -1993,14 +2033,13 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
 
     // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
     // (deadline must be > now) and its update lands in the current instant's
-    // NBA region, so push the record straight onto the ready list (rt_intra_cb).
+    // NBA region, so link the record straight onto the ready list (rt_intra_now).
     // A compile-time-constant delay emits only the taken path; a runtime delay
     // that happens to be zero branches to the same immediate path.
-    auto* nullp     = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     auto  schedule  = [&] {
         b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, intra_cb_trampoline() });
     };
-    auto immediate = [&] { b_.CreateCall(intra_cb_fn(), { rec, nullp }); };
+    auto immediate = [&] { b_.CreateCall(intra_now_fn(), { rec }); };
 
     if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
         if (c->isZero()) {
@@ -2021,6 +2060,50 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     schedule();
     b_.CreateBr(contb);
     b_.SetInsertPoint(contb);
+}
+
+// A plain NBA to a signal that also takes `<= #d` / `<= @e`. NBA updates are performed in
+// the order they were created (LRM 4.6 b), 10.4.2, 15.5.1; docs/LRM_NOTES.md, note 51): a
+// plain NBA's is created when it executes, a timed one's when its delay elapses or its
+// event occurs. So this write is later than every deferred update of the signal released
+// before it executed: those records are already on the ready list. But the write stages
+// into the block shadow (or the array / aggregate queue), which commits BEFORE the
+// ready list, so left alone it would lose to them. When such a record is waiting, also
+// copy the write onto the list behind it: the record carries the value and mask the
+// staged write used, so replaying it re-applies exactly the bits this write selects.
+//
+// The staged write itself is unchanged: a record released AFTER this write executed goes
+// behind it on the list (its batch is later, intra_ready_push), so the write commits first
+// and the update after it, as creation order says. A write executed while no record is
+// waiting anywhere costs one load of rt_intra_total.
+void Backend::emit_intra_nba_ordered(const LValue& lv, Plane rhs) {
+    if (lv.wide_dyn) {
+        // TODO: a runtime-offset select of a very wide vector stages through
+        // rt_wide_ins, which the deferred record has no room to encode (see
+        // fill_intra_payload). Refused rather than left ordered wrongly against the
+        // timed updates of the same vector.
+        throw BackendError{ "nonblocking assignment to a runtime-offset select of a very wide "
+                            "vector that also takes a timed nonblocking assignment is not "
+                            "supported" };
+    }
+    auto* fn    = b_.GetInsertBlock()->getParent();
+    auto* probe = llvm::BasicBlock::Create(ctx_, "intraord.probe", fn);
+    auto* copy  = llvm::BasicBlock::Create(ctx_, "intraord.copy", fn);
+    auto* cont  = llvm::BasicBlock::Create(ctx_, "intraord.cont", fn);
+    // A word every simulation keeps, ahead of the per-site count: it is zero for almost
+    // every write, and the count is a call into the runtime.
+    b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(b_.getInt32Ty(), intra_total_gv()), b_.getInt32(0)), probe, cont);
+
+    b_.SetInsertPoint(probe);
+    llvm::Value* waiting =
+      b_.CreateICmpNE(b_.CreateCall(intra_ready_count_fn(), { intra_id_value(lv.sig) }), b_.getInt32(0));
+    b_.CreateCondBr(waiting, copy, cont);
+
+    b_.SetInsertPoint(copy);
+    emit_intra_nba_arm(lv, rhs, b_.getInt64(0));
+    b_.CreateBr(cont);
+
+    b_.SetInsertPoint(cont);
 }
 
 // Arm (or reschedule) an inertial continuous-assignment delay (`assign #d x = y`,
@@ -2277,7 +2360,12 @@ void Backend::emit_intra_commit(Signal sig) {
     b_.CreateCondBr(b_.CreateICmpULT(i, n), body, after);
 
     b_.SetInsertPoint(body);
-    llvm::Value* recp   = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
+    // A handle-written member wakes inside this loop, and the wake can release a record of
+    // this very site: that pushes onto the list the loop reads through, and a push may
+    // reallocate it. So that path re-reads the list's base for each record rather than trust
+    // the pointer taken before the loop.
+    llvm::Value* rec_base = s.intra_ptr ? b_.CreateCall(intra_ready_base_fn(), { b_.getInt32(idx) }) : base;
+    llvm::Value* recp     = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, rec_base, i));
     llvm::Value* dst_mm = live_mm;
     llvm::Value* dst_z  = live_z;
     if (s.is_array || s.intra_ptr) {
@@ -2369,7 +2457,10 @@ void Backend::emit_intra_commit(Signal sig) {
             });
         }
     }
-    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx) });
+    // Only the `n` records this commit applied are released. The wake above can satisfy a
+    // `<= @` control of this very signal, and the record it releases is an update created
+    // in this region: it commits in the next pass, not freed unapplied with the rest.
+    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx), n });
     b_.CreateBr(skip);
 
     b_.SetInsertPoint(skip);
@@ -2448,7 +2539,7 @@ void Backend::emit_intra_agg_commit(Signal sig) {
     if (signal_has_waiters(sig)) {
         service_any_waiters(sig);
     }
-    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx) });
+    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx), n });
     b_.CreateBr(skip);
 
     b_.SetInsertPoint(skip);

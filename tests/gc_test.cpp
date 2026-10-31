@@ -3744,3 +3744,45 @@ TEST_CASE("gc: handles staged by an event-controlled nonblocking assignment surv
     CHECK(st.collections > 0);
     CHECK(st.conservative_pins > 0);
 }
+
+// A plain nonblocking write executed after a delayed one fired commits after it, and
+// copies itself onto the site's ready list to do so (docs/LRM_NOTES.md, note 51). That copy
+// is a record like the others of a site whose records stage a handle: it comes from the
+// rooted allocation and goes back through the rooted release, which asserts that every
+// record it drops was registered. The design runs the delayed record through its flight
+// with collections, fires it, writes the same struct plainly, and reads the plain value
+// back.
+TEST_CASE("gc: a plain nonblocking write after a delayed struct assignment fired") {
+    constexpr std::string_view src = R"(
+        module top;
+            class H; int x; static function H make(int v); H h = new; h.x = v; return h; endfunction endclass
+            class Junk; int x; endclass
+            typedef struct { int a; H h; } S_t;
+            S_t s, t, u;
+            Junk keep;
+            initial begin
+                t.a = 7;
+                t.h = H::make(42);
+                u.a = 9;
+                u.h = H::make(43);
+                s <= #5 t;
+                t.h = null;
+                repeat (4) begin
+                    for (int i = 0; i < 300; i++) begin keep = new; keep.x = 32'h5A5A5A5A; end
+                    #1;
+                end
+                #1;
+                s <= u;
+                u.h = null;
+                repeat (2) begin
+                    for (int i = 0; i < 300; i++) begin keep = new; keep.x = 32'h5A5A5A5A; end
+                    #1;
+                end
+                $display("a=%0d h.x=%0d", s.a, s.h.x);
+            end
+        endmodule
+    )";
+    check_both_cadences(src, "a=9 h.x=43\n");
+    const rt_gc_stats st = run_stats(src, "a=9 h.x=43\n", cadence_stress);
+    CHECK(st.collections > 0);
+}

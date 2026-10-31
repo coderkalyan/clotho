@@ -1097,6 +1097,11 @@ void Backend::lower_inst(Index i) {
             } else {
                 lower_store_nb(lv, rhs);
             }
+            // A signal that also takes timed NBAs keeps this write behind the deferred
+            // updates that were already released (emit_intra_nba_ordered).
+            if (lv.is_signal && is_intra_target(lv.sig)) {
+                emit_intra_nba_ordered(lv, rhs);
+            }
             return;
         }
         case Inst::Tag::AggCopy: {
@@ -1985,7 +1990,7 @@ void Backend::lower_inst(Index i) {
             return;
 
         case Inst::Tag::EventTriggerNb:
-            // `->> e` (LRM 15.5.4): link the object onto the pending chain; the
+            // `->> e` (LRM 15.5.1): link the object onto the pending chain; the
             // NBA region stamps + wakes. The triggering process does not block.
             emit_event_pend_guarded(must_of(p.unary));
             return;

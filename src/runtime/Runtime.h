@@ -1987,8 +1987,9 @@ int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 // the backend's value tail follows. `timer` is the wheel node (offset 0, so the
 // record base doubles as the rt_timer*, used by the `#d` delay path); `idx`
 // routes the record to its target site; `seq` is a monotonic arm-order stamp (set
-// by rt_intra_alloc) so same-instant commits apply in statement-execution order
-// (LRM 10.4.2, last-executed wins), which fire order does not preserve; `count`
+// by rt_intra_alloc) that orders the records of one release batch -- those created at
+// one moment -- in statement-execution order (LRM 4.6 b), 10.4.2 Examples 4 and 6),
+// which fire order does not preserve; `count`
 // is the event countdown for the `@e` / `repeat(N) @e` path (unused by `#d`).
 typedef struct rt_intra_rec {
     rt_timer timer;
@@ -2010,7 +2011,26 @@ void* rt_intra_alloc(uint32_t idx, uint32_t stride);
 // Wheel expiry callback: recover the record, link it onto its site's ready list,
 // and bump the global pending count. Shared by every deferred-store site; does
 // not touch design state (commit is the NBA region's job).
+//
+// A site's ready list is in the order its updates were created (LRM 4.6 b), 15.5.1): a
+// `#d` update when the delay elapses, an event-controlled one when its event occurs, a
+// plain NBA's copy and a zero delay when the statement executes. The records released by
+// one moment -- one wheel tick, one occurrence of an event (rt_intra_moment), the leaves
+// of one statement -- are a batch: they were created together and go in the order their
+// statements executed (`seq`). A batch goes behind every earlier one.
 void rt_intra_cb(rt_timer* timer, void* ctx);
+
+// Link a record onto its site's ready list at the moment its update is created by the
+// statement that filled it (a plain NBA copied there, or a zero delay): behind every
+// record already on the list, as a batch of its own, ahead of any that matures later.
+// The commit then applies the records in list order. Does not touch design state.
+void rt_intra_now(void* rec);
+
+// Start a new release moment. Generated code calls it once per occurrence that can
+// release `<= @e` records: before the first of a signal change's edge buckets, and before
+// an event object's records are counted down. Records released with no call between
+// them are one batch (rt_intra_cb); the wheel never calls it, a tick being one moment.
+void rt_intra_moment(void);
 
 // Base (a `void**` array of record pointers) and length of site `idx`'s ready
 // list, read once in the NBA region to drive the backend-emitted commit loop.
@@ -2021,15 +2041,21 @@ uint32_t rt_intra_ready_count(uint32_t idx);
 // deferred commit is needed.
 uint32_t rt_intra_any(void);
 
-// Return site `idx`'s committed records to its freelist and clear its ready list
-// (called by the backend after the site's commit loop).
-void rt_intra_release(uint32_t idx);
+// The same total as a variable, so generated code can test it inline: a plain NBA to a
+// signal that also takes timed ones asks whether any record is waiting before it pays
+// for the per-site count.
+extern uint32_t rt_intra_total;
+
+// Return the first `n` records of site `idx`'s ready list -- the ones the backend's commit
+// loop has just applied -- to its freelist (called after the loop). A record released
+// after the loop took its count, by the commit's own wake, stays for the next pass.
+void rt_intra_release(uint32_t idx, uint32_t n);
 
 // The same pair for a site whose records stage a class handle (LRM 9.4.5 on an aggregate
 // or an array with a handle leaf). Between alloc and release the record is a conservative
 // GC root: until the delay elapses it may hold the only reference to the object it carries.
 void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride);
-void  rt_intra_release_rooted(uint32_t idx);
+void  rt_intra_release_rooted(uint32_t idx, uint32_t n);
 
 // Reclaim every record (including any left scheduled by a $finish mid-flight)
 // into its freelist and clear all ready lists. Called once at simulation start.

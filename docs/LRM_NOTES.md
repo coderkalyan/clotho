@@ -578,3 +578,55 @@ Code: `src/lower/Nets.cpp` (`emit_wire_resolvers`, `release_net`). Tests: `tests
 Clotho keeps the copy and the `assign` in the Reactive region, where 24.3.1 and 24.3.2 put them, and picks the order 4.7 leaves open: every queued reactive continuous process (a program's port copy, its `assign`, and the resolver of a net it drives) runs before any program procedural code, at the start of the region and again each time program code wakes one. A program thread therefore never reads a port or continuous assign that has an update pending: `initial $display(a)` on an input port prints the design's value at time zero, not `x`, and a `#5` read in the slot where the design writes the port's source reads the new value. Settling the copy in the Active region would give the same reads but contradicts 24.3.1. The first-in-first-out order used before made both reads depend on seed order and wake order.
 
 Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `emit_wake_push`, `ensure_reactive_cont_queue`), `src/ir/llvm/Backend.h` (`kReactiveContTag`). Tests: `tests/program_test.cpp` ("a program initial reads an input port settled at time zero", "a program thread resuming in the slot of a design write reads the port settled", "a program waiter on an input port wakes on the design change, not the settle", "a program initial reads its own assign of an input port settled", "a port copy woken behind a queued program thread still settles before it reads"). Oracle: Verilator 5.050 agrees on every case; iverilog 13 agrees except where the program resumes in the slot of the design write, where it prints the old value because it runs program code in the Active region (`docs/design/program-blocks.md` §2). Design: `docs/design/program-blocks.md` §3.1.
+
+## 51. Order of a timed nonblocking update against other nonblocking updates (4.6, 10.4.2, 15.5.1)
+
+4.6 b) says "NBAs shall be performed in the order the statements were executed", and
+10.4.2 that "if there is clear ordering of the execution of a set of nonblocking
+assignments, then the order of the resulting updates of the destination of the
+nonblocking assignments shall be the same as the ordering of the execution". Neither
+says when the update of `x <= #d v` or `x <= @e v` is created, and so which of two
+statements was "executed" first once one is timed. 15.5.1 says it for `->>`: it
+"creates a nonblocking assign update event in the time in which the delay control
+expires or the event control occurs". Clotho applies that reading to `<=` as one rule:
+an update is created when its statement executes (a plain NBA, a zero delay), when its
+delay elapses (at the start of that instant, before any process runs) or when its event
+occurs, and updates are performed in the order they were created. Updates created at one
+moment, which is one wheel tick, one occurrence of an event (for a signal, one value
+change, however many of that signal's own edge controls it satisfies) or the leaves of one
+statement, are performed in the order their statements were executed. The events that `->>`
+triggers in the NBA region are such updates too, and trigger in the order the `->>`
+statements ran.
+
+A signal's own controls share a moment; a control on a select or an expression of it does
+not. `@(posedge c[0])`, a struct member, an array element or an operator expression is
+waited on through a net that Clotho synthesizes for it and drives with a continuous
+process (`event_signal`, `synth_event_net`; the wait engine detects edges on whole signals),
+and that net changes one step after the signal. Its records are released in a separate,
+later moment than those of `@(c)` and `@(posedge c)`, so `w <= @(posedge c[0]) 10;
+w <= @(posedge c) 20; c = 1;` ends with `w` 10 (the control on `c` released first, and
+the one on `c[0]` was created last), whichever statement was executed first, while
+`v <= @(posedge c) 10; v <= @(c) 20;` ends with `v` 20. The clauses do not say how soon
+an expression is noticed to have changed. iverilog 13 prints 10 for the first design too.
+
+So a plain NBA executed after a timed update was created wins over it, and one executed
+before commits before it. Both are decided by every reading. Two cases are not, and the
+other reading, ordering by the execution of the statements, gives the other answer:
+
+- A plain NBA executed after the timed statement and before its update is created:
+  `x <= @e 1; #1; x <= 2; -> e;` ends with `x` 1. Ordering by execution gives 2.
+- Two event-controlled updates whose events occur in the opposite order to their
+  statements: `x <= @e1 1; x <= @e2 2; -> e2; -> e1;` ends with `x` 1, and so does the
+  same with a write to another bit or element in between. Ordering by execution gives 2.
+  A `<= #d` update and an event-controlled one released in its instant are the same case:
+  the delayed update is created first and the event's wins, whichever statement was
+  executed first.
+
+iverilog 13 applies an event-controlled update at the occurrence, in the active region.
+It agrees with Clotho for two event-controlled updates and wherever the plain NBA executes
+after the occurrence, and prints the other answer wherever a plain NBA executes before the
+occurrence or a `#d` update is involved. Verilator 5.050 orders by source position (swap
+the `initial` blocks of the first case and its answer changes) and does not support
+`repeat (n) @e`. Neither decides, so the choice is Clotho's, made once.
+
+Code: `src/runtime/Scheduler.cpp` (`intra_ready_push`, `rt_intra_now`, `rt_intra_moment`), `src/ir/llvm/Events.cpp` (`emit_release_moment`, `emit_event_fire`, `emit_event_pend_drain`), `src/ir/llvm/Stores.cpp` (`emit_intra_nba_ordered`, `emit_nba_service`), `src/lower/Timing.cpp` (`event_signal`, `synth_event_net`). Tests: `tests/intra_assign_test.cpp` ("a plain NBA executed before the event commits before the update", "event-controlled updates commit in the order their events occurred", "a delayed update precedes an event-controlled one released in its instant", "updates released by one change keep the order of their statements", "an edge control on a select is a later moment than the signal's own", "nonblocking event triggers occur in the order they executed"). Oracle: none that decides; iverilog 13 and Verilator 5.050 differ as above, and iverilog 13 does not implement `->>`.

@@ -405,7 +405,7 @@ llvm::StructType* Backend::wait_elem_ty() {
 //               VCD registers a raw pointer to the tick at $dumpvars time, so
 //               the object address and the tick address must coincide.
 //     waiters — head of the intrusive waiter list (event_node_ty), or null.
-//     pending — a `->> e` awaiting the NBA region (LRM 15.5.4).
+//     pending — a `->> e` awaiting the NBA region (LRM 15.5.1).
 //
 // An event owns a LIST rather than the fixed-capacity per-(signal, edge)
 // buckets a real signal uses, because a trigger has no value transition and
@@ -1163,6 +1163,10 @@ void Backend::service_wait_queue(Signal       sig,
 void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
     const auto i = static_cast<uint32_t>(sig);
 
+    // One change is one release moment for the `<= @` records it matures, however many
+    // of the buckets below it satisfies.
+    emit_release_moment(sig, f);
+
     // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
     // bucket also fires on an LSB transition.
     const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
@@ -1249,6 +1253,40 @@ void Backend::service_change_notify(const LValue& lv,
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }
+}
+
+// Start a release moment (rt_intra_moment) when a change of `sig` satisfies an edge that
+// some `<= @(...)` control lists. The records its buckets mature were created together:
+// they commit in the order their statements executed, and behind every record an earlier
+// occurrence matured -- not in the order the Any, Positive and Negative buckets are
+// scanned, which counting once here, before the first of them, keeps out of it
+// (docs/design/intra-assignment-timing.md, "Order against plain NBAs"). A signal no
+// `<= @` control lists emits nothing.
+void Backend::emit_release_moment(Signal sig, const EdgeFacts& f) {
+    if (intra_trigger_edge_.empty()) {
+        return;
+    }
+    const auto&  listed = intra_trigger_edge_[static_cast<uint32_t>(sig)];
+    llvm::Value* hit    = nullptr;
+    const auto   add    = [&](Edge e, llvm::Value* fact) {
+        if (fact != nullptr && listed[static_cast<uint32_t>(e)]) {
+            hit = hit != nullptr ? b_.CreateOr(hit, fact) : fact;
+        }
+    };
+    add(Edge::Any, f.changed);
+    add(Edge::Positive, f.pos);
+    add(Edge::Negative, f.neg);
+    if (hit == nullptr) {
+        return;
+    }
+    auto* fn   = b_.GetInsertBlock()->getParent();
+    auto* body = llvm::BasicBlock::Create(ctx_, "moment.body", fn);
+    auto* cont = llvm::BasicBlock::Create(ctx_, "moment.cont", fn);
+    b_.CreateCondBr(hit, body, cont);
+    b_.SetInsertPoint(body);
+    b_.CreateCall(intra_moment_fn(), {});
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
 }
 
 // If (sig, edge) fires a `<= @e` deferred store, count down its records and
@@ -1379,7 +1417,7 @@ llvm::Function* Backend::event_delay_thunk() {
     return sym(event_delay_thunk_);
 }
 
-// Link an event object onto the NBA pending chain (LRM 15.5.4), unless it is
+// Link an event object onto the NBA pending chain (LRM 15.5.1), unless it is
 // already on it. The chain replaces the old compile-time list of `->>` target
 // signals, which a handle-reached event could not join; it also means the NBA
 // region visits exactly the events that fired rather than every `->>` target in
@@ -1425,27 +1463,49 @@ void Backend::emit_event_pend(llvm::Value* obj) {
 }
 
 // Drain the NBA pending chain: fire every `->> e` staged this instant, clearing
-// each object's pending mark as it goes. Reads `next` before firing, because a
-// waiter woken by the fire may itself `->>` another event -- that link goes onto
-// the (now empty) head and is drained by the NBA region's next pass, which is
-// the deferral LRM 15.5.4 asks for.
+// each object's pending mark as it goes. `->> e` creates a nonblocking assign update
+// event that triggers the event in the NBA region (LRM 15.5.1), and NBAs are performed in
+// the order their statements executed (4.6 b)), so the events trigger in that order: the
+// records a `<= @e` control holds commit in the order their events occurred
+// (docs/LRM_NOTES.md, note 51). The chain links the newest event first, so it is reversed
+// before the walk. Reads `next` before firing, because a waiter woken by the fire may
+// itself `->>` another event -- that link goes onto the (now empty) head and is drained
+// by the NBA region's next pass, which is the deferral LRM 15.5.1 asks for.
 void Backend::emit_event_pend_drain(llvm::Value* wheel) {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* null = llvm::ConstantPointerNull::get(ptr);
-    auto* fn   = b_.GetInsertBlock()->getParent();
-    auto* head = llvm::BasicBlock::Create(ctx_, "evpend.walk", fn);
-    auto* body = llvm::BasicBlock::Create(ctx_, "evpend.fire", fn);
-    auto* done = llvm::BasicBlock::Create(ctx_, "evpend.drained", fn);
+    auto* ptr   = llvm::PointerType::getUnqual(ctx_);
+    auto* null  = llvm::ConstantPointerNull::get(ptr);
+    auto* fn    = b_.GetInsertBlock()->getParent();
+    auto* flip  = llvm::BasicBlock::Create(ctx_, "evpend.flip", fn);
+    auto* relnk = llvm::BasicBlock::Create(ctx_, "evpend.relink", fn);
+    auto* head  = llvm::BasicBlock::Create(ctx_, "evpend.walk", fn);
+    auto* body  = llvm::BasicBlock::Create(ctx_, "evpend.fire", fn);
+    auto* done  = llvm::BasicBlock::Create(ctx_, "evpend.drained", fn);
 
-    llvm::Value* headp = sym(event_pend_head_gv_);
-    llvm::Value* first = b_.CreateLoad(ptr, headp);
+    llvm::Value* headp  = sym(event_pend_head_gv_);
+    llvm::Value* newest = b_.CreateLoad(ptr, headp);
     b_.CreateStore(null, headp);
     auto* entry = b_.GetInsertBlock();
-    b_.CreateBr(head);
+    b_.CreateBr(flip);
+
+    // Reverse the chain in place: `cur` walks it newest first, `oldest_first` is the
+    // part already relinked.
+    b_.SetInsertPoint(flip);
+    llvm::PHINode* cur          = b_.CreatePHI(ptr, 2);
+    llvm::PHINode* oldest_first = b_.CreatePHI(ptr, 2);
+    cur->addIncoming(newest, entry);
+    oldest_first->addIncoming(null, entry);
+    b_.CreateCondBr(b_.CreateICmpNE(cur, null), relnk, head);
+
+    b_.SetInsertPoint(relnk);
+    llvm::Value* older = b_.CreateLoad(ptr, event_field(cur, kEventNextPend));
+    b_.CreateStore(oldest_first, event_field(cur, kEventNextPend));
+    cur->addIncoming(older, relnk);
+    oldest_first->addIncoming(cur, relnk);
+    b_.CreateBr(flip);
 
     b_.SetInsertPoint(head);
     llvm::PHINode* n = b_.CreatePHI(ptr, 2);
-    n->addIncoming(first, entry);
+    n->addIncoming(oldest_first, flip);
     b_.CreateCondBr(b_.CreateICmpNE(n, null), body, done);
 
     b_.SetInsertPoint(body);
@@ -1474,6 +1534,10 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, llvm::Value*
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here.
     if (design_uses_event_triggers_) {
+        // One occurrence of the event is one release moment for the records it matures.
+        if (design_uses_intra_event_objs_) {
+            b_.CreateCall(intra_moment_fn(), {});
+        }
         emit_trigger_fire(trig_id != nullptr ? trig_id : b_.CreateCall(event_trig_id_fn(), { obj }));
     }
 }

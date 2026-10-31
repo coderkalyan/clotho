@@ -102,9 +102,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
   time-consuming task call or an `expect`, or a task that forks, cannot be aborted. A block
   whose body calls a subroutine that forks is refused too: those children are not in it.
-- [ ] **Order of an event-controlled `<=` against plain NBAs** (4.6, 10.4.2) — the update of
-  `x <= @e v` or `x <= @(posedge c) v` commits after the step's plain NBAs, not in the order
-  its event occurred, so a plain `x <= w` executed after the trigger loses to it.
 
 ## M2 — Icarus Verilog parity
 
@@ -116,8 +113,8 @@ Milestones, in order; lower ones unblock higher ones:
     needs an owned-copy record that is freed on every drop path.
   - [ ] **`iff` on a nonblocking intra-assignment event** (9.4.2.3) — only enabled
     occurrences may count down, so a `repeat` count cannot reuse the body guard.
-  - [ ] **Runtime-offset select of a very wide vector as a nonblocking target** —
-    needs a heap-side record payload.
+  - [ ] **Runtime-offset select of a very wide vector as a nonblocking target** — needs a
+    heap-side record payload; also refused for a plain NBA to a vector that takes a timed one.
   - [ ] **Conditional RHS over a whole aggregate in a nonblocking form** — refused.
   - [ ] **Aggregate target with a container member in a nonblocking form** — refused.
   - [ ] **Indexed array-slice target in a nonblocking form** (`a[i +: n] <= #5 x`) —
