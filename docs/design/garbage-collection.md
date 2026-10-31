@@ -677,13 +677,38 @@ into a frame above the one whose address starts the scan; the scan runs to the b
    element computed before the allocation) cannot be resolved to its owner. A finalizer
    run by an emergency collection therefore does not free a buffer that a word of the
    stack lies in (`buffers_park`): it is parked and re-tested at the next collection.
-4. *Not a root:* a buffer pointer held only in a suspended frame is the existing task
+4. *Staged nonblocking assignments.* Staging and commit used to be separated by no
+   collection (the only one followed the NBA commit), so the shadow a scalar or
+   struct-member target stages into was not a root, and `h <= new C` followed by enough
+   allocation in the same time step freed the handle before it committed. A target that
+   can hold a handle now registers its shadow as a conservatively scanned range
+   (`emit_gc_root_tables`, `rt_gc_range_add`). Array-element records, a whole-container
+   copy and a delayed (`<= #d`) record were already roots; a class-property target is
+   refused by the frontend.
+5. *Not a root:* a buffer pointer held only in a suspended frame is the existing task
    case, unchanged.
-5. ASan: the scan loop is `no_sanitize("address")` since it must read redzones.
+6. ASan: the scan loop is `no_sanitize("address")` since it must read redzones.
 
 `--gc-stress` extends to "every opportunity": with a stack base recorded, every
 allocation empties the hole so the next `new` takes the slow path and collects. That
-makes the existing stress runs a dense test of items 1-3.
+makes the existing stress runs a dense test of items 1-4.
+
+**Audit of what assumed "a collection happens only after the drain".** Each place that
+said so, and what now holds:
+
+| assumption | resolution |
+|---|---|
+| NBA shadow needs no root (`StoreNb` barrier comment) | item 4: shadow registered as a range |
+| fresh `new` needs no barrier (`HandleDeref`) | item 2: found, promoted, re-logged |
+| barrier then store, nothing between (`Store`) | still true: nothing between them allocates |
+| call-site barrier is airtight for a function (`lower_call_common`) | item 2: callee holds the actual, re-logged; `ref` into a class-owned container registered |
+| frame unlink with no safepoint after it | still true: the cleanup path allocates nothing |
+| vptr stored before any collection sees the object | still true: nothing allocates between `rt_gc_alloc` and the vptr store |
+| deferred (`<= #d`) targets are design state | unchanged: asserted, and the records are roots |
+| class-property NBA | refused by the frontend, so no staging record names an object body |
+| `$strobe` / `$monitor` argument images | precise roots; they hold values that are printed, never dereferenced |
+| the safepoint comment in `emit_active_run` | describes the region-boundary collection, which is unchanged; the emergency one is additional |
+| `new` as a blocker in `Scans.cpp` | already treated as a safepoint, so no purity analysis relied on its absence |
 
 ### 6.5 Buffers owned by objects
 

@@ -718,6 +718,15 @@ void Backend::emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base, 
 // beside the handle offsets rather than an add / remove pair
 // (docs/design/garbage-collection.md §3.3). Static class properties are ordinary
 // SignalSlots, as above, so `static Cell q[$]` is covered here too.
+//
+// The third half is the NBA SHADOW of a target that can hold a handle (`h <= new C`,
+// `s.h <= x`): the value sits in the shadow from staging to the NBA commit, and no
+// signal holds it yet. Nothing separated staging from commit by a collection until an
+// allocation could collect (design §6.1), so shadows were never roots; now a handle
+// that exists only there would be freed. The shadow is registered as a conservatively
+// scanned range (rt_gc_range_add) rather than described by offsets: it is a flat
+// staging struct of masks and planes beside the handle, and a stale word in it is
+// retention at worst, which the validation of every candidate bounds.
 void Backend::emit_gc_root_tables() {
     const llvm::DataLayout& dl = env_->llmod.getDataLayout();
     // Anchor index -> offsets, with the root state buffer in the last bucket:
@@ -757,6 +766,21 @@ void Backend::emit_gc_root_tables() {
           r == root_region ? sym(state_global_) : sym(anchors_[r].state_gv);
         b_.CreateCall(gc_containers_add_fn(),
                       { gc_containers_global(base, cont_by_region[r], cont_emitted++) });
+    }
+    // NBA shadows that can stage a handle, one range per region that has any.
+    std::vector<bool> shadow_roots(anchors_.size() + 1, false);
+    for (const SignalSlot& s : slots_) {
+        if (s.nba && reaches_class_handle(s.ir_type)) {
+            shadow_roots[s.anchor == SignalSlot::no_anchor ? root_region : s.anchor] = true;
+        }
+    }
+    for (size_t r = 0; r < shadow_roots.size(); ++r) {
+        llvm::GlobalVariable* shadow = r == root_region ? shadow_global_ : anchors_[r].shadow_gv;
+        if (!shadow_roots[r] || shadow == nullptr) {
+            continue; // no handle staged here, or only through deferred records, which are roots
+        }
+        b_.CreateCall(gc_range_add_fn(),
+                      { sym(shadow), b_.getInt64(dl.getTypeAllocSize(shadow->getValueType())) });
     }
     assert(cont_emitted <= cont_by_region.size() && "one container table per region at most");
 }

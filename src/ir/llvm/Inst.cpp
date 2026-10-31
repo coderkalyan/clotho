@@ -1064,12 +1064,16 @@ void Backend::lower_inst(Index i) {
             // The barrier for a nonblocking write into a class property (§7). It is
             // emitted at the STAGING site, not at the commit, because the commit is
             // the runtime's own memcpy out of a staging pool and carries no owner
-            // identity. That is sound because staging and commit are never separated
-            // by a safepoint: the NBA region drains before the drain loop reaches
-            // its quiescent edge, which is the only place a collection can happen
-            // (:11542). The staged image is itself a conservatively scanned root
-            // while pending (Gc.h:301-306), so the handle cannot die in between
-            // either.
+            // identity. Frontend-refused today for a class property, so the owner is
+            // null and this is a no-op; kept so a widening cannot skip it.
+            //
+            // Staging and commit ARE separated by a collection now: an allocation that has
+            // outrun its budget collects (design §6.1), in any process of the same active
+            // region. What keeps the staged HANDLE alive across it is that every place one
+            // can sit is a root: the block shadow is a scanned range (emit_gc_root_tables),
+            // array-element and whole-container staging are registered, and a delayed
+            // record is rooted (intra_rec_rooted). That a shadow was a root used to be
+            // claimed here and was not true.
             emit_gc_barrier_for(lv);
             // Deferral splits three ways: an unpacked-array element defers a
             // typed record; an aggregate leaf reached through a runtime array

@@ -3928,3 +3928,59 @@ TEST_CASE("gc: a dead object sharing a line with a survivor is not read as live 
     const rt_gc_stats st = run_stats(src, "d 4\n", cadence_stress);
     CHECK(st.full_collections > 2u);
 }
+
+// Staging and commit of a nonblocking assignment were never separated by a collection
+// while the only collection was a region boundary, after the NBA commit. A collection
+// from inside an allocation (§6.1) can fall between them, so every place a staged handle
+// lives must be a root: the shadow a scalar or struct-member target stages into, the
+// records of an array element, the copy a whole-container assignment makes, and the
+// records of a delayed (`<= #d`) assignment. Each handle here is held ONLY by its staging
+// until the commit, and a delay-free loop of poisoned filler objects runs between the
+// two, so a staged handle that is not a root reads back as 0x5A5A5A5A or another object.
+TEST_CASE("gc: a handle staged by a nonblocking assignment survives a collection before the commit") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; string tag; endclass
+          class Junk; int v; string tag; endclass
+          typedef struct { int a; C h; } S_t;
+          C sig;
+          S_t s, t;
+          C arr[3];
+          C q[$];
+          C src[$];
+          Junk sink;
+          function automatic C make(int v); C c = new; c.v = v; c.tag = "kept"; return c; endfunction
+          task automatic churn();
+            for (int i = 0; i < 3000; i++) begin
+              sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
+            end
+          endtask
+          initial begin
+            sig <= make(1);
+            s.a <= 5;
+            s.h <= make(2);
+            arr[1] <= make(3);
+            src.push_back(make(4)); src.push_back(make(5));
+            q <= src;
+            src.delete();
+            t.h = make(6);
+            t.a = 7;
+            s <= #2 t;
+            t.h = null;
+            churn();
+            #1;
+            churn();
+            #2;
+            churn();
+            $display("%0d %s | %0d %s | %0d %s | %0d %0d %s", sig.v, sig.tag, s.h.v, s.h.tag,
+                     arr[1].v, arr[1].tag, q.size(), q[1].v, q[1].tag);
+          end
+        endmodule
+    )";
+    // `s <= #2 t` lands last and carries h = 6, so that is what s.h reads at the end.
+    const std::string expected = "1 kept | 6 kept | 3 kept | 2 5 kept\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}

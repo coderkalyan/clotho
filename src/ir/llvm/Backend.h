@@ -2612,6 +2612,7 @@ private:
     llvm::FunctionCallee gc_mutator_fn();
     llvm::FunctionCallee gc_alloc_fn();
     llvm::FunctionCallee gc_roots_add_fn();
+    llvm::FunctionCallee gc_range_add_fn();
     llvm::FunctionCallee gc_containers_add_fn();
     llvm::FunctionCallee gc_container_add_fn();
     llvm::FunctionCallee gc_container_remove_fn();

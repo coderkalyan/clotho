@@ -1458,6 +1458,12 @@ llvm::FunctionCallee Backend::gc_roots_add_fn() {
     return rt_fn("rt_gc_roots_add", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+// A runtime-owned or constant region scanned conservatively at every collection (Gc.h,
+// rt_gc_range_add): the NBA shadows that can stage a class handle.
+llvm::FunctionCallee Backend::gc_range_add_fn() {
+    return rt_fn("rt_gc_range_add", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+}
+
 // The container-root ABI (Gc.h:263-268). rt_gc_containers_add takes a constant
 // rt_gc_container_table for state-resident storage; the add / remove pair takes a
 // live rt_dynarr / rt_queue / rt_assoc address for a frame local or a body
