@@ -3911,22 +3911,39 @@ TEST_CASE("gc: dead objects owning large strings are collected inside a delay-fr
 // reclamation, and used to keep a stale mark: the single full-collection parity read it
 // as live again two full collections later, and rt_gc_verify's heap walk (an
 // extra-asserts build) found the disagreement. Full collections now retire such corpses
-// -- the start bit goes -- so nothing can resolve to one. The design is the report of the
-// failure: forked children of an object whose frames come and go across stress
-// collections.
+// -- the start bit goes -- so nothing can resolve to one.
+//
+// The cadence is pinned because the failure needs three FULL collections after the death:
+// `drop` and `keep` are allocated side by side (one line), both survive the first full
+// collection (promoted, stamped with the parity P), `drop` dies, the second full leaves
+// it as a corpse with the stale P, and the third full toggles back to P and reads it
+// marked. Without the fix this design fails the heap walk of a Debug / CLOTHO_EXTRA_ASSERTS
+// build ("the heap walk disagrees on live objects"); a release build has no walk, so there
+// it checks the output and the collection counts.
 TEST_CASE("gc: a dead object sharing a line with a survivor is not read as live later") {
     constexpr std::string_view src = R"(
         module t;
-          class C;
-            int v = 1;
-            task spawn(); fork #3 $display("d %0d", v); join_none endtask
-            task go();    fork #1 v = 3; #2 v = 4; join endtask
-          endclass
-          initial begin C c = new(); c.spawn(); c.go(); #5; end
+          class C; int v; endclass
+          class Junk; int v; endclass
+          C keep, drop;
+          Junk sink;
+          task automatic churn();
+            for (int i = 0; i < 2000; i++) begin sink = new; sink.v = 7; end
+          endtask
+          initial begin
+            drop = new; keep = new;
+            drop.v = 1; keep.v = 2;
+            churn(); #1;
+            drop = null;
+            repeat (6) begin churn(); #1; end
+            $display("keep %0d", keep.v);
+          end
         endmodule
     )";
-    const rt_gc_stats st = run_stats(src, "d 4\n", cadence_stress);
-    CHECK(st.full_collections > 2u);
+    const rt_gc_stats st =
+      run_stats(src, "keep 2\n", cadence_ordinary, nursery_bytes_small, /*full_every=*/1);
+    CHECK(st.full_collections >= 4u);
+    CHECK(st.young_collections == 0u);
 }
 
 // Staging and commit of a nonblocking assignment were never separated by a collection
