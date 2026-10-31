@@ -1639,15 +1639,18 @@ struct Inst {
         WireRes,
         WandRes,
         WorRes,
-        // Drive-strength wire/tri multi-driver resolution (LRM 6.6.1, 28.11):
-        // an N-ary fold (payload: extra -> StrengthResInfo, a slice of driver
-        // slot values plus a parallel slice of packed per-driver (strength0,
-        // strength1) constants). Per bit, the strongest side wins — stronger 0
-        // beats weaker 1 and vice versa; equal top strength on both sides is X;
-        // no driver (all Z) is Z. With every driver at the default Strong this
-        // degenerates to WireRes. Emitted only by emit_wire_resolvers when a net
-        // has any non-default drive strength; N operands, not pairwise, because
-        // the winner needs every driver's strength at once.
+        // Drive-strength wire/tri multi-driver resolution (LRM 6.6.1, 28.11,
+        // 28.12): an N-ary resolution (payload: extra -> StrengthResInfo, a slice
+        // of driver slot values plus a parallel slice of packed per-driver
+        // (strength0, strength1) constants). A 0 or 1 driver has the one strength
+        // of its value, an x driver the range from its strength0 to its strength1
+        // (28.12.3), z none. Per bit the net is 0 (1) when the strongest definite 0
+        // (1) is stronger than every strength the other value can have, z when
+        // nothing drives, x otherwise (equal strengths of opposite value included).
+        // With every driver at the default Strong this degenerates to WireRes.
+        // Emitted only by emit_wire_resolvers when a net has any non-default drive
+        // strength; N operands, not pairwise, because the winner needs every
+        // driver's strength at once.
         StrengthRes,
         // Resistive pull applied after a tri0/tri1 net's drivers are resolved
         // (LRM 6.6.4): a bit still Z (all drivers off) is pulled to the immediate

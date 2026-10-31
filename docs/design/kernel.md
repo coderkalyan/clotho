@@ -141,7 +141,7 @@ when it does.
 - Drive strengths are per-driver compile-time constants, resolved by per-level
   mask arithmetic. An x/z driver with asymmetric strengths contributes a strength
   range (LRM 28.12.3). Strength is carried with the value only on nets connected
-  to switch primitives. **Not yet:** no strength ranges, no switch strength.
+  to switch primitives. **Not yet:** no switch strength.
 
 ## Sanitizers
 
