@@ -926,6 +926,9 @@ void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool forc
         // expression, so it needs no function frame; clear fn_ctx_ so a stray
         // non-constant reference fails loudly rather than mis-resolving to a
         // frame local.
+        if (static_init_done_.contains(&vs)) {
+            return; // an interface instance lowered it with the instance (declare_interface_statics)
+        }
         const Restore<FnCtx*>     no_frame(fn_ctx_, nullptr);
         const std::optional<Home> home = home_of(vs.getParentScope());
         HomePreInit               init(*this, home);

@@ -317,7 +317,12 @@ unit, which is also what the no-IR-rewriting rule asks
      (`Lowerer::home_of`), whichever instance's code reaches them first
      (`a.f()` from the parent), named under that instance; their declaration
      initializers close into a PreInit process of it rather than of the
-     caller. A body reached across tops keeps them with the caller.
+     caller. A body reached across tops keeps them with the caller. An interface
+     instance declares the statics of its subroutines with its other signals,
+     and runs their initializers in its own PreInit segment, whether or not
+     anything called them there: a virtual interface handle runs one instance's
+     body against any instance's record, so the instances of one interface
+     have to agree on layout and on start values (`declare_interface_statics`).
    - **2d, lower once.** The Lowerer lowers each specialization's canonical
      body only; per-instance lowering and the comparison go.
 3. **Backend per unit** (not on this branch; it is on `modular-ir`). Code is a function of (unit, inbound facts, config);

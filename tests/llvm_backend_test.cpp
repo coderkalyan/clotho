@@ -5296,6 +5296,50 @@ TEST_CASE("twin parents calling their own child's subroutine keep its statics an
     )") == "top.x 101\ntop.x 102\ntop.y 101\ntop.y 102\n");
 }
 
+TEST_CASE("an interface task's statics are per instance, however the instance was reached") {
+    // The statics of an interface subroutine belong to each instance (LRM 13.4.2) and
+    // start at their declared value there. A handle runs one body against any
+    // instance's record, so an instance that only handles reached has the storage
+    // and the initializer its twin got from a direct call.
+    constexpr std::string_view decl = R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+        endinterface
+    )";
+    CHECK(run_capture(std::string(decl) + R"(
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            virtual bus_if vi0 = b0;
+            virtual bus_if vi1 = b1;
+            initial begin
+                vi0.put(10); vi0.put(20); vi1.put(1000);
+                $display("%0d %0d", b0.last, b1.last);
+            end
+        endmodule
+    )") == "122 1101\n");
+    CHECK(run_capture(std::string(decl) + R"(
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            virtual bus_if vi0 = b0;
+            virtual bus_if vi1 = b1;
+            initial begin
+                vi0.put(10); vi0.put(20); vi1.put(1000);
+                $display("%0d %0d", b0.last, b1.last);
+                b0.put(5);
+                b1.put(6);
+                $display("%0d %0d", b0.last, b1.last);
+            end
+        endmodule
+    )") == "122 1101\n108 108\n");
+}
+
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     // Dispatch picks the body at run time, so the caller cannot know which override
     // it reaches. If one sibling took the fat form and another the narrow one, an

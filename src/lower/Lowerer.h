@@ -4867,6 +4867,20 @@ private:
 
     std::vector<const ValueSymbol*> body_automatics(const SubroutineSymbol& sub, const Statement& body);
 
+    // The static-lifetime locals `sub` declares through declaration statements, in
+    // source order: the variables lower_var_decl gives persistent storage (a `for`
+    // loop's own variables are per-call and are not among them).
+    static std::vector<const VariableSymbol*> static_locals_of(const SubroutineSymbol& sub);
+
+    // The statics of an interface's subroutine, declared with the interface
+    // instance instead of at the first call (`collect`: Collect, which registers
+    // the signals), and initialized in the instance's own PreInit segment (Emit).
+    void declare_interface_statics(const SubroutineSymbol& sub, bool collect);
+
+    // The static locals whose declaration initializer declare_interface_statics
+    // already lowered: lower_var_decl must not lower it again at the first call.
+    ankerl::unordered_dense::set<const VariableSymbol*> static_init_done_;
+
     // An object handle paired with the class type that selects its layout, for
     // the two scoped implicit-`this` overrides (ctor_this_ / default_arg_this_,
     // declared with the rest of the state at the bottom of the class). Defined

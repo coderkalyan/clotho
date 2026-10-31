@@ -559,6 +559,51 @@ std::vector<const ValueSymbol*> Lowerer::body_automatics(const SubroutineSymbol&
     return std::move(sc.out);
 }
 
+std::vector<const VariableSymbol*> Lowerer::static_locals_of(const SubroutineSymbol& sub) {
+    struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+        std::vector<const VariableSymbol*> out;
+        void handle(const VariableDeclStatement& d) {
+            if (d.symbol.lifetime == slang::ast::VariableLifetime::Static) {
+                out.push_back(&d.symbol);
+            }
+            visitDefault(d);
+        }
+    };
+    Scan sc;
+    sub.getBody().visit(sc);
+    return std::move(sc.out);
+}
+
+// An interface instance declares the statics of its subroutines with its other
+// signals, in member order, and runs their initializers in its own PreInit
+// segment, so the instances of one interface agree on their layout and on their
+// start values however each was reached: a call through a handle runs the
+// representative's body against another instance's record, and an instance
+// nothing called directly has neither the storage nor the initializer its twin
+// got from the call. The body, when it is built, finds them already declared.
+void Lowerer::declare_interface_statics(const SubroutineSymbol& sub, bool collect) {
+    const std::vector<const VariableSymbol*> statics = static_locals_of(sub);
+    if (collect) {
+        FnCtx ctx;
+        ctx.name_prefix = std::string(sub.name) + ".";
+        const FnScope fn_scope(*this, &ctx);
+        for (const VariableSymbol* vs : statics) {
+            (void)declare_static_local(*vs);
+        }
+        if (sub.returnValVar != nullptr && sub.defaultLifetime == slang::ast::VariableLifetime::Static &&
+            static_return_needs_storage(sub)) {
+            (void)declare_static_return(sub);
+        }
+        return;
+    }
+    for (const VariableSymbol* vs : statics) {
+        if (vs->getInitializer() != nullptr || aggregate_has_field_defaults(vs->getType())) {
+            lower_var_initializer(*vs);
+            static_init_done_.insert(vs);
+        }
+    }
+}
+
 // True for a scope that depends on no module instance: inside a package or
 // `$unit`, so it has no instance multiplicity (LRM 8.9, 6.21: one static property,
 // one set of function statics). A class declared in a module is not, and neither

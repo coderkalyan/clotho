@@ -1026,6 +1026,16 @@ void Lowerer::lower_members(const Scope&       scope,
                 if (pass == Pass::Collect)
                     recover([&] { check_defparam_type(m.as<DefParamSymbol>()); });
                 break;
+            // Subroutines lower on demand at call sites, except that an interface's
+            // statics are declared with the instance: a virtual interface handle
+            // reaches the body of ONE instance for all of them and addresses what it
+            // touches by that instance's layout, so every instance of the interface
+            // must hold the same signals, whichever of its subroutines were called.
+            case SymbolKind::Subroutine:
+                if ((pass == Pass::Collect || emit) && is_iface_body_subroutine(m.as<SubroutineSymbol>())) {
+                    recover([&] { declare_interface_statics(m.as<SubroutineSymbol>(), pass == Pass::Collect); });
+                }
+                break;
             // Known-inert members: elaboration artifacts and declarations
             // that bear no simulation behavior of their own. Ports are wired
             // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -1069,7 +1079,6 @@ void Lowerer::lower_members(const Scope&       scope,
             case SymbolKind::GenericClassDef:
             case SymbolKind::TransparentMember:
             case SymbolKind::Genvar:
-            case SymbolKind::Subroutine:
             case SymbolKind::StatementBlock:
             case SymbolKind::WildcardImport:
             case SymbolKind::ExplicitImport:
