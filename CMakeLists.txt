@@ -275,6 +275,14 @@ FetchContent_Declare(
   # and in every value slang folds (parameters, enum members, constant
   # functions, case labels). This is upstream slang commit 0f89ca18 verbatim
   # (IntegerLiteral::propagateType); drop it on the first bump past that commit.
+  #
+  # slang-clog2-unknown: LRM 20.8.1 does not say what `$clog2` of an argument with an
+  # x or z bit is. Clotho gives all x, at run time and in constants, as Icarus Verilog
+  # does (docs/LRM_NOTES.md, note 53). slang's Clog2Function::eval flattened the
+  # unknown bits to 0 and folded a number, so `logic [$clog2(8'bx)-1:0]` was a
+  # two-bit vector. A built-in system function cannot be replaced from outside:
+  # Compilation::addSystemSubroutine keeps the subroutine already registered under
+  # a name. Not upstream.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
 )

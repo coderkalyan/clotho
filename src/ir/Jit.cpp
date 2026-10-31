@@ -246,6 +246,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_wide_sdiv", &rt_wide_sdiv);
     expose("rt_wide_umod", &rt_wide_umod);
     expose("rt_wide_smod", &rt_wide_smod);
+    expose("rt_pow", &rt_pow);
     expose("rt_null_handle", &rt_null_handle);
     expose("rt_encoding_violation", &rt_encoding_violation);
     expose("rt_tagged_access", &rt_tagged_access);

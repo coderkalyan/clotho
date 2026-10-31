@@ -346,6 +346,28 @@ void rt_wide_sdiv(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t 
 void rt_wide_umod(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
 void rt_wide_smod(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
 
+// -- Power (LRM 11.4.3) --
+
+// What rt_pow is told about the operands' signs.
+typedef enum rt_pow_flags {
+    RT_POW_BASE_SIGNED = 1u << 0, // -1 ** n is -1 for an odd n, 1 for an even one
+    RT_POW_EXP_SIGNED  = 1u << 1, // an exponent with its top bit set is negative
+} rt_pow_flags;
+
+// out = base ** exp of two definite operands, per Table 11-4, wrapped at `width`. `base`
+// and `out` are `width` bits, `exp` is `exp_width` bits, all little-endian arrays of whole
+// 64-bit words with the bits above the width zero; `out` is neither of the others.
+//
+// Returns nonzero when the result is x: a zero base with a negative exponent. `out` is 0
+// then, which is what a 2-state result makes of an x. The caller handles x and z bits in
+// an operand (the result is all x) and never passes one: the routine takes values.
+//
+// The exponent is self-determined and is read as unsigned unless `RT_POW_EXP_SIGNED`; the
+// product of a negative base needs no sign, since the low `width` bits of a product are
+// the same either way. A wide base multiplies as rt_wide_mul does.
+uint32_t rt_pow(uint64_t* out, const uint64_t* base, const uint64_t* exp, uint32_t width,
+                uint32_t exp_width, uint32_t flags);
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 // The site of one guarded class-handle use — a property dereference or a virtual

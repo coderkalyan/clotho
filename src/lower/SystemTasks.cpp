@@ -1015,6 +1015,8 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // unsigned and $clog2(0) == 0; the result is a 32-bit integer. slang's
     // constant evaluator implements clog2, so a constant argument (the
     // common `$clog2(PARAM)` / literal usage) folds to a pooled literal here.
+    // An argument with an x or z bit folds to all x, as the run-time form below
+    // gives (patches/slang-clog2-unknown.patch, docs/LRM_NOTES.md note 53).
     if (name == "$clog2") {
         if (call.arguments().size() != 1) {
             fail("$clog2 expects exactly one argument");

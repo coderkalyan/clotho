@@ -4,7 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Wide value kernels: dynamic part-select read and write, and multiply, divide and modulo.
+// Wide value kernels: dynamic part-select read and write, and multiply, divide, modulo and power.
 
 #include "RuntimeInternal.h"
 
@@ -559,4 +559,137 @@ extern "C" void rt_wide_smod(uint64_t* out, const uint64_t* a, const uint64_t* b
     check_operands(out, a, b, width);
     divide(out, a, b, width, Division::signed_remainder);
     assert(is_canonical(out, width));
+}
+
+// -- Power --
+//
+// `**` on definite operands (LRM 11.4.3, Table 11-4). The backend deals with x and z bits
+// in an operand, which make the result x whatever the other one is, and with what the
+// result's domain makes of an x; the values are all this sees.
+
+namespace {
+
+// The number of bits in `v` up to its highest set one; 0 for a zero value.
+uint32_t bit_length(const uint64_t* v, uint32_t words) {
+    const uint32_t n = significant_words(v, words);
+    return n == 0 ? 0 : 64 * (n - 1) + (64 - static_cast<uint32_t>(std::countl_zero(v[n - 1])));
+}
+
+// Whether the `width`-bit `v` is all ones: the value -1 of a signed one.
+bool is_all_ones(const uint64_t* v, uint32_t width) {
+    const uint32_t words = plane_words(width);
+    for (uint32_t i = 0; i + 1 < words; ++i) {
+        if (v[i] != ~uint64_t{ 0 }) {
+            return false;
+        }
+    }
+    return v[words - 1] == top_mask(width);
+}
+
+// out = base ** exp modulo 2^64: square and multiply over the bits of `exp` up to its
+// highest set one, so an exponent of 0 is the empty product 1. The product of two numbers
+// has the same low bits whatever their high ones are, so nothing is masked until the end.
+template <typename Word>
+Word power_native(Word base, const uint64_t* exp, uint32_t exp_words) {
+    Word           result = 1;
+    const uint32_t length = bit_length(exp, exp_words);
+    for (uint32_t i = 0; i < length; ++i) {
+        if (take_bits(exp, i, 1) != 0) {
+            result *= base;
+        }
+        base *= base;
+    }
+    return result;
+}
+
+// The same modulo 2^(64 * words), by the schoolbook product of the multiply above. The
+// scratch is on the stack up to `kInlineWords`, which is every width the backend does not
+// hand to the wide multiply routines and a good deal past it.
+constexpr uint32_t kInlineWords = 8;
+
+void power_words(uint64_t* out, const uint64_t* base, const uint64_t* exp, uint32_t exp_words, uint32_t words) {
+    // The result and the power of the base, each with a buffer for the product that replaces it.
+    uint64_t              inline_work[4 * kInlineWords];
+    std::vector<uint64_t> heap_work;
+    uint64_t*             work = inline_work;
+    if (words > kInlineWords) {
+        heap_work.resize(4 * words);
+        work = heap_work.data();
+    }
+    uint64_t* result      = work;
+    uint64_t* result_next = result + words;
+    uint64_t* power       = result_next + words;
+    uint64_t* power_next  = power + words;
+    std::memset(result, 0, words * sizeof(uint64_t));
+    result[0] = 1;
+    std::memcpy(power, base, words * sizeof(uint64_t));
+
+    const uint32_t length = bit_length(exp, exp_words);
+    for (uint32_t i = 0; i < length; ++i) {
+        if (take_bits(exp, i, 1) != 0) {
+            multiply_words(result_next, result, power, words);
+            std::swap(result, result_next);
+        }
+        // The square after the last bit would not be read.
+        if (i + 1 < length) {
+            multiply_words(power_next, power, power, words);
+            std::swap(power, power_next);
+        }
+    }
+    std::memcpy(out, result, words * sizeof(uint64_t));
+}
+
+} // namespace
+
+// out = base ** exp at `width` bits. `base` and `out` are `width` bits and `exp` is
+// `exp_width`, all little-endian words with nothing set above the width, and `out` is
+// neither of the others. Returns whether the result is x: a zero base with a negative
+// exponent. `out` is 0 then, which is what a 2-state result makes of it (LRM 6.3.1).
+//
+// Table 11-4. A negative exponent is one with its top bit set when `RT_POW_EXP_SIGNED`,
+// and gives 0 for |base| > 1, 1 for 1, and for -1 (an all-ones base when
+// `RT_POW_BASE_SIGNED`) -1 for an odd exponent and 1 for an even one. A non-negative one
+// is the product of the base that many times, wrapped at `width`, 1 for an exponent of 0
+// whatever the base, 0 ** 0 included.
+extern "C" uint32_t rt_pow(uint64_t* out, const uint64_t* base, const uint64_t* exp, uint32_t width,
+                           uint32_t exp_width, uint32_t flags) {
+    assert(width > 0);
+    assert(exp_width > 0);
+    assert(out != nullptr && base != nullptr && exp != nullptr);
+    assert(out != base && out != exp && "the result does not overlap an operand");
+    assert(is_canonical(base, width));
+    assert(is_canonical(exp, exp_width));
+    assert((flags & ~uint32_t{ RT_POW_BASE_SIGNED | RT_POW_EXP_SIGNED }) == 0);
+
+    const uint32_t words     = plane_words(width);
+    const uint32_t exp_words = plane_words(exp_width);
+    std::memset(out, 0, words * sizeof(uint64_t));
+
+    const bool negative = (flags & RT_POW_EXP_SIGNED) != 0 && take_bits(exp, exp_width - 1, 1) != 0;
+    if (!negative) {
+        if (words == 1) {
+            out[0] = power_native<uint64_t>(base[0], exp, exp_words) & top_mask(width);
+        } else if (words == 2) {
+            const u128 r = power_native<u128>((static_cast<u128>(base[1]) << 64) | base[0], exp, exp_words);
+            out[0]       = static_cast<uint64_t>(r);
+            out[1]       = static_cast<uint64_t>(r >> 64) & top_mask(width);
+        } else {
+            power_words(out, base, exp, exp_words, words);
+            out[words - 1] &= top_mask(width);
+        }
+        assert(is_canonical(out, width));
+        return 0;
+    }
+    if (significant_words(base, words) == 0) {
+        return 1;
+    }
+    const bool one       = base[0] == 1 && significant_words(base + 1, words - 1) == 0;
+    const bool minus_one = (flags & RT_POW_BASE_SIGNED) != 0 && is_all_ones(base, width);
+    if (minus_one && (exp[0] & 1) != 0) {
+        std::memcpy(out, base, words * sizeof(uint64_t)); // -1 is its own odd power.
+    } else if (one || minus_one) {
+        out[0] = 1;
+    }
+    assert(is_canonical(out, width));
+    return 0;
 }

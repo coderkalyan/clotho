@@ -483,6 +483,7 @@ TEST_CASE("single-bit div/mod/pow use their own truth-table immediates, no branc
     )");
     CHECK(pow.find("lshr i32 -475922397") != std::string::npos); // POW1_LUT
     CHECK(pow.find("pow.x") == std::string::npos);
+    CHECK(pow.find("rt_pow") == std::string::npos);
 }
 
 TEST_CASE("single-bit div agrees with LRM, including divide-by-zero and X") {
@@ -533,9 +534,67 @@ TEST_CASE("single-bit pow agrees with LRM, including X") {
     CHECK(run_capture(src) == "1\n0\n1\nx\n");
 }
 
-// Signed ** covers LRM Table 11-4: signed base at a non-negative exponent (the
-// squaring loop is sign-agnostic) and the negative-exponent corners (op1==0 -> X,
-// op1==1 -> 1, op1==-1 -> parity of op2, |op1|>1 -> 0). Values match iverilog 13.
+// `**` above one bit is one call to rt_pow, which works out Table 11-4 and the wrap at the
+// result's width; what the generated code adds is the decision on x and z bits, which the
+// routine never sees, and only when an operand can have them. One unsigned bit stays a
+// truth table: a signed one is -1 and is the routine's.
+TEST_CASE("pow calls rt_pow above one bit and stays a truth table at one unsigned bit") {
+    // Variables rather than ports: a port is a net, which is 4-state whatever its type says.
+    const auto raw = [](std::string_view declarations) {
+        return emit_raw("module m; " + std::string(declarations) + " initial y = a ** b; endmodule");
+    };
+    SUBCASE("one unsigned bit, either domain: the table and no call") {
+        CHECK(raw("logic a, b, y;").find("rt_pow") == std::string::npos);
+        CHECK(raw("bit a, b, y;").find("rt_pow") == std::string::npos);
+    }
+    SUBCASE("a signed one-bit base or exponent is the routine's") {
+        CHECK(raw("logic signed a; logic b, y;").find("call i32 @rt_pow") != std::string::npos);
+        CHECK(raw("logic a, y; logic signed b;").find("call i32 @rt_pow") != std::string::npos);
+    }
+    SUBCASE("4-state operands: x and z bits are decided before the call") {
+        const std::string ir = raw("logic [7:0] a, y; logic [3:0] b;");
+        CHECK(count_substr(ir, "call i32 @rt_pow") == 1);
+        CHECK(ir.find("pow.x") != std::string::npos);
+        CHECK(ir.find("pow.val") != std::string::npos);
+        CHECK(ir.find("pow.loop") == std::string::npos);
+    }
+    SUBCASE("a 2-state base is lifted by the frontend, so the x test is raw IR and not optimized code") {
+        // slang types `**` as 4-state (0 ** -1 is x), so the base arrives lifted; the optimizer
+        // sees that a lifted 2-state value has no x or z bit and drops the test, and with it
+        // the block that builds the x. The operands come from a plusarg so that nothing folds.
+        constexpr std::string_view source = R"(
+            module m;
+                bit [63:0] a, y; bit [7:0] b; int n;
+                initial begin
+                    if (!$value$plusargs("N=%d", n)) n = 5;
+                    a = n; b = n + 1; y = a ** b; $display("%h", y);
+                end
+            endmodule
+        )";
+        CHECK(emit_raw(source).find("pow.x") != std::string::npos);
+        const std::string optimized = emit(source);
+        CHECK(count_substr(optimized, "call i32 @rt_pow") == 1);
+        CHECK(optimized.find("pow.x") == std::string::npos);
+    }
+    SUBCASE("no width multiplies in the generated code") {
+        // The operands come from a plusarg so that nothing folds.
+        for (const uint32_t width : { 32u, 64u, 128u, 200u, 1000u }) {
+            const std::string ir = emit("module m; logic [" + std::to_string(width - 1) + ":0] a, y; logic [7:0] b; int n; " +
+                                        "initial begin if (!$value$plusargs(\"N=%d\", n)) n = 5; a = n; b = n + 1; y = a ** b; " +
+                                        "$display(\"%h\", y); end endmodule");
+            CAPTURE(width);
+            CHECK(count_substr(ir, "call i32 @rt_pow") == 1);
+            CHECK(ir.find("rt_wide_mul") == std::string::npos);
+            CHECK(ir.find("mul i" + std::to_string(width)) == std::string::npos);
+        }
+    }
+}
+
+// Signed ** covers LRM Table 11-4: signed base at a non-negative exponent (the product
+// needs no sign: its low bits are the same either way) and the negative-exponent corners
+// (op1==0 -> X, op1==1 -> 1, op1==-1 -> parity of op2, |op1|>1 -> 0). Values match
+// iverilog 13. tests/wide_arith_test.cpp checks every pair of small operands and random
+// ones at every width against the routine directly.
 TEST_CASE("signed pow agrees with LRM Table 11-4") {
     constexpr std::string_view src = R"(
         module m;
@@ -560,12 +619,11 @@ TEST_CASE("signed pow agrees with LRM Table 11-4") {
     CHECK(run_capture(src) == "-27\n4\n1\n0\n1\n-1\n1\n-1\nx\n0\n");
 }
 
-// A constant exponent lets the optimizer fold the squaring loop; a bare literal
-// exponent is 2-state, so with a 4-state base the operands are mixed-domain. The
-// backend must lift the exponent to 4-state or the X-mask shifts an iW word by its
-// full width (poison), which the optimizer turns into an unreachable process body.
-// Regression: `x ** 3` and an unsigned constant exponent both once produced no
-// output. 2-state `int` operands exercise the recursion + wide-multiply path.
+// A bare literal exponent is 2-state, so with a 4-state base the operands are
+// mixed-domain. The backend must lift the exponent to 4-state or the x test shifts an
+// iW word by its full width (poison), which the optimizer turns into an unreachable
+// process body. Regression: `x ** 3` and an unsigned constant exponent both once
+// produced no output. The 2-state `int` operands below are the call without an x test.
 TEST_CASE("pow with a constant / mixed-domain exponent is not miscompiled") {
     constexpr std::string_view src = R"(
         module m;
@@ -592,6 +650,23 @@ TEST_CASE("0 ** negative coerces X to 0 in a 2-state result") {
     CHECK(run_capture(R"(module m; int r; integer q;
         initial begin r = 0 ** -1; $display("%0d", r); q = 0 ** -1; $display("%0d", q); end
         endmodule)") == "0\nx\n");
+}
+
+// The exponent is self-determined, so it can be one bit. The inline loop shifted it right
+// by its own width, which is poison, and the optimizer deleted the rest of the process:
+// "start" printed and nothing after the power did.
+TEST_CASE("pow with a one-bit exponent does not delete the rest of the process") {
+    CHECK(run_capture(R"(module m;
+        logic [7:0] a, r; logic e; bit be; logic signed se;
+        initial begin
+            $display("start");
+            a = 8'd3; e = 1'b1;  r = a ** e;  $display("%0d", r);
+            be = 1'b1;           r = a ** be; $display("%0d", r);
+            e = 1'b0;            r = a ** e;  $display("%0d", r);
+            se = 1'b1;           r = a ** se; $display("%0d", r);
+            $display("end");
+        end
+        endmodule)") == "start\n3\n3\n1\n0\nend\n");
 }
 
 TEST_CASE("wide div keeps the branching divmod path") {
@@ -2141,6 +2216,109 @@ TEST_CASE("$clog2 propagates X when the operand has unknown bits") {
     )");
     CHECK(out == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
                  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+}
+
+// LRM 20.8.1 says nothing about an argument with an x or z bit. Clotho gives x, as iverilog
+// 13 does, wherever the call is evaluated (docs/LRM_NOTES.md, note 53). The run-time
+// operand above and the constants below must agree: slang's evaluator folded x to 0
+// until patches/slang-clog2-unknown.patch.
+TEST_CASE("$clog2 of a constant with an x or z bit is x in a localparam") {
+    const std::string out = run_capture(R"(
+        module m #(parameter integer D = 8'bxx10_0000);
+            localparam integer PX = $clog2(8'bxxxx_xxxx);
+            localparam integer PZ = $clog2(4'bz001);
+            localparam integer PM = $clog2(100'b1x0);
+            localparam integer PD = $clog2(D);
+            localparam integer PK = $clog2(8'b0000_0101);
+            initial $display("%b %b %b %b %0d", PX, PZ, PM, PD, PK);
+        endmodule
+    )");
+    const std::string x32(32, 'x');
+    CHECK(out == x32 + " " + x32 + " " + x32 + " " + x32 + " 3\n");
+}
+
+TEST_CASE("$clog2 of a constant with an x or z bit is x in a procedural statement") {
+    const std::string out = run_capture(R"(
+        module m;
+            integer     r;
+            int         i;
+            logic [3:0] n;
+            initial begin
+                r = $clog2(4'b1x01);          $display("%b", r);
+                i = $clog2(4'b1x01);          $display("%0d", i);
+                $display("%b", $clog2(8'bz));
+                if ($clog2(4'bx) === 32'bx)   $display("is x");
+                n = 4'b1x01;                  $display("%b", $clog2(n) === $clog2(4'b1x01));
+                n = 4'b1001;                  $display("%0d", $clog2(n) + $clog2(4'b1001));
+            end
+        endmodule
+    )");
+    CHECK(out == std::string(32, 'x') + "\n0\n" + std::string(32, 'x') + "\nis x\n1\n8\n");
+}
+
+// An x where the language needs a known number (a width, a range bound, a count) has no
+// value to use, so it is an error where the number is needed: the declaration of the
+// vector, array or select. It was silently 0, so `[W-1:0]` was a two-bit vector.
+TEST_CASE("an x result of $clog2 where a known value is required is an error at the declaration") {
+    const auto unknown_at = [](const LowerResult& r, std::string_view line_and_column) {
+        const std::string text = r.diagnostic_text();
+        return text.find(std::string(line_and_column) + ": error: value must not have any unknown bits") !=
+               std::string::npos;
+    };
+    SUBCASE("a packed width") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer W = $clog2(8'bx);
+                logic [W-1:0] v;
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":4:24"));
+    }
+    SUBCASE("an unpacked range") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer AW = $clog2(4'bz1);
+                logic [7:0] mem [0:AW-1];
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":4:36"));
+    }
+    SUBCASE("a parameter that carries the x into a submodule") {
+        const LowerResult r = lower_text(R"(
+            module sub #(parameter integer DEPTH = 4);
+                localparam integer AW = $clog2(DEPTH);
+                logic [AW-1:0] addr;
+            endmodule
+            module top;
+                sub #(.DEPTH(8'bx)) u();
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":4:24"));
+    }
+    SUBCASE("a replication count") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer N = $clog2(4'bz1);
+                logic [3:0] a;
+                logic [8:0] r;
+                initial r = {N{a}};
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":6:30"));
+    }
+    SUBCASE("a known argument is not an error") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer W = $clog2(8'b0001_0000);
+                logic [W-1:0] v;
+            endmodule
+        )");
+        CHECK(r.ok);
+    }
 }
 
 TEST_CASE("unsigned divide and modulo truncate toward zero") {
