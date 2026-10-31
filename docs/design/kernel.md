@@ -79,8 +79,10 @@ when it does.
   extension, multiply by a repeating constant). **Not yet:** concatenation,
   which is still a serial shift-and-OR chain: independent terms measured
   +6.6% instructions on tests/perf timers (a 32-operand 4-state concat).
-- `$clog2` of an argument with x or z bits: decided after checking what other
-  simulators do. **Not yet:** all-x, checked against Icarus only.
+- `$clog2` of an argument with an x or z bit is all x, in constants and at run time:
+  the LRM is silent (20.8.1) and Icarus agrees (docs/LRM_NOTES.md, note 53). An x
+  where a known value is required, a width or a range bound, is slang's located
+  error. The constant case is `patches/slang-clog2-unknown.patch`.
 - Real math: the classic functions as LLVM intrinsics, the rest as C math calls.
 - `?:`, `&&` and `||` lower to control flow in the frontend; the optimizer
   recovers selects. **Not yet:** control flow only for arms unsafe to speculate.

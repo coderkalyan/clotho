@@ -636,3 +636,24 @@ Code: `src/runtime/Scheduler.cpp` (`intra_ready_push`, `rt_intra_now`, `rt_intra
 28.12.3 rule b drops the levels of an ambiguous signal that are "smaller than or equal to" the strength of the unambiguous signal it combines with. Read literally, a definite 1 at strong would beat an x driver whose strength0 is strong (the x range loses its strong0 level), though 28.12.2 makes two signals of equal strength and opposite value x. Clotho reads the rule as 28.12.3 introduces it, the unambiguous signal combining "with a component" of the ambiguous one: that component, a strong0, meets the strong 1 at equal strength and opposite value, so 28.12.2 applies and the result is x. iverilog 13 gives the same value for every pair of drivers (value 0, 1, x or z, each with any legal strength pair, 9216 cases). The pairwise rules are not associative: with three drivers some combinations (about 0.5%) give different values in different orders, and the LRM fixes no order. The N drivers of a net therefore resolve in one step, independent of order: 0 when the strongest definite 0 is stronger than every strength a 1 can have (a definite 1 or any x driver's strength1), 1 symmetrically, z when nothing drives, x otherwise. In every order-dependent triple checked that is one of the pairwise-order results. iverilog folds pairwise and differs from it on 10 of 6000 random triples: 5 are order-dependent triples, and in the other 5 every order of the rules as read here gives x where iverilog gives a definite value (one order of the literal rule b gives that value). A range that holds one value and high-Z (the L and H of 28.12.2) is x, as in note 37.
 
 Code: `src/ir/llvm/Ops.cpp` (`lower_strength_res`). Tests: `tests/net_resolution_test.cpp` ("an x driver with asymmetric strengths contributes a strength range", "two drivers of every value and strength pair resolve by LRM 28.12"). Oracle: iverilog 13.
+
+## 53. `$clog2` of an argument with an x or z bit (20.8.1)
+
+20.8.1 defines `$clog2` as the ceiling of the log base 2 of its argument, "treated as
+an unsigned value", and says nothing about an argument with an x or z bit. Clotho
+gives all x (a 32-bit `integer` of x bits) wherever the call is evaluated: at run
+time, in a localparam or other constant expression, and in a constant operand of a
+procedural statement. Where the language needs a known number (a vector width, a
+range bound, a replication count) the x has no value to use, so it is slang's error
+"value must not have any unknown bits", located at the declaration or expression that
+needs the number. A 2-state destination converts the x to 0 as 6.3.1 does for any
+4-state value.
+
+iverilog 13 gives all x for a constant and for a run-time operand. Verilator 5.050
+gives all x for a constant but, at run time, a 2-state variable has already turned
+the operand's x bits into 0: `n = 8'bx; $clog2(n)` is 0 and `8'b0000_1x01` reads as
+`8'b0000_1001` (4). slang's constant evaluator also flattened the unknown bits to 0,
+so a constant gave a number and `logic [$clog2(8'bx)-1:0]` was a two-bit vector.
+`patches/slang-clog2-unknown.patch` makes it x, as the run-time lowering already was.
+
+Code: `patches/slang-clog2-unknown.patch` (slang's `Clog2Function::eval`), `src/ir/llvm/Ops.cpp` (`lower_clog2`). Tests: `tests/llvm_backend_test.cpp` ("$clog2 propagates X when the operand has unknown bits", "$clog2 of a constant with an x or z bit is x in a localparam", "$clog2 of a constant with an x or z bit is x in a procedural statement", "an x result of $clog2 where a known value is required is an error at the declaration"). Oracle: iverilog 13; Verilator 5.050 differs at run time.

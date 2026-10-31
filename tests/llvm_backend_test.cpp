@@ -2143,6 +2143,109 @@ TEST_CASE("$clog2 propagates X when the operand has unknown bits") {
                  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
 }
 
+// LRM 20.8.1 says nothing about an argument with an x or z bit. Clotho gives x, as iverilog
+// 13 does, wherever the call is evaluated (docs/LRM_NOTES.md, note 53). The run-time
+// operand above and the constants below must agree: slang's evaluator folded x to 0
+// until patches/slang-clog2-unknown.patch.
+TEST_CASE("$clog2 of a constant with an x or z bit is x in a localparam") {
+    const std::string out = run_capture(R"(
+        module m #(parameter integer D = 8'bxx10_0000);
+            localparam integer PX = $clog2(8'bxxxx_xxxx);
+            localparam integer PZ = $clog2(4'bz001);
+            localparam integer PM = $clog2(100'b1x0);
+            localparam integer PD = $clog2(D);
+            localparam integer PK = $clog2(8'b0000_0101);
+            initial $display("%b %b %b %b %0d", PX, PZ, PM, PD, PK);
+        endmodule
+    )");
+    const std::string x32(32, 'x');
+    CHECK(out == x32 + " " + x32 + " " + x32 + " " + x32 + " 3\n");
+}
+
+TEST_CASE("$clog2 of a constant with an x or z bit is x in a procedural statement") {
+    const std::string out = run_capture(R"(
+        module m;
+            integer     r;
+            int         i;
+            logic [3:0] n;
+            initial begin
+                r = $clog2(4'b1x01);          $display("%b", r);
+                i = $clog2(4'b1x01);          $display("%0d", i);
+                $display("%b", $clog2(8'bz));
+                if ($clog2(4'bx) === 32'bx)   $display("is x");
+                n = 4'b1x01;                  $display("%b", $clog2(n) === $clog2(4'b1x01));
+                n = 4'b1001;                  $display("%0d", $clog2(n) + $clog2(4'b1001));
+            end
+        endmodule
+    )");
+    CHECK(out == std::string(32, 'x') + "\n0\n" + std::string(32, 'x') + "\nis x\n1\n8\n");
+}
+
+// An x where the language needs a known number (a width, a range bound, a count) has no
+// value to use, so it is an error where the number is needed: the declaration of the
+// vector, array or select. It was silently 0, so `[W-1:0]` was a two-bit vector.
+TEST_CASE("an x result of $clog2 where a known value is required is an error at the declaration") {
+    const auto unknown_at = [](const LowerResult& r, std::string_view line_and_column) {
+        const std::string text = r.diagnostic_text();
+        return text.find(std::string(line_and_column) + ": error: value must not have any unknown bits") !=
+               std::string::npos;
+    };
+    SUBCASE("a packed width") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer W = $clog2(8'bx);
+                logic [W-1:0] v;
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":4:24"));
+    }
+    SUBCASE("an unpacked range") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer AW = $clog2(4'bz1);
+                logic [7:0] mem [0:AW-1];
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":4:36"));
+    }
+    SUBCASE("a parameter that carries the x into a submodule") {
+        const LowerResult r = lower_text(R"(
+            module sub #(parameter integer DEPTH = 4);
+                localparam integer AW = $clog2(DEPTH);
+                logic [AW-1:0] addr;
+            endmodule
+            module top;
+                sub #(.DEPTH(8'bx)) u();
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":4:24"));
+    }
+    SUBCASE("a replication count") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer N = $clog2(4'bz1);
+                logic [3:0] a;
+                logic [8:0] r;
+                initial r = {N{a}};
+            endmodule
+        )");
+        REQUIRE_FALSE(r.ok);
+        CHECK(unknown_at(r, ":6:30"));
+    }
+    SUBCASE("a known argument is not an error") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                localparam integer W = $clog2(8'b0001_0000);
+                logic [W-1:0] v;
+            endmodule
+        )");
+        CHECK(r.ok);
+    }
+}
+
 TEST_CASE("unsigned divide and modulo truncate toward zero") {
     const std::string out = run_capture(R"(
         module m;
