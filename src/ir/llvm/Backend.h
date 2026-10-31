@@ -1058,6 +1058,11 @@ struct Anchor {
     // (signal, family) the unit's signals have, at ctx_id_base + Backend::id_ord_.
     uint32_t ctx_id_base = 0;
     uint32_t n_id        = 0;
+    // The instance's hierarchical name (`%m`): one ptr field at ctx_name_base, the
+    // address of the borrowed string handle of its path (Backend::inst_path_global),
+    // filled at startup, so code of the unit reads its instance's name and bakes
+    // none. It follows the id fields; later fields append after it.
+    uint32_t ctx_name_base = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -1179,10 +1184,8 @@ struct ModuleEnv {
     // Writable images of an aggregate type that an out-of-range aggregate `ref` / `out`
     // actual is bound to, keyed by the type Ref (agg_sink_global).
     ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> agg_sinks;
-    // The borrowed string handle of each instance's path, keyed by the instance's
-    // anchor index (inst_path_handle). Per module like the other internal constants:
-    // every unit module that reads an instance's path holds its own.
-    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> inst_paths;
+    // (the borrowed string handle of an instance's path is a global of root, one per
+    // anchor: Backend::inst_path_global; the record holds its address.)
 };
 
 // Builds the shared state struct and lowers every process. One instance per
@@ -3102,6 +3105,9 @@ private:
     void lower_string_constant(Index i, Ref ref);
 
     llvm::Value* inst_path_handle(uint32_t scope);
+    // The global of root holding the borrowed string handle of the path of the
+    // instance anchored at `anchor`, created on first use.
+    llvm::GlobalVariable* inst_path_global(uint32_t anchor);
 
     uint32_t body_scope() const;
 
@@ -4418,6 +4424,8 @@ private:
     // cannot be.
     bool                                                 share_active_ = false;
     const char*                                          taint_why_    = nullptr;
+    // The borrowed path handle of each instance (inst_path_global), by anchor.
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> inst_path_gvs_;
     // Thunk groups lowered per instance after all, by what stopped sharing them.
     std::map<std::string, uint64_t>                      unshared_;
     // Subroutines of multi-instance units lowered per instance after all, by what

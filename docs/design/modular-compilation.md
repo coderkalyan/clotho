@@ -388,7 +388,9 @@ code go.
      buffers, `<= @e` triggers) are record fields at def-local ordinals, filled
      at startup, and the sets they index are joined over a unit's instances;
      the dump-var base was a field already. A signal of no instance keeps its
-     immediates. Name ids (`inst_path`) are not in the record yet.
+     immediates. The name (`inst_path`) is a record field, the address of the
+     instance's borrowed path handle (a constant of root), so code of a unit
+     reads its instance's name and bakes none.
    - **3c, code once per unit.** Each unit's processes and functions are
      lowered once from the unit's IR, taking the record, into the unit's module.
      Fusion runs within a unit; groups spanning instances become dispatch
@@ -456,8 +458,8 @@ code go.
      stayed one instance's own taints the group. A function that is not
      shared is lowered as it was, into its unit's module like every other, and
      `--stat=unit-code` counts the subroutines of multi-instance units, the
-     functions emitted for them and what kept each per instance: a name read
-     (`%m`), a nonblocking write, a disable target, a covergroup, a process
+     functions emitted for them and what kept each per instance: a
+     nonblocking write, a disable target, a covergroup, a process
      control block or a process-local random stream, a call of such a
      subroutine, a cycle. Two program instances' subroutines differ in the
      program that `$exit` ends and are not one function either. Measured:
@@ -564,8 +566,8 @@ Each of these makes lowered IR depend on something outside the unit:
   scope; a declaration initializer reads it like any other body), hidden
   temporaries are numbered per name prefix, and assertion state is named by an
   instance-relative ordinal. `inst_path` is a borrowed string, a read-only
-  handle over constant bytes today (a record field later), so evaluating it
-  takes no temporary and no init or release, and a severity report or a
+  handle over constant bytes whose address is a field of the instance's record,
+  so evaluating it takes no temporary and no init or release, and a severity report or a
   covergroup name keeps it apart from the text around it (`SeverityInfo`:
   banner, path, tail; `CoverInfo::text`) for the runtime to join when the line
   is issued or the name is made, so a report that does not fire costs its body

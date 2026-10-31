@@ -1189,6 +1189,7 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_bind_base        = a.ctx_gmask_base + a.n_mask;
         a.ctx_fbind_base       = a.ctx_bind_base + 2 * a.n_bind;
         a.ctx_id_base          = a.ctx_fbind_base + a.n_fbind;
+        a.ctx_name_base        = a.ctx_id_base + a.n_id;
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1200,11 +1201,12 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), 2 * a.n_bind, ptr);
             f.insert(f.end(), a.n_fbind, ptr);
             f.insert(f.end(), a.n_id, i32);
+            f.push_back(ptr); // the instance's name handle (ctx_name_base)
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
-        assert(a.ctx_ty->getNumElements() == a.ctx_id_base + a.n_id && "instances of one unit lay their records out alike");
+        assert(a.ctx_ty->getNumElements() == a.ctx_name_base + 1 && "instances of one unit lay their records out alike");
     }
 }
 

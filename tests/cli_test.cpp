@@ -751,9 +751,9 @@ TEST_CASE("cli: --stat=unit-code shows the fold of a forceable net shared by twi
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
-TEST_CASE("cli: --stat=unit-code names what keeps a subroutine per instance") {
-    // `hello` reads its instance's name, which is the instance's own: it is
-    // lowered per instance, and so is the code that calls it. `twice` shares.
+TEST_CASE("cli: --stat=unit-code shows subroutines that read their instance's name shared") {
+    // `hello` reads its instance's name (`%m`) from the instance's record, so it
+    // is one function for both instances, and so is the code that calls it.
     const Scratch  s;
     const fs::path design = s.write("design.sv", R"(
         module leaf (input int k);
@@ -778,10 +778,9 @@ TEST_CASE("cli: --stat=unit-code names what keeps a subroutine per instance") {
     )");
     const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
     CHECK(r.code == 0);
-    CHECK(contains(r.err, "2 subroutines of multi-instance units over 4 instances' subroutines, 3 functions emitted "
+    CHECK(contains(r.err, "2 subroutines of multi-instance units over 4 instances' subroutines, 2 functions emitted "
                           "(2 of the subroutines are tasks)"));
-    CHECK(contains(r.err, "2 subroutines lowered per instance: reads the name of its instance"));
-    CHECK(contains(r.err, "2 groups lowered per instance: calls a function copy of its instance"));
+    CHECK(!contains(r.err, "lowered per instance"));
 }
 
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {

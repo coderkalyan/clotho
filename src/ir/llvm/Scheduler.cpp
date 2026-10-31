@@ -885,6 +885,8 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         if (a.first_vcd >= 0) {
             b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, 3));
         }
+        // The instance's name, which its code reads for `%m` and banners.
+        b_.CreateStore(sym(inst_path_global(static_cast<uint32_t>(&a - anchors_.data()))), ctx_ptr(a, a.ctx_name_base));
         // The imports this instance's code reads: where each signal is and who
         // owns it (nobody, for a package's).
         for (uint32_t k = 0; k < a.bind_used.size(); ++k) {

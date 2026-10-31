@@ -2462,23 +2462,14 @@ uint32_t Backend::body_scope() const {
     return cur_fn_ != nullptr ? cur_fn_->scope : cur_proc_scope_;
 }
 
-// The path of the instance `scope` names, as the BORROWED string handle an InstPath
-// evaluates to: a read-only rt_string in its heap form whose buffer is the path's own
-// constant bytes. It needs no temp, no init and no release, so a body that reads it
-// only on a rare path (a report) pays nothing for it on the others. The flat module
-// knows each instance's hierarchical name (the anchor of its scope, which is how its
-// state global is named), so for now the handle is a constant of the module that
-// reads it. Compiling units directly will have the instance's record hold the same
-// handle in a field and read it from there, which is why the instruction exists at
-// all -- and why nothing may write through the handle.
-llvm::Value* Backend::inst_path_handle(uint32_t scope) {
-    taint("reads the name of its instance");
-    if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
-        anchor_of_scope_[scope] == SignalSlot::no_anchor) {
-        throw BackendError{ "internal: inst_path in a body that belongs to no instance" };
-    }
-    const uint32_t         anchor = anchor_of_scope_[scope];
-    llvm::GlobalVariable*& slot   = env_->inst_paths[anchor];
+// The path of the instance anchored at `anchor`, as the BORROWED string handle an
+// InstPath evaluates to: a read-only rt_string in its heap form whose buffer is the
+// path's own constant bytes. It needs no temp, no init and no release, so a body
+// that reads it only on a rare path (a report) pays nothing for it on the others,
+// and nothing may write through it. A global of root, one per instance, whose
+// address the instance's record holds (Anchor::ctx_name_base).
+llvm::GlobalVariable* Backend::inst_path_global(uint32_t anchor) {
+    llvm::GlobalVariable*& slot = inst_path_gvs_[anchor];
     if (slot != nullptr) {
         return slot;
     }
@@ -2492,19 +2483,41 @@ llvm::Value* Backend::inst_path_handle(uint32_t scope) {
     auto*              pad_ty = llvm::ArrayType::get(i8, sizeof(rt_string) - sizeof(rt_string_heap) - 1);
     auto*              ty     = llvm::StructType::get(ctx_, { raw_ptr_ty(), i64, i64, pad_ty, i8 }, /*isPacked=*/true);
     const std::string& path   = anchors_[anchor].name;
+    llvm::Module&      root   = root_env_->llmod;
 
     // The bytes keep their NUL terminator: a handle's data is also a valid C string.
     llvm::Constant* text  = llvm::ConstantDataArray::getString(ctx_, path, /*AddNull=*/true);
-    auto*           bytes = new llvm::GlobalVariable(env_->llmod, text->getType(), /*isConstant=*/true,
+    auto*           bytes = new llvm::GlobalVariable(root, text->getType(), /*isConstant=*/true,
                                                      llvm::GlobalValue::PrivateLinkage, text, "inst.path.str");
     bytes->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     llvm::Constant* init = llvm::ConstantStruct::get(
       ty, { bytes, b_.getInt64(path.size()), b_.getInt64(path.size()), llvm::ConstantAggregateZero::get(pad_ty),
             b_.getInt8(rt_string_heap_flag) });
-    slot = new llvm::GlobalVariable(env_->llmod, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init,
+    slot = new llvm::GlobalVariable(root, ty, /*isConstant=*/true, llvm::GlobalValue::InternalLinkage, init,
                                     "inst.path");
     slot->setAlignment(llvm::Align(alignof(rt_string)));
     return slot;
+}
+
+// What an InstPath in the body being lowered evaluates to: the borrowed path handle
+// of the instance `scope` names. A body of that instance reads the address from its
+// record, so the unit's code is the same for every instance and holds no name; code
+// that has no record of it (root glue, a body of another instance) names the root
+// global, which is per instance and so keeps a shared lowering from being shared.
+llvm::Value* Backend::inst_path_handle(uint32_t scope) {
+    if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
+        anchor_of_scope_[scope] == SignalSlot::no_anchor) {
+        throw BackendError{ "internal: inst_path in a body that belongs to no instance" };
+    }
+    const uint32_t anchor = anchor_of_scope_[scope];
+    if (own_ctx_ != nullptr && anchor == own_anchor_) {
+        Anchor& a = anchors_[anchor];
+        return ctx_field(a, a.ctx_name_base, llvm::PointerType::getUnqual(ctx_));
+    }
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        taint("reads the name of an instance it has no record of");
+    }
+    return sym(inst_path_global(anchor));
 }
 
 // String concatenation: gather the part handles into a stack array and hand

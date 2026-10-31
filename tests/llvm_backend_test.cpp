@@ -5530,6 +5530,58 @@ TEST_CASE("twin instances calling their own tasks and functions keep their stati
     )") == "top.a 1\ntop.a 2\ntop.a f 11\ntop.a f 12\ntop.b 10\ntop.b 20\ntop.b f 20\ntop.b f 30\n");
 }
 
+TEST_CASE("twin instances read their own name from a task and a function") {
+    // `%m` in a subroutine names that subroutine of the instance it runs for (LRM
+    // 21.2.1.6) whichever instance's code runs, also through a string built of it;
+    // the twins' calls are one function each (cli_test: --stat=unit-code).
+    CHECK(run_capture(R"(
+        module m (input int D);
+            function string who();
+                return $sformatf("<%m>");
+            endfunction
+            task automatic say(input int v);
+                $display("%m says %0d", v);
+            endtask
+            initial begin
+                #D;
+                say(D);
+                $display("%s", who());
+            end
+        endmodule
+        module top;
+            m a (.D(1));
+            m b (.D(5));
+        endmodule
+    )") == "top.a.say says 1\n<top.a.who>\ntop.b.say says 5\n<top.b.who>\n");
+}
+
+TEST_CASE("a subroutine its parent calls by hierarchical name reads the name of its own instance") {
+    CHECK(run_capture(R"(
+        module m (input int D);
+            function string who();
+                return $sformatf("<%m>");
+            endfunction
+            task automatic say(input int v);
+                $display("%m says %0d", v);
+            endtask
+            initial begin
+                #D;
+                say(D);
+                $display("%s", who());
+            end
+        endmodule
+        module top;
+            m a (.D(1));
+            m b (.D(5));
+            initial begin
+                #10;
+                $display("%s %s", a.who(), b.who());
+                b.say(9);
+            end
+        endmodule
+    )") == "top.a.say says 1\n<top.a.who>\ntop.b.say says 5\n<top.b.who>\n<top.a.who> <top.b.who>\ntop.b.say says 9\n");
+}
+
 TEST_CASE("a subroutine its parent calls by hierarchical name keeps the statics of its own instance") {
     // `a.bump` and `b.f` run in the parent's code but belong to the instances that
     // declare them: each has its own `calls` / `fc` (LRM 13.3.1, 13.4.2), however
