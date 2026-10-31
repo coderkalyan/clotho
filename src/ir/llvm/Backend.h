@@ -98,21 +98,21 @@
 
 namespace clotho::ir::backend {
 
-// A lowered value: the must/may planes packed into one i(2W) integer (low W bits
-// = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
-// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, select select)
-// act on both planes with a single instruction.
+// A lowered value. A 2-state value is one iW in `mm`. A 4-state value packs the
+// must/may planes into one i(2W) integer (low W bits = must / definitely 1, high W
+// bits = may / could be 1) and keeps a separate iW `z` (high-impedance marker); the
+// packing lets the monotone ops (AND/OR/NOT, select) act on both planes with a
+// single instruction.
+//
+// The plane does not say which it is. The domain is its IR type's (`four_state`),
+// the single source of truth, and whoever reads a plane passes it: the accessors
+// (must_of / may_of / width_of / any_unknown) and every operator take it from the
+// operand's type, and an operator never converts its operands. Storage and the call
+// ABI hold a value in the encoding of its type's domain too: a 2-state signal,
+// local, member or element is the native iW slot.
 struct Plane {
     llvm::Value* mm = nullptr; // 4-state: i(2W) [0,W) must, [W,2W) may. 2-state: iW value.
     llvm::Value* z  = nullptr; // 4-state z plane (iW), or null when never-z. Null for 2-state.
-    // The encoding of `mm`: a 2-state value is a single iW with no unknown/z plane,
-    // and the accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
-    // 2-state value never carries the redundant may/z half. For an instruction's
-    // value the encoding is its IR type's domain, the single source of truth:
-    // set_value asserts they agree and an operator never converts its operands.
-    // Storage and the call ABI hold a value in the encoding of its type's domain
-    // too: a 2-state signal, local, member or element is the native iW slot.
-    bool two = false;
     // Real / shortreal value (double / float). Exactly one of fp and mm is set:
     // a real SSA value carries fp only; its storage form is the raw bit pattern
     // in a 2-state slot (see the real helpers).
@@ -310,12 +310,14 @@ struct LValue {
     llvm::Value* base = nullptr;
     // The leaf slot type `{ i(2W), iW }` of the addressed storage.
     llvm::StructType* slot_ty = nullptr;
-    // Whether the slot stores a z word (field 1). False for a never-z signal;
-    // loads then materialize a zero z plane and stores drop theirs.
+    // The domain of the addressed slot: a 4-state slot is `{ i(2W) must|may [, iW z] }`,
+    // a 2-state one the native `{ iW }`, whose loads yield a 2-state plane and whose
+    // stores write the iW value. It follows the IR type of the storage.
+    bool four_state = true;
+    // Whether the slot stores a z word (field 1): a 4-state slot the may-z analysis
+    // could not prove never-z. A never-z slot loads a zero z plane and its stores
+    // drop theirs.
     bool has_z = true;
-    // A genuine single-iW 2-state slot: the mm word is `iW`, not `i(2W)`, and
-    // there is no z word. Loads yield a two_val Plane; stores write the iW value.
-    bool narrow = false;
     // The `[N x slot]` storage type when `base` addresses a whole memory; null
     // for plain scalar storage.
     llvm::ArrayType* array_ty = nullptr;
@@ -443,8 +445,8 @@ struct LValue {
     // it fresh inside each resolution keeps every rt_keybuf_begin/append/span/end
     // call self-contained, so no span the backend hands to the runtime ever
     // outlives its one consuming call. `assoc_ops` is the value element's
-    // rt_elem_ops descriptor. The value element slot facts (slot_ty / has_z /
-    // narrow / width / store_width / bit_off / array_ty) are filled as for a dyn
+    // rt_elem_ops descriptor. The value element slot facts (slot_ty / four_state /
+    // has_z / width / store_width / bit_off / array_ty) are filled as for a dyn
     // element. A Load resolves via rt_assoc_get_ptr (absent -> element default); a
     // Store via rt_assoc_put_ptr.
     bool            is_assoc       = false;
@@ -587,7 +589,6 @@ struct AggLeaf {
     uint32_t              width      = 0;
     bool                  four_state = false;
     bool                  has_z      = false;
-    bool                  narrow     = false;
     bool                  is_string  = false;
     // Shadow-struct field indices for nonblocking staging (mm plane, and z plane
     // when has_z), assigned in build_state_layout when the aggregate is an NBA
@@ -608,16 +609,14 @@ struct SignalSlot {
     // GEP field indices from the root state struct to this signal's storage.
     std::vector<uint32_t> path;
     uint32_t width      = 0;
+    // The domain of the signal's type: a 2-state slot is the native `{ iW }`, a
+    // 4-state one packs must|may into `i(2W)`, with a z word unless proven never-z.
     bool     four_state = false;
-    // Whether the slot stores a z word: the signal may carry z (compute_may_z)
-    // or is a task out/inout target (the task ABI stores z through a pointer to
-    // it). A never-z slot is just `{ i(2W) }`.
+    // Whether the slot stores a z word: a 4-state signal that may carry z
+    // (compute_may_z), is passed by pointer (ptr_arg) or is reached through a
+    // virtual interface. A never-z 4-state slot is just `{ i(2W) }`; a 2-state
+    // slot never has one.
     bool has_z = true;
-    // A genuine single-iW 2-state slot (`{ iW }`): the packed must|may word is
-    // dropped. Set only for a 2-state signal proven decoupled from every path that
-    // still reads the packed form (ABI, NBA, arrays). Loads yield a two_val Plane;
-    // stores write the must plane as iW.
-    bool narrow = false;
     // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
     // has_z (undriven nets are a may-z seed).
     bool init_z = false;
@@ -820,10 +819,9 @@ struct Anchor {
 struct FrameSlot {
     llvm::StructType* slot_ty    = nullptr;
     uint32_t          width      = 0;
+    // Set for a 4-state local: `{ i(2W), iW }`. A 2-state one is the native
+    // single-iW slot (`{ iW }`), which the call ABI addresses and passes as it is.
     bool              four_state = false;
-    // A 2-state local, the native single-iW slot (`{ iW }`), which the call ABI
-    // addresses and passes as it is.
-    bool narrow = false;
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
     bool is_string = false;
@@ -973,7 +971,7 @@ private:
 
     // -- State types --
 
-    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z, bool narrow = false);
+    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z);
 
     llvm::StructType* str_slot_ty();
 
@@ -987,13 +985,12 @@ private:
 
     // Per-element slot facts for a dynamic array's element (a POD scalar in phase
     // 1). Mirrors the scalar-signal slot choice: 4-state keeps its z plane
-    // (`{ i2W, iW }`); 2-state and real take the narrow single-iW form.
+    // (`{ i2W, iW }`); 2-state and real take the native single-iW form.
     struct DynElem {
         llvm::StructType* slot_ty    = nullptr;
         uint32_t          width      = 0;
         bool              four_state = false;
         bool              has_z      = false;
-        bool              narrow     = false;
         // Managed element shapes: a string handle slot, or a nested container
         // (dynamic array / queue) handle slot. Width / domain fields are
         // meaningless for these.
@@ -1375,8 +1372,8 @@ private:
     llvm::GlobalVariable* shadow_base_gv();
 
     llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field);
-    llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
-                                       bool four_state, bool has_z);
+    llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
+                                       bool has_z);
 
     RefBinding ref_actual_arg(const LValue& raw);
 
@@ -2113,7 +2110,7 @@ private:
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
 
     void emit_nba_service(Signal sig, llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
-                          uint32_t width, bool narrow, llvm::Value* old_z, llvm::Value* new_z);
+                          uint32_t width, bool four_state, llvm::Value* old_z, llvm::Value* new_z);
 
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
@@ -2505,7 +2502,7 @@ private:
 
     llvm::Constant* scope_state_initializer(const Anchor& a);
 
-    llvm::Constant* const_leaf(llvm::StructType* slot_ty, uint32_t width, bool four_state, bool narrow,
+    llvm::Constant* const_leaf(llvm::StructType* slot_ty, uint32_t width, bool four_state,
                                bool has_z, std::span<const uint8_t> planes);
 
     llvm::Constant* const_slot(const SignalSlot& s, std::span<const uint8_t> planes);
@@ -2535,7 +2532,7 @@ private:
 
     void emit_array_convert_copy(llvm::Value* d_base, llvm::Value* s_base,
                                  llvm::StructType* d_slot, llvm::StructType* s_slot,
-                                 bool d_narrow, bool s_narrow, uint32_t leaf_width,
+                                 uint32_t leaf_width,
                                  uint32_t count, Signal dsig, bool service);
 
     void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base,
@@ -2757,7 +2754,7 @@ private:
 
     AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
 
-    llvm::Value* integral_key_valid(Plane pl);
+    llvm::Value* integral_key_valid(Plane pl, bool four);
 
     AssocKeySpan normalize_assoc_key_value(Index key, Ref assoc_type);
 
@@ -3219,7 +3216,7 @@ private:
 
     llvm::Value* dpi_vec_alloca(DpiCType ct, uint32_t nchunks);
 
-    void dpi_vec_copyin(DpiCType ct, Plane pl, uint32_t w, llvm::Value* scratch);
+    void dpi_vec_copyin(DpiCType ct, Plane pl, bool four, uint32_t w, llvm::Value* scratch);
 
     Plane dpi_vec_copyout(DpiCType ct, llvm::Value* scratch, uint32_t w);
 
@@ -3308,7 +3305,7 @@ private:
 
     void emit_dpi_export(const DpiExport& ex);
 
-    llvm::Value* dpi_arg_to_c(DpiCType t, Plane p);
+    llvm::Value* dpi_arg_to_c(DpiCType t, Plane p, bool four);
 
     Plane dpi_c_to_plane(DpiCType t, llvm::Value* r);
 
@@ -3341,47 +3338,54 @@ private:
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v);
 
     // -- Plane helpers --
+    //
+    // A Plane is a bare pair of LLVM values and does not record its domain. The
+    // caller says which it is, from the IR type of the value (`type_of(i).four_state`)
+    // or of the storage it was read from: a 2-state plane is one iW, a 4-state one an
+    // i(2W) must|may word and an iW z. The overloads taking an Index read the domain
+    // from that instruction's IR type.
 
     static uint32_t bits_of(llvm::Value* v);
-    static uint32_t width_of(Plane a);
+    static uint32_t width_of(Plane a, bool four);
 
-    llvm::Value* must_of(Plane a);
-    llvm::Value* may_of(Plane a);
+    llvm::Value* must_of(Plane a, bool four);
+    llvm::Value* must_of(Index i);
+    llvm::Value* may_of(Plane a, bool four);
 
-    llvm::Value* z_of(Plane a);
+    llvm::Value* z_of(Plane a, bool four);
 
     Plane two_val(llvm::Value* v);
     Plane known_plane(llvm::Value* v, bool four_state);
-    Plane in_type_domain(Plane p, ValueType t);
 
-    Plane to_four(Plane a);
+    // The 4-state encoding of `a`: `a` itself when `four`, else must == may == a, z = 0.
+    Plane to_four(Plane a, bool four);
 
     Plane packed(llvm::Value* must, llvm::Value* may, llvm::Value* z);
 
-    llvm::Value* any_unknown(Plane a);
+    llvm::Value* any_unknown(Plane a, bool four);
+    llvm::Value* any_unknown(Index i);
 
     Plane bit_plane(llvm::Value* must_i1, llvm::Value* may_i1);
 
-    Plane cast_plane(Plane a, uint32_t to, bool sign);
+    Plane cast_plane(Plane a, bool four, uint32_t to, bool sign);
 
-    Plane lower_conversion(Inst::Tag tag, Plane a, ValueType to);
+    Plane lower_conversion(Inst::Tag tag, Plane a, ValueType from, ValueType to);
 
     llvm::Value* xz_mask(Plane a, Plane b, uint32_t w);
 
-    Plane lower_net_res(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_net_res(Inst::Tag tag, Plane a, bool a_four, Plane b, bool b_four);
 
     Plane lower_strength_res(Index i);
 
-    Plane lower_net_pull(Plane a, uint32_t pull);
+    Plane lower_net_pull(Plane a, bool four, uint32_t pull);
 
     // -- Real (floating point) helpers --
     //
     // A real SSA value rides Plane.fp. Its storage / ABI form is the IEEE-754
-    // bit pattern duplicated across must and may (a legal known value; the
-    // must => may invariant holds) with z = 0, so state layout, change
-    // detection, NBA staging, and the function ABI stay integer. Pack / unpack
-    // happens only at these boundaries; instcombine folds the chains between
-    // back-to-back float ops.
+    // bit pattern in a 2-state iW slot, so state layout, change detection, NBA
+    // staging, and the function ABI stay integer. Pack / unpack happens only at
+    // these boundaries; instcombine folds the chains between back-to-back float
+    // ops.
 
     llvm::Type* fp_ty(uint32_t width);
 
@@ -3399,9 +3403,9 @@ private:
 
     Plane lower_ftoi(Inst::Tag tag, Plane v, ValueType to);
 
-    Plane lower_real_mux(Plane cond, Plane a, Plane b);
+    Plane lower_real_mux(Plane cond, bool cond_four, Plane a, Plane b);
 
-    llvm::Value* lower_string_mux(Plane cond, Index a, Index b);
+    llvm::Value* lower_string_mux(Plane cond, bool cond_four, Index a, Index b);
 
     llvm::Value* libm_call(const char* name, llvm::Value* x, llvm::Value* y = nullptr);
 
@@ -3422,9 +3426,9 @@ private:
     // while the hot block does a single W-bit add/sub/mul of the value and
     // duplicates it across both planes (known bits have must == may).
 
-    Plane lower_arith(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_arith(Inst::Tag tag, Plane a, Plane b, bool four);
 
-    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool four);
 
     // A multiply, divide or modulo of two iW values through the runtime routine `routine`
     // (rt_wide_mul, rt_wide_udiv, ...): spill both to word buffers, call, reload.
@@ -3433,36 +3437,36 @@ private:
     // a * b as iW, wrapping: LLVM's `mul` up to `wide_arith_bits`, rt_wide_mul above.
     llvm::Value* lower_mul(llvm::Value* a, llvm::Value* b);
 
-    Plane lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed);
+    Plane lower_pow(Plane a, bool a_four, Plane b, bool b_four, bool base_signed, bool exp_signed);
 
     // -- Bitwise: AND/OR are monotone, so one op on the packed planes does both;
     // the result is never Z, so z is cleared. --
 
     Plane single_bit_lut(uint32_t lut, Plane a, Plane b);
 
-    Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b, bool four);
 
-    Plane lower_bnot(Plane a);
+    Plane lower_bnot(Plane a, bool four);
 
     // -- Reductions -> 1-bit (chained AND/OR/XOR over the bits). --
 
-    Plane lower_reduce(Inst::Tag tag, Plane a);
+    Plane lower_reduce(Inst::Tag tag, Plane a, bool four);
 
-    Plane lower_bit_index(Inst::Tag tag, Plane a);
+    Plane lower_bit_index(Inst::Tag tag, Plane a, bool four);
 
-    llvm::Value* count_bits_pop(Plane a, uint32_t mask);
+    llvm::Value* count_bits_pop(Plane a, bool four, uint32_t mask);
 
-    Plane lower_count_bits(Plane a, uint32_t mask);
+    Plane lower_count_bits(Plane a, bool four, uint32_t mask);
 
-    Plane lower_onehot(Plane a, bool allow_zero);
+    Plane lower_onehot(Plane a, bool four, bool allow_zero);
 
-    Plane lower_isunknown(Plane a);
+    Plane lower_isunknown(Plane a, bool four);
 
-    Plane lower_clog2(Plane a);
+    Plane lower_clog2(Plane a, bool four);
 
     // -- Shifts: X/Z in the count makes the whole result X; value planes shift. --
 
-    Plane lower_shift(Inst::Tag tag, Plane a, Plane amt);
+    Plane lower_shift(Inst::Tag tag, Plane a, bool a_four, Plane amt, bool amt_four);
 
     // -- Comparisons -> 1-bit. X rules differ per operator class (see
     // lower_compare): ==/!= are X only when genuinely ambiguous (LRM 11.4.5),
@@ -3508,15 +3512,17 @@ private:
 
     Plane emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e);
 
+    bool agg_eq_four(Ref type);
+
     Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type);
 
-    Plane lower_compare(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 
-    Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 
     Plane lower_inside_set(Index i);
 
-    Plane lower_wildeq(Plane a, Plane b);
+    Plane lower_wildeq(Plane a, Plane b, bool four);
 
     // -- Logical and/or/not -> 1-bit, three-valued. --
 
@@ -3531,18 +3537,18 @@ private:
     // i1: whether a 2-state value is nonzero, its truth in a logical operator.
     llvm::Value* nonzero(Plane a);
 
-    Plane lower_logical(Inst::Tag tag, Plane a, Plane b);
+    Plane lower_logical(Inst::Tag tag, Plane a, bool a_four, Plane b, bool b_four);
 
-    Plane lower_lnot(Plane a);
+    Plane lower_lnot(Plane a, bool four);
 
-    Plane lower_limplies(Plane a, Plane b);
+    Plane lower_limplies(Plane a, bool a_four, Plane b, bool b_four);
 
-    Plane lower_lequiv(Plane a, Plane b);
+    Plane lower_lequiv(Plane a, bool a_four, Plane b, bool b_four);
 
     // -- Select: known condition selects (one packed select); unknown merges bitwise
     // (X where the arms disagree). --
 
-    Plane lower_select(Plane cond, Plane a, Plane b);
+    Plane lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool four);
 
     // -- Concat / Repl: first operand occupies the most-significant bits. --
 
@@ -3550,9 +3556,9 @@ private:
 
     llvm::Value* reverse_blocks(llvm::Value* v, uint32_t w, uint32_t slice);
 
-    Plane lower_stream_reverse(Plane v, uint32_t slice);
+    Plane lower_stream_reverse(Plane v, bool four, uint32_t slice);
 
-    Plane lower_repl(Plane v, uint32_t part_width, uint32_t count);
+    Plane lower_repl(Plane v, bool four, uint32_t part_width, uint32_t count);
 
     // -- Control flow: if/else with two regions. X/Z condition takes else. --
 
@@ -3795,8 +3801,8 @@ private:
     llvm::GlobalVariable* dpi_caller_proc_gv_ = nullptr; // ptr: calling thread's PCB
     llvm::GlobalVariable* dpi_caller_home_gv_ = nullptr; // i8: calling thread's home region
     llvm::GlobalVariable* dpi_caller_rng_gv_  = nullptr; // ptr: calling thread's RNG state
-    // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
-    std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
+    // Slot-type memo, one `{ iW }` / `{ i(2W)[, iW] }` per (width, domain, has_z).
+    std::vector<std::tuple<uint32_t, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).
     // Instances of one definition share the type; a same-named definition with
     // different fields (different parameterization) gets its own entry.

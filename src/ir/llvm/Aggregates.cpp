@@ -7,12 +7,12 @@ namespace clotho::ir::backend {
 // Leaf slot type for a scalar / real aggregate leaf. A 4-state leaf carries a
 // z plane conservatively (there is no per-leaf may-z analysis under an
 // aggregate), so z assigned to a member is representable; a 2-state / real
-// leaf is the narrow single-iW form.
+// leaf is the native single-iW form.
 llvm::StructType* Backend::agg_leaf_slot_ty(Ref type) {
     const Layout   lay  = mod_.pool.layout(type);
     const uint32_t w    = lay.width == 0 ? 1 : lay.width;
     const bool     four = lay.domain == Domain::Four;
-    return slot_type(w, four, /*has_z=*/four, /*narrow=*/!four);
+    return slot_type(w, four, /*has_z=*/four);
 }
 
 // Recursive LLVM storage type mirroring an (aggregate) IR type: a nested
@@ -101,9 +101,9 @@ void Backend::fill_agg_leaf(LValue& lv, Ref leaf_type) {
     const bool     four = lay.domain == Domain::Four;
     lv.store_width = w;
     lv.width       = w;
+    lv.four_state  = four;
     lv.has_z       = four;
-    lv.narrow      = !four;
-    lv.slot_ty     = slot_type(w, four, four, !four);
+    lv.slot_ty     = slot_type(w, four, four);
     lv.bit_off     = b_.getInt32(0);
 }
 
@@ -141,8 +141,7 @@ void Backend::collect_static_leaves(Ref type, std::vector<uint32_t>& path, std::
         leaf.width       = lay.width == 0 ? 1 : lay.width;
         leaf.four_state  = lay.domain == Domain::Four;
         leaf.has_z       = leaf.four_state;
-        leaf.narrow      = !leaf.four_state;
-        leaf.slot_ty     = slot_type(leaf.width, leaf.four_state, leaf.four_state, !leaf.four_state);
+        leaf.slot_ty     = slot_type(leaf.width, leaf.four_state, leaf.four_state);
     }
     out.push_back(leaf);
 }
@@ -449,13 +448,12 @@ void Backend::emit_agg_deep_copy(Ref                        type,
 }
 
 // One leaf's slot constant from its canonical val / xz planes: `mm` packs
-// must | may << W (or the bare value for a narrow 2-state slot), plus the z
+// must | may << W (or is the bare value for a 2-state slot), plus the z
 // plane when the slot keeps one. The compile-time twin of lower_constant's
 // VPI ingest.
 llvm::Constant* Backend::const_leaf(llvm::StructType*        slot_ty,
                                     uint32_t                 width,
                                     bool                     four_state,
-                                    bool                     narrow,
                                     bool                     has_z,
                                     std::span<const uint8_t> planes) {
     const uint32_t    pb  = plane_bytes(width);
@@ -464,7 +462,7 @@ llvm::Constant* Backend::const_leaf(llvm::StructType*        slot_ty,
       four_state ? apint_from_bytes(planes.subspan(pb, pb), width) : llvm::APInt(width, 0);
 
     std::vector<llvm::Constant*> fields;
-    if (narrow) {
+    if (!four_state) {
         fields.push_back(llvm::ConstantInt::get(ctx_, val));
     } else {
         const llvm::APInt must = val & ~xz;
@@ -479,7 +477,7 @@ llvm::Constant* Backend::const_leaf(llvm::StructType*        slot_ty,
 }
 
 llvm::Constant* Backend::const_slot(const SignalSlot& s, std::span<const uint8_t> planes) {
-    return const_leaf(s.slot_ty, s.width, s.four_state, s.narrow, s.has_z, planes);
+    return const_leaf(s.slot_ty, s.width, s.four_state, s.has_z, planes);
 }
 
 // Recursive baked image for an aggregate constant table, walking the IR type
@@ -514,7 +512,7 @@ llvm::Constant* Backend::const_agg(Ref type, llvm::Type* storage, std::span<cons
     const bool     four = lay.domain == Domain::Four;
     const uint32_t used = (four ? 2u : 1u) * plane_bytes(w);
     llvm::Constant* leaf =
-      const_leaf(llvm::cast<llvm::StructType>(storage), w, four, !four, four, cursor.subspan(0, used));
+      const_leaf(llvm::cast<llvm::StructType>(storage), w, four, four, cursor.subspan(0, used));
     cursor = cursor.subspan(used);
     return leaf;
 }
@@ -561,24 +559,12 @@ llvm::Constant* Backend::slot_const(const SignalSlot& s) {
         // A null handle is all-zero, i.e. slot 0, which is why real slots start
         // at 1: an uninitialized or explicitly nulled event resolves to the
         // reserved null object and its trigger is the no-op LRM 15.5.5 asks for.
-        // Build to the slot's ACTUAL shape: a narrow slot is one iW word, a
-        // wide one packs must | may << W (a handle is definite, so both planes
-        // carry it), and a slot forced to keep a z plane needs that field too.
-        // Assuming the narrow shape here produced a struct initializer with the
-        // wrong field count for a class-property event, whose slot is widened.
-        const uint64_t                h = event_slot_[sidx];
-        std::vector<llvm::Constant*>  fields;
-        if (s.narrow) {
-            fields.push_back(llvm::ConstantInt::get(int_ty(s.width), h));
-        } else {
-            llvm::APInt mm(2 * s.width, 0);
-            mm |= llvm::APInt(2 * s.width, h);
-            mm |= llvm::APInt(2 * s.width, h) << s.width;
-            fields.push_back(llvm::ConstantInt::get(int_ty(2 * s.width), mm));
-        }
-        if (s.has_z) {
-            fields.push_back(llvm::ConstantInt::get(int_ty(s.width), 0));
-        }
+        // An event is a 2-state handle word (its layout is Domain::Two), so its slot
+        // is the native `{ i64 }`, and a handle is definite, so one word carries it.
+        assert(!s.four_state && !s.has_z);
+        const uint64_t               h = event_slot_[sidx];
+        std::vector<llvm::Constant*> fields;
+        fields.push_back(llvm::ConstantInt::get(int_ty(s.width), h));
         return llvm::ConstantStruct::get(s.slot_ty, fields);
     }
     if (s.is_array || s.is_agg) {
@@ -604,8 +590,7 @@ llvm::Constant* Backend::slot_const(const SignalSlot& s) {
         // terminator (already 0 from the zero-fill).
         return str_empty_const();
     }
-    llvm::Constant* mm =
-      s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
+    llvm::Constant* mm = s.four_state ? x_mm(s.width) : zero(s.width);
     std::vector<llvm::Constant*> fields{ mm };
     if (s.has_z) {
         fields.push_back(init_z_plane(s));
@@ -657,7 +642,7 @@ void Backend::emit_array_init(const SignalSlot& s) {
     // handle per element instead of one shared image.
     const bool     evt = std::get<Type>(mod_.pool.get(s.ir_type)).kind == Type::Kind::Event ||
                      types::has_ctor_leaf(mod_.pool, s.ir_type);
-    llvm::Value*   mm  = s.narrow ? zero(w) : (s.four_state ? x_mm(w) : zero(2 * w));
+    llvm::Value*   mm  = s.four_state ? x_mm(w) : zero(w);
     auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
     llvm::Value* base   = storage_ptr(s);
 
@@ -760,7 +745,7 @@ llvm::Constant* Backend::agg_copy_proto(Ref type, const LValue& slv) {
     }
     const SignalSlot& ss   = slot_of(slv.sig);
     auto*             arr  = llvm::ArrayType::get(ss.slot_ty, array_leaf_count(type));
-    llvm::Constant*   leaf = slot_default_const(ss.slot_ty, ss.width, ss.narrow, ss.four_state, ss.has_z);
+    llvm::Constant*   leaf = slot_default_const(ss.slot_ty, ss.width, ss.four_state, ss.has_z);
     auto*             init = llvm::ConstantArray::get(
       arr, std::vector<llvm::Constant*>(arr->getNumElements(), leaf));
     return new llvm::GlobalVariable(env_->llmod, arr, /*isConstant=*/true,
@@ -934,31 +919,17 @@ void Backend::emit_agg_ret_copy(llvm::Value* dst, const LValue& slv, Ref type) {
                           /*service=*/false);
 }
 
-// Element-wise whole-(sub-)array copy for two plain (non-struct) 4-state
-// unpacked arrays of the SAME element width whose z-elided slots differ only in
-// the z word's presence (the dest is may-z, the source proven never-z, or vice
-// versa). A memcpy is invalid (element strides differ); the mm plane is an
-// identical i(2W) in both, so loop over `count` elements copying each mm word
-// and, into a z-capable dest, its z word (0 when the source is never-z).
-// `d_base` / `s_base` point at the first copied element (already offset for a
-// sub-array). `service` wakes the dest's Any-edge readers on any change.
-// Element-wise whole-(sub-)array copy between two storage images whose element
-// slots differ in SHAPE, not just in the z word's presence: one side narrow
-// (a single iW value word), the other the packed must|may pair, or a 2-state
-// pair of differing widths. A memcpy and even a word move are both wrong here,
-// so each element goes through the ordinary lower_load / lower_store pair, which
-// is where narrow <-> packed conversion already lives and is already exercised
-// by every scalar assignment between differently-shaped slots.
-//
-// Reached when the two models meet: a class property or struct member is always
-// in the canonical, type-derived mirror while a module-scope array signal's
-// element slot is may-z-analysed and may be independently widened.
+// Element-wise whole-(sub-)array copy of a 2-state array. Its elements are the
+// native `{ iW }` slots, which the word-move loop of emit_array_zdiff_copy (one
+// packed must|may pair per element) does not address, and a memcpy would not wake
+// the destination's waiters, so each element goes through the ordinary lower_load /
+// lower_store pair, which is exactly how a scalar assignment between two slots of
+// this shape is lowered. A converting copy cannot cheaply prove nothing changed, so
+// it wakes the waiters unconditionally.
 void Backend::emit_array_convert_copy(llvm::Value*      d_base,
                                       llvm::Value*      s_base,
                                       llvm::StructType* d_slot,
                                       llvm::StructType* s_slot,
-                                      bool              d_narrow,
-                                      bool              s_narrow,
                                       uint32_t          leaf_width,
                                       uint32_t          count,
                                       Signal            dsig,
@@ -966,14 +937,13 @@ void Backend::emit_array_convert_copy(llvm::Value*      d_base,
     auto* dst_arr = llvm::ArrayType::get(d_slot, count);
     auto* src_arr = llvm::ArrayType::get(s_slot, count);
 
-    const auto elem_lv = [&](llvm::Value* base, llvm::ArrayType* arr,
-                             llvm::StructType* slot, bool narrow,
+    const auto elem_lv = [&](llvm::Value* base, llvm::ArrayType* arr, llvm::StructType* slot,
                              llvm::Value* idx) {
         LValue lv;
         lv.base        = base;
         lv.slot_ty     = slot;
-        lv.narrow      = narrow;
-        lv.has_z       = !narrow && slot->getNumElements() > 1;
+        lv.four_state  = false;
+        lv.has_z       = false;
         lv.array_ty    = arr;
         lv.elem_idx    = idx;
         lv.store_width = leaf_width;
@@ -995,20 +965,26 @@ void Backend::emit_array_convert_copy(llvm::Value*      d_base,
     b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(count)), body, done);
 
     b_.SetInsertPoint(body);
-    lower_store(elem_lv(d_base, dst_arr, d_slot, d_narrow, idx),
-                lower_load(elem_lv(s_base, src_arr, s_slot, s_narrow, idx)));
+    lower_store(elem_lv(d_base, dst_arr, d_slot, idx), lower_load(elem_lv(s_base, src_arr, s_slot, idx)));
     idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
     b_.CreateBr(head);
 
     b_.SetInsertPoint(done);
-    // A converting copy cannot cheaply prove nothing changed (the two images are
-    // not comparable word for word), so it wakes unconditionally. Correct, and
-    // only reachable for the model-crossing shapes above.
+    // No cheap proof that nothing changed: wake the waiters unconditionally.
     if (service) {
         service_any_waiters(dsig);
     }
 }
 
+// Element-wise whole-(sub-)array copy for two plain (non-struct) 4-state
+// unpacked arrays of the SAME element width whose z-elided slots differ only in
+// the z word's presence (the dest is may-z, the source proven never-z, or vice
+// versa). A memcpy is invalid (element strides differ); the mm plane is an
+// identical i(2W) in both, so loop over `count` elements copying each mm word
+// and, into a z-capable dest, its z word (0 when the source is never-z).
+// `d_base` / `s_base` point at the first copied element (already offset for a
+// sub-array). `service` wakes the dest's Any-edge readers on any change. A 2-state
+// array takes emit_array_convert_copy instead.
 void Backend::emit_array_zdiff_copy(llvm::Value*      d_base,
                                     llvm::Value*      s_base,
                                     llvm::StructType* d_slot,
@@ -1018,19 +994,8 @@ void Backend::emit_array_zdiff_copy(llvm::Value*      d_base,
                                     uint32_t          count,
                                     Signal            dsig,
                                     bool              service) {
-    // A NARROW slot's single word is the value itself, not a must|may pair, so
-    // when the two sides disagree about narrowness the mm words are different
-    // widths and no word move is sound. Route those through the ordinary
-    // load/store pair, which is exactly where narrow <-> packed conversion
-    // already lives; the word-move loop below then only ever sees two packed
-    // slots differing in the z word's presence.
-    const bool d_narrow = d_slot->getNumElements() == 1 &&
-                          d_slot->getElementType(0) == int_ty(leaf_width);
-    const bool s_narrow = s_slot->getNumElements() == 1 &&
-                          s_slot->getElementType(0) == int_ty(leaf_width);
-    if (d_narrow != s_narrow || !four_state) {
-        emit_array_convert_copy(d_base, s_base, d_slot, s_slot, d_narrow, s_narrow,
-                                leaf_width, count, dsig, service);
+    if (!four_state) {
+        emit_array_convert_copy(d_base, s_base, d_slot, s_slot, leaf_width, count, dsig, service);
         return;
     }
     auto* dst_arr = llvm::ArrayType::get(d_slot, count);

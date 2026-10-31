@@ -252,7 +252,7 @@ must be *identical*, not merely both readable. The invariant that makes that hol
 without either side knowing the other:
 
 > A ref actual's storage, and a ref formal's slot, both take the CANONICAL
-> type-derived shape — `has_z = four_state`, `narrow = !four_state` — which is
+> type-derived shape — `has_z = four_state`, and the native `{ iW }` when 2-state — which is
 > exactly the rule an aggregate leaf already followed.
 
 Getting this wrong is silent memory corruption, and it did go wrong twice while

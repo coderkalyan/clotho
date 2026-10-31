@@ -459,51 +459,38 @@ uint32_t Backend::bits_of(llvm::Value* v) {
 
 // Value width W of a plane. A 2-state value's mm IS the iW value; a 4-state
 // value packs must|may into i(2W).
-uint32_t Backend::width_of(Plane a) {
-    return a.two ? bits_of(a.mm) : bits_of(a.mm) / 2;
+uint32_t Backend::width_of(Plane a, bool four) {
+    return four ? bits_of(a.mm) / 2 : bits_of(a.mm);
 }
 
 // The must (low W) and may (high W) halves of a plane. For a 2-state value
 // both are the value itself (must == may, no unknown bits).
-llvm::Value* Backend::must_of(Plane a) {
+llvm::Value* Backend::must_of(Plane a, bool four) {
     if (a.mm == nullptr) {
         // Depth guard: a real value reached an integer-plane lowering; the
         // frontend must convert reals explicitly (float tags), never route
         // them through integer ops.
         throw BackendError{ "internal: integer plane of a real value" };
     }
-    return a.two ? a.mm : b_.CreateTrunc(a.mm, int_ty(width_of(a)));
+    return four ? b_.CreateTrunc(a.mm, int_ty(width_of(a, four))) : a.mm;
 }
 
-llvm::Value* Backend::may_of(Plane a) {
-    if (a.two) {
+// The must half of the value instruction `i` produced, in the domain of its IR type.
+llvm::Value* Backend::must_of(Index i) {
+    return must_of(value_of(i), type_of(i).four_state);
+}
+
+llvm::Value* Backend::may_of(Plane a, bool four) {
+    if (!four) {
         return a.mm;
     }
-    const uint32_t w = width_of(a);
+    const uint32_t w = width_of(a, four);
     return b_.CreateTrunc(b_.CreateLShr(a.mm, w), int_ty(w));
 }
 
 // The z plane, materialized as a zero constant for a 2-state (never-z) value.
-llvm::Value* Backend::z_of(Plane a) {
-    return a.two ? zero(width_of(a)) : a.z;
-}
-
-// The result of a whole-aggregate compare in the encoding of the domain its IR
-// type has: lower_agg_eq builds a 1-bit packed answer for an associative-array
-// compare whatever the leaves are, while the type of an `==` over 2-state leaves
-// is 2-state. This converts a producer's result; it is not a storage or ABI
-// boundary, and an operator never converts its operands.
-Plane Backend::in_type_domain(Plane p, ValueType t) {
-    if (t.is_string || t.is_real) {
-        return p;
-    }
-    if (t.four_state) {
-        assert(!p.two && "a 4-state value is read from packed planes");
-
-        return p;
-    }
-
-    return p.two ? p : two_val(must_of(p));
+llvm::Value* Backend::z_of(Plane a, bool four) {
+    return four ? a.z : zero(width_of(a, four));
 }
 
 // A value that is never x or z, in the encoding of the domain its IR type has.
@@ -513,14 +500,14 @@ Plane Backend::known_plane(llvm::Value* v, bool four_state) {
 
 // Wrap a single iW value as a 2-state Plane.
 Plane Backend::two_val(llvm::Value* v) {
-    return { v, nullptr, true };
+    return Plane{ .mm = v };
 }
 
-// Lift a 2-state value into the 4-state must|may encoding (must == may == v,
-// z = 0); a no-op on an already-4-state value. Used at storage / ABI sinks
-// that still consume the packed i(2W) word.
-Plane Backend::to_four(Plane a) {
-    if (!a.two) {
+// The 4-state must|may encoding of `a` (must == may == v, z = 0) when it is
+// 2-state; `a` itself when `four`. Used where an operator or a storage / ABI sink
+// consumes the packed i(2W) word.
+Plane Backend::to_four(Plane a, bool four) {
+    if (four) {
         return a;
     }
     const uint32_t w = bits_of(a.mm);
@@ -537,12 +524,16 @@ Plane Backend::packed(llvm::Value* must, llvm::Value* may, llvm::Value* z) {
 
 // i1: does this value contain any X/Z bit? Unknown bits are exactly must!=may.
 // A 2-state value never has any.
-llvm::Value* Backend::any_unknown(Plane a) {
-    if (a.two) {
+llvm::Value* Backend::any_unknown(Plane a, bool four) {
+    if (!four) {
         return b_.getFalse();
     }
-    llvm::Value* u = b_.CreateXor(must_of(a), may_of(a));
+    llvm::Value* u = b_.CreateXor(must_of(a, four), may_of(a, four));
     return b_.CreateICmpNE(u, llvm::ConstantInt::get(u->getType(), 0));
+}
+
+llvm::Value* Backend::any_unknown(Index i) {
+    return any_unknown(value_of(i), type_of(i).four_state);
 }
 
 // Pack an i1 must + i1 may into a width-1 Plane (z cleared).
@@ -553,33 +544,33 @@ Plane Backend::bit_plane(llvm::Value* must_i1, llvm::Value* may_i1) {
 // Cast all planes to width `to`. No-op when already that width — avoids a
 // pointless unpack/repack of the packed mm. Preserves the value's domain: a
 // 2-state value stays a single iW.
-Plane Backend::cast_plane(Plane a, uint32_t to, bool sign) {
-    if (width_of(a) == to) {
+Plane Backend::cast_plane(Plane a, bool four, uint32_t to, bool sign) {
+    if (width_of(a, four) == to) {
         return a;
     }
-    if (a.two) {
+    if (!four) {
         return two_val(cast(a.mm, to, sign));
     }
-    return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
+    return packed(cast(must_of(a, four), to, sign), cast(may_of(a, four), to, sign), cast(a.z, to, sign));
 }
 
-// A conversion instruction (ZExt, SExt, Trunc, ToFour, ToTwo). The extension is
-// the opcode's: nothing here reads a sign from a type.
+// A conversion instruction (ZExt, SExt, Trunc, ToFour, ToTwo) from the domain
+// `from` to `to`. The extension is the opcode's: nothing here reads a sign from a type.
 //
 // ToTwo follows LRM 1800-2023 6.3.1: a 4-state value assigned to a 2-state target
 // drops x/z to 0, which is exactly the must plane (must is 0 for both x and z).
 // ToFour duplicates the value into both planes with z = 0.
-Plane Backend::lower_conversion(Inst::Tag tag, Plane a, ValueType to) {
+Plane Backend::lower_conversion(Inst::Tag tag, Plane a, ValueType from, ValueType to) {
     switch (tag) {
         case Inst::Tag::ZExt:
         case Inst::Tag::Trunc:
-            return cast_plane(a, to.width, false);
+            return cast_plane(a, from.four_state, to.width, false);
         case Inst::Tag::SExt:
-            return cast_plane(a, to.width, true);
+            return cast_plane(a, from.four_state, to.width, true);
         case Inst::Tag::ToFour:
-            return to_four(a);
+            return to_four(a, from.four_state);
         default: // ToTwo
-            return a.two ? a : two_val(must_of(a));
+            return from.four_state ? two_val(must_of(a, true)) : a;
     }
 }
 
