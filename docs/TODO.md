@@ -192,6 +192,8 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
   bit/part-selects as the target.
 - [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
+- [ ] **`force` inside a task or function** (10.6.2) — a net force there, and a variable force
+  that no procedural block also holds, is refused: the scan reads procedural blocks only.
 
 ### Real numbers
 

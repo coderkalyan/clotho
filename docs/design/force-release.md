@@ -9,10 +9,12 @@ select or concatenation of a *variable* stays guarded loud.
 Four statements, two priority layers over a signal's ordinary drivers:
 
 - `force lhs = rhs;` (10.6.2) — highest priority. Overrides *every* other driver
-  (procedural, continuous, gate, resolved-net) on `lhs` until released. `rhs` is a
-  **continuous** relationship: re-evaluated whenever it changes. Legal on both nets
-  and variables. May be conditional / impure (`if (c) force x = $random`), so which
-  force is active is a runtime fact.
+  (procedural, continuous, output-port copy, gate, resolved-net) on `lhs` until
+  released. `rhs` is a **continuous** relationship: re-evaluated whenever it changes.
+  Legal on both nets and variables. May be conditional / impure (`if (c) force x =
+  $random`), so which force is active is a runtime fact. On a *variable*, a gate or
+  switch output and a delayed continuous assignment are refused instead (see Lowering
+  (variables)).
 - `release lhs;` — ends the force.
   - Net: reverts **immediately** to the resolved continuous-driver value.
   - Variable: **holds** the forced value until the next procedural write, *unless* a
@@ -53,7 +55,13 @@ conditional / impure-RHS force). We adopt that insight but not the structure:
 ### Forceable set
 
 A pre-pass collects every signal that is a whole-signal `force`/`assign` target. Only
-these carry override state and gated writers. Everything else lowers unchanged.
+these carry override state and gated writers. Everything else lowers unchanged. The
+pre-pass is `scan_force_targets` over every procedural block of the top, in the
+Classify walk: Collect has registered every signal by then, so a target named by
+hierarchy resolves whatever the order of the forcing block and the instance, and every
+site is known before Emit decides which writers to gate. It reads procedural blocks
+only, so a `force` inside a task or function is refused on a net, and on a variable
+that no block forces (docs/TODO.md).
 
 ### Per-forceable-signal state (hidden signals)
 
@@ -95,8 +103,14 @@ A variable driven by a module-level continuous `assign` (`assign v = expr;` at m
 scope, not the procedural statement) is handled the same way as the `assign`-statement
 layer's reestablish: `lower_continuous_assign` appends `force_site` to that driver's
 sensitivity (`with_force_wake`) and the driver is gated through the ordinary path, so
-`release` re-wakes it and reverts. Input/inout-port variables (driven by an external
-port-copy process that is not `force_site`-aware) are guarded loud.
+`release` re-wakes it and reverts. A child's output port copied into the variable
+(`wire_ports`) is the same kind of driver (LRM 4.9.6: an implicit continuous
+assignment) and takes the same gate and wake; `with_force_wake` also reaches each
+operand of a concatenation target. Input/inout-port variables (driven by an external
+port-copy process that is not `force_site`-aware) are guarded loud. So are two drivers
+whose store cannot carry the gate, a gate or switch output and a delayed continuous
+assignment (`assign #d v = e`): the delayed commit has no predicate hook, and 10.6.2
+names neither among the drivers a release reestablishes.
 
 Ordinary procedural writers to `v` (blocking `Store`, nonblocking `StoreNb`) are gated
 `if (force_site == 0 && assign_site == 0) <store + wait-service>`. This gives

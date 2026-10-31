@@ -1201,7 +1201,7 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
                                       const ValueSymbol&               root) {
     const auto sit = sigmap_.find(&canonical_value_symbol(root));
     if (sit == sigmap_.end()) {
-        return; // hierarchical / not-yet-collected: guarded loud
+        return; // a target in another top: lower_proc_assign refuses it (kUnregisteredForce)
     }
     if (!lhs.type->getCanonicalType().isIntegral()) {
         // A whole unpacked array or struct net: its layout width is one element's, so
@@ -1278,7 +1278,7 @@ void Lowerer::register_pca_target(const Expression& lhs, bool is_force) {
     }
     const auto sit = sigmap_.find(&canonical_value_symbol(*sym));
     if (sit == sigmap_.end()) {
-        return; // not registered in this scope (hierarchical): guarded loud
+        return; // a target in another top: lower_proc_assign refuses it (kUnregisteredForce)
     }
     const auto [it, inserted] = forceable_.try_emplace(static_cast<uint32_t>(sit->second));
     ForceInfo& fi             = it->second;
@@ -1435,14 +1435,18 @@ const ValueSymbol* Lowerer::pca_target_var(const Expression& lhs, const char* ve
 }
 
 namespace {
-// What a force whose target the Classify scan never met is refused with. The scan sees
-// every `force` in an initial / always / final block of the top, whatever the order of
-// the instances it names; a target it cannot meet is one in another top (each top lowers
-// with its own signals, docs/TODO.md "Cross-top hierarchical reference") or one that only
-// a force inside a subroutine names.
+// What a force the Classify scan did not register is refused with. The scan sees every
+// `force` in an initial / always / final block of the top, whatever the order of the
+// instances it names. It cannot meet a target in another top (each top lowers with its own
+// signals, docs/TODO.md "Cross-top hierarchical reference"), and it does not read a task or
+// function body: a net site is registered per force statement, so a net force inside a
+// subroutine is never registered, and a variable is forceable only if some block forces it.
+// TODO: a force inside a task or function (LRM 10.6.2) -- needs the scan to read the bodies
+// of the subroutines a procedural block can reach, the package and class ones included.
 constexpr const char* kUnregisteredForce =
-  "force on a target that no force statement of this top's procedural blocks registered is not "
-  "supported: a cross-top hierarchical reference, or a force that only a subroutine holds";
+  "force that this top's procedural-block scan did not register is not supported (a cross-top "
+  "hierarchical reference; inside a task or function, a force of a net or of a variable that no "
+  "procedural block forces)";
 } // namespace
 
 void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder& b) {

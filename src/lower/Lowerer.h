@@ -1877,7 +1877,7 @@ private:
 
     ir::FunctionId net_resolver_fn(uint32_t net);
     // A `force` statement -> (net handle, index into net_force_sites_) so the Emit
-    // lowering reuses the site the Collect scan created.
+    // lowering reuses the site the Classify scan (scan_force_targets) created.
     ankerl::unordered_dense::map<const void*, std::pair<uint32_t, uint32_t>> stmt_force_site_;
 
     const ValueSymbol* force_target(const Expression& lhs, bool* is_net);

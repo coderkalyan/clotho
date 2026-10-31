@@ -1077,3 +1077,43 @@ TEST_CASE("force: a target in another top-level module is rejected") {
         CHECK_MESSAGE(err.find("cross-top hierarchical reference") != std::string::npos, err);
     }
 }
+
+// A `force` inside a task or function is not seen by the scan of the procedural blocks that
+// registers the force sites. A net site is registered per force statement, so a net forced in
+// a subroutine has none, even when a procedural block forces the same net; a variable is
+// forceable when some block forces it, so a variable forced only in a subroutine is not.
+// Each is refused with the message that says so rather than run with the force lost
+// (docs/TODO.md "`force` inside a task or function"). No oracle: the LRM allows the force
+// anywhere a statement is.
+TEST_CASE("force: a force inside a task or function that no procedural block registers is rejected") {
+    for (const std::string_view src :
+         { "module m; logic v; task automatic t(); force v = 1'b0; endtask initial t(); endmodule",
+           "module m; logic v; function automatic void f(); force v = 1'b0; endfunction initial f(); endmodule",
+           "module m; wire w; task automatic t(); force w = 1'b0; endtask initial t(); endmodule",
+           "module m; wire w; task automatic t(); force w = 1'b0; endtask\n"
+           "initial begin t(); force w = 1'b1; release w; end endmodule" }) {
+        const std::string err = lower_error(src);
+        CHECK_MESSAGE(err.find("inside a task or function") != std::string::npos, err, " for ", src);
+    }
+}
+
+// The boundary of that refusal: a variable that a procedural block also forces is forceable, so
+// the force inside the task is exact. LRM 10.6.2: the force holds 0 until the release, which
+// reestablishes the continuous assignment (a=1).
+TEST_CASE("force: a variable forced in a task and in a procedural block takes both") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a = 1, v;
+            assign v = a;
+            task automatic t(); force v = 1'b0; endtask
+            initial begin
+                #1 t();
+                #1 $display("v=%b", v);
+                release v;
+                #1 $display("v=%b", v);
+                $finish;
+            end
+            initial begin #10 force v = 1'b1; release v; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "v=0\nv=1\n");
+}
