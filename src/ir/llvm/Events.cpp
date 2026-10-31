@@ -1463,27 +1463,49 @@ void Backend::emit_event_pend(llvm::Value* obj) {
 }
 
 // Drain the NBA pending chain: fire every `->> e` staged this instant, clearing
-// each object's pending mark as it goes. Reads `next` before firing, because a
-// waiter woken by the fire may itself `->>` another event -- that link goes onto
-// the (now empty) head and is drained by the NBA region's next pass, which is
-// the deferral LRM 15.5.4 asks for.
+// each object's pending mark as it goes. `->> e` creates a nonblocking assign update
+// event that triggers the event in the NBA region (LRM 15.5.1), and NBAs are performed in
+// the order their statements executed (4.6 b)), so the events trigger in that order: the
+// records a `<= @e` control holds commit in the order their events occurred
+// (docs/LRM_NOTES.md, note 51). The chain links the newest event first, so it is reversed
+// before the walk. Reads `next` before firing, because a waiter woken by the fire may
+// itself `->>` another event -- that link goes onto the (now empty) head and is drained
+// by the NBA region's next pass, which is the deferral LRM 15.5.1 asks for.
 void Backend::emit_event_pend_drain(llvm::Value* wheel) {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* null = llvm::ConstantPointerNull::get(ptr);
-    auto* fn   = b_.GetInsertBlock()->getParent();
-    auto* head = llvm::BasicBlock::Create(ctx_, "evpend.walk", fn);
-    auto* body = llvm::BasicBlock::Create(ctx_, "evpend.fire", fn);
-    auto* done = llvm::BasicBlock::Create(ctx_, "evpend.drained", fn);
+    auto* ptr   = llvm::PointerType::getUnqual(ctx_);
+    auto* null  = llvm::ConstantPointerNull::get(ptr);
+    auto* fn    = b_.GetInsertBlock()->getParent();
+    auto* flip  = llvm::BasicBlock::Create(ctx_, "evpend.flip", fn);
+    auto* relnk = llvm::BasicBlock::Create(ctx_, "evpend.relink", fn);
+    auto* head  = llvm::BasicBlock::Create(ctx_, "evpend.walk", fn);
+    auto* body  = llvm::BasicBlock::Create(ctx_, "evpend.fire", fn);
+    auto* done  = llvm::BasicBlock::Create(ctx_, "evpend.drained", fn);
 
-    llvm::Value* headp = sym(event_pend_head_gv_);
-    llvm::Value* first = b_.CreateLoad(ptr, headp);
+    llvm::Value* headp  = sym(event_pend_head_gv_);
+    llvm::Value* newest = b_.CreateLoad(ptr, headp);
     b_.CreateStore(null, headp);
     auto* entry = b_.GetInsertBlock();
-    b_.CreateBr(head);
+    b_.CreateBr(flip);
+
+    // Reverse the chain in place: `cur` walks it newest first, `oldest_first` is the
+    // part already relinked.
+    b_.SetInsertPoint(flip);
+    llvm::PHINode* cur          = b_.CreatePHI(ptr, 2);
+    llvm::PHINode* oldest_first = b_.CreatePHI(ptr, 2);
+    cur->addIncoming(newest, entry);
+    oldest_first->addIncoming(null, entry);
+    b_.CreateCondBr(b_.CreateICmpNE(cur, null), relnk, head);
+
+    b_.SetInsertPoint(relnk);
+    llvm::Value* older = b_.CreateLoad(ptr, event_field(cur, kEventNextPend));
+    b_.CreateStore(oldest_first, event_field(cur, kEventNextPend));
+    cur->addIncoming(older, relnk);
+    oldest_first->addIncoming(cur, relnk);
+    b_.CreateBr(flip);
 
     b_.SetInsertPoint(head);
     llvm::PHINode* n = b_.CreatePHI(ptr, 2);
-    n->addIncoming(first, entry);
+    n->addIncoming(oldest_first, flip);
     b_.CreateCondBr(b_.CreateICmpNE(n, null), body, done);
 
     b_.SetInsertPoint(body);

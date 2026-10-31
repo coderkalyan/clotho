@@ -407,8 +407,9 @@ event cannot join. Replace with an **intrusive pending chain** through
 
 - `->> e` sets `obj->pending` and, if it was clear, links the slot onto a runtime
   head `g_event_pending`.
-- The NBA region walks the chain, calling `clotho.event_fire` per entry, clearing
-  `pending`, and emptying the chain.
+- The NBA region reverses the chain (it links the newest first) and walks it oldest first,
+  calling `clotho.event_fire` per entry, clearing `pending`, and emptying the chain. Events
+  trigger in the order their `->>` executed (LRM 4.6 b)).
 - `emit_nba_any_staged` (`:8586-8606`) gains `g_event_pending != 0`; `has_nba`
   (`:8871-8873`) gains "the design contains any `->>`".
 

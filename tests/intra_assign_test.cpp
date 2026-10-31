@@ -2287,3 +2287,68 @@ TEST_CASE("a plain NBA to a runtime-offset select of a very wide vector that tak
         endmodule)");
     CHECK(run.err.find("very wide vector that also takes a timed nonblocking assignment") != std::string::npos);
 }
+
+// `->> e` creates a nonblocking assign update event that triggers the event in the NBA
+// region (15.5.1), and NBA updates are performed in the order their statements executed
+// (4.6 b)). The pending chain was drained newest first, so two `->>` of one instant
+// triggered their events in the reverse of that order, and the records they release
+// committed that way round: `->> e2; ->> e1;` left the update of e2 last.
+// Oracle: the clauses; iverilog 13 does not implement `->>`.
+TEST_CASE("nonblocking event triggers occur in the order they executed") {
+    SUBCASE("the second event first") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    #1 ->> e2; ->> e1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+    SUBCASE("statement order") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    #1 ->> e1; ->> e2;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("three events") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2, e3;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    x <= @e3 8'd3;
+                    #1 ->> e3; ->> e1; ->> e2;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("a delayed trigger and an immediate one of the same instant") {
+        // `->> #1 e1` is armed first and fires at t=1 (the wheel pends it before any
+        // process runs); `->> e2` executes at t=1. The pending chain holds e1 then e2.
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    ->> #1 e1;
+                    #1 ->> e2;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+}

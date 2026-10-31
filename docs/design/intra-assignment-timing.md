@@ -458,6 +458,12 @@ paths) and before an event object's records are counted down (`emit_event_fire`)
 links its record and closes the batch, so what is released later goes behind it, and a zero
 delay is its own moment like a plain NBA.
 
+The NBA region triggers a `->> e` event as an update event created when its statement
+executed, so the events pending in one pass trigger in the order their `->>` ran, and the
+records they release commit in that order. The pending chain links the newest first, and the
+drain reverses it before the walk (`emit_event_pend_drain`). A `->> #d e` is created when its
+delay elapses, so it goes ahead of one a process executes in that instant.
+
 A signal with no timed NBA compiles to what it did before, and so does a design that has no
 `<= @`. A plain NBA to a signal that has a timed one pays a load of `rt_intra_total`, and the
 `rt_intra_ready_count` call and the copy only while a record is waiting somewhere. A change
