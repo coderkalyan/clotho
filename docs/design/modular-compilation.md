@@ -2,17 +2,18 @@
 
 Status: steps 1 and 2a/2b/2c are on this branch (2d, lowering a specialization
 once, is not), and step 3, the backend per unit, is under way: layout, records,
-groups, functions and tasks are lowered once per unit (3a-3c; see each below
-for what is left). The frontend's output is a `Design` (src/ir/Design.h)
-with one unit per specialization wherever its instances lower identically, which
-`flatten` expands back into the flat module the backend consumes (`clotho run
---stat=units` reports what is still split: none on rocket-chip, nor on a design
-whose instances print `%m`, report through assertions and build covergroups).
-The frontend still lowers every instance, and the whole-design analyses still
-decide the layout; `module-split.md` describes the LLVM-level partition. An
-instance's own path is read through `inst_path`, which the flat backend resolves
-from the instance a body belongs to (a borrowed constant string); it costs a
-body nothing until a report fires.
+groups, functions and tasks are lowered once per unit (3a-3c), each unit has
+its own LLVM module named by the unit with the instance glue in root, and the
+gate test passes (3e; see each below for what is left). The frontend's output
+is a `Design` (src/ir/Design.h) with one unit per specialization wherever its
+instances lower identically, which `flatten` expands back into the flat module
+the backend consumes (`clotho run --stat=units` reports what is still split:
+none on rocket-chip, nor on a design whose instances print `%m`, report through
+assertions and build covergroups). The frontend still lowers every instance, and
+the whole-design analyses still decide the layout; `module-split.md` describes
+the LLVM-level partition. An instance's own path is read through `inst_path`,
+the address of a borrowed constant string held in the instance's record; it
+costs a body nothing until a report fires.
 
 Goal: compile an SV design as a composition of small units, so compilation can
 be incremental, cached and parallel. The aim is an architecture whose unit
@@ -547,10 +548,26 @@ code go.
      each committed signal's bits. What a park or self-start stores into the
      scheduled flag is every trigger bit whether or not the design guards a
      group, so no unit's code depends on that.
-   - **3e, root as link glue.** Instance records, the scheduling plan, the
-     seed loop, NBA, VCD and covergroup tables are built from the instance
-     table; flatten stops copying bodies and becomes the link step's instance
-     expansion.
+  - **3e, root as link glue (partly landed).** Landed: one LLVM module per
+    Design unit, named by the unit's key (`InstanceScope::unit_key`: the
+    definition name, plus a body hash when several units share it) and holding
+    only that unit's code under unit-key symbols; instance storage, records, the
+    per-instance trampoline of a one-row schedule group (the entry itself is
+    unit code taking the record), dispatchers, the shared queues and the wheel's
+    trampolines are defined in root whichever unit asked first; a unit's
+    declarations of root globals carry no size. Gate (tests/modular_gate_test.cpp,
+    `ir::emit_llvm_modules`, `clotho build --emit llvm-units`): compiling a
+    design of several modules with several instances each, and a package,
+    twice with one definition's body edited changes that unit's module and no
+    other unit's; every unit module names no instance. Still open: NBA block
+    commit functions live in root (block ids are already record base plus
+    ordinal; the commit function would take a block descriptor and sit in the
+    writer's unit), the seed loop and record fills are root code rather than
+    tables built from the instance table, and flatten still copies bodies per
+    instance. What still makes a unit module depend on outside it: lowerings the
+    taint list keeps per instance (they name `clotho.inst.<hier>.*` globals),
+    `clotho.expect<monitor>` queue names, and the intern pool's type and class
+    numbers (step 5).
 4. **Summaries and the link step** replace the whole-design `analyze()`.
 5. **Caches and parallelism.** Per-unit intern pools (cross-unit types match by
    structure, nominal types by unit and name), content keys, an object cache,

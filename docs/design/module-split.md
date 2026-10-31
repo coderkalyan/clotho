@@ -13,43 +13,30 @@ and the backend compiles independently.
 
 ## Partition
 
-Unit = the definition's state struct type (`Anchor::ty`, keyed on `def_name`
-plus the slot types of the definition's own signals), so two parameterizations
-with identical own-signal types share one module. The process-body hash set the
-twin detector computes (`--stat=dedup`) is not part of the key.
+Unit = a `ir::Design` unit (one specialization), keyed by `InstanceScope::unit`;
+a scope built without a unit is a unit of its own. Its module is named by the
+unit key (`InstanceScope::unit_key`, from flatten): the definition name, plus a
+hash of the unit's body when several units share the name.
 
-- `M_def(key)`: the fusion groups of the definition's instances (a group
-  never mixes instances, so each belongs to one scope), plus the entry of a
-  schedule group that runs exactly one such group. Every instance,
-  singletons included, addresses its storage through its instance ctx record;
-  a `.ctx` global is created in whichever module first needs it.
-- `M_root`: everything else -- state globals and power-on initializers, wait
-  queues, every function and task, NBA commit functions, `main` / `sim_drain`
-  / finals, the seed loop, DPI export thunks, package/`$unit` (`no_scope`)
-  processes and the dispatchers of schedule groups that run the groups of
-  several instances. `$dumpvars` emits its whole-tree registration inline in the
-  calling process's module, and the lazily created
-  singletons (`clotho.active`, `enqueue_timer`, `ev_delay`, `shadow_base`)
-  land in the first module that needs them.
+- `M_unit`: the groups of the unit's instances, lowered once per family of
+  instances that lower alike and run with the instance's record; the functions
+  and tasks of the unit, once per family; the entry of a schedule group of one
+  row (it takes the record).
+- `M_root`: everything else -- instance storage, records, wait queues, the
+  trampoline each instance's one-row group hands the entry its record through,
+  dispatchers of schedule groups spanning instances, NBA block commit functions
+  (not yet in the writer's unit), `clotho_main` / `sim_drain` / finals, the seed
+  loop, DPI export thunks, package/`$unit` processes, and the lazily created
+  singletons (rings, `clotho.enqueue_timer`, `clotho.ev_delay`, trampolines),
+  which are defined in root whichever unit asked first.
 
-A thunk group is a function taking its instance's record
-(`@clotho.inst.<hier>.ctx`) as its first parameter (and, when it guards its
-members, the wake word whose trigger bits the guards test): a ROW. It runs its
-members inline and addresses its own instance through the record, its NBA block
-ids at the record's field for its front process; signals of other instances stay
-absolute. What the scheduler holds is the entry of a SCHEDULE GROUP: the rows
-that wait on the very same (signal, edge) set, whichever instances and units
-they belong to, share one subscription and one scheduled flag. The entry owns
-the flag timeline (held across every row), re-arms it, and calls each row with
-its record in rank order. A schedule group of one row puts its entry in the
-row's own unit module, where the inliner can fold the body into it; a schedule
-group of several rows spans units, so its dispatcher is root glue, with no
-member cap and calls that cannot inline (a 256-member comb group measured 3.7x
-sim this way on combchain before comb fusion went per instance, while the real
-core populations -- 2-7 member clocked groups, picorv32 -- are wall-neutral).
-Identical row bodies of one unit's twins are merged by their printed text, so
-twins compile once. A coroutine group is one function over one frame, so it is
-its own schedule group, as before.
+What the scheduler holds is the entry of a SCHEDULE GROUP: the rows that wait on
+the very same (signal, edge) set, whichever instances and units they belong to,
+share one subscription and one scheduled flag. The entry owns the flag timeline,
+re-arms it, and calls each row with its record in rank order. One row's entry is
+unit code beside a body the inliner may fold in; several rows span units, so the
+dispatcher is root glue and its row calls stay calls (`NoInline`). A coroutine
+group is one function over one frame, so it is its own schedule group.
 
 ## Context and types
 
@@ -89,157 +76,22 @@ group at startup, so the whole design is always reachable. ObjectCache keys on
 changes other units' ctx *values* (root-filled), not their code, by
 construction of the anchors work.
 
-## Cache stability: fully relocatable def modules (approved direction)
+## Cache stability
 
-Goal: def-module object bytes are a pure function of (definition content,
-instance name list) — a body edit in def A never changes def B's bytes, only
-root's symbol values. Everything resolves at JIT link, zero runtime cost.
-Numbers shift on edits; hierarchy-derived *names* don't. No ObjectCache yet —
-these phases only make the objects cacheable.
+A unit module's text is a function of the unit and the facts its context
+imposes on it (modular-compilation.md, "Code generation"): its symbols lead
+with its unit key, its code reaches its instance through the record it is handed
+and other units through bindings, and what it names in root is a link symbol
+with a stable name (`clotho.nba_block_enqueue`, `clotho.active*`, `clotho.rng`,
+`clotho.wheel`, `clotho.enqueue_timer`), declared without a size. The
+modular-compilation gate test (tests/modular_gate_test.cpp) checks that an edit
+to one definition changes only that unit's module. `clotho build --emit
+llvm-units -o <dir>` writes one file per module for looking at it.
 
-Two mechanism classes:
-
-- **Address families → real data symbols + standard relocations.** Split the
-  monolithic `@clotho.state` into per-instance-scope globals
-  (`@clotho.inst.<hier>.state`, own signals only — children get their own
-  globals; unscoped signals keep a root `@clotho.state`). Def code addresses
-  `symbol + def-local offset`: same link-time-constant codegen shape as
-  today's constant anchors (pico FastISel win preserved), def-stable bytes.
-  Same treatment: per-scope sched arrays, per-instance NBA shadow globals,
-  wait queues (already per-signal globals — need hier-stable names). The
-  GlobalAlias-into-interior route stays dead (JITLink bounds validation).
-- **Integer-id families → loads of root-defined value globals.** VCD var
-  index, NBA block id, trigger id, array/intra buffer ids are immediates,
-  not addresses. A unit-module use is a 4-byte load of
-  `@clotho.idval.<family>.<hier>[+ordinal]`, an i32 the ROOT module defines
-  with the value baked (root always recompiles, so no cache-stability cost;
-  the unit carries only the hierarchy-derived symbol name). The
-  absolute-symbol relocation scheme was tried first and REVERTED: a
-  truncating-ptrtoint constant in operand position makes SelectionDAG (the
-  -O0 fallback for blocks FastISel misses) keep the symbol address live
-  function-wide and spill it — measured +3KB codegen on the extracted pico
-  core thunk vs the literal floor, with the instruction form no better; the
-  load form lands within 1.7KB of the floor with no spill cascades (llc A/B:
-  72248 / 72169 / 70992 / 69298 B). Root-side code keeps plain immediates.
-
-Shadow opacity (Zen4 memory-renaming hazard): per-instance shadow globals are
-accessed through per-instance root-filled base-pointer globals
-(`@clotho.inst.<hier>.shadow_base`) — one load, exactly today's cost, opacity
-preserved, def-stable symbol reference. Direct symbol addressing of shadow is
-a later experiment gated on the wideff resync-counter signature.
-
-Shared twin bodies keep the ctx-parameter indirection (one body cannot be
-relocated two ways); unshared bodies use direct per-instance symbols. This
-replaces the old absolute-vs-ctx `def_relative_for` split with
-shared-vs-unshared.
-
-Unavoidable costs, accepted: root always recompiles (whole-design tables,
-seed loop, symbol values); hierarchy renames/restructures invalidate
-dependent def modules; per-instance stubs regenerate; symbolic immediates
-materialize as relocated movs.
-
-State-split measured cost (2026-07-13, S1-S3 landed): tier-0 sim neutral
-across the corpus (hazard3 instructions identical, L1d misses −18% after
-dropping the 64-byte scope-global over-alignment, wall within noise; wideff
-Zen4 resync gate clean at ~106K vs the hazard's ~101M). picorv32 `-O` pays
-~+2% cycles (wall +4-5% on a noisy box): L1i misses +30% with instructions,
-L1d, branches, and resyncs flat — a code-layout effect of multi-symbol
-addressing under the O3 pipeline, not a data-path cost. Accepted: `-O` is
-opt-in, and the -O tier rework (the FastISel ceiling) is the right place
-to revisit code layout.
-
-## Phasing
-
-Approved scope (2026-07-13): through integer-id relocs; no ObjectCache yet.
-State split deliberately lands *before* the module split — it is the delicate
-piece, verified in isolation on the single-module pipeline; the module split
-then externalizes real symbols instead of interior GEPs.
-
-1. **ModuleEnv + sym() funnel** (landed, "backend: route cross-unit symbol operands through ModuleEnv::sym"): all cached symbol members
-   used as IR operands route through `sym()`; single env; byte-identical.
-   Misses are caught by the per-module verifier once emission splits.
-2. **State split** (single module still):
-   a. per-scope state globals (own signals only; shadow leaves the root
-      struct and becomes its own global(s)); slot paths become scope-relative
-   b. per-instance shadow globals behind per-instance base-pointer globals
-   c. per-scope sched arrays
-   Gate each step: identical sim output on the perf corpus + full suite;
-   wideff resync signature; pico -O spot check (constant-anchor shape must
-   survive).
-3. **Split emission**: one env per unit + root, `lower_group` looped by owning
-   unit (a fusion group → its instance's unit; the dispatcher of a schedule
-   group over several instances, functions/tasks, commit fns, all machinery →
-   root, V1), per-module
-   `lower_coroutines` + verify, one `addIRModule` per unit, `--no-split`
-   escape hatch. Gate: `--no-split` byte-identical to pre-split; split mode
-   sim-output identical; compile time neutral or better.
-4. **Symbol hygiene**: def-local function naming (`@<defkey>.p<local>` +
-   per-instance stubs), hier-stable wait-queue / event / ctx symbol names.
-5. **Integer-id relocs**: absolute-value symbols, upfront `absoluteSymbols()`
-   registration in Jit.cpp; def bodies emit relocated immediates; drop
-   ctx-loads that existed only for id renumbering (shared bodies keep ctx).
-6. **Parallel codegen** (landed, feat/orc-parallel-compile): bitcode round-trip
-   per module into its own `LLVMContext` + thread pool +
-   `LLJITBuilder::setNumCompileThreads`, not a `Backend`-level
-   per-module-context rewrite (see "Context and types" above).
-7. Later, out of scope now: ObjectCache; direct-symbol shadow addressing
-   experiment.
-
-## Status (2026-07-14)
-
-Landed on refactor/module-env: sym() funnel ("backend: route cross-unit symbol operands through ModuleEnv::sym"), state split S1-S3
-("backend: split design state into per-scope globals", "backend: split NBA shadow into per-instance globals", "backend: split scheduled flags into per-scope arrays"), split emission ("backend: split emission into root + per-definition modules"), def-local naming
-("backend: def-local, instance-qualified names for unit-module processes"), integer-id absolute symbols ("backend: integer design-numbering ids as absolute-symbol relocations"). Suite 991/991 with split
-default-on; corpus sim outputs identical in both modes; --no-split
-byte-identical to the pre-split build; compile time neutral.
-
-OPEN — split-mode sim regression: combchain +29% cycles (sim-phase branch
-misses 5.7M -> 24.8M), pico +5.7% sim, wideff +14% sim. DIAGNOSIS (revised
-2026-07-14 — NOT placement): identical IR does not give identical machine
-code. objdump of the jitted wideff hot thunk shows FastISel emits different
-code depending on symbol linkage: with the state global promoted internal ->
-external dso_local (sym()'s cross-unit promotion), the address is
-materialized once and stack-spilled/reloaded on always-executed paths, where
-the internal form re-movabs'd per use (split thunk: 778 vs 1040 movabs, 524
-fewer static instructions, yet more executed per activation). Measured
-sim-phase deltas: wideff +7.5% instructions (+416/cycle, mispredicts
-near-flat); pico +6.7% instructions; combchain instead shows taken-branch
-mispredicts 2.7M -> 13.4M (indirect flat — dispatch/stub theories dead),
-plausibly downstream of the same codegen shift moving branch layout in its
-giant root thunks. Supporting facts: post-pipeline IR byte-identical modulo
-absid immediates; addIRModule order reversal is a no-op perturbation
-(materialization order is dependency-driven from lookup("clotho_main")); miss
-counts run-stable under ASLR; --perf-jitdump inflates branch-misses ~7x
-(never attribute misses under it); compile-phase counters clean everywhere.
-
-FIXED ("backend: mark sym() cross-unit declarations dso_local"): sym() created its cross-unit declarations without
-dso_local — a non-dso_local external is addressed conservatively (address
-stack-spilled/reloaded on hot paths). Marking the declarations dso_local
-(everything links into one JIT dylib) restored the direct form: wideff
-instruction bloat gone (below no-split), combchain flipped to a WIN (cycles
-+29% -> -7.5% vs no-split, taken-mispredicts 13.4M -> 3.5M), pico compile
--4%. Follow-up: absid addend folded into the symbol
-reference as a byte GEP — one relocated movabs per id, no add.
-
-RESIDUAL: pico split sim +4% (compile -4%; net wall ~+1%). Attribution
-bottoms out in sampling artifacts: sim_drain's IR is byte-identical modulo
-unit-fn renames (3205 lines both, 170 rename-pair diff) yet gets +18%
-instruction attribution — return-skid from callees; the hot core thunk's
-own attribution is equal between modes. The idval load form eliminated the
-absid spill cascades (hot thunk codegen now within 1.7KB of the literal
-floor). Remaining candidates if this is ever worth more: IBS (skid-free)
-attribution, per-activation instruction microbench of one unit thunk in
-isolation. Split default stays ON in the branch; final default decision at
-merge weighs pico's +4% sim / -4% compile against combchain's -7.5% win
-and the caching payoff.
-
-Also fixed in flight: a zero-valued integer id defined its @clotho.absid.*
-symbol at address null, which the RTDyld object layer (--perf-jitdump path)
-reports as unresolved and aborts — values are registered +1 with the -1
-folded into the relocation addend ("backend: bias absolute-id symbol values by +1").
-
-Split stays default-on within the branch for soak; the default must be
-re-decided on measurement before any merge to main.
+Integer ids of design-wide spaces (VCD variables, NBA blocks, triggers, buffers)
+are record fields (base plus unit-local ordinal), not immediates or symbols.
+Measured history of the earlier symbol-relocation experiments (absolute-symbol
+ids, per-scope state globals) is in git history.
 
 ## Known landmines
 
