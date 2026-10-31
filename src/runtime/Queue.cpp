@@ -9,7 +9,7 @@
 // growing the ring and dropping a bounded queue's overflow.
 //
 // Built twice. The runtime compiles this file like every other source. CMakeLists
-// also compiles it to LLVM bitcode with CLOTHO_RT_BITCODE defined, and the backend
+// also compiles it to LLVM bitcode with CLOTHO_BITCODE_IMAGE defined, and the backend
 // links the element operations a module calls into that module
 // (ir/llvm/RuntimeBitcode.cpp), where the element descriptor is a constant the
 // optimizer folds through. Both builds copy and destroy a managed element through
@@ -216,7 +216,7 @@ extern "C" void rt_queue_append_range(rt_queue*            dst,
     }
 }
 
-#if !defined(CLOTHO_RT_BITCODE)
+#if !defined(CLOTHO_BITCODE_IMAGE)
 // Geometric growth keeps repeated push amortised O(1). The new buffer holds the
 // live elements contiguously from head == 0.
 extern "C" void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site* site) {
