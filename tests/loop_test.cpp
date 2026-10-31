@@ -2121,6 +2121,32 @@ TEST_CASE("a disabled block's process parked on an event keeps its pending repor
     }
 }
 
+// The counter that drops a pending report belongs to the instance whose procedure holds
+// the assertion, whichever instance's code disables the procedure (LRM 16.4.4).
+TEST_CASE("a disable from another instance drops the deferred reports of the procedure") {
+    const test::DesignRun dropped = test::run_design_captured(R"(
+        module child;
+          bit a = 0;
+          initial begin : P
+            #5;
+            assert #0 (a) else $error("pending report of child.P");
+            #20 $display("FAILED: P not disabled");
+          end
+        endmodule
+        module t;
+          child c();
+          initial begin
+            #5;
+            fork #0 ; join
+            disable c.P;
+          end
+          initial #10 $display("end %0t", $time);
+        endmodule
+    )");
+    CHECK(dropped.out == "end 10\n");
+    CHECK(dropped.err.find("pending report") == std::string::npos);
+}
+
 // The children of a fork a block holds are ended with it only when the fork is lexically
 // inside the block. One reached through a virtual call (any override in the design may
 // be the one that runs) or a randsequence production (lowered to a function of its own)
