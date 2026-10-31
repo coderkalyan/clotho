@@ -1152,6 +1152,14 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     // check the value that is about to be written.
     emit_encoding_check(rhs, lv.four_state, cur_inst_);
 
+    // A constant select writes the words that hold its bits, not the whole slot.
+    if (!selects_whole(lv)) {
+        if (const auto win = static_window(lv)) {
+            store_window(lv, *win, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, rhs);
+            return;
+        }
+    }
+
     const uint32_t s_width = lv.store_width;
     llvm::Value*   mp      = lv_mm_ptr(lv);
 
@@ -1242,6 +1250,19 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
     }
 
     llvm::Value* mp = shadow_ptr(s, s.sh_mm_field);
+
+    // A constant select stages into the words that hold its bits, and marks only
+    // those in the dirty mask.
+    if (s.nba_partial && !selects_whole(lv)) {
+        if (const auto win = static_window(lv)) {
+            store_window(lv, *win, mp, s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr, rhs);
+            if (s.nba_dyn) {
+                set_bits(shadow_ptr(s, s.sh_mask_field), s.width, win->at, win->len);
+            }
+            register_block_store(lv, s);
+            return;
+        }
+    }
 
     // 2-state target: stage the single iW value into the iW shadow. No z.
     if (!s.four_state) {

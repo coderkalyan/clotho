@@ -294,6 +294,121 @@ llvm::Value* Backend::merge_sel(llvm::Value*      old,
     return b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), placed);
 }
 
+// The window a constant select reads and writes, or nothing when it is not one or
+// the slot is no wider than a word in each plane, where the whole slot already is the
+// word. The in-range bits are the constant mask's, or all of them without one.
+std::optional<Backend::StaticWindow> Backend::static_window(const LValueInfo& lv) {
+    const auto*    off   = llvm::dyn_cast_or_null<llvm::ConstantInt>(lv.bit_off);
+    const uint32_t field = lv.four_state ? 2 * lv.store_width : lv.store_width;
+    if (off == nullptr || field <= 64 || lv.wide_dyn || lv.nest_valid != nullptr || lv.range_mask_outer ||
+        lv.is_string || lv.is_handle) {
+        return std::nullopt;
+    }
+    const int64_t first = off->getSExtValue();
+    if (lv.range_mask == nullptr) {
+        return StaticWindow{ static_cast<uint32_t>(first), 0, lv.width };
+    }
+    const auto* m = llvm::dyn_cast<llvm::ConstantInt>(lv.range_mask);
+    if (m == nullptr) {
+        return std::nullopt;
+    }
+    const llvm::APInt& bits = m->getValue();
+    const uint32_t     lo   = bits.countr_zero();
+    const uint32_t     hi   = bits.getBitWidth() - bits.countl_zero();
+    return StaticWindow{ lo, static_cast<uint32_t>(lo - first), hi - lo };
+}
+
+// The 64-bit words [lo / 64, (lo + n - 1) / 64] of the plane, and where the run
+// starts in them. A plane of at most a word is loaded whole: it is smaller than the
+// word a window would address.
+static llvm::Value* bit_words(llvm::IRBuilder<>& b,
+                              llvm::Value*       ptr,
+                              uint32_t           field_bits,
+                              uint32_t           lo,
+                              uint32_t           n,
+                              llvm::Type*&       ty,
+                              uint32_t&          shift) {
+    if (field_bits <= 64) {
+        ty    = b.getIntNTy(field_bits);
+        shift = lo;
+        return ptr;
+    }
+    const uint32_t w0 = lo / 64;
+    const uint32_t w1 = (lo + n - 1) / 64;
+    ty                = b.getIntNTy(64 * (w1 - w0 + 1));
+    shift             = lo % 64;
+    return w0 == 0 ? ptr : b.CreateConstInBoundsGEP1_64(b.getInt64Ty(), ptr, w0);
+}
+
+llvm::Value* Backend::load_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, uint32_t n) {
+    llvm::Type*  ty;
+    uint32_t     shift;
+    llvm::Value* p = bit_words(b_, ptr, field_bits, lo, n, ty, shift);
+    llvm::Value* v = b_.CreateAlignedLoad(ty, p, field_bits <= 64 ? llvm::MaybeAlign() : llvm::MaybeAlign(8));
+    return cast(shift == 0 ? v : b_.CreateLShr(v, shift), n, false);
+}
+
+void Backend::store_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, llvm::Value* v) {
+    const uint32_t n = bits_of(v);
+    llvm::Type*    ty;
+    uint32_t       shift;
+    llvm::Value*   p     = bit_words(b_, ptr, field_bits, lo, n, ty, shift);
+    const auto     width = ty->getIntegerBitWidth();
+    const auto     align = field_bits <= 64 ? llvm::MaybeAlign() : llvm::MaybeAlign(8);
+    if (shift == 0 && n == width) {
+        b_.CreateAlignedStore(v, p, align);
+        return;
+    }
+    llvm::Value* old  = b_.CreateAlignedLoad(ty, p, align);
+    llvm::Value* mask = llvm::ConstantInt::get(ctx_, llvm::APInt::getBitsSet(width, shift, shift + n));
+    llvm::Value* put  = b_.CreateShl(cast(v, width, false), shift);
+    b_.CreateAlignedStore(b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), put), p, align);
+}
+
+void Backend::set_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, uint32_t n) {
+    llvm::Type*  ty;
+    uint32_t     shift;
+    llvm::Value* p     = bit_words(b_, ptr, field_bits, lo, n, ty, shift);
+    const auto   align = field_bits <= 64 ? llvm::MaybeAlign() : llvm::MaybeAlign(8);
+    llvm::Value* mask =
+      llvm::ConstantInt::get(ctx_, llvm::APInt::getBitsSet(ty->getIntegerBitWidth(), shift, shift + n));
+    b_.CreateAlignedStore(b_.CreateOr(b_.CreateAlignedLoad(ty, p, align), mask), p, align);
+}
+
+// A constant select read through its window: each plane's in-range bits, placed at
+// their position in the selection, with x (0 for a 2-state slot) below and above.
+Plane Backend::load_window(const LValue& lv, const StaticWindow& w) {
+    const uint32_t W     = lv.store_width;
+    const uint32_t n     = lv.width;
+    llvm::Value*   mm    = lv_mm_ptr(lv);
+    const auto     place = [&](llvm::Value* v) { return w.len == n ? v : b_.CreateShl(cast(v, n, false), w.pad); };
+    if (!lv.four_state) {
+        return two_val(place(load_bits(mm, W, w.at, w.len)));
+    }
+    llvm::Value* must = place(load_bits(mm, 2 * W, w.at, w.len));
+    llvm::Value* may  = place(load_bits(mm, 2 * W, W + w.at, w.len));
+    if (w.len != n) {
+        llvm::Value* inside = cast(ones(w.len), n, false);
+        may                 = b_.CreateOr(may, b_.CreateNot(b_.CreateShl(inside, w.pad)));
+    }
+    llvm::Value* z = lv.has_z ? place(load_bits(lv_z_ptr(lv), W, w.at, w.len)) : zero(n);
+    return packed(must, may, z);
+}
+
+void Backend::store_window(const LValueInfo& lv, const StaticWindow& w, llvm::Value* mm, llvm::Value* z, Plane rhs) {
+    const uint32_t W    = lv.store_width;
+    const auto     part = [&](llvm::Value* v) { return cast(w.pad == 0 ? v : b_.CreateLShr(v, w.pad), w.len, false); };
+    if (!lv.four_state) {
+        store_bits(mm, W, w.at, part(must_of(rhs, false)));
+        return;
+    }
+    store_bits(mm, 2 * W, w.at, part(must_of(rhs, true)));
+    store_bits(mm, 2 * W, W + w.at, part(may_of(rhs, true)));
+    if (z != nullptr) {
+        store_bits(z, W, w.at, part(rhs.z != nullptr ? rhs.z : zero(lv.width)));
+    }
+}
+
 // Whether the lvalue is its whole storage and every bit of it is valid, so a
 // load / store needs no select arithmetic. A bit-select of a one-bit vector has
 // the whole storage's width and offset 0 whatever its index is, so the mask

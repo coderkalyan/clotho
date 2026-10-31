@@ -1040,3 +1040,89 @@ TEST_CASE("a nonblocking wide select stages its dirty mask through one plane") {
     CHECK(with_z == 1);    // the shadow: must, may and z
     CHECK(mask_only == 1); // the dirty mask: must only
 }
+
+TEST_CASE("a constant select of a wide vector reads and writes the words that hold it") {
+    // kernel.md: constant selects touch only the 64-bit words they cover, plane by
+    // plane: bits on both sides of every word boundary, a run across several, x and
+    // z payloads, a window hanging over either end of the vector, in a 4-state slot,
+    // a 2-state one and a z-free one (its may plane starts on a word boundary), by
+    // blocking and nonblocking writes, and in a signal that also takes a run-time
+    // index (so its dirty mask is a plane). Checked against iverilog 13 line for line.
+    CHECK(run_capture(R"(
+module t;
+    logic [299:0] a;
+    bit   [299:0] b;
+    logic [255:0] c;
+    logic [99:0]  r;
+    integer       i;
+    initial begin
+        a = 0; b = 0; c = 0;
+        a[0] = 1'b1; a[63] = 1'b1; a[64] = 1'b1; a[127] = 1'b1; a[128] = 1'b1; a[299] = 1'bx;
+        b[0] = 1'b1; b[63] = 1'b1; b[64] = 1'b1; b[127] = 1'b1; b[128] = 1'b1; b[299] = 1'b1;
+        c[0] = 1'b1; c[63] = 1'b1; c[64] = 1'b1; c[127] = 1'b1; c[128] = 1'b1; c[255] = 1'b1;
+        $display("%h\n%h\n%h", a, b, c);
+        $display("%b%b%b%b%b%b %b%b", a[0], a[63], a[64], a[127], a[128], a[299], b[63], c[255]);
+        a[130:60] = {7'b1xz0xz1, 64'hf0f0_f0f0_0f0f_0f0f};
+        b[130:60] = {7'b1010101, 64'hf0f0_f0f0_0f0f_0f0f};
+        c[130:60] = {7'b1100110, 64'hf0f0_f0f0_0f0f_0f0f};
+        $display("%h\n%h\n%h", a[140:50], b[140:50], c[140:50]);
+        r = a[299:200]; $display("%h", r);
+        a[299:236] = 64'hdead_beef_cafe_f00d; b[299:236] = 64'hdead_beef_cafe_f00d;
+        $display("%h %h", a[299:236], b[299:236]);
+        a[63:0] <= 64'h0123_4567_89ab_cdef; b[191:128] <= 64'h1111_2222_3333_4444; c[255:192] <= 64'h5555_6666_7777_8888;
+        #1 $display("%h %h %h", a[63:0], b[191:128], c[255:192]);
+        i = 5;
+        a[i] <= 1'b1; a[200:190] <= 11'h7ff; b[i] <= 1'b0; b[100:90] <= 11'h555;
+        #1 $display("%h %h", a[200:190], a[7:0]);
+        $display("%h %h", b[100:90], b[7:0]);
+        a[303:296] = 8'hff; a[3:-4] = 8'h5a;
+        $display("%h %h", a[303:296], a[7:0]);
+        $display("%b %b", a[303:296], a[3:-4]);
+        a[303:296] <= 8'h00; a[3:-4] <= 8'hff;
+        #1 $display("%h %h", a[299:296], a[7:0]);
+    end
+endmodule
+    )") == "X00000000000000000000000000000000000000000180000000000000018000000000000001\n"
+           "800000000000000000000000000000000000000000180000000000000018000000000000001\n"
+           "8000000000000000000000000000000180000000000000018000000000000001\n"
+           "11111x 11\n"
+           "001XZc3c3c3c03c3c3c3c00\n"
+           "00157c3c3c3c03c3c3c3c00\n"
+           "0019bc3c3c3c03c3c3c3c00\n"
+           "X000000000000000000000000\n"
+           "deadbeefcafef00d deadbeefcafef00d\n"
+           "0123456789abcdef 1111222233334444 5555666677778888\n"
+           "7ff ef\n"
+           "555 01\n"
+           "xf e5\n"
+           "xxxx1111 0101xxxx\n"
+           "0 ef\n");
+}
+
+TEST_CASE("a constant select of a wide vector addresses no word it does not cover") {
+    // Raw IR: a one-word window of a 4-state 512-bit vector is an i64 load and store
+    // on each plane, never the 1024-bit must|may word or the 512-bit z word.
+    const std::string ir = emit_raw_ir(R"(
+        module m;
+          logic [511:0] v;
+          bit   [511:0] b;
+          logic [5:0]   r6;
+          logic         r;
+          initial begin
+            v[70:65] = 6'h2a;
+            b[70:65] = 6'h15;
+            r6 = v[70:65];
+            r6 = b[70:65];
+            v[300] = 1'b1;
+            r = v[300];
+          end
+        endmodule
+    )");
+    const size_t      at = ir.find("define ptr @clotho.inst.m.p");
+    REQUIRE(at != std::string::npos);
+    const std::string body = ir.substr(at, ir.find("\n}\n", at) - at);
+    for (const std::string_view whole : { "load i1024", "store i1024", "load i512", "store i512" }) {
+        CHECK_MESSAGE(body.find(whole) == std::string::npos, whole);
+    }
+    CHECK(body.find("load i64") != std::string::npos);
+}

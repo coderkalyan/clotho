@@ -2561,6 +2561,13 @@ Plane Backend::lower_load(const LValue& lv) {
         return wide_dyn_load(lv);
     }
 
+    // A constant select reads the words that hold its bits, not the whole slot.
+    if (!selects_whole(lv)) {
+        if (const auto win = static_window(lv)) {
+            return load_window(lv, *win);
+        }
+    }
+
     // 2-state slot: the stored word IS the iW value.
     if (!lv.four_state) {
         llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));

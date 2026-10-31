@@ -3226,6 +3226,35 @@ private:
 
     static bool selects_whole(const LValueInfo& lv);
 
+    // -- Constant selects touch only the words they cover --
+    //
+    // A select at a constant offset of a slot with more than 64 bits in a plane
+    // reads and writes the 64-bit words that hold its bits, plane by plane, not the
+    // whole slot. `at` is the storage bit of the first selected bit that is in range,
+    // `pad` the selected bits below it (out of range: they read x, or 0 for a 2-state
+    // slot, and are not written), `len` the in-range bits (LRM 11.5.1).
+    struct StaticWindow {
+        uint32_t at  = 0;
+        uint32_t pad = 0;
+        uint32_t len = 0;
+    };
+
+    static std::optional<StaticWindow> static_window(const LValueInfo& lv);
+
+    // Bits [lo, lo + n) of a plane of `field_bits` bits at `ptr`, as an i(n); and the
+    // same bits overwritten with `v` or set.
+    llvm::Value* load_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, uint32_t n);
+
+    void store_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, llvm::Value* v);
+
+    void set_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, uint32_t n);
+
+    Plane load_window(const LValue& lv, const StaticWindow& w);
+
+    // Store `rhs` through a window into the planes at `mm` / `z` (the live slot or an
+    // NBA shadow of the same shape); `z` is null for a slot without a z field.
+    void store_window(const LValueInfo& lv, const StaticWindow& w, llvm::Value* mm, llvm::Value* z, Plane rhs);
+
     // -- System tasks --
 
     void lower_timeformat(Index i);
