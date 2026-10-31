@@ -556,6 +556,19 @@ code go.
      body were different code (and a `$finish` in a function, lowered before
      any body, left what it had woken running). `--stat=unit-code` reports how
      many groups and subroutines were checked and what it cost.
+     The check only sees a unit with two instances in the design being compiled, so
+     it missed a queue named by monitor number until a test happened to instantiate
+     an `expect`'s module twice. Twin mode (docs/VERIFICATION.md, `set_twin_check` in
+     src/Lower.h) removes the dependence on the designs' own instance counts: with
+     the check built in, every design the suite lowers is lowered again with each
+     top instantiated twice and checked (`ir::check_shared_code`, no codegen). It
+     found a second miss: the dereference guard of a `ref` formal that a forwarded
+     string store (`s = {s, "x"}`) resolves in the body's prologue named the
+     instruction an earlier body left in `cur_inst_`, a different site in each
+     lowering of one body. Lowerings that would bake an instance's number now taint
+     instead of falling back to it (a design-wide id, a dump-var index, the
+     deferred-assertion counter of another instance), and a verifying lowering that
+     makes a global in root, which the lowering it checks did not, is a difference.
    - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
      capacity from the record, a subscription carries its trigger bits, the
      ring mask is a root constant (`clotho.ring_mask`) a unit loads, NBA and

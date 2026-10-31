@@ -11,6 +11,14 @@ namespace {
 
 using namespace lower;
 
+// Twin mode's state (Lower.h). `g_in_twin` is set exactly while a twin design is
+// lowered, which keeps that lowering from twinning itself.
+TwinCheck g_twin_check;
+TwinStats g_twin_stats;
+bool      g_in_twin = false;
+
+void twin_check_design(slang::ast::Compilation& comp, ir::SystemAccess allow_system, bool allow_port_coercion);
+
 // Map slang's severity scale onto Clotho's. slang's Ignored never reaches here (an
 // ignored diagnostic is not reported at all) and its Fatal collapses onto Error:
 // Clotho has no "stop the world" tier, since a lowering guard that cannot continue
@@ -1078,7 +1086,110 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         }
     }
 
+    if (g_twin_check && !g_in_twin && !partial && result.ok && result.module != nullptr) {
+        twin_check_design(comp, allow_system, allow_port_coercion);
+    }
     return result;
+}
+
+// Twin mode: lower `comp`'s design again with each of its tops instantiated twice
+// and hand it to the installed check (Lower.h). The second compilation reuses the
+// first's syntax trees and options and adds one wrapper module, the only top:
+//
+//     module __clotho_twin; t t (); t __twin_t (); endmodule
+//
+// with its ports open (an input, output or inout port may be, and slang already
+// refuses a top with an interface or `ref` port). Whatever keeps that form from being
+// the same design (`$root.t`, a `timescale` the wrapper cannot inherit) skips the
+// design, and the reason is counted.
+void twin_check_design(slang::ast::Compilation& comp, ir::SystemAccess allow_system, bool allow_port_coercion) {
+    using namespace slang::ast;
+    constexpr std::string_view wrapper = "__clotho_twin";
+    const auto                 skip    = [](std::string why) { ++g_twin_stats.skipped[std::move(why)]; };
+
+    const slang::SourceManager* const sm = comp.getSourceManager();
+    if (sm == nullptr) {
+        return skip("no source manager");
+    }
+    const auto tops = comp.getRoot().topInstances;
+    if (tops.empty()) {
+        return skip("no top-level module");
+    }
+    std::string                     text;
+    std::optional<slang::TimeScale> scale;
+    for (size_t k = 0; k < tops.size(); ++k) {
+        const InstanceSymbol& top = *tops[k];
+        const bool plain = !top.name.empty() && std::ranges::all_of(top.name, [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '$';
+        });
+        if (!plain) {
+            return skip("a top's name needs escaping");
+        }
+        if (!scale) {
+            scale = top.body.getTimeScale();
+        }
+    }
+    if (scale) {
+        text += "`timescale " + scale->base.toString() + " / " + scale->precision.toString() + "\n";
+    }
+    text += "module " + std::string(wrapper) + ";\n";
+    // The first copy of a top keeps its module's name, so a hierarchical name that
+    // reaches a top (`t.x`, which finds the wrapper's child by upward lookup) still
+    // resolves; the second is named for the copy.
+    for (size_t k = 0; k < tops.size(); ++k) {
+        const std::string def(tops[k]->body.getDefinition().name);
+        text += "  " + def + " " + def + " ();\n";
+        text += "  " + def + " __twin_" + def + " ();\n";
+    }
+    text += "endmodule\n";
+
+    CompilationOptions opts = comp.getOptions();
+    opts.topModules.clear();
+    opts.topModules.emplace(wrapper);
+    opts.paramOverrides.clear();
+    slang::Bag bag;
+    bag.set(opts);
+    auto twin = std::make_unique<Compilation>(bag);
+    for (const auto& tree : comp.getSyntaxTrees()) {
+        twin->addSyntaxTree(tree);
+    }
+    // The manager is the one the original's trees were read into, which this
+    // compilation shares; slang only hands out a const view of it.
+    twin->addSyntaxTree(slang::syntax::SyntaxTree::fromText(text, const_cast<slang::SourceManager&>(*sm), "twin"));
+    auto ctx = std::make_shared<SourceContext>();
+    ctx->borrow_source_manager(sm);
+    Compilation& twin_comp = *twin;
+    ctx->adopt_compilation(std::move(twin));
+
+    // The twin is not itself twinned.
+    struct InTwin {
+        InTwin() { g_in_twin = true; }
+        ~InTwin() { g_in_twin = false; }
+    } in_twin;
+    const LowerResult lowered =
+      lower_compilation(twin_comp, std::move(ctx), nullptr, allow_system, false, {}, allow_port_coercion, 0);
+    if (!lowered.ok || lowered.module == nullptr) {
+        const auto bad = std::ranges::find_if(lowered.diagnostics, [](const Diagnostic& d) { return d.severity == Severity::Error; });
+        if (bad != lowered.diagnostics.end() && std::getenv("CLOTHO_TWIN_VERBOSE") != nullptr) {
+            std::fprintf(stderr, "twin skipped: %s [%s]\n", bad->message.c_str(), bad->code.c_str());
+        }
+        // The reason is the diagnostic's text with the names it quotes stripped, so
+        // designs that fail alike count together.
+        std::string why = bad == lowered.diagnostics.end() ? std::string("error") : bad->message;
+        for (size_t open = why.find('\''); open != std::string::npos; open = why.find('\'', open + 3)) {
+            const size_t close = why.find('\'', open + 1);
+            if (close == std::string::npos) {
+                break;
+            }
+            why.replace(open + 1, close - open - 1, "_");
+        }
+        return skip("the twin form does not elaborate: " + why);
+    }
+    if (g_twin_check(lowered) == TwinVerdict::Checked) {
+        ++g_twin_stats.twinned;
+    } else {
+        skip("the backend refuses the twin form");
+    }
 }
 
 } // namespace
@@ -1310,4 +1421,13 @@ ir::LocResolver loc_resolver(const LowerResult& result) {
     };
 }
 
+void set_twin_check(TwinCheck check) {
+    g_twin_check = std::move(check);
+}
+
+const TwinStats& twin_stats() {
+    return g_twin_stats;
+}
+
 } // namespace clotho
+

@@ -103,6 +103,19 @@ struct ModuleIr {
 bool emit_llvm_modules(const Module& m, std::vector<ModuleIr>& out, const SimulationConfig& config = {},
                        const LocResolver& resolve = {});
 
+// Lower the design as build_modules does, with `verify_shared_code` on and no
+// optimization, verification or code generation, and report whether the code its
+// instances share is what each lowers for itself. `Mismatch` carries the report
+// (the unit, group, instances and first differing line, as `file:line:col:
+// error:` text); `Refused` is any other refusal of the backend, which says
+// nothing about sharing. Used by twin mode (Lower.h).
+struct SharedCodeCheck {
+    enum class Outcome : uint8_t { Ok, Refused, Mismatch };
+    Outcome     outcome = Outcome::Ok;
+    std::string message;
+};
+SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve = {});
+
 // Compile the design for `target`'s triple, CPU and features and write it to
 // `os` as one relocatable object file. The object defines `clotho_main`, the
 // entry rt_run takes, and `clotho_design`, the rt_design an executable's main

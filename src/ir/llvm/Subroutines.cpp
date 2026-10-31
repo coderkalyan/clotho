@@ -17,6 +17,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const uint32_t proc_index = members.front();
     const Process& proc       = all[proc_index];
     ir_                       = &proc.ir;
+    cur_inst_                 = Index{ 0 }; // not the site an earlier body left: code names it (loc_text)
     frame_slots_.clear(); // a process has no frame; deinit sees only temps
     // The NBA blocks this lowering registers get their commit functions when it is
     // done (emit_block_commits), in the module the body went into.
@@ -74,6 +75,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // Per-member table setup, run before lowering anything of that member.
     const auto select_member = [&](uint32_t m) {
         ir_             = &all[m].ir;
+        cur_inst_       = Index{ 0 };
         cur_proc_scope_ = all[m].scope;
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
@@ -396,6 +398,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         member_agg_elem.push_back(agg_elem_ret_);
     }
     ir_ = &proc.ir;
+    cur_inst_ = Index{ 0 };
 
     // Shared epilogue, built up front so #delay suspends and the final suspend
     // can all branch to it. cleanup frees the frame (coro.free -> rt_free); ret
@@ -1235,6 +1238,7 @@ void Backend::lower_function(FunctionId id) {
     own_anchor_ = subroutine_anchor(f);
     own_ctx_    = nullptr;
     ir_ = &f.ir;
+    cur_inst_ = Index{ 0 };
     cur_fn_           = &f;
     cur_sub_ordinal_  = subroutine_home_[static_cast<uint32_t>(id)].ordinal;
     group_first_block_ = -1;
@@ -1387,6 +1391,7 @@ void Backend::lower_task(FunctionId id) {
     const Function& f = mod_.function(id);
     const BodyCtx   body_ctx(*this, f);
     ir_               = &f.ir;
+    cur_inst_         = Index{ 0 };
     cur_fn_           = &f;
     cur_sub_ordinal_  = subroutine_home_[static_cast<uint32_t>(id)].ordinal;
     // Same two answers a function's prologue records, and here they are the ones

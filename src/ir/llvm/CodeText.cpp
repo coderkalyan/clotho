@@ -119,6 +119,15 @@ std::string CodeText::operand_token(const llvm::Value* v) {
     return os.str();
 }
 
+// The write-only sinks of a module (a place an out-of-range access is redirected to): internal
+// variables, not constants, one per module and type. Which of the module's own sinks a body names
+// is no fact of an instance, so they compare by what they hold like the constants do.
+static bool is_sink(const llvm::GlobalVariable& gv) {
+    const llvm::StringRef name = gv.getName();
+    return name.starts_with("clotho.handle.sink") || name.starts_with("clotho.agg.sink") ||
+           name.starts_with("clotho.str.sink");
+}
+
 // The private constants of the function's own module that its instructions name,
 // directly or through other constants.
 void CodeText::gather(const llvm::Constant* c, ankerl::unordered_dense::set<const llvm::Constant*>& seen) {
@@ -126,7 +135,7 @@ void CodeText::gather(const llvm::Constant* c, ankerl::unordered_dense::set<cons
         return;
     }
     if (const auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(c)) {
-        if (gv->getParent() == fn_->getParent() && gv->hasLocalLinkage() && gv->isConstant() && gv->hasInitializer()) {
+        if (gv->getParent() == fn_->getParent() && gv->hasLocalLinkage() && gv->hasInitializer() && (gv->isConstant() || is_sink(*gv))) {
             constants_.emplace(operand_token(gv), gv);
             gather(gv->getInitializer(), seen);
         }
@@ -174,6 +183,12 @@ std::string CodeText::token(std::string_view tok, unsigned depth) {
         }
         const auto it = constants_.find(std::string(tok));
         if (it == constants_.end() || depth >= max_depth) {
+            // The element kernels a descriptor names are generated per module from the layout the
+            // descriptor is keyed by, and LLVM numbers them as they come: the number is no fact of
+            // an instance.
+            if (tok.starts_with("@clotho.elem.ops.copy.") || tok.starts_with("@clotho.elem.ops.destroy.")) {
+                return std::string(tok.substr(0, tok.rfind('.')));
+            }
             return std::string(tok);
         }
         const auto [held, fresh] = content_.try_emplace(it->first);

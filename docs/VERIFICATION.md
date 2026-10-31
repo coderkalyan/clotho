@@ -56,7 +56,28 @@ VCD, not only what a test prints.
   each group for each instance that shares it and fails the build, naming the
   unit, the group, the instances and the first differing line, if that is not
   the code shared (`SimulationConfig::verify_shared_code`,
-  docs/design/modular-compilation.md).
+  docs/design/modular-compilation.md). The check compares only units a design
+  instantiates twice, so a bake the taint list misses stays unseen by every design
+  that has one instance of the unit (an `expect` queue named by monitor number
+  shipped that way). **Twin mode** closes that: in a build with the check, every
+  design the suite lowers is lowered a second time with each of its top-level
+  modules instantiated twice (a synthetic wrapper module, ports open), output
+  discarded, and `ir::check_shared_code` runs the check on that design. A
+  mismatch throws out of the lowering entry point (`set_twin_check`, Lower.h), so
+  the test that compiled the design fails and names what the instances do not
+  lower alike. Nothing is generated or optimized, so it costs a second frontend
+  and backend lowering per design and no codegen. A design whose twin form cannot
+  be built (no top, a hierarchical name that reaches a top by its module name, a
+  twin that does not elaborate) is skipped and counted by reason; the suite prints
+  the counts after its summary. `CLOTHO_NO_TWIN=1` turns it off to time the suite
+  without it, `CLOTHO_TWIN_VERBOSE=1` prints each skip's diagnostic. A new test of a
+  construct whose lowering names something of its instance is covered without a
+  two-instance design of its own; a fix still gets one, since the twin check is a
+  build-time check and a Release build has neither it nor the suite's twins.
+  Shared code that reaches something of one instance by no record or binding
+  (a design-wide id, a dump-var index, another instance's record) taints the
+  lowering instead of baking it, and a verifying re-lowering must leave root as it
+  found it: a global it makes there is reported as a difference.
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.
 - **sv-tests.** Outcomes are classified as pass, refused, crash or fail; the
   crash count is zero. A pass there means only that nothing failed, not that

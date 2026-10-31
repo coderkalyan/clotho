@@ -85,8 +85,10 @@ TEST_CASE("an unresolvable location degrades instead of lying") {
     CHECK_FALSE(r.sources->resolve(ir::SourceLoc{ 0 }).valid);
     CHECK(r.sources->render(ir::SourceLoc{ 0 }) == "<unknown>");
     // A handle naming a buffer this context never saw must not be reported as a
-    // real position -- that would be a silent wrong answer.
-    const ir::SourceLoc alien = to_source_loc(slang::SourceLocation(slang::BufferID(9999, ""), 4));
+    // real position -- that would be a silent wrong answer. The id is far past any
+    // buffer the process-wide manager can have handed out by now: every lowering
+    // through `lower_text` adds one (two in twin mode).
+    const ir::SourceLoc alien = to_source_loc(slang::SourceLocation(slang::BufferID(1u << 27, ""), 4));
     CHECK_FALSE(r.sources->resolve(alien).valid);
 }
 

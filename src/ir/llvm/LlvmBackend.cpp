@@ -393,6 +393,40 @@ static bool reload_modules(BuiltDesign& built, llvm::LLVMContext* shared,
     return true;
 }
 
+SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve) {
+    assert_well_typed(m, resolve);
+    auto host = host_target();
+    if (!host) {
+        return { SharedCodeCheck::Outcome::Refused, "cannot detect host target" };
+    }
+    auto tm = host->createTargetMachine();
+    if (!tm) {
+        llvm::consumeError(tm.takeError());
+        return { SharedCodeCheck::Outcome::Refused, "cannot create the target machine" };
+    }
+    // Declared before the backend so they outlive it.
+    llvm::LLVMContext ctx;
+    llvm::Module      root("clotho.root", ctx);
+    root.setTargetTriple((*tm)->getTargetTriple());
+    root.setDataLayout((*tm)->createDataLayout());
+    SimulationConfig config;
+    config.verify_shared_code = true;
+    try {
+        Backend be(m, ctx, root, config, resolve);
+        be.run();
+    } catch (const BackendError& e) {
+        if (!e.message.starts_with("internal: the code shared by")) {
+            return { SharedCodeCheck::Outcome::Refused, e.message };
+        }
+        std::string where;
+        if (e.span.valid() && resolve) {
+            where = resolve(e.span).where + ": ";
+        }
+        return { SharedCodeCheck::Outcome::Mismatch, where + "error: " + e.message };
+    }
+    return {};
+}
+
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config,
                Timings* timings, const LocResolver& resolve) {
     const auto t_llvm = std::chrono::steady_clock::now();
