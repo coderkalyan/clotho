@@ -143,7 +143,9 @@ when a per-signal freelist must grow:
   pending counter nonzero at `nba.check`, and for each intra-NBA signal runs a
   monomorphized `emit_intra_commit(sig)` that walks the ready list, stores each
   record's planes to its live pointer, wakes readers via `emit_nba_service`, and
-  returns the record to the freelist.
+  returns the records it applied to the freelist. The wake can satisfy a `<= @` control
+  of the same signal; the record that releases is an update created in this region, and
+  stays on the list for the next pass.
 
 Steady state allocates nothing: the freelist high-water mark equals the peak
 outstanding count, reached once and then recycled — the same discipline that
@@ -195,9 +197,10 @@ uint32_t rt_intra_ready_count(uint32_t idx);
 // deferred commit is needed (mirrors rt_nba_arr_any).
 uint32_t rt_intra_any(void);
 
-// Return site `idx`'s committed records to its freelist and clear its ready list.
-// Called by the backend after emit_intra_commit(sig) (mirrors the per-pass reset).
-void rt_intra_release(uint32_t idx);
+// Return the first `n` records of site `idx`'s ready list -- the ones the commit loop
+// applied -- to its freelist. Called by the backend after emit_intra_commit(sig);
+// records released after the loop took its count stay for the next pass.
+void rt_intra_release(uint32_t idx, uint32_t n);
 ```
 
 The record is armed on the wheel with `rt_intra_cb` as `on_expire`, so no new
@@ -209,7 +212,7 @@ Two additions, both modelled on existing code:
 
 1. **`emit_intra_commit(Signal sig)`** — a near-copy of `emit_array_commit`: loop
    `rt_intra_ready_count(idx)` records from `rt_intra_ready_base(idx)` and apply
-   each one, then `rt_intra_release(idx)`. Where the destination comes from depends
+   each one, then `rt_intra_release(idx, n)`. Where the destination comes from depends
    on the target shape, and so does the wake:
    - **whole scalar, or a bit/part-select of one** (a packed struct field included):
      the address is a link-time constant, so `storage_ptr(s)` is hoisted out of the
@@ -614,7 +617,9 @@ carries the resolved instance context, and the commit wakes **per record** under
 `CtxOverride` built from it (`service_wait_queue` + `vcd_touch_signal`), because
 two records of one signal may have landed in different instances. `collect_vif_nba`
 also had to learn to scan `StoreNbDelay` / `StoreNbEvent`, so an intra-only write
-marks the member.
+marks the member. That wake runs inside the commit loop and can release a record of the
+same member onto the list the loop reads, so this path re-reads the list's base for each
+record instead of keeping the pointer taken before the loop.
 
 ### R3 — one new record class: the owned handle (string, whole container)
 

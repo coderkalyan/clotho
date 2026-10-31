@@ -2370,7 +2370,12 @@ void Backend::emit_intra_commit(Signal sig) {
     b_.CreateCondBr(b_.CreateICmpULT(i, n), body, after);
 
     b_.SetInsertPoint(body);
-    llvm::Value* recp   = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
+    // A handle-written member wakes inside this loop, and the wake can release a record of
+    // this very site: that pushes onto the list the loop reads through, and a push may
+    // reallocate it. So that path re-reads the list's base for each record rather than trust
+    // the pointer taken before the loop.
+    llvm::Value* rec_base = s.intra_ptr ? b_.CreateCall(intra_ready_base_fn(), { b_.getInt32(idx) }) : base;
+    llvm::Value* recp     = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, rec_base, i));
     llvm::Value* dst_mm = live_mm;
     llvm::Value* dst_z  = live_z;
     if (s.is_array || s.intra_ptr) {
@@ -2462,7 +2467,10 @@ void Backend::emit_intra_commit(Signal sig) {
             });
         }
     }
-    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx) });
+    // Only the `n` records this commit applied are released. The wake above can satisfy a
+    // `<= @` control of this very signal, and the record it releases is an update created
+    // in this region: it commits in the next pass, not freed unapplied with the rest.
+    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx), n });
     b_.CreateBr(skip);
 
     b_.SetInsertPoint(skip);
@@ -2541,7 +2549,7 @@ void Backend::emit_intra_agg_commit(Signal sig) {
     if (signal_has_waiters(sig)) {
         service_any_waiters(sig);
     }
-    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx) });
+    b_.CreateCall(intra_rec_rooted(s) ? intra_release_rooted_fn() : intra_release_fn(), { b_.getInt32(idx), n });
     b_.CreateBr(skip);
 
     b_.SetInsertPoint(skip);

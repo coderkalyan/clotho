@@ -1218,11 +1218,11 @@ llvm::FunctionCallee Backend::intra_any_fn() {
 }
 
 llvm::FunctionCallee Backend::intra_release_fn() {
-    return rt_fn("rt_intra_release", b_.getVoidTy(), { b_.getInt32Ty() });
+    return rt_fn("rt_intra_release", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
 }
 
 llvm::FunctionCallee Backend::intra_release_rooted_fn() {
-    return rt_fn("rt_intra_release_rooted", b_.getVoidTy(), { b_.getInt32Ty() });
+    return rt_fn("rt_intra_release_rooted", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
 }
 
 llvm::FunctionCallee Backend::intra_reset_fn() {

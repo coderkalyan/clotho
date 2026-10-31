@@ -2352,3 +2352,61 @@ TEST_CASE("nonblocking event triggers occur in the order they executed") {
             endmodule)") == "x=2\n");
     }
 }
+
+// A record released while its own site commits -- the committed update raises the edge or
+// change its `<= @` control waits for -- is an update created in the NBA region, and has to
+// commit in the next pass. The commit freed the whole ready list after waking readers, so
+// the record was dropped uncommitted and the update lost: `x <= #1 1; x <= @(posedge x) 0;`
+// left x at 1. Oracle: the clauses (15.5.1, 4.6 b)); iverilog 13 agrees on the first
+// design, and aborts on the second.
+TEST_CASE("an update released while its own signal commits is not lost") {
+    SUBCASE("a delayed update raises the edge an event update waits for") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic x = 0;
+                initial begin
+                    x <= #1 1'b1;
+                    x <= @(posedge x) 1'b0;
+                    #3 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=0\n");
+    }
+    SUBCASE("a change control") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0;
+                initial begin
+                    x <= #1 8'd1;
+                    x <= @(x) 8'd7;
+                    #3 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=7\n");
+    }
+    SUBCASE("several records released by one commit keep the order of their statements") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0;
+                initial begin
+                    x <= #1 8'd1;
+                    x <= @(x) 8'd5;
+                    x <= @(x) 8'd6;
+                    #3 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=6\n");
+    }
+    SUBCASE("a plain NBA raises the edge: the record commits in the same pass") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic x = 0;
+                initial begin
+                    x <= 1'b1;
+                    x <= @(posedge x) 1'b0;
+                    #3 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=0\n");
+    }
+}

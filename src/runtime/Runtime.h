@@ -2045,15 +2045,16 @@ uint32_t rt_intra_any(void);
 // for the per-site count.
 extern uint32_t rt_intra_total;
 
-// Return site `idx`'s committed records to its freelist and clear its ready list
-// (called by the backend after the site's commit loop).
-void rt_intra_release(uint32_t idx);
+// Return the first `n` records of site `idx`'s ready list -- the ones the backend's commit
+// loop has just applied -- to its freelist (called after the loop). A record released
+// after the loop took its count, by the commit's own wake, stays for the next pass.
+void rt_intra_release(uint32_t idx, uint32_t n);
 
 // The same pair for a site whose records stage a class handle (LRM 9.4.5 on an aggregate
 // or an array with a handle leaf). Between alloc and release the record is a conservative
 // GC root: until the delay elapses it may hold the only reference to the object it carries.
 void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride);
-void  rt_intra_release_rooted(uint32_t idx);
+void  rt_intra_release_rooted(uint32_t idx, uint32_t n);
 
 // Reclaim every record (including any left scheduled by a $finish mid-flight)
 // into its freelist and clear all ready lists. Called once at simulation start.

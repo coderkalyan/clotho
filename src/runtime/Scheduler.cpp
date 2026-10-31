@@ -436,17 +436,29 @@ extern "C" uint32_t rt_intra_any(void) {
     return rt_intra_total;
 }
 
-extern "C" void rt_intra_release(uint32_t idx) {
+// Return the first `n` records of site `idx`'s ready list -- the ones its commit loop has
+// just applied -- to the freelist. Records released after the loop took its count (the
+// commit's own wake can satisfy a `<= @` control of the same site) are an update created
+// in the NBA region: they stay for the next pass instead of being freed uncommitted.
+extern "C" void rt_intra_release(uint32_t idx, uint32_t n) {
     if (idx >= intra_sites.size()) {
         return;
     }
-    IntraSite& site = intra_sites[idx];
-    rt_intra_total -= static_cast<uint32_t>(site.ready.size());
-    for (void* p : site.ready) {
-        site.freelist.push_back(p);
+    IntraSite&   site  = intra_sites[idx];
+    const size_t total = site.ready.size();
+    assert(n <= total && "a commit releases only what its loop applied");
+    rt_intra_total -= n;
+    void* const* recs = site.ready.data();
+    for (uint32_t i = 0; i < n; ++i) {
+        site.freelist.push_back(recs[i]);
     }
-    site.ready.clear();
-    site.batch_start = 0;
+    if (n == total) { // the usual case: nothing was released during the commit
+        site.ready.clear();
+        site.batch_start = 0;
+        return;
+    }
+    site.ready.erase(site.ready.begin(), site.ready.begin() + static_cast<std::ptrdiff_t>(n));
+    site.batch_start = site.batch_start > n ? site.batch_start - n : 0;
 }
 
 // The pair for a site whose records stage a class handle (an aggregate or an array with a
@@ -463,13 +475,13 @@ extern "C" void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride) {
     return rec;
 }
 
-extern "C" void rt_intra_release_rooted(uint32_t idx) {
+extern "C" void rt_intra_release_rooted(uint32_t idx, uint32_t n) {
     if (idx < intra_sites.size()) {
-        for (void* rec : intra_sites[idx].ready) {
-            rt_gc_range_remove(rec);
+        for (uint32_t i = 0; i < n; ++i) {
+            rt_gc_range_remove(intra_sites[idx].ready[i]);
         }
     }
-    rt_intra_release(idx);
+    rt_intra_release(idx, n);
 }
 
 extern "C" void rt_intra_reset(void) {

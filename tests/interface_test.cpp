@@ -1085,3 +1085,29 @@ TEST_CASE("virtual interface: a plain write after the trigger commits after a ti
         CHECK(out == "b0=33 b1=22\n");
     }
 }
+
+// A record released while its own member commits -- here by the wake of the first of two
+// updates that land in the same pass -- is an update created in the NBA region and commits
+// in the next pass. The per-record wake of a member written through a handle pushed it onto
+// the list being committed, which the commit then freed whole: the update was lost, and
+// the pointer the loop read its records through could be the freed buffer of the list's
+// reallocation. Derived from 15.5.1 and 4.6 b): iverilog 13 has no interface support.
+TEST_CASE("virtual interface: an update released while its member commits is not lost") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic d = 0; endinterface
+        module top;
+            ibus b0();
+            virtual ibus vif;
+            initial begin
+                vif = b0;
+                vif.d <= #1 1'b1;
+                vif.d <= #1 1'b1;
+                b0.d <= @(posedge b0.d) 1'b0;
+                b0.d <= @(posedge b0.d) 1'b0;
+                #3 $display("d=%0d", b0.d);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "d=0\n");
+}
