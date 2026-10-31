@@ -463,7 +463,11 @@ code go.
      after their callees (the order of the call graph's strongly connected
      components), so a key names its callees as they were settled: instances
      whose calls land in one function match, instances whose callee was lowered
-     apart do not, and a cycle of subroutines is never shared. A group's key
+     apart do not. A cycle of subroutines (a strongly connected component of the
+     call graph) is one family: its key is its members' keys in the unit's order,
+     each naming the members it calls by their place in the cycle, and the cycle is
+     lowered once, all of it or none (a taint in any member keeps every member
+     per instance); a cycle with a member of another instance is not shared. A group's key
      names the functions its processes call the same way (`group_key`), which
      is what lets a group that calls a function of its instance, or of the
      instance a binding names, share like any other; a call of a function that
@@ -472,7 +476,7 @@ code go.
      `--stat=unit-code` counts the subroutines of multi-instance units, the
      functions emitted for them and what kept each per instance: a
      nonblocking write, a disable target or covergroup of another instance, a call of such a
-     subroutine, a cycle. The instance a process, a control block, a random
+     subroutine. The instance a process, a control block, a random
      stream or a `$exit` names is a record field (process indices, the program
      instance) read by the instance's own code, so none of them splits a family; a
      `$exit`'s relation to the subroutine's own instance is in its key. Measured:

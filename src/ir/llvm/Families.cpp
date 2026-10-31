@@ -150,7 +150,7 @@ std::string Backend::subroutine_symbol(const Function& f, std::string_view kind)
 // instances whose callee is the one function of a family call it alike, and
 // instances whose callees were lowered apart do not match. A call of the
 // function itself is one of the family's own.
-std::vector<uint64_t> Backend::subroutine_key(uint32_t f) const {
+std::vector<uint64_t> Backend::subroutine_key(uint32_t f, const std::vector<uint32_t>& scc) const {
     const auto           id   = static_cast<FunctionId>(f);
     const Function&      fu   = mod_.function(id);
     const SubroutineHome home = subroutine_home_[f];
@@ -164,7 +164,13 @@ std::vector<uint64_t> Backend::subroutine_key(uint32_t f) const {
     std::vector<FunctionId> callees;
     direct_callees(fu.ir, callees);
     for (const FunctionId c : callees) {
-        key.push_back(c == id ? 0 : reinterpret_cast<uintptr_t>(fn_decls_[static_cast<uint32_t>(c)]));
+        const auto at = std::ranges::find(scc, static_cast<uint32_t>(c));
+        if (at != scc.end()) {
+            // A member of the cycle f is in is settled with it: named by its place in it.
+            key.push_back((uint64_t{ 1 } << 40) | static_cast<uint64_t>(at - scc.begin()));
+        } else {
+            key.push_back(c == id ? 0 : reinterpret_cast<uintptr_t>(fn_decls_[static_cast<uint32_t>(c)]));
+        }
         key.push_back(callee_may_finish(c) ? 1 : 0);
     }
     return key;
@@ -200,7 +206,16 @@ void Backend::lower_subroutine(FunctionId id) {
 // (and an instance that did bake something lowers its own). Every other
 // subroutine is lowered as it always was, apart from living in its unit's module.
 void Backend::lower_subroutines() {
-    for (const uint32_t f : subroutine_order_) {
+    for (size_t oi = 0; oi < subroutine_order_.size(); ++oi) {
+        const uint32_t f = subroutine_order_[oi];
+        if (subroutine_cycle_[f] > 1) {
+            // The members of a cycle are consecutive in the order.
+            std::vector<uint32_t> members(subroutine_order_.begin() + static_cast<std::ptrdiff_t>(oi),
+                                          subroutine_order_.begin() + static_cast<std::ptrdiff_t>(oi + subroutine_cycle_[f]));
+            oi += members.size() - 1;
+            lower_cycle(std::move(members));
+            continue;
+        }
         const auto      id   = static_cast<FunctionId>(f);
         const Function& fu   = mod_.function(id);
         const uint32_t  anch = subroutine_home_[f].anchor;
@@ -211,14 +226,6 @@ void Backend::lower_subroutines() {
         const bool many = anch != SignalSlot::no_anchor && unit_instances_.at(anchors_[anch].unit) >= 2;
         if (!many || !config_.dedup) {
             lower_subroutine(id);
-            continue;
-        }
-        if (subroutine_cycle_[f] > 1) {
-            // Callers of a cycle cannot name its members as settled, so none is
-            // shared.
-            lower_subroutine(id);
-            instance_fns_.insert(fn_decls_[f]);
-            ++unshared_subroutines_["calls itself through other subroutines"];
             continue;
         }
         auto       key = subroutine_key(f);
@@ -253,6 +260,88 @@ void Backend::lower_subroutines() {
             ++unshared_subroutines_[taint_why_];
         }
         subroutine_families_.emplace(std::move(key), SharedSubroutine{ f, fn_decls_[f], taint_why_, {} });
+    }
+    env_ = root_env_.get();
+}
+
+// Lower a cycle of subroutines (a strongly connected component of the call graph).
+// The members of one instance of a unit that has several are a family together when
+// they all belong to that instance: the key of the cycle is its members' keys in
+// the unit's order, each naming the members it calls by their place in the cycle,
+// so a cycle lowered once is the cycle of every instance whose key matches. The
+// first of a key is lowered with a taint watching the whole cycle; a later one is
+// those functions when nothing was baked. Any other cycle (a member of another
+// instance, a unit of one instance) is lowered as it always was, member by member.
+void Backend::lower_cycle(std::vector<uint32_t> members) {
+    const auto anchor_of = [&](uint32_t m) { return subroutine_home_[m].anchor; };
+    const uint32_t anch  = anchor_of(members.front());
+    bool           share = config_.dedup && anch != SignalSlot::no_anchor && unit_instances_.at(anchors_[anch].unit) >= 2;
+    for (const uint32_t m : members) {
+        share = share && anchor_of(m) == anch && !mod_.function(static_cast<FunctionId>(m)).is_dpi;
+    }
+    if (!share) {
+        for (const uint32_t m : members) {
+            const auto id = static_cast<FunctionId>(m);
+            if (mod_.function(id).is_dpi) {
+                continue;
+            }
+            env_ = subroutine_env(id);
+            lower_subroutine(id);
+            if (anchor_of(m) != SignalSlot::no_anchor && unit_instances_.at(anchors_[anchor_of(m)].unit) >= 2) {
+                instance_fns_.insert(fn_decls_[m]);
+                ++unshared_subroutines_["calls itself through subroutines of another instance"];
+            }
+        }
+        env_ = root_env_.get();
+        return;
+    }
+    std::ranges::sort(members, {}, [&](uint32_t m) { return subroutine_home_[m].ordinal; });
+    std::vector<uint64_t> key{ ~uint64_t{ 0 }, members.size() };
+    for (const uint32_t m : members) {
+        const auto k = subroutine_key(m, members);
+        key.push_back(k.size());
+        key.insert(key.end(), k.begin(), k.end());
+    }
+    env_ = subroutine_env(static_cast<FunctionId>(members.front()));
+    const auto it = cycle_families_.find(key);
+    if (it != cycle_families_.end() && it->second.front().taint == nullptr) {
+        std::vector<SharedSubroutine>& rep = it->second;
+        for (size_t k = 0; k < members.size(); ++k) {
+            assert(fn_decls_[members[k]]->use_empty() && "a cycle is settled before anything outside it calls it");
+            fn_decls_[members[k]]->eraseFromParent();
+            fn_decls_[members[k]] = rep[k].fn;
+            shared_instances_.emplace_back(anch, subroutine_home_[rep[k].f].anchor);
+        }
+        if (config_.verify_shared_code) {
+            for (size_t k = 0; k < members.size(); ++k) {
+                verify_shared_subroutine(members[k], rep[k]);
+            }
+        }
+        env_ = root_env_.get();
+        return;
+    }
+    const bool fresh = it == cycle_families_.end();
+    if (fresh) {
+        share_active_ = true;
+        taint_why_    = nullptr;
+    }
+    for (const uint32_t m : members) {
+        lower_subroutine(static_cast<FunctionId>(m));
+    }
+    const char* why = fresh ? taint_why_ : it->second.front().taint;
+    share_active_   = false;
+    if (why != nullptr) {
+        for (const uint32_t m : members) {
+            instance_fns_.insert(fn_decls_[m]);
+            ++unshared_subroutines_[why];
+        }
+    }
+    if (fresh) {
+        std::vector<SharedSubroutine> rep;
+        for (const uint32_t m : members) {
+            rep.push_back(SharedSubroutine{ m, fn_decls_[m], why, {} });
+        }
+        cycle_families_.emplace(std::move(key), std::move(rep));
     }
     env_ = root_env_.get();
 }

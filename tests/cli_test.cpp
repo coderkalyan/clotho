@@ -922,6 +922,36 @@ TEST_CASE("cli: --stat=unit-code shows twin instances that run $dumpvars sharing
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code shows twin instances with mutually recursive functions sharing them") {
+    // `even` and `odd` call each other: the cycle is one family, lowered once and
+    // run by both instances with their own records.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module m(input int k);
+            function automatic int even(int n);
+                if (n == 0) return 1;
+                return odd(n - 1);
+            endfunction
+            function automatic int odd(int n);
+                if (n == 0) return 0;
+                return even(n - 1);
+            endfunction
+            initial begin
+                #1;
+                $display("%m %0d %0d", even(k), odd(k));
+            end
+        endmodule
+        module top;
+            m a(.k(4));
+            m b(.k(7));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "2 subroutines of multi-instance units over 4 instances' subroutines, 2 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

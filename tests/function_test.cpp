@@ -1589,3 +1589,28 @@ TEST_CASE("$finish through mutually recursive tasks stops the caller") {
         endmodule
     )") == "in h\n");
 }
+
+// Twin instances run one lowering of a cycle of functions (cli_test: --stat=unit-code),
+// each call chain staying in the instance whose record it was handed.
+TEST_CASE("mutually recursive functions in twin instances") {
+    CHECK(run_capture(R"(
+        module m(input int k);
+          function automatic int even(int n);
+            if (n == 0) return 1;
+            return odd(n - 1);
+          endfunction
+          function automatic int odd(int n);
+            if (n == 0) return 0;
+            return even(n - 1);
+          endfunction
+          initial begin
+            #k;
+            $display("%m %0d %0d", even(k), odd(k));
+          end
+        endmodule
+        module t;
+          m a(.k(4));
+          m b(.k(7));
+        endmodule
+    )") == "t.a 1 0\nt.b 0 1\n");
+}

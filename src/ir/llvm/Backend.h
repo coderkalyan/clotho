@@ -2214,7 +2214,12 @@ private:
     // key of its instance, what the design says of it (home region, random
     // stream, program exit) and the functions it calls as declared, with
     // whether each may finish.
-    std::vector<uint64_t> subroutine_key(uint32_t f) const;
+    // `scc` is the cycle `f` is in, when the key is that of a member of one: the
+    // members it calls are named by their place in it.
+    std::vector<uint64_t> subroutine_key(uint32_t f, const std::vector<uint32_t>& scc = {}) const;
+
+    // Lower the members of one cycle of the call graph (see Families.cpp).
+    void lower_cycle(std::vector<uint32_t> members);
 
     // Lower every function and task, callees first, once per family.
     void lower_subroutines();
@@ -5241,6 +5246,9 @@ private:
         std::string     text;  // CodeText of fn, set by the first check
     };
     std::map<std::vector<uint64_t>, SharedSubroutine> subroutine_families_;
+    // Cycles of subroutines shared as one family: the key of the cycle (its members'
+    // keys in the unit's order) to its members, in that order.
+    std::map<std::vector<uint64_t>, std::vector<SharedSubroutine>> cycle_families_;
 
     // `SimulationConfig::verify_shared_code`: lower subroutine `f` for its own
     // instance, as it would have been without sharing, into a scratch module,
