@@ -1287,7 +1287,7 @@ void Backend::emit_gc_barrier(llvm::Value* owner) {
 // test lives here, once, rather than repeated at each of the eleven store sites,
 // so a new store site is instrumented by routing through this function and cannot
 // forget it.
-void Backend::emit_gc_barrier_for(const LValue& lv) {
+void Backend::emit_gc_barrier_for(const LValueInfo& lv) {
     if (lv.gc_owner == nullptr) {
         return;
     }
@@ -1315,7 +1315,7 @@ void Backend::emit_gc_barrier_for(const LValue& lv) {
 // Skipped when there is no owner, which also skips the case that needs nothing: a
 // frame-local container is already a registered root for its activation, so its
 // elements are reached without any of this.
-void Backend::note_gc_container_root(LValue& lv, const LValue& parent, llvm::Value* handle, Ref container_type) {
+void Backend::note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle, Ref container_type) {
     assert(handle != nullptr && "a container root needs its handle address");
     assert(container_type != Ref::Invalid && "a container root names its type");
     if (lv.gc_owner == nullptr) {
@@ -1351,7 +1351,7 @@ void Backend::note_gc_container_root(LValue& lv, const LValue& parent, llvm::Val
 // Task calls only. A function cannot suspend, and the only safepoint is the drain
 // loop's quiescent edge (:11542), so no collection can occur inside a function call
 // and the call-site barrier alone covers it.
-llvm::Value* Backend::emit_gc_ref_container_add(const LValue& lv) {
+llvm::Value* Backend::emit_gc_ref_container_add(const LValueInfo& lv) {
     if (lv.gc_container_root == nullptr) {
         return nullptr;
     }

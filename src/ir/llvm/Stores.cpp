@@ -1274,7 +1274,7 @@ void Backend::wide_dyn_stage_mask(const LValue& lv, const SignalSlot& s) {
 // (LRM 11.5.1). `lsb` is signed, below zero for `v[1:-2]`.
 // Precondition: the site is static (constant bit_off), i.e. the signal is not
 // nba_dyn.
-llvm::APInt Backend::site_const_mask(const LValue& lv, const SignalSlot& s) const {
+llvm::APInt Backend::site_const_mask(const LValueInfo& lv, const SignalSlot& s) const {
     if (lv.width == s.width && is_zero_const(lv.bit_off)) {
         return llvm::APInt::getAllOnes(s.width);
     }
@@ -1310,7 +1310,7 @@ llvm::APInt Backend::leaf_set_mask(const SignalSlot& s, uint32_t leaf) const {
 // Register this NBA store's target on the current block, recording the commit
 // mask: a runtime dirty-mask field for a dynamic-select signal, else the union
 // of this site's compile-time mask.
-void Backend::register_block_store(const LValue& lv, const SignalSlot& s) {
+void Backend::register_block_store(const LValueInfo& lv, const SignalSlot& s) {
     if (s.nba_dyn) {
         block_register(lv.sig, llvm::APInt(s.width, 0), /*dynamic=*/true);
     } else {
@@ -1367,7 +1367,7 @@ void Backend::emit_handle_move(llvm::Value* dst, llvm::Value* src, Ref type) {
 void Backend::emit_handle_whole_nba(Index i) {
     const auto&       p    = ir_->payload(i).op_extra;
     const auto        qa   = ir_->extra_data<QueueArg>(p.extra);
-    const LValue      dlv  = lvalue_of(p.op);
+    const Guarded&    dlv  = lvalue_of(p.op);
     // Signal-keyed like the deferred store family (handle_buf_idx(dlv.sig)), so the
     // destination is design state and needs no barrier. Asserted, not assumed.
     assert(dlv.gc_owner == nullptr && "a whole-container NBA targets a signal");
@@ -1549,18 +1549,24 @@ llvm::StructType* Backend::agg_rec_ty(const SignalSlot& s) {
     return llvm::StructType::get(ctx_, f);
 }
 
-// Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
-// without the final mm/z field select).
 // Pointer to a whole aggregate ARGUMENT's storage image. An `input` actual may
 // be an associative-array value, which is a deferred place: resolve it with
 // get_ptr, because passing by value only reads it and LRM 7.8.6 forbids a read
 // creating the entry. An out / inout aggregate actual is a caller temp
 // (lower/Subroutines.cpp's make_canonical_agg_temp), so it never arrives deferred.
-llvm::Value* Backend::agg_arg_ptr(const LValue& lv) {
-    return lv.is_assoc ? agg_image_ptr(assoc_elem_lvalue(lv, /*for_write=*/false))
-                       : agg_image_ptr(lv);
+//
+// An input is only read, so an invalid place (an out-of-range or x/z index, an
+// absent key) hands the callee the type's power-on image (LRM 7.4.5); an out /
+// inout is written through the pointer, so it hands over a private image instead
+// and the write goes nowhere.
+llvm::Value* Backend::agg_arg_ptr(const Guarded& g, Ref type, ArgDir dir) {
+    const Guarded r = g.is_assoc ? assoc_elem_lvalue(g, /*for_write=*/false) : g;
+    emit_bounds_reports(r, /*is_write=*/dir != ArgDir::In);
+    return dir == ArgDir::In ? agg_read_ptr(r, type) : agg_place_ptr(r, type);
 }
 
+// Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
+// without the final mm/z field select).
 llvm::Value* Backend::agg_slot_ptr(const LValue& lv) {
     if (lv.is_assoc) {
         // Every supported aggregate-assoc access resolves the map slot (base)
@@ -1585,31 +1591,12 @@ llvm::Value* Backend::agg_slot_ptr(const LValue& lv) {
 // the leaf's slot byte count, and the new value written in the leaf's own slot
 // layout. The NBA region replays it by memcpy (later write to the same leaf
 // wins). Whole-leaf only — a partial leaf write is guarded in the frontend.
+//
+// The caller opens the place's guard, so no record is staged for an invalid
+// element (LRM 7.4.5: the write performs no operation): its destination would
+// point past the array, and the NBA region memcpys through that pointer
+// unconditionally when it replays the record.
 void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
-    if (lv.dyn_inrange != nullptr) {
-        // An aggregate leaf under a variable array index outside the
-        // declared bound (LRM 7.4.5: the write performs no operation), so
-        // no record is staged at all. Without this, agg_slot_ptr below GEPs
-        // past the array and the NBA region memcpys through that pointer
-        // unconditionally when it replays the record -- `arr[9].f <= v` on
-        // an `arr[0:3]` corrupts state, and a wild index segfaults.
-        // emit_array_nba guards its own path the same way; this one was
-        // missed.
-        auto* fn   = b_.GetInsertBlock()->getParent();
-        auto* dobb = llvm::BasicBlock::Create(ctx_, "aggnba.do", fn);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "aggnba.cont", fn);
-        b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
-
-        b_.SetInsertPoint(dobb);
-        LValue clean      = lv;
-        clean.dyn_inrange = nullptr;
-        clean.bounds_checks.clear();
-        emit_agg_nba(clean, rhs);
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        return;
-    }
     const SignalSlot& s      = slot_of(lv.sig);
     const uint32_t    W      = lv.store_width;
     const llvm::Align a1{ 1 };
@@ -1736,28 +1723,13 @@ void Backend::emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
 // the destination pointer(s), the positioned value, and (for a masked target) the
 // write mask. The NBA region replays it. Element width is unrestricted — the
 // value is a native iMM word of any size.
+//
+// The caller opens the place's guard: a variable-indexed element outside the
+// array's declared bound (LRM 7.4.5 / 11.5.1) is a no-op, so no record is staged
+// at all -- lv_mm_ptr(lv) below would otherwise compute an out-of-bounds
+// destination pointer that the NBA region later dereferences unconditionally when
+// replaying the record.
 void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
-    if (lv.dyn_inrange != nullptr) {
-        // A variable-indexed element outside the array's declared bound
-        // (LRM 7.4.5 / 11.5.1): the write is a no-op, so no record is
-        // staged at all -- lv_mm_ptr(lv) below would otherwise compute an
-        // out-of-bounds destination pointer that the NBA region later
-        // dereferences unconditionally when replaying the record.
-        auto* fn   = b_.GetInsertBlock()->getParent();
-        auto* dobb = llvm::BasicBlock::Create(ctx_, "arrnba.do", fn);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "arrnba.cont", fn);
-        b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
-
-        b_.SetInsertPoint(dobb);
-        LValue clean      = lv;
-        clean.dyn_inrange = nullptr;
-        clean.bounds_checks.clear();
-        emit_array_nba(clean, rhs);
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        return;
-    }
     const uint32_t    W = lv.store_width;
     const SignalSlot& s = slot_of(lv.sig);
     const llvm::Align a1{ 1 }; // records live in an unaligned byte buffer
@@ -1959,28 +1931,13 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
     }
 }
 
+// Arm a nonblocking intra-assignment delay (`x <= #d y`). The caller opens the
+// place's guard: a variable index outside the declared bound (LRM 7.4.5 / 11.5.1)
+// is a no-op, so nothing is armed at all. Otherwise the record would carry an
+// out-of-bounds destination pointer that the NBA region dereferences
+// unconditionally when it replays -- and for a scalar select, an unrestricted
+// mask. Mirrors emit_array_nba.
 void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
-    if (lv.dyn_inrange != nullptr) {
-        // A variable index outside the declared bound (LRM 7.4.5 / 11.5.1): the
-        // write is a no-op, so arm nothing at all. Otherwise the record would
-        // carry an out-of-bounds destination pointer that the NBA region
-        // dereferences unconditionally when it replays -- and for a scalar
-        // select, an unrestricted mask. Mirrors emit_array_nba.
-        auto* fn   = b_.GetInsertBlock()->getParent();
-        auto* dobb = llvm::BasicBlock::Create(ctx_, "intranba.do", fn);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "intranba.cont", fn);
-        b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
-
-        b_.SetInsertPoint(dobb);
-        LValue clean      = lv;
-        clean.dyn_inrange = nullptr;
-        clean.bounds_checks.clear();
-        emit_intra_nba_arm(clean, rhs, ticks);
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        return;
-    }
     const SignalSlot& s      = slot_of(lv.sig);
     llvm::StructType* rt     = intra_rec_ty(s);
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
@@ -2154,23 +2111,6 @@ void Backend::emit_intra_event_arm(const LValue&                lv,
                                    Plane                        rhs,
                                    llvm::Value*                 count,
                                    llvm::ArrayRef<llvm::Value*> trig_ids) {
-    if (lv.dyn_inrange != nullptr) {
-        // Out-of-range variable index: register nothing (see emit_intra_nba_arm).
-        auto* fn   = b_.GetInsertBlock()->getParent();
-        auto* dobb = llvm::BasicBlock::Create(ctx_, "intraev.do", fn);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "intraev.cont", fn);
-        b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
-
-        b_.SetInsertPoint(dobb);
-        LValue clean      = lv;
-        clean.dyn_inrange = nullptr;
-        clean.bounds_checks.clear();
-        emit_intra_event_arm(clean, rhs, count, trig_ids);
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        return;
-    }
     const SignalSlot& s      = slot_of(lv.sig);
     llvm::StructType* rt     = intra_rec_ty(s);
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));

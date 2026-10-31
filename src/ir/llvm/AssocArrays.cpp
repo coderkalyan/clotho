@@ -193,7 +193,7 @@ std::pair<llvm::Value*, llvm::Value*> Backend::normalize_integral_key(llvm::Valu
 // integer type: it is the member's (Field::is_signed) or the array's element
 // (Type::elem_signed), and `is_signed` carries it down to the leaf.
 uint32_t Backend::emit_agg_key_bytes(Ref              type,
-                                     const LValue&    lv,
+                                     const Guarded&   lv,
                                      llvm::Value*     scratch,
                                      llvm::ArrayType* arr_ty,
                                      uint32_t         off,
@@ -215,12 +215,12 @@ uint32_t Backend::emit_agg_key_bytes(Ref              type,
         }
         return off;
     }
-    LValue leaf = lv;
+    Guarded leaf = lv;
     if (leaf.is_agg) {
         fill_agg_leaf(leaf, type);
         leaf.agg_leaf = true;
     }
-    const Plane  pl  = lower_load(leaf);
+    const Plane  pl  = load_guarded(leaf);
     llvm::Value* ux  = any_unknown(pl, leaf.four_state);
     any_x            = any_x == nullptr ? ux : b_.CreateOr(any_x, ux);
     const uint32_t w = mod_.pool.layout(type).width;
@@ -230,7 +230,7 @@ uint32_t Backend::emit_agg_key_bytes(Ref              type,
 }
 
 // Normalized span of an aggregate key held in `key_lv`.
-Backend::AssocKeySpan Backend::normalize_agg_key(const LValue& key_lv, const AssocKeyInfo& info) {
+Backend::AssocKeySpan Backend::normalize_agg_key(const Guarded& key_lv, const AssocKeyInfo& info) {
     const uint32_t nbytes  = agg_key_bytes(info.key_ty);
     auto*          arr_ty  = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
     auto*          scratch = entry_alloca(arr_ty, "assoc.key");
@@ -262,7 +262,7 @@ Backend::AssocKeySpan Backend::normalize_agg_key(const LValue& key_lv, const Ass
 // is a compile-time constant with no defining block to violate). A plain
 // load/store through the slot is correct regardless of trip count or
 // nesting depth.
-void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot, bool is_signed) {
+void Backend::emit_variable_agg_key_bytes(Ref type, const Guarded& lv, llvm::Value* any_x_slot, bool is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
@@ -383,12 +383,12 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
     // Every non-scalar leaf kind is handled above; what remains is a plain
     // scalar leaf (integral / class handle / event / chandle / virtual
     // interface / packed struct or union).
-    LValue leaf = lv;
+    Guarded leaf = lv;
     if (leaf.is_agg) {
         fill_agg_leaf(leaf, type);
         leaf.agg_leaf = true;
     }
-    const Plane  pl = lower_load(leaf);
+    const Plane  pl = load_guarded(leaf);
     llvm::Value* ux = any_unknown(pl, leaf.four_state);
     b_.CreateStore(b_.CreateOr(b_.CreateLoad(b_.getInt1Ty(), any_x_slot), cast(ux, 1, false)), any_x_slot);
     const uint32_t w       = mod_.pool.layout(type).width;
@@ -407,7 +407,7 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
 // build, read the span, pop, all in this one call, so the mark never
 // survives past it -- see the LValue field comment on assoc_key_arg for why
 // that matters (a deferred a[k] place can resolve its key twice).
-Backend::AssocKeySpan Backend::normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info) {
+Backend::AssocKeySpan Backend::normalize_variable_agg_key(const Guarded& key_lv, const AssocKeyInfo& info) {
     llvm::Value* mark      = b_.CreateCall(keybuf_begin_fn(), {});
     llvm::Value* any_x_slot = entry_alloca(b_.getInt1Ty(), "assoc.vkey.anyx");
     b_.CreateStore(b_.getInt1(false), any_x_slot);
@@ -466,7 +466,7 @@ Backend::AssocKeySpan Backend::normalize_assoc_key_value(Index key, Ref assoc_ty
 
 // Normalized key span for the CURRENT value of a key VARIABLE lvalue (next /
 // prev traversal).
-Backend::AssocKeySpan Backend::normalize_assoc_key_lvalue(const LValue& key_lv, Ref assoc_type) {
+Backend::AssocKeySpan Backend::normalize_assoc_key_lvalue(const Guarded& key_lv, Ref assoc_type) {
     const AssocKeyInfo info = assoc_key_info(assoc_type);
     if (info.is_string) {
         llvm::Value* sh = lv_string_ptr(key_lv, StringUse::Read);
@@ -477,7 +477,7 @@ Backend::AssocKeySpan Backend::normalize_assoc_key_lvalue(const LValue& key_lv, 
     if (info.is_agg) {
         return info.is_variable ? normalize_variable_agg_key(key_lv, info) : normalize_agg_key(key_lv, info);
     }
-    const Plane pl    = lower_load(key_lv);
+    const Plane pl    = load_guarded(key_lv);
     auto [kptr, klen] = normalize_integral_key(must_of(pl, key_lv.four_state), info);
     return { kptr, klen, integral_key_valid(pl, key_lv.four_state) };
 }
@@ -487,7 +487,7 @@ Backend::AssocKeySpan Backend::normalize_assoc_key_lvalue(const LValue& key_lv, 
 void Backend::denormalize_assoc_key(llvm::Value*  kptr,
                                     llvm::Value*  klen,
                                     Ref           assoc_type,
-                                    const LValue& key_lv,
+                                    const Guarded& key_lv,
                                     Index         at) {
     const AssocKeyInfo info = assoc_key_info(assoc_type);
     if (info.is_string) {
@@ -508,8 +508,10 @@ void Backend::denormalize_assoc_key(llvm::Value*  kptr,
         }
         return;
     }
-    lower_store(key_lv, known_plane(denormalize_key_word(kptr, 0, info.W, info.is_signed, key_lv.store_width),
-                                    key_lv.four_state));
+    key_lv.when_valid(b_, [&](const LValue& v) {
+        lower_store(v, known_plane(denormalize_key_word(kptr, 0, info.W, info.is_signed, v.store_width),
+                                   v.four_state));
+    });
 }
 
 // Rebuild one leaf value from `nbytes` big-endian key bytes at `off`: reassemble,
@@ -539,7 +541,7 @@ llvm::Value* Backend::denormalize_key_word(llvm::Value* kptr,
 // Inverse of emit_agg_key_bytes: one store per leaf, in the same declaration
 // order, so a `foreach` / `first` / `next` key variable of aggregate type reads
 // back exactly the key that was inserted.
-void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off, bool is_signed) {
+void Backend::denormalize_agg_key(Ref type, const Guarded& lv, llvm::Value* kptr, uint32_t& off, bool is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
@@ -556,14 +558,16 @@ void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr,
         }
         return;
     }
-    LValue leaf = lv;
+    Guarded leaf = lv;
     if (leaf.is_agg) {
         fill_agg_leaf(leaf, type);
         leaf.agg_leaf = true;
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, known_plane(denormalize_key_word(kptr, off, W, is_signed, leaf.store_width), leaf.four_state));
+    leaf.when_valid(b_, [&](const LValue& v) {
+        lower_store(v, known_plane(denormalize_key_word(kptr, off, W, is_signed, v.store_width), v.four_state));
+    });
     off += (W + 7) / 8;
 }
 
@@ -573,12 +577,12 @@ void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr,
 // fresh GEP off `kbase` rather than the fixed helper's compile-time offset --
 // `denormalize_key_word` still does the big-endian reassembly / sign-unflip,
 // just relative to that GEP instead of `kbase` directly.
-void Backend::denormalize_variable_agg_key(Ref           type,
-                                           const LValue& lv,
-                                           llvm::Value*  kbase,
-                                           llvm::Value*& off,
-                                           Index         at,
-                                           bool          is_signed) {
+void Backend::denormalize_variable_agg_key(Ref            type,
+                                           const Guarded& lv,
+                                           llvm::Value*   kbase,
+                                           llvm::Value*&  off,
+                                           Index          at,
+                                           bool           is_signed) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         uint32_t f = 0;
@@ -599,7 +603,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
     if (t.kind == Type::Kind::String) {
         llvm::Value* len32  = denormalize_key_word(leafptr, 0, 32, false, 32);
         llvm::Value* datptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), leafptr, b_.getInt32(4));
-        LValue       leaf   = lv;
+        Guarded      leaf   = lv;
         if (leaf.is_agg) {
             fill_agg_leaf(leaf, type);
             leaf.agg_leaf = true;
@@ -712,26 +716,28 @@ void Backend::denormalize_variable_agg_key(Ref           type,
         return;
     }
     // Every non-scalar leaf kind is handled above; see emit_variable_agg_key_bytes.
-    LValue leaf = lv;
+    Guarded leaf = lv;
     if (leaf.is_agg) {
         fill_agg_leaf(leaf, type);
         leaf.agg_leaf = true;
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, known_plane(denormalize_key_word(leafptr, 0, W, is_signed, leaf.store_width), leaf.four_state));
+    leaf.when_valid(b_, [&](const LValue& v) {
+        lower_store(v, known_plane(denormalize_key_word(leafptr, 0, W, is_signed, v.store_width), v.four_state));
+    });
     off = b_.CreateAdd(off, b_.getInt32((W + 7) / 8));
 }
 
 // Resolve an assoc element lvalue (deferred in AssocSelect) to a concrete
 // element lvalue over the heap slot: get_ptr for a read (absent -> the
-// dyn_inrange=false default path, no entry created), put_ptr for a write
+// invalid-place default path, no entry created), put_ptr for a write
 // (creates + proto-inits the entry).
 //
 // The resolver is shared with lower_agg_eq, which recurses over aggregate
 // leaves without an Index, so no instruction location reaches here and an
 // entry-creating allocation reports "<unknown>".
-LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
+Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
     const SourceText at{ .where = "<unknown>" };
     // The key is normalized HERE, fresh for every resolution, rather than once
     // at AssocSelect-lowering time -- see the LValue field comment for why: a
@@ -782,20 +788,26 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
                                    alloc_site_global(at, "associative array") });
         }
         if (for_write) {
-            if (kvalid == nullptr) {
+            // An invalid (x/z) key must not even allocate the entry, or
+            // `num`/`exists` would see a key the write was supposed to drop
+            // (LRM 7.8.6); nor may a select the entry sits behind that is itself
+            // invalid (`arr[i][k]` with `i` outside `arr`). Branch around put_ptr
+            // and hand back a null slot; the store itself is guarded by the same
+            // verdict below.
+            llvm::Value* entry_ok = kvalid;
+            if (lv.valid() != nullptr) {
+                entry_ok = entry_ok != nullptr ? b_.CreateAnd(entry_ok, lv.valid()) : lv.valid();
+            }
+            if (entry_ok == nullptr) {
                 return b_.CreateCall(assoc_put_ptr_fn(),
                                      { lv.assoc_handle, lv.assoc_ops, kptr, klen,
                                        alloc_site_global(at, "associative array") });
             }
-            // An invalid (x/z) key must not even allocate the entry, or
-            // `num`/`exists` would see a key the write was supposed to drop
-            // (LRM 7.8.6). Branch around put_ptr and hand back a null slot; the
-            // store itself is gated by the same predicate below.
             auto* fn    = b_.GetInsertBlock()->getParent();
             auto* putbb = llvm::BasicBlock::Create(ctx_, "assoc.key.ok", fn);
             auto* cont  = llvm::BasicBlock::Create(ctx_, "assoc.key.cont", fn);
             auto* from  = b_.GetInsertBlock();
-            b_.CreateCondBr(kvalid, putbb, cont);
+            b_.CreateCondBr(entry_ok, putbb, cont);
             b_.SetInsertPoint(putbb);
             llvm::Value* p = b_.CreateCall(assoc_put_ptr_fn(),
                                           { lv.assoc_handle, lv.assoc_ops, kptr, klen,
@@ -847,34 +859,28 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
     // A found-check is only meaningful for a key read: everything else yields a
     // live slot.
     const bool checked = !lv.assoc_default && !for_write;
-    // Aggregate value (unpacked struct / fixed array): the resolved slot is
-    // the flat aggregate image. The is_agg lvalue (root_ty + agg_path + leaf
-    // facts) was built by the MemberSelect / ElemSelect descent; only the base
-    // is deferred. A read of an absent key finds no slot -- the found-check
-    // (ANDed with any array-bound gate from a runtime element index, and with
-    // the key-validity gate) drives dyn_elem_load to the per-leaf element
+    // The resolved place is valid only where the key is, where the entry was found
+    // (a read), and where every select on the way here is. An aggregate value
+    // (unpacked struct / fixed array) resolves to the flat aggregate image: the
+    // is_agg lvalue (root_ty + agg_path + leaf facts) was built by the
+    // MemberSelect / ElemSelect descent and already carries the verdict of its
+    // array-bound selects, which only the base is missing; the key and the
+    // found-check narrow it further, so an absent key reads the per-leaf element
     // default (Table 7-1), no entry created.
     llvm::Value* slot    = slot_ptr();
     llvm::Value* nonnull = checked
                              ? b_.CreateICmpNE(slot, llvm::Constant::getNullValue(raw_ptr_ty()))
                              : nullptr;
-    const auto   gate    = [&](llvm::Value* base_gate) -> llvm::Value* {
-        if (base_gate == nullptr) {
-            return kvalid;
-        }
-        return kvalid != nullptr ? b_.CreateAnd(kvalid, base_gate) : base_gate;
-    };
     if (lv.is_agg) {
-        LValue el      = lv;
-        el.is_assoc    = false;
-        el.is_signal   = false;
-        el.base        = slot;
-        el.dyn_inrange = gate(nonnull);
+        Guarded el   = lv.rooted_at(slot);
+        el.is_assoc  = false;
+        el.is_signal = false;
+        el.require(b_, kvalid);
+        el.require(b_, nonnull);
         return el;
     }
     LValue el;
     el.base        = slot;
-    el.dyn_inrange = gate(nonnull);
     // An entry's slot dies with the entry, so a `ref` formed through it carries
     // the map's relocation epoch exactly as a queue element does — and whatever
     // containers the map itself sits inside, ahead of it.
@@ -886,6 +892,13 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
     // Root and owner travel together; see agg_member for the invariant.
     el.gc_container_root = lv.gc_container_root;
     el.gc_container_type = lv.gc_container_type;
+    // The verdicts the deferred place carried, then the key's and the entry's.
+    const auto resolved = [&](const LValue& v) {
+        Guarded g = nested_select(v, lv);
+        g.require(b_, kvalid);
+        g.require(b_, nonnull);
+        return g;
+    };
     // Managed value elements (string / nested container): the resolved slot
     // IS the handle. put_ptr proto-inits a fresh entry (owned-empty string /
     // null container), so a write never sees null; a read of an absent key
@@ -897,7 +910,7 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
         // The sink redirect lv_handle_ptr / lv_string_ptr apply when the key is
         // absent needs the element's own type to pick the empty image.
         el.handle_type = lv.handle_type;
-        return el;
+        return resolved(el);
     }
     el.slot_ty     = lv.slot_ty;
     el.has_z       = lv.has_z;
@@ -919,7 +932,7 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
     el.sel_base         = lv.sel_base;
     el.sel_cwidth       = lv.sel_cwidth;
     el.sel_unknown      = lv.sel_unknown;
-    return el;
+    return resolved(el);
 }
 
 void Backend::lower_assoc_num(Index i) {
@@ -1002,7 +1015,7 @@ void Backend::lower_assoc_traverse(Index i, Inst::Tag tag) {
     const auto&  p      = ir_->payload(i).op_extra;
     const auto   aa     = ir_->extra_data<AssocArg>(p.extra);
     llvm::Value* handle = lv_handle_ptr(lvalue_of(p.op), HandleUse::Place);
-    const LValue key_lv = lvalue_of(aa.arg);
+    const Guarded& key_lv = lvalue_of(aa.arg);
     auto*        outptr = entry_alloca(raw_ptr_ty(), "assoc.kp");
     auto*        outlen = entry_alloca(b_.getInt32Ty(), "assoc.kl");
     llvm::Value* status = nullptr;

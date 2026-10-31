@@ -299,15 +299,15 @@ constexpr uint32_t wide_dyn_select_bits = 256;
 // call costs more than the native sequence there.
 constexpr uint32_t wide_arith_bits = 128;
 
-// A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
-// typed storage (the module state struct for a signal, or the per-call frame
-// struct for a function local) plus a bit offset / width selecting part of it.
-// `bit_off` is an i32; a whole-storage target has offset 0 and width ==
-// store_width.
-struct LValue {
-    // Pointer to the slot struct — or, for an unpacked-array signal, to the
-    // whole `[N x slot]` storage (`elem_idx` then selects the leaf).
-    llvm::Value* base = nullptr;
+// What a resolved assignment target is, without the pointer it is rooted at: a
+// `{ i(2W) must|may, iW z }` slot somewhere in typed storage (the module state
+// struct for a signal, or the per-call frame struct for a function local) plus a
+// bit offset / width selecting part of it. `bit_off` is an i32; a whole-storage
+// target has offset 0 and width == store_width.
+//
+// Nothing here can be dereferenced, which is why it is a type of its own: an
+// LValue adds the root pointer and a Guarded keeps it private (see Guarded).
+struct LValueInfo {
     // The leaf slot type `{ i(2W), iW }` of the addressed storage.
     llvm::StructType* slot_ty = nullptr;
     // The domain of the addressed slot: a 4-state slot is `{ i(2W) must|may [, iW z] }`,
@@ -378,8 +378,8 @@ struct LValue {
     // plane Load/Store on it traps (the frontend never emits one).
     bool is_handle = false;
     // The element / leaf type behind `is_handle`, needed to reach its rt_elem_ops
-    // and its out-of-range sink. Only set for a container ELEMENT (where
-    // dyn_inrange applies); a handle leaf inside an aggregate leaves it invalid.
+    // and its out-of-range sink. Only set for a container ELEMENT; a handle leaf
+    // inside an aggregate leaves it invalid.
     Ref handle_type{};
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
@@ -400,18 +400,11 @@ struct LValue {
     // indices so the target static leaf can be matched in SignalSlot::static_leaves.
     bool                  agg_static = true;
     std::vector<uint32_t> agg_field_path;
-    // A dynamic-array or queue element target (LRM 7.5.1 / 7.10): `base` is the
-    // heap data pointer loaded from the handle, `elem_idx` the physical element
-    // position (the wrapped ring index for a queue), and this is the i1 "index in
-    // [0, len)" predicate. When set, a read forces the element default (x/0) out
-    // of range and a write is suppressed out of range, so the heap buffer is
-    // never accessed past its length.
-    llvm::Value* dyn_inrange = nullptr;
     // Pending `--sanitize=bounds` reports, one per runtime array index taken on
     // the way to this element. Always empty unless the sanitizer is on, so an
     // unsanitized build emits byte-identical code. Drained by the load / store
     // lowering into rt_bounds_report calls; purely a report channel, the LRM's
-    // own out-of-range behaviour stays driven by `dyn_inrange` above.
+    // own out-of-range behaviour is the Guarded verdict's.
     std::vector<BoundsCheck> bounds_checks;
     // Relocation-epoch witnesses of the containers this place is nested inside,
     // OUTERMOST FIRST; empty when the place is stable (a module signal, a frame
@@ -535,6 +528,149 @@ struct LValue {
     // down the mm-snapshot path with a null base.
     bool   mut_sig_valid = false;
     Signal mut_sig{ 0 };
+};
+
+// An lvalue that can be dereferenced: the pointer its selection is rooted at, plus
+// everything LValueInfo says about the selection. Every raw primitive (lv_mm_ptr,
+// lower_load, lower_store, ...) takes one, so none can be handed a place whose
+// select may be invalid.
+struct LValue : LValueInfo {
+    // Pointer to the slot struct -- or, for an unpacked-array signal, to the whole
+    // `[N x slot]` storage (`elem_idx` then selects the leaf).
+    llvm::Value* base = nullptr;
+};
+
+// An lvalue whose select may be invalid at run time: an element index outside its
+// container or with an x/z bit, or an associative-array key that is invalid or
+// absent (LRM 7.4.5, 7.8.6, 7.10.1). Reading such a place yields the element
+// default (Table 7-1) and writing it does nothing, so the storage behind it must
+// never be touched: with a wild index the address points at nothing.
+//
+// The type guarantees that, not each consumer remembering to. The pointer the
+// selection is rooted at is private, so a Guarded is not an LValue: no raw
+// primitive accepts one and no address can be formed from one. The three openers
+// below are the only way out; each tests the verdict before it hands over an
+// LValue, and a place that cannot be invalid opens at no cost, emitting exactly
+// what the primitives alone would. Nor can a producer drop a verdict it was
+// handed: it only ever narrows it (`require`). An LValue converts to a Guarded
+// implicitly and never back (`unguarded` asserts that no verdict is carried).
+class Guarded : public LValueInfo {
+public:
+    Guarded() = default;
+    // A place that cannot be invalid.
+    Guarded(const LValue& lv)
+      : LValueInfo(lv)
+      , base_(lv.base) {}
+
+    // The select is valid only where `ok` holds as well. Verdicts compose -- a
+    // select nested in an invalid one is invalid -- so a producer adds its own with
+    // this and never assigns one. A null `ok` (an index that cannot be invalid)
+    // changes nothing.
+    void require(llvm::IRBuilder<>& b, llvm::Value* ok) {
+        if (ok != nullptr) {
+            valid_ = valid_ != nullptr ? b.CreateAnd(valid_, ok) : ok;
+        }
+    }
+
+    // The i1 verdict, null for a place that cannot be invalid. Reading it opens
+    // nothing; it is for a consumer deciding whether it needs a guard at all.
+    llvm::Value* valid() const {
+        return valid_;
+    }
+
+    // The same selection rooted at another pointer, verdict carried: an
+    // associative-array place is rooted at its entry only once the entry resolves.
+    Guarded rooted_at(llvm::Value* base) const {
+        Guarded g = *this;
+        g.base_   = base;
+        return g;
+    }
+
+    // The place as an LValue, for one the frontend never selects with an index that
+    // can be invalid (a call's out temp, a whole array handed to DPI). That is an
+    // assumption about the producer, so a wrong one stops the compiler here rather
+    // than the simulation later.
+    LValue unguarded() const {
+        assert(valid_ == nullptr && "an LValue is wanted of a place that can be invalid");
+        return open();
+    }
+
+    // `emit(lv)` on the path where the place is valid, nothing on the other: a
+    // write, and everything that must not happen for a dropped one (waking
+    // waiters, staging a deferred record).
+    template <class Emit>
+    void when_valid(llvm::IRBuilder<>& b, Emit&& emit) const {
+        const LValue lv = open();
+        if (valid_ == nullptr) {
+            emit(lv);
+            return;
+        }
+        auto* fn   = b.GetInsertBlock()->getParent();
+        auto* then = llvm::BasicBlock::Create(b.getContext(), "valid.do", fn);
+        auto* cont = llvm::BasicBlock::Create(b.getContext(), "valid.cont", fn);
+        b.CreateCondBr(valid_, then, cont);
+        b.SetInsertPoint(then);
+        emit(lv);
+        b.CreateBr(cont);
+        b.SetInsertPoint(cont);
+    }
+
+    // `read(lv)` where the place is valid and `otherwise` where not. The memory is
+    // read on the valid path only; the planes of `otherwise` are those `read` returns.
+    template <class Read>
+    Plane read_or(llvm::IRBuilder<>& b, Read&& read, const Plane& otherwise) const {
+        const LValue lv = open();
+        if (valid_ == nullptr) {
+            return read(lv);
+        }
+        auto* fn   = b.GetInsertBlock()->getParent();
+        auto* then = llvm::BasicBlock::Create(b.getContext(), "valid.read", fn);
+        auto* none = llvm::BasicBlock::Create(b.getContext(), "valid.default", fn);
+        auto* cont = llvm::BasicBlock::Create(b.getContext(), "valid.cont", fn);
+        b.CreateCondBr(valid_, then, none);
+        b.SetInsertPoint(then);
+        const Plane value = read(lv);
+        auto*       end   = b.GetInsertBlock();
+        b.CreateBr(cont);
+        b.SetInsertPoint(none);
+        b.CreateBr(cont);
+        b.SetInsertPoint(cont);
+        const auto merge = [&](llvm::Value* read_value, llvm::Value* default_value) -> llvm::Value* {
+            if (read_value == nullptr) {
+                assert(default_value == nullptr && "the default has a plane the read does not");
+                return nullptr;
+            }
+            assert(default_value != nullptr && "the read has a plane the default does not");
+            auto* phi = b.CreatePHI(read_value->getType(), 2);
+            phi->addIncoming(read_value, end);
+            phi->addIncoming(default_value, none);
+            return phi;
+        };
+        return { merge(value.mm, otherwise.mm), merge(value.z, otherwise.z),
+                 merge(value.fp, otherwise.fp) };
+    }
+
+    // The pointer `form(lv)` computes where the place is valid and `fallback()`
+    // where not, so it can be dereferenced either way: for a consumer that needs an
+    // address on both paths (a `ref` bound for a whole call, a string element).
+    // `fallback` runs only for a place that can be invalid, so one that cannot emits
+    // no sink.
+    template <class Form, class Fallback>
+    llvm::Value* pointer_or(llvm::IRBuilder<>& b, Form&& form, Fallback&& fallback) const {
+        llvm::Value* ptr = form(open());
+        return valid_ == nullptr ? ptr : b.CreateSelect(valid_, ptr, fallback());
+    }
+
+private:
+    LValue open() const {
+        LValue lv;
+        static_cast<LValueInfo&>(lv) = *this;
+        lv.base                      = base_;
+        return lv;
+    }
+
+    llvm::Value* base_  = nullptr;
+    llvm::Value* valid_ = nullptr;
 };
 
 // Why a container handle pointer is being taken (lv_handle_ptr).
@@ -902,6 +1038,9 @@ struct ModuleEnv {
     // Write-only sink handles for out-of-range nested-container elements, keyed by
     // element type Ref (handle_sink_global).
     ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> handle_sinks;
+    // Writable images of an aggregate type that an out-of-range aggregate `ref` / `out`
+    // actual is bound to, keyed by the type Ref (agg_sink_global).
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> agg_sinks;
     // The shared zero word a `ref` through a stable place aims its epoch at
     // (no_epoch_global).
     llvm::GlobalVariable* no_epoch = nullptr;
@@ -1132,17 +1271,17 @@ private:
     void emit_handle_delete(llvm::Value* handle, Ref type);
     llvm::Value* handle_sink_global(Ref elem_type);
 
-    llvm::Value* lv_handle_ptr(const LValue& lv, HandleUse use);
+    llvm::Value* lv_handle_ptr(const Guarded& lv, HandleUse use);
 
-    void notify_container_mutation(const LValue& lv);
+    void notify_container_mutation(const LValueInfo& lv);
 
     void service_signal_container_mutation(Signal sig);
 
-    void fire_prop_notifier(const LValue& lv, Edge edge);
+    void fire_prop_notifier(const LValueInfo& lv, Edge edge);
 
-    llvm::Value* str_chg_snapshot(const LValue& lv);
+    llvm::Value* str_chg_snapshot(const Guarded& lv);
 
-    void str_chg_after(const LValue& lv, llvm::Value* snap);
+    void str_chg_after(const Guarded& lv, llvm::Value* snap);
 
     bool is_string_type(Ref type) const;
 
@@ -1264,15 +1403,15 @@ private:
     void emit_class_body_init(Ref class_ref, llvm::Value* body_ptr);
 
     void emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type);
-    void fill_agg_leaf(LValue& lv, Ref leaf_type);
+    void fill_agg_leaf(LValueInfo& lv, Ref leaf_type);
 
     void collect_static_leaves(Ref type, std::vector<uint32_t>& path, std::vector<AggLeaf>& out);
 
     bool is_leaf_type(Ref type) const;
 
-    LValue agg_member(LValue lv, Ref struct_type, uint32_t field_index);
+    Guarded agg_member(Guarded lv, Ref struct_type, uint32_t field_index);
 
-    LValue agg_elem(LValue lv, Ref array_type, uint32_t pos);
+    Guarded agg_elem(Guarded lv, Ref array_type, uint32_t pos);
 
     void scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier);
 
@@ -1363,7 +1502,7 @@ private:
         uint32_t     saved_anchor_;
     };
 
-    uint32_t lvalue_ctx_anchor(const LValue& lv) const;
+    uint32_t lvalue_ctx_anchor(const LValueInfo& lv) const;
 
     bool ctx_override_for(const SignalSlot& owner) const;
 
@@ -1372,14 +1511,23 @@ private:
     llvm::GlobalVariable* shadow_base_gv();
 
     llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field);
+    // The address of the leaf slot an lvalue designates, without a field select.
+    llvm::Value* slot_ptr(const LValue& lv);
+    // The same selection rooted at `slot` itself, as a whole-slot lvalue.
+    LValue slot_lvalue(const LValueInfo& sel, llvm::Value* slot);
+    // An lvalue that can be dereferenced whether or not `g` is valid: `g` itself when
+    // it cannot be invalid, else its leaf slot where valid and a scratch slot (holding
+    // the element default) where not. For a runtime routine that writes through raw
+    // pointers, and for snapshots taken before such a write.
+    LValue safe_lvalue(const Guarded& g);
     llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
                                        bool has_z);
 
-    RefBinding ref_actual_arg(const LValue& raw);
+    RefBinding ref_actual_arg(const Guarded& raw, Ref type);
 
     void push_ref_epochs(std::vector<llvm::Value*>& argv, const RefBinding& rb, uint32_t depth);
 
-    llvm::Value* ref_actual_ptr(const LValue& lv);
+    llvm::Value* ref_actual_ptr(const Guarded& lv, Ref type);
 
     llvm::Value* lv_mm_ptr(const LValue& lv);
     llvm::Value* lv_z_ptr(const LValue& lv);
@@ -1752,7 +1900,7 @@ private:
 
     llvm::Value* load_mm(Signal sig);
 
-    uint32_t slot_mm_bits(const LValue& lv) const;
+    uint32_t slot_mm_bits(const LValueInfo& lv) const;
 
     llvm::Value* load_lv_mm(const LValue& lv);
 
@@ -1813,9 +1961,9 @@ private:
         std::optional<WideWindow> wide;
     };
 
-    ServiceSnapshot service_snapshot(const LValue& lv);
+    ServiceSnapshot service_snapshot(const Guarded& lv);
 
-    void service_after_write(const LValue& lv, ServiceSnapshot old);
+    void service_after_write(const Guarded& lv, ServiceSnapshot old);
 
     std::optional<WideWindow> wide_window_snapshot(const LValue& lv);
 
@@ -2454,12 +2602,12 @@ private:
 
     void emit_gc_barrier(llvm::Value* owner);
 
-    void emit_gc_barrier_for(const LValue& lv);
+    void emit_gc_barrier_for(const LValueInfo& lv);
 
-    void note_gc_container_root(LValue& lv, const LValue& parent, llvm::Value* handle,
+    void note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle,
                                 Ref container_type);
 
-    llvm::Value* emit_gc_ref_container_add(const LValue& lv);
+    llvm::Value* emit_gc_ref_container_add(const LValueInfo& lv);
 
     uint32_t intra_idx(Signal sig) const;
     llvm::StructType* intra_rec_ty(const SignalSlot& s);
@@ -2521,14 +2669,26 @@ private:
 
     llvm::Value* agg_image_ptr(const LValue& lv);
 
-    llvm::StructType* image_elem_slot(const LValue& lv, Ref type);
+    llvm::StructType* image_elem_slot(const LValueInfo& lv, Ref type);
 
-    llvm::Constant* agg_copy_proto(Ref type, const LValue& slv);
+    llvm::Constant* agg_copy_proto(Ref type, const LValueInfo& slv);
 
-    void emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LValue& slv,
-                       llvm::Value* src_override);
+    // The source resolves through its own guard (agg_read_ptr) as the copy forms it.
+    void emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Guarded& slv);
 
-    void emit_agg_ret_copy(llvm::Value* dst, const LValue& slv, Ref type);
+    // The image of an aggregate place, for a consumer that only reads it: the place
+    // where it is valid and the type's power-on image (Table 7-1) where not.
+    llvm::Value* agg_read_ptr(const Guarded& g, Ref type);
+
+    // The image of an aggregate place, for a consumer that writes through it for a
+    // whole call (a `ref` or `out` formal): the place where it is valid and a private
+    // writable image of the type's defaults where not, so the callee's reads see the
+    // element default and its writes go nowhere.
+    llvm::Value* agg_place_ptr(const Guarded& g, Ref type);
+
+    llvm::GlobalVariable* agg_sink_global(Ref type);
+
+    void emit_agg_ret_copy(llvm::Value* dst, const Guarded& slv, Ref type);
 
     void emit_array_convert_copy(llvm::Value* d_base, llvm::Value* s_base,
                                  llvm::StructType* d_slot, llvm::StructType* s_slot,
@@ -2560,13 +2720,13 @@ private:
     Plane value_of(Index i) const;
     void set_value(Index i, Plane p);
 
-    const LValue& lvalue_of(Index i) const;
-    void set_lvalue(Index i, LValue lv);
+    const Guarded& lvalue_of(Index i) const;
+    void set_lvalue(Index i, Guarded lv);
 
     llvm::Value* str_of(Index i) const;
     void set_str(Index i, llvm::Value* handle);
 
-    llvm::Value* lv_string_ptr(const LValue& lv, StringUse use);
+    llvm::Value* lv_string_ptr(const Guarded& lv, StringUse use);
 
     llvm::Value* str_sink_global();
 
@@ -2630,9 +2790,13 @@ private:
 
     void wide_dyn_store(const LValue& lv, Plane rhs);
 
-    Plane dyn_elem_load(const LValue& lv);
+    // A read of a place that may be invalid: its value where valid, the element
+    // default (x for 4-state, 0 for 2-state) where not. Same Plane shape as lower_load.
+    Plane load_guarded(const Guarded& g);
 
-    void dyn_elem_store(const LValue& lv, Plane rhs);
+    // A blocking store to a place that may be invalid, with its wait-queue servicing:
+    // both happen only where the place is valid.
+    void store_guarded(const Guarded& g, Plane rhs);
 
     void lower_dyn_array_new(Index i);
 
@@ -2652,11 +2816,23 @@ private:
 
     llvm::AllocaInst* entry_alloca(llvm::Type* ty, const llvm::Twine& name);
 
-    LValue dyn_agg_elem_lvalue(const LValue&  container,
-                               const DynElem& e,
-                               llvm::Value*   data,
-                               llvm::Value*   slot_index,
-                               llvm::Value*   inrange);
+    // The element lvalue at logical slot `slot_index` of a container's heap buffer.
+    // It is valid by construction; element_select applies the verdict of the select
+    // that produced it.
+    LValue dyn_agg_elem_lvalue(const LValueInfo& container,
+                               const DynElem&    e,
+                               llvm::Value*      data,
+                               llvm::Value*      slot_index);
+
+    // A place `el` selected from inside `container`, which it is valid only as far as:
+    // a select nested in an invalid one is invalid.
+    Guarded nested_select(const LValue& el, const Guarded& container);
+
+    // The element `el` an element select of `container` designates: valid only where
+    // the index is (`inrange`) and where the container place itself is. Records the
+    // index for --sanitize=bounds.
+    Guarded element_select(const LValue& el, const Guarded& container, Index at, Index idx_expr,
+                           llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent);
 
     LValue elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e);
 
@@ -2741,27 +2917,27 @@ private:
     std::pair<llvm::Value*, llvm::Value*> normalize_integral_key(llvm::Value* mustval, const AssocKeyInfo& info);
 
     uint32_t emit_agg_key_bytes(Ref              type,
-                                const LValue&    lv,
+                                const Guarded&   lv,
                                 llvm::Value*     scratch,
                                 llvm::ArrayType* arr_ty,
                                 uint32_t         off,
                                 llvm::Value*&    any_x,
                                 bool             is_signed);
 
-    AssocKeySpan normalize_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
+    AssocKeySpan normalize_agg_key(const Guarded& key_lv, const AssocKeyInfo& info);
 
-    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot, bool is_signed);
+    void emit_variable_agg_key_bytes(Ref type, const Guarded& lv, llvm::Value* any_x_slot, bool is_signed);
 
-    AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info);
+    AssocKeySpan normalize_variable_agg_key(const Guarded& key_lv, const AssocKeyInfo& info);
 
     llvm::Value* integral_key_valid(Plane pl, bool four);
 
     AssocKeySpan normalize_assoc_key_value(Index key, Ref assoc_type);
 
-    AssocKeySpan normalize_assoc_key_lvalue(const LValue& key_lv, Ref assoc_type);
+    AssocKeySpan normalize_assoc_key_lvalue(const Guarded& key_lv, Ref assoc_type);
 
     void denormalize_assoc_key(llvm::Value* kptr, llvm::Value* klen, Ref assoc_type,
-                               const LValue& key_lv, Index at);
+                               const Guarded& key_lv, Index at);
 
     llvm::Value* denormalize_key_word(llvm::Value* kptr,
                                       uint32_t     off,
@@ -2769,16 +2945,20 @@ private:
                                       bool         is_signed,
                                       uint32_t     store_width);
 
-    void denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr, uint32_t& off, bool is_signed);
+    void denormalize_agg_key(Ref type, const Guarded& lv, llvm::Value* kptr, uint32_t& off, bool is_signed);
 
-    void denormalize_variable_agg_key(Ref           type,
-                                      const LValue& lv,
-                                      llvm::Value*  kbase,
-                                      llvm::Value*& off,
-                                      Index         at,
-                                      bool          is_signed);
+    void denormalize_variable_agg_key(Ref            type,
+                                      const Guarded& lv,
+                                      llvm::Value*   kbase,
+                                      llvm::Value*&  off,
+                                      Index          at,
+                                      bool           is_signed);
 
-    LValue assoc_elem_lvalue(const LValue& lv, bool for_write);
+    Guarded assoc_elem_lvalue(const Guarded& lv, bool for_write);
+
+    // The place a runtime routine writes through: a deferred associative element
+    // resolves for write first (the write creates the entry, LRM 7.8).
+    Guarded write_dest(Index i);
 
     void lower_assoc_num(Index i);
 
@@ -2802,13 +2982,13 @@ private:
 
     void wide_dyn_stage_mask(const LValue& lv, const SignalSlot& s);
 
-    llvm::APInt site_const_mask(const LValue& lv, const SignalSlot& s) const;
+    llvm::APInt site_const_mask(const LValueInfo& lv, const SignalSlot& s) const;
 
     int agg_static_leaf_index(const SignalSlot& s, const std::vector<uint32_t>& fpath) const;
 
     llvm::APInt leaf_set_mask(const SignalSlot& s, uint32_t leaf) const;
 
-    void register_block_store(const LValue& lv, const SignalSlot& s);
+    void register_block_store(const LValueInfo& lv, const SignalSlot& s);
 
     uint32_t agg_buf_idx(Signal sig) const;
 
@@ -2838,7 +3018,7 @@ private:
 
     llvm::StructType* agg_rec_ty(const SignalSlot& s);
 
-    llvm::Value* agg_arg_ptr(const LValue& lv);
+    llvm::Value* agg_arg_ptr(const Guarded& lv, Ref type, ArgDir dir);
 
     llvm::Value* agg_slot_ptr(const LValue& lv);
 
@@ -2903,7 +3083,7 @@ private:
     // `constant_window`: the select is a compile-time window at a constant offset
     // (a constant part-select hanging over its vector), so its mask folds to a
     // constant and needs no runtime kernel even on storage too wide to shift.
-    SelectVerdict set_select_bounds(LValue& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
+    SelectVerdict set_select_bounds(LValueInfo& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
                                     llvm::Value* idx_unknown, bool constant_window = false);
 
     static bool wide_dyn_storage(uint32_t sw);
@@ -2935,16 +3115,16 @@ private:
 
     ElemBelow elem_index_below(Plane idx, ValueType t, llvm::Value* len);
 
-    llvm::Value* store_mask(const LValue& lv, uint32_t sw);
+    llvm::Value* store_mask(const LValueInfo& lv, uint32_t sw);
 
-    llvm::Value* place_val(const LValue& lv, llvm::Value* v_iw, uint32_t sw);
+    llvm::Value* place_val(const LValueInfo& lv, llvm::Value* v_iw, uint32_t sw);
 
-    llvm::Value* merge_sel(llvm::Value* old, llvm::Value* ins_iw, const LValue& lv, uint32_t sw,
+    llvm::Value* merge_sel(llvm::Value* old, llvm::Value* ins_iw, const LValueInfo& lv, uint32_t sw,
                            llvm::Value* mask);
 
     static bool is_zero_const(llvm::Value* v);
 
-    static bool selects_whole(const LValue& lv);
+    static bool selects_whole(const LValueInfo& lv);
 
     // -- System tasks --
 
@@ -2993,28 +3173,28 @@ private:
                                        const std::string& name, BoundsWhat what, int32_t left,
                                        int32_t right, int32_t width = 1);
 
-    std::string bounds_name(const LValue& lv) const;
+    std::string bounds_name(const LValueInfo& lv) const;
 
-    void add_elem_bounds_check(LValue& target, Index at, const LValue& named, Index idx_expr,
+    void add_elem_bounds_check(LValueInfo& target, Index at, const LValueInfo& named, Index idx_expr,
                                llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent,
                                int32_t left = 0, int32_t right = 0);
 
-    void add_select_bounds_check(LValue& target, Index at, Index off_expr, const SelectVerdict& v,
+    void add_select_bounds_check(LValueInfo& target, Index at, Index off_expr, const SelectVerdict& v,
                                  BoundsWhat what, uint32_t container_width, uint32_t sel_width);
 
     void emit_string_bounds_check(Index at, llvm::Value* str, Index idx_expr, const std::string& name,
                                   bool is_write);
 
-    void emit_queue_bounds_check(Index at, llvm::Value* handle, Index idx_expr, const LValue& named,
+    void emit_queue_bounds_check(Index at, llvm::Value* handle, Index idx_expr, const LValueInfo& named,
                                  bool allow_append);
 
-    void emit_empty_pop_bounds_check(Index at, llvm::Value* handle, const LValue& named);
+    void emit_empty_pop_bounds_check(Index at, llvm::Value* handle, const LValueInfo& named);
 
-    void emit_assoc_key_bounds_check(llvm::Value* kvalid, const LValue& lv, bool for_write);
+    void emit_assoc_key_bounds_check(llvm::Value* kvalid, const LValueInfo& lv, bool for_write);
 
     void emit_bounds_report(const BoundsCheck& bc, bool is_write);
 
-    void emit_bounds_reports(const LValue& lv, bool is_write);
+    void emit_bounds_reports(const LValueInfo& lv, bool is_write);
 
     // The rt_null_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
     // i32 column, i32 end_column }. Field order and types mirror the C struct
@@ -3170,7 +3350,7 @@ private:
 
     llvm::Value* vcd_index_value(Signal sig, int32_t base);
 
-    void vcd_touch_lvalue(const LValue& lv);
+    void vcd_touch_lvalue(const LValueInfo& lv);
 
     void vcd_touch_signal(Signal sig);
 
@@ -3510,11 +3690,11 @@ private:
 
     LValue tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx);
 
-    Plane emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e);
+    Plane emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e);
 
     bool agg_eq_four(Ref type);
 
-    Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type);
+    Plane lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type);
 
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 
@@ -4409,7 +4589,7 @@ private:
     llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's commit fn
 
     std::vector<Plane>                 values_;
-    std::vector<std::optional<LValue>> lvals_;
+    std::vector<std::optional<Guarded>> lvals_;
     // The type of every instruction of the current body (ir/Typing.h), computed
     // when the body starts lowering.
     std::vector<ValueType> types_;

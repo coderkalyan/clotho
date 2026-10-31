@@ -112,7 +112,7 @@ composable inside an aggregate — which is exactly what `guard_agg_key_leaves`
 enforces.
 
 x/z never reaches the span: only the must plane is serialized, and the may/z
-planes fold into a separate `i1` validity predicate carried on `dyn_inrange`
+planes fold into a separate `i1` validity predicate carried as the place's `Guarded` verdict
 (`AssocKeySpan::valid`).
 
 ### Runtime — `src/runtime/Containers.cpp, rt_assoc_*`, `Runtime.h:1133-1213`

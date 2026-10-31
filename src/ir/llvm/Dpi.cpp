@@ -285,7 +285,7 @@ llvm::Value* Backend::build_dpi_open_array_desc(Index                       a,
                                                 DpiCType                    elem_ct,
                                                 ArgDir                      dir,
                                                 std::vector<OaMarshalBack>& backs) {
-    const LValue lv = lvalue_of(a);
+    const LValue lv = lvalue_of(a).unguarded();
     const Ref    arr_ref = open_array_type_ref(a);
     const Type&  at      = std::get<Type>(mod_.pool.get(arr_ref));
     if (at.kind == Type::Kind::DynArray) {
@@ -518,7 +518,7 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
             if (dir == ArgDir::In) {
                 dpi_vec_copyin(ct, value_of(a), type_of(a).four_state, w, scratch);
             } else if (dir == ArgDir::Inout) {
-                const LValue& alv = lvalue_of(a);
+                const LValue alv = lvalue_of(a).unguarded();
                 dpi_vec_copyin(ct, lower_load(alv), alv.four_state, w, scratch);
             }
             argv.push_back(scratch);
@@ -531,7 +531,7 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
             llvm::Type*  cty     = dpi_c_llvm_ty(ct);
             llvm::Value* scratch = entry_alloca(cty, "dpi.out");
             if (dir == ArgDir::Inout) {
-                const LValue& alv = lvalue_of(a);
+                const LValue alv = lvalue_of(a).unguarded();
                 b_.CreateStore(dpi_arg_to_c(ct, lower_load(alv), alv.four_state), scratch);
             }
             argv.push_back(scratch);
@@ -553,7 +553,7 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
         const Plane pl = is_dpi_vec(o.ct)
                            ? dpi_vec_copyout(o.ct, o.scratch, o.w)
                            : dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch));
-        lower_store(lvalue_of(o.temp), pl);
+        lower_store(lvalue_of(o.temp).unguarded(), pl);
     }
     // Marshalled open-array output/inout: unpack the C-written svVecVal scratch
     // back into the design element storage (inline IR, native iW/i2W). A

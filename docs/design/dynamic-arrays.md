@@ -283,7 +283,7 @@ fires within one array.
 **An invalid (x/z) index** (LRM 7.8.4 for integral, 7.8.5 for a struct: "an index
 expression that is or contains x or z … is invalid") is gated, not normalized: the
 converter returns an `i1` alongside the span, false when any bit (or any leaf) is
-unknown, which rides the same `dyn_inrange` predicate a dynamic-array element uses.
+unknown, which rides the same verdict (`Guarded::valid`) a dynamic-array element uses.
 7.8.6 then falls out — a read yields the element default with no entry created, a
 write is dropped (and `put_ptr` is branched around, so `num` never sees the key),
 `exists` answers 0 and `delete` is a no-op. `next`/`prev` are unaffected: their key

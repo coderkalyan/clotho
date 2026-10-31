@@ -78,7 +78,7 @@ void Backend::emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type
 // Fill an LValue's leaf metadata (slot type, width, domain flags) from the
 // scalar / string / handle leaf type a select chain has resolved to.
 // Conservative z for a 4-state leaf, matching agg_leaf_slot_ty.
-void Backend::fill_agg_leaf(LValue& lv, Ref leaf_type) {
+void Backend::fill_agg_leaf(LValueInfo& lv, Ref leaf_type) {
     const Type& t = std::get<Type>(mod_.pool.get(leaf_type));
     if (t.kind == Type::Kind::String) {
         lv.is_string = true;
@@ -157,7 +157,7 @@ bool Backend::is_leaf_type(Ref type) const {
 // metadata if the member is a scalar/string (a struct/array member stays
 // interior for a further select). Shared by MemberSelect and the AggEq
 // member walk.
-LValue Backend::agg_member(LValue lv, Ref struct_type, uint32_t field_index) {
+Guarded Backend::agg_member(Guarded lv, Ref struct_type, uint32_t field_index) {
     const Type& st = std::get<Type>(mod_.pool.get(struct_type));
     const Ref   mt = mod_.pool.struct_fields(st.fields_id)[field_index].type;
     // Skip a polymorphic class's vtable-pointer header (LLVM field 0); the
@@ -175,7 +175,9 @@ LValue Backend::agg_member(LValue lv, Ref struct_type, uint32_t field_index) {
     // clears it: a notifier belongs to the whole property, not to a leaf in it.
     lv.chg = off_body ? mod_.change_notify(struct_type, field_index) : nullptr;
     if (lv.chg != nullptr) {
-        lv.chg_body    = lv.base;
+        // Only a property off the body, where no select has been applied yet, so the
+        // place cannot be invalid and the body pointer is the root itself.
+        lv.chg_body    = lv.unguarded().base;
         lv.chg_body_ty = lv.root_ty;
     }
     // The write barrier's precision knob (§7): a member that cannot reach a class
@@ -206,8 +208,8 @@ LValue Backend::agg_member(LValue lv, Ref struct_type, uint32_t field_index) {
 // recursive-storage (is_agg) array pushes a nested-GEP index step; a flat
 // memory advances the single flattened leaf index by pos * inner leaf count
 // -- the same two storage models the runtime ElemSelect path handles, minus
-// the dyn_inrange gate (an in-bounds constant position is always valid).
-LValue Backend::agg_elem(LValue lv, Ref array_type, uint32_t pos) {
+// the verdict (an in-bounds constant position is always valid).
+Guarded Backend::agg_elem(Guarded lv, Ref array_type, uint32_t pos) {
     const Type& at = std::get<Type>(mod_.pool.get(array_type));
     if (lv.is_agg) {
         lv.agg_path.push_back(b_.getInt32(pos));
@@ -719,7 +721,7 @@ llvm::Value* Backend::agg_image_ptr(const LValue& lv) {
 // Always answered from the place whose bytes it describes, never from the type
 // alone: the two models disagree precisely when one side's may-z analysis elided
 // a z plane the other keeps, and that is invisible in the type.
-llvm::StructType* Backend::image_elem_slot(const LValue& lv, Ref type) {
+llvm::StructType* Backend::image_elem_slot(const LValueInfo& lv, Ref type) {
     if (lv.is_agg) {
         return agg_leaf_slot_ty(leaf_type(type));
     }
@@ -739,7 +741,7 @@ llvm::StructType* Backend::image_elem_slot(const LValue& lv, Ref type) {
 // for. An aggregate source shares the type-derived recursive storage, so
 // agg_proto_global serves; a flat array's per-element slot is z-elided per
 // SIGNAL, so its image has to be built against that signal's slot type.
-llvm::Constant* Backend::agg_copy_proto(Ref type, const LValue& slv) {
+llvm::Constant* Backend::agg_copy_proto(Ref type, const LValueInfo& slv) {
     if (slv.is_agg) {
         return agg_proto_global(type);
     }
@@ -753,19 +755,65 @@ llvm::Constant* Backend::agg_copy_proto(Ref type, const LValue& slv) {
                                     "clotho.arr.proto");
 }
 
-// The whole-object copy itself, once both ends are known good: one memcpy of
+// The image of an aggregate place for a consumer that only reads it: the place where
+// its select is valid, the type's power-on image (LRM 7.4.5 / Table 7-1) where not.
+// The image is a constant, so a read of it is safe wherever the pointer ends up.
+llvm::Value* Backend::agg_read_ptr(const Guarded& g, Ref type) {
+    return g.pointer_or(
+      b_, [&](const LValue& lv) { return agg_image_ptr(lv); },
+      [&]() -> llvm::Value* { return agg_copy_proto(type, g); });
+}
+
+// A writable image of an aggregate type that stands in for an invalid place a
+// callee writes through for the whole call (agg_place_ptr). One per type, shared:
+// it starts as the type's power-on image, and every use resets it before handing it
+// out, so a heap leaf the previous callee left in it is released first.
+llvm::GlobalVariable* Backend::agg_sink_global(Ref type) {
+    const auto key = static_cast<uint32_t>(type);
+    if (const auto it = env_->agg_sinks.find(key); it != env_->agg_sinks.end()) {
+        return it->second;
+    }
+    llvm::Type* st = agg_storage_ty(type);
+    auto*       gv = new llvm::GlobalVariable(env_->llmod, st, /*isConstant=*/false,
+                                              llvm::GlobalValue::InternalLinkage,
+                                              agg_proto_const(type, st), "clotho.agg.sink");
+    env_->agg_sinks.emplace(key, gv);
+    return gv;
+}
+
+// The image of an aggregate place for a consumer that writes through it for a whole
+// call (a `ref`, `out` or `inout` formal): the place where its select is valid, and
+// the type's writable sink where not. The callee's reads then see the element
+// default and its writes go nowhere (LRM 7.4.5), as for a plane slot (ref_actual_ptr).
+llvm::Value* Backend::agg_place_ptr(const Guarded& g, Ref type) {
+    const auto sink = [&]() -> llvm::Value* {
+        llvm::GlobalVariable* s = agg_sink_global(type);
+        if (has_heap_leaf(type)) {
+            std::vector<llvm::Value*> path;
+            emit_agg_deinit(type, s, path, agg_storage_ty(type));
+        }
+        const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(type));
+        b_.CreateMemCpy(s, llvm::MaybeAlign(), agg_proto_global(type), llvm::MaybeAlign(),
+                        b_.getInt64(size));
+        return s;
+    };
+    return g.pointer_or(b_, [&](const LValue& lv) { return agg_image_ptr(lv); }, sink);
+}
+
+// The whole-object copy itself, once the destination is known good: one memcpy of
 // the storage, or an element-wise pass when z-elision left the two arrays
-// different per-element layouts. Split out of the AggCopy case so an
-// out-of-range destination can skip all of it (LRM 7.4.5: the write performs
-// no operation) without the gate having to thread through every exit.
-void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LValue& slv, llvm::Value* src_override) {
+// different per-element layouts. Split out of the AggCopy case so an invalid
+// destination can skip all of it (LRM 7.4.5: the write performs no operation)
+// without the guard having to thread through every exit.
+void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Guarded& slv) {
     // Both sides resolve through the ONE image resolver, so either may be in
     // either storage model. That matters because a whole-object copy can
     // legitimately mix them: `v.m = tmp` assigns a plain array into a struct
-    // member, and the member is in the canonical mirror while `tmp` is flat.
+    // member, and the member is in the canonical mirror while `tmp` is flat. The
+    // source resolves through its own guard, so an invalid select copies the
+    // type's power-on image.
     llvm::Value* const dst = agg_image_ptr(dlv);
-    llvm::Value* const src =
-      src_override != nullptr ? src_override : agg_image_ptr(slv);
+    llvm::Value* const src = agg_read_ptr(slv, info.type);
     llvm::Type* st = nullptr;
     // Which storage model a place is in is decided by its TYPE for everything
     // struct- or container-bearing (needs_agg_storage), so both sides of such a
@@ -776,20 +824,18 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LV
     if (needs_agg_storage(info.type) || !is_agg_abi(info.type)) {
         st = agg_storage_ty(info.type);
     } else {
-        // Each side's element slot comes from ITS OWN place. A src_override
-        // redirects the source POINTER only -- to an associative entry's slot, or
-        // to the Table 7-1 image an out-of-range index must read (LRM 7.4.5) --
-        // and every override is built in the SOURCE's shape: agg_image_ptr of
-        // `slv`, and agg_copy_proto, which lays its image out against
-        // slot_of(slv.sig) for precisely that reason. Taking d_slot for the
-        // source instead sized the memcpy for the destination AND strode the
-        // source with the destination's element size, so every element past the
-        // first read the wrong bytes, silently, whenever the two elisions
-        // disagreed. It was reachable for any offset source, because an
-        // ElemSelect on a fixed unpacked array always gates on dyn_inrange (even
-        // for a constant, statically in-range index), hence always takes an
-        // override: a sub-array actual on a 4-state NET port copied 8 bytes out
-        // of the 4-byte z-elided variable behind it.
+        // Each side's element slot comes from ITS OWN place. The source's guard
+        // redirects the POINTER only -- to the Table 7-1 image an invalid select
+        // must read (LRM 7.4.5), which agg_copy_proto lays out in the SOURCE's
+        // shape, against slot_of(slv.sig), for precisely that reason. Taking
+        // d_slot for the source instead sized the memcpy for the destination AND
+        // strode the source with the destination's element size, so every
+        // element past the first read the wrong bytes, silently, whenever the two
+        // elisions disagreed. It was reachable for any offset source, because an
+        // ElemSelect on a fixed unpacked array always carries a verdict (even for
+        // a constant, statically in-range index): a sub-array actual on a
+        // 4-state NET port copied 8 bytes out of the 4-byte z-elided variable
+        // behind it.
         llvm::StructType* const d_slot = image_elem_slot(dlv, info.type);
         llvm::StructType* const s_slot = image_elem_slot(slv, info.type);
         if (d_slot != s_slot) {
@@ -859,10 +905,12 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LV
 // `[2 x { i16, i8 }]`'s eight. A memcpy of agg_storage_ty bytes would read
 // four bytes past the end of the signal, so the element SHAPES decide the copy
 // here exactly as they do for a place-to-place AggCopy above.
-void Backend::emit_agg_ret_copy(llvm::Value* dst, const LValue& slv, Ref type) {
+void Backend::emit_agg_ret_copy(llvm::Value* dst, const Guarded& slv, Ref type) {
     // Resolves either storage model, and keeps agg_slot_ptr's loud refusal of
-    // a deferred associative place (its base is null; nothing to copy from).
-    llvm::Value* const src = agg_image_ptr(slv);
+    // a deferred associative place (its base is null; nothing to copy from). An
+    // invalid select (`return a[i]` with `i` outside `a`) returns the type's
+    // power-on image (LRM 7.4.5).
+    llvm::Value* const src = agg_read_ptr(slv, type);
     if (slv.is_agg) {
         // Both ends are the same type-derived mirror, so the whole-storage
         // copy -- deep, when a leaf owns heap -- is exact.

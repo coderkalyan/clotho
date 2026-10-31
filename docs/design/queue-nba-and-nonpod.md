@@ -111,7 +111,7 @@ already drove it — so the work was frontend/backend addressing, as predicted.
    `dyn_agg_elem_lvalue` — and it is SIMPLER than the assoc one: a container
    element's slot address is known at select time, so the base is concrete instead
    of deferred. Everything downstream (`agg_member` / `agg_elem` descent,
-   `AggCopy`'s `dyn_inrange` gating, `dyn_elem_load`'s per-leaf out-of-range
+   `AggCopy`'s guard on an invalid select, `load_guarded`'s per-leaf out-of-range
    default, `AggEq`) then worked unchanged, which is exactly the payoff the entry
    predicted.
 

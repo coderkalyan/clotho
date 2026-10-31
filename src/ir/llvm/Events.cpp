@@ -858,7 +858,7 @@ llvm::Value* Backend::load_mm(Signal sig) {
 // servicing detects an element-level change, not just element 0.
 // Bit width of a slot's stored value word: iW for a 2-state slot, the packed
 // i(2W) of a 4-state one.
-uint32_t Backend::slot_mm_bits(const LValue& lv) const {
+uint32_t Backend::slot_mm_bits(const LValueInfo& lv) const {
     return lv.four_state ? 2 * lv.store_width : lv.store_width;
 }
 
@@ -878,38 +878,45 @@ llvm::Value* Backend::load_lv_z(const LValue& lv) {
 // servicing a no-op — for a target that never wakes anyone: a frame local, a
 // signal without waiters, or a PreInit store (variable declaration initializers
 // generate no events).
-Backend::ServiceSnapshot Backend::service_snapshot(const LValue& lv) {
+//
+// A place that may be invalid (an element select outside its container) is
+// snapshotted through its stand-in (safe_lvalue), so the old value is defined and
+// no wild address is read, and serviced only where it is valid: an invalid write
+// changes nothing and wakes nobody.
+Backend::ServiceSnapshot Backend::service_snapshot(const Guarded& g) {
     if (silent_stores_) {
         // A PreInit store: declaration initializers generate no events, and no
         // waiter can exist yet anyway.
         return {};
     }
-    if (lv.is_string) {
+    if (g.is_string) {
         // A string's value is its CONTENT, not the handle the place holds, so the
         // old value has to be copied out rather than loaded as a word. Covers
         // every string write path by construction, including a `ref` / `out` /
         // `inout` string formal, which reaches this same bracket.
-        return ServiceSnapshot{ .str = str_chg_snapshot(lv) };
+        return ServiceSnapshot{ .str = str_chg_snapshot(g) };
     }
-    if (lv.chg != nullptr && lv.chg->container) {
+    if (g.chg != nullptr && g.chg->container) {
         // A container property never reaches here through a plane store (the
         // frontend has no such op) -- only through the `ref`/`inout` brackets,
         // whose lvalue is a handle with no mm word to load.
         return ServiceSnapshot{ .mm = nullptr, .z = nullptr, .container = true };
     }
-    if (lv.chg != nullptr) {
+    if (g.chg != nullptr) {
         // A waited-on class property (LRM 9.4.2). Snapshot unconditionally: the
         // notifier that exists is the one some `@`/`wait` asked for, so there is no
         // "has waiters" question to fold in -- an empty waiter list makes the wake
         // walk a single null load.
+        const LValue    lv = safe_lvalue(g);
         ServiceSnapshot old;
         old.mm = load_lv_mm(lv);
         old.z  = lv.has_z ? load_lv_z(lv) : nullptr;
         return old;
     }
-    if (!lv.is_signal || !signal_has_waiters(lv.sig)) {
+    if (!g.is_signal || !signal_has_waiters(g.sig)) {
         return {};
     }
+    const LValue lv = safe_lvalue(g);
     // A store through the wide-select path writes only the words around its offset.
     // Loading and comparing the whole slot, as below, is O(width) for a one-bit
     // store: 16 Kbytes of loads and a 131072-bit compare for a 64 Kbit 4-state
@@ -929,22 +936,25 @@ Backend::ServiceSnapshot Backend::service_snapshot(const LValue& lv) {
     return old;
 }
 
-void Backend::service_after_write(const LValue& lv, ServiceSnapshot old) {
-    if (old.str != nullptr) {
-        str_chg_after(lv, old.str);
-    } else if (old.container) {
-        notify_container_mutation(lv);
-    } else if (old.wide) {
-        service_wide_window(lv, *old.wide);
-    } else if (old.mm != nullptr && lv.chg != nullptr) {
-        service_change_notify(lv, old.mm, load_lv_mm(lv), old.z, old.z != nullptr ? load_lv_z(lv) : nullptr);
-    } else if (old.mm != nullptr) {
-        service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
-                           old.z != nullptr ? load_lv_z(lv) : nullptr);
-    }
-    // Mark the signal changed for the VCD dirty set. Independent of wait-queue
-    // servicing: a dumped signal with no waiters still needs a touch.
-    vcd_touch_lvalue(lv);
+void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
+    g.when_valid(b_, [&](const LValue& lv) {
+        if (old.str != nullptr) {
+            str_chg_after(lv, old.str);
+        } else if (old.container) {
+            notify_container_mutation(lv);
+        } else if (old.wide) {
+            service_wide_window(lv, *old.wide);
+        } else if (old.mm != nullptr && lv.chg != nullptr) {
+            service_change_notify(lv, old.mm, load_lv_mm(lv), old.z,
+                                  old.z != nullptr ? load_lv_z(lv) : nullptr);
+        } else if (old.mm != nullptr) {
+            service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
+                               old.z != nullptr ? load_lv_z(lv) : nullptr);
+        }
+        // Mark the signal changed for the VCD dirty set. Independent of wait-queue
+        // servicing: a dumped signal with no waiters still needs a touch.
+        vcd_touch_lvalue(lv);
+    });
 }
 
 // Classify a store's old -> new transition of a packed must|may word into wake

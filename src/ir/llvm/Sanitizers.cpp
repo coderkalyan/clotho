@@ -53,7 +53,7 @@ llvm::Constant* Backend::bounds_site_global(const SourceText&  idx,
 
 // The name to report for whatever `lv` addresses. A local / formal has none
 // in the backend (frame slots carry no name), so it says what it is.
-std::string Backend::bounds_name(const LValue& lv) const {
+std::string Backend::bounds_name(const LValueInfo& lv) const {
     return lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>");
 }
 
@@ -66,15 +66,15 @@ std::string Backend::bounds_name(const LValue& lv) const {
 //
 // Reported at the access rather than here: a select is not yet a read or a
 // write, and the direction is half the report.
-void Backend::add_elem_bounds_check(LValue&       target,
-                                    Index         at,
-                                    const LValue& named,
-                                    Index         idx_expr,
-                                    llvm::Value*  inrange,
-                                    llvm::Value*  unknown,
-                                    llvm::Value*  extent,
-                                    int32_t       left,
-                                    int32_t       right) {
+void Backend::add_elem_bounds_check(LValueInfo&       target,
+                                    Index             at,
+                                    const LValueInfo& named,
+                                    Index             idx_expr,
+                                    llvm::Value*      inrange,
+                                    llvm::Value*      unknown,
+                                    llvm::Value*      extent,
+                                    int32_t           left,
+                                    int32_t           right) {
     if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
         return;
     }
@@ -96,7 +96,7 @@ void Backend::add_elem_bounds_check(LValue&       target,
 // two coincide.
 // TODO(xsan): carry the declared range on the select records so a
 // `logic [15:8]` vector reports the index the design actually wrote.
-void Backend::add_select_bounds_check(LValue&              target,
+void Backend::add_select_bounds_check(LValueInfo&          target,
                                       Index                at,
                                       Index                off_expr,
                                       const SelectVerdict& v,
@@ -150,11 +150,11 @@ void Backend::emit_string_bounds_check(Index              at,
 // check loads the queue's length itself. `limit` is the largest legal index
 // -- `len` for insert, whose index may equal the size (an append), `len - 1`
 // for delete.
-void Backend::emit_queue_bounds_check(Index         at,
-                                      llvm::Value*  handle,
-                                      Index         idx_expr,
-                                      const LValue& named,
-                                      bool          allow_append) {
+void Backend::emit_queue_bounds_check(Index             at,
+                                      llvm::Value*      handle,
+                                      Index             idx_expr,
+                                      const LValueInfo& named,
+                                      bool              allow_append) {
     if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
         return;
     }
@@ -177,7 +177,7 @@ void Backend::emit_queue_bounds_check(Index         at,
 // result is the Table 7-1 element default, the queue is untouched, and the
 // clause explicitly permits a warning). No index to report -- the finding
 // is that the queue had nothing in it.
-void Backend::emit_empty_pop_bounds_check(Index at, llvm::Value* handle, const LValue& named) {
+void Backend::emit_empty_pop_bounds_check(Index at, llvm::Value* handle, const LValueInfo& named) {
     if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
         return;
     }
@@ -204,7 +204,7 @@ void Backend::emit_empty_pop_bounds_check(Index at, llvm::Value* handle, const L
 // the key type is 2-state (or has no x/z concept at all -- string, queue,
 // dynamic array, associative array): statically always valid, nothing to
 // report.
-void Backend::emit_assoc_key_bounds_check(llvm::Value* kvalid, const LValue& lv, bool for_write) {
+void Backend::emit_assoc_key_bounds_check(llvm::Value* kvalid, const LValueInfo& lv, bool for_write) {
     if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds) || kvalid == nullptr) {
         return;
     }
@@ -253,7 +253,7 @@ void Backend::emit_bounds_report(const BoundsCheck& bc, bool is_write) {
 // Drain every check `lv` accumulated on the way to this access. No check
 // exists unless the sanitizer is on, so this is a no-op otherwise and the
 // emitted code is unchanged.
-void Backend::emit_bounds_reports(const LValue& lv, bool is_write) {
+void Backend::emit_bounds_reports(const LValueInfo& lv, bool is_write) {
     for (const BoundsCheck& bc : lv.bounds_checks) {
         emit_bounds_report(bc, is_write);
     }

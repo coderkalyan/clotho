@@ -700,7 +700,7 @@ void Backend::lower_fseek(Index i) {
 void Backend::lower_fgets(Index i) {
     const Index  dst = ir_->payload(i).binary.l;
     llvm::Value* fd  = cast(must_of(ir_->payload(i).binary.r), 32, true);
-    const LValue& lv = lvalue_of(dst);
+    const Guarded& lv = lvalue_of(dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
         llvm::Value* r    = b_.CreateCall(
@@ -721,19 +721,24 @@ void Backend::lower_fgets(Index i) {
 // Flags bit0 marks a 2-state slot, so the runtime writes only the iW
 // value word. Part-select and non-byte-multiple targets loud-fail: the runtime
 // fills a whole byte-aligned vector. `who` names the caller.
+//
+// The pointers are the place's own where its select is valid and a scratch slot's
+// where not (safe_lvalue), so the runtime never writes through a wild address and
+// an invalid target is a no-op (LRM 7.4.5). The caller wakes waiters through
+// service_snapshot / service_after_write, which skip an invalid place as well.
 std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(Index dst, const char* who) {
-    const LValue& lv = lvalue_of(dst);
-    if (lv.is_string) {
+    const Guarded g = write_dest(dst);
+    if (g.is_string) {
         // Every caller (fgets/ferror/sformat) checks lv.is_string and branches to
         // its own rt_string-handle path before reaching here; this is defense in
         // depth against a future caller doing otherwise.
         throw BackendError{ std::string(who) + " into a string object is not supported" };
     }
-    if (lv.width != lv.store_width) {
+    if (g.width != g.store_width) {
         // TODO: a part-select target (s[15:0]) writes only a slice.
         throw BackendError{ std::string(who) + " into a part-select target is not supported" };
     }
-    if (lv.store_width % 8 != 0) {
+    if (g.store_width % 8 != 0) {
         // TODO: a non-byte-multiple width leaves the must|may plane halves
         // byte-unaligned; targets are byte vectors in practice.
         throw BackendError{ std::string(who) +
@@ -741,10 +746,16 @@ std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(
     }
     // A never-z target (z elision) has no z word; pass null and the runtime
     // skips the z write.
+    const LValue lv = safe_lvalue(g);
     llvm::Value* mm = lv_mm_ptr(lv);
     llvm::Value* z =
       lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     return { mm, z, lv.store_width, !lv.four_state ? 1u : 0u };
+}
+
+Guarded Backend::write_dest(Index i) {
+    const Guarded& g = lvalue_of(i);
+    return g.is_assoc ? assoc_elem_lvalue(g, /*for_write=*/true) : g;
 }
 
 Backend::FormatArg Backend::format_arg(Index i, Index fmt_value, ExtraIndex fmt, uint32_t fmt_len, TickScale scale) {
@@ -769,7 +780,7 @@ void Backend::lower_sformat(Index i) {
     llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     llvm::Value*                 argc = b_.getInt32(static_cast<uint32_t>(args.size()));
     const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
-    const LValue&   lv = lvalue_of(info.dst);
+    const Guarded&  lv = lvalue_of(info.dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
         b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv, StringUse::Write), f.fmt, argc, arr,
@@ -803,7 +814,7 @@ void Backend::lower_sformatf(Index i) {
 void Backend::lower_ferror(Index i) {
     const Index   dst = ir_->payload(i).binary.l;
     llvm::Value*  fd  = cast(must_of(ir_->payload(i).binary.r), 32, true);
-    const LValue& lv  = lvalue_of(dst);
+    const Guarded& lv  = lvalue_of(dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
         llvm::Value* r    = b_.CreateCall(
@@ -838,7 +849,7 @@ void Backend::lower_scanf(Index i) {
     if (n > 0) {
         arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
         for (uint32_t k = 0; k < n; ++k) {
-            const LValue& lv  = lvalue_of(outs[k]);
+            const Guarded lv   = write_dest(outs[k]);
             llvm::Value*  elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
             llvm::Value*  nul = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
             if (lv.is_string) {
@@ -864,13 +875,15 @@ void Backend::lower_scanf(Index i) {
             }
             // A never-z target (z elision) passes a null z pointer. Flags bit0
             // marks a 2-state slot: the runtime writes only the iW value
-            // word (parsed x/z digits drop to 0 per LRM 6.3.1).
-            llvm::Value* mm = lv_mm_ptr(lv);
-            llvm::Value* z  = lv.has_z ? lv_z_ptr(lv) : nul;
+            // word (parsed x/z digits drop to 0 per LRM 6.3.1). An invalid
+            // target hands the runtime a scratch slot (safe_lvalue).
+            const LValue dest = safe_lvalue(lv);
+            llvm::Value* mm   = lv_mm_ptr(dest);
+            llvm::Value* z    = dest.has_z ? lv_z_ptr(dest) : nul;
             b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
             b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
-            b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
-            b_.CreateStore(b_.getInt32(!lv.four_state ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
+            b_.CreateStore(b_.getInt32(dest.store_width), b_.CreateStructGEP(sty, elt, 2));
+            b_.CreateStore(b_.getInt32(!dest.four_state ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
             b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 4));
             b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 5));
             olds[k] = service_snapshot(lv);
@@ -924,7 +937,7 @@ void Backend::lower_value_plusargs(Index i) {
     llvm::Value*      prefix_ptr = b_.CreateGlobalString(prefix);
     llvm::Value*      prefix_len = b_.getInt32(static_cast<uint32_t>(prefix.size()));
 
-    const LValue& lv = lvalue_of(dst);
+    const Guarded lv = write_dest(dst);
     if (lv.is_string) {
         if (info.conv != 's') {
             // TODO: a numeric conversion into a `string` object. LRM §21.6 stores
@@ -950,15 +963,17 @@ void Backend::lower_value_plusargs(Index i) {
         throw BackendError{ "$value$plusargs into a part-select target is not supported" };
     }
 
-    llvm::StructType* sty = scan_arg_struct_ty();
-    llvm::Value*      arg = b_.CreateAlloca(sty, nullptr, "plusarg_val");
-    llvm::Value*       mm = lv_mm_ptr(lv);
-    llvm::Value*       z  = lv.has_z ? lv_z_ptr(lv)
-                                     : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    // An invalid target hands the runtime a scratch slot (safe_lvalue).
+    const LValue      dest = safe_lvalue(lv);
+    llvm::StructType* sty  = scan_arg_struct_ty();
+    llvm::Value*      arg  = b_.CreateAlloca(sty, nullptr, "plusarg_val");
+    llvm::Value*      mm   = lv_mm_ptr(dest);
+    llvm::Value*      z    = dest.has_z ? lv_z_ptr(dest)
+                                        : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     b_.CreateStore(mm, b_.CreateStructGEP(sty, arg, 0));
     b_.CreateStore(z, b_.CreateStructGEP(sty, arg, 1));
-    b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, arg, 2));
-    b_.CreateStore(b_.getInt32(!lv.four_state ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
+    b_.CreateStore(b_.getInt32(dest.store_width), b_.CreateStructGEP(sty, arg, 2));
+    b_.CreateStore(b_.getInt32(!dest.four_state ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
 
     const ServiceSnapshot old = service_snapshot(lv);
     llvm::Value*           r   = b_.CreateCall(
@@ -994,7 +1009,7 @@ Backend::AsciiArg Backend::spill_ascii_arg(Index v, const char* name) {
 void Backend::lower_fread_word(Index i) {
     const Index dst = ir_->payload(i).binary.l;
 
-    const LValue& lv = lvalue_of(dst);
+    const Guarded lv = write_dest(dst);
     if (lv.is_string) {
         throw BackendError{ "$fread into a string object is not supported" };
     }
@@ -1002,17 +1017,19 @@ void Backend::lower_fread_word(Index i) {
         throw BackendError{ "$fread into a part-select target is not supported" };
     }
     // A never-z target (z elision) passes a null z pointer; a 2-state
-    // slot sets flags bit2 so the runtime writes only the iW value word.
-    llvm::Value* mm = lv_mm_ptr(lv);
+    // slot sets flags bit2 so the runtime writes only the iW value word. An
+    // invalid target hands the runtime a scratch slot (safe_lvalue).
+    const LValue dest = safe_lvalue(lv);
+    llvm::Value* mm   = lv_mm_ptr(dest);
     llvm::Value* z =
-      lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+      dest.has_z ? lv_z_ptr(dest) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     llvm::Value* fd = cast(must_of(ir_->payload(i).binary.r), 32, true);
 
     const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
-    const uint32_t flags  = !lv.four_state ? 4u : 0u;
+    const uint32_t flags  = !dest.four_state ? 4u : 0u;
     const ServiceSnapshot old = service_snapshot(lv);
     llvm::Value*   r      = b_.CreateCall(fread_fn(),
-                                          { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
+                                          { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(dest.store_width),
                                             b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
                                             b_.getInt64(0), b_.getInt32(flags) });
     service_after_write(lv, old);

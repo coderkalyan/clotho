@@ -115,8 +115,10 @@ when it does.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.
 - An element access with an invalid index is guarded so only valid paths touch
-  memory. The select itself is safe by construction; no consumer can bypass it.
-  **Not yet:** each consumer applies a carried validity flag.
+  memory. The select itself is safe by construction; no consumer can bypass it:
+  a place whose select may be invalid is a `Guarded`, not an `LValue`, with its
+  storage pointer private, so no raw primitive accepts it and the guards
+  (`when_valid`, `read_or`, `pointer_or`) are the only way to an address.
 - Change detection after a blocking store compares the whole slot before and
   after; through the wide-select path it compares only the words the store
   touches.

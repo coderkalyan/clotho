@@ -673,7 +673,7 @@ llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
 // The anchor a vif-rooted lvalue's context record describes: its representative
 // signal's own scope. no_anchor when the lvalue is not vif-rooted, which makes
 // the CtxOverride a no-op.
-uint32_t Backend::lvalue_ctx_anchor(const LValue& lv) const {
+uint32_t Backend::lvalue_ctx_anchor(const LValueInfo& lv) const {
     return lv.vif_ctx != nullptr && lv.is_signal ? slot_of(lv.sig).anchor : SignalSlot::no_anchor;
 }
 
@@ -733,6 +733,54 @@ llvm::Value* Backend::lv_field_ptr(const LValue& lv, uint32_t field) {
     return b_.CreateStructGEP(lv.slot_ty, lv.base, field);
 }
 
+// The address of the leaf slot an lvalue designates: lv_field_ptr without the
+// final field select. A guard that has to name the slot itself, to pick it or a
+// stand-in (safe_lvalue, a `ref` binding), forms it here; the ordinary load / store
+// path keeps lv_field_ptr's single GEP.
+llvm::Value* Backend::slot_ptr(const LValue& lv) {
+    if (lv.is_agg) {
+        return agg_slot_ptr(lv);
+    }
+    if (lv.array_ty != nullptr) {
+        llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+        return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+    }
+    return lv.base;
+}
+
+// `sel` rooted at the slot `slot` itself: the path and the element index it carried
+// were spent forming `slot`, so none is left to apply to it.
+LValue Backend::slot_lvalue(const LValueInfo& sel, llvm::Value* slot) {
+    LValue lv;
+    static_cast<LValueInfo&>(lv) = sel;
+    lv.base                      = slot;
+    lv.array_ty                  = nullptr;
+    lv.elem_idx                  = nullptr;
+    lv.is_agg                    = false;
+    lv.root_ty                   = nullptr;
+    lv.agg_path.clear();
+    return lv;
+}
+
+// An lvalue a runtime routine can write through, or that can be read for a snapshot,
+// whether or not `g` is valid. An invalid place stands in for a scratch slot that
+// starts at the element default (LRM 7.4.5), so what the routine writes goes nowhere
+// and what is read is defined. The caller wakes waiters only for the valid place
+// (`g.when_valid`).
+LValue Backend::safe_lvalue(const Guarded& g) {
+    if (g.valid() == nullptr) {
+        return g.unguarded();
+    }
+    assert(!g.is_string && !g.is_handle && "a managed place has its own sink");
+    const auto scratch = [&]() -> llvm::Value* {
+        auto* slot = entry_alloca(g.slot_ty, "valid.scratch");
+        b_.CreateStore(slot_default_const(g.slot_ty, g.store_width, g.four_state, g.has_z), slot);
+        return slot;
+    };
+    return slot_lvalue(
+      g, g.pointer_or(b_, [&](const LValue& lv) { return slot_ptr(lv); }, scratch));
+}
+
 // The power-on image of one leaf slot: what an out-of-range read of it must
 // yield (LRM 7.4.5 / Table 7-1 -- x for a 4-state element, 0 for 2-state).
 llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
@@ -758,22 +806,22 @@ llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t 
 // plane slot, a managed handle, or an aggregate image. A bit / part selection
 // is not a place a pointer can name, so it is rejected — the frontend guards
 // it too (is_whole_ref_actual), and this is the defensive backstop.
-RefBinding Backend::ref_actual_arg(const LValue& raw) {
+RefBinding Backend::ref_actual_arg(const Guarded& raw, Ref type) {
     // An associative-array element is a DEFERRED place, and a `ref` is its third
     // consumer alongside Load and Store: it needs the address itself. Resolve it
     // with put_ptr, because LRM 13.5.2 binds the formal to a VARIABLE — there is
     // no variable to alias until the entry exists, so forming the ref creates it,
     // exactly as a mutating method on `a[k]` does.
-    const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
-    RefBinding   rb;
+    const Guarded g = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
+    RefBinding    rb;
     // One witness per container level, outermost first, each sampled now. A
     // stable place has none; the caller pads to the formal's declared depth with
     // the compile-time zero word so the callee's unrolled check is uniform.
-    for (llvm::Value* ep : lv.epoch_chain) {
+    for (llvm::Value* ep : g.epoch_chain) {
         rb.epochs.push_back(ep);
         rb.expects.push_back(b_.CreateLoad(b_.getInt64Ty(), ep, "ref.epoch.at.call"));
     }
-    rb.slot = ref_actual_ptr(lv);
+    rb.slot = ref_actual_ptr(g, type);
     return rb;
 }
 
@@ -793,47 +841,47 @@ void Backend::push_ref_epochs(std::vector<llvm::Value*>& argv, const RefBinding&
 // Pointer to a ref actual's storage: the aliased place the callee holds.
 // A whole scalar is its slot pointer; an unpacked-array or container element is
 // `&array[idx]`; an aggregate is its image pointer; a managed value is its
-// handle pointer.
-llvm::Value* Backend::ref_actual_ptr(const LValue& lv) {
-    if (lv.is_agg) {
-        // An aggregate (or a managed leaf inside one) is addressed by its GEP
-        // path; the ABI guarantees the canonical layout on both sides.
-        return agg_slot_ptr(lv);
-    }
-    if (lv.is_string || lv.is_handle) {
+// handle pointer. `type` is the formal's type, which names the image an invalid
+// aggregate binds to.
+//
+// A `ref` formal aliases storage for the whole call, so an invalid element (an
+// out-of-range or x/z index, an absent key) cannot simply be dropped the way a
+// store can -- the callee would hold a live pointer past the array and read and
+// write through it. It binds to a discard slot instead, freshly reset to the
+// element default: the callee's reads see what LRM 7.4.5 / Table 7-1 say an
+// invalid element read yields, and its writes go nowhere, which is the
+// no-operation the same clause requires. Mirrors lv_string_ptr's sink redirect
+// for an invalid string element.
+//
+// The clause does not spell out `ref` binding to an invalid element, so this is
+// the reading of it that keeps both halves of 7.4.5 true; the alternative
+// (aliasing real storage) is memory corruption.
+llvm::Value* Backend::ref_actual_ptr(const Guarded& g, Ref type) {
+    emit_bounds_reports(g, /*is_write=*/true);
+    if (g.is_string || g.is_handle) {
         // A managed place: the ref aliases the handle itself, so the callee's
         // deep-copy / mutation lands on the actual.
-        return lv.is_string ? lv_string_ptr(lv, StringUse::Place) : lv_handle_ptr(lv, HandleUse::Place);
+        return g.is_string ? lv_string_ptr(g, StringUse::Place) : lv_handle_ptr(g, HandleUse::Place);
     }
-    const bool whole =
-      lv.range_mask == nullptr && is_zero_const(lv.bit_off) && lv.width == lv.store_width;
-    if (!whole) {
-        throw BackendError{ "ref actual must be a whole variable, element or member" };
+    if (g.is_agg && !g.agg_leaf) {
+        // An aggregate is addressed by its GEP path; the ABI guarantees the
+        // canonical layout on both sides.
+        return agg_place_ptr(g, type);
     }
-    if (lv.array_ty == nullptr) {
-        return lv.base;
+    if (!g.is_agg) {
+        const bool whole =
+          g.range_mask == nullptr && is_zero_const(g.bit_off) && g.width == g.store_width;
+        if (!whole) {
+            throw BackendError{ "ref actual must be a whole variable, element or member" };
+        }
     }
-    llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
-    llvm::Value* ptr = b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
-    if (lv.dyn_inrange == nullptr) {
-        return ptr;
-    }
-    // A `ref` formal aliases storage for the whole call, so an out-of-range
-    // element index cannot simply be dropped the way a store can -- the
-    // callee would hold a live pointer past the array and read and write
-    // through it. Redirect to a discard slot, freshly reset to the element
-    // default: the callee's reads see what LRM 7.4.5 / Table 7-1 say an
-    // invalid element read yields, and its writes go nowhere, which is the
-    // no-operation the same clause requires. Mirrors lv_string_ptr's sink
-    // redirect for an out-of-range string element.
-    //
-    // The clause does not spell out `ref` binding to an invalid element, so
-    // this is the reading of it that keeps both halves of 7.4.5 true; the
-    // alternative (aliasing real storage) is memory corruption.
-    auto* sink = entry_alloca(lv.slot_ty, "ref.sink");
-    b_.CreateStore(slot_default_const(lv.slot_ty, lv.store_width, lv.four_state, lv.has_z), sink);
-    emit_bounds_reports(lv, /*is_write=*/true);
-    return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
+    // A plane slot: the whole variable, `&array[idx]`, or a leaf of an aggregate.
+    const auto sink = [&]() -> llvm::Value* {
+        auto* slot = entry_alloca(g.slot_ty, "ref.sink");
+        b_.CreateStore(slot_default_const(g.slot_ty, g.store_width, g.four_state, g.has_z), slot);
+        return slot;
+    };
+    return g.pointer_or(b_, [&](const LValue& lv) { return slot_ptr(lv); }, sink);
 }
 
 llvm::Value* Backend::lv_mm_ptr(const LValue& lv) {

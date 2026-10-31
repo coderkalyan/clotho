@@ -217,7 +217,7 @@ elaboration order (§5), so their indices are compile-time constants.
 
 Both fold away for a monomorphic static handle (§5). For a dynamic handle they
 are one compare each against a base/length pair the backend loads once per
-region, exactly as the container element path does with `dyn_inrange`
+region, exactly as the container element path does with its `Guarded` verdict
 (`ir/llvm/Inst.cpp, lower_inst`). Failure calls
 `rt_event_stale(const rt_null_site*, uint64_t now)` — a `[[noreturn]]` located
 fatal modelled on `rt_null_handle` (`runtime/Reports.cpp`), reusing the existing
