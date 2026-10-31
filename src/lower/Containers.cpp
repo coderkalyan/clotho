@@ -1011,25 +1011,31 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
     const ir::Ref   i64   = make_int_type(64, false);
     const ir::Index lo0   = b.constant(module_.pool.put_int(i64, 0), l);
     const ir::Index hiEnd = b.constant(module_.pool.put_int(i64, static_cast<uint64_t>(INT64_MAX)), l);
-    // A CONCATENATION operand that is itself a queue splices its elements
-    // (LRM 11.4.12): `{q, e}` flattens q's own elements in, one queue-typed
-    // operand contributing many. A PATTERN element never does this,
-    // regardless of its own type: `'{a, b}` specifies exactly one value per
-    // outer element (LRM 5.11 / 7.10.2), so when the outer queue's OWN
-    // element type happens to itself be a queue (`int qq[$][$]`), a
-    // queue-typed PATTERN piece like `'{1,2}` is one element to push, not a
-    // source to splice. Treating it as a splice source read it through the
-    // OUTER container's element stride (a queue-handle-sized stride) instead
-    // of its own -- silent memory corruption, not a refusal, since both
-    // ops tables are well-formed on their own.
-    const bool splices_queues = pat == nullptr;
+    // A CONCATENATION operand is either one element or an array whose
+    // elements splice in (LRM 10.10 / 11.4.12): `{q, e}` flattens q's own
+    // elements, one array-typed operand contributing many. Which one an
+    // operand is follows from its type against the target's ELEMENT type,
+    // not from whether it is a queue: slang binds an operand that is
+    // assignable to the element type as one element (converted to exactly
+    // that type) and only otherwise as a splice source, and its evaluator
+    // tells them apart by `elemType.isEquivalent(op->type)`. For a queue of
+    // queues (`IQ q0[$]`, `IQ` = `int[$]`), `{q0, mk(2)}`'s `mk(2)` is an
+    // `int[$]` -- a queue, but exactly one ELEMENT of q0. Splicing it read
+    // the inner queue's int buffer through the OUTER container's
+    // queue-handle-sized stride, so the copy kernel took a heap pointer for
+    // an inner queue's length and asked for hundreds of TiB.
+    //
+    // A PATTERN element is always one element, regardless of its own type:
+    // `'{a, b}` specifies exactly one value per outer element (LRM 5.11 /
+    // 7.10.2), so `'{1,2}` in `'{'{1,2}, '{3,4}}` is one inner queue to push.
+    const slang::ast::Type* concat_elem_ty = pat == nullptr ? e.type->getArrayElementType() : nullptr;
     for (const Expression* op : pieces) {
-        if (splices_queues && is_queue(*op)) {
+        const bool splices = concat_elem_ty != nullptr && !concat_elem_ty->isEquivalent(*op->type);
+        if (splices && is_queue(*op)) {
             b.queue_append_range(dst, materialize_queue_rvalue(*op, b), lo0, hiEnd, qty, l);
             continue;
         }
-        if (splices_queues &&
-            (is_dyn_array(*op) || op->type->getCanonicalType().isUnpackedArray())) {
+        if (splices && (is_dyn_array(*op) || op->type->getCanonicalType().isUnpackedArray())) {
             // A dynamic-array / unpacked-array operand splices its elements
             // (LRM 11.4.12), but rt_queue_append_range only walks an rt_queue
             // source; the frontend would otherwise push the whole aggregate as
@@ -1193,6 +1199,16 @@ ir::Index Lowerer::lower_container_element_value(const Expression& val,
         // lvalue (a '{...} pattern, a concatenation, a slice) materializes into a
         // temp handle first, exactly as a whole-queue assignment source does.
         if (std::get<ir::Type>(module_.pool.get(er)).kind == ir::Type::Kind::Queue) {
+            // A dynamic / fixed array converting to the inner queue type is a
+            // different handle (or no handle) at run time: it needs the
+            // array-into-queue copy, not a read of its storage as an rt_queue.
+            const Expression& arr = unwrap_conversion(val);
+            if (is_dyn_array(arr) || is_unpacked_array(arr)) {
+                const ir::Index tmp = make_arg_temp(er, b, l);
+                b.queue_delete(tmp, tmp, /*has_idx=*/false, er, l);
+                emit_queue_store(tmp, er, val, b, l);
+                return tmp;
+            }
             return materialize_queue_rvalue(val, b);
         }
         const Expression& src = unwrap_conversion(val);
