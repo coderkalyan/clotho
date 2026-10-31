@@ -729,6 +729,10 @@ struct Function {
     // a unit's functions are its instance's by position, and flatten, which makes
     // one copy per instance, assigns it.
     uint32_t scope = Process::no_scope;
+    // InstanceScope::unit_key of the unit that declares the function, which names
+    // its symbol; flatten sets it, like `scope`. Empty for a body built without a
+    // unit.
+    std::string unit_key;
     // The lowered body.
     Ir ir;
 

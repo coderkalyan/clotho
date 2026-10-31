@@ -122,12 +122,20 @@ ModuleEnv* Backend::subroutine_env(FunctionId id) {
     return config_.split && a != SignalSlot::no_anchor && !f.is_dpi ? &unit_env(anchors_[a]) : root_env_.get();
 }
 
-// The instance's name and the subroutine's own, so a symbol says whose it is in
-// a profile. Every module links into one, so a symbol is unique across them:
-// two functions of one name (a package's and an instance's, say) get a count.
+// The unit's key and the subroutine's own name, so a symbol says whose it is in
+// a profile and names nothing of the instance. Every module links into one, so a
+// symbol is unique across them: two functions of one name in one unit (copies
+// that stayed apart) get a count.
+std::string Backend::subroutine_base(const Function& f) {
+    if (const uint32_t a = subroutine_anchor(f); a != SignalSlot::no_anchor) {
+        return unit_symbol(anchors_[a]);
+    }
+    return f.unit_key.empty() ? std::string(kRootSymbol) : f.unit_key;
+}
+
+// subroutine_base, the kind and the subroutine's name, counted when taken.
 std::string Backend::subroutine_symbol(const Function& f, std::string_view kind) {
-    const uint32_t a    = subroutine_anchor(f);
-    std::string    base = a != SignalSlot::no_anchor ? unit_symbol(anchors_[a]) : mod_.name;
+    std::string base = subroutine_base(f);
     base += kind;
     base += f.name;
     if (verifying_) {

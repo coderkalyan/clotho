@@ -194,7 +194,8 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
     // state and repairs none of them.
     assert_well_typed(m, resolve);
 
-    auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
+    // Not the design's name: a unit module can be named like the design.
+    auto root = std::make_unique<llvm::Module>("clotho.root", ctx);
 
     // Pin the modules to the target's triple and DataLayout before any IR is
     // built: the state/frame struct layouts, the NBA meta table's baked byte

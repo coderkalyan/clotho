@@ -64,7 +64,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const uint32_t ua   = group_unit_anchor_[g_];
     std::string    name = ua != SignalSlot::no_anchor
                             ? unit_symbol(anchors_[ua]) + ".p" + std::to_string(proc_sched_ord_[proc_index])
-                            : mod_.name + ".p" + std::to_string(proc_index);
+                            : std::string(kRootSymbol) + ".p" + std::to_string(proc_index);
     if (members.size() > 1) {
         name += ".f" + std::to_string(members.size());
     }
@@ -1086,7 +1086,7 @@ void Backend::build_frame_layout(const Function& f) {
                                             frame_slots_[i].four_state);
         fields[i]               = frame_slots_[i].slot_ty;
     }
-    frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
+    frame_ty_ = llvm::StructType::create(ctx_, fields, subroutine_base(f) + ".fn." + f.name + ".frame");
 }
 
 // Power up the frame: 4-state locals come up X (must 0, may 1), 2-state 0; z

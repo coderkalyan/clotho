@@ -868,7 +868,7 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
         }
         std::string name = one && ua != SignalSlot::no_anchor
                              ? "clotho.inst." + anchors_[ua].name + ".p" + std::to_string(proc_sched_ord_[sg.front])
-                             : mod_.name + ".p" + std::to_string(sg.front);
+                             : std::string(kRootSymbol) + ".p" + std::to_string(sg.front);
         if (procs > 1) {
             name += ".f" + std::to_string(procs);
         }

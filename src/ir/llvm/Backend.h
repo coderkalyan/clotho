@@ -2244,6 +2244,14 @@ private:
     // instance's name and its own, made unique across every module.
     std::string subroutine_symbol(const Function& f, std::string_view kind);
 
+    // The prefix of the symbols of root's own code (what belongs to no unit, and
+    // the link glue): a unit named like the design cannot collide with it.
+    static constexpr std::string_view kRootSymbol = "clotho.root";
+
+    // What leads the symbol (and frame type name) of subroutine `f`: its unit's
+    // key, or root's prefix for one built without a unit.
+    std::string subroutine_base(const Function& f);
+
     // What decides the code of subroutine `f`: its unit and ordinal, the code
     // key of its instance, what the design says of it (home region, random
     // stream, program exit) and the functions it calls as declared, with

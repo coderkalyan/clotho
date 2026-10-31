@@ -42,10 +42,10 @@ module top;
   logic       clk = 0;
   logic [7:0] d   = 1;
   logic [7:0] q0, q1, q2, q3;
-  pair p0 (.clk, .d, .q(q0));
-  pair p1 (.clk, .d, .q(q1));
-  pair p2 (.clk, .d, .q(q2));
-  pair p3 (.clk, .d, .q(q3));
+  pair inst0 (.clk, .d, .q(q0));
+  pair inst1 (.clk, .d, .q(q1));
+  pair inst2 (.clk, .d, .q(q2));
+  pair inst3 (.clk, .d, .q(q3));
   always #5 clk = ~clk;
   initial begin
     #100 $display("%0d %0d %0d %0d", q0, q1, q2, q3);
@@ -137,6 +137,6 @@ TEST_CASE("a unit's module names no instance") {
     for (const auto& [name, text] : modules_of(instantiate("d + 8'(N)", "t2"))) {
         INFO("module ", name);
         CHECK(text.find("clotho.inst.") == std::string::npos);
-        CHECK(text.find("top.p") == std::string::npos); // an instance path of the design
+        CHECK(text.find("top.inst") == std::string::npos); // an instance path of the design
     }
 }

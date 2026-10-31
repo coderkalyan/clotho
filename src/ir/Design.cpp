@@ -48,24 +48,35 @@ struct FlatInstance {
     std::vector<uint32_t> cover_types;
 };
 
-// Each unit's key (InstanceScope::unit_key): its definition name and a hash of its
-// printed body, children by definition name, so the key is a function of the
-// unit's own content. Units that print alike without being merged (the same body
-// over different subtrees) take a count, in unit order, so keys stay unique.
+// Each unit's key (InstanceScope::unit_key), which names its LLVM module and the
+// symbols of its code. A definition that is one unit is named by its definition
+// name alone, so what calls into it (a hierarchical or package call names the
+// callee's symbol) does not change when its body is edited. Units that share a
+// definition name (parameterizations, a class specialization) add a hash of their
+// printed body, children by definition name, and units that still print alike
+// without being merged (the same body over different subtrees) take a count, in
+// unit order, so keys stay unique.
 std::vector<std::string> name_units(const Design& design) {
     std::vector<std::string>                            keys(design.units.size());
+    ankerl::unordered_dense::map<std::string, uint32_t> by_name;
+    for (const Unit& u : design.units) {
+        ++by_name[u.def_name];
+    }
     ankerl::unordered_dense::map<std::string, uint32_t> seen;
     for (uint32_t u = 0; u < design.units.size(); ++u) {
-        std::ostringstream os;
-        print_unit(design, UnitId{ u }, os);
-        uint64_t h = 1469598103934665603ull; // FNV-1a
-        for (const char c : os.str()) {
-            h = (h ^ static_cast<uint8_t>(c)) * 1099511628211ull;
-        }
-        static constexpr char digits[] = "0123456789abcdef";
-        std::string           key      = design.units[u].def_name + ".";
-        for (int shift = 28; shift >= 0; shift -= 4) {
-            key += digits[((h ^ (h >> 32)) >> shift) & 0xf];
+        std::string key = design.units[u].def_name;
+        if (by_name[key] > 1) {
+            std::ostringstream os;
+            print_unit(design, UnitId{ u }, os);
+            uint64_t h = 1469598103934665603ull; // FNV-1a
+            for (const char c : os.str()) {
+                h = (h ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+            }
+            static constexpr char digits[] = "0123456789abcdef";
+            key += ".";
+            for (int shift = 28; shift >= 0; shift -= 4) {
+                key += digits[((h ^ (h >> 32)) >> shift) & 0xf];
+            }
         }
         const uint32_t n = seen[key]++;
         keys[u]          = n == 0 ? key : key + "." + std::to_string(n);
@@ -492,6 +503,7 @@ private:
                 Function copy = signature_of(src);
                 copy.ir       = src.ir.rebased(mapper);
                 copy.scope    = fi.scope;
+                copy.unit_key = unit_keys_[static_cast<uint32_t>(fi.unit)];
                 if (src.takes_iface_ctx) {
                     copy.ctx_member =
                       static_cast<Signal>(mapper.map(HandleFamily::Layout, static_cast<uint32_t>(src.ctx_member)));

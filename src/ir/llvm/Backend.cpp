@@ -251,7 +251,20 @@ llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
         if (g->hasLocalLinkage() && !verifying_) {
             g->setLinkage(llvm::GlobalValue::ExternalLinkage);
         }
-        auto* decl = new llvm::GlobalVariable(env_->llmod, g->getValueType(), g->isConstant(),
+        // A unit's module names root's global by its symbol and nothing of its
+        // size: the root state's layout and every array's length (a ring's
+        // capacity, a bucket's) are design-wide facts, and a declaration's type
+        // is part of the module's text. An unsized declaration only tells LLVM
+        // less (what is dereferenceable), never more.
+        llvm::Type* type = g->getValueType();
+        if (env_ != root_env_.get()) {
+            if (g == state_global_) {
+                type = llvm::ArrayType::get(b_.getInt8Ty(), 0);
+            } else if (auto* arr = llvm::dyn_cast<llvm::ArrayType>(type)) {
+                type = llvm::ArrayType::get(arr->getElementType(), 0);
+            }
+        }
+        auto* decl = new llvm::GlobalVariable(env_->llmod, type, g->isConstant(),
                                               llvm::GlobalValue::ExternalLinkage, nullptr, g->getName());
         decl->setAlignment(g->getAlign());
         decl->setDSOLocal(true);
