@@ -1323,6 +1323,162 @@ TEST_CASE("a program initial drives an output port and the design reads it") {
            "[15] DESIGN active\n[25] DESIGN active\n");
 }
 
+// -- Program input ports read settled ----------------------------------------
+//
+// A value port's copy is a Reactive-region continuous process (24.3.1: "The
+// continuous assignment assign tclk = clk; would also be scheduled in the
+// Reactive region"), and so is a program's own `assign`. Program code runs in
+// Reactive as well, and 4.7 leaves the order of events within one region open,
+// so which goes first is Clotho's choice: every queued reactive continuous
+// process runs before any program procedural code, so the program always reads
+// its inputs settled (docs/design/program-blocks.md §3, docs/LRM_NOTES.md note
+// 50). Before that, both kinds shared one FIFO ring, the seed order put a
+// program's `initial` ahead of its port copies, and a copy woken by a design
+// write queued behind a program thread already resumed in the same slot.
+//
+// Oracles, measured: Verilator 5.050 prints the expected output of every case
+// here. iverilog 13 agrees except in the two cases where the program thread
+// resumes in the slot of the design write, where it prints the stale value: it
+// does not schedule program code in the Reactive region at all (§2's oracle
+// note), so the write and the read race there.
+
+// The reported shape: an `initial` reading an input port at time zero must see
+// the design's declaration-initialized 1, not the port's power-on x.
+TEST_CASE("a program initial reads an input port settled at time zero") {
+    CHECK(run_capture(R"(
+        module top;
+          logic a = 1;
+          prog p(a);
+          initial #40 $finish;
+        endmodule
+
+        program prog(input logic a);
+          initial $display("t0 a=%b", a);
+        endprogram
+    )") == "t0 a=1\n");
+}
+
+// The design writes the port's source in slot 5's Active region, which wakes
+// the copy; the program's `#5` resumes in the same slot's Reactive region
+// (24.3.1: "The standard # delay operator within program blocks schedules
+// process resumption in the Reactive region"), already queued when the copy
+// wakes. The copy still runs first.
+TEST_CASE("a program thread resuming in the slot of a design write reads the port settled") {
+    CHECK(run_capture(R"(
+        module top;
+          logic a = 1;
+          initial #5 a = 0;
+          prog p(a);
+          initial #40 $finish;
+        endmodule
+
+        program prog(input logic a);
+          initial #5 $display("[%0t] a=%b", $time, a);
+        endprogram
+    )") == "[5] a=0\n");
+}
+
+// A program waiting on its own input port. The port settles before the
+// `initial` reaches its `@(a)`, so the wait sees no time-zero x -> 1 -- that
+// would be the port catching up with a value the design had all along -- and
+// wakes on the design's change at 5.
+TEST_CASE("a program waiter on an input port wakes on the design change, not the settle") {
+    CHECK(run_capture(R"(
+        module top;
+          logic a = 1;
+          initial #5 a = 0;
+          prog p(a);
+          initial #40 $finish;
+        endmodule
+
+        program prog(input logic a);
+          initial begin
+            @(a);
+            $display("[%0t] a=%b", $time, a);
+          end
+        endprogram
+    )") == "[5] a=0\n");
+}
+
+// A program's own `assign` chained behind the port copy: both are reactive
+// continuous processes, so the chain settles before the `initial` reads, at
+// time zero and again in slot 5 after the design write.
+TEST_CASE("a program initial reads its own assign of an input port settled") {
+    CHECK(run_capture(R"(
+        module top;
+          logic a = 1;
+          initial #5 a = 0;
+          prog p(a);
+          initial #40 $finish;
+        endmodule
+
+        program prog(input logic a);
+          logic t;
+          assign t = a;
+          initial begin
+            $display("[%0t] t=%b", $time, t);
+            #5 $display("[%0t] t=%b", $time, t);
+          end
+        endprogram
+    )") == "[0] t=1\n[5] t=0\n");
+}
+
+// The drain order holds for the whole Reactive region, not only at its start. One
+// program thread triggers an event, which queues another program's reading
+// thread, and then writes the variable that port copies: the copy is queued
+// BEHIND the reader, and still runs before it. The reader being queued first is
+// what the event buys, independent of which timer the wheel fires first.
+TEST_CASE("a port copy woken behind a queued program thread still settles before it reads") {
+    CHECK(run_capture(R"(
+        module top;
+          logic d = 0;
+          event go;
+          prog1 p1();
+          prog2 p2(d);
+          initial #40 $finish;
+        endmodule
+
+        program prog1;
+          initial begin
+            #5;
+            -> top.go;
+            top.d = 1;
+          end
+        endprogram
+
+        program prog2(input logic a);
+          initial begin
+            @(top.go);
+            $display("[%0t] a=%b", $time, a);
+          end
+        endprogram
+    )") == "[5] a=1\n");
+}
+
+// The output direction is unchanged: its copy is a reactive continuous process
+// too, so the design reader of the port still runs in the Active region of the
+// next iteration (24.3.2), after the program code that wrote the port.
+TEST_CASE("a program output port still reaches its design reader in the next Active") {
+    CHECK(run_capture(R"(
+        module top;
+          logic [7:0] d;
+          always @(d) $display("[%0t] DESIGN d=%0d", $time, d);
+          prog p(d);
+          initial #40 $finish;
+        endmodule
+
+        program prog(output logic [7:0] o);
+          initial begin
+            o = 1;
+            $display("[%0t] PROGRAM wrote %0d", $time, o);
+            #5 o = 2;
+            $display("[%0t] PROGRAM wrote %0d", $time, o);
+            #10;
+          end
+        endprogram
+    )") == "[0] PROGRAM wrote 1\n[0] DESIGN d=1\n[5] PROGRAM wrote 2\n[5] DESIGN d=2\n");
+}
+
 // An interface port -- `program test ( interface device_ifc );` is LRM 24.3's own
 // second example. No copy process exists: canonical_value_symbol resolves the
 // program's `b.data` and the module's onto the interface instance's one signal

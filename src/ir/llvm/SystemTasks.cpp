@@ -412,12 +412,15 @@ void Backend::lower_finish(Index i) {
         b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)),
                        sym(active_head_gv_));
     }
-    // Same for the reactive ring and its batch: a $fatal in an action block
+    // Same for the reactive rings and the batch: a $fatal in an action block
     // would otherwise leave the rest of this instant's pass/fail code queued,
     // and the reactive drain tests the finish flag only on its empty edge.
     if (reactive_head_gv_ != nullptr) {
         b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(reactive_tail_gv_)),
                        sym(reactive_head_gv_));
+    }
+    if (reactive_cont_head_gv_ != nullptr) {
+        b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(reactive_cont_tail_gv_)), sym(reactive_cont_head_gv_));
     }
     if (re_inactive_top_gv_ != nullptr) {
         b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
