@@ -1143,6 +1143,26 @@ TEST_CASE("virtual interface: a nonblocking write to a struct member through a h
     CHECK(out == "s.b 7 8 t 11 12 5a sa 33 hit 1 1\n");
 }
 
+// A whole string member written through a handle. Its type was not known to the
+// classification that runs before lowering, which staged the write in a string record
+// while counting the member as a scalar: nothing committed the record.
+TEST_CASE("virtual interface: a nonblocking write to a string member through a handle") {
+    const std::string out = run_capture(R"(
+        interface ibus; string name; endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus v1, v2;
+            initial begin
+                v1 = a; v2 = b;
+                v1.name <= "one";
+                v2.name <= "two";
+                #1 $display("%s %s", a.name, b.name);
+            end
+        endmodule
+    )");
+    CHECK(out == "one two\n");
+}
+
 // Several kinds of deferred write through handles to twin instances in one loop: a struct
 // member and a whole queue. Each kind has its own record queue, so a record sent to the
 // wrong one was read back as the other's shape (a crash in the JIT'd commit).

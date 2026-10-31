@@ -106,6 +106,12 @@ Ref Backend::lvalue_place_type(const Ir& ir, Index lv) const {
     switch (ir.tag(lv)) {
         case Inst::Tag::Signal:
             return mod_.signal(ir.payload(lv).signal).type;
+        case Inst::Tag::IfaceSignal:
+            // A member reached through a virtual interface handle: its type is the
+            // representative's, as nba_target takes the representative's signal. Without this
+            // a whole string through a handle was classified as a scalar array-queue write
+            // while lowering staged a string record, which nothing committed.
+            return mod_.signal(ir.extra_data<IfaceMember>(ir.payload(lv).op_extra.extra).signal).type;
         case Inst::Tag::Local:
             return ir.payload(lv).local.type;
         case Inst::Tag::MemberSelect: {
