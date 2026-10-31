@@ -141,11 +141,10 @@ void clamp_unproven_align(llvm::Module& m) {
 // module after a bitcode context migration (parallel compilation).
 bool optimize_module(llvm::Module& m, const SimulationConfig& config) {
     // The runtime's own functions the module calls come in first, so the pipeline
-    // inlines them and folds what they are called with. What the design then
-    // inlines away is left dead (an element descriptor still points at the kernels
-    // that only the inlined engine called, and nothing reads the descriptor), which
-    // tier 0 does not sweep on its own, so it ends with a global DCE exactly when
-    // something was linked.
+    // inlines them and folds what they are called with. A queue that is only pushed
+    // and popped inline can leave its descriptor, and the kernels it points at, with
+    // no reader, which tier 0 does not sweep on its own, so it ends with a global DCE
+    // exactly when something was linked.
     const bool linked = config.rt_bitcode && link_runtime_bitcode(m);
 
     llvm::PassBuilder         pb;
