@@ -156,6 +156,10 @@ llvm::Value* Backend::vcd_index_value(Signal sig, int32_t base) {
             return index;
         }
     }
+    // The flat number of a signal of some instance is that instance's own.
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names the dump-var index of a signal of one instance");
+    }
     return b_.getInt32(static_cast<uint32_t>(base));
 }
 

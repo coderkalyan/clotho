@@ -1444,6 +1444,10 @@ llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
     if (wait_sta_trig_gv_[i][edge] != nullptr) {
         return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
     }
+    // The colours of a signal of some instance are that instance's own.
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names the trigger bits of a signal of one instance");
+    }
     return b_.getInt64(trig_bits(sig, edge));
 }
 

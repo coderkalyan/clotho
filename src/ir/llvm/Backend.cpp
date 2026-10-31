@@ -289,6 +289,12 @@ llvm::Value* Backend::id_value(Signal sig, IdFamily family, uint32_t id) {
             return b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, elem));
         }
     }
+    // The design-wide number of a signal of some instance is that instance's own:
+    // shared code that reaches it by no record or binding would run it for the
+    // others.
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names a design-wide id of a signal of one instance");
+    }
     return b_.getInt32(id);
 }
 

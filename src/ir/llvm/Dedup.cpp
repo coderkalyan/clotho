@@ -352,6 +352,28 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
 // others. The check lowers the group again for each such instance, the way it
 // was lowered before groups were shared, and compares.
 
+// The last global and the last function root's module holds now (both lists only
+// ever get appended to), and the names of what follows them after.
+Backend::RootMark Backend::root_mark() const {
+    const llvm::Module& mod = root_env_->llmod;
+    return RootMark{ mod.global_empty() ? nullptr : &*std::prev(mod.global_end()),
+                     mod.empty() ? nullptr : &*std::prev(mod.end()) };
+}
+
+std::string Backend::root_added_since(const RootMark& mark) const {
+    std::string         out;
+    const llvm::Module& mod = root_env_->llmod;
+    // Newest first, so each name goes in front of the ones after it.
+    const auto add = [&](const llvm::GlobalValue& gv) { out = "@" + gv.getName().str() + (out.empty() ? "" : ", ") + out; };
+    for (auto it = mod.global_end(); it != mod.global_begin() && &*std::prev(it) != mark.last_global;) {
+        add(*--it);
+    }
+    for (auto it = mod.end(); it != mod.begin() && &*std::prev(it) != mark.last_function;) {
+        add(*--it);
+    }
+    return out;
+}
+
 // Lower group `g` for its own instance into a scratch module and take back out
 // of the backend what lowering registers outside it. The function stays in the
 // scratch module (see verify_modules_).
@@ -365,6 +387,7 @@ Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
     const auto                 block_lo = static_cast<std::ptrdiff_t>(block_commits_.size());
     const auto                 fill_lo  = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
     const std::vector<uint8_t> bound    = a.bind_used;
+    const RootMark             mark     = root_mark();
     const std::vector<uint8_t> fbound   = a.fbind_used;
     verifying_                          = true;
     share_active_                       = true;
@@ -372,6 +395,7 @@ Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
     OwnLowering own;
     own.fn        = lower_group(groups_[g]);
     own.taint     = std::exchange(taint_why_, nullptr);
+    own.root_added = root_added_since(mark);
     verifying_    = false;
     share_active_ = false;
     env_          = real_env;
@@ -394,6 +418,10 @@ std::string Backend::shared_code_differs(uint32_t g, SharedGroup& rep, const Own
     std::string    differs;
     if (own.taint != nullptr) {
         differs += std::format("  lowered for itself, the group bakes something of its instance: {}\n", own.taint);
+    }
+    if (!own.root_added.empty()) {
+        differs += std::format("  lowered for itself, the group makes in root what the shared code did not: {}\n",
+                               own.root_added);
     }
     if (rep.text.empty()) {
         rep.text = CodeText(rep.fn).joined();
@@ -491,6 +519,7 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
     ModuleEnv* const           real_env  = env_;
     llvm::Function* const      real_decl = fn_decls_[f];
     const std::vector<uint8_t> bound     = a.bind_used;
+    const RootMark             mark      = root_mark();
     const std::vector<uint8_t> fbound    = a.fbind_used;
     const auto                 block_lo  = static_cast<std::ptrdiff_t>(block_commits_.size());
     const auto                 fill_lo   = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
@@ -502,6 +531,7 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
     lower_subroutine(id);
     llvm::Function* const own_fn = fn_decls_[f];
     const char* const     taint  = std::exchange(taint_why_, nullptr);
+    const std::string     root_added = root_added_since(mark);
     fn_decls_[f]                 = real_decl;
     verifying_                   = false;
     share_active_                = false;
@@ -518,6 +548,10 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
     std::string differs;
     if (taint != nullptr) {
         differs += std::format("  lowered for itself, the subroutine bakes something of its instance: {}\n", taint);
+    }
+    if (!root_added.empty()) {
+        differs += std::format("  lowered for itself, the subroutine makes in root what the shared code did not: {}\n",
+                               root_added);
     }
     // The shared function may have been promoted to external linkage by a caller
     // in another module since; compared at the linkage it was declared with.

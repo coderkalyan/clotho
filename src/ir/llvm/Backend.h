@@ -5426,12 +5426,25 @@ private:
     // found it.
     void verify_shared_group(uint32_t g, SharedGroup& rep);
 
+    // The last global and function root's module held when a verifying lowering began
+    // (both lists only grow at the end), and the names of what follows them after: the
+    // check lowers into scratch modules, so a global or function it makes in root (a
+    // queue, a table made on first use) is a side effect only the check has, and root
+    // would differ with the check on and off. Empty when there is none.
+    struct RootMark {
+        const llvm::GlobalVariable* last_global;
+        const llvm::Function*       last_function;
+    };
+    RootMark    root_mark() const;
+    std::string root_added_since(const RootMark& mark) const;
+
     // What lowering group `g` for its own instance gives: the function, in a
     // scratch module, why it could not have been shared, and what it registered
     // (`lower_for_own_instance` takes that back out of the backend).
     struct OwnLowering {
         llvm::Function*                                       fn    = nullptr;
         const char*                                           taint = nullptr;
+        std::string                                           root_added;
         std::vector<BlockCommit>                              blocks;
         std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fills;
     };

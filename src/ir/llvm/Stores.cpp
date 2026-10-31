@@ -892,6 +892,10 @@ llvm::Value* Backend::emit_nba_any_staged() {
 // b_.GetInsertBlock()->getParent(), as do the four commit helpers it calls --
 // which is what makes a second copy after the Reactive region possible.
 void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
+    // Root code: the whole-design commit names the design-wide numbers of the NBA
+    // record buffers it drains (arr_idx, handle_buf_idx, ...), so it is never lowered
+    // as a shared unit's code.
+    assert(!share_active_ && "the whole-design NBA commit is code of root, never of a shared unit");
     auto*      ptr_ty   = llvm::PointerType::getUnqual(ctx_);
     const bool uses_vcd = design_uses_vcd();
     // Block-commit scalar NBAs: call the head block's commit function; it
@@ -2335,6 +2339,8 @@ void Backend::emit_intra_event_arm(const LValue&                lv,
 // array element's address was resolved when the statement executed and travels
 // in the record, so it is loaded per record and the wake is level-only.
 void Backend::emit_intra_commit(Signal sig) {
+    // Root code: it names the design-wide number of the record buffer it drains.
+    assert(!share_active_ && "a whole-signal intra-assignment commit is code of root, never of a shared unit");
     const SignalSlot& s = slot_of(sig);
     if (s.is_agg) {
         emit_intra_agg_commit(sig);

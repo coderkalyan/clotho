@@ -1264,7 +1264,13 @@ llvm::Value* Backend::defer_gen_ptr_for(uint32_t g) {
     const uint32_t ga = group_unit_anchor_[g];
     if (ga != SignalSlot::no_anchor) {
         Anchor&      a   = anchors_[ga];
-        llvm::Value* rec = ga == own_anchor_ && own_ctx_ != nullptr ? own_ctx_ : static_cast<llvm::Value*>(ensure_ctx(a));
+        llvm::Value* rec = nullptr;
+        if (ga == own_anchor_ && own_ctx_ != nullptr) {
+            rec = own_ctx_;
+        } else {
+            taint("names the deferred-assertion counter of another instance");
+            rec = ensure_ctx(a);
+        }
         return b_.CreateInBoundsGEP(
           a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(a.ctx_defer_base + proc_sched_ord_[groups_[g].front()]) });
     }
