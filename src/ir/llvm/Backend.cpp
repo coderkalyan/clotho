@@ -368,15 +368,26 @@ std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
 
 // The NBA blocks an instance registers when it runs the code `rep` lowered: the
 // same blocks, of the signals that sit at the same def-local fields of its own
-// instance.
+// instance, and of the signals that its bindings name at the positions the
+// representative's did (a signal of another instance, written through a port or a
+// hierarchical name). A signal of no instance is the same one for everybody.
 std::vector<Backend::BlockCommit> Backend::shared_blocks(const SharedGroup& rep, uint32_t anchor) const {
     std::vector<BlockCommit> blocks;
     blocks.reserve(rep.block_hi - rep.block_lo);
+    const uint32_t rep_anchor = group_unit_anchor_[rep.g];
     for (uint32_t b = rep.block_lo; b < rep.block_hi; ++b) {
         BlockCommit bc;
         for (const BlockSig& bs : block_commits_[b].sigs) {
-            const uint32_t field = slots_[static_cast<uint32_t>(bs.sig)].path.back();
-            bc.sigs.push_back({ anchor_signals_[anchor][field], bs.mask, bs.dynamic });
+            const SignalSlot& s = slots_[static_cast<uint32_t>(bs.sig)];
+            Signal            mapped = bs.sig;
+            if (s.anchor == rep_anchor) {
+                mapped = anchor_signals_[anchor][s.path.back()];
+            } else if (s.anchor != SignalSlot::no_anchor) {
+                const auto at = anchors_[rep_anchor].bind_of.find(static_cast<uint32_t>(bs.sig));
+                assert(at != anchors_[rep_anchor].bind_of.end() && "a signal of another instance is staged through a binding");
+                mapped = anchors_[anchor].externs[at->second];
+            }
+            bc.sigs.push_back({ mapped, bs.mask, bs.dynamic });
         }
         blocks.push_back(std::move(bc));
     }

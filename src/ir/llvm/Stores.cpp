@@ -591,8 +591,6 @@ void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) 
     const bool in_group = own_anchor_ != SignalSlot::no_anchor && cur_fn_ == nullptr;
     if (cur_fn_ != nullptr) {
         taint("stages a nonblocking write from a subroutine");
-    } else if (own_anchor_ != SignalSlot::no_anchor && slot_of(sig).anchor != own_anchor_) {
-        taint("stages a nonblocking write into another instance");
     }
     // Open a new block on the first NBA of a segment (the enqueue call is emitted
     // once, here, at that first store's insert point; it runs unconditionally

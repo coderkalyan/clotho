@@ -952,6 +952,33 @@ TEST_CASE("cli: --stat=unit-code shows twin instances with mutually recursive fu
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code shows twins that stage nonblocking writes into other instances sharing") {
+    // Each driver writes the interface instance its port names: the staged blocks of
+    // the second instance name its own interface's signal, though the code is one.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        interface bus;
+            logic [7:0] d;
+        endinterface
+        module drv(bus b, input int k);
+            initial begin
+                #k;
+                b.d <= 8'd10 + k[7:0];
+            end
+        endmodule
+        module top;
+            bus b0();
+            bus b1();
+            drv u0(b0, 1);
+            drv u1(b1, 2);
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 groups of multi-instance units over 2 instances' groups, 1 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

@@ -6115,3 +6115,27 @@ TEST_CASE("--emit llvm of a design with several definitions is one module") {
         CHECK(text.find("\nsource_filename") == text.rfind("\nsource_filename"));
     }
 }
+
+TEST_CASE("twin instances stage nonblocking writes into the interface their port names") {
+    // One body for both drivers (cli_test: --stat=unit-code); each commits into the
+    // signal of its own interface instance, in order.
+    CHECK(run_capture(R"(
+        interface bus;
+          logic [7:0] d;
+        endinterface
+        module drv(bus b, input int k);
+          initial begin
+            #k;
+            b.d <= 8'd10 + k[7:0];
+            #1 b.d <= 8'd20 + k[7:0];
+          end
+        endmodule
+        module top;
+          bus b0();
+          bus b1();
+          drv u0(b0, 1);
+          drv u1(b1, 2);
+          initial #10 $display("%0d %0d", b0.d, b1.d);
+        endmodule
+    )") == "21 22\n");
+}
