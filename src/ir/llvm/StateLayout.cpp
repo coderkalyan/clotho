@@ -869,8 +869,7 @@ llvm::Value* Backend::ref_actual_ptr(const Guarded& g, Ref type) {
         return agg_place_ptr(g, type);
     }
     if (!g.is_agg) {
-        const bool whole =
-          g.range_mask == nullptr && is_zero_const(g.bit_off) && g.width == g.store_width;
+        const bool whole = !g.masked() && is_zero_const(g.bit_off) && g.width == g.store_width;
         if (!whole) {
             throw BackendError{ "ref actual must be a whole variable, element or member" };
         }

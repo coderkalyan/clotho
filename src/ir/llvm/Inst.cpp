@@ -320,7 +320,7 @@ void Backend::lower_inst(Index i) {
             // 11.5.1): an out-of-range or x/z index reads x / writes nothing. A
             // constant index of a constant place is settled at compile time.
             const Plane        idxp         = value_of(p.binary.r);
-            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt64(0);
             const uint32_t     cwidth       = lv.width;
             llvm::Value*       idx          = select_index(idxp, type_of(p.binary.r));
             llvm::Value* const unknown      = any_unknown(p.binary.r);
@@ -339,7 +339,7 @@ void Backend::lower_inst(Index i) {
             const auto         ps          = ir_->extra_data<PartSelect>(p.op_extra.extra);
             llvm::Value* const cbase       = lv.bit_off;
             const uint32_t     outer_width = lv.width;
-            lv.bit_off                     = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
+            lv.bit_off                     = b_.CreateAdd(lv.bit_off, b_.getInt64(static_cast<int32_t>(ps.lsb)));
             lv.width                       = ps.msb - ps.lsb + 1;
             // A constant window that hangs over the vector it selects from (`v[11:8]`
             // of 8 bits, `v[1:-2]`, the element `a[5]` of `a[3:0]`) is out of range
@@ -352,7 +352,7 @@ void Backend::lower_inst(Index i) {
                 const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
                 if (first < 0 || first + lv.width > outer_width) {
                     set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse());
-                } else if (lv.range_mask != nullptr && lv.width != outer_width) {
+                } else if (lv.masked() && lv.width != outer_width) {
                     // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
                     // the inherited mask still covers the whole outer window, which a
                     // write must narrow (store_mask).
@@ -373,7 +373,7 @@ void Backend::lower_inst(Index i) {
             Guarded            lv           = lvalue_of(p.op_extra.op);
             const auto         dps          = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
             const Plane        offp         = value_of(dps.offset);
-            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt64(0);
             const uint32_t     cwidth       = lv.width;
             llvm::Value*       off          = select_index(offp, type_of(dps.offset));
             llvm::Value* const unknown      = any_unknown(dps.offset);
@@ -486,7 +486,7 @@ void Backend::lower_inst(Index i) {
                 el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
                 el.elem_idx      = cast(idx64, 32, false);
                 el.store_width   = e.width;
-                el.bit_off       = b_.getInt32(0);
+                el.bit_off       = b_.getInt64(0);
                 el.width         = e.width;
                 el.is_signal     = lv.is_signal;
                 el.sig           = lv.sig;
@@ -555,7 +555,7 @@ void Backend::lower_inst(Index i) {
                 el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
                 el.elem_idx      = cast(phys, 32, false);
                 el.store_width   = e.width;
-                el.bit_off       = b_.getInt32(0);
+                el.bit_off       = b_.getInt64(0);
                 el.width         = e.width;
                 el.is_signal     = lv.is_signal;
                 el.sig           = lv.sig;
@@ -606,7 +606,7 @@ void Backend::lower_inst(Index i) {
             const uint32_t stride = array_leaf_count(at.element);
             llvm::Value*   off    = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
             lv.elem_idx           = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
-            lv.bit_off            = b_.getInt32(0);
+            lv.bit_off            = b_.getInt64(0);
             set_lvalue(i, lv);
             return;
         }
@@ -689,7 +689,7 @@ void Backend::lower_inst(Index i) {
             // stacked on this deferred place ADDS to bit_off, and PartSelect's
             // unconditional CreateAdd crashed codegen on a null base. A packed
             // struct or union value element reaches exactly that path.
-            el.bit_off     = b_.getInt32(0);
+            el.bit_off     = b_.getInt64(0);
             el.width       = e.width;
             set_lvalue(i, el);
             return;
@@ -738,7 +738,7 @@ void Backend::lower_inst(Index i) {
             // stacked on this deferred place ADDS to bit_off, and PartSelect's
             // unconditional CreateAdd crashed codegen on a null base. A packed
             // struct or union value element reaches exactly that path.
-            el.bit_off     = b_.getInt32(0);
+            el.bit_off     = b_.getInt64(0);
             el.width       = e.width;
             set_lvalue(i, el);
             return;
@@ -764,7 +764,7 @@ void Backend::lower_inst(Index i) {
                 llvm::Value* off = b_.getInt32(as.first_pos * stride);
                 lv.elem_idx      = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
             }
-            lv.bit_off = b_.getInt32(0);
+            lv.bit_off = b_.getInt64(0);
             set_lvalue(i, lv);
             return;
         }
@@ -2504,7 +2504,7 @@ LValue Backend::signal_lvalue(Signal sig) {
     lv.has_z       = s.has_z;
     lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
     lv.store_width = s.width;
-    lv.bit_off     = b_.getInt32(0);
+    lv.bit_off     = b_.getInt64(0);
     lv.width       = s.width;
     lv.is_signal   = true;
     lv.sig         = sig;
@@ -2543,7 +2543,7 @@ LValue Backend::local_lvalue(uint32_t index) {
     lv.four_state  = s.four_state;
     lv.has_z       = s.four_state;
     lv.store_width = s.width;
-    lv.bit_off     = b_.getInt32(0);
+    lv.bit_off     = b_.getInt64(0);
     lv.width       = s.width;
     lv.is_signal   = false;
     lv.sig         = Signal{ 0 };
@@ -2561,6 +2561,20 @@ Plane Backend::lower_load(const LValue& lv) {
         return wide_dyn_load(lv);
     }
 
+    // A select that may be out of range reads plainly where it is in range and
+    // through the mask otherwise (LRM 11.5.1).
+    if (has_fast_path(lv)) {
+        return select_paths_read(
+          lv.nest_valid, [&] { return lower_load(plain_of(lv)); }, [&] { return lower_load(slow_of(lv)); });
+    }
+
+    // A constant select reads the words that hold its bits, not the whole slot.
+    if (!selects_whole(lv)) {
+        if (const auto win = static_window(lv)) {
+            return load_window(lv, *win);
+        }
+    }
+
     // 2-state slot: the stored word IS the iW value.
     if (!lv.four_state) {
         llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));
@@ -2569,9 +2583,9 @@ Plane Backend::lower_load(const LValue& lv) {
         }
         // A bounds-checked select aligns poison-free and reads 0 outside range
         // (LRM 11.5.1: an out-of-range read of a 2-state value is 0).
-        if (lv.range_mask != nullptr) {
+        if (lv.masked()) {
             llvm::Value* shifted = align_shl(v, b_.CreateNeg(lv.bit_off), w);
-            llvm::Value* valid   = align_shl(lv.range_mask, b_.CreateNeg(lv.bit_off), w);
+            llvm::Value* valid   = align_shl(window_mask(lv, w), b_.CreateNeg(lv.bit_off), w);
             return two_val(cast(b_.CreateAnd(shifted, valid), lv.width, false));
         }
         llvm::Value* off = cast(lv.bit_off, w, false);
@@ -2587,12 +2601,12 @@ Plane Backend::lower_load(const LValue& lv) {
     const Plane full = { mm, z };
     // A bounds-checked select aligns poison-free and forces x on the bits that
     // fall outside the vector (LRM 11.5.1: must=0, may=1, z=0).
-    if (lv.range_mask != nullptr) {
+    if (lv.masked()) {
         llvm::Value* down  = b_.CreateNeg(lv.bit_off);
         llvm::Value* must  = align_shl(must_of(full, true), down, w);
         llvm::Value* may   = align_shl(may_of(full, true), down, w);
         llvm::Value* zp    = align_shl(z, down, w);
-        llvm::Value* valid = align_shl(lv.range_mask, down, w);
+        llvm::Value* valid = align_shl(window_mask(lv, w), down, w);
         llvm::Value* oob   = b_.CreateNot(valid);
         return packed(cast(b_.CreateAnd(must, valid), lv.width, false),
                       cast(b_.CreateOr(may, oob), lv.width, false),

@@ -851,7 +851,7 @@ LValue Backend::elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
     lv.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     lv.elem_idx    = b_.getInt32(0);
     lv.store_width = e.width;
-    lv.bit_off     = b_.getInt32(0);
+    lv.bit_off     = b_.getInt64(0);
     lv.width       = e.width;
     lv.is_signal   = false;
     return lv;
@@ -1181,7 +1181,7 @@ LValue Backend::container_elem_lvalue(llvm::Value*   handle,
     el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     el.elem_idx    = cast(phys, 32, false);
     el.store_width = e.width;
-    el.bit_off     = b_.getInt32(0);
+    el.bit_off     = b_.getInt64(0);
     el.width       = e.width;
     return el;
 }
@@ -1204,7 +1204,7 @@ LValue Backend::tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value
     el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     el.elem_idx    = cast(idx, 32, false);
     el.store_width = e.width;
-    el.bit_off     = b_.getInt32(0);
+    el.bit_off     = b_.getInt64(0);
     el.width       = e.width;
     return el;
 }

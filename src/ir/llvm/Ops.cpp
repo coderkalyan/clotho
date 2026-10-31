@@ -29,7 +29,7 @@ llvm::Value* Backend::range_bits(uint32_t W, llvm::Value* lo, llvm::Value* hi) {
     return b_.CreateAnd(low_ones(W, hi), b_.CreateNot(low_ones(W, lo)));
 }
 
-// `v` shifted by the signed i32 `s`: left when s >= 0, right by |s| when
+// `v` shifted by the signed `s`: left when s >= 0, right by |s| when
 // s < 0. Poison-free and saturating — |s| >= W yields 0 (every bit leaves the
 // W-bit word), the correct behavior when aligning an out-of-range selection.
 // A constant `s` is one shift, or nothing left of `v`.
@@ -41,10 +41,11 @@ llvm::Value* Backend::align_shl(llvm::Value* v, llvm::Value* s, uint32_t W) {
         }
         return k == 0 ? v : k > 0 ? b_.CreateShl(v, k) : b_.CreateLShr(v, -k);
     }
-    llvm::Value* neg  = b_.CreateICmpSLT(s, b_.getInt32(0));
+    auto*        st   = s->getType();
+    llvm::Value* neg  = b_.CreateICmpSLT(s, llvm::ConstantInt::get(st, 0));
     llvm::Value* amt  = b_.CreateSelect(neg, b_.CreateNeg(s), s);
-    llvm::Value* ovf  = b_.CreateICmpUGE(amt, b_.getInt32(W));
-    llvm::Value* samt = cast(b_.CreateSelect(ovf, b_.getInt32(0), amt), W, false);
+    llvm::Value* ovf  = b_.CreateICmpUGE(amt, llvm::ConstantInt::get(st, W));
+    llvm::Value* samt = cast(b_.CreateSelect(ovf, llvm::ConstantInt::get(st, 0), amt), W, false);
     llvm::Value* pick = b_.CreateSelect(neg, b_.CreateLShr(v, samt), b_.CreateShl(v, samt));
     return b_.CreateSelect(ovf, zero(W), pick);
 }
@@ -115,15 +116,26 @@ Backend::SelectVerdict Backend::set_select_bounds(LValueInfo&  lv,
                                                           b_.CreateNot(bad)));
         return v;
     }
-    llvm::Value* lo   = smax(smin(off, end), base);
-    llvm::Value* hi   = smax(smin(top, end), base);
-    llvm::Value* mask = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
-    lv.range_mask       = b_.CreateSelect(bad, zero(sw), mask);
+    // The mask is not built here but at the access that needs it (window_mask), so
+    // that one that finds the select in range does without it. Its fast path needs
+    // the select inside the vector as well as its container, which a container that
+    // hangs over the vector, or lies in one that does, is not.
+    const auto* cb      = llvm::dyn_cast<llvm::ConstantInt>(cbase);
+    const bool  inside  = cb != nullptr ? cb->getSExtValue() >= 0 && cb->getSExtValue() + cwidth <= sw : lv.dyn_fast;
+    lv.dyn_fast         = inside && (cb != nullptr || lv.dyn_sel);
+    lv.dyn_sel          = true;
+    lv.range_mask       = nullptr;
     lv.range_mask_outer = false;
-
-    v.partial =
-      selw == 1 ? nullptr
-                : b_.CreateAnd(b_.CreateNot(v.fully), b_.CreateICmpNE(lv.range_mask, zero(sw)));
+    lv.sel_off          = lv.bit_off;
+    lv.sel_width        = selw;
+    lv.sel_base         = base;
+    lv.sel_cwidth       = cwidth;
+    lv.sel_unknown      = bad;
+    // Only a bounds report wants the partial verdict, and it is the one thing that
+    // reads the mask here.
+    if (selw != 1 && sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+        v.partial = b_.CreateAnd(b_.CreateNot(v.fully), b_.CreateICmpNE(window_mask(lv, sw), zero(sw)));
+    }
     return v;
 }
 
@@ -176,22 +188,21 @@ std::optional<Backend::SelectVerdict> Backend::resolve_constant_select(Guarded& 
     return v;
 }
 
-// A bit / part-select index operand as the i32 that is added to a bit offset.
-// LRM 11.5.1 compares the index VALUE, so a narrower operand extends by its own
-// signedness, and a wider one is narrowed by saturation: every value an i32
-// holds passes, and a larger one (a 64-bit index of 2**32 + 1, which its low 32
-// bits would turn into bit 1) becomes INT32_MAX or INT32_MIN, which no container
-// reaches. The frontend hands over an operand wider than 32 bits only when a
-// 32-bit offset could not hold its arithmetic.
+// A bit / part-select index operand as the i64 that is added to a bit offset. The
+// frontend has extended it by its own signedness, and an offset is a signed number, so
+// an operand of up to 64 bits is that number. A wider one (the frontend builds one
+// when a 64-bit offset could not hold its arithmetic) is checked: a value beyond
+// +-2^40 is out of range in any container, and is narrowed to that bound rather than
+// to its low bits, which would put a huge index back inside a vector.
 llvm::Value* Backend::select_index(Plane idx, ValueType t) {
-    // An offset is a signed number: the frontend zero-extends an unsigned index
-    // past its top bit, and builds a wide offset in a signed type.
     llvm::Value* m = must_of(idx, t.four_state);
-    if (t.width <= 32) {
-        return cast(m, 32, true);
+    if (t.width <= 64) {
+        return cast(m, 64, true);
     }
-    llvm::Value* hi = llvm::ConstantInt::get(m->getType(), INT32_MAX);
-    return cast(smax(smin(m, hi), llvm::ConstantInt::getSigned(m->getType(), INT32_MIN)), 32, false);
+    auto*        ty = m->getType();
+    llvm::Value* hi = llvm::ConstantInt::get(ty, uint64_t{ 1 } << 40);
+    llvm::Value* lo = llvm::ConstantInt::getSigned(ty, -(int64_t{ 1 } << 40));
+    return cast(smax(smin(m, hi), lo), 64, false);
 }
 
 // The 0-based position of a fixed-size unpacked array element and whether the
@@ -228,27 +239,27 @@ Backend::ElemBelow Backend::elem_index_below(Plane idx, ValueType t, llvm::Value
 //
 // The inline form asks LLVM for a variable shift on an i(2*sw) SSA value, which
 // legalizes into O(sw/64) selects per word, so its cost grows with the vector: user
-// instructions per iteration of a loop that makes one bit-select access (`perf stat
-// -e instructions:u`, loop of N and 2N iterations; the loop itself is 19), inline
-// against helper:
+// instructions per iteration of a loop that makes one bit-select access whose index
+// is in range (`perf stat -e instructions:u`, loop of N and 2N iterations; the loop
+// itself is 19), inline against helper:
 //
 //                   128      256      384      512      1024
-//   2-state read    99/119   207/119  343/118  348/119  667/119
-//   2-state write  105/117   221/117  332/117  436/118  981/117
-//   4-state read   121/139   240/139  414/139  418/139  799/138
-//   4-state write  115/138   248/138  384/138  496/139 1087/138
+//   2-state read    35/35    54/53    67/119   66/120   96/119
+//   2-state write   56/56    95/95    147/117  191/118  416/117
+//   4-state read    56/57    79/77    95/139   102/140  184/141
+//   4-state write   69/68   118/120   220/138  277/139  657/138
 //
-// The helper is flat (the 128 and 256 columns repeat it), so the lines cross between
-// 128 and 192 bits. The threshold stays at 256 rather than at the crossing because a
-// helper select cannot yet take a nonblocking assignment with a delay or an event
-// control (fill_intra_payload refuses it), which a vector of 129 to 256 bits can
-// today. Above 256 the helper wins everywhere, and time agrees: it is 2-15x faster
-// from 512 bits on. Compile time is the other cost of the inline form: 0.2 s per
-// dynamic select at 4 Kbit, 21 s at 12 Kbit and over half an hour at 64 Kbit (ivtest
-// pr722). Above the threshold the cost is a call whose work is O(selw / 64) and
-// independent of the vector's width. The selection's own width is unrestricted: its
-// planes travel as ceil(selw/64)-word buffers, so `[i +: 128]` of a 64 Kbit vector
-// costs what the same select of a 512-bit one does.
+// The helper is flat (the 128 and 256 columns repeat it). A write crosses it between
+// 256 and 384 bits, a read only at 1 Kbit, since a select whose index is in range
+// takes the plain path (kernel.md) and pays no mask. The threshold stays at 256: the
+// inline form's compile time is the other cost, 0.2 s per dynamic select at 4 Kbit,
+// 21 s at 12 Kbit and over half an hour at 64 Kbit (ivtest pr722), and a helper select
+// cannot yet take a nonblocking assignment with a delay or an event control
+// (fill_intra_payload refuses it), which a vector of up to 256 bits can today. Above
+// the threshold the cost is a call whose work is O(selw / 64) and independent of the
+// vector's width. The selection's own width is unrestricted: its planes travel as
+// ceil(selw/64)-word buffers, so `[i +: 128]` of a 64 Kbit vector costs what the same
+// select of a 512-bit one does.
 bool Backend::wide_dyn_storage(uint32_t sw) {
     return sw > wide_dyn_select_bits;
 }
@@ -260,14 +271,15 @@ bool Backend::wide_dyn_storage(uint32_t sw) {
 // staging route to rt_wide_ins, which addresses words instead of needing a mask
 // this wide -- building one is the O(width^2) legalization that path avoids.
 llvm::Value* Backend::store_mask(const LValueInfo& lv, uint32_t sw) {
-    if (lv.range_mask != nullptr) {
+    if (lv.masked()) {
+        llvm::Value* mask = window_mask(lv, sw);
         if (lv.range_mask_outer) {
             // A constant part-select inside a dynamic select's window writes
             // only its own in-range bits (LRM 11.5.1). place_val is poison-free,
             // which matters when the outer index is out of range.
-            return b_.CreateAnd(lv.range_mask, place_val(lv, ones(lv.width), sw));
+            return b_.CreateAnd(mask, place_val(lv, ones(lv.width), sw));
         }
-        return lv.range_mask;
+        return mask;
     }
     return b_.CreateShl(cast(ones(lv.width), sw, false), cast(lv.bit_off, sw, false));
 }
@@ -276,10 +288,35 @@ llvm::Value* Backend::store_mask(const LValueInfo& lv, uint32_t sw) {
 // bounds-checked select, a plain left shift otherwise).
 llvm::Value* Backend::place_val(const LValueInfo& lv, llvm::Value* v_iw, uint32_t sw) {
     llvm::Value* vW = cast(v_iw, sw, false);
-    if (lv.range_mask != nullptr) {
+    if (lv.masked()) {
         return align_shl(vW, lv.bit_off, sw);
     }
     return b_.CreateShl(vW, cast(lv.bit_off, sw, false));
+}
+
+// The storage-width mask of the bits a select can address: the constant one of a
+// constant select that hangs over its place, or, for a dynamic one, built here from
+// what set_select_bounds recorded. Building it where it is used is what lets a
+// select that is in range never pay for it.
+llvm::Value* Backend::window_mask(const LValueInfo& lv, uint32_t sw) {
+    if (lv.range_mask != nullptr) {
+        return lv.range_mask;
+    }
+    assert(lv.dyn_sel && "a mask is wanted of a select that has none");
+    auto*        i64t = int_ty(64);
+    llvm::Value* base = lv.sel_base;
+    llvm::Value* end  = b_.CreateAdd(base, llvm::ConstantInt::get(i64t, lv.sel_cwidth));
+    llvm::Value* off  = b_.CreateSExt(lv.sel_off, i64t);
+    llvm::Value* top  = b_.CreateAdd(off, llvm::ConstantInt::get(i64t, lv.sel_width));
+    // The container's base is any i64, so the bounds are clamped to the vector before
+    // they are narrowed to the i32 range_bits takes.
+    const auto clamp = [&](llvm::Value* x) {
+        return b_.CreateTrunc(
+          smax(smin(smax(smin(x, end), base), llvm::ConstantInt::get(i64t, sw)), llvm::ConstantInt::get(i64t, 0)),
+          int_ty(32));
+    };
+    llvm::Value* mask = range_bits(sw, clamp(off), clamp(top));
+    return b_.CreateSelect(lv.sel_unknown, zero(sw), mask);
 }
 
 // Merge one plane of a partial store: (old & ~mask) | (aligned ins & mask),
@@ -294,6 +331,121 @@ llvm::Value* Backend::merge_sel(llvm::Value*      old,
     return b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), placed);
 }
 
+// The window a constant select reads and writes, or nothing when it is not one or
+// the slot is no wider than a word in each plane, where the whole slot already is the
+// word. The in-range bits are the constant mask's, or all of them without one.
+std::optional<Backend::StaticWindow> Backend::static_window(const LValueInfo& lv) {
+    const auto*    off   = llvm::dyn_cast_or_null<llvm::ConstantInt>(lv.bit_off);
+    const uint32_t field = lv.four_state ? 2 * lv.store_width : lv.store_width;
+    if (off == nullptr || field <= 64 || lv.wide_dyn || lv.dyn_sel || lv.nest_valid != nullptr || lv.range_mask_outer ||
+        lv.is_string || lv.is_handle) {
+        return std::nullopt;
+    }
+    const int64_t first = off->getSExtValue();
+    if (lv.range_mask == nullptr) {
+        return StaticWindow{ static_cast<uint32_t>(first), 0, lv.width };
+    }
+    const auto* m = llvm::dyn_cast<llvm::ConstantInt>(lv.range_mask);
+    if (m == nullptr) {
+        return std::nullopt;
+    }
+    const llvm::APInt& bits = m->getValue();
+    const uint32_t     lo   = bits.countr_zero();
+    const uint32_t     hi   = bits.getBitWidth() - bits.countl_zero();
+    return StaticWindow{ lo, static_cast<uint32_t>(lo - first), hi - lo };
+}
+
+// The 64-bit words [lo / 64, (lo + n - 1) / 64] of the plane, and where the run
+// starts in them. A plane of at most a word is loaded whole: it is smaller than the
+// word a window would address.
+static llvm::Value* bit_words(llvm::IRBuilder<>& b,
+                              llvm::Value*       ptr,
+                              uint32_t           field_bits,
+                              uint32_t           lo,
+                              uint32_t           n,
+                              llvm::Type*&       ty,
+                              uint32_t&          shift) {
+    if (field_bits <= 64) {
+        ty    = b.getIntNTy(field_bits);
+        shift = lo;
+        return ptr;
+    }
+    const uint32_t w0 = lo / 64;
+    const uint32_t w1 = (lo + n - 1) / 64;
+    ty                = b.getIntNTy(64 * (w1 - w0 + 1));
+    shift             = lo % 64;
+    return w0 == 0 ? ptr : b.CreateConstInBoundsGEP1_64(b.getInt64Ty(), ptr, w0);
+}
+
+llvm::Value* Backend::load_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, uint32_t n) {
+    llvm::Type*  ty;
+    uint32_t     shift;
+    llvm::Value* p = bit_words(b_, ptr, field_bits, lo, n, ty, shift);
+    llvm::Value* v = b_.CreateAlignedLoad(ty, p, field_bits <= 64 ? llvm::MaybeAlign() : llvm::MaybeAlign(8));
+    return cast(shift == 0 ? v : b_.CreateLShr(v, shift), n, false);
+}
+
+void Backend::store_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, llvm::Value* v) {
+    const uint32_t n = bits_of(v);
+    llvm::Type*    ty;
+    uint32_t       shift;
+    llvm::Value*   p     = bit_words(b_, ptr, field_bits, lo, n, ty, shift);
+    const auto     width = ty->getIntegerBitWidth();
+    const auto     align = field_bits <= 64 ? llvm::MaybeAlign() : llvm::MaybeAlign(8);
+    if (shift == 0 && n == width) {
+        b_.CreateAlignedStore(v, p, align);
+        return;
+    }
+    llvm::Value* old  = b_.CreateAlignedLoad(ty, p, align);
+    llvm::Value* mask = llvm::ConstantInt::get(ctx_, llvm::APInt::getBitsSet(width, shift, shift + n));
+    llvm::Value* put  = b_.CreateShl(cast(v, width, false), shift);
+    b_.CreateAlignedStore(b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), put), p, align);
+}
+
+void Backend::set_bits(llvm::Value* ptr, uint32_t field_bits, uint32_t lo, uint32_t n) {
+    llvm::Type*  ty;
+    uint32_t     shift;
+    llvm::Value* p     = bit_words(b_, ptr, field_bits, lo, n, ty, shift);
+    const auto   align = field_bits <= 64 ? llvm::MaybeAlign() : llvm::MaybeAlign(8);
+    llvm::Value* mask =
+      llvm::ConstantInt::get(ctx_, llvm::APInt::getBitsSet(ty->getIntegerBitWidth(), shift, shift + n));
+    b_.CreateAlignedStore(b_.CreateOr(b_.CreateAlignedLoad(ty, p, align), mask), p, align);
+}
+
+// A constant select read through its window: each plane's in-range bits, placed at
+// their position in the selection, with x (0 for a 2-state slot) below and above.
+Plane Backend::load_window(const LValue& lv, const StaticWindow& w) {
+    const uint32_t W     = lv.store_width;
+    const uint32_t n     = lv.width;
+    llvm::Value*   mm    = lv_mm_ptr(lv);
+    const auto     place = [&](llvm::Value* v) { return w.len == n ? v : b_.CreateShl(cast(v, n, false), w.pad); };
+    if (!lv.four_state) {
+        return two_val(place(load_bits(mm, W, w.at, w.len)));
+    }
+    llvm::Value* must = place(load_bits(mm, 2 * W, w.at, w.len));
+    llvm::Value* may  = place(load_bits(mm, 2 * W, W + w.at, w.len));
+    if (w.len != n) {
+        llvm::Value* inside = cast(ones(w.len), n, false);
+        may                 = b_.CreateOr(may, b_.CreateNot(b_.CreateShl(inside, w.pad)));
+    }
+    llvm::Value* z = lv.has_z ? place(load_bits(lv_z_ptr(lv), W, w.at, w.len)) : zero(n);
+    return packed(must, may, z);
+}
+
+void Backend::store_window(const LValueInfo& lv, const StaticWindow& w, llvm::Value* mm, llvm::Value* z, Plane rhs) {
+    const uint32_t W    = lv.store_width;
+    const auto     part = [&](llvm::Value* v) { return cast(w.pad == 0 ? v : b_.CreateLShr(v, w.pad), w.len, false); };
+    if (!lv.four_state) {
+        store_bits(mm, W, w.at, part(must_of(rhs, false)));
+        return;
+    }
+    store_bits(mm, 2 * W, w.at, part(must_of(rhs, true)));
+    store_bits(mm, 2 * W, W + w.at, part(may_of(rhs, true)));
+    if (z != nullptr) {
+        store_bits(z, W, w.at, part(rhs.z != nullptr ? rhs.z : zero(lv.width)));
+    }
+}
+
 // Whether the lvalue is its whole storage and every bit of it is valid, so a
 // load / store needs no select arithmetic. A bit-select of a one-bit vector has
 // the whole storage's width and offset 0 whatever its index is, so the mask
@@ -304,6 +456,9 @@ bool Backend::selects_whole(const LValueInfo& lv) {
         return false;
     }
     if (lv.wide_dyn) {
+        return false;
+    }
+    if (lv.dyn_sel) {
         return false;
     }
     if (lv.range_mask == nullptr) {
