@@ -529,7 +529,8 @@ collection fails to satisfy the request.
 | Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, u64 size }` node in the frame, linked at the ramp, unlinked at frame free | conservative, validated, **pinning** |
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
 | Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
-| NBA staging images (`rt_nba_arr_slot`), `$strobe` / `$monitor` argument images, deferred-report queues | Registered with their element descriptor | precise |
+| NBA record queues (`rt_nba_arr_slot`: array element, virtual-interface member, aggregate leaf, whole container) | Registered by shape at start-up (`rt_gc_nba_words_add` / `rt_gc_nba_container_add`); the staged records are read at each collection | conservative words, or precise through the container's element descriptor |
+| `$strobe` / `$monitor` argument images, deferred-report queues | Registered with their element descriptor | precise |
 | Detached `->> #d e` timer node (`src/ir/llvm/`), later `rt_event` waiter lists | Explicit root registration at creation | precise |
 | Wheel timers, wait buckets, the active ring, fork/disable records | Nothing to do — they hold *frame* pointers, and frames are enumerated above | — |
 | VCD var tables, `rt_ref_names`, `chandle` | **Not roots.** VCD caches only pointers into `clotho.state`; `chandle` is foreign | — |
@@ -678,13 +679,25 @@ into a frame above the one whose address starts the scan; the scan runs to the b
    run by an emergency collection therefore does not free a buffer that a word of the
    stack lies in (`buffers_park`): it is parked and re-tested at the next collection.
 4. *Staged nonblocking assignments.* Staging and commit used to be separated by no
-   collection (the only one followed the NBA commit), so the shadow a scalar or
-   struct-member target stages into was not a root, and `h <= new C` followed by enough
-   allocation in the same time step freed the handle before it committed. A target that
-   can hold a handle now registers its shadow as a conservatively scanned range
-   (`emit_gc_root_tables`, `rt_gc_range_add`). Array-element records, a whole-container
-   copy and a delayed (`<= #d`) record were already roots; a class-property target is
-   refused by the frontend.
+   collection (the only one followed the NBA commit), so nothing that holds a staged
+   handle had to be a root, and `h <= new C` followed by enough allocation in the same
+   time step freed the handle before it committed. Every place one can sit is now a root:
+   - *The block shadow* of a scalar or struct-member target that can hold a handle: a
+     conservatively scanned range (`emit_gc_root_tables`, `rt_gc_range_add`).
+   - *The record queues* (`rt_nba_arr_slot`, one growable buffer per signal) of an array
+     element, a member written through a virtual interface, an aggregate leaf reached
+     through a runtime index, and a whole-container copy. The buffers move as they grow,
+     so a record cannot be a range of its own; the queue is registered once at start-up
+     (`emit_gc_nba_queues`, `rt_gc_nba_words_add` / `rt_gc_nba_container_add`) and each
+     collection reads the staged records through `rt_nba_arr_base` / `rt_nba_arr_count`:
+     a word-scanned record for a handle in the record, the element descriptor of the
+     container image for a whole-container copy. An aggregate record pads its payload to
+     a word boundary (`agg_rec_payload`) so the scan sees a handle leaf.
+   - *The records of a delayed* (`<= #d`, `<= @e`) assignment: ranges from allocation to
+     release (`rt_intra_alloc_rooted`).
+   A class-property target is refused by the frontend. The record queues were claimed to
+   be roots by this audit's first version and were not; `gc_test` stages through runtime
+   indices and a virtual interface so that no stale copy on the stack can hide it.
 5. *Not a root:* a buffer pointer held only in a suspended frame is the existing task
    case, unchanged.
 6. ASan: the scan loop is `no_sanitize("address")` since it must read redzones.
@@ -699,6 +712,7 @@ said so, and what now holds:
 | assumption | resolution |
 |---|---|
 | NBA shadow needs no root (`StoreNb` barrier comment) | item 4: shadow registered as a range |
+| array-element, aggregate-leaf, whole-container and virtual-interface NBA records are roots | they were not: item 4, the record queues are registered and scanned |
 | fresh `new` needs no barrier (`HandleDeref`) | item 2: found, promoted, re-logged |
 | barrier then store, nothing between (`Store`) | still true: nothing between them allocates |
 | call-site barrier is airtight for a function (`lower_call_common`) | item 2: callee holds the actual, re-logged; `ref` into a class-owned container registered |

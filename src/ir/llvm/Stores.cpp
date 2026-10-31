@@ -1624,16 +1624,33 @@ uint32_t Backend::agg_max_leaf_bytes(Ref type) {
     return static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(slot));
 }
 
-// Deferred aggregate-NBA record: { ptr dest_slot, i32 nbytes, [max x i8]
+// Deferred aggregate-NBA record: { ptr dest_slot, i32 nbytes, [i32 pad,] [max x i8]
 // payload [, [max x i8] mask] }. `payload` holds the new leaf value in the
 // leaf's own slot byte layout. Without a mask the commit memcpies `nbytes` of
 // it to `dest_slot`; with a mask (any partial site in the aggregate) the
 // commit does a byte-wise masked read-modify-write. Either way a leaf of any
 // width / domain replays uniformly (no per-leaf monomorphization).
+//
+// The pad exists only for an aggregate that can hold a class handle. The queue is a GC
+// root (rt_gc_nba_words_add) scanned one aligned word at a time, and a handle leaf sits at
+// the start of the payload, which after `i32 nbytes` would be 4 bytes off a word boundary
+// and invisible to the scan (the same reason as intra_agg_payload).
+bool Backend::agg_rec_rooted(const SignalSlot& s) {
+    return reaches_class_handle(s.ir_type);
+}
+
+uint32_t Backend::agg_rec_payload(const SignalSlot& s) {
+    return agg_rec_rooted(s) ? 3 : 2;
+}
+
 llvm::StructType* Backend::agg_rec_ty(const SignalSlot& s) {
     const uint32_t maxb   = agg_max_leaf_bytes(s.ir_type);
     auto*          bytes  = llvm::ArrayType::get(b_.getInt8Ty(), maxb);
-    std::vector<llvm::Type*> f{ raw_ptr_ty(), b_.getInt32Ty(), bytes };
+    std::vector<llvm::Type*> f{ raw_ptr_ty(), b_.getInt32Ty() };
+    if (agg_rec_rooted(s)) {
+        f.push_back(b_.getInt32Ty());
+    }
+    f.push_back(bytes);
     if (s.agg_masked) {
         f.push_back(bytes);
     }
@@ -1709,7 +1726,7 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
         b_.CreateAlignedStore(v, p, a1);
     };
 
-    llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+    llvm::Value* payload = b_.CreateStructGEP(rt, rec, agg_rec_payload(s));
     // The value, positioned at the leaf's bit offset (partial select), in slot
     // layout: mm plane at offset 0, z plane at zoff.
     if (!lv.four_state) {
@@ -1728,7 +1745,7 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     // ever gate the dest slot's own padding, which is never read.
     if (s.agg_masked) {
         llvm::Value* mask   = store_mask(lv, W);
-        llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, 3);
+        llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, agg_rec_payload(s) + 1);
         if (!lv.four_state) {
             put(mask_p, mask, 0);
         } else {
@@ -1766,7 +1783,7 @@ void Backend::emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
     llvm::Value* rec     = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(stride)) });
     llvm::Value* dest    = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
     llvm::Value* nbytes  = b_.CreateAlignedLoad(b_.getInt32Ty(), b_.CreateStructGEP(rt, rec, 1), llvm::Align{ 1 });
-    llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+    llvm::Value* payload = b_.CreateStructGEP(rt, rec, agg_rec_payload(s));
     if (!s.agg_masked) {
         b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
     } else {
@@ -1774,7 +1791,7 @@ void Backend::emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
         // Width-agnostic — a mask byte of 0 leaves dest[j] unchanged, so an
         // unselected bit (or a garbage padding byte gating dest padding) is a
         // no-op. Mirrors the array masked commit without monomorphizing width.
-        llvm::Value* mask_r = b_.CreateStructGEP(rt, rec, 3);
+        llvm::Value* mask_r = b_.CreateStructGEP(rt, rec, agg_rec_payload(s) + 1);
         auto*        bh     = llvm::BasicBlock::Create(ctx_, "aggnba.bh", fn);
         auto*        bb     = llvm::BasicBlock::Create(ctx_, "aggnba.bb", fn);
         auto*        bd     = llvm::BasicBlock::Create(ctx_, "aggnba.bd", fn);

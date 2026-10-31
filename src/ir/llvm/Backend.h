@@ -1482,6 +1482,8 @@ private:
 
     uint32_t gc_container_kind(Ref container_type);
 
+    void emit_gc_nba_queues();
+
     // Register (Add) or unregister (Remove) every handle-bearing container inside a
     // FRAME-RESIDENT image at `base`, whose storage is a root for exactly as long as
     // the activation lives (Gc.h:239-241).
@@ -2659,6 +2661,8 @@ private:
     llvm::FunctionCallee gc_alloc_fn();
     llvm::FunctionCallee gc_roots_add_fn();
     llvm::FunctionCallee gc_range_add_fn();
+    llvm::FunctionCallee gc_nba_words_add_fn();
+    llvm::FunctionCallee gc_nba_container_add_fn();
     llvm::FunctionCallee gc_containers_add_fn();
     llvm::FunctionCallee gc_container_add_fn();
     llvm::FunctionCallee gc_container_remove_fn();
@@ -3125,6 +3129,10 @@ private:
     uint32_t agg_max_leaf_bytes(Ref type);
 
     llvm::StructType* agg_rec_ty(const SignalSlot& s);
+
+    bool agg_rec_rooted(const SignalSlot& s);
+
+    uint32_t agg_rec_payload(const SignalSlot& s);
 
     llvm::Value* agg_arg_ptr(const Guarded& lv, Ref type, ArgDir dir);
 

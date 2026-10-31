@@ -325,6 +325,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_gc_remember", &rt_gc_remember);
     expose("rt_gc_roots_add", &rt_gc_roots_add);
     expose("rt_gc_range_add", &rt_gc_range_add);
+    expose("rt_gc_nba_words_add", &rt_gc_nba_words_add);
+    expose("rt_gc_nba_container_add", &rt_gc_nba_container_add);
     expose("rt_gc_frame_link", &rt_gc_frame_link);
     expose("rt_gc_frame_unlink", &rt_gc_frame_unlink);
     // The safepoint's SLOW half only. Generated code polls rt_gc_mutator::request
