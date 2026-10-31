@@ -669,7 +669,7 @@ void Backend::lower_inst(Index i) {
                 // (assoc_elem_lvalue). Leaf facts are filled by the descent.
                 el.is_agg  = true;
                 el.root_ty = e.agg_ty;
-                set_lvalue(i, nested_select(el, hlv));
+                set_lvalue(i, el);
                 return;
             }
             // Managed value elements carry only the slot type (a string / a
@@ -686,7 +686,7 @@ void Backend::lower_inst(Index i) {
             // struct or union value element reaches exactly that path.
             el.bit_off     = b_.getInt32(0);
             el.width       = e.width;
-            set_lvalue(i, nested_select(el, hlv));
+            set_lvalue(i, el);
             return;
         }
         case Inst::Tag::AssocDefault: {
@@ -721,7 +721,7 @@ void Backend::lower_inst(Index i) {
             if (e.is_agg) {
                 el.is_agg  = true;
                 el.root_ty = e.agg_ty;
-                set_lvalue(i, nested_select(el, dlv));
+                set_lvalue(i, el);
                 return;
             }
             el.slot_ty     = e.slot_ty;
@@ -735,7 +735,7 @@ void Backend::lower_inst(Index i) {
             // struct or union value element reaches exactly that path.
             el.bit_off     = b_.getInt32(0);
             el.width       = e.width;
-            set_lvalue(i, nested_select(el, dlv));
+            set_lvalue(i, el);
             return;
         }
         case Inst::Tag::MemberSelect: {

@@ -788,26 +788,20 @@ Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
                                    alloc_site_global(at, "associative array") });
         }
         if (for_write) {
-            // An invalid (x/z) key must not even allocate the entry, or
-            // `num`/`exists` would see a key the write was supposed to drop
-            // (LRM 7.8.6); nor may a select the entry sits behind that is itself
-            // invalid (`arr[i][k]` with `i` outside `arr`). Branch around put_ptr
-            // and hand back a null slot; the store itself is guarded by the same
-            // verdict below.
-            llvm::Value* entry_ok = kvalid;
-            if (lv.valid() != nullptr) {
-                entry_ok = entry_ok != nullptr ? b_.CreateAnd(entry_ok, lv.valid()) : lv.valid();
-            }
-            if (entry_ok == nullptr) {
+            if (kvalid == nullptr) {
                 return b_.CreateCall(assoc_put_ptr_fn(),
                                      { lv.assoc_handle, lv.assoc_ops, kptr, klen,
                                        alloc_site_global(at, "associative array") });
             }
+            // An invalid (x/z) key must not even allocate the entry, or
+            // `num`/`exists` would see a key the write was supposed to drop
+            // (LRM 7.8.6). Branch around put_ptr and hand back a null slot; the
+            // store itself is guarded by the same verdict below.
             auto* fn    = b_.GetInsertBlock()->getParent();
             auto* putbb = llvm::BasicBlock::Create(ctx_, "assoc.key.ok", fn);
             auto* cont  = llvm::BasicBlock::Create(ctx_, "assoc.key.cont", fn);
             auto* from  = b_.GetInsertBlock();
-            b_.CreateCondBr(entry_ok, putbb, cont);
+            b_.CreateCondBr(kvalid, putbb, cont);
             b_.SetInsertPoint(putbb);
             llvm::Value* p = b_.CreateCall(assoc_put_ptr_fn(),
                                           { lv.assoc_handle, lv.assoc_ops, kptr, klen,
@@ -892,9 +886,11 @@ Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
     // Root and owner travel together; see agg_member for the invariant.
     el.gc_container_root = lv.gc_container_root;
     el.gc_container_type = lv.gc_container_type;
-    // The verdicts the deferred place carried, then the key's and the entry's.
+    // Valid where the key is and, for a read, where the entry was found. The deferred
+    // place itself carries no verdict here: a base inside an invalid container was
+    // opened (lv_handle_ptr) when the place was formed.
     const auto resolved = [&](const LValue& v) {
-        Guarded g = nested_select(v, lv);
+        Guarded g(v);
         g.require(b_, kvalid);
         g.require(b_, nonnull);
         return g;

@@ -2830,14 +2830,10 @@ private:
                                llvm::Value*      data,
                                llvm::Value*      slot_index);
 
-    // A place `el` selected from inside `container`, which it is valid only as far as:
-    // a select nested in an invalid one is invalid.
-    Guarded nested_select(const LValue& el, const Guarded& container);
-
-    // The element `el` an element select of `container` designates: valid only where
-    // the index is (`inrange`) and where the container place itself is. Records the
-    // index for --sanitize=bounds.
-    Guarded element_select(const LValue& el, const Guarded& container, Index at, Index idx_expr,
+    // The element `el` an element select of a dynamic array or queue designates:
+    // valid only where the index is (`inrange`). `named` is the container, for
+    // --sanitize=bounds, which this records the index for.
+    Guarded element_select(const LValue& el, const LValueInfo& named, Index at, Index idx_expr,
                            llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent);
 
     LValue elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e);
@@ -3251,7 +3247,7 @@ private:
 
     void lower_fgets(Index i);
 
-    std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> string_dest(Index dst, const char* who);
+    std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> string_dest(const Guarded& g, const char* who);
 
     // The format string and the rt_fmt_dyn context of a $sformat / $sformatf.
     //

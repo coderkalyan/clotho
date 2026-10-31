@@ -807,17 +807,16 @@ LValue Backend::dyn_agg_elem_lvalue(const LValueInfo& container,
     return sel;
 }
 
-Guarded Backend::nested_select(const LValue& el, const Guarded& container) {
-    Guarded g(el);
-    g.require(b_, container.valid());
-    return g;
-}
-
-Guarded Backend::element_select(const LValue& el, const Guarded& container, Index at, Index idx_expr,
+// The element of a dynamic array or queue: valid where the index is inside the live
+// length. Nothing about the container place is required here, because that place has
+// already been opened: the element is rooted at the data pointer loaded through
+// lv_handle_ptr, which hands back the empty sink for an invalid container, so its
+// length is 0 and `inrange` is false whenever the container is invalid.
+Guarded Backend::element_select(const LValue& el, const LValueInfo& named, Index at, Index idx_expr,
                                 llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent) {
-    Guarded g = nested_select(el, container);
+    Guarded g(el);
     g.require(b_, inrange);
-    add_elem_bounds_check(g, at, container, idx_expr, inrange, unknown, extent);
+    add_elem_bounds_check(g, at, named, idx_expr, inrange, unknown, extent);
     return g;
 }
 

@@ -785,19 +785,35 @@ llvm::GlobalVariable* Backend::agg_sink_global(Ref type) {
 // call (a `ref`, `out` or `inout` formal): the place where its select is valid, and
 // the type's writable sink where not. The callee's reads then see the element
 // default and its writes go nowhere (LRM 7.4.5), as for a plane slot (ref_actual_ptr).
+//
+// The sink is reset to the type's power-on image before it is handed out, but only
+// on the invalid path: an aggregate is too big to rewrite on every call that binds
+// a valid element.
 llvm::Value* Backend::agg_place_ptr(const Guarded& g, Ref type) {
-    const auto sink = [&]() -> llvm::Value* {
-        llvm::GlobalVariable* s = agg_sink_global(type);
-        if (has_heap_leaf(type)) {
-            std::vector<llvm::Value*> path;
-            emit_agg_deinit(type, s, path, agg_storage_ty(type));
-        }
-        const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(type));
-        b_.CreateMemCpy(s, llvm::MaybeAlign(), agg_proto_global(type), llvm::MaybeAlign(),
-                        b_.getInt64(size));
-        return s;
-    };
-    return g.pointer_or(b_, [&](const LValue& lv) { return agg_image_ptr(lv); }, sink);
+    llvm::GlobalVariable* sink = nullptr;
+    if (g.valid() != nullptr) {
+        sink = agg_sink_global(type);
+    }
+    llvm::Value* ptr = g.pointer_or(
+      b_, [&](const LValue& lv) { return agg_image_ptr(lv); }, [&]() -> llvm::Value* { return sink; });
+    if (sink == nullptr) {
+        return ptr;
+    }
+    auto* fn    = b_.GetInsertBlock()->getParent();
+    auto* reset = llvm::BasicBlock::Create(ctx_, "agg.sink.reset", fn);
+    auto* cont  = llvm::BasicBlock::Create(ctx_, "agg.sink.cont", fn);
+    b_.CreateCondBr(g.valid(), cont, reset);
+    b_.SetInsertPoint(reset);
+    if (has_heap_leaf(type)) {
+        std::vector<llvm::Value*> path;
+        emit_agg_deinit(type, sink, path, agg_storage_ty(type));
+    }
+    const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(type));
+    b_.CreateMemCpy(sink, llvm::MaybeAlign(), agg_proto_global(type), llvm::MaybeAlign(),
+                    b_.getInt64(size));
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+    return ptr;
 }
 
 // The whole-object copy itself, once the destination is known good: one memcpy of

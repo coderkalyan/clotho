@@ -700,7 +700,7 @@ void Backend::lower_fseek(Index i) {
 void Backend::lower_fgets(Index i) {
     const Index  dst = ir_->payload(i).binary.l;
     llvm::Value* fd  = cast(must_of(ir_->payload(i).binary.r), 32, true);
-    const Guarded& lv = lvalue_of(dst);
+    const Guarded lv = write_dest(dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
         llvm::Value* r    = b_.CreateCall(
@@ -709,7 +709,7 @@ void Backend::lower_fgets(Index i) {
         set_value(i, two_val(r));
         return;
     }
-    const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
+    const auto [mm, z, width, flags] = string_dest(lv, "$fgets");
     const ServiceSnapshot old          = service_snapshot(lv);
     llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
     service_after_write(lv, old);
@@ -726,8 +726,7 @@ void Backend::lower_fgets(Index i) {
 // where not (safe_lvalue), so the runtime never writes through a wild address and
 // an invalid target is a no-op (LRM 7.4.5). The caller wakes waiters through
 // service_snapshot / service_after_write, which skip an invalid place as well.
-std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(Index dst, const char* who) {
-    const Guarded g = write_dest(dst);
+std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(const Guarded& g, const char* who) {
     if (g.is_string) {
         // Every caller (fgets/ferror/sformat) checks lv.is_string and branches to
         // its own rt_string-handle path before reaching here; this is defense in
@@ -780,7 +779,7 @@ void Backend::lower_sformat(Index i) {
     llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     llvm::Value*                 argc = b_.getInt32(static_cast<uint32_t>(args.size()));
     const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
-    const Guarded&  lv = lvalue_of(info.dst);
+    const Guarded   lv = write_dest(info.dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
         b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv, StringUse::Write), f.fmt, argc, arr,
@@ -788,11 +787,11 @@ void Backend::lower_sformat(Index i) {
         str_chg_after(lv, snap);
         return;
     }
-    const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
-    const ServiceSnapshot old          = service_snapshot(lvalue_of(info.dst));
+    const auto [mm, z, width, flags] = string_dest(lv, "$sformat / $swrite");
+    const ServiceSnapshot old          = service_snapshot(lv);
     b_.CreateCall(sformat_fn(),
                   { mm, z, b_.getInt32(width), f.fmt, argc, arr, b_.getInt32(flags), f.dyn });
-    service_after_write(lvalue_of(info.dst), old);
+    service_after_write(lv, old);
 }
 
 // Lower a $sformatf: format into the instruction's string temp.
@@ -814,7 +813,7 @@ void Backend::lower_sformatf(Index i) {
 void Backend::lower_ferror(Index i) {
     const Index   dst = ir_->payload(i).binary.l;
     llvm::Value*  fd  = cast(must_of(ir_->payload(i).binary.r), 32, true);
-    const Guarded& lv  = lvalue_of(dst);
+    const Guarded lv   = write_dest(dst);
     if (lv.is_string) {
         llvm::Value* snap = str_chg_snapshot(lv);
         llvm::Value* r    = b_.CreateCall(
@@ -823,7 +822,7 @@ void Backend::lower_ferror(Index i) {
         set_value(i, two_val(r));
         return;
     }
-    const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
+    const auto [mm, z, width, flags] = string_dest(lv, "$ferror");
     const ServiceSnapshot old          = service_snapshot(lv);
     llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
     service_after_write(lv, old);
@@ -844,12 +843,15 @@ void Backend::lower_scanf(Index i) {
     llvm::StructType*         sty = scan_arg_struct_ty();
     llvm::Value*              arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     // Old-value snapshots for wait-queue servicing, parallel to `outs`
-    // (null where a target needs no servicing).
+    // (null where a target needs no servicing), and the places they belong to,
+    // resolved once so a deferred associative element is not resolved twice.
     std::vector<ServiceSnapshot> olds(n);
+    std::vector<Guarded>         dests;
+    dests.reserve(n);
     if (n > 0) {
         arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
         for (uint32_t k = 0; k < n; ++k) {
-            const Guarded lv   = write_dest(outs[k]);
+            const Guarded lv   = dests.emplace_back(write_dest(outs[k]));
             llvm::Value*  elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
             llvm::Value*  nul = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
             if (lv.is_string) {
@@ -902,7 +904,7 @@ void Backend::lower_scanf(Index i) {
     // Every conversion has landed; wake anything a written target changed
     // (an unconverted target reloads its old value and stays quiet).
     for (uint32_t k = 0; k < n; ++k) {
-        service_after_write(lvalue_of(outs[k]), olds[k]);
+        service_after_write(dests[k], olds[k]);
     }
     set_value(i, two_val(r));
 }
