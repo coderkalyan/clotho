@@ -1146,6 +1146,8 @@ void Backend::ensure_active_queue() {
     const auto cap =
       std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_ring_slots(), 1));
     active_mask_   = static_cast<uint32_t>(cap - 1);
+    ring_mask_gv_  = new llvm::GlobalVariable(root_env_->llmod, i32, true, llvm::GlobalValue::InternalLinkage,
+                                              llvm::ConstantInt::get(i32, active_mask_), "clotho.ring_mask");
 
     queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
     active_gv_    = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
@@ -1203,15 +1205,22 @@ void Backend::emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, 
         return;
     }
     llvm::Function* fn   = b.GetInsertBlock()->getParent();
-    const uint32_t  cap  = active_mask_ + 1;
+    llvm::Value*    cap  = b.CreateAdd(ring_mask(b), b.getInt32(1));
     llvm::Value*    live = b.CreateSub(tail, b.CreateLoad(b.getInt32Ty(), head_ptr));
     auto*           bad  = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
     auto*           ok   = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
-    b.CreateCondBr(b.CreateICmpUGE(live, b.getInt32(cap)), bad, ok);
+    b.CreateCondBr(b.CreateICmpUGE(live, cap), bad, ok);
     b.SetInsertPoint(bad);
-    b.CreateCall(ring_overflow_fn(), { ring, b.getInt32(cap) });
+    b.CreateCall(ring_overflow_fn(), { ring, cap });
     b.CreateUnreachable();
     b.SetInsertPoint(ok);
+}
+
+llvm::Value* Backend::ring_mask(llvm::IRBuilder<>& b) {
+    if (env_ == root_env_.get()) {
+        return b.getInt32(active_mask_);
+    }
+    return b.CreateLoad(b.getInt32Ty(), sym(ring_mask_gv_));
 }
 
 // The same guard for a buffer whose index IS its live count: the two `#0`
@@ -1225,16 +1234,16 @@ void Backend::emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, 
 // call chain, so it can hold at most one `#0` and one wait entry at a time, and
 // capacity is at least the process count. A fork child is an extra chain, which
 // is what breaks that and why the check appears exactly when a fork does.
-void Backend::emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, uint32_t cap, uint32_t which) {
+void Backend::emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, llvm::Value* cap, uint32_t which) {
     if (!ring_guard_wanted()) {
         return;
     }
     llvm::Function* fn  = b.GetInsertBlock()->getParent();
     auto*           bad = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
     auto*           ok  = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
-    b.CreateCondBr(b.CreateICmpUGE(len, b.getInt32(cap)), bad, ok);
+    b.CreateCondBr(b.CreateICmpUGE(len, cap), bad, ok);
     b.SetInsertPoint(bad);
-    b.CreateCall(ring_overflow_fn(), { b.getInt32(which), b.getInt32(cap) });
+    b.CreateCall(ring_overflow_fn(), { b.getInt32(which), cap });
     b.CreateUnreachable();
     b.SetInsertPoint(ok);
 }
@@ -1264,8 +1273,8 @@ void Backend::emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     auto*        i32  = b.getInt32Ty();
     llvm::Value* tl   = b.CreateLoad(i32, sym(active_tail_gv_));
     emit_ring_full_check(b, sym(active_head_gv_), tl, b.getInt32(kRingActive));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(active_gv_), idx);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(active_tail_gv_));
 }
@@ -1275,8 +1284,8 @@ void Backend::emit_inactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     ensure_inactive_queue();
     auto*        i32  = b.getInt32Ty();
     llvm::Value* sp   = b.CreateLoad(i32, sym(inactive_top_gv_));
-    emit_len_full_check(b, sp, active_mask_ + 1, kRingInactive);
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(inactive_gv_), { b.getInt32(0), sp });
+    emit_len_full_check(b, sp, b.CreateAdd(ring_mask(b), b.getInt32(1)), kRingInactive);
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(inactive_gv_), sp);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(inactive_top_gv_));
 }
@@ -1379,8 +1388,8 @@ void Backend::emit_reactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     auto*        i32  = b.getInt32Ty();
     llvm::Value* tl   = b.CreateLoad(i32, sym(reactive_tail_gv_));
     emit_ring_full_check(b, sym(reactive_head_gv_), tl, b.getInt32(kRingReactive));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(reactive_gv_), idx);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(reactive_tail_gv_));
 }
@@ -1391,8 +1400,8 @@ void Backend::emit_reactive_cont_push(llvm::IRBuilder<>& b, llvm::Value* handle)
     auto*        i32 = b.getInt32Ty();
     llvm::Value* tl  = b.CreateLoad(i32, sym(reactive_cont_tail_gv_));
     emit_ring_full_check(b, sym(reactive_cont_head_gv_), tl, b.getInt32(kRingReactive));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_cont_gv_), { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(reactive_cont_gv_), idx);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(reactive_cont_tail_gv_));
 }
@@ -1402,8 +1411,8 @@ void Backend::emit_re_inactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     ensure_re_inactive_queue();
     auto*        i32  = b.getInt32Ty();
     llvm::Value* sp   = b.CreateLoad(i32, sym(re_inactive_top_gv_));
-    emit_len_full_check(b, sp, active_mask_ + 1, kRingReInactive);
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(re_inactive_gv_), { b.getInt32(0), sp });
+    emit_len_full_check(b, sp, b.CreateAdd(ring_mask(b), b.getInt32(1)), kRingReInactive);
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(re_inactive_gv_), sp);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(re_inactive_top_gv_));
 }
@@ -1627,8 +1636,8 @@ void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked) {
     // fatal names the ring the handle was actually headed for.
     emit_ring_full_check(b, hp, tl,
                          b.CreateSelect(home, b.getInt32(kRingReactive), b.getInt32(kRingActive)));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, arr, { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), arr, idx);
     b.CreateStore(hdl, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), tp);
 }

@@ -21,13 +21,17 @@ hash of the unit's body when several units share the name.
 - `M_unit`: the groups of the unit's instances, lowered once per family of
   instances that lower alike and run with the instance's record; the functions
   and tasks of the unit, once per family; the entry of a schedule group of one
-  row (it takes the address of its process's wake pair, a field of the record).
-- `M_root`: everything else -- instance storage, records, wait queues,
-  dispatchers of schedule groups spanning instances, NBA block commit functions
-  (not yet in the writer's unit), `clotho_main` / `sim_drain` / finals, the seed
-  loop, DPI export thunks, package/`$unit` processes, and the lazily created
-  singletons (rings, `clotho.enqueue_timer`, `clotho.ev_delay`, trampolines),
-  which are defined in root whichever unit asked first.
+  row (it takes the address of its process's wake pair, a field of the record);
+  the commit function of each NBA block those bodies register (`void(desc)`,
+  `desc` being the block's `{ commit fn, writer's record, next }` entry in root's
+  `clotho.nba_blocks`).
+- `M_root`: everything else -- instance storage, records, wait queues, the block
+  descriptor table, dispatchers of schedule groups spanning instances,
+  `clotho_main` / `sim_drain` / finals, the seed loop, DPI export thunks,
+  package/`$unit` processes (and the commit functions of blocks they register),
+  and the lazily created singletons (rings, `clotho.ring_mask`,
+  `clotho.enqueue_timer`, `clotho.ev_delay`, trampolines), which are defined in
+  root whichever unit asked first.
 
 What the scheduler holds is the entry of a SCHEDULE GROUP: the rows that wait on
 the very same (signal, edge) set, whichever instances and units they belong to,

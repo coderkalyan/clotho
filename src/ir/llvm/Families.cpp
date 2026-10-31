@@ -200,11 +200,14 @@ std::vector<uint64_t> Backend::group_key(uint32_t g, uint32_t anchor) const {
 }
 
 void Backend::lower_subroutine(FunctionId id) {
+    const auto first_block = static_cast<uint32_t>(block_commits_.size());
     if (mod_.function(id).is_task) {
         lower_task(id);
     } else {
         lower_function(id);
     }
+    // The commit functions of the NBA blocks it registered, in the module it went into.
+    emit_block_commits(first_block, fn_decls_[static_cast<uint32_t>(id)]);
 }
 
 // Lower every function and task, callees first. The ones of an instance of a

@@ -32,9 +32,9 @@ Every stage up to and including LLVM IR construction is one whole-design pass:
 - `analyze()` runs whole-design fixpoints (may-z, undriven, pointer arguments)
   whose results decide state layout.
 - The backend builds every LLVM module in one serial pass: the groups and the
-  functions and tasks of an instance go into the module of its unit, and the
-  code of no instance (a package's, `$unit`'s), NBA commit functions,
-  initializers and the seed loop stay in root.
+  functions and tasks of an instance, and the commit functions of the NBA
+  blocks they register, go into the module of its unit, and the code of no
+  instance (a package's, `$unit`'s), initializers and the seed loop stay in root.
 - Nothing is cached. `clotho build` links every module back into one.
 
 The partition is drawn after every whole-design decision, so no stage above
@@ -541,19 +541,19 @@ code go.
      many groups and subroutines were checked and what it cost.
    - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
      capacity from the record, a subscription carries its trigger bits, the
-     ring mask is a root global, NBA and trigger ids are record base plus
-     unit-local ordinal, and block commit functions live in the writer's unit.
-     Facts other units impose (a signal is waited on, forced, may carry z)
-     stay joined per unit and part of its codegen key until step 4. Landed so
-     far: an owner's scan reads its buckets' subscriber count and trigger bits
-     from the record, and trigger colours (design-global, first-fit) are data
-     wherever unit code needs them, never an immediate: a guarded group's
-     member and group masks are record fields filled at startup, a writer of
-     another instance's signal reads that instance's record, a signal of no
-     instance has a trigger global per bucket, and the NBA meta table carries
-     each committed signal's bits. What a park or self-start stores into the
-     scheduled flag is every trigger bit whether or not the design guards a
-     group, so no unit's code depends on that.
+     ring mask is a root constant (`clotho.ring_mask`) a unit loads, NBA and
+     trigger ids are record base plus unit-local ordinal, and block commit
+     functions live in the writer's unit (see 3e). Facts other units impose (a
+     signal is waited on, forced, may carry z) stay joined per unit and part of
+     its codegen key until step 4. Landed so far: an owner's scan reads its
+     buckets' subscriber count and trigger bits from the record, and trigger
+     colours (design-global, first-fit) are data wherever unit code needs them,
+     never an immediate: a guarded group's member and group masks are record
+     fields filled at startup, a writer of another instance's signal reads that
+     instance's record, and a signal of no instance has a trigger global per
+     bucket. What a park or self-start stores into the scheduled flag is every
+     trigger bit whether or not the design guards a group, so no unit's code
+     depends on that.
   - **3e, root as link glue (partly landed).** Landed: one LLVM module per
     Design unit, named by the unit's key (`InstanceScope::unit_key`: the
     definition name, plus a body hash when several units share it) and holding
@@ -567,14 +567,26 @@ code go.
     llvm-units`): compiling a design of several modules with several instances
     each, and a package, twice with one definition's body edited changes that
     unit's module and no other unit's; every unit module names no instance.
-    Still open: NBA block commit functions live in root (block ids are already
-    record base plus ordinal; the commit function would take a block descriptor
-    and sit in the writer's unit), the seed loop and record fills are root code
-    rather than tables built from the instance table, and flatten still copies
-    bodies per instance. What still makes a unit module depend on outside it:
-    lowerings the taint list keeps per instance (they name
-    `clotho.inst.<hier>.*` globals), `clotho.expect<monitor>` queue names, and
-    the intern pool's type and class numbers (step 5).
+    NBA block commit functions are unit code too. The lowering of a group or a
+    subroutine emits, when it is done, one `void(desc)` function per block it
+    registered, in the module the body went into, named from the body's
+    function (`<unit>.p3.nba0`): it commits the shadows of the block's targets
+    into the live state of the writer's instance and services their wake
+    buckets and dump-var indices through the record exactly as a blocking store
+    does (`service_wait_queue`, `vcd_touch_signal`), a target of another
+    instance through the binding the writer reaches it by. `desc` is the
+    block's entry in root's `clotho.nba_blocks`, `{ commit function, the
+    writer's record, next pending block }` by block id, which also links the
+    pending chain: `clotho.nba_block_enqueue(i32)` pushes a descriptor and each
+    commit function tail-calls the next one's. The instances that share a
+    group's code share its commit functions, each block with a descriptor of
+    its own, and `verify_shared_code` compares the commit functions' code too.
+    Still open: the seed loop and record fills are root code rather than tables
+    built from the instance table, and flatten still copies bodies per
+    instance. What still makes a unit module depend on outside it: lowerings
+    the taint list keeps per instance (they name `clotho.inst.<hier>.*`
+    globals), `clotho.expect<monitor>` queue names, and the intern pool's type
+    and class numbers (step 5).
 
     What the entry costs at tier 0. A root trampoline per instance (`lea
     ctx,%rdi; jmp entry`) and an entry that spilled the record's addresses and

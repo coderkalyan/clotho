@@ -428,6 +428,16 @@ std::string Backend::shared_code_differs(uint32_t g, SharedGroup& rep, const Own
             break;
         }
     }
+    // The code that commits each block: the function the shared lowering emitted
+    // against the one this instance's own lowering did.
+    for (size_t b = 0; b < shared.size() && b < own.blocks.size(); ++b) {
+        const CodeText theirs(shared[b].fn);
+        const CodeText mine(own.blocks[b].fn);
+        if (theirs.joined() != mine.joined()) {
+            differs += std::format("  the commit function of NBA block {}: ", b) + CodeText::difference(theirs, mine);
+            break;
+        }
+    }
     // Its own lowering numbered its blocks from where the backend stood.
     if (shared_fills(rep, ua, static_cast<uint32_t>(block_commits_.size())) != own.fills) {
         differs += "  the record fields that hold the first id of its NBA blocks differ from the ones the shared "
@@ -535,6 +545,14 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
         !std::equal(shared_bl.begin(), shared_bl.end(), own_blocks.begin(), same_block)) {
         differs += std::format("  it registers {} NBA blocks, and the shared code's differ ({}) from them\n",
                                own_blocks.size(), shared_bl.size());
+    }
+    for (size_t b = 0; b < shared_bl.size() && b < own_blocks.size(); ++b) {
+        const CodeText theirs(shared_bl[b].fn);
+        const CodeText mine(own_blocks[b].fn);
+        if (theirs.joined() != mine.joined()) {
+            differs += std::format("  the commit function of NBA block {}: ", b) + CodeText::difference(theirs, mine);
+            break;
+        }
     }
     if (shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, home.anchor,
                         static_cast<uint32_t>(block_commits_.size())) != own_fills) {

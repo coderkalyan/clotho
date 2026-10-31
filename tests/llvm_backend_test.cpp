@@ -164,6 +164,40 @@ size_t count_substr(const std::string& hay, std::string_view needle) {
     return n;
 }
 
+// Count the definitions (lines starting with "define") whose line holds both `a`
+// and `b`: what a function is named and how it is declared, without the calls and
+// declarations of it other modules print.
+size_t count_defs(const std::string& ir, std::string_view a, std::string_view b) {
+    size_t n = 0;
+    for (size_t start = 0; start < ir.size();) {
+        size_t end = ir.find('\n', start);
+        end        = end == std::string::npos ? ir.size() : end;
+        const std::string_view line(ir.data() + start, end - start);
+        n += line.starts_with("define ") && line.find(a) != std::string_view::npos &&
+                 line.find(b) != std::string_view::npos
+               ? 1
+               : 0;
+        start = end + 1;
+    }
+    return n;
+}
+
+// The text of the function whose definition line holds `header`, or empty when no
+// definition does.
+std::string function_text(const std::string& ir, std::string_view header) {
+    const size_t at = ir.find(header);
+    if (at == std::string::npos) {
+        return {};
+    }
+    const size_t nl    = ir.rfind('\n', at);
+    const size_t start = nl == std::string::npos ? 0 : nl + 1;
+    if (!std::string_view(ir).substr(start).starts_with("define ")) {
+        return {};
+    }
+    const size_t end = ir.find("\n}\n", at);
+    return ir.substr(start, end == std::string::npos ? std::string::npos : end + 3 - start);
+}
+
 // The argument count of the one call `ir` makes to a function whose symbol ends
 // with `callee` (e.g. ".fn.f"; a unit's symbols lead with its key), or ~0 when it
 // makes none or several.
@@ -235,9 +269,10 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // instead a switched-resume coroutine ramp returning the handle (CoroSplit
     // then emits .resume/.destroy/.cleanup parts, which don't match "define ptr
     // @alu.p").
-    CHECK(count_substr(ir, "define dso_local void @alu.p") == 3);
     // Definitions only: declarations print without argument names.
-    CHECK(count_substr(ir, ".entry(ptr %wake, ptr %wheel)") == 3);
+    CHECK(count_defs(ir, "@alu.p0.entry(", "(ptr %wake, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p1.entry(", "(ptr %wake, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p2.entry(", "(ptr %wake, ptr %wheel)") == 1);
     const std::string co = emit(kAlu, { .thunk = false });
     CHECK(count_substr(co, "define ptr @alu.") == 3);
     CHECK(co.find("(ptr %ctx, ptr %wheel)") != std::string::npos);
@@ -246,11 +281,11 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant typed GEPs, anchored at the owning instance
-    // scope's own state global: def-relative (%alu.state) off
-    // @clotho.inst.alu.state, folded link-time constant (asserted on raw IR;
-    // instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") != std::string::npos);
+    // Signal access via constant typed GEPs off a base the instance's record
+    // holds, def-relative (%alu.state): a unit's code names no instance's state
+    // global (asserted on raw IR; instcombine canonicalizes GEP shapes).
+    CHECK(raw.find("%alu.state, ptr %") != std::string::npos);
+    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -1287,7 +1322,7 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     // form appears under --no-thunk. Labels asserted on raw IR (simplifycfg
     // merges and renames blocks).
     const std::string raw = emit_raw(src);
-    CHECK(raw.find("sta.head") != std::string::npos);
+    CHECK(raw.find("nsta.body") != std::string::npos);
     CHECK(raw.find("dyn.head") != std::string::npos);
     CHECK(count_substr(raw, ".entry(ptr %wake") == 2);
     CHECK(raw.find("always.loop") == std::string::npos);
@@ -2156,8 +2191,8 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     // pair is `top.p0.f2.entry`; under --no-thunk they are coroutine ramps.
     // Definitions only (split emission re-declares cross-module symbols;
     // declarations and calls print without argument names).
-    CHECK(count_substr(ir, "define dso_local void @top.") == 3);
-    CHECK(count_substr(ir, "define dso_local void @counter.") == 1);
+    CHECK(count_defs(ir, "@top.", ".entry(ptr %wake") == 3);
+    CHECK(count_defs(ir, "@counter.", ".entry(ptr %wake") == 1);
     CHECK(count_substr(ir, ".f2.entry(ptr %wake") == 1);
     const std::string co = emit(src, { .thunk = false });
     // The two counters run one ramp of their unit, named by it.
@@ -4532,7 +4567,7 @@ TEST_CASE("NBA of a z value round-trips a static-select block commit (z and neve
     // mask; no per-signal bucket globals form. zq carries z (full slot), nq is
     // proven never-z, and both round-trip their shadow commit.
     const std::string ir = emit(src);
-    CHECK(ir.find("clotho.nba.commit_blk") != std::string::npos);
+    CHECK(count_defs(ir, "@m.p", ".nba0(ptr %desc)") == 1);
     CHECK(ir.find("clotho.nba.w4") == std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
@@ -4559,12 +4594,15 @@ TEST_CASE("whole-scalar NBAs lower to the block-commit path by default") {
     // One straight-line block: a single enqueue registration and one commit
     // function; no per-signal w4 bucket worklists form.
     CHECK(ir.find("clotho.nba_block_enqueue") != std::string::npos);
-    CHECK(ir.find("clotho.nba.commit_blk0") != std::string::npos);
+    CHECK(count_defs(ir, "@m.p", ".nba0(ptr %desc)") == 1);
+    CHECK(count_defs(ir, "@m.p", ".nba1(ptr %desc)") == 0);
     CHECK(ir.find("clotho.nba.w4.full") == std::string::npos);
-    // Shadow accesses go through the owning instance's opaque base pointer,
-    // not state-relative constant offsets (memory-dependence mis-speculation
-    // defense; see shadow_ptr).
-    CHECK(ir.find("clotho.inst.m.shadow_base") != std::string::npos);
+    // Shadow accesses go through the base pointer the writer's record holds, not
+    // state-relative constant offsets (memory-dependence mis-speculation defense;
+    // see shadow_ptr), and the commit function names no instance's global.
+    const std::string commit = function_text(ir, "@m.p0.nba0(ptr %desc)");
+    CHECK(commit.find("%rec = load ptr") != std::string::npos);
+    CHECK(commit.find("@clotho.inst.") == std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
 

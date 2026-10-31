@@ -172,7 +172,7 @@ void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
     llvm::Value* q       = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
     auto*        i32     = b_.getInt32Ty();
     llvm::Value* len     = b_.CreateLoad(i32, len_ptr);
-    emit_len_full_check(b_, len, static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()),
+    emit_len_full_check(b_, len, b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements())),
                         kRingWaitDynamic);
     emit_entry(wait_dyn_ty_[i][edge], q, len, parked_handle(b_, hdl_), sched_ptr_);
     b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_ptr);
@@ -1937,20 +1937,11 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
     b_.CreateStore(w, len_gv);
 }
 
-// -- NBA update region --
-//
-// After the active queue drains, the NBA region commits every staged update:
-// Load edge element `e` of meta array field `field`. Meta layout (per nba-id):
-// 0 sta_base[3], 1 sta_cap[3], 2 dyn_base[3], 3 dyn_len[3] — the wait-queue
-// pointers emit_nba_service scans per edge.
-llvm::Value* Backend::meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty) {
-    return b_.CreateLoad(
-      ty, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-}
+// -- Wait-queue scans --
 
 // Generic static-queue scan (base + capacity values), null base => no
-// waiters. Serves both callers: service_static_queue passes a constant
-// global and cap; the NBA commit loop passes values read from meta. Each
+// waiters. Serves service_static_queue, which passes the bucket's base and
+// capacity (a constant global, or fields of the owner's record). Each
 // entry wakes its process only if its scheduled flag is 0, then sets the
 // flag — collapsing a multi-signal sensitivity (the same process
 // subscribed under several signals) into a single wake.
@@ -1970,23 +1961,24 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
     auto* word = sched_word_ty();
     auto* elem = wait_elem_ty();
     auto* fn   = b_.GetInsertBlock()->getParent();
-    auto* head = llvm::BasicBlock::Create(ctx_, "nsta.head", fn);
     auto* body = llvm::BasicBlock::Create(ctx_, "nsta.body", fn);
     auto* wake = llvm::BasicBlock::Create(ctx_, "nsta.wake", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "nsta.cont", fn);
     auto* done = llvm::BasicBlock::Create(ctx_, "nsta.done", fn);
     auto* entry = b_.GetInsertBlock();
-    b_.CreateCondBr(b_.CreateICmpNE(base, llvm::ConstantPointerNull::get(ptr)), head, done);
-
-    b_.SetInsertPoint(head);
-    auto* idx = b_.CreatePHI(i32, 2);
-    idx->addIncoming(b_.getInt32(0), entry);
-    b_.CreateCondBr(b_.CreateICmpULT(idx, cap), body, done);
+    // A bucket nobody subscribed to has no entries, whatever its base is. A loop
+    // that tests at its bottom and carries one pointer and one count is what
+    // tier-0 code generation (which keeps every value that outlives a block in
+    // memory) makes the least of: this is the shape of every wake a store makes.
+    b_.CreateCondBr(b_.CreateICmpNE(cap, b_.getInt32(0)), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
-    llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
-    llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
+    auto* cur  = b_.CreatePHI(ptr, 2);
+    auto* left = b_.CreatePHI(i32, 2);
+    cur->addIncoming(base, entry);
+    left->addIncoming(cap, entry);
+    llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, cur, 0));
+    llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, cur, 1));
     if (padded) {
         auto* live = llvm::BasicBlock::Create(ctx_, "nsta.live", fn);
         b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
@@ -1995,24 +1987,26 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
     llvm::Value* old    = b_.CreateLoad(word, fptr);
     auto*        queued = b_.CreateICmpNE(old, b_.getInt64(0));
     auto*        none   = llvm::dyn_cast<llvm::ConstantInt>(trig);
-    if (none == nullptr || !none->isZero()) {
-        auto* arm = llvm::BasicBlock::Create(ctx_, "nsta.arm", fn);
-        b_.CreateCondBr(queued, arm, wake);
-        b_.SetInsertPoint(arm);
-        b_.CreateStore(b_.CreateOr(old, trig), fptr);
-        b_.CreateBr(cont);
-    } else {
+    if (none != nullptr && none->isZero()) {
         b_.CreateCondBr(queued, cont, wake);
+        b_.SetInsertPoint(wake);
+        emit_wake_push(b_, h);
+        b_.CreateStore(b_.getInt64(1), fptr);
+    } else {
+        // The word becomes the entry's bits OR-ed in if it was already queued, else
+        // queued with them: one store, so only the push is a block of its own.
+        b_.CreateStore(b_.CreateSelect(queued, b_.CreateOr(old, trig), b_.CreateOr(trig, b_.getInt64(1))), fptr);
+        b_.CreateCondBr(queued, cont, wake);
+        b_.SetInsertPoint(wake);
+        emit_wake_push(b_, h);
     }
-
-    b_.SetInsertPoint(wake);
-    emit_wake_push(b_, h);
-    b_.CreateStore(b_.CreateOr(trig, b_.getInt64(1)), fptr);
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(cont);
-    idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), cont);
-    b_.CreateBr(head);
+    cur->addIncoming(b_.CreateInBoundsGEP(elem, cur, b_.getInt32(1)), cont);
+    llvm::Value* next = b_.CreateSub(left, b_.getInt32(1));
+    left->addIncoming(next, cont);
+    b_.CreateCondBr(b_.CreateICmpNE(next, b_.getInt32(0)), body, done);
 
     b_.SetInsertPoint(done);
 }

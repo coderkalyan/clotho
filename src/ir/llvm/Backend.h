@@ -819,8 +819,8 @@ struct SignalSlot {
     // Nonblocking-assignment staging. Set only for signals that are NBA targets.
     // A target gets shadow `i(2W)` / `iW` fields mirroring its live slot in the
     // root's shadow struct; a target with any dynamic (runtime-indexed) select site
-    // also gets an iW dirty mask field. nba_id is a dense index into the meta table;
-    // the sh_* members are field indices into the shadow struct.
+    // also gets an iW dirty mask field. The sh_* members are field indices into the
+    // shadow struct.
     bool     nba           = false;
     bool     nba_partial   = false;
     // Any bit/part-select NBA site with a runtime index/offset (BitSelect /
@@ -863,7 +863,6 @@ struct SignalSlot {
     // that, each record holds the dense ids IT registered on, so the first trigger
     // to mature it can take it off the others (rt_intra_event_register_group).
     uint32_t intra_trigs   = 0;
-    uint32_t nba_id        = 0;
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
     uint32_t sh_mask_field = 0;
@@ -2326,9 +2325,23 @@ private:
     void block_register(Signal sig, const llvm::APInt& mask, bool dynamic);
 
     llvm::Constant* block_not_queued();
-    void emit_block_commit_tail(uint32_t id);
 
-    void emit_block_commit_fn(uint32_t id);
+    // The descriptor of an NBA block -- the entry of root's table by block id, and
+    // the one argument of its commit function: { the commit function, the record of
+    // the instance that writes the block (null when it belongs to none), the next
+    // pending block }. A fixed link ABI: a unit's commit function names nothing else
+    // of root.
+    llvm::StructType* nba_desc_ty();
+
+    void emit_block_commit_tail(llvm::Value* desc);
+
+    // The commit function of each block a lowering from block id `first` on
+    // registered, emitted into the module that lowering went into (its unit's, or
+    // root's for a body of no instance) and named from `owner`, the function it
+    // lowered.
+    void emit_block_commits(uint32_t first, llvm::Function* owner);
+
+    void emit_block_commit_fn(uint32_t id, const std::string& name);
 
     void emit_block_commit_body(uint32_t id);
 
@@ -2578,7 +2591,12 @@ private:
     void emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, llvm::Value* tail,
                               llvm::Value* ring);
 
-    void emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, uint32_t cap, uint32_t which);
+    void emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, llvm::Value* cap, uint32_t which);
+
+    // The mask of the scheduler's rings (their capacity - 1) as a value: a constant in
+    // root, which owns the rings and is the design's, and a load of root's
+    // `clotho.ring_mask` in a unit, whose code must not hold the design's process count.
+    llvm::Value* ring_mask(llvm::IRBuilder<>& b);
 
     bool ring_guard_wanted();
 
@@ -2707,14 +2725,9 @@ private:
         b.SetInsertPoint(cont);
     }
 
-    llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty);
-
     void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig);
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
-
-    void emit_nba_service(Signal sig, llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
-                          uint32_t width, bool four_state, llvm::Value* old_z, llvm::Value* new_z);
 
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
@@ -4685,8 +4698,7 @@ private:
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
     // not a touched scalar (an unnamed temporary, a string, or an unpacked array —
-    // array elements are always-scanned, not instrumented). nba_vcd_gv_ is a
-    // parallel [n_nba x i32] of those indices, read in the NBA commit loop.
+    // array elements are always-scanned, not instrumented).
     bool                  design_uses_vcd_ = false;
     // Any StrobePend instruction anywhere in the design? Gates the per-instant
     // Postponed-region drain loop (emit_active_run), so a design with no
@@ -4804,7 +4816,6 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> disable_owner_;
     std::vector<std::pair<uint32_t, uint32_t>> cover_owner_;
     std::vector<int32_t>  vcd_index_;
-    llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
@@ -5050,6 +5061,7 @@ private:
     ankerl::unordered_dense::map<uint32_t, std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*>> expect_queue_;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
+    llvm::GlobalVariable*               ring_mask_gv_      = nullptr; // active_mask_ as a constant global
     // Memoized design_forks(); only a forking design pays the ring-overflow check.
     std::optional<bool>                 design_forks_;
     // Process indices in static-subscription order (compute_subscription_order).
@@ -5193,11 +5205,9 @@ private:
 
     // Nonblocking-assignment update state, built in build_nba_state(). A StoreNb
     // stages its RHS into the target's shadow and registers its block; the NBA region
-    // commits the shadows into live state and services wait queues via nba_meta.
+    // commits the shadows into live state and services wait queues through the
+    // block's commit function.
     uint32_t                n_nba_  = 0; // distinct NBA-target signals
-    llvm::GlobalVariable*   nba_meta_gv_    = nullptr; // [n_nba x NbaMeta] constants
-    llvm::ArrayType*        nba_meta_arr_ty_ = nullptr;
-    llvm::StructType*       nba_meta_ty_    = nullptr;
     // Unpacked-array signals that are nonblocking-assignment targets. Their
     // per-element writes go through the runtime deferred queue (rt_nba_arr_*)
     // rather than the per-signal shadow; after a commit, each is woken if any
@@ -5252,11 +5262,13 @@ private:
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant
-    // via nba_block_enqueue_fn_ onto the threaded chain (block_next / block_head). The
-    // NBA region calls the chain head; each block's monomorphized commit function
-    // (block_commits_[id].fn) copies that block's shadows -> live, services their
-    // waiters, then musttail-calls the next pending block. Segments are keyed on
-    // cur_seg_epoch_ so back-to-back fused members coalesce into one block.
+    // via nba_block_enqueue_fn_ onto the threaded chain of descriptors (root's
+    // clotho.nba_blocks, by block id; nba_desc_ty). The NBA region calls the chain head's
+    // commit function; each block's commit function, in the writer's unit, copies that
+    // block's shadows -> live in the writer's instance (the record its descriptor
+    // holds), services their waiters, then musttail-calls the next pending block.
+    // Segments are keyed on cur_seg_epoch_ so back-to-back fused members coalesce into
+    // one block.
     // One NBA target the block writes, with the commit mask: `dynamic` means the mask
     // is a runtime dirty field (sh_mask_field); otherwise `mask` is the compile-time
     // union of the block's static writes to the signal (all-ones for a whole target).
@@ -5266,8 +5278,9 @@ private:
         bool        dynamic = false;
     };
     struct BlockCommit {
-        std::vector<BlockSig> sigs;         // targets, in first-store order
-        llvm::Function*       fn = nullptr; // monomorphized commit, void(state)
+        std::vector<BlockSig> sigs;                           // targets, in first-store order
+        llvm::Function*       fn     = nullptr;               // commit, void(descriptor)
+        uint32_t              anchor = SignalSlot::no_anchor; // the writer's instance
     };
     std::vector<BlockCommit>                    block_commits_;
 
@@ -5373,16 +5386,13 @@ private:
     int64_t                 cur_block_epoch_ = -1;  // epoch cur_block_id_ was opened at (-1: none)
     uint32_t                cur_block_id_    = 0;
     llvm::Function*         nba_block_enqueue_fn_ = nullptr;    // void(i32 id), body emitted post-lowering
-    llvm::GlobalVariable*   block_commit_fns_gv_  = nullptr;    // [n_block x ptr] commit fn table
-    llvm::ArrayType*        block_commit_fns_ty_  = nullptr;
-    // Threaded-dispatch state. An intrusive chain of pending blocks: block_next[id]
-    // holds the next pending block's commit-fn pointer, `null` = chain end, sentinel
-    // 1 (block_not_queued) = not enqueued (also the dedup marker). block_head points
-    // at the first pending block's commit fn. Each commit fn musttail-calls its
-    // successor; the NBA region just calls the head.
-    llvm::GlobalVariable*   block_next_gv_        = nullptr;    // [n_block x ptr] intrusive links
-    llvm::ArrayType*        block_next_ty_        = nullptr;
-    llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's commit fn
+    // Root's table of block descriptors by block id (nba_desc_ty). Threaded-dispatch
+    // state: the intrusive chain of pending blocks runs through the descriptors' `next`
+    // fields, `null` = chain end, sentinel 1 (block_not_queued) = not enqueued (also the
+    // dedup marker). block_head points at the first pending block's descriptor.
+    llvm::GlobalVariable*   nba_blocks_gv_        = nullptr;    // [n_block x descriptor]
+    llvm::ArrayType*        nba_blocks_ty_        = nullptr;
+    llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's descriptor
 
     std::vector<Plane>                 values_;
     std::vector<std::optional<Guarded>> lvals_;

@@ -392,7 +392,10 @@ std::vector<Backend::BlockCommit> Backend::shared_blocks_of(uint32_t rep_anchor,
     std::vector<BlockCommit> blocks;
     blocks.reserve(block_hi - block_lo);
     for (uint32_t b = block_lo; b < block_hi; ++b) {
+        // The instance runs the representative's commit function over its own record.
         BlockCommit bc;
+        bc.fn     = block_commits_[b].fn;
+        bc.anchor = anchor;
         for (const BlockSig& bs : block_commits_[b].sigs) {
             const SignalSlot& s      = slots_[static_cast<uint32_t>(bs.sig)];
             Signal            mapped = bs.sig;

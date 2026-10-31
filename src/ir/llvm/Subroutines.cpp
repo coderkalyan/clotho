@@ -18,6 +18,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const Process& proc       = all[proc_index];
     ir_                       = &proc.ir;
     frame_slots_.clear(); // a process has no frame; deinit sees only temps
+    // The NBA blocks this lowering registers get their commit functions when it is
+    // done (emit_block_commits), in the module the body went into.
+    const auto first_block = static_cast<uint32_t>(block_commits_.size());
 
     // A group of an instance addresses everything of that instance through its
     // record. A coroutine group's flag is its own wake word in the instance's
@@ -246,6 +249,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.CreateRetVoid();
         own_ctx_   = nullptr;
         sched_ptr_ = nullptr;
+        emit_block_commits(first_block, fn_);
         return fn_;
     }
 
@@ -573,6 +577,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     program_end_bb_   = nullptr;
     cur_program_inst_ = kNoProgramInst;
     own_ctx_ = nullptr;
+    emit_block_commits(first_block, fn_);
     return fn_;
 }
 
