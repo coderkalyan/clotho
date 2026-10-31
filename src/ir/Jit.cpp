@@ -384,6 +384,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_dynarr_shuffle", &rt_dynarr_shuffle);
     expose("rt_queue_push_back", &rt_queue_push_back);
     expose("rt_queue_grow", &rt_queue_grow);
+    expose("rt_queue_drop_tail", &rt_queue_drop_tail);
     expose("rt_queue_push_front", &rt_queue_push_front);
     expose("rt_queue_pop_back", &rt_queue_pop_back);
     expose("rt_queue_pop_front", &rt_queue_pop_front);

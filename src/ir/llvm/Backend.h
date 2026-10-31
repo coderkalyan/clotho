@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -897,9 +898,12 @@ struct ModuleEnv {
     // and the write-only string sink. Memoized per env so each unit creates
     // its own copies.
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops;
-    // The same descriptors with their copy / destroy kernels filled in, for the
-    // elements a queue operation passes to the runtime's bitcode engine, keyed by
-    // element type Ref (queue_elem_ops). A plain-bytes element has none.
+    // The descriptors' initializers, keyed the same way: what a descriptor says about
+    // its element, before it is a global (elem_ops_init), so that the one form a
+    // queue uses (elem_ops_kernels) does not leave the plain one behind unused.
+    ankerl::unordered_dense::map<uint32_t, llvm::ConstantStruct*> elem_ops_inits;
+    // The descriptors a queue is handed for an element that owns heap: the same
+    // initializer with its copy / destroy kernels filled in (queue_elem_ops).
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops_kernels;
     llvm::GlobalVariable* str_sink  = nullptr;
     // The read-only empty-string image an ambiguous string ternary yields
@@ -1114,23 +1118,47 @@ private:
 
     std::vector<uint32_t> elem_handle_offsets(Ref elem_type, const DynElem& e);
 
-    llvm::Constant* elem_ops_for(Ref elem_type);
-    llvm::Constant* elem_ops_global(Ref container_type);
+    // What the descriptor of `elem_type` says (ir/llvm/Containers.cpp), and the global
+    // that holds it for the containers that interpret it.
+    llvm::ConstantStruct* elem_ops_init(Ref elem_type);
+    llvm::Constant*       elem_ops_for(Ref elem_type);
+    llvm::Constant*       elem_ops_global(Ref container_type);
 
-    // The descriptor a queue operation implemented by the runtime bitcode passes:
-    // elem_ops_global plus the element's kernels when config_.rt_bitcode is on
-    // (ir/llvm/ElemKernels.cpp).
-    llvm::Constant* queue_elem_ops(Ref queue_type);
-    // void copy(dst, src, site) / void destroy(slot) for the element `ops` describes.
-    llvm::Function* elem_copy_kernel(const llvm::GlobalVariable* ops);
-    llvm::Function* elem_destroy_kernel(const llvm::GlobalVariable* ops);
-    // The kernels' bodies: the runtime's rt_elem_init / rt_elem_copy / rt_elem_deinit,
-    // specialized to one descriptor.
-    void emit_elem_init(const llvm::GlobalVariable* ops, llvm::Value* p);
-    void emit_elem_copy(const llvm::GlobalVariable* ops, llvm::Value* dst, llvm::Value* src, llvm::Value* site);
-    void emit_elem_copy_aggregate(const llvm::GlobalVariable* ops, llvm::Value* dst, llvm::Value* src, llvm::Value* site);
-    void emit_elem_deinit(const llvm::GlobalVariable* ops, llvm::Value* p);
+    // The descriptor of a QUEUE's element, in its one form: the initializer of
+    // elem_ops_for plus a copy and a destroy kernel when the element owns heap
+    // (ir/llvm/ElemKernels.cpp). Every rt_queue_* function reads the element's
+    // lifecycle from these, whether the design calls the runtime or has the function
+    // linked in, so a queue is never handed the plain descriptor. `elem_type` is the
+    // queue's ELEMENT type.
+    llvm::Constant* queue_elem_ops(Ref elem_type);
+    // void copy(dst, src, site) / void destroy(slot) for the element `ops` describes,
+    // which is a descriptor global or the initializer of one.
+    llvm::Function* elem_copy_kernel(const llvm::Constant* ops);
+    llvm::Function* elem_destroy_kernel(const llvm::Constant* ops);
+    // The kernels' bodies: the interpreter of an element descriptor (the runtime's
+    // rt_elem_init / rt_elem_copy / rt_elem_deinit in runtime/Containers.cpp, which the
+    // other containers still use), specialized to one descriptor.
+    void emit_elem_init(const llvm::Constant* ops, llvm::Value* p);
+    void emit_elem_copy(const llvm::Constant* ops, llvm::Value* dst, llvm::Value* src, llvm::Value* site);
+    void emit_elem_copy_aggregate(const llvm::Constant* ops, llvm::Value* dst, llvm::Value* src, llvm::Value* site);
+    void emit_elem_deinit(const llvm::Constant* ops, llvm::Value* p);
     llvm::Value* elem_byte_ptr(llvm::Value* base, uint64_t offset);
+    // An aggregate with more leaves than kElemKernelLeavesUnrolledMax walks its leaf
+    // table in a loop instead of one statement per leaf: `body` is emitted once, inside
+    // the loop, with the leaf's byte offset, its descriptor pointer and one i64 carried
+    // from the previous leaf (`carried_init` for the first), and returns the value to
+    // carry on. The loop returns the value after the last leaf and leaves the insert
+    // point after it. emit_leaf_dispatch picks the code for a leaf's descriptor among
+    // the `types` the table holds, which is as many arms as there are distinct leaf
+    // descriptors rather than leaves.
+    llvm::Value* emit_leaf_loop(
+      const llvm::GlobalVariable* table,
+      uint32_t                    nleaves,
+      llvm::Value*                carried_init,
+      const std::function<llvm::Value*(llvm::Value* offset, llvm::Value* leaf_ops, llvm::Value* carried)>& body);
+    void emit_leaf_dispatch(const std::vector<const llvm::GlobalVariable*>&         types,
+                            llvm::Value*                                            leaf_ops,
+                            const std::function<void(const llvm::GlobalVariable*)>& arm);
 
     // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
     // sort()/rsort()). `kind`: 0 = unsigned integral, 1 = signed integral,

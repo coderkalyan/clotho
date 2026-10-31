@@ -10,14 +10,16 @@
 
 using namespace rt_internal;
 
+namespace {
+
 // -- Container element lifecycle (rt_elem_ops) --
 //
 // Generic recursion over the element descriptor. POD short-circuits to raw
 // byte moves, so the descriptor adds no cost to the plane-scalar fast paths.
-// Shared with Queue.cpp (declared in RuntimeInternal.h) but internal to the
-// runtime: the backend inlines the element ops at call sites and never emits a
-// call to these, so they carry no C linkage.
-namespace rt_internal {
+// Internal to the runtime — the backend inlines the element ops at call sites
+// and never emits a call to these, so they carry no C linkage. A queue does not use
+// them for its own elements: it calls the descriptor's generated kernels, as
+// Queue.cpp does.
 
 void rt_elem_init(const rt_elem_ops* o, void* p) {
     if (o->kind == rt_elem_event) {
@@ -126,10 +128,6 @@ void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src, const rt_all
             return;
     }
 }
-
-} // namespace rt_internal
-
-namespace {
 
 // Whether elements need per-element construction / destruction (anything but
 // raw bytes).
@@ -549,7 +547,8 @@ namespace {
 // rt_queue_slot. All indexing is via q_elem. The operations that change a queue
 // one element at a time (push, pop, insert, delete, append a range) and the ring's
 // growth live in Queue.cpp, which is also built as bitcode for the backend to link
-// into a design; what is here works on a whole queue.
+// into a design; what is here works on a whole queue. Both copy and destroy a
+// managed element through the descriptor's kernels (rt_elem_ops::copy / destroy).
 
 // Address of logical element `i` (0-based) in the ring. Requires cap > 0 and
 // i < cap.
@@ -561,8 +560,9 @@ uint8_t* q_elem(const rt_queue* h, uint64_t stride, uint64_t i) {
 
 extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
     if (ops->kind != rt_elem_pod) {
+        assert(ops->destroy != nullptr && "a managed queue element has a destroy kernel");
         for (uint64_t i = 0; i < h->len; ++i) {
-            rt_elem_deinit(ops, q_elem(h, ops->stride, i));
+            ops->destroy(q_elem(h, ops->stride, i));
         }
     }
     std::free(h->base);
@@ -593,9 +593,9 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
             std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
         }
     } else {
+        assert(ops->copy != nullptr && "a managed queue element has a copy kernel");
         for (uint64_t i = 0; i < src->len; ++i) {
-            rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, q_elem(src, stride, i), site);
+            ops->copy(buf + i * stride, q_elem(src, stride, i), site);
         }
     }
     dst->base = buf;
@@ -625,9 +625,9 @@ extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
     if (!elem_managed(ops)) {
         std::memcpy(buf, sdata, static_cast<size_t>(src->len * stride));
     } else {
+        assert(ops->copy != nullptr && "a managed queue element has a copy kernel");
         for (uint64_t i = 0; i < src->len; ++i) {
-            rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, sdata + i * stride, site);
+            ops->copy(buf + i * stride, sdata + i * stride, site);
         }
     }
     dst->base = buf;

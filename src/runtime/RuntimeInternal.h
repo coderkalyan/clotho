@@ -312,17 +312,6 @@ inline uint64_t xoshiro_next(uint64_t* s) {
     return result;
 }
 
-// -- Container element lifecycle (rt_elem_ops), defined in Containers.cpp --
-//
-// The runtime's interpreter of an element descriptor: construct a fresh element in
-// an uninitialized slot, assign one element over a constructed one, destroy one.
-// Plain bytes short-circuit to memcpy. C++ linkage: the backend never calls these
-// (it emits the same work inline, or as the descriptor's own kernels), only the
-// runtime's containers do.
-void rt_elem_init(const rt_elem_ops* o, void* p);
-void rt_elem_deinit(const rt_elem_ops* o, void* p);
-void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src, const rt_alloc_site* site);
-
 // The single active $monitor (LRM 21.2.2): its body's ramp function pointer, the
 // enable flag, and the last rendered output for change detection. `primed` is
 // false until the first emit (or after a re-arm), forcing that first print.
