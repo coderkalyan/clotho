@@ -3906,3 +3906,25 @@ TEST_CASE("gc: dead objects owning large strings are collected inside a delay-fr
     CHECK(st.finalized > 16u);
     CHECK(st.owned_bytes == 0u);
 }
+
+// A dead OLD object that shares a line with a survivor is left behind by line-granular
+// reclamation, and used to keep a stale mark: the single full-collection parity read it
+// as live again two full collections later, and rt_gc_verify's heap walk (an
+// extra-asserts build) found the disagreement. Full collections now retire such corpses
+// -- the start bit goes -- so nothing can resolve to one. The design is the report of the
+// failure: forked children of an object whose frames come and go across stress
+// collections.
+TEST_CASE("gc: a dead object sharing a line with a survivor is not read as live later") {
+    constexpr std::string_view src = R"(
+        module t;
+          class C;
+            int v = 1;
+            task spawn(); fork #3 $display("d %0d", v); join_none endtask
+            task go();    fork #1 v = 3; #2 v = 4; join endtask
+          endclass
+          initial begin C c = new(); c.spawn(); c.go(); #5; end
+        endmodule
+    )";
+    const rt_gc_stats st = run_stats(src, "d 4\n", cadence_stress);
+    CHECK(st.full_collections > 2u);
+}

@@ -2439,9 +2439,32 @@ struct LineSweep {
     uint64_t old_after  = 0;
 };
 
+// A FULL collection's verdict on every object that starts in a line it keeps, applied: an
+// object this collection did not mark is dead, and its start bit goes. Reclamation is line
+// granular, so a dead object whose first line a survivor shares is otherwise left behind
+// as a corpse, and a corpse keeps a stale mark -- which the single full-collection parity
+// reads as live again two full collections later (is_stamped), and which a conservative
+// word could resolve to and have the marker trace, through fields whose bytes belong to
+// whatever was allocated over its later lines. Without the bit it resolves to nothing and
+// no walk of the heap finds it. Full collections only: a young one has no opinion about
+// an OLD object, so it cannot tell a corpse from a survivor it did not visit.
+void retire_corpses(const uint8_t* base, BlockMeta* m, uint32_t line) {
+    unsigned bits = m->start_bits[line];
+    while (bits != 0) {
+        const uint32_t bit  = static_cast<uint32_t>(std::countr_zero(bits));
+        const uint8_t  mask = static_cast<uint8_t>(1u << bit);
+        bits &= bits - 1;
+        void* const h = handle_of(const_cast<uint8_t*>(base) +
+                                  (static_cast<uint64_t>(line) * 8 + bit) * RT_GC_ALIGN);
+        if (!is_stamped(*gcword_ptr(h))) {
+            m->start_bits[line] = static_cast<uint8_t>(m->start_bits[line] & ~mask);
+        }
+    }
+}
+
 // One block's 256 line-mark bytes, and the whole of the generational reclamation
 // predicate. Split out of reclaim_blocks() only for length (TigerStyle).
-void reclaim_block_lines(BlockMeta* m, bool full, LineSweep* out) {
+void reclaim_block_lines(const uint8_t* base, BlockMeta* m, bool full, LineSweep* out) {
     assert(m != nullptr && "a block being reclaimed has metadata");
     assert(out != nullptr && "the line walk reports through its out-parameter");
     const uint8_t epoch = static_cast<uint8_t>(g.mark_epoch);
@@ -2473,6 +2496,9 @@ void reclaim_block_lines(BlockMeta* m, bool full, LineSweep* out) {
         m->line_old[i] = static_cast<uint8_t>(old_here ? 1 : 0);
         if (old_here) {
             out->kept += 1;
+            if (full) {
+                retire_corpses(base, m, i);
+            }
             // Re-publish the mark for a line kept only by line_old, and this is not
             // bookkeeping either: find_hole() looks for runs of lines whose line_mark
             // misses the epoch, so a protected line still reading the PREVIOUS epoch would
@@ -2537,7 +2563,7 @@ void reclaim_blocks() {
     for (uint32_t b = 0; b < g.blocks.size(); ++b) {
         BlockMeta* m = g.blocks[b].meta;
         LineSweep  sweep;
-        reclaim_block_lines(m, full, &sweep);
+        reclaim_block_lines(g.blocks[b].base, m, full, &sweep);
         old_before += sweep.old_before;
         old_after += sweep.old_after;
         m->has_finalizable = static_cast<uint8_t>(sweep.any_fin != 0 ? 1 : 0);
@@ -2625,6 +2651,13 @@ void release_heap() {
     // not outlive the heap. The LOGGED bits go with the objects; there is nothing left
     // to re-arm and rt_gc_init re-establishes the rest of the generational state.
     g.remembered.clear();
+    // The buffers an emergency collection kept for the code that was using them: that code
+    // is gone with the run, so nothing can name them now.
+    for (const GcState::Parked& p : g.parked) {
+        std::free(p.ptr);
+    }
+    g.parked.clear();
+    g.inflight.clear();
 }
 
 void reset_mutator() {
@@ -2639,39 +2672,6 @@ void reset_mutator() {
     assert(g_mutator.frames_head == nullptr && "a reset mutator has an empty registry");
 }
 
-// What a collection leaves behind for the next one. Separate from reset_mutator()
-// because it deliberately does NOT touch the hole -- rt_gc_collect dropped that before
-// marking -- and deliberately does not clear the frame registry, whose nodes are still
-// live frames.
-void rearm_after_collection() {
-    // Re-armed under stress, cleared otherwise: the inlined poll tests this byte and
-    // nothing else, so leaving it set is the whole of "collect at every safepoint". It
-    // cannot livelock: rt_gc_safepoint_slow() collects once and returns, and the next
-    // poll is only reached when the scheduler advances to another region boundary, so
-    // re-arming buys exactly one collection per safepoint -- which is what --gc-stress
-    // meant before the poll was inlined.
-    g_mutator.request     = (g.cfg.stress != 0) ? 1u : 0u;
-    // The buffers an emergency collection kept for the code that was using them: that code
-    // is gone with the run, so nothing can name them now.
-    for (const GcState::Parked& p : g.parked) {
-        std::free(p.ptr);
-    }
-    g.parked.clear();
-    g.inflight.clear();
-    g_mutator.budget_left = g.cfg.nursery_bytes;
-    assert(g_mutator.cursor == nullptr && "a collection drops the hole before marking");
-    assert(g_mutator.budget_left > 0 && "rt_gc_init floors the nursery budget");
-}
-
-// -- Collection policy (§7) ---------------------------------------------------
-
-// Committed heap bytes: whole blocks plus large cells. Large cells belong in it because
-// a young collection does not reclaim an unmarked OLD cell either (reclaim_large), so a
-// design whose garbage is all large objects would otherwise never take a full one.
-uint64_t heap_bytes() {
-    const uint64_t blocks = g.stats.blocks_total * RT_GC_BLOCK_BYTES;
-    uint64_t       bytes  = blocks;
-    for (const LargeCell& cell : g.large) {
 // Saturating, because the budgets are configuration and the byte counts are whatever the
 // design made them; neither is bounded by anything the collector controls.
 uint64_t sat_add(uint64_t a, uint64_t b) {
@@ -2689,6 +2689,34 @@ void arm_owned_trigger() {
     g_owned.trigger      = g.owned_request_at;
 }
 
+// What a collection leaves behind for the next one. Separate from reset_mutator()
+// because it deliberately does NOT touch the hole -- rt_gc_collect dropped that before
+// marking -- and deliberately does not clear the frame registry, whose nodes are still
+// live frames.
+void rearm_after_collection() {
+    // Re-armed under stress, cleared otherwise: the inlined poll tests this byte and
+    // nothing else, so leaving it set is the whole of "collect at every safepoint". It
+    // cannot livelock: rt_gc_safepoint_slow() collects once and returns, and the next
+    // poll is only reached when the scheduler advances to another region boundary, so
+    // re-arming buys exactly one collection per safepoint -- which is what --gc-stress
+    // meant before the poll was inlined.
+    g_mutator.request     = (g.cfg.stress != 0) ? 1u : 0u;
+    g_mutator.budget_left = g.cfg.nursery_bytes;
+    g.charged_since_gc    = 0;
+    arm_owned_trigger();
+    assert(g_mutator.cursor == nullptr && "a collection drops the hole before marking");
+    assert(g_mutator.budget_left > 0 && "rt_gc_init floors the nursery budget");
+}
+
+// -- Collection policy (§7) ---------------------------------------------------
+
+// Committed heap bytes: whole blocks plus large cells. Large cells belong in it because
+// a young collection does not reclaim an unmarked OLD cell either (reclaim_large), so a
+// design whose garbage is all large objects would otherwise never take a full one.
+uint64_t heap_bytes() {
+    const uint64_t blocks = g.stats.blocks_total * RT_GC_BLOCK_BYTES;
+    uint64_t       bytes  = blocks;
+    for (const LargeCell& cell : g.large) {
         assert(cell.bytes > kLargeObjectBytes && "a small object in the large list");
         bytes += cell.bytes;
     }
@@ -2702,8 +2730,6 @@ void arm_owned_trigger() {
 //   1. The first collection is always full. line_old has never been derived, so no young
 //      collection may precede one, and there is no live baseline for the growth rule. It
 //      costs exactly what a young collection costs, because nothing is OLD yet.
-    g.charged_since_gc    = 0;
-    arm_owned_trigger();
 //   2. A remembered-set overflow forces the next one full. That is the whole reason
 //      dropping an entry is sound (remember_object), so it outranks every preference.
 //   3. cfg.full_every is a user instruction and wins over everything below: every Nth
@@ -2805,6 +2831,9 @@ void mark_from_roots() {
     push_container_roots();
     push_frame_roots();
     push_range_roots();
+    // Empty and a no-op outside an emergency collection, where it is the one root set that
+    // is not a registered structure: the design's own native stack (§6.1).
+    push_stack_roots();
     drain();
 }
 
@@ -2820,6 +2849,10 @@ void account_collection(uint32_t reason, uint32_t kind) {
         // measured the WHOLE live set, and the only one that re-derived line_old from that
         // measurement rather than inheriting it.
         g.live_after_full = g.stats.bytes_live;
+        // The owned-buffer half of the same baseline. Read at the end of the collection,
+        // after the finalizers have freed what the dead objects owned, so it is what the
+        // live set holds.
+        g.owned_after_full = g_owned.live;
         g.force_full      = 0;
     } else {
         g.stats.young_collections += 1;
@@ -2831,9 +2864,6 @@ void account_collection(uint32_t reason, uint32_t kind) {
     assert(g.stats.objects_live <= g.stats.objects_allocated && "live exceeds ever-allocated");
     assert(g.stats.bytes_live <= g.stats.bytes_allocated && "live exceeds ever-allocated");
 }
-    // Empty and a no-op outside an emergency collection, where it is the one root set that
-    // is not a registered structure: the design's own native stack (§6.1).
-    push_stack_roots();
 
 // The three numbers the backend computes independently from its own mirror of these
 // layouts, checked before anything else and in RELEASE as well as debug. Generated code
@@ -2849,10 +2879,6 @@ void check_backend_mirror(const rt_gc_config* cfg) {
         std::snprintf(note, sizeof(note),
                       "the backend computed %d; this runtime computes %d from kMaxClassDepth=%u",
                       cfg->map_vptr_offset, rt_gc_map_vptr_offset(), kMaxClassDepth);
-        // The owned-buffer half of the same baseline. Read at the end of the collection,
-        // after the finalizers have freed what the dead objects owned, so it is what the
-        // live set holds.
-        g.owned_after_full = g_owned.live;
         gc_fatal("the GC trace-map offset disagrees with the class descriptor layout", note);
     }
     // (2) The poll byte generated code loads at every safepoint. Polling the wrong field
@@ -2900,6 +2926,8 @@ void print_stats(uint64_t swept_at_teardown) {
                  " bytes\n",
                  g.stats.blocks_total, RT_GC_BLOCK_BYTES, g.stats.blocks_free,
                  g.cfg.heap_bytes_max);
+    std::fprintf(stderr, "gc: %" PRIu64 " bytes of string and container buffers still held\n",
+                 g_owned.live);
     std::fprintf(stderr, "gc: finalized %" PRIu64 " by collection, %" PRIu64 " at teardown\n",
                  g.stats.finalized, swept_at_teardown);
     std::fprintf(stderr, "gc: %" PRIu64 " conservative pins over the run\n",
@@ -2926,8 +2954,6 @@ void print_stats(uint64_t swept_at_teardown) {
 // accounting the mark phase computed, and the size of the remembered set -- and so cannot
 // be checked object by object.
 struct VerifyTally {
-    std::fprintf(stderr, "gc: %" PRIu64 " bytes of string and container buffers still held\n",
-                 g_owned.live);
     uint64_t objects = 0;
     uint64_t bytes   = 0;
     uint64_t logged  = 0;
@@ -3318,32 +3344,6 @@ void verify_totals(const VerifyTally& tally) {
 
 }  // namespace
 
-// -- Configuration and lifecycle ---------------------------------------------
-
-extern "C" int32_t rt_gc_map_vptr_offset(void) {
-    // The backend prepends a `ptr` field to class_desc_ty, so the map pointer sits
-    // immediately below the ancestor display: one pointer plus kMaxClassDepth i32
-    // display entries below the vptr. -(8 + 4*16) = -72 on a 64-bit host, which is
-    // the value rt_gc_init cross-checks against the backend's own computation.
-    return -static_cast<int32_t>(sizeof(void*) + 4 * kMaxClassDepth);
-}
-
-extern "C" void rt_gc_init(const rt_gc_config* cfg) {
-    assert(cfg != nullptr && "rt_gc_init needs a configuration");
-    check_backend_mirror(cfg);
-    assert(g.initialized == 0 && "rt_gc_init without a matching rt_gc_shutdown");
-    // Defensive rather than necessary: rt_gc_shutdown already released everything
-    // and the assertion above says so. Releasing again means a double init in a
-    // release build leaks nothing.
-    release_heap();
-
-    g.cfg = *cfg;
-    assert(g.cfg.nursery_bytes > 0 && "a zero nursery budget is a configuration bug");
-    if (g.cfg.nursery_bytes < kNurseryBytesFloor) {
-        // A tiny budget would request a collection at nearly every allocation and
-        // silently duplicate --gc-stress; the floor keeps the two distinguishable.
-        g.cfg.nursery_bytes = kNurseryBytesFloor;
-    }
 // -- Owned buffers (GcBuffers.h, design §6.5) ---------------------------------
 
 namespace rt_internal {
@@ -3392,6 +3392,32 @@ bool buffers_park(void* p, uint64_t bytes) {
 }
 
 } // namespace rt_internal
+// -- Configuration and lifecycle ---------------------------------------------
+
+extern "C" int32_t rt_gc_map_vptr_offset(void) {
+    // The backend prepends a `ptr` field to class_desc_ty, so the map pointer sits
+    // immediately below the ancestor display: one pointer plus kMaxClassDepth i32
+    // display entries below the vptr. -(8 + 4*16) = -72 on a 64-bit host, which is
+    // the value rt_gc_init cross-checks against the backend's own computation.
+    return -static_cast<int32_t>(sizeof(void*) + 4 * kMaxClassDepth);
+}
+
+extern "C" void rt_gc_init(const rt_gc_config* cfg) {
+    assert(cfg != nullptr && "rt_gc_init needs a configuration");
+    check_backend_mirror(cfg);
+    assert(g.initialized == 0 && "rt_gc_init without a matching rt_gc_shutdown");
+    // Defensive rather than necessary: rt_gc_shutdown already released everything
+    // and the assertion above says so. Releasing again means a double init in a
+    // release build leaks nothing.
+    release_heap();
+
+    g.cfg = *cfg;
+    assert(g.cfg.nursery_bytes > 0 && "a zero nursery budget is a configuration bug");
+    if (g.cfg.nursery_bytes < kNurseryBytesFloor) {
+        // A tiny budget would request a collection at nearly every allocation and
+        // silently duplicate --gc-stress; the floor keeps the two distinguishable.
+        g.cfg.nursery_bytes = kNurseryBytesFloor;
+    }
     // Zeroed here, and NEVER by rt_gc_shutdown: the test harness runs designs
     // in-process and reads the counters after a run returns, so teardown must leave
     // a usable oracle behind while a fresh run starts from zero.
@@ -3407,6 +3433,19 @@ bool buffers_park(void* p, uint64_t bytes) {
     g.kind            = RT_GC_KIND_FULL;
     g.force_full      = 0;
     g.live_after_full = 0;
+    // The owned-buffer side of the same fresh start (§6.5), and the emergency threshold the
+    // budget implies. Zeroing the count is what makes the clamp in buffer_free matter: a
+    // string a previous run left in a runtime global is freed by this one against it.
+    g.emergency_bytes  = g.cfg.nursery_bytes > UINT64_MAX / kEmergencyFactor
+                           ? UINT64_MAX
+                           : g.cfg.nursery_bytes * kEmergencyFactor;
+    g.charged_since_gc = 0;
+    g.owned_after_full = 0;
+    g.stack_base       = nullptr;
+    g.stack_lo         = 0;
+    g_owned.live       = 0;
+    g_owned.parking    = false;
+    arm_owned_trigger();
     g.remembered.clear();
     for (uint64_t& n : g.by_reason) {
         n = 0;
@@ -3433,19 +3472,6 @@ extern "C" void rt_gc_shutdown(void) {
     // Retire the hole before the sweep, for the same reason rt_gc_collect does: the
     // stats line and the teardown sweep must both see a complete count, and the sweep
     // is about to start clearing the start bits the count is derived from.
-    // The owned-buffer side of the same fresh start (§6.5), and the emergency threshold the
-    // budget implies. Zeroing the count is what makes the clamp in buffer_free matter: a
-    // string a previous run left in a runtime global is freed by this one against it.
-    g.emergency_bytes  = g.cfg.nursery_bytes > UINT64_MAX / kEmergencyFactor
-                           ? UINT64_MAX
-                           : g.cfg.nursery_bytes * kEmergencyFactor;
-    g.charged_since_gc = 0;
-    g.owned_after_full = 0;
-    g.stack_base       = nullptr;
-    g.stack_lo         = 0;
-    g_owned.live       = 0;
-    g_owned.parking    = false;
-    arm_owned_trigger();
     drop_hole(&g_mutator);
     const uint64_t swept = finalize_all_remaining();
     if (g.cfg.stats != 0) {
@@ -3482,15 +3508,6 @@ extern "C" void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map*
     return alloc_object(mut, size, map, site);
 }
 
-extern "C" void rt_gc_run_enter(const void* stack_base) {
-    assert(stack_base != nullptr && "a run records the stack it runs on");
-    g.stack_base = static_cast<const uint8_t*>(stack_base);
-}
-
-extern "C" void rt_gc_run_leave(void) {
-    g.stack_base = nullptr;
-}
-
 extern "C" void* rt_gc_alloc_slow(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
                                   const rt_alloc_site* site) {
     // rt_gc_alloc's body behind two extra assertions, deliberately: one function means
@@ -3509,6 +3526,15 @@ extern "C" void* rt_gc_alloc_slow(rt_gc_mutator* mut, uint64_t size, const rt_gc
     // allocation straddled two.
     assert_hole_consistent(mut);
     return alloc_object(mut, size, map, site);
+}
+
+extern "C" void rt_gc_run_enter(const void* stack_base) {
+    assert(stack_base != nullptr && "a run records the stack it runs on");
+    g.stack_base = static_cast<const uint8_t*>(stack_base);
+}
+
+extern "C" void rt_gc_run_leave(void) {
+    g.stack_base = nullptr;
 }
 
 // -- Roots --------------------------------------------------------------------
@@ -3824,9 +3850,17 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
 
     mark_from_roots();
 
+    // The stack is read, so the words a running activation may be using a buffer through
+    // are known: first let go of what an earlier collection kept for them that none of
+    // them covers now, then keep what they cover from the finalizers (§6.1). Outside an
+    // emergency collection the set is empty and nothing is kept.
+    release_parked();
+    g_owned.parking = !g.inflight.empty();
+
     // Finalizers before reclamation: the buffers they free are inside object bodies
     // whose lines are about to be handed out again.
     run_finalizers();
+    g_owned.parking = false;
     reclaim_blocks();
     reclaim_large();
     // Before unpin_all(), which is what clears the pins this reads. See the function:
@@ -3850,17 +3884,9 @@ extern "C" void rt_gc_collect(uint32_t reason) {
     }
     // The only difference between the two entry points: this one applies the policy, and
     // rt_gc_collect_kind is what the policy resolves to. Tests and --gc-full-every reach
-    // The stack is read, so the words a running activation may be using a buffer through
-    // are known: first let go of what an earlier collection kept for them that none of
-    // them covers now, then keep what they cover from the finalizers (§6.1). Outside an
-    // emergency collection the set is empty and nothing is kept.
-    release_parked();
-    g_owned.parking = !g.inflight.empty();
-
     // the kinds directly; the safepoint reaches them through here.
     rt_gc_collect_kind(reason, choose_kind());
 }
-    g_owned.parking = false;
 
 // The out-of-line half of the inlined write barrier (Gc.h:98-108). Generated code has
 // already tested `(gcword & (OLD|LOGGED)) == OLD` and taken the cold edge, so reaching
@@ -3897,6 +3923,11 @@ extern "C" void rt_gc_get_stats(rt_gc_stats* out) {
     assert(out != nullptr && "rt_gc_get_stats needs a destination");
     assert(g.stats.blocks_free <= g.stats.blocks_total && "the block accounting is consistent");
     *out = g.stats;
+    // Not kept in g.stats: the first is by_reason's fourth entry and the second is
+    // g_owned, which the runtime's own free sites move. Read here, at the end of the run
+    // for a test, which is when owned_bytes means "what the design leaked".
+    out->emergency_collections = g.by_reason[RT_GC_REASON_EMERGENCY];
+    out->owned_bytes           = g_owned.live;
     // The bytes and objects the current hole has handed out but not yet retired. Folded
     // in here rather than committed, because a read must not mutate the counters:
     // retirement happens at the next hole publication, at every collection and at
@@ -3923,11 +3954,6 @@ extern "C" void* rt_gc_find_object(const void* addr) {
     const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
     // (2) Outside every chunk and every large cell: a stack word, a frame pointer, a
     // string buffer, an integer that happens to look like an address, a chandle from
-    // Not kept in g.stats: the first is by_reason's fourth entry and the second is
-    // g_owned, which the runtime's own free sites move. Read here, at the end of the run
-    // for a test, which is when owned_bytes means "what the design leaked".
-    out->emergency_collections = g.by_reason[RT_GC_REASON_EMERGENCY];
-    out->owned_bytes           = g_owned.live;
     // DPI code -- which the collector must never trace or reclaim (design §0).
     // block_start_of() also rejects (3) an address in a wholly free block, whose
     // bitmap reclamation cleared, and (4) an address below the first object start in
