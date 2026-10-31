@@ -1,11 +1,12 @@
-// Multiply, divide and modulo of values wider than 128 bits (docs/design/kernel.md,
+// Multiply, divide, modulo and power of values wider than 128 bits (docs/design/kernel.md,
 // Values). Above `wide_arith_bits` the backend calls rt_wide_mul, rt_wide_udiv,
 // rt_wide_sdiv, rt_wide_umod and rt_wide_smod instead of asking LLVM for the operation:
 // LLVM lowers a wide divide to a bit-serial loop and a wide multiply to every partial
-// product.
+// product. `**` is one call, rt_pow, at every width above one bit.
 //
 // Two layers, each checked against an oracle that shares no code with the routines
-// (llvm::APInt; the routines are the schoolbook product and Knuth's Algorithm D):
+// (llvm::APInt; the routines are the schoolbook product and Knuth's Algorithm D; for
+// rt_pow also Table 11-4 over plain integers and slang's SVInt::pow):
 //
 //   - the routines themselves, over random and boundary operands at every width around
 //     a word boundary, signed and unsigned, with guard words around every buffer;
@@ -28,6 +29,7 @@
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/raw_ostream.h>
+#include <slang/numeric/SVInt.h>
 
 #include "Lower.h"
 #include "PosixIo.h"
@@ -270,6 +272,224 @@ TEST_CASE("the wide divide matches APInt on operands built to reach every branch
         }
         CAPTURE(width);
         CHECK(mismatches == 0);
+    }
+}
+
+// -- Power --
+//
+// rt_pow takes two definite values and returns whether the result is x (a zero base to a
+// negative exponent); the generated code decides x and z bits in an operand before it
+// calls. Three oracles, none of which shares code with the routine:
+//
+//   - Table 11-4 over plain integers, for every operand pair of up to 4 bits;
+//   - Table 11-4 over APInt, with the product by repeated multiplication for a small
+//     exponent and by squaring in the test for a large one, over random and boundary
+//     operands at every width around a word boundary;
+//   - slang's SVInt::pow, which the constant evaluator folds `**` with, so that a
+//     constant and the same value in a variable cannot disagree.
+
+namespace {
+
+struct Power {
+    APInt value;
+    bool  is_x = false;
+};
+
+uint32_t pow_flags(bool base_signed, bool exp_signed) {
+    return (base_signed ? uint32_t{ RT_POW_BASE_SIGNED } : 0u) | (exp_signed ? uint32_t{ RT_POW_EXP_SIGNED } : 0u);
+}
+
+// rt_pow as the backend calls it, with the buffer checks of `call`.
+Power call_pow(const APInt& base, const APInt& exp, bool base_signed, bool exp_signed) {
+    const uint32_t width = base.getBitWidth();
+    Buffer         out(width);
+    Buffer         base_buf(base);
+    Buffer         exp_buf(exp);
+    const uint32_t is_x =
+      rt_pow(out.data(), base_buf.data(), exp_buf.data(), width, exp.getBitWidth(), pow_flags(base_signed, exp_signed));
+
+    const uint64_t above = width % 64 == 0 ? 0 : ~uint64_t{ 0 } << (width % 64);
+    const bool     clean = out.guards_intact() && base_buf.guards_intact() && exp_buf.guards_intact() &&
+                       base_buf.value(width) == base && exp_buf.value(exp.getBitWidth()) == exp &&
+                       (out.data()[out.count - 1] & above) == 0;
+    CHECK_MESSAGE(clean, "a guard word, an operand or the padding above the width changed");
+    return { out.value(width), is_x != 0 };
+}
+
+// The product of `exp` copies of `base`, wrapped at the base's width.
+APInt power_by_multiplication(const APInt& base, uint64_t exp) {
+    APInt r(base.getBitWidth(), 1);
+    for (uint64_t k = 0; k < exp; ++k) {
+        r *= base;
+    }
+    return r;
+}
+
+// The same by squaring, for an exponent too large to count.
+APInt power_by_squaring(APInt base, APInt exp) {
+    APInt r(base.getBitWidth(), 1);
+    while (!exp.isZero()) {
+        if (exp[0]) {
+            r *= base;
+        }
+        base *= base;
+        exp.lshrInPlace(1);
+    }
+    return r;
+}
+
+// Table 11-4, row by row. The exponent is negative when it is signed and its top bit is
+// set; the base is -1 when it is signed and all ones (a signed 1-bit base of 1 is -1).
+Power table_11_4(const APInt& base, const APInt& exp, bool base_signed, bool exp_signed) {
+    const uint32_t width    = base.getBitWidth();
+    const APInt    one(width, 1);
+    const APInt    zero(width, 0);
+    const bool     negative = exp_signed && exp.isNegative();
+    const bool     odd      = exp[0];
+    const bool     minus_one = base_signed && base.isAllOnes();
+
+    if (exp.isZero()) {
+        return { one, false };
+    }
+    if (minus_one) {
+        return { odd ? APInt::getAllOnes(width) : one, false };
+    }
+    if (base.isZero()) {
+        return { zero, negative };
+    }
+    if (base.isOne()) {
+        return { one, false };
+    }
+    if (negative) {
+        return { zero, false };
+    }
+    const APInt result = exp.getActiveBits() <= 6 ? power_by_multiplication(base, exp.getZExtValue())
+                                                  : power_by_squaring(base, exp);
+    return { result, false };
+}
+
+// slang's SVInt::pow on the same operands.
+Power slang_power(const APInt& base, const APInt& exp, bool base_signed, bool exp_signed) {
+    const auto literal_of = [](const APInt& v, bool is_signed) {
+        return slang::SVInt::fromString(std::to_string(v.getBitWidth()) + (is_signed ? "'sh" : "'h") +
+                                        llvm::toString(v, 16, false));
+    };
+    const slang::SVInt r = literal_of(base, base_signed).pow(literal_of(exp, exp_signed));
+    if (r.hasUnknown()) {
+        return { APInt(base.getBitWidth(), 0), true };
+    }
+    return { APInt(base.getBitWidth(), llvm::ArrayRef<uint64_t>(r.getRawPtr(), r.getNumWords())), false };
+}
+
+// A `width`-bit pattern as the integer it stands for.
+__int128 integer_of(uint64_t bits, uint32_t width, bool is_signed) {
+    if (is_signed && ((bits >> (width - 1)) & 1) != 0) {
+        return static_cast<__int128>(bits) - (static_cast<__int128>(1) << width);
+    }
+    return bits;
+}
+
+// Table 11-4 on plain integers, for operands of at most 4 bits: the exact power, wrapped.
+Power table_11_4_integers(uint64_t base_bits, uint32_t width, uint64_t exp_bits, uint32_t exp_width, bool base_signed,
+                          bool exp_signed) {
+    const __int128 b = integer_of(base_bits, width, base_signed);
+    const __int128 e = integer_of(exp_bits, exp_width, exp_signed);
+    __int128       r = 1;
+    bool           is_x = false;
+    if (e == 0) {
+        r = 1;
+    } else if (e > 0) {
+        if (b == -1) {
+            r = e % 2 == 1 ? -1 : 1;
+        } else if (b == 0 || b == 1) {
+            r = b;
+        } else {
+            for (__int128 k = 0; k < e; ++k) {
+                r *= b; // 15 ** 15 fits.
+            }
+        }
+    } else if (b == -1) {
+        r = (-e) % 2 == 1 ? -1 : 1;
+    } else if (b == 0) {
+        r    = 0;
+        is_x = true;
+    } else {
+        r = b == 1 ? 1 : 0;
+    }
+    const uint64_t mask = (uint64_t{ 1 } << width) - 1;
+    return { APInt(width, static_cast<uint64_t>(r) & mask), is_x };
+}
+
+void check_power(const APInt& base, const APInt& exp, bool base_signed, bool exp_signed) {
+    CAPTURE(base.getBitWidth());
+    CAPTURE(exp.getBitWidth());
+    CAPTURE(base_signed);
+    CAPTURE(exp_signed);
+    CAPTURE(llvm::toString(base, 16, false));
+    CAPTURE(llvm::toString(exp, 16, false));
+    const Power want   = table_11_4(base, exp, base_signed, exp_signed);
+    const Power got    = call_pow(base, exp, base_signed, exp_signed);
+    const Power folded = slang_power(base, exp, base_signed, exp_signed);
+    CHECK(got.is_x == want.is_x);
+    CHECK(got.value == want.value);
+    CHECK(folded.is_x == want.is_x);
+    CHECK(folded.value == want.value);
+}
+
+} // namespace
+
+TEST_CASE("rt_pow matches Table 11-4 for every pair of operands of up to 4 bits") {
+    int pairs = 0;
+    for (uint32_t width = 1; width <= 4; ++width) {
+        for (uint32_t exp_width = 1; exp_width <= 4; ++exp_width) {
+            for (const bool base_signed : { false, true }) {
+                for (const bool exp_signed : { false, true }) {
+                    for (uint64_t b = 0; b < (uint64_t{ 1 } << width); ++b) {
+                        for (uint64_t e = 0; e < (uint64_t{ 1 } << exp_width); ++e) {
+                            const Power want = table_11_4_integers(b, width, e, exp_width, base_signed, exp_signed);
+                            const Power got  = call_pow(APInt(width, b), APInt(exp_width, e), base_signed, exp_signed);
+                            CAPTURE(width);
+                            CAPTURE(exp_width);
+                            CAPTURE(base_signed);
+                            CAPTURE(exp_signed);
+                            CAPTURE(b);
+                            CAPTURE(e);
+                            CHECK(got.is_x == want.is_x);
+                            CHECK(got.value == want.value);
+                            ++pairs;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Both signs of each operand, over 2 + 4 + 8 + 16 patterns of each width.
+    CHECK(pairs == 4 * 30 * 30);
+}
+
+TEST_CASE("rt_pow matches Table 11-4 over APInt and slang at every width around a word boundary") {
+    Rng                         rng{ 11 };
+    const std::vector<uint32_t> base_widths = { 1,   2,   3,   4,   5,   7,   8,   9,   16,  31,  32,  33,  63,  64,  65,
+                                                66,  100, 127, 128, 129, 130, 191, 192, 193, 255, 256, 257, 321, 512, 1000 };
+    const std::vector<uint32_t> exp_widths  = { 1, 2, 3, 6, 8, 31, 32, 33, 64, 65, 129 };
+    for (const uint32_t width : base_widths) {
+        const std::vector<APInt> bases = operands(rng, width);
+        for (const uint32_t exp_width : exp_widths) {
+            std::vector<APInt> exps = operands(rng, exp_width);
+            // Exponents a loop can count as well as the ones it cannot.
+            for (const uint64_t small : { 3u, 5u, 17u, 40u }) {
+                exps.push_back(APInt(exp_width, small, /*isSigned=*/false, /*implicitTrunc=*/true));
+            }
+            for (const APInt& base : bases) {
+                for (const APInt& exp : exps) {
+                    for (const bool base_signed : { false, true }) {
+                        for (const bool exp_signed : { false, true }) {
+                            check_power(base, exp, base_signed, exp_signed);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -543,9 +763,9 @@ TEST_CASE("an operation above 128 bits calls the runtime and one at or below it 
     CHECK(wide.find("mul i129") == std::string::npos);
 }
 
-TEST_CASE("a wide power goes through the same multiply") {
-    // `**` squares and multiplies in a loop, each of them a W-bit multiply, so it takes the
-    // same routine above the threshold. Oracle: APInt, by repeated multiplication.
+TEST_CASE("a 200-bit power through the JIT matches repeated multiplication in both domains") {
+    // The values of a power above the backend's multiply threshold, a 2-state one and a
+    // 4-state one, and the all-x of an x base. Oracle: APInt, by repeated multiplication.
     constexpr uint32_t width = 200;
     Rng                rng{ 99 };
     const APInt        base = operand(rng, width, Shape::random);
@@ -575,4 +795,106 @@ TEST_CASE("a wide power goes through the same multiply") {
         want += pow(e) + " " + pow(e) + "\n";
     }
     CHECK(out == want + all_x(width) + "\n");
+}
+
+// What a power's operands are, independently of each other: the exponent is
+// self-determined, so it keeps its own domain and its own sign (LRM 11.4.3).
+namespace {
+
+struct PowKind {
+    const char* type;
+    bool        four;
+    bool        is_signed;
+};
+
+constexpr PowKind kPowKinds[] = {
+    { "bit", false, false },
+    { "bit signed", false, true },
+    { "logic", true, false },
+    { "logic signed", true, true },
+};
+
+struct PowPair {
+    APInt base;
+    APInt exp;
+    bool  x_base = false;
+    bool  x_exp  = false;
+};
+
+// For each pair and each combination of kinds: assign the operands at run time and print
+// the power assigned to a variable of the base's own kind. A 2-state result turns the x of
+// `0 ** negative` into 0 (LRM 6.3.1); a 4-state one keeps it.
+std::string power_design(uint32_t width, uint32_t exp_width, const std::vector<PowPair>& pairs) {
+    std::string s = "module m;\n";
+    for (size_t k = 0; k < std::size(kPowKinds); ++k) {
+        s += std::string("  ") + kPowKinds[k].type + " [" + std::to_string(width - 1) + ":0] a" + std::to_string(k) + ", r" +
+             std::to_string(k) + ";\n";
+        s += std::string("  ") + kPowKinds[k].type + " [" + std::to_string(exp_width - 1) + ":0] e" + std::to_string(k) + ";\n";
+    }
+    s += "  initial begin\n";
+    for (size_t k = 0; k < std::size(kPowKinds); ++k) {
+        for (size_t j = 0; j < std::size(kPowKinds); ++j) {
+            for (const PowPair& p : pairs) {
+                if ((p.x_base && !kPowKinds[k].four) || (p.x_exp && !kPowKinds[j].four)) {
+                    continue;
+                }
+                const std::string a = "a" + std::to_string(k);
+                const std::string e = "e" + std::to_string(j);
+                const std::string r = "r" + std::to_string(k);
+                s += "    " + a + " = " + (p.x_base ? "'x" : literal(p.base)) + "; " + e + " = " + (p.x_exp ? "'x" : literal(p.exp)) +
+                     "; " + r + " = " + a + " ** " + e + "; $display(\"%h\", " + r + ");\n";
+            }
+        }
+    }
+    return s + "  end\nendmodule\n";
+}
+
+std::vector<std::string> power_expected(uint32_t width, const std::vector<PowPair>& pairs) {
+    std::vector<std::string> lines;
+    for (size_t k = 0; k < std::size(kPowKinds); ++k) {
+        for (size_t j = 0; j < std::size(kPowKinds); ++j) {
+            for (const PowPair& p : pairs) {
+                if ((p.x_base && !kPowKinds[k].four) || (p.x_exp && !kPowKinds[j].four)) {
+                    continue;
+                }
+                const Power want = table_11_4(p.base, p.exp, kPowKinds[k].is_signed, kPowKinds[j].is_signed);
+                const bool  is_x = p.x_base || p.x_exp || want.is_x;
+                lines.push_back(is_x && kPowKinds[k].four ? all_x(width) : hex_digits(is_x ? APInt(width, 0) : want.value));
+            }
+        }
+    }
+    return lines;
+}
+
+} // namespace
+
+TEST_CASE("a power through the JIT matches Table 11-4 for every domain and sign of its operands") {
+    // A multiword and a one-word base, with an exponent that fits a word and one that
+    // does not. The exponents are the Table 11-4 rows: zero, positive, and the patterns
+    // that are negative to a signed exponent and huge to an unsigned one.
+    for (const auto [width, exp_width] : { std::pair{ 8u, 1u }, std::pair{ 65u, 1u }, std::pair{ 8u, 5u }, std::pair{ 8u, 70u },
+                                           std::pair{ 65u, 5u }, std::pair{ 200u, 70u } }) {
+        Rng                  rng{ width * 1000 + exp_width };
+        std::vector<PowPair> pairs;
+        for (const APInt& base : { APInt(width, 0), APInt(width, 1), APInt::getAllOnes(width), APInt(width, 2),
+                                   operand(rng, width, Shape::random) }) {
+            for (const APInt& exp : { APInt(exp_width, 0), APInt(exp_width, 1), APInt(exp_width, 3, false, true),
+                                      APInt(exp_width, 4, false, true), APInt::getAllOnes(exp_width),
+                                      APInt::getAllOnes(exp_width) - 1, APInt::getSignedMinValue(exp_width) }) {
+                pairs.push_back({ base, exp });
+            }
+        }
+        pairs.push_back({ APInt(width, 3), APInt(exp_width, 2, false, true), /*x_base=*/true });
+        pairs.push_back({ APInt(width, 3), APInt(exp_width, 2, false, true), /*x_base=*/false, /*x_exp=*/true });
+        pairs.push_back({ APInt(width, 0), APInt(exp_width, 0), /*x_base=*/true });
+
+        CAPTURE(width);
+        CAPTURE(exp_width);
+        const std::vector<std::string> want = power_expected(width, pairs);
+        const std::vector<std::string> got  = split_lines(run_capture(power_design(width, exp_width, pairs)));
+        REQUIRE(got.size() == want.size());
+        for (size_t i = 0; i < want.size(); ++i) {
+            CHECK_MESSAGE(got[i] == want[i], "line ", i, ": got ", abbreviated(got[i]), ", want ", abbreviated(want[i]));
+        }
+    }
 }

@@ -71,7 +71,9 @@ when it does.
 - 2-state divide and modulo are straight-line (zero divisor gives 0, MIN / -1
   wraps); `--sanitize=divzero` adds a cold located report of a zero divisor and
   nothing otherwise.
-- `**` calls one support-library routine. **Not yet:** an inline loop.
+- `**` is one call to a support-library routine (Table 11-4 and the wrap at the
+  result's width); the generated code decides x and z bits in an operand first, and
+  only when one can have them. One unsigned bit stays a truth table.
 - XOR and XNOR test for unknown bits and use one native XOR when all are known.
 - `->` and `<->` are IR operations lowered from their own three-valued rules.
 - Concatenation, replication and streaming reversal build independent

@@ -187,6 +187,15 @@ llvm::FunctionCallee Backend::wide_arith_fn(const char* name) {
                  { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
 }
 
+// -- Power --
+
+// u32 rt_pow(u64* out, const u64* base, const u64* exp, u32 width, u32 exp_width, u32 flags):
+// out = base ** exp of definite operands in whole-word buffers; nonzero when the result is x.
+llvm::FunctionCallee Backend::pow_fn() {
+    auto* i32 = b_.getInt32Ty();
+    return rt_fn("rt_pow", i32, { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+}
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 llvm::StructType* Backend::null_site_ty() {

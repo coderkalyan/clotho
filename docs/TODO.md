@@ -102,6 +102,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
   time-consuming task call or an `expect`, or a task that forks, cannot be aborted. A block
   whose body calls a subroutine that forks is refused too: those children are not in it.
+- [ ] **Thousands of straight-line statements over wide values** — LLVM's type legalizer
+  recurses once per store of a value above 128 bits (a 4-state vector above 64 bits) in one
+  block and overflows the compile thread's stack, so the JIT dies with SIGSEGV.
 
 ## M2 — Icarus Verilog parity
 

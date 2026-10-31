@@ -2385,6 +2385,7 @@ private:
     llvm::FunctionCallee wide_sel_fn();
     llvm::FunctionCallee wide_ins_fn();
     llvm::FunctionCallee wide_arith_fn(const char* name);
+    llvm::FunctionCallee pow_fn();
 
     llvm::StructType* null_site_ty();
     llvm::FunctionCallee null_handle_fn();
