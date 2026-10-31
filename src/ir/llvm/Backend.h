@@ -98,21 +98,21 @@
 
 namespace clotho::ir::backend {
 
-// A lowered value: the must/may planes packed into one i(2W) integer (low W bits
-// = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
-// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, select select)
-// act on both planes with a single instruction.
+// A lowered value. A 2-state value is one iW in `mm`. A 4-state value packs the
+// must/may planes into one i(2W) integer (low W bits = must / definitely 1, high W
+// bits = may / could be 1) and keeps a separate iW `z` (high-impedance marker); the
+// packing lets the monotone ops (AND/OR/NOT, select) act on both planes with a
+// single instruction.
+//
+// The plane does not say which it is. The domain is its IR type's (`four_state`),
+// the single source of truth, and whoever reads a plane passes it: the accessors
+// (must_of / may_of / width_of / any_unknown) and every operator take it from the
+// operand's type, and an operator never converts its operands. Storage and the call
+// ABI hold a value in the encoding of its type's domain too: a 2-state signal,
+// local, member or element is the native iW slot.
 struct Plane {
     llvm::Value* mm = nullptr; // 4-state: i(2W) [0,W) must, [W,2W) may. 2-state: iW value.
     llvm::Value* z  = nullptr; // 4-state z plane (iW), or null when never-z. Null for 2-state.
-    // The encoding of `mm`: a 2-state value is a single iW with no unknown/z plane,
-    // and the accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
-    // 2-state value never carries the redundant may/z half. For an instruction's
-    // value the encoding is its IR type's domain, the single source of truth:
-    // set_value asserts they agree and an operator never converts its operands.
-    // Storage and the call ABI hold a value in the encoding of its type's domain
-    // too: a 2-state signal, local, member or element is the native iW slot.
-    bool two = false;
     // Real / shortreal value (double / float). Exactly one of fp and mm is set:
     // a real SSA value carries fp only; its storage form is the raw bit pattern
     // in a 2-state slot (see the real helpers).
@@ -3361,11 +3361,10 @@ private:
     // -- Real (floating point) helpers --
     //
     // A real SSA value rides Plane.fp. Its storage / ABI form is the IEEE-754
-    // bit pattern duplicated across must and may (a legal known value; the
-    // must => may invariant holds) with z = 0, so state layout, change
-    // detection, NBA staging, and the function ABI stay integer. Pack / unpack
-    // happens only at these boundaries; instcombine folds the chains between
-    // back-to-back float ops.
+    // bit pattern in a 2-state iW slot, so state layout, change detection, NBA
+    // staging, and the function ABI stay integer. Pack / unpack happens only at
+    // these boundaries; instcombine folds the chains between back-to-back float
+    // ops.
 
     llvm::Type* fp_ty(uint32_t width);
 

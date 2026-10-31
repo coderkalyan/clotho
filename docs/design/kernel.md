@@ -18,9 +18,9 @@ when it does.
 - A 2-state value is a native W-bit integer, and its domain comes from its IR
   type alone: one source of truth, no per-value flag to keep in agreement. A
   2-state variable's storage, and the call ABI, use the native form too, so no
-  boundary ever holds a 2-state value in the packed form. **Not yet:** the code
-  generator tracks each value's encoding in a flag (`Plane::two`) that it asserts
-  against the type.
+  boundary ever holds a 2-state value in the packed form. The code generator
+  keeps no record of a value's encoding: whoever reads a plane passes the domain
+  of the type it came from.
 - An IR integer type is a width and a domain; it has no sign. Domains, signedness
   and extension are decided by the language, through slang's legalized AST, and the
   IR carries them explicitly: signed and unsigned opcodes (`SDiv`/`UDiv`,

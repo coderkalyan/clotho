@@ -70,16 +70,12 @@ Plane Backend::value_of(Index i) const {
     return values_[static_cast<uint32_t>(i)];
 }
 
+// A value's domain is its IR type's, the single source of truth: nothing here records
+// it, and the operator dispatch hands each operator the domain of its operands'
+// types. No storage or ABI boundary holds a 2-state value packed, so a load, an
+// argument and a call result arrive in their type's domain. A real value stays
+// fp-only; pack/unpack happens at the storage / ABI boundaries (see the real helpers).
 void Backend::set_value(Index i, Plane p) {
-    // A value's encoding is its IR type's domain, which is the single source of
-    // truth: the operator dispatch reads `two` as the domain of both operands, so
-    // a producer whose plane disagrees with type_of(i) is a backend bug. No storage
-    // or ABI boundary holds a 2-state value packed, so a load, an argument and a
-    // call result arrive in their type's domain. A real value stays fp-only;
-    // pack/unpack happens at the storage / ABI boundaries (see the real helpers).
-    [[maybe_unused]] const ValueType t = type_of(i);
-    assert((t.is_string || t.is_real || p.two == !t.four_state) &&
-           "a value's plane encoding follows its IR type's domain");
     values_[static_cast<uint32_t>(i)] = p;
 }
 
@@ -2729,7 +2725,6 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
         args.push_back(zbuf);
         args.push_back(zbuf);
     } else {
-        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         const Plane f = rhs;
         args.push_back(spill(must_of(f, true), "wins.must"));
         args.push_back(spill(may_of(f, true), "wins.may"));
@@ -2932,16 +2927,10 @@ void Backend::lower_select_lazy(Index i) {
     // Both arms are in the instruction's own domain (ir::verify: select-arm-domain):
     // the PHIs need identical value types.
     const bool four = type_of(i).four_state;
-    const auto norm = [&](Index v) {
-        const Plane p = value_of(v);
-        assert(p.two == !four && "lazy select arms share the result's domain (ir::verify: select-arm-domain)");
-
-        return p;
-    };
 
     b_.SetInsertPoint(then_bb);
     lower_region(ir_->region(sel.then_));
-    const Plane       tv       = is_str || is_real ? Plane{} : norm(sel.then_val);
+    const Plane       tv       = is_str || is_real ? Plane{} : value_of(sel.then_val);
     llvm::Value*      ts       = is_str ? str_of(sel.then_val) : nullptr;
     llvm::Value*      tf       = is_real ? fp_of(value_of(sel.then_val)) : nullptr;
     llvm::BasicBlock* then_end = b_.GetInsertBlock();
@@ -2949,7 +2938,7 @@ void Backend::lower_select_lazy(Index i) {
 
     b_.SetInsertPoint(else_bb);
     lower_region(ir_->region(sel.else_));
-    const Plane       ev       = is_str || is_real ? Plane{} : norm(sel.else_val);
+    const Plane       ev       = is_str || is_real ? Plane{} : value_of(sel.else_val);
     llvm::Value*      es       = is_str ? str_of(sel.else_val) : nullptr;
     llvm::Value*      ef       = is_real ? fp_of(value_of(sel.else_val)) : nullptr;
     llvm::BasicBlock* else_end = b_.GetInsertBlock();

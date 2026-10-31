@@ -629,7 +629,6 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
-    assert(pl.two == !four && "an actual crosses a call in its formal's domain (ir::verify: call-arg-domain)");
     argv.push_back(pl.mm);
     if (four) {
         argv.push_back(pl.z);
@@ -1894,12 +1893,10 @@ void Backend::lower_ret(Index value) {
         pl = real_to_planes(fp_of(pl));
     }
     if (!abi_four_state(cur_fn_->return_type)) {
-        assert(pl.two && "a 2-state result is returned in its domain (ir::verify: ret-domain)");
         deinit_body_strings();
         b_.CreateRet(pl.mm);
         return;
     }
-    assert(!pl.two && "a 4-state result is returned in its domain (ir::verify: ret-domain)");
     auto* rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
     llvm::Value* agg = llvm::UndefValue::get(rty);
     agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });

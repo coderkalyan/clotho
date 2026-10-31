@@ -1128,7 +1128,6 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
 
     // A packed slot is a 4-state slot, and ir::verify's store-domain rule gives it a
     // 4-state value.
-    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
 
     // Whole-storage store: the frontend context-sizes the RHS to the lvalue
     // width (via an inserted conversion), so rhs already matches the storage width
@@ -1175,7 +1174,6 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         if (!m.four_state) {
             b_.CreateStore(must_of(rhs, false), shadow_ptr(s, m.sh_mm_field));
         } else {
-            assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
             const Plane& f = rhs;
             b_.CreateStore(f.mm, shadow_ptr(s, m.sh_mm_field));
             if (m.has_z) {
@@ -1216,7 +1214,6 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         return;
     }
 
-    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     // A never-z target stages no z shadow (and its commit loop skips z).
     llvm::Value* zp = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
 
@@ -1640,7 +1637,6 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     if (!lv.four_state) {
         put(payload, place_val(lv, must_of(rhs, false), W), 0);
     } else {
-        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         const Plane& f = rhs;
         llvm::Value* mm = packed(place_val(lv, must_of(f, true), W), place_val(lv, may_of(f, true), W),
                                  place_val(lv, f.z, W)).mm;
@@ -1774,7 +1770,6 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
     if (!s.four_state) {
         mm_val = place_val(lv, must_of(rhs, false), W); // iW
     } else {
-        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         llvm::Value* must = place_val(lv, must_of(rhs, true), W);
         llvm::Value* may  = place_val(lv, may_of(rhs, true), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
@@ -1831,7 +1826,6 @@ llvm::Value* Backend::intra_pack_mm(const SignalSlot& s, Plane& rhs) {
     if (!s.four_state) {
         return must_of(rhs, false);
     }
-    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     return rhs.mm;
 }
 
@@ -1875,7 +1869,6 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
     if (!s.four_state) {
         mm_val = place_val(lv, must_of(rhs, false), W);
     } else {
-        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         llvm::Value* must = place_val(lv, must_of(rhs, true), W);
         llvm::Value* may  = place_val(lv, may_of(rhs, true), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
@@ -1941,7 +1934,6 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
     if (!lv.four_state) {
         put(payload, place_val(lv, must_of(rhs, false), W), 0);
     } else {
-        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         const Plane& f = rhs;
         llvm::Value* mm = packed(place_val(lv, must_of(f, true), W), place_val(lv, may_of(f, true), W),
                                  place_val(lv, f.z, W))
@@ -2057,7 +2049,6 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     if (!s.four_state) {
         mm_val = must_of(rhs, false);
     } else {
-        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         mm_val = rhs.mm; // i2W: must | (may << W)
     }
     llvm::Value* z_val = s.has_z ? rhs.z : nullptr;

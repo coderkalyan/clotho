@@ -710,10 +710,9 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b, bool four) {
 
     // 2-state: a single native op on the value; no X rule, no plane duplication.
     // The IR has one domain for both operands (LRM 5.7: any 4-state operand makes
-    // the result 4-state, and the frontend converts the other side), so the planes
-    // agree and the packed-plane path below sees both as i(2W). A mismatched pair
-    // would be malformed LLVM IR, so it is an assertion, not a repair.
-    assert(b.two == !four && "arithmetic operands share a domain (ir::verify: operand-domain)");
+    // the result 4-state, and the frontend converts the other side; ir::verify:
+    // operand-domain), so `four` is the domain of both and the packed-plane path
+    // below sees both as i(2W).
     if (!four) {
         switch (tag) {
             case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
@@ -796,10 +795,8 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b, bool four) {
     // INT_MIN / -1 is also poison, patched to the wrapped value like the
     // 4-state path.
     //
-    // The IR has one domain for both operands; a mismatched pair is malformed LLVM
-    // IR (an i(2W) vs iW operand to the same icmp/select) that crashes inside LLVM's
-    // constant folder, so it is an assertion, not a repair.
-    assert(b.two == !four && "divide / modulo operands share a domain (ir::verify: operand-domain)");
+    // The IR has one domain for both operands (ir::verify: operand-domain), so `four`
+    // is the domain of both.
     if (!four) {
         if (w > wide_arith_bits) {
             // The routine gives 0 for a zero divisor and wraps MIN / -1 itself, so the
@@ -1043,9 +1040,7 @@ Plane Backend::lower_bitwise(Inst::Tag tag, Plane a, Plane b, bool four) {
     const uint32_t w = width_of(a, four);
 
     // 2-state: one native bitwise op; xnor is ~(xor). The IR has one domain for
-    // both operands (LRM 5.7), so a mismatched pair is malformed LLVM IR and an
-    // assertion, not a repair.
-    assert(b.two == !four && "bitwise operands share a domain (ir::verify: operand-domain)");
+    // both operands (LRM 5.7; ir::verify: operand-domain).
     if (!four) {
         switch (tag) {
             case Inst::Tag::Band:  return two_val(b_.CreateAnd(a.mm, b.mm));
@@ -1520,9 +1515,8 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool four) {
         }
     };
     // 2-state operands carry no x or z, so the result is a definite bit from one
-    // native compare. The IR has one domain for both operands, and a 4-state pair
-    // is the packed encoding below; a mismatched pair is malformed LLVM IR.
-    assert(b.two == !four && "compare operands share a domain (ir::verify: operand-domain)");
+    // native compare. The IR has one domain for both operands (ir::verify:
+    // operand-domain), and a 4-state pair is the packed encoding below.
     if (!four) {
         return two_val(b_.CreateICmp(predicate(), a.mm, b.mm));
     }
@@ -1580,7 +1574,6 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool four) {
 //   CasexEq:  x and z bits in either operand are don't-care
 //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
 Plane Backend::lower_case_compare(Inst::Tag tag, Plane a, Plane b, bool four) {
-    assert(b.two == !four && "case-compare operands share a domain (ir::verify: operand-domain)");
     assert(width_of(a, four) == width_of(b, four) && "case-compare operands share a width (ir::verify: operand-width)");
     // 2-state operands carry no x or z, so every case form is a plain ==.
     if (!four) {
@@ -1644,7 +1637,6 @@ Plane Backend::lower_inside_set(Index i) {
 }
 
 Plane Backend::lower_wildeq(Plane a, Plane b, bool four) {
-    assert(b.two == !four && "wildcard-equality operands share a domain (ir::verify: operand-domain)");
     assert(width_of(a, four) == width_of(b, four) && "wildcard-equality operands share a width (ir::verify: operand-width)");
     const uint32_t w = width_of(a, four);
     // 2-state operands have no wildcard (x/z) bits, so ==? is a plain ==.
@@ -1777,8 +1769,7 @@ Plane Backend::lower_lequiv(Plane a, bool a_four, Plane b, bool b_four) {
 
 Plane Backend::lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool four) {
     // The arms share one domain: the frontend converts both to the conditional's
-    // type (LRM 11.4.11), and a mismatched pair would be malformed LLVM IR.
-    assert(b.two == !four && "select arms share a domain (ir::verify: select-arm-domain)");
+    // type (LRM 11.4.11; ir::verify: select-arm-domain).
     // 2-state arms: a native select. A 4-state condition may be x (LRM
     // 1800-2023 11.4.11: bitwise merge, x where the arms disagree); in a
     // 2-state result that x collapses to 0, which is exactly `a & b`.

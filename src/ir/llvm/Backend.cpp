@@ -453,7 +453,6 @@ uint32_t Backend::bits_of(llvm::Value* v) {
 // Value width W of a plane. A 2-state value's mm IS the iW value; a 4-state
 // value packs must|may into i(2W).
 uint32_t Backend::width_of(Plane a, bool four) {
-    assert(a.two == !four && "the plane's domain is its IR type's");
     return four ? bits_of(a.mm) / 2 : bits_of(a.mm);
 }
 
@@ -466,7 +465,6 @@ llvm::Value* Backend::must_of(Plane a, bool four) {
         // them through integer ops.
         throw BackendError{ "internal: integer plane of a real value" };
     }
-    assert(a.two == !four && "the plane's domain is its IR type's");
     return four ? b_.CreateTrunc(a.mm, int_ty(width_of(a, four))) : a.mm;
 }
 
@@ -476,7 +474,6 @@ llvm::Value* Backend::must_of(Index i) {
 }
 
 llvm::Value* Backend::may_of(Plane a, bool four) {
-    assert(a.two == !four && "the plane's domain is its IR type's");
     if (!four) {
         return a.mm;
     }
@@ -496,14 +493,13 @@ Plane Backend::known_plane(llvm::Value* v, bool four_state) {
 
 // Wrap a single iW value as a 2-state Plane.
 Plane Backend::two_val(llvm::Value* v) {
-    return { v, nullptr, true };
+    return Plane{ .mm = v };
 }
 
 // The 4-state must|may encoding of `a` (must == may == v, z = 0) when it is
 // 2-state; `a` itself when `four`. Used where an operator or a storage / ABI sink
 // consumes the packed i(2W) word.
 Plane Backend::to_four(Plane a, bool four) {
-    assert(a.two == !four && "the plane's domain is its IR type's");
     if (four) {
         return a;
     }
@@ -522,7 +518,6 @@ Plane Backend::packed(llvm::Value* must, llvm::Value* may, llvm::Value* z) {
 // i1: does this value contain any X/Z bit? Unknown bits are exactly must!=may.
 // A 2-state value never has any.
 llvm::Value* Backend::any_unknown(Plane a, bool four) {
-    assert(a.two == !four && "the plane's domain is its IR type's");
     if (!four) {
         return b_.getFalse();
     }

@@ -758,7 +758,6 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
                 if (pl.fp != nullptr) {
                     pl = real_to_planes(fp_of(pl));
                 }
-                assert(pl.two == !four && "a C value arrives in its formal's domain");
                 b_.CreateStore(pl.mm, mm_ptr);
                 if (four) {
                     b_.CreateStore(pl.z, z_ptr);

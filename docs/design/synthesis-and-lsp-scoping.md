@@ -153,7 +153,7 @@ This is the one genuine correctness risk in the plan and it
 wants a differential test against `--no-fold` from day one.
 
 **(b) A read-only analysis producing a side table.** The established pattern —
-`compute_may_z` → `SignalSlot::has_z`/`narrow` at `src/ir/llvm/`. Nothing
+`compute_may_z` → `SignalSlot::has_z`/`four_state` at `src/ir/llvm/`. Nothing
 in the IR is touched; the backend consults the table while lowering.
 
 Critically: **iteration to fixpoint happens in the analysis lattice, not in the

@@ -2,7 +2,7 @@
 
 Extend the landed 2-state path (`two-state.md`) to `logic`/`reg` designs by
 **statically proving a 4-state signal can never carry X**, then lowering it as
-2-state (narrow storage, native ops, `two`-valued loads). The may-plane analog
+2-state (narrow storage, native ops, 2-state loads). The may-plane analog
 of z-elision (`ZElision.h`). Default-safe: only ever fires on a *proof* of
 never-X, so it changes performance, never results.
 
@@ -125,10 +125,10 @@ Small, because the 2-state machinery already exists:
   proven-clean `logic` slot becomes narrow (`{iW}`). The store into it already
   applies the must-plane projection; never-x guarantees must == may, so it is
   exact. Frame locals / NBA targets mirror.
-- **Value** (loads, `type_of`): a load of a narrowed signal must produce a
-  `two_val` (`Plane.two = true`) and report `ValueType.four_state = false`. The
-  existing per-instruction `four_state` recompute + operator `two`-propagation
-  then carry it downstream natively with no further change — the same dispatch
+- **Value** (loads, `type_of`): a load of a narrowed signal must report
+  `ValueType.four_state = false`. A value's domain is its IR type's (a `Plane`
+  does not record it), so the operators, which read the domain off their operands'
+  types, carry it downstream natively with no further change — the same dispatch
   that makes `bit` fast.
 - **Ports / ABI**: narrowing is per storage node; a narrowed signal crossing the
   (still-packed) call ABI lifts via `to_four` at the boundary as today.
@@ -137,7 +137,7 @@ Small, because the 2-state machinery already exists:
 
 No new runtime, no ABI change. The pass is one analysis file
 (`compute_may_x`, ideally fused into `ZElision.cpp` as a two-bit sweep) plus the
-one-line storage-eligibility change and the load `two`-tagging.
+one-line storage-eligibility change and the load's 2-state type.
 
 ## 8. Coverage / value — honest
 
