@@ -5199,6 +5199,39 @@ TEST_CASE("one ref formal reached by both actual shapes stays fat at every call"
     CHECK(run_capture(src) == "2 6\n");
 }
 
+TEST_CASE("twin instances calling their own tasks and functions keep their statics apart") {
+    // Each instance of one module has its own copy of a subroutine's static
+    // locals (LRM 13.4.2), whichever instance's code runs. Staggered by a
+    // parameter so the output order does not depend on the scheduler.
+    CHECK(run_capture(R"(
+        module m #(parameter int D = 1, parameter int K = 1);
+            task automatic bump(output int r);
+                static int calls = 0;
+                calls++;
+                r = calls * K;
+            endtask
+            function int f(int x);
+                static int fc = 0;
+                fc++;
+                return x + fc * K;
+            endfunction
+            initial begin
+                int r;
+                #D;
+                bump(r); $display("%m %0d", r);
+                bump(r); $display("%m %0d", r);
+                $display("%m f %0d", f(10));
+                $display("%m f %0d", f(10));
+            end
+        endmodule
+        module top;
+            m #(.D(1), .K(1)) a ();
+            m #(.D(5), .K(10)) b ();
+            initial #20 $finish;
+        endmodule
+    )") == "top.a 1\ntop.a 2\ntop.a f 11\ntop.a f 12\ntop.b 10\ntop.b 20\ntop.b f 20\ntop.b f 30\n");
+}
+
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     // Dispatch picks the body at run time, so the caller cannot know which override
     // it reaches. If one sibling took the fat form and another the narrow one, an
