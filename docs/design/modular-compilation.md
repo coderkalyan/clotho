@@ -1,11 +1,16 @@
 # Modular compilation
 
-Status: steps 1, 2a and 2b landed. The frontend's output is a `Design`
-(src/ir/Design.h) with one unit per specialization wherever its instances lower
-identically, which `flatten` expands back into the flat module the backend
-consumes. The frontend still lowers every instance, and everything below the IR
-is still whole-design; `module-split.md` describes the LLVM-level partition that
-exists today.
+Status: steps 1 and 2 are on this branch (2c partly: see below); step 3, the
+backend per unit (instance records, groups and functions lowered once per unit,
+one LLVM module per unit), is on the `modular-ir` branch and is described here as
+the design it implements, not as what this branch does. The frontend's output is
+a `Design` (src/ir/Design.h) with one unit per specialization wherever its
+instances lower identically, which `flatten` expands back into the flat module
+the backend consumes (`clotho run --stat=units` reports what is still split).
+The frontend still lowers every instance, and everything below the IR is still
+whole-design; `module-split.md` describes the LLVM-level partition that exists
+today. `inst_path`, the instance's own path as a string value, exists in the IR;
+nothing emits it yet on this branch.
 
 Goal: compile an SV design as a composition of small units, so compilation can
 be incremental, cached and parallel. The aim is an architecture whose unit
@@ -263,7 +268,7 @@ unit, which is also what the no-IR-rewriting rule asks
      specialization stays split.
    - **2d, lower once.** The Lowerer lowers each specialization's canonical
      body only; per-instance lowering and the comparison go.
-3. **Backend per unit.** Code is a function of (unit, inbound facts, config);
+3. **Backend per unit** (not on this branch; it is on `modular-ir`). Code is a function of (unit, inbound facts, config);
    functions, commit functions and initializers move into units; root becomes
    link glue; the adapter goes. Gate: an edit to one definition changes only
    that unit's object bytes and root's.
