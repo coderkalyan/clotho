@@ -399,15 +399,13 @@ llvm::Constant* Backend::program_live_ptr() {
 // partition apart for free and each gets its own countdown and its own
 // termination root.
 //
-// The instance index is folded into each body as a COMPILE-TIME constant. That
-// is sound because a program `initial` body is never shared between instances:
-// the only body sharing in the backend is the code-once lowering (Backend::run), which takes only
-// thunk groups, and thunk eligibility is is_simple_always, which requires
-// Activation::Always (src/ir/Analysis.cpp) -- so an Activation::Reactive
-// process is always a coroutine of its own, one per instance, exactly as
-// lower_group's deferred-assertion note already relies on. No instance-context
-// plumbing is needed, and docs/design/program-blocks.md §5 is wrong to say it
-// is.
+// A body of the instance reads its program instance's index from the instance's
+// record (Anchor::ctx_prog_base, filled at startup), and the control blocks of
+// the instance's `initial`s from the process indices the record holds, so a
+// program `initial` is the same code in every instance of its unit. The index
+// stays a compile-time constant only in a body that does not belong to the
+// instance (a subroutine of another instance that a program's `initial` calls),
+// which is not shared.
 void Backend::build_program_instances() {
     const auto   all   = mod_.processes();
     const size_t nproc = all.size();
@@ -528,6 +526,40 @@ uint32_t Backend::program_exit_owner_of(FunctionId id) const {
     return k < program_exit_owner_.size() ? program_exit_owner_[k] : kNoProgramInst;
 }
 
+// The anchor of the instance whose program `initial`s make up program instance
+// `inst`; they share a scope, so any one answers.
+uint32_t Backend::program_inst_anchor(uint32_t inst) const {
+    const uint32_t first = program_inst_procs_[inst].front();
+    return proc_sched_anchor_[first];
+}
+
+// What a subroutine's key holds of the program its `$exit` ends. The instance it
+// names is only a fact of the subroutine when it is another instance's: the
+// subroutine's own instance is read from the record, so twin instances' subroutines
+// agree on it however the program instances are numbered.
+uint32_t Backend::program_exit_relation(FunctionId id, uint32_t anchor) const {
+    const uint32_t owner = program_exit_owner_of(id);
+    if (owner == kNoProgramInst || owner == kAmbiguousProgramInst) {
+        return owner;
+    }
+    return program_inst_anchor(owner) == anchor ? kOwnProgramInst : owner;
+}
+
+// Program instance `inst` as an IR value: a body of the instance whose program it
+// is reads it from its record, any other body has it as a constant (and is not
+// shared).
+llvm::Value* Backend::program_inst_value(uint32_t inst) {
+    const uint32_t pa = program_inst_anchor(inst);
+    if (pa != SignalSlot::no_anchor && pa == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[pa];
+        return ctx_field(a, a.ctx_prog_base, b_.getInt32Ty());
+    }
+    if (pa != SignalSlot::no_anchor) {
+        taint("names a program instance of another instance");
+    }
+    return b_.getInt32(inst);
+}
+
 // `$exit()` (LRM 24.7): "Calling $exit from a thread or its descendent thread
 // originating in an initial procedure of a program block shall terminate all
 // initial procedures and their descendent threads within that originating program
@@ -602,7 +634,7 @@ void Backend::lower_program_exit(Index i) {
         lower_proc_kill(proc_pcb_slot(p), /*with_self=*/true, /*branch_on_self=*/false);
     }
     // ... and the descendants that outlived an `initial` which already ended.
-    lower_proc_kill(program_root_pcb(cur_program_inst_),
+    lower_proc_kill(program_root_pcb(program_inst_value(cur_program_inst_)),
                     /*with_self=*/false,
                     /*branch_on_self=*/false);
     // The calling thread is in the marked set but is RUNNING, so no wake can reach
@@ -627,7 +659,7 @@ uint32_t Backend::program_inst_of(uint32_t proc_index) const {
 // how many `initial` procedures of instance `inst` have not yet reached their
 // end. One i32 per program instance, initialized to that instance's count.
 // Created on first use, so a design with no program never emits it.
-llvm::Value* Backend::program_inst_live_ptr(uint32_t inst) {
+llvm::Value* Backend::program_inst_live_ptr(llvm::Value* inst) {
     if (program_inst_live_gv_ == nullptr) {
         auto* i32 = llvm::Type::getInt32Ty(ctx_);
         auto* ty  = llvm::ArrayType::get(i32, std::max<size_t>(program_inst_procs_.size(), 1));
@@ -647,8 +679,7 @@ llvm::Value* Backend::program_inst_live_ptr(uint32_t inst) {
                                                              llvm::ConstantArray::get(ty, init),
                                                              "clotho.program_inst_live");
     }
-    return b_.CreateInBoundsGEP(
-      program_inst_live_arr_ty_, sym(program_inst_live_gv_), { b_.getInt32(0), b_.getInt32(inst) });
+    return b_.CreateInBoundsGEP(program_inst_live_arr_ty_, sym(program_inst_live_gv_), { b_.getInt32(0), inst });
 }
 
 // Everything LRM 24.3 requires when ONE program `initial` procedure reaches its
@@ -668,8 +699,8 @@ llvm::Value* Backend::program_inst_live_ptr(uint32_t inst) {
 //
 // So: a per-INSTANCE countdown that terminates that instance's descendants, and
 // a DESIGN-WIDE one that ends the run. Both are plain counters -- nothing here
-// walks the process table at run time -- and the instance index is a compile-time
-// constant (build_program_instances).
+// walks the process table at run time -- and the instance is read from the record
+// of the instance whose body this is (program_inst_value).
 void Backend::emit_program_end(uint32_t proc_index) {
     auto*          i32  = b_.getInt32Ty();
     const uint32_t inst = program_inst_of(proc_index);
@@ -696,9 +727,10 @@ void Backend::emit_program_end(uint32_t proc_index) {
         // program_root_pcb), and it puts them under the single node the kill
         // below is rooted at, so one subtree walk covers every descendant of
         // every `initial` of this instance, transitively.
-        llvm::Value* root = program_root_pcb(inst);
+        llvm::Value* inst_value = program_inst_value(inst);
+        llvm::Value* root       = program_root_pcb(inst_value);
         b_.CreateCall(proc_adopt_fn(), { root, pcb_ });
-        llvm::Value* ilive = program_inst_live_ptr(inst);
+        llvm::Value* ilive = program_inst_live_ptr(inst_value);
         llvm::Value* ni    = b_.CreateSub(b_.CreateLoad(i32, ilive), b_.getInt32(1));
         b_.CreateStore(ni, ilive);
         auto* term = llvm::BasicBlock::Create(ctx_, "program.inst.last", fn_);
@@ -940,6 +972,20 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     }
     for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
         b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
+    }
+    // Each owned process's design-wide index, which its instance's code reads for
+    // its control block and its random stream, and each program instance's index.
+    for (uint32_t k = 0; k < mod_.processes().size(); ++k) {
+        const uint32_t pa = proc_sched_anchor_[k];
+        if (pa != SignalSlot::no_anchor && anchors_[pa].ctx_gv != nullptr && anchors_[pa].n_proc != 0) {
+            b_.CreateStore(b_.getInt32(k), ctx_ptr(anchors_[pa], anchors_[pa].ctx_proc_base + proc_sched_ord_[k]));
+        }
+    }
+    for (uint32_t inst = 0; inst < program_inst_procs_.size(); ++inst) {
+        const uint32_t pa = program_inst_anchor(inst);
+        if (pa != SignalSlot::no_anchor && anchors_[pa].ctx_gv != nullptr) {
+            b_.CreateStore(b_.getInt32(inst), ctx_ptr(anchors_[pa], anchors_[pa].ctx_prog_base));
+        }
     }
     // Trigger masks of the guarded groups an instance owns: the design-global
     // colours, so data in its record rather than immediates in its code. A

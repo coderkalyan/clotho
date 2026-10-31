@@ -142,8 +142,9 @@ std::string Backend::subroutine_symbol(const Function& f, std::string_view kind)
 // instances with equal keys lower alike: the same body over the same layout, the
 // same facts of how the design uses it and the same calls. The facts are those
 // lowering reads of a function rather than of its body (the home region its
-// parks answer to, the random stream it owns, the program a `$exit` in it ends),
-// and a call's one fact of its callee (whether it may finish, which decides
+// parks answer to, the random stream it owns, whether a `$exit` in it ends the
+// program of its own instance or another's), and a call's one fact of its callee
+// (whether it may finish, which decides
 // whether a test of rt_finishing follows the call). A callee is named by the
 // function it is declared as: callees are settled before their callers, so
 // instances whose callee is the one function of a family call it alike, and
@@ -159,7 +160,7 @@ std::vector<uint64_t> Backend::subroutine_key(uint32_t f) const {
     key.push_back(is_reactive_home_fn(id) ? 1 : 0);
     key.push_back(is_shared_home_fn(id) ? 1 : 0);
     key.push_back(rng_own_[f] && rng_fns_[f] ? 1 : 0);
-    key.push_back(program_exit_owner_of(id));
+    key.push_back(program_exit_relation(id, home.anchor));
     std::vector<FunctionId> callees;
     direct_callees(fu.ir, callees);
     for (const FunctionId c : callees) {

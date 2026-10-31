@@ -1071,6 +1071,18 @@ struct Anchor {
     // by unit code.
     uint32_t ctx_defer_base = 0;
     uint32_t n_defer        = 0;
+    // Process identity: one i32 per owned process at ctx_proc_base + its def-local
+    // ordinal, the process's design-wide index (n_proc of them: n_blk when the
+    // design has control blocks or a per-process random stream, else 0). Code
+    // that needs a thread's control block or seeds its random stream reads the
+    // index here, so it names no process of the instance it was lowered for.
+    uint32_t ctx_proc_base = 0;
+    uint32_t n_proc        = 0;
+    // The program instance (LRM 24.3) of the instance's program `initial`s: one i32
+    // at ctx_prog_base, its index among the design's program instances, when the
+    // design has a program `initial` (n_prog 1, else 0).
+    uint32_t ctx_prog_base = 0;
+    uint32_t n_prog        = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -1977,11 +1989,28 @@ private:
 
     uint32_t program_exit_owner_of(FunctionId id) const;
 
+    // What a subroutine's key says of the program its `$exit` ends: none or
+    // ambiguous as they are, the instance the subroutine belongs to as one value,
+    // any other instance as itself.
+    uint32_t program_exit_relation(FunctionId id, uint32_t anchor) const;
+
+    // The anchor whose records hold program instance `inst` (that of its processes).
+    uint32_t program_inst_anchor(uint32_t inst) const;
+
+    // Program instance `inst` as an IR value: the own record's field when the body
+    // being lowered is that instance's, else the constant (which taints).
+    llvm::Value* program_inst_value(uint32_t inst);
+
+    // The design-wide index of process `k` as an IR value, read from the record of
+    // the instance that owns it when that is the instance being lowered, else a
+    // constant (which taints).
+    llvm::Value* proc_index_value(uint32_t k);
+
     void lower_program_exit(Index i);
 
     uint32_t program_inst_of(uint32_t proc_index) const;
 
-    llvm::Value* program_inst_live_ptr(uint32_t inst);
+    llvm::Value* program_inst_live_ptr(llvm::Value* inst);
 
     void emit_program_end(uint32_t proc_index);
 
@@ -4302,7 +4331,7 @@ private:
 
     llvm::Value* proc_pcb_slot(uint32_t proc_index);
 
-    llvm::Value* program_root_pcb(uint32_t inst);
+    llvm::Value* program_root_pcb(llvm::Value* inst);
 
     void emit_proc_state(uint32_t from, uint32_t to);
 
@@ -4637,6 +4666,9 @@ private:
     // instances reach it, or a program instance and a design process both do. Only
     // `$exit` cares, and it refuses rather than guess (LRM 24.7 answers by thread).
     static constexpr uint32_t kAmbiguousProgramInst = ~1u;
+    // In a subroutine's key (program_exit_relation): the program instance of the
+    // subroutine's own instance, which its code reads from the record.
+    static constexpr uint32_t kOwnProgramInst = ~2u;
     // Per instance, the process indices of its `initial` procedures, in process
     // order. Its size is the number of program instances, and each entry's size is
     // that instance's live-`initial` count at time zero.

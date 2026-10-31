@@ -1159,6 +1159,7 @@ void Backend::build_instance_ctx_layout() {
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     any_defer_ = std::any_of(facts_.processes.begin(), facts_.processes.end(),
                              [](const auto& p) { return p.deferred_severity; });
+    const bool any_rng = std::any_of(rng_procs_.begin(), rng_procs_.end(), [](bool b) { return b; });
     auto* i32 = b_.getInt32Ty();
     // Per unit, not per state type: two units can lay their own signals out
     // alike (the same definition at different parameters) yet import different
@@ -1170,6 +1171,8 @@ void Backend::build_instance_ctx_layout() {
         a.n_bind       = static_cast<uint32_t>(a.externs.size());
         a.n_fbind      = static_cast<uint32_t>(a.fn_externs.size());
         a.n_defer      = any_defer_ ? a.n_blk : 0;
+        a.n_proc       = design_uses_process_ || any_rng ? a.n_blk : 0;
+        a.n_prog       = has_program_initial() ? 1 : 0;
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;
         uint32_t nsta  = 0;
@@ -1194,6 +1197,8 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_id_base          = a.ctx_fbind_base + a.n_fbind;
         a.ctx_name_base        = a.ctx_id_base + a.n_id;
         a.ctx_defer_base       = a.ctx_name_base + 1;
+        a.ctx_proc_base        = a.ctx_defer_base + a.n_defer;
+        a.ctx_prog_base        = a.ctx_proc_base + a.n_proc;
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1207,11 +1212,13 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), a.n_id, i32);
             f.push_back(ptr); // the instance's name handle (ctx_name_base)
             f.insert(f.end(), a.n_defer, b_.getInt64Ty());
+            f.insert(f.end(), a.n_proc, i32);
+            f.insert(f.end(), a.n_prog, i32);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
-        assert(a.ctx_ty->getNumElements() == a.ctx_defer_base + a.n_defer && "instances of one unit lay their records out alike");
+        assert(a.ctx_ty->getNumElements() == a.ctx_prog_base + a.n_prog && "instances of one unit lay their records out alike");
     }
 }
 

@@ -671,3 +671,28 @@ TEST_CASE("process: two threads seeded alike draw alike") {
     )");
     CHECK(out == "equal=1\n");
 }
+
+// Twin instances run one body (cli_test: --stat=unit-code), each with the control block
+// and random stream of its own process: one kills itself and the other survives, and
+// the streams are not the same stream.
+TEST_CASE("process: twin instances keep their own control block and random stream") {
+    const std::string out = run_capture(R"(
+        module m(input int k, output int unsigned a);
+          process p;
+          initial begin
+            p = process::self();
+            #k;
+            a = $urandom;
+            if (k == 1) p.kill();
+            #5 $display("%m survived %0d", k);
+          end
+        endmodule
+        module t;
+          int unsigned x0, x1;
+          m m0(.k(1), .a(x0));
+          m m1(.k(2), .a(x1));
+          initial #20 $display("distinct=%0d", x0 != x1);
+        endmodule
+    )");
+    CHECK(out == "t.m1 survived 2\ndistinct=1\n");
+}

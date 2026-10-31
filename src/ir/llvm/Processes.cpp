@@ -646,11 +646,25 @@ llvm::GlobalVariable* Backend::proc_pcb_table() {
     return proc_pcb_gv_;
 }
 
+// The design-wide index of process `k` as an IR value. A process of the instance
+// whose code is being lowered reads it from that instance's record at its
+// def-local ordinal, so the code names no process. A process of another instance
+// is a constant, and a body that names one is not shared.
+llvm::Value* Backend::proc_index_value(uint32_t k) {
+    const uint32_t pa = proc_sched_anchor_[k];
+    if (pa != SignalSlot::no_anchor && pa == own_anchor_ && own_ctx_ != nullptr && anchors_[pa].n_proc != 0) {
+        Anchor& a = anchors_[pa];
+        return ctx_field(a, a.ctx_proc_base + proc_sched_ord_[k], b_.getInt32Ty());
+    }
+    if (pa != SignalSlot::no_anchor) {
+        taint("names a process of another instance");
+    }
+    return b_.getInt32(k);
+}
+
 llvm::Value* Backend::proc_pcb_slot(uint32_t proc_index) {
-    taint("names the control block of its process");
     auto* gv = proc_pcb_table();
-    return b_.CreateInBoundsGEP(proc_pcb_arr_ty_, sym(gv),
-                                { b_.getInt32(0), b_.getInt32(proc_index) });
+    return b_.CreateInBoundsGEP(proc_pcb_arr_ty_, sym(gv), { b_.getInt32(0), proc_index_value(proc_index) });
 }
 
 // The per-program-instance TERMINATION ROOT (LRM 24.3): one static control block
@@ -677,7 +691,7 @@ llvm::Value* Backend::proc_pcb_slot(uint32_t proc_index) {
 // kProcStatic keeps it off the pool freelist (proc_maybe_free), like every block
 // in clotho.proc_pcb. Created on first use, so a design with no program never
 // emits it.
-llvm::Value* Backend::program_root_pcb(uint32_t inst) {
+llvm::Value* Backend::program_root_pcb(llvm::Value* inst) {
     if (program_root_gv_ == nullptr) {
         const auto                   n    = std::max<size_t>(program_inst_procs_.size(), 1);
         auto*                        ty   = llvm::ArrayType::get(pcb_ty(), n);
@@ -699,7 +713,7 @@ llvm::Value* Backend::program_root_pcb(uint32_t inst) {
                                    llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, one)),
                                    "clotho.program_root");
     }
-    return b_.CreateInBoundsGEP(program_root_arr_ty_, sym(program_root_gv_), { b_.getInt32(0), b_.getInt32(inst) });
+    return b_.CreateInBoundsGEP(program_root_arr_ty_, sym(program_root_gv_), { b_.getInt32(0), inst });
 }
 
 // Move this thread's LRM 9.7 state from `from` to `to`, preserving the flag bits

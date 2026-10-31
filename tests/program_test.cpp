@@ -1044,6 +1044,34 @@ TEST_CASE("$exit in one program leaves another program running") {
     )") == "[5] A exits\n[20] B tick\n[50] B done\n");
 }
 
+// Twin instances of one program run one body (cli_test: --stat=unit-code), and each `$exit`
+// ends the program it is in: p0 exits at 6 and takes its orphan and its sibling `initial`
+// with it, while p1 runs on untouched until it exits at 21.
+TEST_CASE("$exit in twin instances of a program ends only its own instance") {
+    CHECK(run_capture(R"(
+        module t;
+          p p0(.d(5));
+          p p1(.d(20));
+        endmodule
+
+        program p(input int d);
+          task automatic bail();
+            $display("[%0t] %m bailing", $time);
+            $exit;
+            $display("never");
+          endtask
+          initial begin
+            #1;
+            fork begin #(d * 10) $display("[%0t] %m orphan", $time); end join_none
+            #d;
+            bail();
+            $display("never after call");
+          end
+          initial begin #100 $display("[%0t] %m sibling", $time); end
+        endprogram
+    )") == "[6] t.p0.bail bailing\n[21] t.p1.bail bailing\n");
+}
+
 // The second sentence: a thread that does not originate in a program `initial`
 // gets nothing at all, not an error -- clotho used to refuse $exit outright,
 // which is itself non-compliant. The design thread continues on the next

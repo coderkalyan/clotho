@@ -316,6 +316,8 @@ between instances:
   bumps its counter at each activation and tags the reports it queues with it
   (LRM 16.4.2), so the counter is a field of the instance, not a global of the
   group;
+- the design-wide index of each process it owns (its control block, its random
+  stream's seed) and the index of its program instance (LRM 24.3, `$exit`);
 - one binding per extern declaration: the address of an imported signal and the
   record of the instance that owns it, and the record of an imported function's
   instance (landed); the record of an instance an interface port or `inst_refs`
@@ -420,9 +422,8 @@ code go.
      too. `merge_twin_bodies`, `share_twin_groups` and
      `SimulationConfig::outline` are gone. A lowering that bakes something of the
      instance it ran for (a symbol of its storage or wait buckets, a call of a
-     function that is its instance's own, its name, a covergroup index, a
-     disable target, a program instance, a process control block or random
-     stream, nonblocking staging into another instance) taints itself and each
+     function that is its instance's own, a covergroup index, a
+     disable target, nonblocking staging into another instance) taints itself and each
      instance lowers its own; `--stat=unit-code` reports unit groups, functions
      emitted and what stopped sharing. Comb fusion stays within one instance
      (combchain regresses; accepted until fusion across instances is revisited).
@@ -467,10 +468,11 @@ code go.
      shared is lowered as it was, into its unit's module like every other, and
      `--stat=unit-code` counts the subroutines of multi-instance units, the
      functions emitted for them and what kept each per instance: a
-     nonblocking write, a disable target, a covergroup, a process
-     control block or a process-local random stream, a call of such a
-     subroutine, a cycle. Two program instances' subroutines differ in the
-     program that `$exit` ends and are not one function either. Measured:
+     nonblocking write, a disable target, a covergroup, a call of such a
+     subroutine, a cycle. The instance a process, a control block, a random
+     stream or a `$exit` names is a record field (process indices, the program
+     instance) read by the instance's own code, so none of them splits a family; a
+     `$exit`'s relation to the subroutine's own instance is in its key. Measured:
      rocket-chip has no function or task in a multi-instance unit (0 of 0; its
      1021 groups of multi-instance units are as many functions as before), so
      the suite's twin designs are what covers shared subroutines; the perf

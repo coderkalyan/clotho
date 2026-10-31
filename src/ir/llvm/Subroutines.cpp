@@ -418,9 +418,6 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // and a fork child get theirs from the owner closure instead (build_function
     // / lower_task).
     cur_program_inst_ = in_program_body_ ? program_inst_of(proc_index) : kNoProgramInst;
-    if (in_program_body_) {
-        taint("belongs to a program instance");
-    }
 
     b_.SetInsertPoint(coro_cleanup_bb_);
     if (gc_frame) {
@@ -464,9 +461,8 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // forks or a deferred body it ramps) materializes nothing and passes the
     // module-wide state along, which by that proof nothing dereferences.
     if (rng_procs_[proc_index]) {
-        taint("draws from a per-process random stream");
         rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
-        b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.getInt64(proc_index) });
+        b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.CreateZExt(proc_index_value(proc_index), b_.getInt64Ty()) });
     } else {
         rng_slot_ = sym(rng_global_);
     }

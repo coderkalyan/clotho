@@ -808,6 +808,57 @@ TEST_CASE("cli: --stat=unit-code shows the groups of twin instances with deferre
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code shows twin instances with process control and random streams shared") {
+    // A body names its process's control block and seeds its random stream from
+    // the process index its instance's record holds, so twins share the group.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module m(input int k, output int unsigned a);
+            process p;
+            initial begin
+                p = process::self();
+                #k;
+                a = $urandom;
+                if (k == 1) p.kill();
+            end
+        endmodule
+        module top;
+            int unsigned x0, x1;
+            m m0(.k(1), .a(x0));
+            m m1(.k(2), .a(x1));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 groups of multi-instance units over 2 instances' groups, 1 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
+TEST_CASE("cli: --stat=unit-code shows twin program instances and their $exit task shared") {
+    // The program instance an `initial` or a task ends is read from the instance's
+    // record, so two instances of one program are one function each.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module top;
+            p p0(.d(5));
+            p p1(.d(20));
+        endmodule
+        program p(input int d);
+            task automatic bail();
+                $exit;
+            endtask
+            initial begin
+                #d;
+                bail();
+            end
+        endprogram
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 subroutines of multi-instance units over 2 instances' subroutines, 1 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);
