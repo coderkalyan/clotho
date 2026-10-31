@@ -2090,29 +2090,15 @@ slang::ConstantRange Lowerer::packed_range_of(const Expression& value) {
 }
 
 // Whether the offset arithmetic of lower_packed_offset, `(v - adj) * stride` for a
-// descending range and `(adj - v) * stride` for an ascending one, is exact in 32
-// bits for every value `v` of a `width`-bit index of the given signedness. Where
-// nothing is computed (stride 1, adj 0, descending) the index only has to be
-// reinterpreted as an i32: a value that does not fit, a 32-bit unsigned one
-// included, turns negative, which no container contains.
-static bool packed_offset_fits_i32(uint32_t width, bool is_signed, bool descending, int64_t adj, uint32_t stride) {
-    if (width > 32) {
-        return false;
-    }
-    if (descending && adj == 0 && stride == 1) {
-        return true;
-    }
-    if (stride > (uint32_t{ 1 } << 24)) {
-        return false; // keeps the products below inside an i64
-    }
-    const int64_t vmin = is_signed ? -(int64_t{ 1 } << (width - 1)) : 0;
-    const int64_t vmax = is_signed ? (int64_t{ 1 } << (width - 1)) - 1 : (int64_t{ 1 } << width) - 1;
-    const int64_t lo   = (descending ? vmin - adj : adj - vmax) * stride;
-    const int64_t hi   = (descending ? vmax - adj : adj - vmin) * stride;
-    return lo >= INT32_MIN && hi <= INT32_MAX;
+// descending range and `(adj - v) * stride` for an ascending one, is exact in 64
+// bits for every value `v` of a `width`-bit index of either signedness: |v - adj|
+// is below 2^33 and the stride at most 2^24. A wider index takes
+// lower_wide_packed_offset.
+static bool packed_offset_fits_i64(uint32_t width, uint32_t stride) {
+    return width <= 32 && stride <= (uint32_t{ 1 } << 24);
 }
 
-// Lower a packed-select index to its 32-bit zero-based LSB offset, minus
+// Lower a packed-select index to its 64-bit zero-based LSB offset, minus
 // `bias` (0 for a bit select; width-1 when an indexed part-select's low
 // bit sits below the translated base), then scaled by `stride` (the element
 // bit width for a multi-dim packed array element/range select, 1 otherwise).
@@ -2124,10 +2110,9 @@ static bool packed_offset_fits_i32(uint32_t width, bool is_signed, bool descendi
 // domain (a 4-state offset is physically wider than a 2-state constant, so a
 // mismatched-domain Mul operand would be an invalid instruction).
 //
-// LRM 11.5.1 compares the index VALUE against the vector, so a 32-bit offset is
-// only used where it cannot wrap (packed_offset_fits_i32): an `int` index into
-// `[3:0][7:0]` or an unsigned one into a negative range can, and a 64-bit one
-// never fits, and those take lower_wide_packed_offset.
+// LRM 11.5.1 compares the index VALUE against the vector, so an offset is only
+// built in 64 bits where that cannot wrap (packed_offset_fits_i64); a wider index
+// takes lower_wide_packed_offset, and the backend checks what comes out of it.
 ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
                                        slang::ConstantRange range,
                                        int32_t              bias,
@@ -2135,13 +2120,12 @@ ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
                                        ir::SourceLoc        l,
                                        uint32_t             stride) {
     if (const std::optional<int32_t> c = try_const_int(idx)) {
-        const auto off = static_cast<uint32_t>((range.translateIndex(*c) - bias) * static_cast<int32_t>(stride));
-        return b.constant(module_.pool.put_int(make_int_type(32, false), off), l);
+        const int64_t off = (int64_t{ range.translateIndex(*c) } - bias) * int64_t{ stride };
+        return b.constant(module_.pool.put_int(make_int_type(64, false), static_cast<uint64_t>(off)), l);
     }
     const bool    descending = range.isDescending();
     const int64_t adj        = descending ? int64_t{ range.right } + bias : int64_t{ range.right } - bias;
-    if (!packed_offset_fits_i32(static_cast<uint32_t>(idx.type->getBitWidth()), idx.type->isSigned(), descending,
-                                adj, stride)) {
+    if (!packed_offset_fits_i64(static_cast<uint32_t>(idx.type->getBitWidth()), stride)) {
         return lower_wide_packed_offset(idx, descending, adj, b, stride);
     }
     // The normalization arithmetic is attributed to the index expression, not
@@ -2150,33 +2134,27 @@ ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
     // puts its caret here) must point at what the user wrote inside the
     // brackets rather than at the vector being indexed.
     const ir::SourceLoc il     = loc(idx);
-    const ir::Ref       off_ty = make_int_type(32, idx.type->isFourState());
+    const ir::Ref       off_ty   = make_int_type(64, idx.type->isFourState());
     const ir::Index     v      = b.convert(lower_expr(idx, b), off_ty, idx.type->isSigned(), il);
-    ir::Index           off;
-    if (range.isDescending()) {
-        const int32_t sub = range.right + bias; // off = idx - right - bias
-        off = sub == 0 ? v
-                       : b.binary(ir::Inst::Tag::Sub,
-                                  v,
-                                  b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), il),
-                                  il);
+    const auto          constant = [&](int64_t n) {
+        return b.constant(module_.pool.put_int(off_ty, static_cast<uint64_t>(n)), il);
+    };
+    ir::Index off;
+    if (descending) {
+        // off = idx - right - bias
+        off = adj == 0 ? v : b.binary(ir::Inst::Tag::Sub, v, constant(adj), il);
     } else {
         // Big-endian: off = (right - bias) - idx.
-        off = b.binary(ir::Inst::Tag::Sub,
-                       b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(range.right - bias)), il),
-                       v,
-                       il);
+        off = b.binary(ir::Inst::Tag::Sub, constant(adj), v, il);
     }
     // The extent goes on whatever instruction the backend will report, which
     // is the offset's final value.
-    const ir::Index result =
-      stride == 1 ? off
-                  : b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), il), il);
+    const ir::Index result = stride == 1 ? off : b.binary(ir::Inst::Tag::Mul, off, constant(stride), il);
     b.set_end(result, to_source_loc(idx.sourceRange.end()));
     return result;
 }
 
-// lower_packed_offset for an index whose 32-bit arithmetic could wrap. The
+// lower_packed_offset for an index whose 64-bit arithmetic could wrap. The
 // offset is computed in a signed type wide enough that nothing does, so the
 // backend sees the true value and (select_index) decides it is out of range,
 // or keeps it exact when it only straddles the vector.

@@ -29,7 +29,7 @@ llvm::Value* Backend::range_bits(uint32_t W, llvm::Value* lo, llvm::Value* hi) {
     return b_.CreateAnd(low_ones(W, hi), b_.CreateNot(low_ones(W, lo)));
 }
 
-// `v` shifted by the signed i32 `s`: left when s >= 0, right by |s| when
+// `v` shifted by the signed `s`: left when s >= 0, right by |s| when
 // s < 0. Poison-free and saturating — |s| >= W yields 0 (every bit leaves the
 // W-bit word), the correct behavior when aligning an out-of-range selection.
 // A constant `s` is one shift, or nothing left of `v`.
@@ -41,10 +41,11 @@ llvm::Value* Backend::align_shl(llvm::Value* v, llvm::Value* s, uint32_t W) {
         }
         return k == 0 ? v : k > 0 ? b_.CreateShl(v, k) : b_.CreateLShr(v, -k);
     }
-    llvm::Value* neg  = b_.CreateICmpSLT(s, b_.getInt32(0));
+    auto*        st   = s->getType();
+    llvm::Value* neg  = b_.CreateICmpSLT(s, llvm::ConstantInt::get(st, 0));
     llvm::Value* amt  = b_.CreateSelect(neg, b_.CreateNeg(s), s);
-    llvm::Value* ovf  = b_.CreateICmpUGE(amt, b_.getInt32(W));
-    llvm::Value* samt = cast(b_.CreateSelect(ovf, b_.getInt32(0), amt), W, false);
+    llvm::Value* ovf  = b_.CreateICmpUGE(amt, llvm::ConstantInt::get(st, W));
+    llvm::Value* samt = cast(b_.CreateSelect(ovf, llvm::ConstantInt::get(st, 0), amt), W, false);
     llvm::Value* pick = b_.CreateSelect(neg, b_.CreateLShr(v, samt), b_.CreateShl(v, samt));
     return b_.CreateSelect(ovf, zero(W), pick);
 }
@@ -187,22 +188,21 @@ std::optional<Backend::SelectVerdict> Backend::resolve_constant_select(Guarded& 
     return v;
 }
 
-// A bit / part-select index operand as the i32 that is added to a bit offset.
-// LRM 11.5.1 compares the index VALUE, so a narrower operand extends by its own
-// signedness, and a wider one is narrowed by saturation: every value an i32
-// holds passes, and a larger one (a 64-bit index of 2**32 + 1, which its low 32
-// bits would turn into bit 1) becomes INT32_MAX or INT32_MIN, which no container
-// reaches. The frontend hands over an operand wider than 32 bits only when a
-// 32-bit offset could not hold its arithmetic.
+// A bit / part-select index operand as the i64 that is added to a bit offset. The
+// frontend has extended it by its own signedness, and an offset is a signed number, so
+// an operand of up to 64 bits is that number. A wider one (the frontend builds one
+// when a 64-bit offset could not hold its arithmetic) is checked: a value beyond
+// +-2^40 is out of range in any container, and is narrowed to that bound rather than
+// to its low bits, which would put a huge index back inside a vector.
 llvm::Value* Backend::select_index(Plane idx, ValueType t) {
-    // An offset is a signed number: the frontend zero-extends an unsigned index
-    // past its top bit, and builds a wide offset in a signed type.
     llvm::Value* m = must_of(idx, t.four_state);
-    if (t.width <= 32) {
-        return cast(m, 32, true);
+    if (t.width <= 64) {
+        return cast(m, 64, true);
     }
-    llvm::Value* hi = llvm::ConstantInt::get(m->getType(), INT32_MAX);
-    return cast(smax(smin(m, hi), llvm::ConstantInt::getSigned(m->getType(), INT32_MIN)), 32, false);
+    auto*        ty = m->getType();
+    llvm::Value* hi = llvm::ConstantInt::get(ty, uint64_t{ 1 } << 40);
+    llvm::Value* lo = llvm::ConstantInt::getSigned(ty, -(int64_t{ 1 } << 40));
+    return cast(smax(smin(m, hi), lo), 64, false);
 }
 
 // The 0-based position of a fixed-size unpacked array element and whether the
@@ -308,9 +308,14 @@ llvm::Value* Backend::window_mask(const LValueInfo& lv, uint32_t sw) {
     llvm::Value* end  = b_.CreateAdd(base, llvm::ConstantInt::get(i64t, lv.sel_cwidth));
     llvm::Value* off  = b_.CreateSExt(lv.sel_off, i64t);
     llvm::Value* top  = b_.CreateAdd(off, llvm::ConstantInt::get(i64t, lv.sel_width));
-    llvm::Value* lo   = smax(smin(off, end), base);
-    llvm::Value* hi   = smax(smin(top, end), base);
-    llvm::Value* mask = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
+    // The container's base is any i64, so the bounds are clamped to the vector before
+    // they are narrowed to the i32 range_bits takes.
+    const auto clamp = [&](llvm::Value* x) {
+        return b_.CreateTrunc(
+          smax(smin(smax(smin(x, end), base), llvm::ConstantInt::get(i64t, sw)), llvm::ConstantInt::get(i64t, 0)),
+          int_ty(32));
+    };
+    llvm::Value* mask = range_bits(sw, clamp(off), clamp(top));
     return b_.CreateSelect(lv.sel_unknown, zero(sw), mask);
 }
 

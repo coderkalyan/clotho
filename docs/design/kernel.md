@@ -109,8 +109,7 @@ when it does.
   read and write only those words, plane by plane.
 - Indices reach the backend as signed numbers of at least 64 bits, which the
   frontend extends by each index's own signedness; wider indices are checked and
-  treated as out of range. **Not yet:** packed
-  offsets are 32-bit, with indices that do not fit saturated out of range.
+  treated as out of range.
 - A dynamic select branches to a plain fast path when its index is known and in
   range; the mask path runs only otherwise. On storage of 64 bits or less too: the
   branch costs 20-60% fewer instructions than the mask (an 8-bit 4-state read 150 ->

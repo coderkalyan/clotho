@@ -104,7 +104,7 @@ void Backend::fill_agg_leaf(LValueInfo& lv, Ref leaf_type) {
     lv.four_state  = four;
     lv.has_z       = four;
     lv.slot_ty     = slot_type(w, four, four);
-    lv.bit_off     = b_.getInt32(0);
+    lv.bit_off          = b_.getInt64(0);
 }
 
 // Enumerate an aggregate's scalar/string leaves reachable by a STATIC path
@@ -222,7 +222,7 @@ Guarded Backend::agg_elem(Guarded lv, Ref array_type, uint32_t pos) {
     const uint32_t stride = array_leaf_count(at.element);
     llvm::Value*   off    = b_.getInt32(pos * stride);
     lv.elem_idx           = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
-    lv.bit_off            = b_.getInt32(0);
+    lv.bit_off            = b_.getInt64(0);
     return lv;
 }
 
@@ -1011,7 +1011,7 @@ void Backend::emit_array_convert_copy(llvm::Value*      d_base,
         lv.array_ty    = arr;
         lv.elem_idx    = idx;
         lv.store_width = leaf_width;
-        lv.bit_off     = b_.getInt32(0);
+        lv.bit_off     = b_.getInt64(0);
         lv.width       = leaf_width;
         return lv;
     };

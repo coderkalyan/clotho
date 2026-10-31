@@ -1055,3 +1055,90 @@ endmodule
            "x 11xx\n"
            "fc\n");
 }
+
+// kernel.md: indices reach the backend as 64-bit offsets, extended by their own
+// signedness, and a wider one is checked and treated as out of range. A 64-bit
+// signed index of -1, INT64_MIN or 2**32 + 1, an unsigned one of 2**63 + 3 or 2**64 - 3
+// (not a negative number), and 65- and 128-bit indices of either signedness whose
+// value is small, huge or negative, into narrow and wide, 2- and 4-state vectors, for
+// reads, blocking and nonblocking writes and indexed part-selects. The expected
+// lines are LRM 11.5.1 worked from the index VALUE: none of these is in range but the
+// small ones (iverilog 13 truncates a wide index and disagrees on them).
+TEST_CASE("a packed select index of 64 bits or more is compared by its value, not its low bits") {
+    CHECK(run_capture(R"(
+module t;
+    logic [31:0]  a;
+    bit   [31:0]  b;
+    logic [299:0] w;
+    bit   [299:0] x;
+    logic [7:0]   v;
+    longint            li;
+    longint unsigned   lu;
+    logic [64:0]       u65;
+    logic signed [64:0] s65;
+    logic [127:0]      u128;
+    logic signed [127:0] s128;
+    int                k;
+    longint            L [0:7];
+    longint unsigned   U [0:7];
+    initial begin
+        a = 32'hA5A5A5A5; b = 32'hA5A5A5A5; w = {300{1'b1}}; x = {300{1'b1}}; v = 8'h3c;
+        L[0] = 0; L[1] = 3; L[2] = -1; L[3] = 64'sh7fffffffffffffff; L[4] = -64'sh8000000000000000; L[5] = 4294967296 + 1; L[6] = -4294967296 - 2; L[7] = 299;
+        U[0] = 0; U[1] = 3; U[2] = 64'hffffffffffffffff; U[3] = 64'h8000000000000000; U[4] = 64'h8000000000000003; U[5] = 64'h0000000100000001; U[6] = 64'hfffffffffffffffd; U[7] = 299;
+        for (k = 0; k < 8; k = k + 1) begin
+            li = L[k]; lu = U[k];
+            $display("L%0d %b %b %b %b %b %b", k, a[li], b[li], w[li], x[li], a[li +: 4], w[li +: 70]);
+            $display("U%0d %b %b %b %b %b %b", k, a[lu], b[lu], w[lu], x[lu], a[lu +: 4], w[lu +: 70]);
+            a[li] = 1'b0; w[lu] = 1'b0; b[lu +: 4] = 4'h0; x[li +: 70] = 70'h0; a[lu +: 4] <= 4'h0; w[li] <= 1'b0;
+            #1 $display("W%0d %h %h %h %h", k, a, b, w, x);
+            a = 32'hA5A5A5A5; b = 32'hA5A5A5A5; w = {300{1'b1}}; x = {300{1'b1}};
+        end
+        u65 = 65'h1_0000_0000_0000_0003; s65 = -65'sd1; u128 = 128'h1_0000_0000_0000_0000_0000_0000_0000_0003 ; s128 = -128'sd5;
+        $display("%b %b %b %b %b", v[u65], v[s65], v[u128], v[s128], v[u65 +: 4]);
+        $display("%b %b %b", w[u128], w[s128], w[s128 +: 70]);
+        u65 = 65'd5; s65 = 65'sd6; u128 = 128'd7; s128 = 128'sd1;
+        $display("%b %b %b %b", v[u65], v[s65], v[u128], v[s128]);
+        v[u128 +: 1] = 1'b0; $display("%h", v);
+        v[u65] = 1'b1; v[s128] = 1'b1; $display("%h", v);
+        u128 = 128'h8000_0000_0000_0000_0000_0000_0000_0001; v[u128] = 1'b0; v[s128 - 128'sd2] = 1'b0; $display("%h %b", v, v[u128]);
+    end
+endmodule
+    )") == "L0 1 1 1 1 0101 1111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "U0 1 1 1 1 0101 1111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "W0 a5a5a5a0 a5a5a5a0 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe "
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffc00000000000000000\n"
+           "L1 0 0 1 1 0100 1111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "U1 0 0 1 1 0100 1111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "W1 a5a5a585 a5a5a585 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7 "
+           "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffe000000000000000007\n"
+           "L2 x 0 x 0 101x 111111111111111111111111111111111111111111111111111111111111111111111x\n"
+           "U2 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "W2 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffe00000000000000000\n"
+           "L3 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "U3 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "W3 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
+           "L4 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "U4 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "W4 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
+           "L5 0 0 1 1 0010 1111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "U5 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "W5 a5a5a5a5 a5a5a5a5 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd "
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffff800000000000000001\n"
+           "L6 x 0 x 0 01xx 11111111111111111111111111111111111111111111111111111111111111111111xx\n"
+           "U6 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+           "W6 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
+           "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000000000000\n"
+           "L7 x 0 1 1 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n"
+           "U7 x 0 1 1 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n"
+           "W7 a5a5a5a5 a5a5a5a5 7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
+           "7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
+           "x x 1 x xxxx\n"
+           "1 x 11111111111111111111111111111111111111111111111111111111111111111xxxxx\n"
+           "1 0 0 0\n"
+           "3c\n"
+           "3e\n"
+           "3e x\n");
+}

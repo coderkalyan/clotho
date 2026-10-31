@@ -511,15 +511,16 @@ std::optional<int64_t> const_signed_index(const Module& m, const Ir& ir, Index c
 }
 
 // The offset a packed select reads from a constant: the frontend folds a select
-// offset into a 32-bit value (lower_packed_offset), and the backend takes it as a
-// signed one, so a base below the vector (`x[-1+:4]`) arrives as 0xFFFFFFFF.
+// offset into a 64-bit value (lower_packed_offset), and the backend takes it as a
+// signed one, so a base below the vector (`x[-1+:4]`) arrives as 0xFFFF...FFFF.
 std::optional<int64_t> const_offset(const Module& m, const Ir& ir, Index c) {
     const std::optional<ConstBits> k = const_bits(m, ir, c);
-    if (!k || k->width > 32) {
+    if (!k || k->width > 64) {
         return std::nullopt;
     }
+    const unsigned shift = 64 - k->width;
 
-    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(k->bits)));
+    return static_cast<int64_t>(static_cast<uint64_t>(k->bits) << shift) >> shift;
 }
 
 DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {

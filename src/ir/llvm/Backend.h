@@ -327,7 +327,7 @@ struct LValueInfo {
     llvm::Value* elem_idx = nullptr;
     // Full storage width in bits (the leaf element width for a memory).
     uint32_t store_width = 0;
-    // Bit offset of the selection within the storage (i32).
+    // Bit offset of the selection within the storage (i64).
     llvm::Value* bit_off = nullptr;
     // Selected width in bits (== store_width for a whole-storage target).
     uint32_t width = 0;
@@ -3165,7 +3165,7 @@ private:
     // out-of-range write is a no-op; a partially out-of-range select keeps the
     // in-range bits and applies the rule bit-by-bit to the rest. An x/z index
     // makes the whole select out of range. The raw run-time offset can be any
-    // i32 (negative, or past the width), so all masking / shifting below is
+    // i64 (negative, or past the width), so all masking / shifting below is
     // poison-free: shift amounts are always clamped below the shifted type's
     // width. The LValue's `range_mask` (storage-width) marks the in-range bits.
 
@@ -3208,8 +3208,8 @@ private:
     // An index is compared as the VALUE it holds, not as its low 32 bits or
     // zero-extended: a 2-bit signed -1 is -1, and 2**32 + 1 is not 1.
 
-    // A bit / part-select index operand as the i32 added to a bit offset; a value
-    // an i32 cannot hold saturates, which lands out of range in any container.
+    // A bit / part-select index operand as the i64 added to a bit offset; one wider
+    // than 64 bits is checked against a bound no container reaches.
     llvm::Value* select_index(Plane idx, ValueType t);
 
     // An unpacked-array element: `pos` is its 0-based position (meaningful only

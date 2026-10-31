@@ -320,7 +320,7 @@ void Backend::lower_inst(Index i) {
             // 11.5.1): an out-of-range or x/z index reads x / writes nothing. A
             // constant index of a constant place is settled at compile time.
             const Plane        idxp         = value_of(p.binary.r);
-            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt64(0);
             const uint32_t     cwidth       = lv.width;
             llvm::Value*       idx          = select_index(idxp, type_of(p.binary.r));
             llvm::Value* const unknown      = any_unknown(p.binary.r);
@@ -339,7 +339,7 @@ void Backend::lower_inst(Index i) {
             const auto         ps          = ir_->extra_data<PartSelect>(p.op_extra.extra);
             llvm::Value* const cbase       = lv.bit_off;
             const uint32_t     outer_width = lv.width;
-            lv.bit_off                     = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
+            lv.bit_off                     = b_.CreateAdd(lv.bit_off, b_.getInt64(static_cast<int32_t>(ps.lsb)));
             lv.width                       = ps.msb - ps.lsb + 1;
             // A constant window that hangs over the vector it selects from (`v[11:8]`
             // of 8 bits, `v[1:-2]`, the element `a[5]` of `a[3:0]`) is out of range
@@ -373,7 +373,7 @@ void Backend::lower_inst(Index i) {
             Guarded            lv           = lvalue_of(p.op_extra.op);
             const auto         dps          = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
             const Plane        offp         = value_of(dps.offset);
-            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt64(0);
             const uint32_t     cwidth       = lv.width;
             llvm::Value*       off          = select_index(offp, type_of(dps.offset));
             llvm::Value* const unknown      = any_unknown(dps.offset);
@@ -486,7 +486,7 @@ void Backend::lower_inst(Index i) {
                 el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
                 el.elem_idx      = cast(idx64, 32, false);
                 el.store_width   = e.width;
-                el.bit_off       = b_.getInt32(0);
+                el.bit_off       = b_.getInt64(0);
                 el.width         = e.width;
                 el.is_signal     = lv.is_signal;
                 el.sig           = lv.sig;
@@ -555,7 +555,7 @@ void Backend::lower_inst(Index i) {
                 el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
                 el.elem_idx      = cast(phys, 32, false);
                 el.store_width   = e.width;
-                el.bit_off       = b_.getInt32(0);
+                el.bit_off       = b_.getInt64(0);
                 el.width         = e.width;
                 el.is_signal     = lv.is_signal;
                 el.sig           = lv.sig;
@@ -606,7 +606,7 @@ void Backend::lower_inst(Index i) {
             const uint32_t stride = array_leaf_count(at.element);
             llvm::Value*   off    = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
             lv.elem_idx           = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
-            lv.bit_off            = b_.getInt32(0);
+            lv.bit_off            = b_.getInt64(0);
             set_lvalue(i, lv);
             return;
         }
@@ -689,7 +689,7 @@ void Backend::lower_inst(Index i) {
             // stacked on this deferred place ADDS to bit_off, and PartSelect's
             // unconditional CreateAdd crashed codegen on a null base. A packed
             // struct or union value element reaches exactly that path.
-            el.bit_off     = b_.getInt32(0);
+            el.bit_off     = b_.getInt64(0);
             el.width       = e.width;
             set_lvalue(i, el);
             return;
@@ -738,7 +738,7 @@ void Backend::lower_inst(Index i) {
             // stacked on this deferred place ADDS to bit_off, and PartSelect's
             // unconditional CreateAdd crashed codegen on a null base. A packed
             // struct or union value element reaches exactly that path.
-            el.bit_off     = b_.getInt32(0);
+            el.bit_off     = b_.getInt64(0);
             el.width       = e.width;
             set_lvalue(i, el);
             return;
@@ -764,7 +764,7 @@ void Backend::lower_inst(Index i) {
                 llvm::Value* off = b_.getInt32(as.first_pos * stride);
                 lv.elem_idx      = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
             }
-            lv.bit_off = b_.getInt32(0);
+            lv.bit_off = b_.getInt64(0);
             set_lvalue(i, lv);
             return;
         }
@@ -2504,7 +2504,7 @@ LValue Backend::signal_lvalue(Signal sig) {
     lv.has_z       = s.has_z;
     lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
     lv.store_width = s.width;
-    lv.bit_off     = b_.getInt32(0);
+    lv.bit_off     = b_.getInt64(0);
     lv.width       = s.width;
     lv.is_signal   = true;
     lv.sig         = sig;
@@ -2543,7 +2543,7 @@ LValue Backend::local_lvalue(uint32_t index) {
     lv.four_state  = s.four_state;
     lv.has_z       = s.four_state;
     lv.store_width = s.width;
-    lv.bit_off     = b_.getInt32(0);
+    lv.bit_off     = b_.getInt64(0);
     lv.width       = s.width;
     lv.is_signal   = false;
     lv.sig         = Signal{ 0 };
