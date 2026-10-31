@@ -1797,6 +1797,104 @@ TEST_CASE("queue of queues: assignment-pattern literal, whole assignment, and se
                               "clear 0\n");
 }
 
+TEST_CASE("queue of queues: a queue-typed concatenation operand is one element, not a splice") {
+    // `IQ q0[$]` with `IQ` = `int[$]`: in `{q0, mk(2)}` the operand `q0` is an
+    // array OF the target's elements (splice), but `mk(2)` has exactly the
+    // target's ELEMENT type, so it is one element (slang binds it as one; LRM
+    // 11.4.12 / 10.10). append_queue_pieces used to splice every queue-typed
+    // operand, reading `mk(2)`'s int buffer through the outer queue-handle
+    // stride; the copy kernel took heap bytes for an inner queue's length and
+    // aborted asking for ~510 TiB. Expectations worked from LRM 10.10 and 11.4.12
+    // by hand; Verilator agrees (iverilog has no queue-of-queue support).
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int IQ[$];
+            IQ q0[$];
+            function automatic IQ mk(int n);
+                IQ r;
+                for (int i = 0; i < n; i++) r.push_back(10*n + i);
+                return r;
+            endfunction
+            initial begin
+                q0 = {q0, mk(2)};
+                $display("a %0d %0d %0d %0d", q0.size(), q0[0].size(), q0[0][0], q0[0][1]);
+                q0 = {mk(1), q0};
+                $display("b %0d %0d %0d %0d", q0.size(), q0[0].size(), q0[0][0], q0[1][1]);
+                q0.push_back(mk(3));
+                $display("c %0d %0d %0d", q0.size(), q0[2].size(), q0[2][2]);
+                q0 = {q0, q0};
+                $display("d %0d %0d %0d %0d", q0.size(), q0[3].size(), q0[5][2], q0[4][1]);
+                foreach (q0[i]) begin
+                    $write("q0[%0d]:", i);
+                    for (int j = 0; j < q0[i].size(); j++) $write(" %0d", q0[i][j]);
+                    $display("");
+                end
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a 1 2 20 21\n"
+                              "b 2 1 10 21\n"
+                              "c 3 3 32\n"
+                              "d 6 1 32 21\n"
+                              "q0[0]: 10\n"
+                              "q0[1]: 20 21\n"
+                              "q0[2]: 30 31 32\n"
+                              "q0[3]: 10\n"
+                              "q0[4]: 20 21\n"
+                              "q0[5]: 30 31 32\n");
+}
+
+TEST_CASE("mixed nesting: concatenating a dynamic array into a queue of dynamic arrays or of queues") {
+    // The same element-vs-splice rule for a queue of dynamic arrays (`mkd(2)`
+    // is one element of `qd`), a dynamic array of queues built element-wise,
+    // and a dynamic-array VARIABLE converting into a queue-of-queues element
+    // (push_back and concatenation): the array-into-queue copy, not a read of
+    // the dynamic array's storage as an rt_queue. Expectations worked from the LRM by hand.
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int IQ[$];
+            typedef int ID[];
+            IQ q0[$];
+            ID qd[$];
+            IQ dq[];
+            int dv[];
+            function automatic IQ mk(int n);
+                IQ r;
+                for (int i = 0; i < n; i++) r.push_back(10*n + i);
+                return r;
+            endfunction
+            function automatic ID mkd(int n);
+                ID r;
+                r = new[n];
+                foreach (r[i]) r[i] = 100*n + i;
+                return r;
+            endfunction
+            initial begin
+                qd = {qd, mkd(2)};
+                qd = {mkd(1), qd};
+                qd.push_back(mkd(3));
+                qd = {qd, qd};
+                $display("qd %0d %0d %0d %0d", qd.size(), qd[0][0], qd[1][1], qd[5][2]);
+                dq = new[2];
+                dq[0] = mk(2);
+                dq[1] = mk(1);
+                $display("dq %0d %0d %0d %0d", dq.size(), dq[0][1], dq[1][0], dq[1].size());
+                dv = new[2];
+                dv[0] = 7;
+                dv[1] = 8;
+                q0.push_back(dv);
+                q0 = {q0, dv};
+                $display("dv %0d %0d %0d %0d", q0.size(), q0[0].size(), q0[1][1], q0[0][0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "qd 6 100 201 302\n"
+                              "dq 2 21 10 1\n"
+                              "dv 2 2 8 7\n");
+}
+
 TEST_CASE("an out-of-range nested container element is empty, and writes to it vanish") {
     // LRM 7.4.5 through a container-valued element: the read is the type's default
     // (an EMPTY container), and a mutating method on it must not touch the heap
