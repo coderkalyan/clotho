@@ -13,23 +13,15 @@ it outright), unpacked-struct-member actual (needs struct support), function
 
 Two decisions differ from / refine the sketch below; both for correctness.
 
-**Uniform-packed one-pointer ABI (not narrow-by-type).** A ref formal is passed
-as one pointer to the actual's `{ i(2W), iW }` slot, and both the ref formal's
-frame slot and any ref-actual signal / frame-local are *forced packed* (`has_z`,
-non-narrow) — even for a 2-state type. Rationale: a narrow-by-type formal (`{iW}`
-for 2-state) silently corrupts the may plane when the *actual* is independently
-forced packed by another constraint — e.g. a 2-state signal that is also a task
-out/inout target keeps `{i2W,iW}` storage; a narrow-formal store of `iW` into its
-field 0 overwrites the must half and leaves the may half stale, so other packed
-readers see spurious x. Uniform-packed sidesteps this and is consistent with the
-existing subroutine ABI, which already passes every formal packed (the narrow
-form is a storage optimization, not a call-ABI one). Cost: a 2-state ref actual's
-storage carries the redundant may/z halves; instcombine folds the traffic.
-Forcing is via `ref_actual_targets()` (signals) and the extended
-`frame_out_targets()` (locals), OR'd into `has_z` / non-narrow exactly like the
-task out/inout keep-z marking. z-elision is made ref-aware (`ZElision.cpp`):
-a ref formal reads the actual's z on entry and writes its z back live, i.e. it is
-analyzed like a task inout.
+**One-pointer ABI, canonical type-derived shape.** A ref formal is passed as one
+pointer to the actual's slot, and the ref formal's frame slot and any ref-actual
+signal / frame-local all take the CANONICAL type-derived shape (`{ iW }` for a
+2-state type, `{ i(2W), iW }` for a 4-state one), whatever else is true of the
+actual: the callee addresses the slot by its formal's type alone, so the two
+sides agree only if the actual is shaped by type as well (data-model.md §3.2).
+Cost: a 4-state ref actual keeps its z word even where the may-z analysis could
+have elided it. z-elision is ref-aware: a ref formal reads the actual's z on
+entry and writes its z back live, i.e. it is analyzed like a task inout.
 
 **Sensitivity waking is serviced at the call site.** A blocking write through a
 ref is a write to the actual, so it must service the actual signal's wait queue.

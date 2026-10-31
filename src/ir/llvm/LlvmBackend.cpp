@@ -2,6 +2,9 @@
 
 #include "ir/llvm/Backend.h"
 
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+
 #include "ir/Verify.h"
 
 namespace clotho::ir {
@@ -263,9 +266,44 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     if (built.modules.empty()) {
         return false;
     }
-    for (const auto& mod : built.modules) {
-        mod->print(os, nullptr);
+    // One linked module, as emit_object writes: the unit modules are separate
+    // llvm::Modules, and printing each in turn gives a file llvm-as rejects at the
+    // second `; ModuleID`.
+    //
+    // The modules are first reloaded into a fresh context (a bitcode round trip,
+    // as run_jit does). Linked inside the context that built them, the IR mover
+    // finds each unit's named state types still held by the source modules and
+    // gives the linked copies no name -- `%0 = type { %1, %1 }` for what was
+    // `%alu.state` -- which is the readable part of this output. In a fresh
+    // context the names are free.
+    std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
+    std::vector<std::string>                names;
+    for (size_t i = 0; i < built.modules.size(); ++i) {
+        llvm::raw_svector_ostream bits(bitcode[i]);
+        llvm::WriteBitcodeToFile(*built.modules[i], bits);
+        names.push_back(built.modules[i]->getModuleIdentifier());
     }
+    built.modules.clear();
+    llvm::LLVMContext             linked_ctx;
+    std::unique_ptr<llvm::Module> root;
+    for (size_t i = 0; i < bitcode.size(); ++i) {
+        const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
+        auto                        parsed = llvm::parseBitcodeFile(buf, linked_ctx);
+        if (!parsed) {
+            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
+            return false;
+        }
+        if (i == 0) {
+            root = std::move(*parsed);
+            continue;
+        }
+        // Reports its own diagnostic through the context's handler.
+        llvm::Linker linker(*root);
+        if (linker.linkInModule(std::move(*parsed))) {
+            return false;
+        }
+    }
+    root->print(os, nullptr);
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
     }

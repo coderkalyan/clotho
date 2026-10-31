@@ -1,9 +1,13 @@
 #include <doctest/doctest.h>
 
+#include <cstdio>
+#include <string>
 #include <string_view>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Analysis.h"
+#include "ir/Jit.h"
 
 using namespace clotho;
 
@@ -37,6 +41,37 @@ Analyzed analyze(std::string_view source) {
     a.may_z = ir::analyze(*a.lowered.module).may_z;
 
     return a;
+}
+
+// JIT-run a module and return what it wrote to stdout.
+std::string run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
 }
 
 } // namespace
@@ -344,4 +379,164 @@ TEST_CASE("a scanf z reaching a signal through a function local is seeded") {
         endmodule
     )");
     CHECK(a.z("s"));
+}
+
+TEST_CASE("a 2-state target takes the must plane alone, so a conversion clears z") {
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [3:0] w = 4'bz01x;
+            bit   [3:0] b;
+            bit   [3:0] arr [0:1];
+            logic [3:0] widened;
+            initial begin
+                b       = w;
+                arr[1]  = w;
+                widened = b;
+            end
+        endmodule
+    )");
+    CHECK(a.z("w"));
+    // LRM 6.3.1: x and z become 0, so what a 2-state signal holds has no z plane,
+    // and neither has anything it is widened back to.
+    CHECK(!a.z("b"));
+    CHECK(!a.z("arr"));
+    CHECK(!a.z("widened"));
+}
+
+TEST_CASE("a constant table's image seeds z for every signal read from it") {
+    const Analyzed a = analyze(R"(
+        typedef struct { int n; logic [3:0] f; } s_t;
+        module top;
+            localparam logic [3:0] ZT[0:1] = '{4'bzzzz, 4'h5};
+            localparam logic [3:0] CT[0:1] = '{4'h1, 4'h5};
+            localparam s_t         ZS[0:1] = '{'{1, 4'bx01z}, '{3, 4'hF}};
+            localparam s_t         CS[0:1] = '{'{1, 4'h2}, '{3, 4'hF}};
+            logic [3:0] from_zt, from_ct, from_zs, from_cs;
+            int i;
+            initial begin
+                i       = 0;
+                from_zt = ZT[i];
+                from_ct = CT[i];
+                from_zs = ZS[i].f;
+                from_cs = CS[i].f;
+            end
+        endmodule
+    )");
+    // The table is never stored to, so the fixpoint cannot see its image: the
+    // analysis reads the image itself, through a flat table and a struct table.
+    CHECK(a.z("from_zt"));
+    CHECK(!a.z("from_ct"));
+    CHECK(a.z("from_zs"));
+    CHECK(!a.z("from_cs"));
+}
+
+TEST_CASE("a 4-state member read from a container element of an unpacked struct may carry z") {
+    const Analyzed a = analyze(R"(
+        typedef struct { logic [3:0] f; } fs_t;
+        typedef struct { int n; } ns_t;
+        module top;
+            fs_t fq[$];
+            fs_t fd[];
+            fs_t fa[int];
+            ns_t nq[$];
+            logic [3:0]  from_q, from_d, from_a;
+            logic [31:0] from_n;
+            initial begin
+                from_q = fq[0].f;
+                from_d = fd[0].f;
+                from_a = fa[1].f;
+                from_n = nq[0].n;
+            end
+        endmodule
+    )");
+    // An unpacked struct has no plane layout of its own, so the element's domain
+    // is read off its leaves, not off Layout.
+    CHECK(a.z("from_q"));
+    CHECK(a.z("from_d"));
+    CHECK(a.z("from_a"));
+    CHECK(!a.z("from_n"));
+}
+
+TEST_CASE("$sscanf seeds a 4-state member of an unpacked struct") {
+    const Analyzed a = analyze(R"(
+        typedef struct { logic [3:0] f; bit [3:0] g; } s_t;
+        module top;
+            s_t         st;
+            logic [3:0] fwd;
+            int         n;
+            initial begin
+                n   = $sscanf("zzzz", "%b", st.f);
+                fwd = st.f;
+            end
+        endmodule
+    )");
+    CHECK(a.z("fwd"));
+}
+
+TEST_CASE("an exported subroutine's 4-state input and inout formals are seeded: C can pass z") {
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [7:0] s4, io4, o4;
+            bit   [7:0] s2;
+            export "DPI-C" function set4;
+            export "DPI-C" function set2;
+            function void set4(input logic [7:0] v, inout logic [7:0] x, output logic [7:0] y);
+                s4  = v;
+                io4 = x;
+                y   = 8'h01;
+            endfunction
+            function void set2(input bit [7:0] v);
+                s2 = v;
+            endfunction
+            initial o4 = 8'h00;
+        endmodule
+    )");
+    CHECK(a.z("s4"));
+    CHECK(a.z("io4"));
+    CHECK(!a.z("s2"));
+}
+
+// The facts above decide a slot's layout, and a wrong "never z" is a silent wrong
+// value. These run the designs, so a lost z shows up as the x it decays to.
+TEST_CASE("z read out of a constant table, a container element or a scanf target survives") {
+    constexpr std::string_view src = R"(
+        typedef struct { int n; logic [3:0] f; } t_t;
+        typedef struct { logic [3:0] f; } s_t;
+        module top;
+            localparam logic [3:0] X[0:3] = '{4'b10x1, 4'bzzzz, 4'h5, 4'bx0z1};
+            localparam t_t         P[0:1] = '{'{1, 4'bx01z}, '{3, 4'hF}};
+            s_t   q[$];
+            s_t   d[];
+            s_t   a[int];
+            s_t   st;
+            logic [3:0] v, vq, vd, va, vs;
+            integer i, n;
+            initial begin
+                for (i = 0; i < 4; i = i + 1) begin
+                    v = X[i];
+                    $write("%b ", v);
+                end
+                $write("\n");
+                for (i = 0; i < 2; i = i + 1) begin
+                    v = P[i].f;
+                    $write("%b ", v);
+                end
+                $write("\n");
+                q.push_back('{f: 4'bz1x0});
+                d = new[1];
+                d[0].f = 4'b1zx0;
+                a[3].f = 4'bzz01;
+                n = $sscanf("1z0x", "%b", st.f);
+                vq = q[0].f;
+                vd = d[0].f;
+                va = a[3].f;
+                vs = st.f;
+                $display("%b %b %b %b", vq, vd, va, vs);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "10x1 zzzz 0101 x0z1 \n"
+          "x01z 1111 \n"
+          "z1x0 1zx0 zz01 1z0x\n");
 }

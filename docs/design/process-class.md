@@ -296,10 +296,10 @@ which is exactly how long the LRM lets a program read `FINISHED`.
 
 `pcb->obj` is a **weak** slot: it is not a root, so an object whose handle the
 program has dropped is collected normally, and the object's finalizer
-(`clotho.classfini.process`, the existing per-class finalizer mechanism,
-`:2082-2131`) clears `pcb->obj` and drops the count. A later `self()` then makes a
-fresh object — unobservable, because the program no longer holds the old one. This
-asymmetry (object → block strong, block → object weak) is what keeps the pair
+(`clotho.classfini.<Ref>`, the existing per-class finalizer mechanism) calls
+`rt_proc_obj_release`, which clears `pcb->obj` and drops the count. A later `self()`
+then makes a fresh object — unobservable, because the program no longer holds the old
+one. This asymmetry (object → block strong, block → object weak) is what keeps the pair
 acyclic; making the memo strong would leak every named thread's object for the run.
 
 No generation counter is needed anywhere, which is the one place this differs from
@@ -307,11 +307,13 @@ No generation counter is needed anywhere, which is the one place this differs fr
 because that object holds a count. The stale-handle class of bug the generation
 half exists to catch cannot arise.
 
-**`--gc off`**: the finalizer never runs, so a `process` object leaks and its
-block's count never drops — identity stays stable and nothing is recycled. That is
-the same trade every class body already makes (`ir/llvm/Inst.cpp, lower_inst`: "With
---gc off the lifetime is leaked, which LRM 8.4 makes observably correct"), and it is
-bounded by the number of distinct threads that called `self()`.
+The object is allocated from the collected heap like any class body (`emit_proc_object`),
+so it reaches the collector through every location a class handle can sit in: design
+state, a class property, a container element, a heap capture box, and a frame word. A
+body that calls `process::self()` registers its coroutine frame for that last case
+(`ir_may_hold_gc_ref`). The pool's high-water mark (`rt_proc_pool_blocks`) therefore follows
+the threads whose object no collection has reclaimed yet, not the threads ever spawned;
+`tests/gc_test.cpp` pins it over 12000 fork children.
 
 One rule the emitted code must obey: do not cache a control-block pointer across a
 suspend if it came from a *pool* chunk — chunks are stable, but a released and
@@ -1020,27 +1022,23 @@ citing them rather than the summary line:
   `tests/fork_test.cpp`, 39 cases, reports **384 bytes in 6 allocations and no pool
   chunk at all**, which is also the check that the V4 capture boxes are collected:
   a per-capture leak would show up there first.
-  Class bodies still leak on this branch by direction (`ir/llvm/Inst.cpp`,
-  `ClassNew`: "with --gc off the lifetime is leaked, which LRM 8.4 makes observably
-  correct"), and a `process` object is a class body.
+  These figures predate the collector, when class bodies -- and so `process` objects --
+  leaked by direction; the object is collected now (§4.2).
 - **The freelist demonstrably works.** 2000 spawn / `disable fork` cycles whose
   children never call `self()` leak *16 bytes in 1 allocation* -- one chunk's worth of
   blocks, recycled 2000 times. The same 2000 cycles where each child DOES call
-  `self()` leak one block per child, because the object that names it leaks and a
-  named block cannot be recycled. That is the `--gc off` cost of §4.2 stated as a
-  measurement rather than a claim, and it is what the collector removes.
+  `self()` leaked one block per child while the object that names the block was never
+  collected, because a named block cannot be recycled. The finalizer of §4.2 removes
+  that term, and `tests/gc_test.cpp` (section 8) pins the pool's high-water mark over
+  12000 such children.
+
+**Landed with the collected object:** `tests/gc_test.cpp` section 8 holds a `process`
+handle in design state, a class property, a queue, an associative array, a suspended
+frame and a heap capture box, under both collection cadences, and checks that `self()`
+keeps naming the same object while a handle exists.
 
 **Still owed:**
 
-- **The three GC modes.** `tests/gc_test.cpp`'s `check_all_gc_modes` harness is the
-  right vehicle once the collector is in the tree -- it is not on this branch. A
-  `process` object is an ordinary class body, so Off/On/Stress must all pass, and a
-  stress run is what would catch one collected while its thread is live. The control
-  block itself is native and untraced, so the collector cannot reach the tree at all
-  (§4.1), which is what makes this a check rather than a risk. The object's finalizer
-  clearing `pcb->obj` (§4.2) is the one piece of the design that only exists on paper
-  until then -- with no collector, the memo is never cleared, which is why the leak
-  above is per named thread rather than per live one.
 - **A UVM-shaped integration case**, once `process q[$]` is expressible (it inherits
   the container class-handle refusal, §11 hazard 9).
 - **ASan + UBSan + LeakSanitizer**, which is what actually covers the fork-record

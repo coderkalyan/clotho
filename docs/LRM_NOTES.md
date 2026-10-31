@@ -526,6 +526,21 @@ Verilator both run the body zero times, and so does Clotho, with a
 
 Code: `src/lower/Statements.cpp` (`lower_foreach`). Tests: `tests/loop_test.cpp` ("foreach with no loop variables never runs its body and warns"). Oracle: iverilog 13 and Verilator 5.050 agree.
 
+## 48. Sorting reals that contain NaN (7.12.2)
+
+7.12.2 sorts "in ascending order" by the relational operators, and 6.12 only
+says a real is an IEEE 754 double. A comparison with NaN is false in IEEE 754, so
+`<` is not an ordering over a set that holds a NaN: a NaN is neither before nor
+after any number, and a comparison sort over that relation has no defined result
+(`std::sort` is undefined, and the numbers around the NaN come out misordered).
+Clotho orders NaN after every number and treats all NaNs as equal, so `sort` puts
+NaNs last and `rsort`, the mirror, puts them first. The numbers themselves always
+come out in order. The runtime sort is unstable among equal NaNs and numbers
+(equal elements are byte-equal there); a `with` clause sort is stable, so equal
+NaN keys keep their input order.
+
+Code: `src/runtime/Containers.cpp` (`slot_less`), `src/lower/Sort.cpp` (`sort_right_wins`). Tests: `tests/array_ordering_test.cpp` ("sorting reals with a NaN orders the numbers and puts NaN last", "sorting by a real key with a NaN"). Oracle: none; the LRM does not say, and iverilog does not implement these methods on reals.
+
 ## 49. Force and release of a net with a net delay (10.6.2, 10.3.3, 28.16, 4.9.2)
 
 28.16 delays "the time it takes from any driver on the net changing value to the

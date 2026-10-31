@@ -1115,6 +1115,10 @@ llvm::FunctionCallee Backend::proc_obj_retain_fn() {
     return rt_fn("rt_proc_obj_retain", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+llvm::FunctionCallee Backend::proc_obj_release_fn() {
+    return rt_fn("rt_proc_obj_release", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::proc_await_self_fn() {
     return rt_fn("rt_proc_await_self", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
@@ -1180,6 +1184,10 @@ llvm::FunctionCallee Backend::intra_alloc_fn() {
     return rt_fn("rt_intra_alloc", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
 }
 
+llvm::FunctionCallee Backend::intra_alloc_rooted_fn() {
+    return rt_fn("rt_intra_alloc_rooted", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
 llvm::FunctionCallee Backend::intra_cb_fn() {
     return rt_fn("rt_intra_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
@@ -1198,6 +1206,10 @@ llvm::FunctionCallee Backend::intra_any_fn() {
 
 llvm::FunctionCallee Backend::intra_release_fn() {
     return rt_fn("rt_intra_release", b_.getVoidTy(), { b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::intra_release_rooted_fn() {
+    return rt_fn("rt_intra_release_rooted", b_.getVoidTy(), { b_.getInt32Ty() });
 }
 
 llvm::FunctionCallee Backend::intra_reset_fn() {

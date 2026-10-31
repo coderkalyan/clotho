@@ -86,8 +86,8 @@ them in step.
   owner that frees them, and the collector traces through them.
 - Every built-in handle kind (fork capture boxes, semaphores, mailboxes, process
   objects, events, covergroup instances) follows one discipline: a collected
-  object, with a finalizer for any native resource it owns. **Not yet:** per kind;
-  events are never freed and process objects are not released during a run.
+  object, with a finalizer for any native resource it owns. **Not yet:** events
+  are never freed.
 - The collector's design (heap organization, roots, generations, barriers,
   triggers, safepoints) is open for discussion.
 
