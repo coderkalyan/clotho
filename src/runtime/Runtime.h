@@ -2010,13 +2010,26 @@ void* rt_intra_alloc(uint32_t idx, uint32_t stride);
 // Wheel expiry callback: recover the record, link it onto its site's ready list,
 // and bump the global pending count. Shared by every deferred-store site; does
 // not touch design state (commit is the NBA region's job).
+//
+// A site's ready list is in the order its updates were created (LRM 4.6 b), 15.5.1): a
+// `#d` update when the delay elapses, an event-controlled one when its event occurs, a
+// plain NBA's copy and a zero delay when the statement executes. The records released by
+// one moment -- one wheel tick, one occurrence of an event (rt_intra_moment), the leaves
+// of one statement -- are a batch: they were created together and go in the order their
+// statements executed (`seq`). A batch goes behind every earlier one.
 void rt_intra_cb(rt_timer* timer, void* ctx);
 
 // Link a record onto its site's ready list at the moment its update is created by the
 // statement that filled it (a plain NBA copied there, or a zero delay): behind every
-// record already on the list, and ahead of any that matures later. The commit then
-// applies the records in list order. Does not touch design state.
+// record already on the list, as a batch of its own, ahead of any that matures later.
+// The commit then applies the records in list order. Does not touch design state.
 void rt_intra_now(void* rec);
+
+// Start a new release moment. Generated code calls it once per occurrence that can
+// release `<= @e` records: before the first of a signal change's edge buckets, and before
+// an event object's records are counted down. Records released with no call between
+// them are one batch (rt_intra_cb); the wheel never calls it, a tick being one moment.
+void rt_intra_moment(void);
 
 // Base (a `void**` array of record pointers) and length of site `idx`'s ready
 // list, read once in the NBA region to drive the backend-emitted commit loop.

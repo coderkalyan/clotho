@@ -1163,6 +1163,10 @@ void Backend::service_wait_queue(Signal       sig,
 void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
     const auto i = static_cast<uint32_t>(sig);
 
+    // One change is one release moment for the `<= @` records it matures, however many
+    // of the buckets below it satisfies.
+    emit_release_moment(sig, f);
+
     // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
     // bucket also fires on an LSB transition.
     const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
@@ -1249,6 +1253,40 @@ void Backend::service_change_notify(const LValue& lv,
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }
+}
+
+// Start a release moment (rt_intra_moment) when a change of `sig` satisfies an edge that
+// some `<= @(...)` control lists. The records its buckets mature were created together:
+// they commit in the order their statements executed, and behind every record an earlier
+// occurrence matured -- not in the order the Any, Positive and Negative buckets are
+// scanned, which counting once here, before the first of them, keeps out of it
+// (docs/design/intra-assignment-timing.md, "Order against plain NBAs"). A signal no
+// `<= @` control lists emits nothing.
+void Backend::emit_release_moment(Signal sig, const EdgeFacts& f) {
+    if (intra_trigger_edge_.empty()) {
+        return;
+    }
+    const auto&  listed = intra_trigger_edge_[static_cast<uint32_t>(sig)];
+    llvm::Value* hit    = nullptr;
+    const auto   add    = [&](Edge e, llvm::Value* fact) {
+        if (fact != nullptr && listed[static_cast<uint32_t>(e)]) {
+            hit = hit != nullptr ? b_.CreateOr(hit, fact) : fact;
+        }
+    };
+    add(Edge::Any, f.changed);
+    add(Edge::Positive, f.pos);
+    add(Edge::Negative, f.neg);
+    if (hit == nullptr) {
+        return;
+    }
+    auto* fn   = b_.GetInsertBlock()->getParent();
+    auto* body = llvm::BasicBlock::Create(ctx_, "moment.body", fn);
+    auto* cont = llvm::BasicBlock::Create(ctx_, "moment.cont", fn);
+    b_.CreateCondBr(hit, body, cont);
+    b_.SetInsertPoint(body);
+    b_.CreateCall(intra_moment_fn(), {});
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
 }
 
 // If (sig, edge) fires a `<= @e` deferred store, count down its records and
@@ -1474,6 +1512,10 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, llvm::Value*
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here.
     if (design_uses_event_triggers_) {
+        // One occurrence of the event is one release moment for the records it matures.
+        if (design_uses_intra_event_objs_) {
+            b_.CreateCall(intra_moment_fn(), {});
+        }
         emit_trigger_fire(trig_id != nullptr ? trig_id : b_.CreateCall(event_trig_id_fn(), { obj }));
     }
 }

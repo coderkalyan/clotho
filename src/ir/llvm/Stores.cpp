@@ -227,9 +227,11 @@ void Backend::nba_classify_ir(const Ir& ir) {
                 if (mod_.signals()[static_cast<uint32_t>(tr.signal)].is_event) {
                     // Waits on the event OBJECT (trigger_id_value), so it takes no
                     // dense id and needs no signal-edge detection.
-                    design_uses_event_triggers_ = true;
+                    design_uses_event_triggers_   = true;
+                    design_uses_intra_event_objs_ = true;
                     continue;
                 }
+                intra_trigger_edge_[static_cast<uint32_t>(tr.signal)][tr.edge] = true;
                 int32_t& tid = trigger_id_[static_cast<uint32_t>(tr.signal)][tr.edge];
                 if (tid < 0) {
                     tid = static_cast<int32_t>(n_triggers_++);
@@ -381,6 +383,7 @@ void Backend::nba_classify_ir(const Ir& ir) {
 // build_nba_state once widths are final.
 void Backend::nba_classify() {
     trigger_id_.assign(mod_.signals().size(), { -1, -1, -1 });
+    intra_trigger_edge_.assign(mod_.signals().size(), { false, false, false });
     for (const Process& p : mod_.processes()) {
         nba_classify_ir(p.ir);
     }
@@ -808,6 +811,9 @@ void Backend::emit_nba_service(Signal       sig,
     const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, /*four_state=*/!narrow, old_z,
                                         new_z, /*need_pos=*/true, /*need_neg=*/true,
                                         /*need_any=*/true);
+    // One change is one release moment for the `<= @` records it matures, however many
+    // of the buckets below it satisfies.
+    emit_release_moment(sig, f);
     const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
         std::make_pair(static_cast<uint32_t>(Edge::Any), f.changed),
         std::make_pair(static_cast<uint32_t>(Edge::Positive), f.pos),
@@ -2065,21 +2071,20 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     b_.SetInsertPoint(contb);
 }
 
-// A plain NBA to a signal that also takes `<= #d` / `<= @e`. NBAs are performed in the
-// order the statements were executed (LRM 4.6 b), 10.4.2), and this write is later than
-// every deferred update of the signal whose delay elapsed or whose event occurred
+// A plain NBA to a signal that also takes `<= #d` / `<= @e`. NBA updates are performed in
+// the order they were created (LRM 4.6 b), 10.4.2, 15.5.1; docs/LRM_NOTES.md, note 51): a
+// plain NBA's is created when it executes, a timed one's when its delay elapses or its
+// event occurs. So this write is later than every deferred update of the signal released
 // before it executed: those records are already on the ready list. But the write stages
 // into the block shadow (or the array / aggregate queue), which commits BEFORE the
 // ready list, so left alone it would lose to them. When such a record is waiting, also
 // copy the write onto the list behind it: the record carries the value and mask the
 // staged write used, so replaying it re-applies exactly the bits this write selects.
 //
-// The staged write itself is unchanged, which keeps the order against a record that
-// matures AFTER this write executed as it was, with the record last. The LRM text does
-// not say which is later there -- the statement that was armed first, or the update
-// scheduled by the later occurrence (docs/design/intra-assignment-timing.md, "Order
-// against plain NBAs") -- so nothing is decided for it here. A write executed while no
-// record is waiting anywhere costs one load of rt_intra_total.
+// The staged write itself is unchanged: a record released AFTER this write executed goes
+// behind it on the list (its batch is later, intra_ready_push), so the write commits first
+// and the update after it, as creation order says. A write executed while no record is
+// waiting anywhere costs one load of rt_intra_total.
 void Backend::emit_intra_nba_ordered(const LValue& lv, Plane rhs) {
     if (lv.wide_dyn) {
         // TODO: a runtime-offset select of a very wide vector stages through

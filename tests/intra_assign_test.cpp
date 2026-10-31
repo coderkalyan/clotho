@@ -1434,26 +1434,33 @@ TEST_CASE("an event triggered through a handle matures an event-controlled updat
 }
 
 // ---------------------------------------------------------------------------------------
-// Order of a timed nonblocking update against plain NBAs to the same signal.
+// Order of a timed nonblocking update against plain NBAs to the same signal, and against
+// other timed updates.
 //
-// LRM 4.6 b): "NBAs shall be performed in the order the statements were executed", and
-// 10.4.2: "if there is clear ordering of the execution of a set of nonblocking
-// assignments, then the order of the resulting updates of the destination of the
-// nonblocking assignments shall be the same as the ordering of the execution". A plain
-// `x <= w` executed after the statement `x <= @e v` was armed AND after its event
-// occurred is later than the update on both counts, so it is performed after it and
-// wins. The update used to commit after every plain NBA of the step, so it won.
+// The rule (docs/LRM_NOTES.md, note 51; docs/design/intra-assignment-timing.md, "Order
+// against plain NBAs"): an update is created when its statement executes (a plain NBA, a zero
+// delay), when its delay elapses (`<= #d`) or when its event occurs (`<= @e`), and NBA
+// updates are performed in the order they were created. LRM 4.6 b): "NBAs shall be
+// performed in the order the statements were executed"; 10.4.2: "if there is clear ordering
+// of the execution of a set of nonblocking assignments, then the order of the resulting
+// updates of the destination of the nonblocking assignments shall be the same as the
+// ordering of the execution"; 15.5.1, of `->>`: it "creates a nonblocking assign update
+// event in the time in which the delay control expires or the event control occurs".
+// Updates created at one moment (one wheel tick, one occurrence of an event, the leaves of
+// one statement) are ordered by the execution of their statements.
 //
-// Only that determinate half is pinned here. Where the plain NBA executes between the
-// arm and the occurrence the LRM text does not say which update is "earlier" (see the
-// last test and docs/design/intra-assignment-timing.md, "Order against plain NBAs").
+// A plain `x <= w` executed after the statement `x <= @e v` was armed AND after its event
+// occurred is later than the update on every reading, so it is performed after it and wins.
+// The update used to commit after every plain NBA of the step, so it won. The groups that
+// follow pin the rule where the readings differ (LRM_NOTES note 51, "undecided").
 //
-// Oracle: the LRM clauses above. iverilog 13 agrees on every design below it can run (it
-// has no unpacked structs): it applies the update in the active region, so every plain
-// NBA of the step wins, which is right here and wrong when one runs before the arm (see
-// "the update wins over a plain NBA that executed before it was armed"). Verilator 5.050
-// orders by source position: it agrees where the arming statement is first in the file,
-// and prints the other answer when an earlier `initial` runs `-> e; x <= 2;`.
+// Oracle: the LRM clauses above. iverilog 13 applies an event-controlled update in the
+// active region at the occurrence, so every plain NBA of the step wins: it agrees on each
+// design here it can run (it has no unpacked structs) and is wrong when a plain NBA runs
+// before the occurrence (see "a plain NBA executed before the event commits before the
+// update"). Verilator 5.050 orders by source position: it agrees where the arming statement
+// is first in the file, and prints the other answer when an earlier `initial` runs
+// `-> e; x <= 2;`.
 // ---------------------------------------------------------------------------------------
 TEST_CASE("a plain NBA executed after the trigger commits after an event-controlled update") {
     SUBCASE("named event, the trigger a step after the arm") {
@@ -1975,30 +1982,294 @@ TEST_CASE("the update wins over a plain NBA that executed before it was armed") 
         endmodule)") == "x=1\n");
 }
 
-// OPEN LRM QUESTION, pinned as a snapshot of Clotho's behavior and not as evidence of
-// correctness: a plain NBA executed AFTER the statement was armed but BEFORE its event
-// occurs. If an NBA is ordered by when its statement executed (4.6 b), 10.4.2: "the
-// order of the execution of distinct nonblocking assignments") the plain write is later
-// and wins; if by when the update is scheduled (15.5.4, for `->>`: "creates a
-// nonblocking assign update event in the time in which the delay control expires or the
-// event control occurs") the update is later and wins. The clauses do not choose.
-// Clotho commits the update last. iverilog 13 and Verilator 5.050 print the other
-// answer here, but iverilog applies the update in the active region, and Verilator's
-// answer follows source position: it prints 1 when the arming statement is in a later
-// `initial` than the plain write and the trigger.
-TEST_CASE("snapshot: a plain NBA between the arm and the trigger") {
-    CHECK(run_capture_finish(R"(
-        module m;
-            logic [7:0] x = 0; event e;
-            initial begin
-                x <= @e 8'd1;
-                #1;
-                x <= 8'd2;
-                -> e;
-                #1 $display("x=%0d", x);
-                $finish;
-            end
-        endmodule)") == "x=1\n");
+// LRM_NOTES note 51, first undecided case: a plain NBA executed AFTER the statement was armed
+// but BEFORE its event occurs. 4.6 b) orders NBAs by the execution of their statements,
+// which would put the plain write last; 15.5.1 creates the update when the event occurs,
+// which puts the update last. Clotho applies 15.5.1 throughout (one rule, independent of
+// what else is written), so the update wins. Oracle: none that agrees; iverilog applies the
+// update at the occurrence and then the plain NBA, Verilator follows source position (it
+// prints 1 when the arming statement is in a later `initial` than the plain write and the
+// trigger).
+TEST_CASE("a plain NBA executed before the event commits before the update") {
+    SUBCASE("the plain write, then the trigger") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e;
+                initial begin
+                    x <= @e 8'd1;
+                    #1;
+                    x <= 8'd2;
+                    -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+    SUBCASE("the same, with the plain write in the instant of the arm") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e;
+                initial begin
+                    x <= @e 8'd1;
+                    x <= 8'd2;
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+}
+
+// LRM_NOTES note 51, second undecided case: two event-controlled updates whose events occur in
+// the opposite order to their statements. 10.4.2 ("the order of the resulting updates ...
+// shall be the same as the ordering of the execution") puts the update of the statement
+// executed first first; 15.5.1 creates each update when its event occurs. Clotho applies
+// 15.5.1: the update whose event occurred last is performed last. The answer used to
+// depend on an unrelated plain write to the same signal, which acted as a barrier.
+// Oracle: iverilog 13 applies each update at its occurrence and agrees on every design
+// here that has no `#d` update; Verilator 5.050 does not support `repeat` event controls.
+TEST_CASE("event-controlled updates commit in the order their events occurred") {
+    SUBCASE("two updates, events in reverse order") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    #1 -> e2; -> e1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+    SUBCASE("events in statement order") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    #1 -> e1; -> e2;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("array element, with and without a write to another element between the triggers") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] mem [4]; event e1, e2;
+                initial begin
+                    foreach (mem[k]) mem[k] = 0;
+                    mem[1] <= @e1 8'd1;
+                    mem[1] <= @e2 8'd2;
+                    #1 -> e2; -> e1;
+                    #1 $display("mem1=%0d", mem[1]);
+                    $finish;
+                end
+            endmodule)") == "mem1=1\n");
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] mem [4]; event e1, e2;
+                initial begin
+                    foreach (mem[k]) mem[k] = 0;
+                    mem[1] <= @e1 8'd1;
+                    mem[1] <= @e2 8'd2;
+                    #1 -> e2; mem[3] <= 8'd9; -> e1;
+                    #1 $display("mem1=%0d mem3=%0d", mem[1], mem[3]);
+                    $finish;
+                end
+            endmodule)") == "mem1=1 mem3=9\n");
+    }
+    SUBCASE("part-select, with and without a write to another bit between the triggers") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x[3:0] <= @e1 4'd1;
+                    x[3:0] <= @e2 4'd2;
+                    #1 -> e2; -> e1;
+                    #1 $display("x=%h", x);
+                    $finish;
+                end
+            endmodule)") == "x=01\n");
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x[3:0] <= @e1 4'd1;
+                    x[3:0] <= @e2 4'd2;
+                    #1 -> e2; x[7] <= 1'b1; -> e1;
+                    #1 $display("x=%h", x);
+                    $finish;
+                end
+            endmodule)") == "x=81\n");
+    }
+    SUBCASE("a concatenation: the leaves of one statement are released together") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [3:0] a = 0, b = 0; event e1, e2;
+                initial begin
+                    {a, b} <= @e1 8'h12;
+                    {a, b} <= @e2 8'h34;
+                    #1 -> e2; -> e1;
+                    #1 $display("a=%h b=%h", a, b);
+                    $finish;
+                end
+            endmodule)") == "a=1 b=2\n");
+    }
+    SUBCASE("repeat(2) matures on the second occurrence, after a single-count update") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e;
+                initial begin
+                    x <= repeat (2) @e 8'd1;
+                    x <= @e 8'd2;
+                    #1 -> e; -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+    SUBCASE("edges raised by blocking stores") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; logic a = 0, b = 0;
+                initial begin
+                    x <= @(posedge a) 8'd1;
+                    x <= @(posedge b) 8'd2;
+                    #1 b = 1; a = 1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+    SUBCASE("edges raised by nonblocking updates committed in one pass") {
+        // The update of `b` was executed first, so it commits first and releases first.
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; logic a = 0, b = 0;
+                initial begin
+                    x <= @(posedge a) 8'd1;
+                    x <= @(posedge b) 8'd2;
+                    #1 b <= 1; a <= 1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
+}
+
+// Updates created at one moment are ordered by the execution of their statements. One
+// value change of a signal is one moment however many controls it satisfies, so `@(c)` and
+// `@(posedge c)` records released by it keep statement order whichever kind comes first,
+// rather than the order of the buckets the runtime scans.
+TEST_CASE("updates released by one change keep the order of their statements") {
+    SUBCASE("the posedge control first") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; logic c = 0;
+                initial begin
+                    x <= @(posedge c) 8'd1;
+                    x <= @(c) 8'd2;
+                    #1 c = 1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("the any-change control first") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; logic c = 0;
+                initial begin
+                    x <= @(c) 8'd1;
+                    x <= @(posedge c) 8'd2;
+                    #1 c = 1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("one occurrence of a named event") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e;
+                initial begin
+                    x <= @e 8'd1;
+                    x <= @(e) 8'd2;
+                    x <= @e 8'd3;
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=3\n");
+    }
+}
+
+// A `<= #d` update is created when its delay elapses, at the start of the instant before any
+// process runs, so it precedes an event-controlled update released in that instant whichever
+// statement was executed first. (4.6 b) alone would order the first case by execution; the
+// 15.5.1 reading of LRM_NOTES note 51 orders both by creation.) iverilog applies the event's
+// update in the active region and the delayed one in the NBA region, and prints 1 for both.
+TEST_CASE("a delayed update precedes an event-controlled one released in its instant") {
+    SUBCASE("the event-controlled statement executed first") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e;
+                initial begin
+                    x <= @e 8'd2;
+                    x <= #1 8'd1;
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("the delayed statement executed first") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e;
+                initial begin
+                    x <= #1 8'd1;
+                    x <= @e 8'd2;
+                    #1 -> e;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+}
+
+// A plain NBA between two releases is later than the first and earlier than the second.
+// Guards the order the copy gives (the unresolved readings agree here).
+TEST_CASE("a plain NBA between two releases commits between their updates") {
+    SUBCASE("the first release, the plain write, the second release") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    #1 -> e1; x <= 8'd3; -> e2;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=2\n");
+    }
+    SUBCASE("the other way round") {
+        CHECK(run_capture_finish(R"(
+            module m;
+                logic [7:0] x = 0; event e1, e2;
+                initial begin
+                    x <= @e1 8'd1;
+                    x <= @e2 8'd2;
+                    #1 -> e2; x <= 8'd3; -> e1;
+                    #1 $display("x=%0d", x);
+                    $finish;
+                end
+            endmodule)") == "x=1\n");
+    }
 }
 
 // The deferred record cannot encode a runtime-offset select of a vector wider than

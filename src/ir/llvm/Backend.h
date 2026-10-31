@@ -1858,6 +1858,8 @@ private:
     void fire_event_trigger(Signal sig, uint32_t edge);
     void emit_trigger_fire(llvm::Value* trig_id);
 
+    void emit_release_moment(Signal sig, const EdgeFacts& f);
+
     llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig);
 
     void service_static_queue(Signal sig, uint32_t edge);
@@ -2351,6 +2353,7 @@ private:
     llvm::FunctionCallee intra_alloc_rooted_fn();
     llvm::FunctionCallee intra_cb_fn();
     llvm::FunctionCallee intra_now_fn();
+    llvm::FunctionCallee intra_moment_fn();
     llvm::Constant*      intra_total_gv();
     llvm::FunctionCallee intra_ready_base_fn();
     llvm::FunctionCallee intra_ready_count_fn();
@@ -4268,6 +4271,10 @@ private:
     // control. An event wakes through its object, not a signal edge, so every event
     // fire then also counts down the records registered on that object's trigger id.
     bool design_uses_event_triggers_ = false;
+    // True when some `x <= @e v` names a declared event, so an event fire also starts a
+    // release moment (rt_intra_moment) for the records it matures. A design with only
+    // `->> @(e) f` emits none.
+    bool design_uses_intra_event_objs_ = false;
     // Head of the NBA pending chain (clotho.event_pend_head).
     llvm::GlobalVariable*                              event_pend_head_gv_ = nullptr;
     // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).
@@ -4335,6 +4342,10 @@ private:
     // Indexed [signal][edge]; empty when the design has no `<= @e`.
     std::vector<std::array<int32_t, 3>> trigger_id_;
     uint32_t                            n_triggers_ = 0;
+    // Per (signal, edge): some `<= @(...)` control lists it, so a change that satisfies
+    // it starts a release moment (emit_release_moment). Unlike trigger_id_, a detached
+    // `->> @(x) e` subscription does not set it.
+    std::vector<std::array<bool, 3>> intra_trigger_edge_;
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant

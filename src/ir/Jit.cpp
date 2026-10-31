@@ -426,6 +426,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_intra_alloc_rooted", &rt_intra_alloc_rooted);
     expose("rt_intra_cb", &rt_intra_cb);
     expose("rt_intra_now", &rt_intra_now);
+    expose("rt_intra_moment", &rt_intra_moment);
     expose("rt_intra_ready_base", &rt_intra_ready_base);
     expose("rt_intra_ready_count", &rt_intra_ready_count);
     expose("rt_intra_any", &rt_intra_any);

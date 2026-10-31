@@ -540,3 +540,42 @@ come out in order. The runtime sort is unstable among equal NaNs and numbers
 NaN keys keep their input order.
 
 Code: `src/runtime/Containers.cpp` (`slot_less`), `src/lower/Sort.cpp` (`sort_right_wins`). Tests: `tests/array_ordering_test.cpp` ("sorting reals with a NaN orders the numbers and puts NaN last", "sorting by a real key with a NaN"). Oracle: none; the LRM does not say, and iverilog does not implement these methods on reals.
+
+## 51. Order of a timed nonblocking update against other nonblocking updates (4.6, 10.4.2, 15.5.1)
+
+4.6 b) says "NBAs shall be performed in the order the statements were executed", and
+10.4.2 that "if there is clear ordering of the execution of a set of nonblocking
+assignments, then the order of the resulting updates of the destination of the
+nonblocking assignments shall be the same as the ordering of the execution". Neither
+says when the update of `x <= #d v` or `x <= @e v` is created, and so which of two
+statements was "executed" first once one is timed. 15.5.1 says it for `->>`: it
+"creates a nonblocking assign update event in the time in which the delay control
+expires or the event control occurs". Clotho applies that reading to `<=` as one rule:
+an update is created when its statement executes (a plain NBA, a zero delay), when its
+delay elapses (at the start of that instant, before any process runs) or when its event
+occurs, and updates are performed in the order they were created. Updates created at one
+moment, which is one wheel tick, one occurrence of an event (for a signal, one value
+change, however many edge controls it satisfies) or the leaves of one statement, are
+performed in the order their statements were executed.
+
+So a plain NBA executed after a timed update was created wins over it, and one executed
+before commits before it. Both are decided by every reading. Two cases are not, and the
+other reading, ordering by the execution of the statements, gives the other answer:
+
+- A plain NBA executed after the timed statement and before its update is created:
+  `x <= @e 1; #1; x <= 2; -> e;` ends with `x` 1. Ordering by execution gives 2.
+- Two event-controlled updates whose events occur in the opposite order to their
+  statements: `x <= @e1 1; x <= @e2 2; -> e2; -> e1;` ends with `x` 1, and so does the
+  same with a write to another bit or element in between. Ordering by execution gives 2.
+  A `<= #d` update and an event-controlled one released in its instant are the same case:
+  the delayed update is created first and the event's wins, whichever statement was
+  executed first.
+
+iverilog 13 applies an event-controlled update at the occurrence, in the active region.
+It agrees with Clotho for two event-controlled updates and wherever the plain NBA executes
+after the occurrence, and prints the other answer wherever a plain NBA executes before the
+occurrence or a `#d` update is involved. Verilator 5.050 orders by source position (swap
+the `initial` blocks of the first case and its answer changes) and does not support
+`repeat (n) @e`. Neither decides, so the choice is Clotho's, made once.
+
+Code: `src/runtime/Scheduler.cpp` (`intra_ready_push`, `rt_intra_now`, `rt_intra_moment`), `src/ir/llvm/Events.cpp` (`emit_release_moment`, `emit_event_fire`), `src/ir/llvm/Stores.cpp` (`emit_intra_nba_ordered`, `emit_nba_service`). Tests: `tests/intra_assign_test.cpp` ("a plain NBA executed before the event commits before the update", "event-controlled updates commit in the order their events occurred", "a delayed update precedes an event-controlled one released in its instant", "updates released by one change keep the order of their statements"). Oracle: none that decides; iverilog 13 and Verilator 5.050 differ as above.
