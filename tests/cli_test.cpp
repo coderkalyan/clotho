@@ -979,6 +979,39 @@ TEST_CASE("cli: --stat=unit-code shows twins that stage nonblocking writes into 
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code shows twins whose subroutines stage nonblocking writes sharing them") {
+    // The first block id of a subroutine's NBA writes is a field of the instance's
+    // record at the subroutine's ordinal, so the task and the function are one
+    // function each however many instances call them.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module drv(input int k);
+            int n = 0;
+            task automatic put(input int v);
+                n <= v;
+                #1;
+                n <= n + v;
+            endtask
+            function void set(input int v);
+                n <= v * 2;
+            endfunction
+            initial begin
+                #k;
+                put(10 * k);
+                #3 set(k);
+            end
+        endmodule
+        module top;
+            drv u0(1);
+            drv u1(5);
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "2 subroutines of multi-instance units over 4 instances' subroutines, 2 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

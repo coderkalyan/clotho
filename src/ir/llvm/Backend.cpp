@@ -372,13 +372,17 @@ std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
 // representative's did (a signal of another instance, written through a port or a
 // hierarchical name). A signal of no instance is the same one for everybody.
 std::vector<Backend::BlockCommit> Backend::shared_blocks(const SharedGroup& rep, uint32_t anchor) const {
+    return shared_blocks_of(group_unit_anchor_[rep.g], rep.block_lo, rep.block_hi, anchor);
+}
+
+std::vector<Backend::BlockCommit> Backend::shared_blocks_of(uint32_t rep_anchor, uint32_t block_lo, uint32_t block_hi,
+                                                            uint32_t anchor) const {
     std::vector<BlockCommit> blocks;
-    blocks.reserve(rep.block_hi - rep.block_lo);
-    const uint32_t rep_anchor = group_unit_anchor_[rep.g];
-    for (uint32_t b = rep.block_lo; b < rep.block_hi; ++b) {
+    blocks.reserve(block_hi - block_lo);
+    for (uint32_t b = block_lo; b < block_hi; ++b) {
         BlockCommit bc;
         for (const BlockSig& bs : block_commits_[b].sigs) {
-            const SignalSlot& s = slots_[static_cast<uint32_t>(bs.sig)];
+            const SignalSlot& s      = slots_[static_cast<uint32_t>(bs.sig)];
             Signal            mapped = bs.sig;
             if (s.anchor == rep_anchor) {
                 mapped = anchor_signals_[anchor][s.path.back()];
@@ -395,17 +399,43 @@ std::vector<Backend::BlockCommit> Backend::shared_blocks(const SharedGroup& rep,
 }
 
 // The record fills of those blocks' first ids, for an instance whose blocks
-// start at id `base`: the field of the same def-local process ordinal, in the
-// instance's own record.
+// start at id `base`: the field of the same def-local ordinal (a group's process
+// or a subroutine), in the instance's own record.
 std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> Backend::shared_fills(const SharedGroup& rep, uint32_t anchor,
                                                                             uint32_t base) const {
+    return shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, anchor, base);
+}
+
+std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> Backend::shared_fills_of(uint32_t block_lo, size_t fill_lo,
+                                                                               size_t fill_hi, uint32_t anchor,
+                                                                               uint32_t base) const {
     std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fills;
-    fills.reserve(rep.fill_hi - rep.fill_lo);
-    for (size_t f = rep.fill_lo; f < rep.fill_hi; ++f) {
+    fills.reserve(fill_hi - fill_lo);
+    for (size_t f = fill_lo; f < fill_hi; ++f) {
         const auto& fill = ctx_blk_fills_[f];
-        fills.emplace_back(anchor, std::get<1>(fill), base + (std::get<2>(fill) - rep.block_lo));
+        fills.emplace_back(anchor, std::get<1>(fill), base + (std::get<2>(fill) - block_lo));
     }
     return fills;
+}
+
+// An instance that runs the subroutine `rep` lowered registers the same NBA blocks
+// for its own signals, numbered from where the backend stands, and the record
+// fields that hold their first ids.
+void Backend::adopt_shared_blocks(const SharedSubroutine& rep, uint32_t anchor) {
+    const auto base = static_cast<uint32_t>(block_commits_.size());
+    for (BlockCommit& bc : shared_blocks_of(subroutine_home_[rep.f].anchor, rep.block_lo, rep.block_hi, anchor)) {
+        block_commits_.push_back(std::move(bc));
+    }
+    for (auto& fill : shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, anchor, base)) {
+        ctx_blk_fills_.push_back(std::move(fill));
+    }
+}
+
+void Backend::note_blocks(SharedSubroutine& s, uint32_t block_lo, size_t fill_lo) const {
+    s.block_lo = block_lo;
+    s.block_hi = static_cast<uint32_t>(block_commits_.size());
+    s.fill_lo  = fill_lo;
+    s.fill_hi  = ctx_blk_fills_.size();
 }
 
 // The definition unit's env for an anchored scope, created (with its

@@ -1230,6 +1230,8 @@ void Backend::lower_function(FunctionId id) {
     own_ctx_    = nullptr;
     ir_ = &f.ir;
     cur_fn_           = &f;
+    cur_sub_ordinal_  = subroutine_home_[static_cast<uint32_t>(id)].ordinal;
+    group_first_block_ = -1;
     // The body's LEXICAL home region (LRM 24.3.1): Reactive when reactive code
     // -- a program block, an assertion action block -- is what reaches it. Only
     // meaningful for a body one KIND of caller reaches; see reactive_home.
@@ -1380,6 +1382,7 @@ void Backend::lower_task(FunctionId id) {
     const BodyCtx   body_ctx(*this, f);
     ir_               = &f.ir;
     cur_fn_           = &f;
+    cur_sub_ordinal_  = subroutine_home_[static_cast<uint32_t>(id)].ordinal;
     // Same two answers a function's prologue records, and here they are the ones
     // that matter: a task suspends, so its park sites are where the home region
     // is actually spent. LRM 24.5's `module ... task T; #5; endtask` called from

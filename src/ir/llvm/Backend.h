@@ -1091,6 +1091,10 @@ struct Anchor {
     std::vector<uint32_t> cover_locals;
     uint32_t              ctx_dis_base = 0;
     uint32_t              ctx_cov_base = 0;
+    // The first NBA block id of each subroutine the instance defines, one i32 at
+    // ctx_subblk_base + the subroutine's ordinal in its unit (fn_locals), like a
+    // group's at its process ordinal (ctx_blk_base).
+    uint32_t              ctx_subblk_base = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -4928,6 +4932,9 @@ private:
     // First NBA block id of the function currently lowering (-1 until a block
     // opens); block_register keys its ctx-relative ids off it.
     int64_t group_first_block_ = -1;
+    // The ordinal in its unit of the subroutine being lowered, whose first NBA block
+    // id is the record field at Anchor::ctx_subblk_base + it.
+    uint32_t cur_sub_ordinal_ = 0;
     // (anchor, ctx field, first block id) triples main stores at startup.
     std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> ctx_blk_fills_;
     // The shared timer callback (pushes a woken handle onto the active queue) and
@@ -5244,7 +5251,24 @@ private:
         llvm::Function* fn;
         const char*     taint; // why it cannot be shared, or null when it can
         std::string     text;  // CodeText of fn, set by the first check
+        // The NBA blocks it registered and the record fills of their first ids (the
+        // function of every other instance repeats them for its own signals).
+        uint32_t block_lo = 0, block_hi = 0;
+        size_t   fill_lo = 0, fill_hi = 0;
     };
+
+    // shared_blocks / shared_fills for the blocks lowered in anchor `rep_anchor`, ids
+    // `block_lo`..`block_hi` and fills `fill_lo`..`fill_hi`.
+    std::vector<BlockCommit> shared_blocks_of(uint32_t rep_anchor, uint32_t block_lo, uint32_t block_hi,
+                                              uint32_t anchor) const;
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> shared_fills_of(uint32_t block_lo, size_t fill_lo,
+                                                                          size_t fill_hi, uint32_t anchor,
+                                                                          uint32_t base) const;
+    // What an instance that runs the function `rep` lowered registers for its own
+    // signals: its blocks and the record fills of their first ids.
+    void adopt_shared_blocks(const SharedSubroutine& rep, uint32_t anchor);
+    // The block/fill range a lowering from `block_lo` / `fill_lo` on registered.
+    void note_blocks(SharedSubroutine& s, uint32_t block_lo, size_t fill_lo) const;
     std::map<std::vector<uint64_t>, SharedSubroutine> subroutine_families_;
     // Cycles of subroutines shared as one family: the key of the cycle (its members'
     // keys in the unit's order) to its members, in that order.

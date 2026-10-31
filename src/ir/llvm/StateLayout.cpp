@@ -1213,6 +1213,7 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_prog_base        = a.ctx_proc_base + a.n_proc;
         a.ctx_dis_base         = a.ctx_prog_base + a.n_prog;
         a.ctx_cov_base         = a.ctx_dis_base + static_cast<uint32_t>(a.disable_locals.size());
+        a.ctx_subblk_base      = a.ctx_cov_base + static_cast<uint32_t>(a.cover_locals.size());
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1230,11 +1231,12 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), a.n_prog, i32);
             f.insert(f.end(), a.disable_locals.size(), i32);
             f.insert(f.end(), a.cover_locals.size(), i32);
+            f.insert(f.end(), a.fn_locals.size(), i32);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
-        assert(a.ctx_ty->getNumElements() == a.ctx_cov_base + a.cover_locals.size() &&
+        assert(a.ctx_ty->getNumElements() == a.ctx_subblk_base + a.fn_locals.size() &&
                "instances of one unit lay their records out alike");
     }
 }

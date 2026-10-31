@@ -482,6 +482,8 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
     llvm::Function* const      real_decl = fn_decls_[f];
     const std::vector<uint8_t> bound     = a.bind_used;
     const std::vector<uint8_t> fbound    = a.fbind_used;
+    const auto                 block_lo  = static_cast<std::ptrdiff_t>(block_commits_.size());
+    const auto                 fill_lo   = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
     env_                                 = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
     verifying_                           = true;
     share_active_                        = true;
@@ -496,6 +498,12 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
     env_                         = real_env;
     a.bind_used                  = bound;
     a.fbind_used                 = fbound;
+    std::vector<BlockCommit> own_blocks(std::make_move_iterator(block_commits_.begin() + block_lo),
+                                        std::make_move_iterator(block_commits_.end()));
+    block_commits_.erase(block_commits_.begin() + block_lo, block_commits_.end());
+    const std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> own_fills(ctx_blk_fills_.begin() + fill_lo,
+                                                                          ctx_blk_fills_.end());
+    ctx_blk_fills_.erase(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
 
     std::string differs;
     if (taint != nullptr) {
@@ -513,6 +521,26 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
         differs += "  " + CodeText::difference(CodeText(rep.fn), own_text);
     }
     rep.fn->setLinkage(linkage);
+    // The NBA blocks it registers for the instance, and the record fields that hold their
+    // first ids, against the ones the shared code's blocks give it.
+    const auto shared_bl = shared_blocks_of(subroutine_home_[rep.f].anchor, rep.block_lo, rep.block_hi, home.anchor);
+    const auto same_block = [](const BlockCommit& x, const BlockCommit& y) {
+        return x.sigs.size() == y.sigs.size() &&
+               std::equal(x.sigs.begin(), x.sigs.end(), y.sigs.begin(), [](const BlockSig& p, const BlockSig& q) {
+                   return p.sig == q.sig && p.dynamic == q.dynamic && p.mask.getBitWidth() == q.mask.getBitWidth() &&
+                          p.mask == q.mask;
+               });
+    };
+    if (shared_bl.size() != own_blocks.size() ||
+        !std::equal(shared_bl.begin(), shared_bl.end(), own_blocks.begin(), same_block)) {
+        differs += std::format("  it registers {} NBA blocks, and the shared code's differ ({}) from them\n",
+                               own_blocks.size(), shared_bl.size());
+    }
+    if (shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, home.anchor,
+                        static_cast<uint32_t>(block_commits_.size())) != own_fills) {
+        differs += "  the record fields that hold the first id of its NBA blocks differ from the ones the shared "
+                   "code's blocks are filled into\n";
+    }
     ++verified_subroutines_;
     verify_subroutine_time_ += std::chrono::steady_clock::now() - started;
     if (differs.empty()) {

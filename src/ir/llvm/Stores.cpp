@@ -585,13 +585,10 @@ void Backend::build_nba_state() {
 // LLVM insert block, so back-to-back fused members that share one block coalesce
 // into a single enqueue + commit.
 void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) {
-    // The record's block-id fields are indexed by a group's process ordinal, which
-    // a subroutine has none of: its blocks keep their absolute ids, which no other
-    // instance can run.
-    const bool in_group = own_anchor_ != SignalSlot::no_anchor && cur_fn_ == nullptr;
-    if (cur_fn_ != nullptr) {
-        taint("stages a nonblocking write from a subroutine");
-    }
+    // The record's block-id fields are indexed by a group's process ordinal or by a
+    // subroutine's ordinal in its unit; a body that belongs to no instance keeps its
+    // absolute ids.
+    const bool in_group = own_anchor_ != SignalSlot::no_anchor;
     // Open a new block on the first NBA of a segment (the enqueue call is emitted
     // once, here, at that first store's insert point; it runs unconditionally
     // because same-epoch stores are straight-line co-executed).
@@ -608,7 +605,7 @@ void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) 
             // open only while it lowers. main stores the first id once the
             // ids are known (ctx_blk_fills_).
             Anchor&        a     = anchors_[own_anchor_];
-            const uint32_t field = a.ctx_blk_base + own_ordinal_;
+            const uint32_t field = cur_fn_ != nullptr ? a.ctx_subblk_base + cur_sub_ordinal_ : a.ctx_blk_base + own_ordinal_;
             if (group_first_block_ < 0) {
                 group_first_block_ = static_cast<int64_t>(cur_block_id_);
                 ctx_blk_fills_.emplace_back(own_anchor_, field, cur_block_id_);

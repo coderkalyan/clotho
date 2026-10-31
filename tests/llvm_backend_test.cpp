@@ -6139,3 +6139,33 @@ TEST_CASE("twin instances stage nonblocking writes into the interface their port
         endmodule
     )") == "21 22\n");
 }
+
+TEST_CASE("twin instances stage nonblocking writes from their tasks and functions") {
+    // One lowering of the task and the function for both instances (cli_test:
+    // --stat=unit-code); each commits into the `n` of the instance whose call it is,
+    // across the task's delay as well.
+    CHECK(run_capture(R"(
+        module drv(input int k);
+          int n = 0;
+          task automatic put(input int v);
+            n <= v;
+            #1;
+            n <= n + v;
+          endtask
+          function void set(input int v);
+            n <= v * 2;
+          endfunction
+          initial begin
+            #k;
+            put(10 * k);
+            #3 $display("%m n=%0d", n);
+            set(k);
+            #1 $display("%m n=%0d", n);
+          end
+        endmodule
+        module top;
+          drv u0(1);
+          drv u1(5);
+        endmodule
+    )") == "top.u0 n=20\ntop.u1 n=100\ntop.u1 n=10\ntop.u0 n=2\n");
+}

@@ -241,6 +241,7 @@ void Backend::lower_subroutines() {
             fn_decls_[f]->eraseFromParent();
             fn_decls_[f] = rep.fn;
             shared_instances_.emplace_back(anch, subroutine_home_[rep.f].anchor);
+            adopt_shared_blocks(rep, anch);
             continue;
         }
         if (it != subroutine_families_.end()) {
@@ -251,15 +252,19 @@ void Backend::lower_subroutines() {
             ++unshared_subroutines_[it->second.taint];
             continue;
         }
-        share_active_ = true;
-        taint_why_    = nullptr;
+        share_active_       = true;
+        taint_why_          = nullptr;
+        const auto block_lo = static_cast<uint32_t>(block_commits_.size());
+        const auto fill_lo  = ctx_blk_fills_.size();
         lower_subroutine(id);
         share_active_ = false;
         if (taint_why_ != nullptr) {
             instance_fns_.insert(fn_decls_[f]);
             ++unshared_subroutines_[taint_why_];
         }
-        subroutine_families_.emplace(std::move(key), SharedSubroutine{ f, fn_decls_[f], taint_why_, {} });
+        SharedSubroutine first{ f, fn_decls_[f], taint_why_, {} };
+        note_blocks(first, block_lo, fill_lo);
+        subroutine_families_.emplace(std::move(key), std::move(first));
     }
     env_ = root_env_.get();
 }
@@ -317,6 +322,9 @@ void Backend::lower_cycle(std::vector<uint32_t> members) {
                 verify_shared_subroutine(members[k], rep[k]);
             }
         }
+        for (size_t k = 0; k < members.size(); ++k) {
+            adopt_shared_blocks(rep[k], anch);
+        }
         env_ = root_env_.get();
         return;
     }
@@ -325,8 +333,14 @@ void Backend::lower_cycle(std::vector<uint32_t> members) {
         share_active_ = true;
         taint_why_    = nullptr;
     }
+    std::vector<SharedSubroutine> rep;
     for (const uint32_t m : members) {
+        const auto block_lo = static_cast<uint32_t>(block_commits_.size());
+        const auto fill_lo  = ctx_blk_fills_.size();
         lower_subroutine(static_cast<FunctionId>(m));
+        SharedSubroutine s{ m, fn_decls_[m], nullptr, {} };
+        note_blocks(s, block_lo, fill_lo);
+        rep.push_back(std::move(s));
     }
     const char* why = fresh ? taint_why_ : it->second.front().taint;
     share_active_   = false;
@@ -337,9 +351,8 @@ void Backend::lower_cycle(std::vector<uint32_t> members) {
         }
     }
     if (fresh) {
-        std::vector<SharedSubroutine> rep;
-        for (const uint32_t m : members) {
-            rep.push_back(SharedSubroutine{ m, fn_decls_[m], why, {} });
+        for (SharedSubroutine& s : rep) {
+            s.taint = why;
         }
         cycle_families_.emplace(std::move(key), std::move(rep));
     }

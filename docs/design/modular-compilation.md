@@ -426,7 +426,7 @@ code go.
      `SimulationConfig::outline` are gone. A lowering that bakes something of the
      instance it ran for (a symbol of its storage or wait buckets, a call of a
      function that is its instance's own, a disable target or covergroup type of
-     another instance, nonblocking staging into another instance) taints itself and each
+     another instance) taints itself and each
      instance lowers its own; `--stat=unit-code` reports unit groups, functions
      emitted and what stopped sharing. Comb fusion stays within one instance
      (combchain regresses; accepted until fusion across instances is revisited).
@@ -445,9 +445,11 @@ code go.
      vtable entry of an instance's method is a root thunk of the same signature
      that does, and a `$strobe` / reactive body, a fork child, an exported
      subroutine and the `$monitor` body (`rt_monitor_set` takes it with the
-     ramp) carry theirs. A subroutine that stages a nonblocking write keeps
-     its absolute block ids (the record's id fields are indexed by a process
-     ordinal) and taints.
+     ramp) carry theirs. A subroutine that stages a nonblocking write registers its
+     blocks like a group: the first block id is a record field at the subroutine's
+     ordinal in its unit, and the instances that share it register the same blocks
+     for their own signals (a signal of another instance through the binding that
+     names it).
 
      The functions and tasks of a unit are lowered once too, into the unit's
      module (`lower_subroutines`, ir/llvm/Families.cpp). The ones of the
@@ -475,7 +477,7 @@ code go.
      shared is lowered as it was, into its unit's module like every other, and
      `--stat=unit-code` counts the subroutines of multi-instance units, the
      functions emitted for them and what kept each per instance: a
-     nonblocking write, a disable target or covergroup of another instance, a call of such a
+     disable target or covergroup of another instance, a call of such a
      subroutine. The instance a process, a control block, a random
      stream or a `$exit` names is a record field (process indices, the program
      instance) read by the instance's own code, so none of them splits a family; a
