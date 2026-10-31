@@ -352,6 +352,21 @@ void rt_gc_frame_unlink(rt_gc_frame* node);
 void rt_gc_range_add(const void* base, uint64_t bytes);
 void rt_gc_range_remove(const void* base);
 
+// An NBA staging queue (rt_nba_arr_*, Runtime.h) whose records may hold a class handle
+// between staging and the NBA commit. The queue is a growable byte buffer of fixed-stride
+// records the backend lays out, so its address moves and each record cannot be a range of
+// its own; the collector instead reads rt_nba_arr_base / rt_nba_arr_count at every
+// collection and scans the records staged so far.
+//
+// `words`: the records hold the handle as a naturally aligned word (an array element, a
+// member written through a virtual interface, an aggregate leaf), so each whole record is
+// scanned conservatively. `container`: each record holds a whole-container copy at byte
+// `offset`, whose handles sit in malloc'd storage and are found by the element
+// descriptor, exactly as for a container local to a frame.
+void rt_gc_nba_words_add(uint32_t idx, uint32_t stride);
+void rt_gc_nba_container_add(uint32_t idx, uint32_t stride, uint32_t offset, uint32_t kind,
+                             const struct rt_elem_ops* ops);
+
 // -- Containers of class handles (docs/design/garbage-collection.md §3.3) ------
 //
 // A container's payload is `malloc`'d, not GC-heap memory, so neither root path

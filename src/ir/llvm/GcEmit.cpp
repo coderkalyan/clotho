@@ -782,7 +782,48 @@ void Backend::emit_gc_root_tables() {
         b_.CreateCall(gc_range_add_fn(),
                       { sym(shadow), b_.getInt64(dl.getTypeAllocSize(shadow->getValueType())) });
     }
+    emit_gc_nba_queues();
     assert(cont_emitted <= cont_by_region.size() && "one container table per region at most");
+}
+
+// The NBA staging queues (the shared rt_nba_arr_* buffers) whose records can hold a class
+// handle, registered once at start-up beside the root tables. The fourth half of the roots:
+// a plain nonblocking assignment to an array element, a member written through a virtual
+// interface, an aggregate leaf reached through a runtime index, or a whole container
+// stages into one of these, and from staging to the NBA commit the record can be the only
+// reference to what it carries. Which kind of record a queue holds is the signal's staging
+// path (Stores.cpp: arr_rec_ty, agg_rec_ty, handle_rec_ty), and the same type test that
+// decides a root table's existence decides whether a queue needs one, so a design that
+// stages no handle registers nothing. Index spaces as the staging code's: arrays, then
+// aggregates, then whole containers.
+void Backend::emit_gc_nba_queues() {
+    const llvm::DataLayout& dl = env_->llmod.getDataLayout();
+    const auto stride_of = [&](llvm::StructType* rt) {
+        return b_.getInt32(static_cast<uint32_t>(dl.getTypeAllocSize(rt)));
+    };
+    for (const Signal sig : array_nba_sigs_) {
+        const SignalSlot& s = slot_of(sig);
+        if (reaches_class_handle(s.ir_type)) {
+            b_.CreateCall(gc_nba_words_add_fn(), { b_.getInt32(arr_idx(sig)), stride_of(arr_rec_ty(s)) });
+        }
+    }
+    for (const Signal sig : agg_nba_sigs_) {
+        const SignalSlot& s = slot_of(sig);
+        if (agg_rec_rooted(s)) {
+            b_.CreateCall(gc_nba_words_add_fn(), { b_.getInt32(agg_buf_idx(sig)), stride_of(agg_rec_ty(s)) });
+        }
+    }
+    for (const Signal sig : handle_nba_sigs_) {
+        const Ref type = handle_nba_types_[handle_nba_slot(sig)];
+        if (!reaches_class_handle(type)) {
+            continue;
+        }
+        llvm::StructType* rt     = handle_rec_ty(type);
+        const uint32_t    offset = static_cast<uint32_t>(dl.getStructLayout(rt)->getElementOffset(1));
+        b_.CreateCall(gc_nba_container_add_fn(),
+                      { b_.getInt32(handle_buf_idx(sig)), stride_of(rt), b_.getInt32(offset),
+                        b_.getInt32(gc_container_kind(type)), elem_ops_for(type) });
+    }
 }
 
 // The byte offsets of every class-handle word inside one signal's storage,

@@ -325,6 +325,17 @@ struct Range {
     uint64_t       bytes;
 };
 
+// One NBA staging queue that can hold a handle (Gc.h, rt_gc_nba_words_add). `ops` is null
+// for a queue whose records are scanned as words, else the descriptor of the container
+// image at `offset` of every record, of container kind `kind`.
+struct NbaQueue {
+    uint32_t           idx;
+    uint32_t           stride;
+    uint32_t           offset;
+    uint32_t           kind;
+    const rt_elem_ops* ops;
+};
+
 // One pending handle-bearing container. `ops` is the descriptor of the CONTAINER
 // type -- kind rt_elem_dynarr / rt_elem_queue / rt_elem_assoc -- so `ops->inner` is
 // the element descriptor and `ops->keyhandles` names the class handles inside one
@@ -486,6 +497,10 @@ struct GcState {
     std::vector<const rt_gc_container_table*>         container_tables;
     ankerl::unordered_dense::map<void*, ContainerReg> containers;
     std::vector<PendingContainer>                     container_work;
+    // The NBA staging queues whose records can hold a handle. Registered once at start-up
+    // by the emitted code; the records themselves are read from the scheduler at each
+    // collection, since the buffers grow and move.
+    std::vector<NbaQueue> nba_queues;
     // Set only for the duration of rt_gc_verify(), which reuses the container
     // walkers with marking replaced by an assertion, so the ring and associative
     // arithmetic has exactly one implementation and cannot drift from itself.
@@ -2069,6 +2084,31 @@ void push_range_roots() {
     }
 }
 
+// The records staged and not yet committed. Only the first `count` records are live: the
+// rest are what earlier passes left, which a collection must not retain. A record is
+// filled before any allocation that could collect (nothing between rt_nba_arr_slot and
+// the last field store allocates a collected object), so no live record is half-written.
+void push_nba_roots() {
+    for (const NbaQueue& q : g.nba_queues) {
+        const uint32_t count = rt_nba_arr_count(q.idx);
+        if (count == 0) {
+            continue;
+        }
+        uint8_t* base = static_cast<uint8_t*>(rt_nba_arr_base(q.idx));
+        assert(base != nullptr && "a queue holding records has a buffer");
+        for (uint32_t k = 0; k < count; ++k) {
+            uint8_t* rec = base + static_cast<uint64_t>(k) * q.stride;
+            if (q.ops != nullptr) {
+                push_container(rec + q.offset, q.kind, q.ops);
+            } else if (g.verifying == 0) {
+                // A conservative hit is marked and pinned; verification only re-checks
+                // what a precise walk reaches, as for a range or a frame.
+                scan_conservative(rec, q.stride);
+            }
+        }
+    }
+}
+
 // -- The native stack, for a collection run from inside an allocation (§6.1) ---
 //
 // Why this is sound is the argument in design §6.1; this is the mechanism. The stack and
@@ -2642,6 +2682,7 @@ void release_heap() {
     g.recycled_blocks.clear();
     g.roots.clear();
     g.ranges.clear();
+    g.nba_queues.clear();
     g.container_tables.clear();
     g.containers.clear();
     g.container_work.clear();
@@ -2831,6 +2872,7 @@ void mark_from_roots() {
     push_container_roots();
     push_frame_roots();
     push_range_roots();
+    push_nba_roots();
     // Empty and a no-op outside an emergency collection, where it is the one root set that
     // is not a registered structure: the design's own native stack (§6.1).
     push_stack_roots();
@@ -3631,6 +3673,28 @@ extern "C" void rt_gc_range_remove(const void* base) {
     }
 }
 
+// The queues are the scheduler's (Scheduler.cpp, arr_queues); only their shape is
+// registered here. A duplicate index is a backend bug: two shapes for one buffer.
+extern "C" void rt_gc_nba_words_add(uint32_t idx, uint32_t stride) {
+    assert(stride >= sizeof(void*) && "a record is at least one word");
+    assert(std::none_of(g.nba_queues.begin(), g.nba_queues.end(),
+                        [idx](const NbaQueue& q) { return q.idx == idx; }) &&
+           "this NBA queue is already registered");
+    g.nba_queues.push_back(NbaQueue{ idx, stride, 0, 0, nullptr });
+}
+
+extern "C" void rt_gc_nba_container_add(uint32_t idx, uint32_t stride, uint32_t offset,
+                                        uint32_t kind, const rt_elem_ops* ops) {
+    assert(is_container_kind(kind) && "only a dynarr / queue / assoc is staged whole");
+    assert_elem_ops(ops);
+    assert(ops->kind == kind && "the kind and the container descriptor disagree");
+    assert(offset < stride && "the staged container lies inside its record");
+    assert(std::none_of(g.nba_queues.begin(), g.nba_queues.end(),
+                        [idx](const NbaQueue& q) { return q.idx == idx; }) &&
+           "this NBA queue is already registered");
+    g.nba_queues.push_back(NbaQueue{ idx, stride, offset, kind, ops });
+}
+
 // -- Containers of class handles ----------------------------------------------
 
 extern "C" void rt_gc_containers_add(const rt_gc_container_table* table) {
@@ -4007,6 +4071,7 @@ extern "C" void rt_gc_verify(void) {
     const uint64_t container_roots_at_mark = g.stats.container_roots;
     g.verifying                            = 1;
     push_container_roots();
+    push_nba_roots();
     VerifyTally tally;
     for (const Block& blk : g.blocks) {
         // Two claims about every block, kept apart because they are different claims: the

@@ -4001,3 +4001,101 @@ TEST_CASE("gc: a handle staged by a nonblocking assignment survives a collection
     const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
     CHECK(ss.emergency_collections > 0u);
 }
+
+// The previous case stages through constant indices, where a stale copy of the handle
+// left in a register or a frame slot can keep the object alive by accident. These stage
+// through runtime indices in a loop, so the only reference to each handle is the record
+// the nonblocking assignment queued (rt_nba_arr_slot): an array element, an aggregate leaf
+// reached through a runtime index (the record pads its payload to a word boundary so the
+// scan sees it), and a whole queue (a container image in the record, walked through its
+// element descriptor). None of them is a root unless the queue is registered with the
+// collector. Before it was, the ordinary cadence read every handle back as 0x5A5A5A5A or
+// another object, and the nursery and stress cadences died on an assertion or on
+// "a precise GC root does not name a class object".
+TEST_CASE("gc: handles staged in an NBA record queue survive a collection before the commit") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; string tag; endclass
+          class Junk; int v; string tag; endclass
+          typedef struct { int a; C h; } S_t;
+          C arr[8];
+          S_t sa[8];
+          C q[$];
+          C src[$];
+          Junk sink;
+          function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
+          task automatic churn();
+            for (int i = 0; i < 3000; i++) begin
+              sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
+            end
+          endtask
+          task automatic stage();
+            foreach (arr[i]) arr[i] <= make(i);
+            foreach (sa[i]) sa[i].h <= make(100 + i);
+            for (int i = 0; i < 8; i++) src.push_back(make(200 + i));
+            q <= src;
+            src.delete();
+          endtask
+          initial begin
+            int bad_a, bad_s, bad_q;
+            bad_a = 0; bad_s = 0; bad_q = 0;
+            stage();
+            churn();
+            #1;
+            churn();
+            foreach (arr[i]) if (arr[i] == null || arr[i].v != i || arr[i].tag != $sformatf("kept%0d", i)) bad_a++;
+            foreach (sa[i]) if (sa[i].h == null || sa[i].h.v != 100 + i || sa[i].h.tag != $sformatf("kept%0d", 100 + i)) bad_s++;
+            if (q.size() != 8) bad_q = 100;
+            else foreach (q[i]) if (q[i] == null || q[i].v != 200 + i || q[i].tag != $sformatf("kept%0d", 200 + i)) bad_q++;
+            $display("array %0d struct %0d queue %0d", bad_a, bad_s, bad_q);
+          end
+        endmodule
+    )";
+    const std::string expected = "array 0 struct 0 queue 0\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}
+
+// A virtual interface write stages in the same queue: the destination is whichever
+// instance the handle names, so the record carries the pointer, and the handle it carries
+// is the only reference to its object until the commit. The interface instances are twins
+// of one definition, so the design also checks that every one of them receives its own.
+TEST_CASE("gc: a handle staged by a nonblocking assignment through a virtual interface survives") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; string tag; endclass
+          class Junk; int v; string tag; endclass
+          interface bus_if; C h; endinterface
+          virtual bus_if vifs[4];
+          for (genvar g = 0; g < 4; g++) begin : gen
+            bus_if bi();
+            initial vifs[g] = bi;
+          end
+          Junk sink;
+          function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
+          task automatic churn();
+            for (int i = 0; i < 3000; i++) begin
+              sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
+            end
+          endtask
+          initial begin
+            int bad;
+            bad = 0;
+            #1;
+            foreach (vifs[i]) vifs[i].h <= make(i);
+            churn();
+            #1;
+            churn();
+            foreach (vifs[i]) if (vifs[i].h == null || vifs[i].h.v != i || vifs[i].h.tag != $sformatf("kept%0d", i)) bad++;
+            $display("vif %0d", bad);
+          end
+        endmodule
+    )";
+    const std::string expected = "vif 0\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}

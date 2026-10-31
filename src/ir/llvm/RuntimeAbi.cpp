@@ -1476,6 +1476,17 @@ llvm::FunctionCallee Backend::gc_range_add_fn() {
     return rt_fn("rt_gc_range_add", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
+// The NBA staging queues that can hold a class handle (Gc.h, rt_gc_nba_words_add): the
+// collector reads the staged records of the shared rt_nba_arr_* buffers at every collection.
+llvm::FunctionCallee Backend::gc_nba_words_add_fn() {
+    return rt_fn("rt_gc_nba_words_add", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::gc_nba_container_add_fn() {
+    return rt_fn("rt_gc_nba_container_add", b_.getVoidTy(),
+                 { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
+}
+
 // The container-root ABI (Gc.h:263-268). rt_gc_containers_add takes a constant
 // rt_gc_container_table for state-resident storage; the add / remove pair takes a
 // live rt_dynarr / rt_queue / rt_assoc address for a frame local or a body
