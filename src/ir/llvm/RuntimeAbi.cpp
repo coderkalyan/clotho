@@ -157,25 +157,28 @@ llvm::FunctionCallee Backend::bounds_report_fn() {
 // -- Runtime-offset bit / part select of a very wide vector (LRM 11.5.1) --
 
 // void rt_wide_sel(const void* mm, const void* z, u32 width, i64 base, u32 cwidth,
-//                  i64 off, u32 n, u32 four, u32 has_z, u32 unknown,
-//                  u64* must, u64* may, u64* z_out)
+//                  i64 off, u32 n, u32 unknown, u64* must, u64* may, u64* z_out)
+//
+// A null `may` is a 2-state slot, a null `z` a slot without a z field; the planes a
+// slot lacks have no buffer either (Runtime.h).
 llvm::FunctionCallee Backend::wide_sel_fn() {
     auto* i32 = b_.getInt32Ty();
     auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_wide_sel", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, i32, i32,
-                   raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    return rt_fn(
+      "rt_wide_sel",
+      b_.getVoidTy(),
+      { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // void rt_wide_ins(void* mm, void* z, u32 width, i64 base, u32 cwidth, i64 off,
-//                  u32 n, u32 four, u32 has_z, u32 unknown, const u64* must,
-//                  const u64* may, const u64* z)
+//                  u32 n, u32 unknown, const u64* must, const u64* may, const u64* z)
 llvm::FunctionCallee Backend::wide_ins_fn() {
     auto* i32 = b_.getInt32Ty();
     auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_wide_ins", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, i32, i32,
-                   raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    return rt_fn(
+      "rt_wide_ins",
+      b_.getVoidTy(),
+      { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // -- Multiply, divide and modulo of very wide integers --

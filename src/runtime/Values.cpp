@@ -19,7 +19,7 @@ namespace {
 // O(W/64) selects per word, so JIT time grows as O(W^2) -- 21 s for a 16 Kbit
 // vector and over half an hour for the 65537-bit one in ivtest pr722. These two
 // helpers index the containing 64-bit word instead, so the cost is O(selected
-// bits) with no dependence on the vector's width at all. The backend routes a
+// bits / 64) with no dependence on the vector's width at all. The backend routes a
 // dynamic select here once the storage passes `wide_dyn_select_bits`.
 //
 // The storage layout is the one the backend's slot types define: a 4-state slot's
@@ -28,18 +28,44 @@ namespace {
 // (narrow) slot is just `width` value bits in `mm`. Bit i of a field lives in word
 // i/64 at bit i%64, little-endian, which is what the LLVM in-memory layout of an
 // iN gives on every target clotho runs on.
+//
+// Which planes a call has is told by its pointers, not by flags that could
+// disagree with them: a null `may` is a 2-state slot, a null `z` a slot without a
+// z field. The selection's own planes are word buffers of the same layout.
+//
+// A selection is worked one of its 64-bit words at a time. Each word is clipped to
+// the bits the select can address (`clip`), and what is left is one run of at most
+// 64 bits of each plane: read out of the one or two storage words it spans with a
+// funnel shift, or merged back into them. A selection of one word that is wholly
+// addressable, which is nearly every call, needs no clipping and no loop, and is
+// handled first in the entry points.
 
-// Bit `i` of a little-endian word array.
-uint64_t plane_bit(const uint64_t* p, uint64_t i) {
-    return (p[i >> 6] >> (i & 63)) & 1;
+// The low `len` (1 to 64) bits.
+uint64_t low_bits(uint32_t len) {
+    return ~uint64_t{ 0 } >> (64 - len);
 }
 
-void plane_bit_set(uint64_t* p, uint64_t i, uint64_t v) {
-    const uint64_t m = uint64_t{ 1 } << (i & 63);
-    if (v != 0) {
-        p[i >> 6] |= m;
-    } else {
-        p[i >> 6] &= ~m;
+// The `len` (1 to 64) bits of the plane `p` that start at bit `at`, low-aligned.
+uint64_t take_bits(const uint64_t* p, uint64_t at, uint32_t len) {
+    const uint64_t i = at >> 6;
+    const unsigned s = at & 63;
+    uint64_t       v = p[i] >> s;
+    if (s + len > 64) {
+        v |= p[i + 1] << (64 - s);
+    }
+    return v & low_bits(len);
+}
+
+// Overwrite the `len` (1 to 64) bits of the plane `p` that start at bit `at` with
+// the low bits of `v`; no other bit changes. `w ^= (w ^ v) & m` merges `v` into `w`
+// under `m`, so `v` needs no masking of its own.
+void put_bits(uint64_t* p, uint64_t at, uint64_t v, uint32_t len) {
+    const uint64_t i = at >> 6;
+    const unsigned s = at & 63;
+    const uint64_t m = low_bits(len);
+    p[i] ^= (p[i] ^ (v << s)) & (m << s);
+    if (s + len > 64) {
+        p[i + 1] ^= (p[i + 1] ^ (v >> (64 - s))) & (m >> (64 - s));
     }
 }
 
@@ -54,23 +80,118 @@ void plane_bit_set(uint64_t* p, uint64_t i, uint64_t v) {
 // word index a huge unsigned). LRM 11.5.1 makes such a bit out of range: x when
 // read, untouched when written.
 //
-// `base` and the offsets are sign-extended i32 values (the backend carries a bit
-// offset as an i32), so no sum below can overflow an i64. An empty intersection
-// is [0, 0).
+// `base` is any i64. An empty intersection is [0, 0).
 struct Span {
     int64_t lo;
     int64_t hi;
 };
 
 Span storage_span(uint32_t width, int64_t base, uint32_t cwidth) {
-    assert(base >= INT32_MIN && base <= INT32_MAX && "a container base is an i32");
-    const int64_t lo = std::max<int64_t>(base, 0);
-    const int64_t hi = std::min<int64_t>(base + static_cast<int64_t>(cwidth), static_cast<int64_t>(width));
-    if (hi <= lo) {
+    // A base at or past the end addresses nothing, and keeps the sum below from
+    // overflowing.
+    if (base >= int64_t{ width }) {
         return { 0, 0 };
     }
-    assert(lo >= 0 && hi <= static_cast<int64_t>(width) && "the span lies inside the vector");
-    return { lo, hi };
+    const int64_t lo = std::max<int64_t>(base, 0);
+    const int64_t hi = std::min<int64_t>(base + int64_t{ cwidth }, int64_t{ width });
+    return hi > lo ? Span{ lo, hi } : Span{ 0, 0 };
+}
+
+// Whether the `n` bits at storage bit `off` lie wholly inside the span. `off` is
+// any i64, and nothing here overflows for it.
+bool inside(Span span, int64_t off, uint32_t n) {
+    return off >= span.lo && off <= span.hi - int64_t{ n };
+}
+
+// Whether any bit of the `n`-bit selection at storage bit `off` can be addressed.
+// Once this holds `off` is within 2^32 of the vector, so `clip`'s arithmetic cannot
+// overflow.
+bool reaches(Span span, int64_t off, uint32_t n) {
+    return span.hi > span.lo && off < span.hi && off + int64_t{ n } > span.lo;
+}
+
+// Word `k` of the selection, clipped to the span: its `len` addressable bits start
+// at storage bit `at` and are bits [shift, shift + len) of the word. `len` is 0
+// when none of the word is.
+struct Window {
+    uint64_t at    = 0;
+    uint32_t len   = 0;
+    uint32_t shift = 0;
+};
+
+Window clip(Span span, int64_t off, uint32_t n, uint32_t k) {
+    const int64_t first = off + 64 * int64_t{ k };
+    const int64_t lo    = std::max(first, span.lo);
+    const int64_t hi    = std::min({ first + 64, off + int64_t{ n }, span.hi });
+    if (hi <= lo) {
+        return {};
+    }
+    return { static_cast<uint64_t>(lo), static_cast<uint32_t>(hi - lo), static_cast<uint32_t>(lo - first) };
+}
+
+// The general case of each entry point. Kept out of line so that the entry point's
+// own frame, which the common case runs, stays small.
+[[gnu::noinline]] void select_words(const uint64_t* mm,
+                                    const uint64_t* zp,
+                                    uint32_t        width,
+                                    Span            span,
+                                    bool            unknown,
+                                    int64_t         off,
+                                    uint32_t        n,
+                                    uint64_t*       out_must,
+                                    uint64_t*       out_may,
+                                    uint64_t*       out_z) {
+    const bool     hit   = !unknown && reaches(span, off, n);
+    const uint32_t words = (n + 63) / 64;
+    for (uint32_t k = 0; k < words; ++k) {
+        uint64_t     must = 0;
+        uint64_t     may  = low_bits(std::min(64u, n - 64 * k)); // x where nothing is read
+        uint64_t     z    = 0;
+        const Window w    = hit ? clip(span, off, n, k) : Window{};
+        if (w.len != 0) {
+            must = take_bits(mm, w.at, w.len) << w.shift;
+            if (out_may != nullptr) {
+                may = (may & ~(low_bits(w.len) << w.shift)) | (take_bits(mm, width + w.at, w.len) << w.shift);
+            }
+            if (zp != nullptr) {
+                z = take_bits(zp, w.at, w.len) << w.shift;
+            }
+        }
+        out_must[k] = must;
+        if (out_may != nullptr) {
+            out_may[k] = may;
+        }
+        if (out_z != nullptr) {
+            out_z[k] = z;
+        }
+    }
+}
+
+[[gnu::noinline]] void insert_words(uint64_t*       mm,
+                                    uint64_t*       zp,
+                                    uint32_t        width,
+                                    Span            span,
+                                    int64_t         off,
+                                    uint32_t        n,
+                                    const uint64_t* must,
+                                    const uint64_t* may,
+                                    const uint64_t* z) {
+    if (!reaches(span, off, n)) {
+        return;
+    }
+    for (uint32_t k = 0, words = (n + 63) / 64; k < words; ++k) {
+        const Window w = clip(span, off, n, k);
+        if (w.len == 0) {
+            continue;
+        }
+        put_bits(mm, w.at, must[k] >> w.shift, w.len);
+        if (may != nullptr) {
+            put_bits(mm, width + w.at, may[k] >> w.shift, w.len);
+        }
+        if (zp != nullptr) {
+            put_bits(zp, w.at, z[k] >> w.shift, w.len);
+        }
+    }
 }
 
 } // namespace
@@ -80,71 +201,72 @@ Span storage_span(uint32_t width, int64_t base, uint32_t cwidth) {
 // `unknown` marks an x/z index, which LRM 11.5.1 makes wholly out of range. Bits
 // outside read x (must 0, may 1) for a 4-state slot and 0 for a 2-state one.
 //
-// The three out-params are little-endian word buffers of ceil(n/64) words each --
-// the same layout as the value planes, so the backend loads each one straight back
-// as an i(n).
-extern "C" void rt_wide_sel(const void* mmp, const void* zpp, uint32_t width, int64_t base,
-                            uint32_t cwidth, int64_t off, uint32_t n, uint32_t four,
-                            uint32_t has_z, uint32_t unknown, uint64_t* out_must,
-                            uint64_t* out_may, uint64_t* out_z) {
-    assert(off >= INT32_MIN && off <= INT32_MAX && "a select offset is an i32");
-    const auto*    mm    = static_cast<const uint64_t*>(mmp);
-    const auto*    zp    = static_cast<const uint64_t*>(zpp);
-    const uint32_t words = (n + 63) / 64;
-    const Span     span  = storage_span(width, base, cwidth);
-    std::memset(out_must, 0, words * sizeof(uint64_t));
-    std::memset(out_may, 0, words * sizeof(uint64_t));
-    std::memset(out_z, 0, words * sizeof(uint64_t));
-    for (uint32_t k = 0; k < n; ++k) {
-        const int64_t i = off + static_cast<int64_t>(k);
-        if (unknown != 0 || i < span.lo || i >= span.hi) {
-            if (four != 0) {
-                plane_bit_set(out_may, k, 1); // x: must 0, may 1
-            }
-            continue;
+// The out-params are little-endian word buffers of ceil(n/64) words each -- the
+// same layout as the value planes, so the backend loads each one straight back as
+// an i(n). Only the planes the slot has are passed and written (see above).
+extern "C" void rt_wide_sel(const void* mmp,
+                            const void* zpp,
+                            uint32_t    width,
+                            int64_t     base,
+                            uint32_t    cwidth,
+                            int64_t     off,
+                            uint32_t    n,
+                            uint32_t    unknown,
+                            uint64_t*   out_must,
+                            uint64_t*   out_may,
+                            uint64_t*   out_z) {
+    assert(n > 0 && "a selection has a bit");
+    assert((out_z != nullptr) == (zpp != nullptr) && "a z plane is read where the slot has one");
+    const auto* mm   = static_cast<const uint64_t*>(mmp);
+    const auto* zp   = static_cast<const uint64_t*>(zpp);
+    const Span  span = storage_span(width, base, cwidth);
+    if (unknown == 0 && n <= 64 && inside(span, off, n)) {
+        out_must[0] = take_bits(mm, static_cast<uint64_t>(off), n);
+        if (out_may != nullptr) {
+            out_may[0] = take_bits(mm, width + static_cast<uint64_t>(off), n);
         }
-        assert(i >= 0 && i < static_cast<int64_t>(width) && "an in-span bit is inside the vector");
-        const auto u = static_cast<uint64_t>(i);
-        plane_bit_set(out_must, k, plane_bit(mm, u));
-        if (four != 0) {
-            plane_bit_set(out_may, k, plane_bit(mm, static_cast<uint64_t>(width) + u));
-            if (has_z != 0) {
-                plane_bit_set(out_z, k, plane_bit(zp, u));
-            }
+        if (out_z != nullptr) {
+            out_z[0] = take_bits(zp, static_cast<uint64_t>(off), n);
         }
+        return;
     }
+    select_words(mm, zp, width, span, unknown != 0, off, n, out_must, out_may, out_z);
 }
 
 // Write the `n` bits of `must` / `may` / `z` at storage bit offset `off`, skipping
 // every bit outside the container and the vector (LRM 11.5.1: an out-of-range
 // write "shall only affect the bits that are in range"; a wholly out-of-range or
 // x/z index writes nothing). Params match rt_wide_sel, value planes included.
-extern "C" void rt_wide_ins(void* mmp, void* zpp, uint32_t width, int64_t base, uint32_t cwidth,
-                            int64_t off, uint32_t n, uint32_t four, uint32_t has_z,
-                            uint32_t unknown, const uint64_t* must, const uint64_t* may,
+extern "C" void rt_wide_ins(void*           mmp,
+                            void*           zpp,
+                            uint32_t        width,
+                            int64_t         base,
+                            uint32_t        cwidth,
+                            int64_t         off,
+                            uint32_t        n,
+                            uint32_t        unknown,
+                            const uint64_t* must,
+                            const uint64_t* may,
                             const uint64_t* z) {
-    assert(off >= INT32_MIN && off <= INT32_MAX && "a select offset is an i32");
+    assert(n > 0 && "a selection has a bit");
+    assert((z != nullptr) == (zpp != nullptr) && "a z plane is written where the slot has one");
     if (unknown != 0) {
         return;
     }
     auto*      mm   = static_cast<uint64_t*>(mmp);
     auto*      zp   = static_cast<uint64_t*>(zpp);
     const Span span = storage_span(width, base, cwidth);
-    for (uint32_t k = 0; k < n; ++k) {
-        const int64_t i = off + static_cast<int64_t>(k);
-        if (i < span.lo || i >= span.hi) {
-            continue;
+    if (n <= 64 && inside(span, off, n)) {
+        put_bits(mm, static_cast<uint64_t>(off), must[0], n);
+        if (may != nullptr) {
+            put_bits(mm, width + static_cast<uint64_t>(off), may[0], n);
         }
-        assert(i >= 0 && i < static_cast<int64_t>(width) && "an in-span bit is inside the vector");
-        const auto u = static_cast<uint64_t>(i);
-        plane_bit_set(mm, u, plane_bit(must, k));
-        if (four != 0) {
-            plane_bit_set(mm, static_cast<uint64_t>(width) + u, plane_bit(may, k));
-            if (has_z != 0) {
-                plane_bit_set(zp, u, plane_bit(z, k));
-            }
+        if (zp != nullptr) {
+            put_bits(zp, static_cast<uint64_t>(off), z[0], n);
         }
+        return;
     }
+    insert_words(mm, zp, width, span, off, n, must, may, z);
 }
 
 // -- Multiply, divide and modulo of very wide integers --

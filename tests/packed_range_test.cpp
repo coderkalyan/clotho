@@ -13,6 +13,9 @@
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
+
+#include <llvm/Support/raw_ostream.h>
 
 using namespace clotho;
 
@@ -736,4 +739,161 @@ TEST_CASE("parameter bit/part/indexed selects agree with iverilog") {
           "ctr 4\n"
           "10101101\n"
           "nib ef\nnib be\nnib ad\nnib de\n");
+}
+
+namespace {
+
+// The backend's raw IR (no optimizer), and the body of the first process in it.
+std::string process_body(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    std::string              ir;
+    llvm::raw_string_ostream os(ir);
+    REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false }));
+    const size_t at = ir.find("define ptr @clotho.inst.m.p");
+    REQUIRE(at != std::string::npos);
+    return ir.substr(at, ir.find("\n}\n", at) - at);
+}
+
+size_t count_of(const std::string& hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+// kernel.md: constant indices are specialized in the backend. An in-range constant
+// select is the plain form -- no bounds sequence, no `select i1 <constant>`, no
+// branch on a constant verdict -- and an out-of-range one emits no access at all.
+TEST_CASE("a constant select is settled at compile time, not by a bounds sequence") {
+    const auto design = [](std::string_view extra) {
+        return "module m;\n logic [31:0] a; bit [31:0] b; logic [255:0] w; logic [7:0] mem [0:3];\n"
+               " logic r1, r2; logic [3:0] r4;\n initial begin\n a = 0; b = 0; w = 0; mem[1] = 0;\n"
+               " a[5] = 1'b1; b[5] = 1'b1; w[200] = 1'b1; a[11:8] = 4'hf; w[130:70] = '1; mem[1][2] = 1'b1;\n"
+               " r1 = a[7]; r2 = b[7]; r4 = a[19:16]; r4 = w[130:127]; mem[2] = mem[1];\n" +
+               std::string(extra) + " end\nendmodule\n";
+    };
+    const std::string in_range = process_body(design(""));
+    CHECK(in_range.find("select i1") == std::string::npos);
+    CHECK(in_range.find("br i1 true") == std::string::npos);
+    CHECK(in_range.find("br i1 false") == std::string::npos);
+    CHECK(in_range.find("valid.") == std::string::npos);
+
+    // Out of range: a write emits nothing, a read loads nothing (it is the default).
+    const std::string outside = process_body(design(
+      "a[40] = 1'b1; a[-1] <= 1'b1; w[300] = 1'b0; mem[5] = 8'h1; mem[5][1] = 1'b1; r1 = a[40]; r1 = mem[5][0];\n"));
+    CHECK(count_of(outside, " = load ") == count_of(in_range, " = load "));
+    CHECK(count_of(outside, "store ") == count_of(in_range, "store ") + 2); // the two reads' defaults
+    CHECK(outside.find("valid.") == std::string::npos);
+}
+
+TEST_CASE("constant selects outside a vector or its element: reads give the default, writes do nothing") {
+    CHECK(run_capture(R"(
+        module t;
+            localparam PX = 1'bx;
+            localparam PZ = 1'bz;
+            logic [7:0] v;
+            bit   [7:0] b;
+            logic [0:7] d;
+            logic [7:0] r8;
+            initial begin
+                v = 8'hA5; b = 8'hA5; d = 8'hA5;
+                $display("%b %b %b %b %b", v[8], v[-1], v[100], b[8], b[-1]);
+                $display("%b %b %b %b", v[15:8], v[-1:-4], b[15:8], b[-1:-4]);
+                $display("%b %b", d[8], d[-1]);
+                v[8] = 1'b0; v[-1] = 1'b0; v[15:8] = 8'h00; v[-1:-4] = 4'h0;
+                b[8] = 1'b0; b[-1] = 1'b0; b[15:8] = 8'h00; b[-1:-4] = 4'h0;
+                $display("%h %h", v, b);
+                v[8] <= 1'b0; v[15:8] <= 8'h00; b[-1] <= 1'b0; b[-1:-4] <= 4'h0;
+                #1 $display("%h %h", v, b);
+                $display("%b %b %b %b", v[9:6], v[1:-2], b[9:6], b[1:-2]);
+                v[9:6] = 4'b0000; b[1:-2] = 4'b0000;
+                $display("%h %h", v, b);
+                v[9:6] <= 4'b1111; b[1:-2] <= 4'b1111;
+                #1 $display("%h %h", v, b);
+                $display("%b %b %b %b", v[6 +: 4], v[-2 +: 4], b[6 +: 4], b[-2 +: 4]);
+                v[6 +: 4] = 4'b0101; b[-2 +: 4] = 4'b0101;
+                $display("%h %h", v, b);
+                $display("%b %b %b", v[PX], v[PZ], b[PX]);
+                v[PX] = 1'b0; b[PZ] = 1'b0;
+                v[PX] <= 1'b0; b[PX] <= 1'b0;
+                #1 $display("%h %h", v, b);
+                r8 = v[7:4]; $display("%h", r8);
+            end
+        endmodule
+    )") == "x x x 0 0\n"
+           "xxxxxxxx xxxx 00000000 0000\n"
+           "x x\n"
+           "a5 a5\n"
+           "a5 a5\n"
+           "xx10 01xx 0010 0100\n"
+           "25 a4\n"
+           "e5 a7\n"
+           "xx11 01xx 0010 1100\n"
+           "65 a5\n"
+           "x x 0\n"
+           "65 a5\n"
+           "06\n");
+}
+
+TEST_CASE("a constant select hanging over its element writes only the element's bits, nonblocking too") {
+    // The element, not the vector, is the container of `pk[2][..]` (LRM 11.5.1): a
+    // bit inside the vector but outside the element is out of range. A signal whose
+    // nonblocking sites are all constant part-selects commits a mask fixed at compile
+    // time; it used to be the part-select's span clipped to the vector only, so the
+    // bits of the neighbouring elements were committed from a stale shadow.
+    CHECK(run_capture(R"(
+        module t;
+            logic [3:0][7:0] pk;
+            bit   [3:0][7:0] pb;
+            initial begin
+                pk = 32'h44332211; pb = 32'h44332211;
+                $display("%b %b %b %b", pk[2][3], pk[2][9], pk[2][-1], pb[2][9]);
+                $display("%b %b %b", pk[2][15:8], pk[2][9:6], pb[2][9:6]);
+                pk[2][9] = 1'b0; pk[2][-1] = 1'b0; pk[2][15:8] = 8'h00; pb[2][9] = 1'b0; pb[2][15:8] = 8'h00;
+                $display("%h %h", pk, pb);
+                pk[2][9:6] = 4'b1111; pb[2][9:6] = 4'b1111;
+                $display("%h %h", pk, pb);
+            end
+        endmodule
+    )") == "0 x x 0\n"
+           "xxxxxxxx xx00 0000\n"
+           "44332211 44332211\n"
+           "44f32211 44f32211\n");
+    CHECK(run_capture(R"(
+        module t;
+            bit   [3:0][7:0] pb;
+            logic [3:0][7:0] pk;
+            initial begin
+                pb = 32'h44332211; pk = 32'h44332211;
+                pb[3][-1:-3] <= 3'b000;
+                pk[1][10:7] <= 4'b0000;
+                #1 $display("%h %h", pb, pk);
+                pk[0][3:2] <= 2'b11;
+                #1 $display("%h", pk);
+            end
+        endmodule
+    )") == "44332211 44332211\n"
+           "4433221d\n");
+}
+
+TEST_CASE("a constant index outside a fixed array reads the default and writes nothing") {
+    CHECK(run_capture(R"(
+        module t;
+            logic [7:0] mem [0:3];
+            bit   [7:0] bm [0:3];
+            localparam PX = 1'bx;
+            initial begin
+                mem[0] = 8'h11; bm[0] = 8'h11;
+                mem[5] = 8'hff; mem[-1] = 8'hff; bm[5] = 8'hff; mem[PX] = 8'hff;
+                mem[5] <= 8'hff; bm[-1] <= 8'hff;
+                #1 $display("%h %h %h %h %h", mem[5], mem[-1], bm[5], mem[PX], mem[0]);
+                $display("%b %b", mem[4][0], bm[4][0]);
+            end
+        endmodule
+    )") == "xx xx 00 xx 11\n"
+           "x 0\n");
 }

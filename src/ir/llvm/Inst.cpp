@@ -317,19 +317,20 @@ void Backend::lower_inst(Index i) {
                 throw BackendError{ "internal: string value in bit_select" };
             }
             // A bit-select is bounds-checked against its container (LRM
-            // 11.5.1): an out-of-range or x/z index reads x / writes nothing.
-            const Plane        idxp   = value_of(p.binary.r);
-            llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
-            const uint32_t     cwidth = lv.width;
-            llvm::Value*       idx    = select_index(idxp, type_of(p.binary.r));
+            // 11.5.1): an out-of-range or x/z index reads x / writes nothing. A
+            // constant index of a constant place is settled at compile time.
+            const Plane        idxp         = value_of(p.binary.r);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            const uint32_t     cwidth       = lv.width;
+            llvm::Value*       idx          = select_index(idxp, type_of(p.binary.r));
+            llvm::Value* const unknown      = any_unknown(p.binary.r);
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
             lv.width   = 1;
-            // A constant offset has no variable shift to legalize, so it stays inline on
-            // wide storage too; a base already on the runtime kernels keeps them.
-            const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
-            const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, 1, any_unknown(p.binary.r), constant_window);
-            add_select_bounds_check(lv, i, p.binary.r, sv, BoundsWhat::Bit, cwidth, 1);
+            std::optional<SelectVerdict> sv = resolve_constant_select(lv, cbase, cwidth, unknown);
+            if (!sv) {
+                sv = set_select_bounds(lv, cbase, cwidth, 1, unknown);
+            }
+            add_select_bounds_check(lv, i, p.binary.r, *sv, BoundsWhat::Bit, cwidth, 1);
             set_lvalue(i, lv);
             return;
         }
@@ -343,19 +344,20 @@ void Backend::lower_inst(Index i) {
             // A constant window that hangs over the vector it selects from (`v[11:8]`
             // of 8 bits, `v[1:-2]`, the element `a[5]` of `a[3:0]`) is out of range
             // in the bits outside it: they read x (0 for 2-state) and are not written
-            // (LRM 11.5.1). It takes the bounds machinery of a dynamic select; the
-            // window is a constant, so the mask folds and costs nothing at run time.
-            // `lsb` is the i32 the frontend wrapped into a uint32.
-            const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
-            if (first < 0 || first + lv.width > outer_width) {
-                // A base that already goes through the runtime kernels keeps them.
-                const bool constant_window = llvm::isa<llvm::ConstantInt>(cbase) && !lv.wide_dyn;
-                set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse(), constant_window);
-            } else if (lv.range_mask != nullptr && lv.width != outer_width) {
-                // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
-                // the inherited mask still covers the whole outer window, which a
-                // write must narrow (store_mask).
-                lv.range_mask_outer = true;
+            // (LRM 11.5.1). Over a constant place that is known now
+            // (resolve_constant_select); inside a dynamic select it takes the bounds
+            // machinery of one, the window being a constant. `lsb` is the i32 the
+            // frontend wrapped into a uint32.
+            if (!resolve_constant_select(lv, cbase, outer_width, b_.getFalse())) {
+                const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
+                if (first < 0 || first + lv.width > outer_width) {
+                    set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse());
+                } else if (lv.range_mask != nullptr && lv.width != outer_width) {
+                    // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
+                    // the inherited mask still covers the whole outer window, which a
+                    // write must narrow (store_mask).
+                    lv.range_mask_outer = true;
+                }
             }
             set_lvalue(i, lv);
             return;
@@ -366,19 +368,22 @@ void Backend::lower_inst(Index i) {
             // shared load/store path shifts/masks by the runtime bit_off.
             // Bounds-checked against its container (LRM 11.5.1): bits of the
             // selection that fall outside read x / are not written; a wholly
-            // out-of-range or x/z offset makes the whole select out of range.
-            Guarded            lv     = lvalue_of(p.op_extra.op);
-            const auto         dps    = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
-            const Plane        offp   = value_of(dps.offset);
-            llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
-            const uint32_t     cwidth = lv.width;
-            llvm::Value*       off    = select_index(offp, type_of(dps.offset));
+            // out-of-range or x/z offset makes the whole select out of range. A
+            // constant offset of a constant place is settled at compile time.
+            Guarded            lv           = lvalue_of(p.op_extra.op);
+            const auto         dps          = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
+            const Plane        offp         = value_of(dps.offset);
+            llvm::Value* const cbase        = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+            const uint32_t     cwidth       = lv.width;
+            llvm::Value*       off          = select_index(offp, type_of(dps.offset));
+            llvm::Value* const unknown      = any_unknown(dps.offset);
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
             lv.width   = dps.width;
-            const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
-            const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(dps.offset), constant_window);
-            add_select_bounds_check(lv, i, dps.offset, sv, BoundsWhat::Part, cwidth, dps.width);
+            std::optional<SelectVerdict> sv = resolve_constant_select(lv, cbase, cwidth, unknown);
+            if (!sv) {
+                sv = set_select_bounds(lv, cbase, cwidth, dps.width, unknown);
+            }
+            add_select_bounds_check(lv, i, dps.offset, *sv, BoundsWhat::Part, cwidth, dps.width);
             set_lvalue(i, lv);
             return;
         }
@@ -2602,18 +2607,14 @@ Plane Backend::lower_load(const LValue& lv) {
 
 // The shared leading arguments of the two wide-select helpers, for the planes of
 // one `width`-bit slot: where they live, the container the selection clamps to,
-// the signed storage offset, the selected width, and the plane layout facts.
-// `zp` null means the slot has no z plane; `four` false means it is 2-state (`mmp`
-// is `width` value bits, not the packed must|may pair).
+// the signed storage offset, the selected width, and whether the index is invalid.
+// `zp` null means the slot has no z plane; whether it is 2-state is told by the
+// buffers the caller adds after these (no may buffer), not here.
 //
 // Taking the planes as parameters is what lets the NBA path stage into the shadow
 // slot -- and its dirty mask, a 2-state plane of the same width -- with the same
 // two calls the live store uses.
-std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv,
-                                                 llvm::Value*  mmp,
-                                                 llvm::Value*  zp,
-                                                 uint32_t      width,
-                                                 bool          four) {
+std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv, llvm::Value* mmp, llvm::Value* zp, uint32_t width) {
     auto* null = llvm::Constant::getNullValue(raw_ptr_ty());
     return { mmp,
              zp != nullptr ? zp : null,
@@ -2622,15 +2623,7 @@ std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv,
              b_.getInt32(lv.sel_cwidth),
              b_.CreateSExt(lv.bit_off, b_.getInt64Ty()),
              b_.getInt32(lv.width),
-             b_.getInt32(four ? 1 : 0),
-             b_.getInt32(zp != nullptr ? 1 : 0),
              b_.CreateZExt(lv.sel_unknown, b_.getInt32Ty()) };
-}
-
-// The live storage planes of a select lvalue.
-std::vector<llvm::Value*> Backend::wide_dyn_args(const LValue& lv) {
-    return wide_dyn_args(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width,
-                         lv.four_state);
 }
 
 // A selection plane's spill width: `n` rounded up to whole 64-bit words, which is
@@ -2645,15 +2638,19 @@ llvm::AllocaInst* Backend::sel_plane_buf(uint32_t n, const char* name) {
     return entry_alloca(int_ty(sel_buf_bits(n)), name);
 }
 
-// Read a runtime-offset selection out of very wide storage.
+// Read a runtime-offset selection out of very wide storage. The helper is handed a
+// buffer for each plane the slot has and none for the others: a 2-state slot reads
+// back one plane, a 4-state slot without a z field two.
 Plane Backend::wide_dyn_load(const LValue& lv) {
-    const uint32_t n  = lv.width;
-    auto*          bt = int_ty(sel_buf_bits(n));
-    auto*          om = sel_plane_buf(n, "wsel.must");
-    auto*          oy = sel_plane_buf(n, "wsel.may");
-    auto*          oz = sel_plane_buf(n, "wsel.z");
+    const uint32_t n    = lv.width;
+    auto*          bt   = int_ty(sel_buf_bits(n));
+    llvm::Value*   null = llvm::Constant::getNullValue(raw_ptr_ty());
+    auto*          om   = sel_plane_buf(n, "wsel.must");
+    llvm::Value*   oy   = lv.four_state ? sel_plane_buf(n, "wsel.may") : null;
+    llvm::Value*   oz   = lv.has_z ? sel_plane_buf(n, "wsel.z") : null;
 
-    std::vector<llvm::Value*> args = wide_dyn_args(lv);
+    std::vector<llvm::Value*> args =
+      wide_dyn_args(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width);
     args.push_back(om);
     args.push_back(oy);
     args.push_back(oz);
@@ -2663,8 +2660,8 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
     if (!lv.four_state) {
         return two_val(must);
     }
-    const Plane got = packed(must, cast(b_.CreateLoad(bt, oy), n, false),
-                             cast(b_.CreateLoad(bt, oz), n, false));
+    const Plane got =
+      packed(must, cast(b_.CreateLoad(bt, oy), n, false), lv.has_z ? cast(b_.CreateLoad(bt, oz), n, false) : zero(n));
     // What rt_wide_sel hands back is a value entering generated code.
     emit_encoding_check(got, true, cur_inst_);
     return got;
@@ -2673,15 +2670,16 @@ Plane Backend::wide_dyn_load(const LValue& lv) {
 // Write a runtime-offset selection into one wide slot's planes: the runtime merges
 // the bits into the containing words and drops the ones outside the container, so
 // there is no read-modify-write of the whole vector here either. `four` / `zp`
-// describe the target planes (the live slot, or an NBA shadow of the same shape).
+// describe the target planes (the live slot, or an NBA shadow of the same shape),
+// and the runtime is handed only the planes of `rhs` they have.
 void Backend::wide_dyn_store_planes(const LValue& lv,
                                     llvm::Value*  mmp,
                                     llvm::Value*  zp,
                                     uint32_t      width,
                                     bool          four,
                                     Plane         rhs) {
-    const uint32_t n  = lv.width;
-    auto*          bt = int_ty(sel_buf_bits(n));
+    const uint32_t n    = lv.width;
+    auto*          null = llvm::Constant::getNullValue(raw_ptr_ty());
     // Spill each plane zero-extended to the buffer's word count.
     const auto spill = [&](llvm::Value* v, const char* name) -> llvm::Value* {
         auto* buf = sel_plane_buf(n, name);
@@ -2691,19 +2689,10 @@ void Backend::wide_dyn_store_planes(const LValue& lv,
 
     // The value crosses into the runtime here, whichever store brought it.
     emit_encoding_check(rhs, four, cur_inst_);
-    std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width, four);
-    if (!four) {
-        auto* zbuf = sel_plane_buf(n, "wins.zero");
-        b_.CreateStore(llvm::ConstantInt::get(bt, 0), zbuf);
-        args.push_back(spill(must_of(rhs, false), "wins.must"));
-        args.push_back(zbuf);
-        args.push_back(zbuf);
-    } else {
-        const Plane f = rhs;
-        args.push_back(spill(must_of(f, true), "wins.must"));
-        args.push_back(spill(may_of(f, true), "wins.may"));
-        args.push_back(spill(f.z != nullptr ? f.z : zero(n), "wins.z"));
-    }
+    std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width);
+    args.push_back(spill(must_of(rhs, four), "wins.must"));
+    args.push_back(four ? spill(may_of(rhs, true), "wins.may") : null);
+    args.push_back(zp != nullptr ? spill(rhs.z != nullptr ? rhs.z : zero(n), "wins.z") : null);
     b_.CreateCall(wide_ins_fn(), args);
 }
 

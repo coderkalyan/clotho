@@ -104,8 +104,7 @@ when it does.
 ## Selects and stores
 
 - Constant indices are specialized in the backend: an in-range constant select
-  is the plain form, an out-of-range one is the default value or a no-op. **Not
-  yet:** one sequence for both, left to constant folding.
+  is the plain form, an out-of-range one is the default value or a no-op.
 - Constant selects touch only the 64-bit words they cover; part-select stores
   read and write only those words, plane by plane. **Not yet:** the whole slot.
 - Indices reach the backend as signed numbers of at least 64 bits, which the
@@ -116,10 +115,9 @@ when it does.
   range; the mask path runs only otherwise. **Not yet:** a storage-wide mask on
   every access.
 - A runtime helper serves only runtime-indexed selects of storage above 256 bits,
-  where it costs less than the inline shift (it is flat at 180-310 instructions; the
-  inline form grows with the width). It works a 64-bit word at a time and receives
-  only the planes the destination needs. **Not yet:** it loops per bit, and all three
-  planes are always passed.
+  where it costs less than the inline shift (it is flat at 100-120 instructions for a
+  bit select; the inline form grows with the width). It works a 64-bit word at a time
+  and receives only the planes the destination needs.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.
 - An element access with an invalid index is guarded so only valid paths touch

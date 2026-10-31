@@ -1315,12 +1315,18 @@ void Backend::wide_dyn_stage_mask(const LValue& lv, const SignalSlot& s) {
 // Compile-time mask (signal-width APInt) of the bits this static site writes:
 // all-ones for a whole-signal site, else the constant [lsb, lsb+width) range, cut
 // to the signal: a constant select that hangs over it writes only the bits inside
-// (LRM 11.5.1). `lsb` is signed, below zero for `v[1:-2]`.
+// (LRM 11.5.1). `lsb` is signed, below zero for `v[1:-2]`. A select that hangs over
+// the container it sits in (`a[0][10:7]` of `logic [3:0][7:0] a`) carries the mask
+// of what it writes, which is narrower than the vector alone makes it: the rest of
+// the vector is not this site's, and its shadow bits are stale.
 // Precondition: the site is static (constant bit_off), i.e. the signal is not
 // nba_dyn.
 llvm::APInt Backend::site_const_mask(const LValueInfo& lv, const SignalSlot& s) const {
     if (lv.width == s.width && is_zero_const(lv.bit_off)) {
         return llvm::APInt::getAllOnes(s.width);
+    }
+    if (const auto* m = llvm::dyn_cast_or_null<llvm::ConstantInt>(lv.range_mask)) {
+        return m->getValue();
     }
     const int64_t lsb = llvm::cast<llvm::ConstantInt>(lv.bit_off)->getSExtValue();
     const int64_t lo  = std::max<int64_t>(lsb, 0);
