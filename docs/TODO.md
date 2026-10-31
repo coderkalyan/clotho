@@ -283,8 +283,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Cross-scope partial driver** — a constant bit/part-select driver from a different
     scope than the net's other drivers, entering through an input port.
 - [~] **Drive strengths** — missing pieces:
-  - [ ] **Strength ranges** — an x/z value on an asymmetric-strength driver resolves to a
-    definite value where the range model yields x.
   - [ ] **Drive strength on `wand` / `wor` nets**.
   - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
   - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the

@@ -223,6 +223,16 @@ Index Builder::net_pull(Index op, uint32_t pull, SourceLoc loc) {
     return emit({ Inst::Tag::NetPull, Inst::Payload{ .op_imm = { op, pull } } }, loc);
 }
 
+Index Builder::net_res(Inst::Tag tag, std::span<const Index> drivers, SourceLoc loc) {
+    assert((tag == Inst::Tag::WireRes || tag == Inst::Tag::WandRes || tag == Inst::Tag::WorRes) &&
+           "net_res takes a strengthless resolution tag");
+    assert(!drivers.empty() && "a resolution has at least one driver");
+    const ExtraSlice slice = add_slice(drivers);
+    const ExtraIndex extra = add_extra(slice);
+
+    return emit({ tag, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths, SourceLoc loc) {
     std::vector<uint32_t> packed(strengths.begin(), strengths.end());
     const StrengthResInfo info{ .values = add_slice(slots), .strengths = add_u32_slice(packed) };

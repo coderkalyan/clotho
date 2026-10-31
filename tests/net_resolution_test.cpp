@@ -1,14 +1,19 @@
 // Multi-driver net resolution (LRM 6.6.1, wire/tri, no drive strengths): the
 // lattice join z ⊑ {0,1} ⊑ x. Whole-net overlapping drivers each stage into a
-// private slot and a WireRes resolver folds them into the net. Every expected
+// private slot and a WireRes resolver resolves them at once. Every expected
 // value below was cross-checked against iverilog 13 (a full net-resolution
 // oracle) on the same source.
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <bit>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "Lower.h"
 #include "PosixIo.h"
@@ -77,7 +82,7 @@ TEST_CASE("tri-state bus: z identity, agreement, conflict") {
     CHECK(out == "zzzz\n0101\n1010\nxxxx\n1x00\n");
 }
 
-TEST_CASE("three tri-state drivers fold left through WireRes") {
+TEST_CASE("three tri-state drivers resolve at once through WireRes") {
     const std::string out = run_capture(R"(
         module top;
           logic [1:0] sel;
@@ -537,6 +542,37 @@ TEST_CASE("open-drain and open-source asymmetric strengths") {
     CHECK(out == "0\nz\n1\n0\n");
 }
 
+// An x driver with asymmetric strengths is the range from its strength0 to its
+// strength1 (LRM 28.12.3): it can still be a 0 at strength0 and a 1 at
+// strength1, so a definite driver only wins by beating both ends. In w1 the x's
+// strong0 is the strongest level but is not a definite 0, and the pull 1
+// outranks its weak1, so the range holds both values. Oracle: iverilog 13
+// prints the same ten values.
+TEST_CASE("an x driver with asymmetric strengths contributes a strength range") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic xv;
+          wire  w1, w2, w3, w4, w5, w6, w7, w8, w9, w10;
+          assign (strong0, weak1)   w1 = xv; assign (pull0,   pull1)   w1 = 1'b1;
+          assign (strong0, weak1)   w2 = xv; assign (pull0,   pull1)   w2 = 1'b0;
+          assign (weak0,   weak1)   w3 = xv; assign (pull0,   pull1)   w3 = 1'b1;
+          assign (strong0, highz1)  w4 = xv; assign (pull0,   pull1)   w4 = 1'b0;
+          assign (highz0,  strong1) w5 = xv;
+          assign (strong0, weak1)   w6 = xv; assign (strong0, strong1) w6 = 1'b0;
+          assign (weak0,   strong1) w7 = xv; assign (weak0,   weak1)   w7 = 1'b1;
+          assign (strong0, weak1)   w8 = xv; assign (strong0, strong1) w8 = 1'b1;
+          assign (strong0, weak1)   w9 = xv; assign (weak0,   weak1)   w9 = 1'b0;
+          assign (strong0, highz1)  w10 = xv; assign (strong0, strong1) w10 = 1'b0;
+          initial begin
+            xv = 1'bx;
+            #1 $display("%b %b %b %b %b %b %b %b %b %b", w1, w2, w3, w4, w5, w6, w7, w8, w9, w10);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "x 0 1 0 x 0 x x x 0\n");
+}
+
 // A tri0/tri1 pull is a Pull-strength driver of 0/1, so it competes in the fold:
 // a Weak (< Pull) driver loses to it, a Strong (> Pull) driver beats it. This is
 // the corner a plain post-fold pull (fills Z only) gets wrong.
@@ -957,4 +993,242 @@ TEST_CASE("disjoint partial continuous assigns to a 2-state variable") {
         endmodule
     )");
     CHECK(out == "v=a5\n");
+}
+
+// -- N-ary resolution against the LRM tables --
+
+namespace {
+
+// LRM Tables 6-2, 6-3 and 6-4, rows and columns in the order 0 1 x z.
+constexpr std::string_view kWireTable = "0xx0" "x1x1" "xxxx" "01xz";
+constexpr std::string_view kWandTable = "0000" "01x1" "0xxx" "01xz";
+constexpr std::string_view kWorTable  = "01x0" "1111" "x1xx" "01xz";
+
+size_t value_index(char v) {
+    return std::string_view("01xz").find(v);
+}
+
+} // namespace
+
+// Every 4-state combination of 2, 3 and 4 drivers on one net bit, for each net
+// type that resolves by value: bit c of the net is driven by digit k of c (base
+// 4) from driver k. The expected value is the table folded left over the
+// drivers; the tables are associative, so that is their value for any order.
+TEST_CASE("N-ary resolution matches LRM tables 6-2 to 6-4 for every driver combination") {
+    struct Kind {
+        const char*      name;
+        std::string_view table;
+    };
+    for (const Kind kind : { Kind{ "wire", kWireTable }, Kind{ "wand", kWandTable }, Kind{ "wor", kWorTable } }) {
+        for (size_t n = 2; n <= 4; ++n) {
+            const size_t bits = size_t{ 1 } << (2 * n);
+            std::string  src  = "module top;\n  " + std::string(kind.name) + " [" + std::to_string(bits - 1) + ":0] w;\n";
+            std::string  expected;
+            for (size_t k = 0; k < n; ++k) {
+                src += "  assign w = " + std::to_string(bits) + "'b";
+                for (size_t c = bits; c-- > 0;) {
+                    src += "01xz"[(c >> (2 * k)) & 3];
+                }
+                src += ";\n";
+            }
+            for (size_t c = bits; c-- > 0;) {
+                char acc = "01xz"[c & 3];
+                for (size_t k = 1; k < n; ++k) {
+                    acc = kind.table[value_index(acc) * 4 + value_index("01xz"[(c >> (2 * k)) & 3])];
+                }
+                expected += acc;
+            }
+            src += "  initial begin #1; $display(\"%b\", w); end\nendmodule\n";
+            CHECK_MESSAGE(run_capture(src) == expected + "\n", kind.name, " with ", n, " drivers");
+        }
+    }
+}
+
+// -- Two drivers of every value and strength pair against LRM 28.12 --
+
+namespace {
+
+// The reference is LRM 28.12 applied literally to a pair of signals. A signal is
+// the set of its strength levels on the scale of Figure 28-2: bit p of a Sig is
+// position p, 0..7 the strength0 levels 7..0 and 8..15 the strength1 levels 0..7,
+// so positions 7 and 8 are highz. A 0 or 1 driver is one level, an x driver the
+// range from its strength0 to its strength1, z is the empty set.
+using Sig = uint32_t;
+
+constexpr int kLrmLevel[5] = { 0, 3, 5, 6, 7 }; // highz, weak, pull, strong, supply
+constexpr Sig kHighz       = Sig{ 1 } << 7 | Sig{ 1 } << 8;
+
+int level_of(int p) {
+    return p <= 7 ? 7 - p : p - 8;
+}
+
+int side_of(int p) { // 0 or 1; -1 for highz
+    return p == 7 || p == 8 ? -1 : (p < 7 ? 0 : 1);
+}
+
+Sig span(int lo, int hi) {
+    return ((Sig{ 1 } << (hi + 1)) - 1) & ~((Sig{ 1 } << lo) - 1);
+}
+
+int lowest(Sig s) {
+    return std::countr_zero(s);
+}
+
+int highest(Sig s) {
+    return std::bit_width(s) - 1;
+}
+
+Sig driver_sig(char v, int s0, int s1) {
+    const int p0 = 7 - kLrmLevel[s0];
+    const int p1 = 8 + kLrmLevel[s1];
+    switch (v) {
+        case '0':
+            return s0 == 0 ? 0 : Sig{ 1 } << p0;
+        case '1':
+            return s1 == 0 ? 0 : Sig{ 1 } << p1;
+        case 'x':
+            return span(p0, p1);
+        default:
+            return 0;
+    }
+}
+
+// The combination rules of 28.12.1 to 28.12.3. An ambiguous signal meets an
+// unambiguous one level by level: levels above it stay, levels at or below it
+// go (rule b), a gap between opposite values is filled (rule c), and a level
+// of opposite value at equal strength makes the x of 28.12.2.
+Sig combine(Sig a, Sig b) {
+    if ((a & ~kHighz) == 0) {
+        return b;
+    }
+    if ((b & ~kHighz) == 0) {
+        return a;
+    }
+    if (std::popcount(a) == 1 && std::popcount(b) == 1) {
+        const int pa = lowest(a);
+        const int pb = lowest(b);
+        if (level_of(pa) != level_of(pb)) {
+            return level_of(pa) > level_of(pb) ? a : b;
+        }
+        return pa == pb ? a : span(std::min(pa, pb), std::max(pa, pb));
+    }
+    if (std::popcount(a) > 1 && std::popcount(b) > 1) {
+        return span(lowest(a | b), highest(a | b));
+    }
+    const Sig amb = std::popcount(a) > 1 ? a : b;
+    const Sig un  = std::popcount(a) > 1 ? b : a;
+    const int pu  = lowest(un);
+    const int s   = level_of(pu);
+    Sig       r   = 0;
+    bool      dropped = false;
+    for (int p = 0; p < 16; ++p) {
+        if (((amb >> p) & 1) == 0) {
+            continue;
+        }
+        if (level_of(p) > s) {
+            r |= Sig{ 1 } << p;
+        } else {
+            dropped = true;
+        }
+        if (level_of(p) == s && side_of(p) >= 0 && side_of(p) != side_of(pu)) {
+            r |= span(7 - s, 8 + s);
+        }
+    }
+    if (dropped) {
+        r |= un;
+    }
+    bool has0 = false, has1 = false;
+    for (int p = 0; p < 16; ++p) {
+        if (((r >> p) & 1) != 0) {
+            has0 = has0 || side_of(p) == 0;
+            has1 = has1 || side_of(p) == 1;
+        }
+    }
+    return has0 && has1 ? span(lowest(r), highest(r)) : r;
+}
+
+// The value of a signal: x when its range holds both values, or one value and
+// high-Z (the L and H of the LRM, which Clotho reads as x), z when it holds none.
+char value_of_sig(Sig s) {
+    const bool has0 = (s & span(0, 6)) != 0;
+    const bool has1 = (s & span(9, 15)) != 0;
+    const bool hiz  = (s & kHighz) != 0;
+    if (!has0 && !has1) {
+        return 'z';
+    }
+    if (has0 && !has1 && !hiz) {
+        return '0';
+    }
+    if (has1 && !has0 && !hiz) {
+        return '1';
+    }
+    return 'x';
+}
+
+} // namespace
+
+// Net n is driven by `va` and `vb` at the n-th pair of strength pairs; bit 4i+j
+// of the nets carries value i (0 1 x z) on the first driver and value j on the
+// second. All 24 legal strength pairs per driver, so 576 nets and 9216 cases.
+// Oracle: iverilog 13 agrees with the reference on every one of them.
+TEST_CASE("two drivers of every value and strength pair resolve by LRM 28.12") {
+    constexpr const char* kName[5] = { "highz", "weak", "pull", "strong", "supply" };
+    std::vector<std::pair<int, int>> pairs;
+    for (int s0 = 0; s0 < 5; ++s0) {
+        for (int s1 = 0; s1 < 5; ++s1) {
+            if (s0 != 0 || s1 != 0) { // (highz0, highz1) is illegal
+                pairs.emplace_back(s0, s1);
+            }
+        }
+    }
+    std::string src = "module top;\n  reg [15:0] va, vb;\n";
+    std::string va  = "16'b";
+    std::string vb  = "16'b";
+    for (int b = 15; b >= 0; --b) {
+        va += "01xz"[b / 4];
+        vb += "01xz"[b % 4];
+    }
+    std::string display;
+    std::string expected;
+    size_t      n = 0;
+    for (const auto& [a0, a1] : pairs) {
+        for (const auto& [b0, b1] : pairs) {
+            const std::string w = "w" + std::to_string(n++);
+            src += "  wire [15:0] " + w + ";\n";
+            src += std::string("  assign (") + kName[a0] + "0, " + kName[a1] + "1) " + w + " = va;\n";
+            src += std::string("  assign (") + kName[b0] + "0, " + kName[b1] + "1) " + w + " = vb;\n";
+            display += "$display(\"%b\", " + w + "); ";
+            for (int bit = 15; bit >= 0; --bit) {
+                const Sig sa = driver_sig("01xz"[bit / 4], a0, a1);
+                const Sig sb = driver_sig("01xz"[bit % 4], b0, b1);
+                expected += value_of_sig(combine(sa, sb));
+            }
+            expected += '\n';
+        }
+    }
+    src += "  initial begin va = " + va + "; vb = " + vb + "; #1; " + display + "end\nendmodule\n";
+    CHECK(run_capture(src) == expected);
+}
+
+// With three drivers the pairwise rules of 28.12.3 can disagree with themselves
+// by order (LRM_NOTES note 52), so a net resolves all its drivers at once and
+// the driver order does not matter. Here the definite 0 and 1 are both pull, so
+// the net is x whatever the x driver, a 0 at strong or a 1 at weak, turns out to
+// be. iverilog 13 prints 0 for net a and x for b and c.
+TEST_CASE("the order of three drivers does not change a strength resolution") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic xv;
+          wire  a, b, c;
+          assign (strong0, weak1) a = xv; assign (pull0, strong1) a = 1'b0; assign (weak0, pull1) a = 1'b1;
+          assign (pull0, strong1) b = 1'b0; assign (weak0, pull1) b = 1'b1; assign (strong0, weak1) b = xv;
+          assign (weak0, pull1) c = 1'b1; assign (strong0, weak1) c = xv; assign (pull0, strong1) c = 1'b0;
+          initial begin
+            xv = 1'bx;
+            #1 $display("%b %b %b", a, b, c);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "x x x\n");
 }
