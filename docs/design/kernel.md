@@ -74,8 +74,10 @@ when it does.
 - XOR and XNOR test for unknown bits and use one native XOR when all are known.
 - `->` and `<->` are IR operations lowered from their own three-valued rules.
 - Concatenation, replication and streaming reversal build independent
-  constant-offset terms, with pattern forms (bit-reverse, byte-swap, multiply by
-  a repeating constant). **Not yet:** a serial shift-and-OR chain.
+  constant-offset terms, with pattern forms (bit-reverse, byte-swap, sign
+  extension, multiply by a repeating constant). **Not yet:** concatenation,
+  which is still a serial shift-and-OR chain: independent terms measured
+  +6.6% instructions on tests/perf timers (a 32-operand 4-state concat).
 - `$clog2` of an argument with x or z bits: decided after checking what other
   simulators do. **Not yet:** all-x, checked against Icarus only.
 - Real math: the classic functions as LLVM intrinsics, the rest as C math calls.

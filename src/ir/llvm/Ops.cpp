@@ -1823,6 +1823,16 @@ Plane Backend::lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool f
     return { b_.CreateSelect(cond_known, sel_mm, merge), b_.CreateSelect(cond_known, sel_z, zero(w)) };
 }
 
+// -- Replication and block reversal: independent terms --
+//
+// Each result is the OR of terms, pieces of the operand shifted to constant offsets of
+// the result, so no term reads another. The obvious alternative, an accumulator shifted
+// by each piece's width before the next piece is OR'd in, is a chain of W-bit
+// operations as long as there are pieces: W of them for a bit reversal, which took
+// time quadratic in W to compile (79 s for 4096 bits). Where a piece pattern has an
+// instruction of its own (bit reverse, byte swap, a sign extension, a multiply by a
+// repeating constant) that is what is generated.
+
 Plane Backend::lower_concat(Index i) {
     const uint32_t       w = type_of(i).width;
     std::array<Index, 4> scratch;
@@ -1880,27 +1890,50 @@ Plane Backend::lower_concat(Index i) {
     return packed(must, may, z);
 }
 
-// {<<S{x}}: reverse the order of the operand's S-bit blocks, sliced from
-// the LSB (a final partial block keeps its own width; block 0 lands at the
-// MSB). Applied to each plane independently — a pure bit permutation.
+// The bytes of `v` in reverse order. llvm.bswap takes a whole number of 16-bit words, so
+// an odd count of bytes goes in with a zero byte on top and comes back shifted down.
+llvm::Value* Backend::byte_reverse(llvm::Value* v, uint32_t w) {
+    assert(w % 8 == 0 && bits_of(v) == w);
+    const uint32_t padded  = (w + 15) / 16 * 16;
+    llvm::Value*   swapped = b_.CreateUnaryIntrinsic(llvm::Intrinsic::bswap, cast(v, padded, false));
+    return padded == w ? swapped : cast(b_.CreateLShr(swapped, padded - w), w, false);
+}
+
+// {<<S{x}}: reverse the order of the operand's S-bit blocks (LRM 11.4.14.2), sliced
+// from the LSB; a final partial block keeps its own width, and block 0 lands at the MSB.
+// Applied to each plane independently, as a pure bit permutation. One-bit blocks are
+// llvm.bitreverse, eight-bit blocks of whole bytes llvm.bswap; any other size is one
+// term per block.
 llvm::Value* Backend::reverse_blocks(llvm::Value* v, uint32_t w, uint32_t slice) {
-    const uint32_t n     = (w + slice - 1) / slice;
-    llvm::Value*   acc   = zero(w);
-    bool           first = true;
-    for (uint32_t i = 0; i < n; ++i) {
-        const uint32_t lo = i * slice;
-        const uint32_t bw = std::min<uint32_t>((i + 1) * slice, w) - lo;
-        llvm::Value*   blk =
-          b_.CreateAnd(b_.CreateLShr(v, lo),
-                       llvm::ConstantInt::get(ctx_, llvm::APInt::getLowBitsSet(w, bw)));
-        // Skip the shift before the first block: for a single block bw == w,
-        // and a shift by the full width is poison in LLVM.
-        if (!first) {
-            acc = b_.CreateShl(acc, bw);
-        }
-        acc   = b_.CreateOr(acc, blk);
-        first = false;
+    assert(slice > 0 && bits_of(v) == w);
+    if (slice >= w) {
+        return v; // A single block.
     }
+    if (slice == 1) {
+        return b_.CreateUnaryIntrinsic(llvm::Intrinsic::bitreverse, v);
+    }
+    if (slice == 8 && w % 8 == 0) {
+        return byte_reverse(v, w);
+    }
+    // The block moves from [lo, lo + bw) to [offset, offset + bw) by one shift, and a mask
+    // drops the bits that came along from the other blocks. The first and last block's
+    // masks are redundant and instcombine removes them, which leaves two blocks as the
+    // rotate they are.
+    llvm::Value* acc    = nullptr;
+    uint32_t     offset = w;
+    for (uint32_t lo = 0; lo < w; lo += slice) {
+        const uint32_t bw = std::min(slice, w - lo);
+        offset -= bw;
+        llvm::Value* moved = v;
+        if (offset > lo) {
+            moved = b_.CreateShl(v, offset - lo);
+        } else if (offset < lo) {
+            moved = b_.CreateLShr(v, lo - offset);
+        }
+        llvm::Value* term = b_.CreateAnd(moved, llvm::ConstantInt::get(ctx_, llvm::APInt::getBitsSet(w, offset, offset + bw)));
+        acc               = acc != nullptr ? b_.CreateOr(acc, term) : term;
+    }
+    assert(offset == 0);
     return acc;
 }
 
@@ -1913,43 +1946,51 @@ Plane Backend::lower_stream_reverse(Plane v, bool four, uint32_t slice) {
                   reverse_blocks(z_of(v, four), w, slice));
 }
 
-Plane Backend::lower_repl(Plane v, bool four, uint32_t part_width, uint32_t count) {
-    // TODO: a zero replication count ({0{x}}) should yield a 0-width value;
-    // here w becomes 0 and int_ty(0) is widened to i1, so it leaks one bit.
-    const uint32_t w    = part_width * count;
-
-    // 2-state: replicate the single word.
-    if (!four) {
-        llvm::Value* p   = cast(v.mm, w, false);
-        llvm::Value* acc = zero(w);
+// `count` copies of `v`, a `pw`-bit value, as one iW value of W = pw * count bits (LRM
+// 11.4.12.1). A bit replicated is a sign extension. A part of up to a word is one
+// multiply by a 1 at the start of each copy: each copy of `v` lands in a field of its
+// own, so no carry crosses one, and with a constant and one operand of a single word LLVM
+// needs a word multiply per word of the result. A wider part would multiply every one of
+// its words by every word of the constant, so the copies double instead: after the step
+// that shifts by `have` copies there are 2 * have, and those shifted past W fall off the
+// end, which makes the last step right for a count that is not a power of two. That is
+// ceil(log2 count) steps, where a chain that adds one copy at a time takes count.
+llvm::Value* Backend::replicate(llvm::Value* v, uint32_t pw, uint32_t count) {
+    assert(count > 0 && bits_of(v) == pw);
+    const uint32_t w = pw * count;
+    if (count == 1) {
+        return v;
+    }
+    if (pw == 1) {
+        return b_.CreateSExt(v, int_ty(w));
+    }
+    if (pw <= 64) {
+        llvm::APInt copies(w, 0);
         for (uint32_t c = 0; c < count; ++c) {
-            if (c != 0) {
-                acc = b_.CreateShl(acc, part_width);
-            }
-            acc = b_.CreateOr(acc, p);
+            copies.setBit(c * pw);
         }
-        return two_val(acc);
+        return b_.CreateMul(cast(v, w, false), llvm::ConstantInt::get(ctx_, copies));
     }
+    llvm::Value* r = cast(v, w, false);
+    for (uint32_t have = 1; have < count; have *= 2) {
+        r = b_.CreateOr(r, b_.CreateShl(r, have * pw));
+    }
+    return r;
+}
 
-    llvm::Value*   pm   = cast(must_of(v, four), w, false);
-    llvm::Value*   pM   = cast(may_of(v, four), w, false);
-    llvm::Value*   pz   = cast(z_of(v, four), w, false);
-    llvm::Value*   must = zero(w);
-    llvm::Value*   may  = zero(w);
-    llvm::Value*   z    = zero(w);
-    // Skip the shift on the first copy: for a single replication ({1{x}})
-    // part_width == w, and a shift by the full width is poison in LLVM.
-    for (uint32_t c = 0; c < count; ++c) {
-        if (c != 0) {
-            must = b_.CreateShl(must, part_width);
-            may  = b_.CreateShl(may, part_width);
-            z    = b_.CreateShl(z, part_width);
-        }
-        must = b_.CreateOr(must, pm);
-        may  = b_.CreateOr(may, pM);
-        z    = b_.CreateOr(z, pz);
+// {n{x}}: every plane of a 4-state operand replicates alike.
+Plane Backend::lower_repl(Plane v, bool four, uint32_t part_width, uint32_t count) {
+    // TODO: a zero replication count ({0{x}}) should yield a 0-width value; the
+    // one-bit zero returned here (int_ty(0) is widened to i1) leaks one bit. A
+    // concatenation skips it by the operand's type width, which is 0.
+    if (part_width * count == 0) {
+        return four ? packed(zero(0), zero(0), zero(0)) : two_val(zero(0));
     }
-    return packed(must, may, z);
+    if (!four) {
+        return two_val(replicate(v.mm, part_width, count));
+    }
+    return packed(replicate(must_of(v, four), part_width, count), replicate(may_of(v, four), part_width, count),
+                  replicate(z_of(v, four), part_width, count));
 }
 
 } // namespace clotho::ir::backend

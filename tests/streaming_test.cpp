@@ -13,6 +13,9 @@
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
+
+#include <llvm/Support/raw_ostream.h>
 
 using namespace clotho;
 
@@ -793,4 +796,98 @@ TEST_CASE("slice size on a dynamically-sized stream into a queue destination sta
             initial bits = {<<8{p}};
         endmodule
     )", "slice size on a dynamically-sized streaming concatenation");
+}
+
+namespace {
+
+// Unoptimized LLVM IR: the shapes below are what the backend writes, which the
+// optimizer is free to rewrite.
+std::string emit_raw(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false }));
+    return text;
+}
+
+// {<<S{v}} on a binary string, MSB first, from LRM 11.4.14.2 alone: slice from the right
+// into S-bit blocks (the last, leftmost one may be shorter), then list the blocks from the
+// right one to the left one.
+std::string reverse_blocks_model(const std::string& bits, size_t slice) {
+    std::string out;
+    for (size_t end = bits.size(); end > 0;) {
+        const size_t start = end > slice ? end - slice : 0;
+        out += bits.substr(start, end - start);
+        end = start;
+    }
+    return out;
+}
+
+} // namespace
+
+// The model above against every slice size at widths around the cases the backend
+// special-cases (1-bit blocks, whole-byte blocks, an odd count of bytes, a partial last
+// block, one block, two blocks), 2- and 4-state, x and z included.
+TEST_CASE("stream << matches the block-reversal model at every slice size") {
+    uint64_t state = 12345;
+    const auto next = [&] { state = state * 6364136223846793005ULL + 1442695040888963407ULL; return state >> 33; };
+    for (const bool four : { false, true }) {
+        for (const size_t w : std::initializer_list<size_t>{ 2, 3, 7, 8, 9, 16, 17, 24, 31, 32, 33, 40, 63, 64, 65, 100, 127, 128, 129, 200, 300 }) {
+            std::string src = "module t;\n  " + std::string(four ? "logic" : "bit") + " [" + std::to_string(w - 1) +
+                              ":0] v, r;\n  initial begin\n";
+            std::string want;
+            for (const size_t s : std::initializer_list<size_t>{ 1, 2, 3, 4, 5, 8, 9, 16, 24, 32, 64, w / 2, w - 1 }) {
+                if (s < 1 || s >= w) {
+                    continue;
+                }
+                std::string bits;
+                for (size_t k = 0; k < w; ++k) {
+                    bits += four ? "01xz0101"[next() % 8] : "01"[next() % 2];
+                }
+                src += "    v = " + std::to_string(w) + "'b" + bits + "; r = {<<" + std::to_string(s) +
+                       " {v}}; $display(\"%b\", r);\n";
+                want += reverse_blocks_model(bits, s) + "\n";
+            }
+            src += "  end\nendmodule\n";
+            CAPTURE(w);
+            CAPTURE(four);
+            CHECK(run_capture(src) == want);
+        }
+    }
+}
+
+// 4096 bits took 79 s to compile as a shift-and-OR chain of 4096 blocks; as one bit
+// reversal it is instant.
+TEST_CASE("a 4096-bit bit reversal and byte swap compile and are right") {
+    std::string bits;
+    for (size_t k = 0; k < 4096; ++k) {
+        bits += (k * 7 + k / 3) % 5 < 2 ? '1' : '0';
+    }
+    const std::string out = run_capture("module t;\n  bit [4095:0] v, r, s;\n  initial begin\n    v = 4096'b" + bits +
+                                        ";\n    r = {<<{v}}; s = {<<8{v}};\n    $display(\"%b\", r); $display(\"%b\", s);\n  end\nendmodule\n");
+    CHECK(out == reverse_blocks_model(bits, 1) + "\n" + reverse_blocks_model(bits, 8) + "\n");
+}
+
+TEST_CASE("stream reversal code shapes: bitreverse, bswap, and terms for other slice sizes") {
+    const auto src = [](std::string_view type, std::string_view slice) {
+        return "module m(input " + std::string(type) + " [63:0] a, output " + std::string(type) + " [63:0] y);\n  assign y = {<<" +
+               std::string(slice) + " {a}};\nendmodule\n";
+    };
+    const std::string rev = emit_raw(src("bit", ""));
+    CHECK(rev.find("@llvm.bitreverse.i64") != std::string::npos);
+    const std::string swap = emit_raw(src("bit", "8"));
+    CHECK(swap.find("@llvm.bswap.i64") != std::string::npos);
+    CHECK(swap.find("@llvm.bitreverse") == std::string::npos);
+    // 4-state: each plane is reversed by itself.
+    CHECK(emit_raw(src("logic", "8")).find("@llvm.bswap.i64") != std::string::npos);
+    // Three whole bytes are padded to a word llvm.bswap accepts and shifted back.
+    const std::string odd = emit_raw("module m(input bit [23:0] a, output bit [23:0] y); assign y = {<<8 {a}}; endmodule");
+    CHECK(odd.find("@llvm.bswap.i32") != std::string::npos);
+    CHECK(odd.find("lshr i32") != std::string::npos);
+    // Any other size: no intrinsic, one shift and mask per block.
+    const std::string gen = emit_raw(src("bit", "16"));
+    CHECK(gen.find("@llvm.bswap") == std::string::npos);
+    CHECK(gen.find("@llvm.bitreverse") == std::string::npos);
+    CHECK(gen.find("and i64") != std::string::npos);
 }
