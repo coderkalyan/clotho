@@ -34,9 +34,8 @@ enum class Rule : uint8_t {
     // Both operands have the same width. The backend patches CaseEq / CasezEq /
     // CasexEq / WildEq with a max-width cast; every other operator is ill-typed.
     OperandWidth,
-    // Both operands have the same domain. Backend patch: lower_arith,
-    // lower_divmod and lower_bitwise promote the 2-state side (to_four);
-    // lower_compare, lower_case_compare and lower_wildeq lift both sides.
+    // Both operands have the same domain. The backend reads one domain for the pair
+    // and converts neither side, so a mismatch is an IR error it cannot repair.
     OperandDomain,
     // Sll Srl Sra: a 4-state amount makes the LRM result 4-state, but the IR
     // result is the shifted operand's type. Also: the shifted operand or the
@@ -53,10 +52,8 @@ enum class Rule : uint8_t {
     // The stored value's width equals the lvalue's. The frontend context-sizes
     // the right-hand side with a conversion, so the backend stores planes directly.
     StoreWidth,
-    // The stored value's domain differs from the lvalue's. Backend patch:
-    // lower_store projects a 4-state value to a narrow slot and lifts a 2-state
-    // one into the packed word; lower_store_nb and the array / aggregate NBA
-    // paths lift likewise. Recorded separately from StoreWidth.
+    // The stored value's domain differs from the lvalue's. The backend reads the value
+    // in the lvalue's domain and converts nothing. Recorded separately from StoreWidth.
     StoreDomain,
     // -- Conversions --
     // A conversion has the shape its opcode names: ZExt / SExt widen and Trunc

@@ -428,7 +428,7 @@ TEST_CASE("a 2-state NBA clock fires posedge and negedge waiters") {
 }
 
 // Regression: lower_arith/lower_divmod/lower_bitwise dispatched their native
-// (2-state) fast path solely on the LEFT operand's domain (`if (a.two)`),
+// (2-state) fast path solely on the LEFT operand's domain (then a `two` flag on its plane),
 // blindly using the right operand's .mm as if it were also a bare iW value.
 // A 2-state left operand (`int`) mixed with a 4-state right operand (`logic`)
 // fed an i(2W) value where an iW was assumed (or vice versa): malformed LLVM

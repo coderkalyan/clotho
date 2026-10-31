@@ -994,3 +994,56 @@ TEST_CASE("a MOS switch whose strength cannot change the result is simulated") {
           initial #1 $display("r=%b s=%b", r, s);
         endmodule)") == "r=1 s=1\n");
 }
+
+// LRM 28.16: "When one delay value is given, then this value shall be used for all
+// propagation delays", so `and #(3)` is `and #3`; slang binds it as a three-delay control
+// with one value, which was refused as a "triple". The lines of the first gate delay test
+// above and of the cmos delay test, byte-identical to iverilog 13 for the bare spelling.
+TEST_CASE("a single gate delay value in parentheses is the same delay (LRM 28.16)") {
+    for (const std::string_view spelling : { "#3", "#(3)" }) {
+        const std::string gate = "module m; logic a, b; wire y;\n and " + std::string(spelling) +
+                                 " (y, a, b);\n"
+                                 R"( initial begin
+                a=0; b=0;
+                #1 $display("y=%b", y);
+                a=1; b=1;
+                #4 $display("y=%b", y);
+                a=0;
+                #4 $display("y=%b", y);
+                a=1; #1 a=0;
+                #4 $display("y=%b", y);
+                $finish;
+            end endmodule)";
+        CHECK_MESSAGE(run_capture(gate) == "y=x\ny=1\ny=0\ny=0\n", spelling);
+    }
+    for (const std::string_view spelling : { "#5", "#(5)" }) {
+        const std::string cmos = "module m; logic d, nc, pc, b; wire w;\n cmos " + std::string(spelling) +
+                                 " c (w, d, nc, pc);\n assign w = b;\n"
+                                 R"( initial begin
+                d = 0; nc = 1; pc = 0; b = 1'bz;
+                #1 $display("t=%0t w=%b", $time, w);
+                #5 $display("t=%0t w=%b", $time, w);
+                d = 1;
+                #6 $display("t=%0t w=%b", $time, w);
+                nc = 0; pc = 1;
+                #6 $display("t=%0t w=%b", $time, w);
+                b = 0;
+                #1 $display("t=%0t w=%b", $time, w);
+                nc = 1; pc = 0;
+                #6 $display("t=%0t w=%b", $time, w);
+                $finish;
+            end endmodule)";
+        CHECK_MESSAGE(run_capture(cmos) == "t=1 w=x\nt=6 w=0\nt=12 w=1\nt=18 w=z\nt=19 w=0\nt=25 w=x\n", spelling);
+    }
+}
+
+// A real value scales as it does without the parentheses.
+TEST_CASE("a real single gate delay value in parentheses is scaled like the bare one") {
+    for (const std::string_view spelling : { "#1.5", "#(1.5)" }) {
+        const std::string src = "`timescale 1ns/1ps\n module m; logic a; wire y;\n buf " + std::string(spelling) +
+                                " g (y, a);\n"
+                                " initial begin a = 0; #1 $display(\"%0.3f y=%b\", $realtime, y);\n"
+                                " #1 $display(\"%0.3f y=%b\", $realtime, y); #1 $finish; end endmodule";
+        CHECK_MESSAGE(run_capture(src) == "1.000 y=x\n2.000 y=0\n", spelling);
+    }
+}

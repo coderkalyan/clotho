@@ -106,6 +106,13 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v);
 
 bool delay_is_real(const TimingControl* tc);
 
+// The one delay value a `#d` or `#(d)` on a net, continuous assignment or gate gives
+// every transition: LRM 28.16, "When one delay value is given, then this value shall be
+// used for all propagation delays". slang binds `#d` as a DelayControl and `#(d)` as a
+// Delay3Control with no second or third value. Null for two or three values (a rise/fall/
+// turn-off selection Clotho does not represent) and for a control that is no delay.
+const Expression* single_delay_expr(const TimingControl& tc);
+
 // Walks a procedural block body for any real (`#1.5`-style) delay: a `#delay`
 // statement or an intra-assignment delay whose amount is floating. Existence-only
 // (stops mattering once `found` is set), so it never needs to descend further,
@@ -1847,6 +1854,19 @@ private:
     // Net handle -> its force sites (in registration order; the resolver blends
     // them in that order, exact for disjoint ranges).
     ankerl::unordered_dense::map<uint32_t, std::vector<NetForceSite>> net_force_sites_;
+    // A net with both a net delay (LRM 28.16) and a force site. The delay is the
+    // drivers' and the force is the net's (LRM 10.6.2), so the delayed fold cannot
+    // be stored into the net itself: it would land over an active force, and the
+    // inertial store would take the forced value for the net's own. The resolver
+    // keeps the delayed fold in `delayed` and lays the active sites over it for the
+    // net. `fold` is the latest undelayed fold: a release copies it into the freed bits
+    // of `delayed`, so they take the drivers' value at once (release_net, LRM note 49).
+    // Allocated with the net's first force site (register_net_force_site).
+    struct NetDelayShadow {
+        ir::Signal delayed{ 0 };
+        ir::Signal fold{ 0 };
+    };
+    ankerl::unordered_dense::map<uint32_t, NetDelayShadow> net_delay_shadow_;
     // Net handle -> the zero-formal function that re-folds the net's drivers and
     // overlays its force sites. The resolver process calls it, and so does a
     // `release` of the net, so the net takes its driven value at once (LRM
@@ -1857,7 +1877,7 @@ private:
 
     ir::FunctionId net_resolver_fn(uint32_t net);
     // A `force` statement -> (net handle, index into net_force_sites_) so the Emit
-    // lowering reuses the site the Collect scan created.
+    // lowering reuses the site the Classify scan (scan_force_targets) created.
     ankerl::unordered_dense::map<const void*, std::pair<uint32_t, uint32_t>> stmt_force_site_;
 
     const ValueSymbol* force_target(const Expression& lhs, bool* is_net);

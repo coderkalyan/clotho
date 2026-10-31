@@ -30,18 +30,19 @@ llvm::Value* Backend::dpi_vec_alloca(DpiCType ct, uint32_t nchunks) {
     return entry_alloca(int_ty((ct == DpiCType::BitVec ? 1u : 2u) * nchunks * 32), "dpi.vec");
 }
 
-// Fill an svVecVal scratch from a value Plane (input build / inout copy-in).
-void Backend::dpi_vec_copyin(DpiCType ct, Plane pl, uint32_t w, llvm::Value* scratch) {
+// Fill an svVecVal scratch from a value Plane in the domain `four` (input build /
+// inout copy-in).
+void Backend::dpi_vec_copyin(DpiCType ct, Plane pl, bool four, uint32_t w, llvm::Value* scratch) {
     const uint32_t nc = dpi_nchunks(w);
     if (ct == DpiCType::BitVec) {
         // svBitVecVal: the (2-state) value plane chunked is already the layout.
-        b_.CreateStore(b_.CreateZExtOrTrunc(must_of(pl), int_ty(nc * 32)), scratch);
+        b_.CreateStore(b_.CreateZExtOrTrunc(must_of(pl, four), int_ty(nc * 32)), scratch);
         return;
     }
     // svLogicVecVal: spill must/may/z; the runtime computes aval/bval + interleave.
-    llvm::Value* zv = (pl.two || pl.z == nullptr) ? zero(w) : pl.z;
-    b_.CreateCall(dpi_pack_logicvec_fn(), { dpi_spill_words(must_of(pl), nc),
-                                            dpi_spill_words(may_of(pl), nc),
+    llvm::Value* zv = (!four || pl.z == nullptr) ? zero(w) : pl.z;
+    b_.CreateCall(dpi_pack_logicvec_fn(), { dpi_spill_words(must_of(pl, four), nc),
+                                            dpi_spill_words(may_of(pl, four), nc),
                                             dpi_spill_words(zv, nc), b_.getInt32(nc), scratch });
 }
 
@@ -113,8 +114,8 @@ void Backend::emit_dpi_oa_pack_ir(llvm::Value*      storage,
         aval       = b_.CreateAnd(may, b_.CreateNot(z));
         bval       = b_.CreateXor(must, may);
     } else {
-        // 2-state: the value is the low W bits of field 0 (narrow iW, or the must
-        // region of a non-narrow i2W) — mirrors the C pack_bit low-W read.
+        // 2-state: the value is the low W bits of field 0 (the native iW, or the
+        // must region of a 4-state i2W) — mirrors the C pack_bit low-W read.
         auto* raw = b_.CreateLoad(slot->getElementType(0), b_.CreateStructGEP(slot, slotptr, 0));
         aval      = b_.CreateZExtOrTrunc(raw, iW);
     }
@@ -258,7 +259,7 @@ llvm::Value* Backend::build_dpi_dynarray_desc(const LValue& lv, Ref arr_ref, Dpi
     const DynElem e            = dynarr_elem(arr_ref);
     const bool    named_scalar = elem_ct == DpiCType::Byte || elem_ct == DpiCType::Shortint ||
                               elem_ct == DpiCType::Int || elem_ct == DpiCType::Longint;
-    if (!named_scalar || !e.narrow) {
+    if (!named_scalar || e.four_state) {
         throw BackendError{ "DPI open-array over a dynamic array supports only "
                             "byte/shortint/int/longint (zero-copy) elements so far" };
     }
@@ -275,7 +276,7 @@ llvm::Value* Backend::build_dpi_dynarray_desc(const LValue& lv, Ref arr_ref, Dpi
 
 // Build the svOpenArrayHandle (rt_svopen*) for a DPI open-array argument
 // (LRM 35.5.6.2). Named-scalar (byte/shortint/int/longint) elements are zero-copy
-// — Clotho's narrow `[N x iW]` element storage is already a contiguous C array —
+// — Clotho's native `[N x iW]` element storage is already a contiguous C array —
 // so the descriptor points straight at the design array (the C reads and, for
 // output/inout, writes it directly). Packed bit/logic elements are marshalled in
 // inline LLVM IR into a contiguous svVecVal buffer: packed in for input/inout,
@@ -325,11 +326,11 @@ llvm::Value* Backend::build_dpi_open_array_desc(Index                       a,
         case DpiCType::Shortint:
         case DpiCType::Int:
         case DpiCType::Longint: {
-            // Zero-copy requires the narrow single-iW element slot (stride ==
-            // C element size). A never-narrow named scalar (its z word forced by
-            // a task out/inout use elsewhere) would not be C-layout — marshal it
-            // as a bit vector instead (the mm plane's low W bits are the value).
-            if (lv.narrow && stride == ew / 8) {
+            // Zero-copy requires the native single-iW element slot (stride ==
+            // C element size); a 4-state element would not be C-layout, so
+            // marshal it as a bit vector instead (the mm plane's low W bits are
+            // the value).
+            if (!lv.four_state && stride == ew / 8) {
                 // The C reads/writes the design array directly; an output/inout
                 // write lands in storage with no copy-back (and, per DPI, does not
                 // trigger wait/NBA scheduling on the array — a documented gap).
@@ -515,21 +516,23 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
             // value; output leaves it empty for the C to fill; inout copies in.
             llvm::Value* scratch = dpi_vec_alloca(ct, dpi_nchunks(w));
             if (dir == ArgDir::In) {
-                dpi_vec_copyin(ct, value_of(a), w, scratch);
+                dpi_vec_copyin(ct, value_of(a), type_of(a).four_state, w, scratch);
             } else if (dir == ArgDir::Inout) {
-                dpi_vec_copyin(ct, lower_load(lvalue_of(a)), w, scratch);
+                const LValue& alv = lvalue_of(a);
+                dpi_vec_copyin(ct, lower_load(alv), alv.four_state, w, scratch);
             }
             argv.push_back(scratch);
             if (dir != ArgDir::In) {
                 outs.push_back({ a, ct, scratch, nullptr, w });
             }
         } else if (dir == ArgDir::In) {
-            argv.push_back(dpi_arg_to_c(ct, value_of(a)));
+            argv.push_back(dpi_arg_to_c(ct, value_of(a), type_of(a).four_state));
         } else {
             llvm::Type*  cty     = dpi_c_llvm_ty(ct);
             llvm::Value* scratch = entry_alloca(cty, "dpi.out");
             if (dir == ArgDir::Inout) {
-                b_.CreateStore(dpi_arg_to_c(ct, lower_load(lvalue_of(a))), scratch);
+                const LValue& alv = lvalue_of(a);
+                b_.CreateStore(dpi_arg_to_c(ct, lower_load(alv), alv.four_state), scratch);
             }
             argv.push_back(scratch);
             outs.push_back({ a, ct, scratch, cty, w });
@@ -613,12 +616,12 @@ void Backend::emit_dpi_export_copyout(const std::vector<ExpOut>& outs, const std
         Plane pl = o.four ? Plane{ b_.CreateLoad(int_ty(2 * o.w), o.mm_ptr), b_.CreateLoad(int_ty(o.w), o.z_ptr) }
                           : two_val(b_.CreateLoad(int_ty(o.w), o.mm_ptr));
         if (is_dpi_vec(o.ct)) {
-            dpi_vec_copyin(o.ct, pl, o.w, o.c_ptr); // plane -> C svVecVal
+            dpi_vec_copyin(o.ct, pl, o.four, o.w, o.c_ptr); // plane -> C svVecVal
         } else {
             if (o.ct == DpiCType::Real || o.ct == DpiCType::Shortreal) {
                 pl = real_plane(planes_to_real(pl, o.w));
             }
-            b_.CreateStore(dpi_arg_to_c(o.ct, pl), o.c_ptr);
+            b_.CreateStore(dpi_arg_to_c(o.ct, pl, o.four), o.c_ptr);
         }
     }
     for (llvm::Value* h : str_temps) {
@@ -755,7 +758,6 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
                 if (pl.fp != nullptr) {
                     pl = real_to_planes(fp_of(pl));
                 }
-                assert(pl.two == !four && "a C value arrives in its formal's domain");
                 b_.CreateStore(pl.mm, mm_ptr);
                 if (four) {
                     b_.CreateStore(pl.z, z_ptr);
@@ -784,7 +786,7 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
         if (t.is_real) {
             rp = real_plane(planes_to_real(rp, t.width));
         }
-        b_.CreateRet(dpi_arg_to_c(ex.ret_ctype, rp));
+        b_.CreateRet(dpi_arg_to_c(ex.ret_ctype, rp, t.four_state));
         return;
     }
 
@@ -825,39 +827,40 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
     b_.CreateRet(b_.getInt32(0));
 }
 
-// Marshal an SV scalar value (a Plane the frontend resized to the formal type)
-// to its DPI-C native argument (LRM 35.5.6). A 2-state integer passes its value
-// plane; a scalar logic packs to svLogic (0/1/2=Z/3=X); a real rides its fp.
-llvm::Value* Backend::dpi_arg_to_c(DpiCType t, Plane p) {
+// Marshal an SV scalar value (a Plane the frontend resized to the formal type, in
+// the domain `four`) to its DPI-C native argument (LRM 35.5.6). A 2-state integer
+// passes its value plane; a scalar logic packs to svLogic (0/1/2=Z/3=X); a real
+// rides its fp.
+llvm::Value* Backend::dpi_arg_to_c(DpiCType t, Plane p, bool four) {
     switch (t) {
         case DpiCType::Byte:
-            return cast(must_of(p), 8, true);
+            return cast(must_of(p, four), 8, true);
         case DpiCType::Shortint:
-            return cast(must_of(p), 16, true);
+            return cast(must_of(p, four), 16, true);
         case DpiCType::Int:
-            return cast(must_of(p), 32, true);
+            return cast(must_of(p, four), 32, true);
         case DpiCType::Longint:
-            return cast(must_of(p), 64, true);
+            return cast(must_of(p, four), 64, true);
         case DpiCType::Real:
         case DpiCType::Shortreal:
             return fp_of(p);
         case DpiCType::Chandle:
             // The i64 handle bits reinterpreted as an opaque void*.
-            return b_.CreateIntToPtr(cast(must_of(p), 64, false), raw_ptr_ty());
+            return b_.CreateIntToPtr(cast(must_of(p, four), 64, false), raw_ptr_ty());
         case DpiCType::BitScalar:
-            return cast(must_of(p), 8, false); // zext the 1-bit value to svBit
+            return cast(must_of(p, four), 8, false); // zext the 1-bit value to svBit
         case DpiCType::LogicScalar: {
             // svLogic: sv_0=0, sv_1=1, sv_z=2, sv_x=3. z wins; else 1 for a
             // definite 1; else 3 (X) for any other unknown; else 0. The formal
             // is width 1. A 4-state Plane may carry no z plane (never-z), so
             // materialize the z bit safely rather than through z_of (nullptr).
-            const uint32_t w    = width_of(p);
-            llvm::Value*   zbit = (p.two || p.z == nullptr) ? b_.getFalse()
+            const uint32_t w    = width_of(p, four);
+            llvm::Value*   zbit = (!four || p.z == nullptr) ? b_.getFalse()
                                                             : b_.CreateICmpNE(p.z, zero(w));
             return b_.CreateSelect(
               zbit, b_.getInt8(2),
-              b_.CreateSelect(b_.CreateICmpNE(must_of(p), zero(w)), b_.getInt8(1),
-                              b_.CreateSelect(b_.CreateICmpNE(may_of(p), zero(w)),
+              b_.CreateSelect(b_.CreateICmpNE(must_of(p, four), zero(w)), b_.getInt8(1),
+                              b_.CreateSelect(b_.CreateICmpNE(may_of(p, four), zero(w)),
                                               b_.getInt8(3), b_.getInt8(0))));
         }
         default:

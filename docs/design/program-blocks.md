@@ -5,7 +5,7 @@ Reactive-region `initial`, `#0` / `#delay` / `@` / `wait` suspension, `fork`, th
 implicit `$finish`, ports in every direction, `assign`, reactive net resolution,
 concurrent assertions, per-program termination of descendant threads (24.3),
 `$exit` (24.7) and the thread-carried home region all work
-(`tests/program_test.cpp`, 70 cases; `docs/TODO.md` "Program blocks"). The one
+(`tests/program_test.cpp`, 76 cases; `docs/TODO.md` "Program blocks"). The one
 shape that does **not** is a clocking block or concurrent assertion whose
 clocking event is a *program* signal, which is refused loudly rather than
 scheduled a time slot late — §10, the last known gap in the clause.
@@ -250,7 +250,7 @@ would fork all of them. Concretely:
 |---|---|
 | `ir::Process` (`src/ir/Module.h:210`) | add `bool reactive_home = false` |
 | `add_continuous_process` (`src/lower/Nets.cpp`) | set it from `in_program_` |
-| seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) | `self_start` push → `emit_reactive_push` when reactive-home, so the time-zero settle happens in slot 0's Reactive |
+| seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) | `self_start` push → `emit_reactive_cont_push` when reactive-home, so the time-zero settle happens in slot 0's Reactive, ahead of every program thread (§3.1) |
 | subscribe loop (`:12013`) | unchanged predicate, but the recorded handle must be tagged — see correction 1 above |
 | `reactive_home()` (`:11399`) | include the current process's flag |
 | `compute_fusion_groups` | make the group key home-homogeneous — never fuse a reactive-home process with an Active one |
@@ -263,6 +263,52 @@ would fork all of them. Concretely:
 Cost to a design with no program: one `bool` in `Process` (fits existing
 padding), one already-taken branch in the seed loop. No new region, no new
 runtime entry point, no IR opcode.
+
+### 3.1 Order inside the Reactive region: continuous before procedural
+
+24.3.1 puts a program thread and a program's continuous process in the same
+region, and 4.7 says "active events can be taken off the Active or Reactive event
+region and processed in any order". No clause orders a program thread against the
+port copy that feeds it, and one FIFO ring left the order to seed order and wake
+order: a program `initial` read its input port as `x` at time 0 (seeded ahead of
+the copy), and a `#5` read in the slot where the design wrote the port's source
+read the old value (the copy was woken behind a thread the wheel had already
+resumed). Verilator 5.050 prints the settled value in both; iverilog 13 in the
+first (its program code is Active, §2's oracle note).
+
+Decision: **a reactive-home continuous process always runs before any program
+procedural code.** The copy stays Reactive-home, which is what 24.3.1 asks (§1,
+§4 A3); moving it to Active would settle it too but contradicts that reading. The
+choice is made in the order of events inside the region, which 4.7 leaves free
+(`docs/LRM_NOTES.md` note 50).
+
+| Site | Change |
+|---|---|
+| `clotho.reactive_cont` + head/tail | second ring, shape and capacity of `clotho.reactive`; exists only when a reactive-home process does (`design_uses_reactive_cont_`) |
+| `kReactiveContTag` | bit 2 on the home tag. Put on the static subscription of a reactive-home group, the one place a continuous process records its home; `emit_wake_push` reads it and picks the ring |
+| seed loop | a reactive-home `self_start` push goes to the continuous ring (`deferred_comb` too) |
+| `reactive.check` | strict priority: while the continuous ring is non-empty the next pop is from it |
+| `lower_finish`, `emit_program_end`, ring reset | empty / reset it with the others |
+
+Strict priority, not "once at the start of each iteration": a continuous process
+woken by program code mid-region (one program writes a design variable another
+program's port copies) would otherwise queue behind program threads already
+waiting, and they would read it stale. Now it runs at the next pop, so program code
+never runs with a reactive continuous process pending. The drain still ends for the
+reason the one-ring one did: every pop spends the oscillation budget.
+
+Net resolvers of program-driven nets (§4 A5) are reactive-home continuous
+processes and use the same ring, so the fold lands before program code reads the
+net. Output copies are unchanged: they run in Reactive and wake design readers
+into the next Active iteration (24.3.2). A copy or `assign` with a constant source
+has no sensitivity and is seeded on the Active ring, so it is settled before
+Reactive begins; that placement is older than this change and untouched by it.
+
+Cost: nothing for a design with no reactive-home process: the LLVM IR of designs
+with no program, with assertions only, and with a program that has no port or
+`assign` is byte-identical before and after. With one: a second ring, an
+`and`/`icmp` and three `select`s more per wake in `emit_wake_push`, and a load,
+an `or` and three `select`s more per pop of the reactive drain.
 
 ## 4. Ports: the phased plan
 

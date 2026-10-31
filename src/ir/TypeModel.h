@@ -21,7 +21,7 @@ namespace clotho::ir::types {
 enum class StorageClass : uint8_t {
     // Valueless (a void function return, a void tagged-union member).
     Void,
-    // One plane-packed slot: `{ i(2W) }`, `{ i(2W), iW }`, or narrow `{ iW }`.
+    // One plane-packed slot: `{ i(2W) }`, `{ i(2W), iW }`, or the native `{ iW }`.
     // Covers every integral kind, `real` / `shortreal`, a PACKED struct or
     // union (which is a single bit vector, LRM 7.2.1 / 7.3.1), and a class
     // handle or chandle (a 64-bit word with reference semantics).

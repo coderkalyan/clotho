@@ -629,7 +629,6 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
     if (pl.fp != nullptr) {
         pl = real_to_planes(fp_of(pl));
     }
-    assert(pl.two == !four && "an actual crosses a call in its formal's domain (ir::verify: call-arg-domain)");
     argv.push_back(pl.mm);
     if (four) {
         argv.push_back(pl.z);
@@ -641,7 +640,7 @@ void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool fo
 // the formal is 4-state. The temp is a whole cell of the formal's own type, so its
 // slot is the one its domain gives it.
 void Backend::push_scalar_out_arg(std::vector<llvm::Value*>& argv, const LValue& lv, bool four) {
-    assert(lv.narrow == !four && "an out / inout temp is the native slot of its domain");
+    assert(lv.four_state == four && "an out / inout temp is the native slot of its domain");
     argv.push_back(lv_mm_ptr(lv));
     if (four) {
         argv.push_back(lv_z_ptr(lv));
@@ -1061,9 +1060,8 @@ void Backend::build_frame_layout(const Function& f) {
         // type gets (agg_leaf_slot_ty), the one rule that makes both sides of an
         // alias agree without either side knowing the other (the actual is forced
         // to the same shape, see DesignFacts::ref_arg).
-        frame_slots_[i].narrow  = !frame_slots_[i].four_state;
         frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state,
-                                            frame_slots_[i].four_state, frame_slots_[i].narrow);
+                                            frame_slots_[i].four_state);
         fields[i]               = frame_slots_[i].slot_ty;
     }
     frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
@@ -1113,13 +1111,13 @@ void Backend::init_frame() {
             emit_gc_container_roots(GcRootOp::Add, s.ir_type, slot, s.slot_ty);
             continue;
         }
-        // A narrow 2-state local is a single iW field (comes up 0); a 4-state
-        // local is the packed word (X) plus a cleared z field.
-        if (s.narrow) {
+        // A 2-state local is a single iW field (comes up 0); a 4-state local is the
+        // packed word (X) plus a cleared z field.
+        if (!s.four_state) {
             b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 0));
             continue;
         }
-        llvm::Value*     mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
+        llvm::Value*     mm   = x_mm(s.width);
         b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
         b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
     }
@@ -1895,12 +1893,10 @@ void Backend::lower_ret(Index value) {
         pl = real_to_planes(fp_of(pl));
     }
     if (!abi_four_state(cur_fn_->return_type)) {
-        assert(pl.two && "a 2-state result is returned in its domain (ir::verify: ret-domain)");
         deinit_body_strings();
         b_.CreateRet(pl.mm);
         return;
     }
-    assert(!pl.two && "a 4-state result is returned in its domain (ir::verify: ret-domain)");
     auto* rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
     llvm::Value* agg = llvm::UndefValue::get(rty);
     agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
@@ -1942,7 +1938,7 @@ void Backend::lower_call_inst(Index i) {
 // illegal accesses, and the vtable load is the first thing that would fault.
 llvm::Value* Backend::load_vtable_callee(const VirtualCallInfo& vci, Index at) {
     const std::span<const Index> args   = ir_->region(vci.args);
-    llvm::Value*                 handle = must_of(value_of(args[0]));
+    llvm::Value*                 handle = must_of(args[0]);
     emit_null_handle_check(handle, at);
     llvm::Value* body = b_.CreateIntToPtr(handle, raw_ptr_ty());
     llvm::Value* vptr = b_.CreateLoad(
@@ -2456,13 +2452,13 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
         }
         // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
         // subset. The runtime distinguishes them per bit.
-        llvm::Value* must = must_of(p);
-        llvm::Value* xz   = b_.CreateXor(must, may_of(p));
+        llvm::Value* must = must_of(p, t.four_state);
+        llvm::Value* xz   = b_.CreateXor(must, may_of(p, t.four_state));
         store_field(sty, elt, 0, b_.getInt32(t.width));
         store_field(sty, elt, 1, b_.getInt32(signs[k] != 0 ? 1u : 0u));
         store_field(sty, elt, 2, put(must, words[k]));
         store_field(sty, elt, 3, put(xz, words[k]));
-        store_field(sty, elt, 4, put(z_of(p), words[k]));
+        store_field(sty, elt, 4, put(z_of(p, t.four_state), words[k]));
     }
     return arr;
 }

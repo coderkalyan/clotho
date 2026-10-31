@@ -221,11 +221,11 @@ uint32_t Backend::emit_agg_key_bytes(Ref              type,
         leaf.agg_leaf = true;
     }
     const Plane  pl  = lower_load(leaf);
-    llvm::Value* ux  = any_unknown(pl);
+    llvm::Value* ux  = any_unknown(pl, leaf.four_state);
     any_x            = any_x == nullptr ? ux : b_.CreateOr(any_x, ux);
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    emit_key_bytes(must_of(pl), W, is_signed, scratch, arr_ty, off);
+    emit_key_bytes(must_of(pl, leaf.four_state), W, is_signed, scratch, arr_ty, off);
     return off + (W + 7) / 8;
 }
 
@@ -389,14 +389,14 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Valu
         leaf.agg_leaf = true;
     }
     const Plane  pl = lower_load(leaf);
-    llvm::Value* ux = any_unknown(pl);
+    llvm::Value* ux = any_unknown(pl, leaf.four_state);
     b_.CreateStore(b_.CreateOr(b_.CreateLoad(b_.getInt1Ty(), any_x_slot), cast(ux, 1, false)), any_x_slot);
     const uint32_t w       = mod_.pool.layout(type).width;
     const uint32_t W       = w == 0 ? 1 : w;
     const uint32_t nbytes  = (W + 7) / 8;
     auto*           arr_ty = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
     auto*           scratch = entry_alloca(arr_ty, "assoc.vkey.leaf");
-    emit_key_bytes(must_of(pl), W, is_signed, scratch, arr_ty, 0);
+    emit_key_bytes(must_of(pl, leaf.four_state), W, is_signed, scratch, arr_ty, 0);
     b_.CreateCall(keybuf_append_fn(), { scratch, b_.getInt32(nbytes) });
 }
 
@@ -425,13 +425,13 @@ Backend::AssocKeySpan Backend::normalize_variable_agg_key(const LValue& key_lv, 
     return { ptr, len, valid };
 }
 
-// The i1 validity of an integral key plane: false when it holds an x/z bit
-// (LRM 7.8.4). Null when the key is 2-state, so nothing is gated.
-llvm::Value* Backend::integral_key_valid(Plane pl) {
-    if (pl.two || pl.mm == nullptr) {
-        return nullptr; // 2-state (or a real, which the frontend rejects as a key)
+// The i1 validity of an integral key plane in the domain `four`: false when it
+// holds an x/z bit (LRM 7.8.4). Null when the key is 2-state, so nothing is gated.
+llvm::Value* Backend::integral_key_valid(Plane pl, bool four) {
+    if (!four) {
+        return nullptr;
     }
-    llvm::Value* ux = any_unknown(pl);
+    llvm::Value* ux = any_unknown(pl, four);
     // A LITERAL x/z key (e.g. `a[8'hxx]`) folds any_unknown() to a compile-
     // time constant TRUE, not false -- "it's a Constant" alone does not mean
     // "statically valid" (P4b: this used to wrongly treat that as always-
@@ -459,8 +459,9 @@ Backend::AssocKeySpan Backend::normalize_assoc_key_value(Index key, Ref assoc_ty
                                 : normalize_agg_key(lvalue_of(key), info);
     }
     const Plane pl    = value_of(key);
-    auto [kptr, klen] = normalize_integral_key(must_of(pl), info);
-    return { kptr, klen, integral_key_valid(pl) };
+    const bool  four  = type_of(key).four_state;
+    auto [kptr, klen] = normalize_integral_key(must_of(pl, four), info);
+    return { kptr, klen, integral_key_valid(pl, four) };
 }
 
 // Normalized key span for the CURRENT value of a key VARIABLE lvalue (next /
@@ -477,8 +478,8 @@ Backend::AssocKeySpan Backend::normalize_assoc_key_lvalue(const LValue& key_lv, 
         return info.is_variable ? normalize_variable_agg_key(key_lv, info) : normalize_agg_key(key_lv, info);
     }
     const Plane pl    = lower_load(key_lv);
-    auto [kptr, klen] = normalize_integral_key(must_of(pl), info);
-    return { kptr, klen, integral_key_valid(pl) };
+    auto [kptr, klen] = normalize_integral_key(must_of(pl, key_lv.four_state), info);
+    return { kptr, klen, integral_key_valid(pl, key_lv.four_state) };
 }
 
 // Write a key span (kptr / klen) back into the key-variable lvalue (foreach /
@@ -508,7 +509,7 @@ void Backend::denormalize_assoc_key(llvm::Value*  kptr,
         return;
     }
     lower_store(key_lv, known_plane(denormalize_key_word(kptr, 0, info.W, info.is_signed, key_lv.store_width),
-                                    !key_lv.narrow));
+                                    key_lv.four_state));
 }
 
 // Rebuild one leaf value from `nbytes` big-endian key bytes at `off`: reassemble,
@@ -562,7 +563,7 @@ void Backend::denormalize_agg_key(Ref type, const LValue& lv, llvm::Value* kptr,
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, known_plane(denormalize_key_word(kptr, off, W, is_signed, leaf.store_width), !leaf.narrow));
+    lower_store(leaf, known_plane(denormalize_key_word(kptr, off, W, is_signed, leaf.store_width), leaf.four_state));
     off += (W + 7) / 8;
 }
 
@@ -718,7 +719,7 @@ void Backend::denormalize_variable_agg_key(Ref           type,
     }
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    lower_store(leaf, known_plane(denormalize_key_word(leafptr, 0, W, is_signed, leaf.store_width), !leaf.narrow));
+    lower_store(leaf, known_plane(denormalize_key_word(leafptr, 0, W, is_signed, leaf.store_width), leaf.four_state));
     off = b_.CreateAdd(off, b_.getInt32((W + 7) / 8));
 }
 
@@ -900,7 +901,7 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
     }
     el.slot_ty     = lv.slot_ty;
     el.has_z       = lv.has_z;
-    el.narrow      = lv.narrow;
+    el.four_state  = lv.four_state;
     el.array_ty    = llvm::ArrayType::get(lv.slot_ty, 0);
     el.elem_idx    = b_.getInt32(0);
     el.store_width = lv.store_width;

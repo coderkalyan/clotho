@@ -258,6 +258,22 @@ bool Backend::has_program() const {
     return false;
 }
 
+// Whether any process is a reactive-home CONTINUOUS one: a program's port copy,
+// `assign`, or the resolver of a net a program drives (LRM 24.3.1, 24.3.2).
+// Narrower than has_program(), which a program with only `initial`s satisfies as
+// well: only a continuous process needs the reactive continuous ring, and a
+// design without one emits the two-ring scheduler it always did.
+// ir::Process::reactive_home is set on Activation::Always processes only, so this
+// is "any reactive-home process that is not an `initial`".
+bool Backend::has_reactive_continuous() const {
+    for (const Process& p : mod_.processes()) {
+        if (p.reactive_home) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Whether any process is a program block's `initial` PROCEDURE (LRM 24.3).
 // Deliberately narrower than has_program(): the clause's two rules -- terminate
 // a program's descendant threads when all its `initial`s have ended, then end
@@ -713,6 +729,9 @@ void Backend::emit_program_end(uint32_t proc_index) {
     if (reactive_head_gv_ != nullptr) {
         b_.CreateStore(b_.CreateLoad(i32, sym(reactive_tail_gv_)), sym(reactive_head_gv_));
     }
+    if (reactive_cont_head_gv_ != nullptr) {
+        b_.CreateStore(b_.CreateLoad(i32, sym(reactive_cont_tail_gv_)), sym(reactive_cont_head_gv_));
+    }
     if (re_inactive_top_gv_ != nullptr) {
         b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
     }
@@ -1135,6 +1154,48 @@ void Backend::ensure_reactive_queue() {
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_tail");
 }
 
+// The reactive CONTINUOUS ring: where a reactive-home continuous process -- a
+// program's port copy, `assign` or net resolver -- waits to run. The reactive
+// ring's shape and capacity, and a tighter bound than it needs: a process queues
+// at most once at a time, its scheduled flag deduping every wake, so the ring
+// never holds more than the design's reactive-home processes.
+//
+// Kept apart from the reactive ring so the drain can empty it FIRST. A
+// continuous process is a Reactive-region event like a program thread (LRM
+// 24.3.1), and 4.7 leaves the order of Reactive events open; running the
+// continuous ones ahead of any program code is what lets a program read its
+// inputs settled (docs/design/program-blocks.md §3.1).
+//
+// Created once, and only for a design with such a process
+// (design_uses_reactive_cont_). An overflow is reported as the reactive ring: it
+// is that region's queue, and the guard only ever fires on a miscomputed
+// capacity.
+void Backend::ensure_reactive_cont_queue() {
+    if (reactive_cont_gv_ != nullptr) {
+        return;
+    }
+    ensure_reactive_queue(); // queue_arr_ty_ and active_mask_ are shared
+    auto* i32              = llvm::Type::getInt32Ty(ctx_);
+    reactive_cont_gv_      = new llvm::GlobalVariable(env_->llmod,
+                                                      queue_arr_ty_,
+                                                      false,
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantAggregateZero::get(queue_arr_ty_),
+                                                      "clotho.reactive_cont");
+    reactive_cont_head_gv_ = new llvm::GlobalVariable(env_->llmod,
+                                                      i32,
+                                                      false,
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantInt::get(i32, 0),
+                                                      "clotho.reactive_cont_head");
+    reactive_cont_tail_gv_ = new llvm::GlobalVariable(env_->llmod,
+                                                      i32,
+                                                      false,
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantInt::get(i32, 0),
+                                                      "clotho.reactive_cont_tail");
+}
+
 // The re-inactive batch (LRM 4.4.2.7): reactive code parked on a #0, the dual
 // of the inactive queue. Promoted into the reactive ring at the same instant,
 // after the ring drains (see the reactive drain in emit_active_run).
@@ -1162,6 +1223,18 @@ void Backend::emit_reactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b.getInt32(0), idx });
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(reactive_tail_gv_));
+}
+
+// Push a handle onto the reactive continuous ring: cont[tail++ & mask] = handle.
+void Backend::emit_reactive_cont_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+    ensure_reactive_cont_queue();
+    auto*        i32 = b.getInt32Ty();
+    llvm::Value* tl  = b.CreateLoad(i32, sym(reactive_cont_tail_gv_));
+    emit_ring_full_check(b, sym(reactive_cont_head_gv_), tl, b.getInt32(kRingReactive));
+    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
+    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_cont_gv_), { b.getInt32(0), idx });
+    b.CreateStore(handle, slot);
+    b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(reactive_cont_tail_gv_));
 }
 
 // Push a handle onto the re-inactive batch: re_inactive[top++] = handle.
@@ -1196,16 +1269,22 @@ bool Backend::reactive_home() const {
 // (emit_active_run) from outside any body. Everything else parks through
 // parked_handle, which asks the body.
 //
+// `continuous` ORs on kReactiveContTag instead, which also names the reactive
+// CONTINUOUS ring. That same static subscription is the only caller that asks
+// for it, and emit_wake_push strips the extra bit only in a design that has such
+// a process, so the pairing is asserted rather than assumed.
+//
 // Gated on design_uses_reactive_ so the tag can only be emitted where
 // emit_wake_push's masking path is emitted too; see parked_handle.
-llvm::Value* Backend::tag_reactive_home(llvm::IRBuilder<>& b, llvm::Value* handle, bool reactive) {
+llvm::Value* Backend::tag_reactive_home(llvm::IRBuilder<>& b, llvm::Value* handle, bool reactive, bool continuous) {
     if (!reactive || !design_uses_reactive_) {
         return handle;
     }
+    assert((!continuous || design_uses_reactive_cont_) && "a continuous tag needs the continuous ring's strip");
     auto* i64 = b.getInt64Ty();
-    return b.CreateIntToPtr(
-      b.CreateOr(b.CreatePtrToInt(handle, i64), llvm::ConstantInt::get(i64, kReactiveHomeTag)),
-      llvm::PointerType::getUnqual(ctx_));
+    return b.CreateIntToPtr(b.CreateOr(b.CreatePtrToInt(handle, i64),
+                                       llvm::ConstantInt::get(i64, continuous ? kReactiveContTag : kReactiveHomeTag)),
+                            llvm::PointerType::getUnqual(ctx_));
 }
 
 // The running THREAD's home region as an i8 -- 0 for Active, kReactiveHomeTag
@@ -1362,12 +1441,27 @@ void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked) {
     llvm::Value* addr = b.CreatePtrToInt(parked, i64);
     llvm::Value* home = b.CreateICmpEQ(b.CreateAnd(addr, llvm::ConstantInt::get(i64, 3)),
                                        llvm::ConstantInt::get(i64, kReactiveHomeTag));
-    llvm::Value* bare = b.CreateAnd(addr, llvm::ConstantInt::get(i64, ~kReactiveHomeTag));
+    // In a design with a reactive-home continuous process the tag may carry bit 2 as
+    // well (kReactiveContTag), so both bits come off; elsewhere bit 2 is never set and
+    // the mask is the home tag alone, as it was.
+    const uint64_t strip = design_uses_reactive_cont_ ? kReactiveContTag : kReactiveHomeTag;
+    llvm::Value*   bare  = b.CreateAnd(addr, llvm::ConstantInt::get(i64, ~strip));
     llvm::Value* hdl  = b.CreateIntToPtr(b.CreateSelect(home, bare, addr),
                                          llvm::PointerType::getUnqual(ctx_));
     llvm::Value* arr  = b.CreateSelect(home, sym(reactive_gv_), sym(active_gv_));
     llvm::Value* tp   = b.CreateSelect(home, sym(reactive_tail_gv_), sym(active_tail_gv_));
     llvm::Value* hp   = b.CreateSelect(home, sym(reactive_head_gv_), sym(active_head_gv_));
+    if (design_uses_reactive_cont_) {
+        // A continuous process goes on the reactive CONTINUOUS ring instead, which the
+        // reactive drain empties before the reactive one. It is still the reactive
+        // region's queue, so the overflow guard below names the reactive ring for it.
+        ensure_reactive_cont_queue();
+        llvm::Value* cont = b.CreateICmpEQ(b.CreateAnd(addr, llvm::ConstantInt::get(i64, 7)),
+                                           llvm::ConstantInt::get(i64, kReactiveContTag));
+        arr               = b.CreateSelect(cont, sym(reactive_cont_gv_), arr);
+        tp                = b.CreateSelect(cont, sym(reactive_cont_tail_gv_), tp);
+        hp                = b.CreateSelect(cont, sym(reactive_cont_head_gv_), hp);
+    }
     llvm::Value* tl   = b.CreateLoad(i32, tp);
     // The ring is chosen at run time here, so the guard's selector is too: the
     // fatal names the ring the handle was actually headed for.
@@ -1441,6 +1535,10 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     if (reactive_gv_ != nullptr) {
         b_.CreateStore(b_.getInt32(0), sym(reactive_head_gv_));
         b_.CreateStore(b_.getInt32(0), sym(reactive_tail_gv_));
+    }
+    if (reactive_cont_gv_ != nullptr) {
+        b_.CreateStore(b_.getInt32(0), sym(reactive_cont_head_gv_));
+        b_.CreateStore(b_.getInt32(0), sym(reactive_cont_tail_gv_));
     }
     if (re_inactive_gv_ != nullptr) {
         b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
@@ -1550,12 +1648,15 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
                 // own sentence. A ring entry is a bare handle either way: the
                 // home tag belongs to a PARKED handle, and the seed loop created
                 // this one so it knows the ring without reading a tag back.
+                // Its ring is the reactive CONTINUOUS one, which the reactive drain
+                // empties before the reactive ring a program `initial` is seeded on,
+                // so no program code starts ahead of the copy that feeds it.
                 if (starts_late(g)) {
                     // always_comb / always_latch (LRM 9.2.2.2): enqueued behind every
                     // other body, below, so it runs once they have all started.
                     deferred_comb.push_back(g);
                 } else if (p.reactive_home) {
-                    emit_reactive_push(b_, hdl);
+                    emit_reactive_cont_push(b_, hdl);
                 } else {
                     emit_active_push(b_, hdl);
                 }
@@ -1597,7 +1698,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // A continuous assignment is not a procedure and keeps its source position above.
     for (const uint32_t g : deferred_comb) {
         if (all[groups_[g].front()].reactive_home) {
-            emit_reactive_push(b_, hdls[g]);
+            emit_reactive_cont_push(b_, hdls[g]);
         } else {
             emit_active_push(b_, hdls[g]);
         }
@@ -1630,8 +1731,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         // suspends) -- so unlike an intra-body wait, which parks through
         // parked_handle at each `@`, this is the only place the home can be
         // stated. Untagged, every wake of a program's continuous assign would
-        // push it onto the active ring, which is the bug this phase fixes.
-        llvm::Value* sub_hdl = tag_reactive_home(b_, hdls[g], all[f].reactive_home);
+        // push it onto the active ring, which is the bug this phase fixes. The tag is
+        // the CONTINUOUS one, so the wake lands on the reactive continuous ring.
+        llvm::Value* sub_hdl = tag_reactive_home(b_, hdls[g], all[f].reactive_home, /*continuous=*/true);
         for (const WaitEvent& w : group_events_[g]) {
             emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), sub_hdl, flag);
         }
@@ -1860,18 +1962,34 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.SetInsertPoint(rcheck);
         llvm::Value* rhd = b_.CreateLoad(i32, sym(reactive_head_gv_));
         llvm::Value* rtl = b_.CreateLoad(i32, sym(reactive_tail_gv_));
+        // The reactive CONTINUOUS ring -- a program's port copies and `assign`s -- has
+        // STRICT priority over the reactive ring that holds program code: while one
+        // continuous process is queued, no program thread is popped. Both are
+        // Reactive-region events and 4.7 leaves their order open; settling the
+        // continuous ones first is what lets a program read its inputs settled,
+        // whether the copy was queued at the start of the region or woken by program
+        // code a moment ago (docs/design/program-blocks.md §3.1, docs/LRM_NOTES.md note
+        // 50). `from_cont` says which ring the pop below takes.
+        llvm::Value* ready     = b_.CreateICmpNE(rhd, rtl);
+        llvm::Value* from_cont = nullptr;
+        llvm::Value* chd       = nullptr;
+        if (reactive_cont_gv_ != nullptr) {
+            chd       = b_.CreateLoad(i32, sym(reactive_cont_head_gv_));
+            from_cont = b_.CreateICmpNE(chd, b_.CreateLoad(i32, sym(reactive_cont_tail_gv_)));
+            ready     = b_.CreateOr(ready, from_cont);
+        }
         // The $finish test sits on the queue-empty edge for the reason it does
         // in the active drain: a cooperative finish empties this ring itself
         // (lower_finish), so the wave it was in ends on the next trip here.
         if (design_has_finish()) {
             auto* rfin = llvm::BasicBlock::Create(ctx_, "reactive.finished", fn);
-            b_.CreateCondBr(b_.CreateICmpNE(rhd, rtl), rbody, rfin);
+            b_.CreateCondBr(ready, rbody, rfin);
             b_.SetInsertPoint(rfin);
             b_.CreateCondBr(
               b_.CreateICmpNE(b_.CreateLoad(b_.getInt8Ty(), finishing_gv()), b_.getInt8(0)), wdone,
               richeck);
         } else {
-            b_.CreateCondBr(b_.CreateICmpNE(rhd, rtl), rbody, richeck);
+            b_.CreateCondBr(ready, rbody, richeck);
         }
 
         b_.SetInsertPoint(rbody);
@@ -1891,9 +2009,18 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             b_.CreateUnreachable();
             b_.SetInsertPoint(osc_ok);
         }
-        b_.CreateStore(b_.CreateAdd(rhd, b_.getInt32(1)), sym(reactive_head_gv_));
-        llvm::Value* ridx  = b_.CreateAnd(rhd, b_.getInt32(active_mask_));
-        llvm::Value* rslot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b_.getInt32(0), ridx });
+        // The continuous ring while it is non-empty, else the reactive one.
+        llvm::Value* rpop  = rhd;
+        llvm::Value* rhead = sym(reactive_head_gv_);
+        llvm::Value* rring = sym(reactive_gv_);
+        if (from_cont != nullptr) {
+            rpop  = b_.CreateSelect(from_cont, chd, rhd);
+            rhead = b_.CreateSelect(from_cont, sym(reactive_cont_head_gv_), rhead);
+            rring = b_.CreateSelect(from_cont, sym(reactive_cont_gv_), rring);
+        }
+        b_.CreateStore(b_.CreateAdd(rpop, b_.getInt32(1)), rhead);
+        llvm::Value* ridx  = b_.CreateAnd(rpop, b_.getInt32(active_mask_));
+        llvm::Value* rslot = b_.CreateInBoundsGEP(queue_arr_ty_, rring, { b_.getInt32(0), ridx });
         llvm::Value* rhdl  = b_.CreateLoad(ptr_ty, rslot);
         if (has_thunk) {
             // Same tagged-pointer discipline as the active drain. Nothing pends

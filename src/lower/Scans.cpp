@@ -67,11 +67,29 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v) {
     return static_cast<uint64_t>(v.magnitude) * fs_per_unit;
 }
 
-// True iff `tc` is a real-valued `#delay` (LRM 3.14): a plain DelayControl whose
-// amount expression is floating. Rise/fall/turn-off triples (Delay3) are rejected
-// at lowering regardless, so a real one there needs no tick handling.
+const Expression* single_delay_expr(const TimingControl& tc) {
+    switch (tc.kind) {
+        case TimingControlKind::Delay:
+            return &tc.as<DelayControl>().expr;
+        case TimingControlKind::Delay3: {
+            const auto& d = tc.as<Delay3Control>();
+            return d.expr2 == nullptr && d.expr3 == nullptr ? &d.expr1 : nullptr;
+        }
+        default:
+            return nullptr;
+    }
+}
+
+// True iff `tc` is a real-valued `#delay` (LRM 3.14): a single delay value, `#d` or
+// `#(d)`, whose amount expression is floating. A rise/fall/turn-off selection of two or
+// three values is rejected at lowering regardless, so a real one there needs no tick
+// handling.
 bool delay_is_real(const TimingControl* tc) {
-    return tc != nullptr && tc->kind == TimingControlKind::Delay && tc->as<DelayControl>().expr.type->isFloating();
+    if (tc == nullptr) {
+        return false;
+    }
+    const Expression* amount = single_delay_expr(*tc);
+    return amount != nullptr && amount->type->isFloating();
 }
 
 void RealDelayFinder::handle(const slang::ast::TimedStatement& s) {

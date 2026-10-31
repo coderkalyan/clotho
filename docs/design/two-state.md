@@ -4,7 +4,7 @@ Status: **landed** (explicit `bit` / sized-int path). This is the as-built
 design. Reconciliation (the sections below predate the code and read as
 proposal — they are accurate as the design that shipped):
 
-- **Done**: native single-`iW` value (`Plane.two`), narrow `{iW}` storage for
+- **Done**: native single-`iW` value (its domain is its IR type's), narrow `{iW}` storage for
   signals / scalar NBA targets / frame locals / plain memories / array-NBA /
   `$readmem` / file-io ABI, native operators (add/sub/mul, bitwise, shifts,
   div/mod, mux, reductions, selects, conversions), LRM 6.3.1 x/z→0 conversion,
@@ -35,24 +35,25 @@ violating LRM 6.3.1 (x/z → 0 on assignment to a 2-state target).
 
 ## Representation
 
-A 2-state value is a single `iW` LLVM value. Reuse `Plane` with a narrowed
-contract, disambiguated by the value's `ValueType.four_state` (derived
-per-instruction from its operands, `ir/Typing.h, ValueType`):
+A 2-state value is a single `iW` LLVM value. One `Plane` carries both encodings,
+and which one it holds comes from the value's `ValueType.four_state` (derived
+per-instruction from its operands, `ir/Typing.h, ValueType`), never from the plane:
 
 | domain | `Plane.mm` | `Plane.z` |
 |--------|-----------|-----------|
 | 4-state | `i(2W)`: `[0,W)` must, `[W,2W)` may | `iW` or null (z-elision) |
 | 2-state | `iW`: the value | always null |
 
-The 4-state helpers (`must_of`/`may_of`/`width_of`/`xz_mask`/`packed`) assume
-`mm` is `i(2W)` and are **never called on a 2-state Plane**. Dispatch happens in
-`lower_inst`: each op checks `type_of(operand).four_state` and routes to either
-the existing 4-state lowering or a new native 2-state lowering. This keeps the
-two representations from leaking into each other and leaves all 4-state code
-untouched.
-
-`Plane` gains a defensive `bool two = false` used only in asserts (release: no
-cost).
+The plane records nothing about its own encoding, so there is no second piece of
+state to keep in agreement with the type. The accessors
+(`must_of`/`may_of`/`z_of`/`width_of`/`any_unknown`/`to_four`) and the operators
+take the domain as an argument, read off the operand's IR type at the call site
+(`type_of(i).four_state`, or the storage's `four_state` for a load); the `Index`
+overloads (`must_of(i)`, `any_unknown(i)`) read it themselves. `xz_mask`, `packed`
+and the single-bit truth tables assume `mm` is `i(2W)` and are only reached with
+4-state planes. Dispatch happens in `lower_inst`: each operator is called with the
+domains of its operands and routes to either the 4-state lowering or the native
+2-state one, so the two representations do not leak into each other.
 
 ### Same-domain operand invariant
 
@@ -60,7 +61,8 @@ slang unifies the domain of context-determined operands: in `a + b`, if either i
 4-state it inserts a `ConversionExpression` making both 4-state, and the result is
 4-state (LRM 11.8.1 / §11.6). So a binary op's two operands always share a domain
 by the time Clotho lowers it. Self-determined operands (shift amount) only
-contribute a value; convert to the value bits and ignore. Assert the invariant.
+contribute a value; convert to the value bits and ignore. `ir::verify` asserts the
+invariant (`operand-domain`), and the operators take it as one `four` argument.
 
 ## Storage / slot
 

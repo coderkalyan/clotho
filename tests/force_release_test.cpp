@@ -325,6 +325,61 @@ TEST_CASE("force: net bit/part-select overlay, z-preserving, range release") {
     CHECK(run_capture_finish(src) == "0001\n1101\n11z1\n11z0\n00z0\n0x10\n");
 }
 
+// LRM 10.6.2: a force on a net "shall override all drivers of the net", so while it
+// is active a driver changing changes nothing a reader of the net can observe: the
+// net holds the forced value and no value change event occurs. The resolver folded
+// the drivers into the net and only then laid the force over the result, and each of
+// the two stores woke the net's waiters on its own old -> new transition, so every
+// driver change under a force gave an edge reader a negedge and a posedge (pos=3
+// neg=4 where the force makes one real posedge and the x -> 0 at time 0 one real
+// negedge). Oracle: iverilog 13 prints pos=1 neg=1.
+TEST_CASE("force: a driver changing under a forced net gives its readers no event") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a;
+            wire w;
+            assign w = a;
+            int pos, neg;
+            always @(posedge w) pos++;
+            always @(negedge w) neg++;
+            initial begin
+                a = 0;
+                #1 force w = 1'b1;
+                #1 a = 1;
+                #1 a = 0;
+                #1 a = 1;
+                #1 a = 0;
+                #1 $display("pos=%0d neg=%0d w=%b", pos, neg, w);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "pos=1 neg=1 w=1\n");
+}
+
+// The same transient seen by a change reader when a driver's own delay lands under the
+// force: `wire #5 w = a` is that driver's continuous-assignment delay, not a net delay
+// (LRM 10.3.3), so a=1 at 10 reaches the net's resolver at 15 and re-runs it under the
+// force taken at 12. `always @(w)` printed a change at 15 although w stayed z. Release
+// at 20 then shows the driver's value. Oracle: iverilog 13, byte-identical.
+TEST_CASE("force: a delayed driver landing under a forced net gives its readers no event") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a;
+            wire #5 w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force w = 1'bz;
+                #6 $strobe("%0t s w=%b", $time, w);
+                #2 release w;
+                $strobe("%0t s w=%b", $time, w);
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "5 chg w=0\n12 chg w=z\n18 s w=z\n20 chg w=1\n20 s w=1\n");
+}
+
 // force / assign target an OUTPUT-port variable driven internally (an input/inout
 // port is the guarded case). sv-tests 10.6.1 / 10.6.2 shape.
 TEST_CASE("force: output-port variable is forceable") {
@@ -548,6 +603,169 @@ TEST_CASE("intra-assignment timing on a write to a forced variable is rejected")
     CHECK(lower_error(src).find("intra-assignment timing on a write to a force-target") != std::string::npos);
 }
 
+// A delayed continuous assignment (`assign #5 v = a`) commits its value from the
+// timing wheel straight into the variable, and the commit carries no force gate, so
+// the value landed over an active force: v=1 at 15 where the force taken at 12 holds
+// z until the release at 20 (LRM 10.6.2; iverilog 13 holds z). What the release then
+// does is not settled either: 10.6.2 says it "shall reestablish that assignment and
+// schedule a reevaluation in the continuous assignment's scheduling region", and
+// 10.3.3 delays an assignment's update by its delay. Refused rather than guessed.
+// A net with a delayed driver is unaffected: its driver stores into a slot that the
+// resolver folds under the force, as the test above ("a delayed driver landing")
+// shows.
+TEST_CASE("a delayed continuous assignment to a forced variable is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, v;
+            assign #5 v = a;
+            initial begin force v = 1'bz; release v; end
+        endmodule)";
+    CHECK(lower_error(src).find("continuous assignment delay on a force-target variable") != std::string::npos);
+}
+
+// A gate output on a variable (LRM 10.3: "Variables can only be driven by one continuous
+// assignment or by one primitive output") stored with no force gate, delayed or not, so its
+// value landed over an active force (`and g (y, a, b)`, b=1 at 13, force y=z at 11: y=1 at 13
+// where the force holds z) and a release did not restore it (y stayed z, not the gate's 1).
+// Refused rather than gated: 10.6.2 lists what a force on a variable overrides ("a procedural
+// assignment, continuous assignment or an assign procedural continuous assignment") and which
+// driver a release reestablishes ("a continuous assignment"), and names no primitive output in
+// either, so what a release does with the gate is open. iverilog 13 refuses a primitive driving
+// a variable at all, so there is no oracle. The same gate on a NET is exact: the resolver folds
+// it under the force (the net tests above and in net_delay_test.cpp).
+TEST_CASE("a gate or switch output on a forced variable is rejected") {
+    for (const std::string_view gate : { "and g (y, a, b);",
+                                         "and #3 g (y, a, b);",
+                                         "bufif1 g (y, a, b);",
+                                         "nmos g (y, a, b);",
+                                         "buf g (z, y, a);",
+                                         "not #2 g (y, z, a);" }) {
+        const std::string src = "module m; logic a, b, y, z;\n " + std::string(gate) +
+                                "\n initial begin force y = 1'bz; release y; end endmodule";
+        const std::string err = lower_error(src);
+        CHECK_MESSAGE(
+          err.find("a gate or switch output on a force-target variable") != std::string::npos, err, " for ", gate);
+    }
+    // The input side of a gate is no driver of the variable, and a net output is no variable.
+    const LowerResult input_side = lower_text(R"(
+        module m; logic a, b, y; wire z;
+            and g (z, a, y);
+            initial begin force y = 1'b1; release y; force z = 1'b0; release z; end
+        endmodule)");
+    CHECK_MESSAGE(input_side.ok, input_side.diagnostic_text());
+}
+
+// A port connection is "a continuous assignment from a local output expression to an outside
+// net or variable" (LRM 4.9.6), so a force on the variable it drives overrides it and a release
+// reestablishes it (LRM 10.6.2), like `assign v = child_net;`. The copy stored with no force
+// gate and never woke on the force site: a child change landed over the force (a=1 at 14: v=1
+// at 14 where the force of 12 holds z) and a release did not restore it (v stayed z). The
+// child's own delay (`assign #5 y = a` in the child) is no different: the force is on the
+// parent's variable, the copy is undelayed. Oracle: iverilog 13, byte-identical.
+TEST_CASE("force: a variable an output port copies into takes the force, and the copy after release") {
+    constexpr std::string_view change_under_force = R"(
+        module sub(input logic a, output logic y);
+            assign y = a;
+        endmodule
+        module m;
+            logic a, v;
+            sub u(.a(a), .y(v));
+            always @(v) $display("%0t chg v=%b", $time, v);
+            initial begin
+                a = 0;
+                #12 force v = 1'bz;
+                #2 a = 1;
+                #4 $strobe("%0t s v=%b", $time, v);
+                #2 release v;
+                #1 $strobe("%0t s v=%b", $time, v);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(change_under_force) == "0 chg v=0\n12 chg v=z\n18 s v=z\n20 chg v=1\n21 s v=1\n");
+
+    constexpr std::string_view delayed_child = R"(
+        module sub(input logic a, output logic y);
+            assign #5 y = a;
+        endmodule
+        module m;
+            logic a, v;
+            sub u(.a(a), .y(v));
+            always @(v) $display("%0t chg v=%b", $time, v);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force v = 1'bz;
+                #6 $strobe("%0t s v=%b", $time, v);
+                #2 release v;
+                #1 $strobe("%0t s v=%b", $time, v);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(delayed_child) == "5 chg v=0\n12 chg v=z\n18 s v=z\n20 chg v=1\n21 s v=1\n");
+
+    // Only the release: the change landed before the force, and the force was released after
+    // the child last changed, so nothing wakes the copy but the release itself.
+    constexpr std::string_view release_only = R"(
+        module sub(input logic a, output logic y);
+            assign y = a;
+        endmodule
+        module m;
+            logic a, v;
+            sub u(.a(a), .y(v));
+            always @(v) $display("%0t chg v=%b", $time, v);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force v = 1'bz;
+                #6 $strobe("%0t s v=%b", $time, v);
+                #2 release v;
+                #1 $strobe("%0t s v=%b", $time, v);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(release_only) == "0 chg v=0\n10 chg v=1\n12 chg v=z\n18 s v=z\n20 chg v=1\n21 s v=1\n");
+}
+
+// The shapes of an output port's actual: a concatenation operand, the whole variable, and a
+// part of a variable forced as a whole, beside a continuous assignment onto a concatenation
+// (`assign {c1, c0} = a`), whose release did not restore the forced operand either. Oracle:
+// iverilog 13 for the first two lines; the last bits of `sel` that the port does not drive
+// are left out, since a variable that is partly continuously driven is no clause's case.
+TEST_CASE("force: concatenation, whole and select actuals of an output port, and a concatenated assign") {
+    constexpr std::string_view src = R"(
+        module sub(input logic [1:0] a, output logic [1:0] y);
+            assign y = a;
+        endmodule
+        module m;
+            logic [1:0] a;
+            logic v1, v0, c1, c0;
+            logic [1:0] w;
+            logic [3:0] sel;
+            sub u1(.a(a), .y({v1, v0}));
+            sub u2(.a(a), .y(w));
+            sub u3(.a(a), .y(sel[1:0]));
+            assign {c1, c0} = a;
+            initial begin
+                a = 2'b00;
+                #1 force v1 = 1'b1;
+                force c1 = 1'b1;
+                force w = 2'b10;
+                force sel = 4'b1010;
+                #1 a = 2'b01;
+                #1 $display("forced %b%b %b%b %b %b", v1, v0, c1, c0, w, sel);
+                release v1;
+                release c1;
+                release w;
+                release sel;
+                #1 $display("released %b%b %b%b %b %b", v1, v0, c1, c0, w, sel[1:0]);
+                #1 a = 2'b10;
+                #1 $display("later %b%b %b%b %b %b", v1, v0, c1, c0, w, sel[1:0]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "forced 11 11 10 1010\nreleased 01 01 01 01\nlater 10 10 10 10\n");
+}
+
 // A partial force of a VARIABLE stays rejected — the site state is per whole
 // variable, and LRM 10.6.2 permits a partial force only on a net. slang flags
 // the lvalue (-Wbad-procedural-force) and leaves the statement unbound, so the
@@ -763,4 +981,139 @@ TEST_CASE("force of a whole unpacked net array is rejected") {
             end
         endmodule)");
     CHECK(err.find("force is only supported on a whole variable/net") != std::string::npos);
+}
+
+// A `force` by hierarchical name is registered when the block that holds it is scanned. The
+// scan ran in Collect, which meets a block before the instances declared after it, so
+// `force s.v` ahead of `sub s(a);` named a signal that was not registered yet, and the
+// legal design was refused ("declare the instance before the forcing block"). The scan now
+// runs once every signal of the top exists, so the order of the block and the instance does
+// not matter, and every writer of the target is gated: this design's continuous assignment
+// and the nested port copy below. Oracle: iverilog 13, byte-identical.
+TEST_CASE("force: a hierarchical force ahead of the instance it names") {
+    constexpr std::string_view var_target = R"(
+        module sub(input logic a);
+            logic v;
+            assign v = a;
+        endmodule
+        module tb;
+            logic a = 1;
+            initial begin
+                #1 force s.v = 1'b0;
+                #1 $display("forced %b", s.v);
+                release s.v;
+                #1 $display("released %b", s.v);
+                $finish;
+            end
+            sub s(a);
+        endmodule)";
+    CHECK(run_capture_finish(var_target) == "forced 0\nreleased 1\n");
+
+    constexpr std::string_view net_target = R"(
+        module sub(input logic a);
+            wire w;
+            assign w = a;
+        endmodule
+        module tb;
+            logic a = 1;
+            initial begin
+                #1 force s.w = 1'b0;
+                #1 $display("forced %b", s.w);
+                release s.w;
+                #1 $display("released %b", s.w);
+                $finish;
+            end
+            sub s(a);
+        endmodule)";
+    CHECK(run_capture_finish(net_target) == "forced 0\nreleased 1\n");
+
+    // The target's writer is a port copy two instances down.
+    constexpr std::string_view port_copy = R"(
+        module leaf(input logic a, output logic y);
+            assign y = a;
+        endmodule
+        module mid(input logic a);
+            logic v;
+            leaf l(.a(a), .y(v));
+        endmodule
+        module tb;
+            logic a;
+            initial begin
+                a = 0;
+                #12 force m.v = 1'bz;
+                #2 a = 1;
+                #4 $strobe("%0t s v=%b", $time, m.v);
+                #2 release m.v;
+                #1 $strobe("%0t s v=%b", $time, m.v);
+                #1 $finish;
+            end
+            mid m(a);
+        endmodule)";
+    CHECK(run_capture_finish(port_copy) == "18 s v=z\n21 s v=1\n");
+}
+
+// The refusals that rest on knowing every force site, reached through a force ahead of the
+// instance: a delayed continuous assignment and a gate output on the forced variable.
+TEST_CASE("force: a hierarchical force ahead of its instance still refuses a delayed assign or a gate") {
+    const std::string delayed = lower_error(R"(
+        module sub(input logic a); logic v; assign #5 v = a; endmodule
+        module tb; initial force s.v = 1'b0; sub s(1'b1); endmodule)");
+    CHECK(delayed.find("continuous assignment delay on a force-target variable") != std::string::npos);
+
+    const std::string gate = lower_error(R"(
+        module sub(input logic a, b); logic y; and g (y, a, b); endmodule
+        module tb; initial force s.y = 1'b0; sub s(1'b1, 1'b1); endmodule)");
+    CHECK(gate.find("a gate or switch output on a force-target variable") != std::string::npos);
+}
+
+// A force into another top-level module is a cross-top hierarchical reference, which each top
+// lowering its own signals cannot resolve (docs/TODO.md): refused, saying so, never lost.
+TEST_CASE("force: a target in another top-level module is rejected") {
+    for (const std::string_view order : { "module t1; logic a = 1; logic v; assign v = a; endmodule\n"
+                                          "module t2; initial begin #1 force t1.v = 1'b0; release t1.v; end endmodule",
+                                          "module t2; initial begin #1 force t1.v = 1'b0; release t1.v; end endmodule\n"
+                                          "module t1; logic a = 1; logic v; assign v = a; endmodule" }) {
+        const std::string err = lower_error(order);
+        CHECK_MESSAGE(err.find("cross-top hierarchical reference") != std::string::npos, err);
+    }
+}
+
+// A `force` inside a task or function is not seen by the scan of the procedural blocks that
+// registers the force sites. A net site is registered per force statement, so a net forced in
+// a subroutine has none, even when a procedural block forces the same net; a variable is
+// forceable when some block forces it, so a variable forced only in a subroutine is not.
+// Each is refused with the message that says so rather than run with the force lost
+// (docs/TODO.md "`force` inside a task or function"). No oracle: the LRM allows the force
+// anywhere a statement is.
+TEST_CASE("force: a force inside a task or function that no procedural block registers is rejected") {
+    for (const std::string_view src :
+         { "module m; logic v; task automatic t(); force v = 1'b0; endtask initial t(); endmodule",
+           "module m; logic v; function automatic void f(); force v = 1'b0; endfunction initial f(); endmodule",
+           "module m; wire w; task automatic t(); force w = 1'b0; endtask initial t(); endmodule",
+           "module m; wire w; task automatic t(); force w = 1'b0; endtask\n"
+           "initial begin t(); force w = 1'b1; release w; end endmodule" }) {
+        const std::string err = lower_error(src);
+        CHECK_MESSAGE(err.find("inside a task or function") != std::string::npos, err, " for ", src);
+    }
+}
+
+// The boundary of that refusal: a variable that a procedural block also forces is forceable, so
+// the force inside the task is exact. LRM 10.6.2: the force holds 0 until the release, which
+// reestablishes the continuous assignment (a=1).
+TEST_CASE("force: a variable forced in a task and in a procedural block takes both") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a = 1, v;
+            assign v = a;
+            task automatic t(); force v = 1'b0; endtask
+            initial begin
+                #1 t();
+                #1 $display("v=%b", v);
+                release v;
+                #1 $display("v=%b", v);
+                $finish;
+            end
+            initial begin #10 force v = 1'b1; release v; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "v=0\nv=1\n");
 }

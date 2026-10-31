@@ -9,7 +9,7 @@ namespace clotho::ir::backend {
 // unsigned wrap to catch a negative index in one compare; a report that
 // reused that value would print 4294967295 where the design wrote -1.
 llvm::Value* Backend::bounds_index(Index idx_expr) {
-    return cast(must_of(value_of(idx_expr)), 64, true);
+    return cast(must_of(idx_expr), 64, true);
 }
 
 // One constant rt_bounds_site per instrumented access. Everything the report
@@ -109,7 +109,7 @@ void Backend::add_select_bounds_check(LValue&              target,
     target.bounds_checks.push_back(BoundsCheck{
       .inrange = v.fully,
       .index   = bounds_index(off_expr),
-      .unknown = any_unknown(value_of(off_expr)),
+      .unknown = any_unknown(off_expr),
       .extent  = b_.getInt64(container_width),
       .partial = v.partial,
       .site    = bounds_site_global(loc_text(off_expr), loc_text(at), bounds_name(target), what,
@@ -137,7 +137,7 @@ void Backend::emit_string_bounds_check(Index              at,
                          .inrange = b_.CreateAnd(b_.CreateICmpSGE(index, b_.getInt64(0)),
                                                  b_.CreateICmpSLT(index, len)),
                          .index   = index,
-                         .unknown = any_unknown(value_of(idx_expr)),
+                         .unknown = any_unknown(idx_expr),
                          .extent  = len,
                          .site = bounds_site_global(loc_text(idx_expr), loc_text(at), name,
                                                     BoundsWhat::Char, 0, 0),
@@ -165,7 +165,7 @@ void Backend::emit_queue_bounds_check(Index         at,
     emit_bounds_report(BoundsCheck{
                          .inrange = b_.CreateAnd(b_.CreateICmpSGE(index, b_.getInt64(0)), hi),
                          .index   = index,
-                         .unknown = any_unknown(value_of(idx_expr)),
+                         .unknown = any_unknown(idx_expr),
                          .extent  = len,
                          .site = bounds_site_global(loc_text(idx_expr), loc_text(at),
                                                     bounds_name(named), BoundsWhat::QueueOp, 0, 0),
@@ -459,8 +459,9 @@ void Backend::lower_tagged_check(Index i) {
     const auto& p    = ir_->payload(i);
     const auto  info = ir_->extra_data<TaggedCheckInfo>(p.op_extra.extra);
     const Plane pl   = value_of(p.op_extra.op);
-    llvm::Value* const must = must_of(pl);
-    llvm::Value* const may  = may_of(pl);
+    const bool  four = type_of(p.op_extra.op).four_state;
+    llvm::Value* const must = must_of(pl, four);
+    llvm::Value* const may  = may_of(pl, four);
 
     // A tag bit that is x or z has must != may, and LRM 11.9 leaves an
     // uninitialized tagged union's tag bits undefined — such a tag selects no

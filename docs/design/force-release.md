@@ -9,10 +9,12 @@ select or concatenation of a *variable* stays guarded loud.
 Four statements, two priority layers over a signal's ordinary drivers:
 
 - `force lhs = rhs;` (10.6.2) — highest priority. Overrides *every* other driver
-  (procedural, continuous, gate, resolved-net) on `lhs` until released. `rhs` is a
-  **continuous** relationship: re-evaluated whenever it changes. Legal on both nets
-  and variables. May be conditional / impure (`if (c) force x = $random`), so which
-  force is active is a runtime fact.
+  (procedural, continuous, output-port copy, gate, resolved-net) on `lhs` until
+  released. `rhs` is a **continuous** relationship: re-evaluated whenever it changes.
+  Legal on both nets and variables. May be conditional / impure (`if (c) force x =
+  $random`), so which force is active is a runtime fact. On a *variable*, a gate or
+  switch output and a delayed continuous assignment are refused instead (see Lowering
+  (variables)).
 - `release lhs;` — ends the force.
   - Net: reverts **immediately** to the resolved continuous-driver value.
   - Variable: **holds** the forced value until the next procedural write, *unless* a
@@ -53,7 +55,13 @@ conditional / impure-RHS force). We adopt that insight but not the structure:
 ### Forceable set
 
 A pre-pass collects every signal that is a whole-signal `force`/`assign` target. Only
-these carry override state and gated writers. Everything else lowers unchanged.
+these carry override state and gated writers. Everything else lowers unchanged. The
+pre-pass is `scan_force_targets` over every procedural block of the top, in the
+Classify walk: Collect has registered every signal by then, so a target named by
+hierarchy resolves whatever the order of the forcing block and the instance, and every
+site is known before Emit decides which writers to gate. It reads procedural blocks
+only, so a `force` inside a task or function is refused on a net, and on a variable
+that no block forces (docs/TODO.md).
 
 ### Per-forceable-signal state (hidden signals)
 
@@ -95,8 +103,14 @@ A variable driven by a module-level continuous `assign` (`assign v = expr;` at m
 scope, not the procedural statement) is handled the same way as the `assign`-statement
 layer's reestablish: `lower_continuous_assign` appends `force_site` to that driver's
 sensitivity (`with_force_wake`) and the driver is gated through the ordinary path, so
-`release` re-wakes it and reverts. Input/inout-port variables (driven by an external
-port-copy process that is not `force_site`-aware) are guarded loud.
+`release` re-wakes it and reverts. A child's output port copied into the variable
+(`wire_ports`) is the same kind of driver (LRM 4.9.6: an implicit continuous
+assignment) and takes the same gate and wake; `with_force_wake` also reaches each
+operand of a concatenation target. Input/inout-port variables (driven by an external
+port-copy process that is not `force_site`-aware) are guarded loud. So are two drivers
+whose store cannot carry the gate, a gate or switch output and a delayed continuous
+assignment (`assign #d v = e`): the delayed commit has no predicate hook, and 10.6.2
+names neither among the drivers a release reestablishes.
 
 Ordinary procedural writers to `v` (blocking `Store`, nonblocking `StoreNb`) are gated
 `if (force_site == 0 && assign_site == 0) <store + wait-service>`. This gives
@@ -164,9 +178,12 @@ deferred record rather than the sampling site.
   over single-driver, gate-driven, multi-driver/resolved, and undriven nets.
 - **Phase 2** (landed for nets): constant **bit/part-select force of a net**. Each
   `force` statement on a net (whole or a constant select) registers a `NetForceSite
-  {active, val, [lo,hi]}` — `val` is exactly range-wide. The net resolver stores the
-  driver fold to the net, then for each site emits `if (active) net[hi:lo] = val` (a
-  positioned store to the net *signal*, an lvalue — a bitwise mask/or would corrupt z).
+  {active, val, [lo,hi]}` — `val` is exactly range-wide. The net resolver builds the net's
+  value in a frame cell of its function: the driver fold, then for each site
+  `if (active) cell[hi:lo] = val` (a positioned store to the cell, an lvalue — a bitwise
+  mask/or would corrupt z), and the net takes the cell in ONE store. A store wakes the
+  net's waiters from the transition it makes, so storing the fold and then the forced bits
+  over it would show readers the fold for an instant: an edge and a change the force forbids.
   A released site (`active == 0`) is skipped, so re-running the resolver reverts those
   bits to the fold; `release net[hi:lo]` clears every site whose range is covered; a release that overlaps a
   site without covering it is a fatal run-time error while that site is active, since a
@@ -180,6 +197,31 @@ deferred record rather than the sampling site.
   - Bit/part-select force of a **variable** is forbidden by §10.6.2 ("shall not be a
     bit-select or a part-select of a variable") — rejected loud — even though iverilog
     accepts it. An open decision (docs/TODO.md).
+
+## Force on a net with a net delay (LRM 10.6.2, 10.3.3, 28.16)
+
+A net delay is "the time it takes from any driver on the net changing value to the time
+when the net value is updated" (28.16). A force is not a driver but an override of all of
+them (10.6.2), and an active update event of its own (4.9.2). Clotho reads the net delay as a
+stage between the drivers and the net value, with the force sitting on the net value past it:
+a force and a release take effect at once, a driver change that is on its way lands under an
+active force without disturbing it, and a release shows what the drivers have delivered.
+
+A net that has both a net delay and a force site (`net_delay_shadow_`, allocated with its
+first site) keeps two more hidden signals. The resolver stores the undelayed fold into
+`$fold` and the delayed fold, through the inertial store, into `$delayed`. The net is
+`$delayed` with the active sites laid over it, built in a frame cell of the resolver function
+and stored once. `$delayed` is in the resolver's sensitivity, so a landing re-runs it. The
+inertial store compares against `$delayed`, not the net, so the forced value is never taken
+for the net's own. A net with a net delay and no force, and a forced net with no delay, do not
+pay for any of this.
+
+A release takes the drivers' value at once: the freed bits of `$delayed` are overwritten
+with `$fold` (only for a site that is active), and the resolver then stores the net once.
+10.6.2 has the net "immediately be assigned the value determined by the drivers", and 28.16
+times a driver changing value, which a release is not. A change still in flight lands as a
+no-op when it matches; a later one goes through the net delay as usual, since the inertial
+store compares with `$delayed`. See `docs/LRM_NOTES.md`, note 49.
 
 ## Oracle
 
