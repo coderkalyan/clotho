@@ -944,6 +944,9 @@ inline constexpr uint32_t kCtxShadow   = 1;
 inline constexpr uint32_t kCtxState    = 2;
 inline constexpr uint32_t kCtxFixed    = 3;
 
+// Where the parked handles of an `expect` queue start (Backend::expect_queue_ty).
+inline constexpr uint64_t kExpectHandlesOffset = 8;
+
 // One instance-scope occurrence: the addressing anchor for every signal the
 // scope declares. Each scope owns its own state global
 // (@clotho.inst.<hier>.state, own signals only — children own theirs), so a
@@ -1109,6 +1112,12 @@ struct Anchor {
     // ctx_subblk_base + the subroutine's ordinal in its unit (fn_locals), like a
     // group's at its process ordinal (ctx_blk_base).
     uint32_t              ctx_subblk_base = 0;
+    // The `expect`s the instance's unit declares (the flat monitors of its range
+    // whose kind is Expect, in the unit's order) and the address of each one's
+    // waiter queue, one ptr field at ctx_expect_base + ordinal, so the wait and
+    // the wake of an `expect`, both code of the unit, name no monitor of the design.
+    std::vector<uint32_t> expect_locals;
+    uint32_t              ctx_expect_base = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -3738,7 +3747,19 @@ private:
 
     void lower_reactive_pend(Index i);
 
-    std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*> expect_queue(uint32_t monitor);
+    // The waiter queue of one `expect`, by flat monitor: a root global
+    // `{ i32 count, parked handles }` (expect_queue_ty).
+    llvm::GlobalVariable* expect_queue(uint32_t monitor);
+
+    // The address of the queue the `expect` of `monitor` names: a field of the
+    // own instance's record in a unit's code, the global for a monitor of no
+    // instance.
+    llvm::Value* expect_queue_ptr(uint32_t monitor);
+
+    // The type of an `expect` queue, `{ i32, [cap x ptr] }`, and the slot of the
+    // parked handle `idx` of the queue at `queue`.
+    llvm::StructType* expect_queue_ty();
+    llvm::Value*      expect_handle_slot(llvm::Value* queue, llvm::Value* idx);
 
     void lower_expect_wait(Index i);
 
@@ -4815,6 +4836,9 @@ private:
     // the ordinal among its unit's own (no_anchor for none).
     std::vector<std::pair<uint32_t, uint32_t>> disable_owner_;
     std::vector<std::pair<uint32_t, uint32_t>> cover_owner_;
+    // Who declares each flat `expect` monitor, and its ordinal among its unit's
+    // own `expect`s (no_anchor for a monitor no instance declares).
+    std::vector<std::pair<uint32_t, uint32_t>> expect_owner_;
     std::vector<int32_t>  vcd_index_;
 
     // Function declarations, indexed by FunctionId; filled before any body is
@@ -5050,15 +5074,19 @@ private:
     llvm::GlobalVariable*               reactive_cont_head_gv_ = nullptr;
     llvm::GlobalVariable*               reactive_cont_tail_gv_ = nullptr;
     llvm::GlobalVariable*               pend_record_gv_     = nullptr;
-    // Per-`expect` waiter queues (LRM 16.17), keyed by monitor index and created
-    // on demand by expect_queue: {array of parked handles, count}. Same shape as
-    // the inactive batch -- push at the top, drain the whole thing -- because an
-    // expect's cohort is drained in one go and never partially.
+    // Per-`expect` waiter queues (LRM 16.17), keyed by flat monitor index and
+    // created on demand by expect_queue: `{ i32 count, [cap x ptr] parked handles }`,
+    // one root global each. Same shape as the inactive batch -- push at the top,
+    // drain the whole thing -- because an expect's cohort is drained in one go and
+    // never partially. A unit's code never names one: the instance's record holds
+    // the address of each queue of its own (Anchor::ctx_expect_base), the handles
+    // start 8 bytes in (expect_handles_offset), and `cap` is no number the code
+    // holds.
     //
     // Sized like the rings, and the same bound justifies it exactly: a process can
     // be parked on at most one `expect` at a time, so one slot per process is
     // enough for every waiter one monitor can hold.
-    ankerl::unordered_dense::map<uint32_t, std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*>> expect_queue_;
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> expect_queue_;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
     llvm::GlobalVariable*               ring_mask_gv_      = nullptr; // active_mask_ as a constant global

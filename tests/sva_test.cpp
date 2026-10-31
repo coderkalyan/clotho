@@ -6154,6 +6154,41 @@ TEST_CASE("re-executing an expect starts a second attempt of its own") {
                                           "[35] EXP after 1\n");
 }
 
+TEST_CASE("the instances of one module each park an expect in a queue of their own") {
+    // The two instances run one unit's code, so the queue their `expect` parks in
+    // can be neither a name in that code nor shared. Instance a executes its expect
+    // at t=6, is seeded by the clock event at t=15 and resolves at t=25; instance b
+    // executes its at t=16, after a's attempt was seeded, is seeded at t=25 and
+    // resolves at t=35, and a's verdict at t=25 must not release it. (The ports are
+    // read after the first clock event, when they have settled.)
+    std::string out = sva_run_capture(R"(
+module w (input bit clk, input bit d, input int dly, input int id);
+  initial begin
+    @(posedge clk);
+    #(dly);
+    expect (@(posedge clk) ##1 d) $display("[%0t] EXP pass %0d", $time, id);
+    else $display("[%0t] EXP fail %0d", $time, id);
+    $display("[%0t] EXP after %0d", $time, id);
+  end
+endmodule
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit d = 1;
+  w a (.clk, .d, .dly(1), .id(0));
+  w b (.clk, .d, .dly(11), .id(1));
+  initial #41 $finish;
+endmodule
+)");
+    if (const size_t banner = out.find("$finish called"); banner != std::string::npos) {
+        out.resize(out.rfind('\n', banner) + 1);
+    }
+    CHECK(out == "[25] EXP pass 0\n"
+                 "[25] EXP after 0\n"
+                 "[35] EXP pass 1\n"
+                 "[35] EXP after 1\n");
+}
+
 TEST_CASE("an expect keeps its monitor, minus the trigger and plus the request") {
     // The tables the backend reads. `kind` is clotho's own -- libsva has no expect
     // kind and compiles it as an assert -- so the round trip through the boundary

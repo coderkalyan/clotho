@@ -222,6 +222,11 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
         an.fn_externs = scope.fn_externs;
         an.disable_locals = scope.disable_locals;
         an.cover_locals   = scope.cover_locals;
+        for (uint32_t m = scope.monitor_base; m < scope.monitor_base + scope.monitor_count; ++m) {
+            if (mod_.monitors[m].kind == AssertionKind::Expect) {
+                an.expect_locals.push_back(m);
+            }
+        }
         for (uint32_t k = 0; k < an.fn_externs.size(); ++k) {
             an.fn_bind_of.try_emplace(static_cast<uint32_t>(an.fn_externs[k]), k);
         }
@@ -1252,12 +1257,16 @@ void Backend::build_instance_ctx_layout() {
     assign_id_fields();
     disable_owner_.assign(mod_.disable_targets, { SignalSlot::no_anchor, 0 });
     cover_owner_.assign(mod_.cover_types.size(), { SignalSlot::no_anchor, 0 });
+    expect_owner_.assign(mod_.monitors.size(), { SignalSlot::no_anchor, 0 });
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
         for (uint32_t k = 0; k < anchors_[ai].disable_locals.size(); ++k) {
             disable_owner_.at(anchors_[ai].disable_locals[k]) = { ai, k };
         }
         for (uint32_t k = 0; k < anchors_[ai].cover_locals.size(); ++k) {
             cover_owner_.at(anchors_[ai].cover_locals[k]) = { ai, k };
+        }
+        for (uint32_t k = 0; k < anchors_[ai].expect_locals.size(); ++k) {
+            expect_owner_.at(anchors_[ai].expect_locals[k]) = { ai, k };
         }
     }
     // Twin instances own the same number of processes; size blk fields by the
@@ -1316,6 +1325,7 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_dis_base         = a.ctx_prog_base + a.n_prog;
         a.ctx_cov_base         = a.ctx_dis_base + static_cast<uint32_t>(a.disable_locals.size());
         a.ctx_subblk_base      = a.ctx_cov_base + static_cast<uint32_t>(a.cover_locals.size());
+        a.ctx_expect_base      = a.ctx_subblk_base + static_cast<uint32_t>(a.fn_locals.size());
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ i32, ptr, ptr };
@@ -1337,11 +1347,12 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), a.disable_locals.size(), i32);
             f.insert(f.end(), a.cover_locals.size(), i32);
             f.insert(f.end(), a.fn_locals.size(), i32);
+            f.insert(f.end(), a.expect_locals.size(), ptr);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
-        assert(a.ctx_ty->getNumElements() == a.ctx_subblk_base + a.fn_locals.size() &&
+        assert(a.ctx_ty->getNumElements() == a.ctx_expect_base + a.expect_locals.size() &&
                "instances of one unit lay their records out alike");
     }
 }

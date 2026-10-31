@@ -175,6 +175,11 @@ module leaf #(parameter int N = 1) (input logic clk, input logic [7:0] d, output
     coverpoint d { bins lo = {[0:127]}; bins hi = {[128:255]}; }
   endgroup
   cg cgi = new;
+  logic ok = 0;
+  initial begin
+    @(posedge clk);
+    expect (@(posedge clk) d != 8'hff ##1 r != 8'hff) ok = 1; else ok = 0;
+  end
 endmodule
 
 module pair (input logic clk, input logic [7:0] d, output logic [7:0] q);
@@ -294,5 +299,6 @@ TEST_CASE("a rich design: a unit's module names no instance") {
         INFO("module ", name);
         CHECK(text.find("clotho.inst.") == std::string::npos);
         CHECK(text.find("top.inst") == std::string::npos);
+        CHECK(text.find("clotho.expect") == std::string::npos); // a monitor's number is the design's
     }
 }

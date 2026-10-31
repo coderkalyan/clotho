@@ -141,6 +141,13 @@ struct InstanceScope {
     // names its own by position. Empty when `unit` is no_unit.
     std::vector<uint32_t> disable_locals;
     std::vector<uint32_t> cover_locals;
+    // The assertion monitors (Module::monitors) the instance's unit declares, in
+    // the unit's order: `monitor_count` of them from flat monitor `monitor_base`,
+    // so a unit's code names a monitor of its own by position (an `expect`'s
+    // waiter queue is a field of the instance's record). 0 when `unit` is
+    // no_unit.
+    uint32_t monitor_base  = 0;
+    uint32_t monitor_count = 0;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the

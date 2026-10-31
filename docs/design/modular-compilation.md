@@ -333,7 +333,11 @@ between instances:
   instance (landed); the record of an instance an interface port or `inst_refs`
   entry names (not yet);
 - descriptors of wake buckets the instance's signals own (base, subscriber
-  count and trigger bits), and the trigger masks of the guarded groups it runs.
+  count and trigger bits), and the trigger masks of the guarded groups it runs;
+- the waiter queue of each `expect` its unit declares (LRM 16.17), as the address
+  of a root global `{ count, parked handles }`: the wait and the wake of the
+  statement are both unit code and read it here, so neither names a monitor's
+  design-wide number (and two instances of one unit do not share a queue).
 
 Today's per-definition `@clotho.inst.<hier>.ctx` (StateLayout.cpp) is the
 seed of it; the `abs_id` / `idval` relocations (gone: ids are record fields) and constant anchors in unit
@@ -585,8 +589,7 @@ code go.
     built from the instance table, and flatten still copies bodies per
     instance. What still makes a unit module depend on outside it: lowerings
     the taint list keeps per instance (they name `clotho.inst.<hier>.*`
-    globals), `clotho.expect<monitor>` queue names, and the intern pool's type
-    and class numbers (step 5).
+    globals) and the intern pool's type and class numbers (step 5).
 
     What the entry costs at tier 0. A root trampoline per instance (`lea
     ctx,%rdi; jmp entry`) and an entry that spilled the record's addresses and

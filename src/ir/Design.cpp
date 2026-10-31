@@ -46,6 +46,9 @@ struct FlatInstance {
     std::vector<uint32_t> targets;
     // Unit-local covergroup type -> flat index into Module::cover_types.
     std::vector<uint32_t> cover_types;
+    // The instance's own monitors, flat: [monitor_base, monitor_base + monitor_count).
+    uint32_t monitor_base  = 0;
+    uint32_t monitor_count = 0;
 };
 
 // Each unit's key (InstanceScope::unit_key), which names its LLVM module and the
@@ -492,7 +495,9 @@ private:
                 assert(insts_[target].scope != Process::no_scope && "an interface reference names a static unit");
                 mapper.iface_scopes.push_back(insts_[target].scope);
             }
-            mapper.monitor_base = static_cast<uint32_t>(m_.monitors.size());
+            mapper.monitor_base      = static_cast<uint32_t>(m_.monitors.size());
+            insts_[ii].monitor_base  = mapper.monitor_base;
+            insts_[ii].monitor_count = static_cast<uint32_t>(u.monitors.size());
 
             for (uint32_t h = 0; h < u.functions.size(); ++h) {
                 if (u.functions[h].import != kLocal) {
@@ -660,6 +665,8 @@ private:
                     s.cover_locals.push_back(fi.cover_types[h]);
                 }
             }
+            s.monitor_base  = fi.monitor_base;
+            s.monitor_count = fi.monitor_count;
             s.children.reserve(fi.children.size());
             for (const uint32_t ci : fi.children) {
                 s.children.push_back(std::move(*scopes[ci]));

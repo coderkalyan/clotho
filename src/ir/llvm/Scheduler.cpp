@@ -929,6 +929,11 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
         for (uint32_t k = 0; k < a.cover_locals.size(); ++k) {
             b_.CreateStore(b_.getInt32(a.cover_locals[k]), ctx_ptr(a, a.ctx_cov_base + k));
         }
+        // The waiter queue of each `expect` it declares, which both halves of the
+        // statement reach through the record.
+        for (uint32_t k = 0; k < a.expect_locals.size(); ++k) {
+            b_.CreateStore(sym(expect_queue(a.expect_locals[k])), ctx_ptr(a, a.ctx_expect_base + k));
+        }
         // The imports this instance's code reads: where each signal is and who
         // owns it (nobody, for a package's).
         for (uint32_t k = 0; k < a.bind_used.size(); ++k) {
