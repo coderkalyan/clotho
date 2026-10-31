@@ -541,6 +541,44 @@ NaN keys keep their input order.
 
 Code: `src/runtime/Containers.cpp` (`slot_less`), `src/lower/Sort.cpp` (`sort_right_wins`). Tests: `tests/array_ordering_test.cpp` ("sorting reals with a NaN orders the numbers and puts NaN last", "sorting by a real key with a NaN"). Oracle: none; the LRM does not say, and iverilog does not implement these methods on reals.
 
+## 49. Force and release of a net with a net delay (10.6.2, 10.3.3, 28.16, 4.9.2)
+
+28.16 delays "the time it takes from any driver on the net changing value to the
+time when the net value is updated", and 10.3.3 delays "any value change that is to
+be applied to [the net] by some other statement". A force is not a driver, and
+neither clause says the net delay applies to it: 10.6.2 has it override all drivers
+until a release, and 4.9.2 makes it an active update event. Clotho puts the force on
+the net value, past the net delay, so a force and a release take effect at once, a
+driver change that is on its way lands under an active force, and a release shows
+what the drivers have delivered. A force that the net delay itself delayed would
+keep a release from taking effect "immediately", which 10.6.2 requires. 38.34 reads
+the same way: `vpiForceFlag` forces the object "with no delay (same as the
+SystemVerilog procedural force)".
+
+A release while a driver change is on its way is the case the two clauses seem to pull
+apart. 10.6.2: "When released, the net shall immediately be assigned the value
+determined by the drivers of the net". 10.3.3: "any value change that is to be applied
+to wireA by some other statement shall be delayed for ten time units before it takes
+effect". Reading (decided by the project owner): the net takes the value its drivers
+determine now, at once, as 10.6.2 says. 28.16 defines a net delay by "any driver on the
+net changing value", and a release is not a driver changing value; 38.34's "with no
+delay (same as the SystemVerilog procedural force)" is the same for force and release.
+The delayed value is overwritten with the drivers' value for the freed bits, so a change
+still in flight lands as a no-op when it matches, and a later driver change goes through
+the net delay as usual. Only the bits of a force that is active move. iverilog 13
+implements no net delay; for a driver's own delay (`assign #5 w = a`) it takes the
+driver's delayed output at the release, which is a different thing.
+
+Code: `src/lower/Nets.cpp` (`emit_wire_resolvers`, `release_net`). Tests: `tests/net_delay_test.cpp` ("net delay: a driver change on its way lands under an active force", "net delay: a release takes the drivers' value at once, past a change in flight", "net delay: a forced bit and part release to the drivers' value, each at once"). Oracle: none for a net delay; iverilog 13 agrees on the driver-delay form of the first.
+
+## 50. Program input ports are settled before program code reads them (24.3.1, 24.3.2, 4.7)
+
+24.3.1: "Statements and constructs within a program block that are sensitive to changes (e.g., update events) on design signals are scheduled in the Reactive region. [...] The continuous assignment assign tclk = clk; would also be scheduled in the Reactive region. Likewise, initial procedures within program blocks are scheduled in the Reactive region." 24.3.2: "Program ports are program-scope objects", and "the driving and resolution of nets on the other side of a program port connection also occurs in the reactive region set". So a program's port copy and `assign` are Reactive-region events, in the region its own code runs in. 4.7: "active events can be taken off the Active or Reactive event region and processed in any order", so no clause says whether the copy that feeds an input port runs before the program thread that reads it.
+
+Clotho keeps the copy and the `assign` in the Reactive region, where 24.3.1 and 24.3.2 put them, and picks the order 4.7 leaves open: every queued reactive continuous process (a program's port copy, its `assign`, and the resolver of a net it drives) runs before any program procedural code, at the start of the region and again each time program code wakes one. A program thread therefore never reads a port or continuous assign that has an update pending: `initial $display(a)` on an input port prints the design's value at time zero, not `x`, and a `#5` read in the slot where the design writes the port's source reads the new value. Settling the copy in the Active region would give the same reads but contradicts 24.3.1. The first-in-first-out order used before made both reads depend on seed order and wake order.
+
+Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `emit_wake_push`, `ensure_reactive_cont_queue`), `src/ir/llvm/Backend.h` (`kReactiveContTag`). Tests: `tests/program_test.cpp` ("a program initial reads an input port settled at time zero", "a program thread resuming in the slot of a design write reads the port settled", "a program waiter on an input port wakes on the design change, not the settle", "a program initial reads its own assign of an input port settled", "a port copy woken behind a queued program thread still settles before it reads"). Oracle: Verilator 5.050 agrees on every case; iverilog 13 agrees except where the program resumes in the slot of the design write, where it prints the old value because it runs program code in the Active region (`docs/design/program-blocks.md` §2). Design: `docs/design/program-blocks.md` §3.1.
+
 ## 51. Order of a timed nonblocking update against other nonblocking updates (4.6, 10.4.2, 15.5.1)
 
 4.6 b) says "NBAs shall be performed in the order the statements were executed", and

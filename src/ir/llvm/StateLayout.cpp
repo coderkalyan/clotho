@@ -85,30 +85,28 @@ llvm::Constant* Backend::sched_flag_ptr(uint32_t k) {
       ty, base, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_sched_ord_[k]) });
 }
 
-// The `{ i(2W) must|may, iW z }` slot struct for a value of the given width
-// and domain — just `{ i(2W) }` when the slot needs no z word (a proven
-// never-z signal; frame locals always keep z). Identified and memoized per
-// (width, domain, has_z) so every signal of one shape shares one named LLVM
-// type (%logic.8, %bit.nz.4, ...); the single-field form keeps the struct
-// wrapper so GEP paths and array-of-slot addressing stay uniform.
-// `narrow` requests the genuine single-iW 2-state slot (`{ iW }`, named
-// `%bit.W`) instead of the packed must|may word — used for a 2-state signal
-// proven decoupled from every path that still reads the packed form (ABI, NBA,
-// arrays). Only valid for a 2-state (four_state == false), never-z slot.
-llvm::StructType* Backend::slot_type(uint32_t width, bool four_state, bool has_z, bool narrow) {
-    for (const auto& [w, four, z, nr, ty] : slot_types_) {
-        if (w == width && four == four_state && z == has_z && nr == narrow) {
+// The `{ i(2W) must|may, iW z }` slot struct for a 4-state value of the given
+// width -- just `{ i(2W) }` when the slot needs no z word (a proven never-z
+// signal; frame locals always keep z) -- or the native `{ iW }` for a 2-state
+// one. Identified and memoized per (width, domain, has_z) so every signal of
+// one shape shares one named LLVM type (%logic.8, %logic.nz.4, %bit.4, ...); the
+// single-field form keeps the struct wrapper so GEP paths and array-of-slot
+// addressing stay uniform.
+llvm::StructType* Backend::slot_type(uint32_t width, bool four_state, bool has_z) {
+    assert((four_state || !has_z) && "a 2-state slot has no z word");
+    for (const auto& [w, four, z, ty] : slot_types_) {
+        if (w == width && four == four_state && z == has_z) {
             return ty;
         }
     }
-    const std::string name = std::string(four_state ? "logic." : "bit.")
-                           + (narrow ? "" : (has_z ? "" : "nz.")) + std::to_string(width);
-    std::vector<llvm::Type*> fields{ int_ty(narrow ? width : 2 * width) };
+    const std::string name =
+      std::string(four_state ? (has_z ? "logic." : "logic.nz.") : "bit.") + std::to_string(width);
+    std::vector<llvm::Type*> fields{ int_ty(four_state ? 2 * width : width) };
     if (has_z) {
         fields.push_back(int_ty(width));
     }
     auto* ty = llvm::StructType::create(ctx_, fields, name);
-    slot_types_.emplace_back(width, four_state, has_z, narrow, ty);
+    slot_types_.emplace_back(width, four_state, has_z, ty);
     return ty;
 }
 
@@ -332,7 +330,7 @@ void Backend::build_state_types() {
             continue;
         }
         // A real / shortreal slot stores the IEEE-754 bit pattern in a
-        // 2-state word: never z, so it takes the narrow single-iW form
+        // 2-state word: never z, so it takes the native single-iW form
         // below (pool layout gives Domain::Two for floats).
         slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
         slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
@@ -358,8 +356,7 @@ void Backend::build_state_types() {
         // so that both sides of an alias agree without either knowing the other.
         slot.has_z  = slot.four_state && (may_z[i] || slot.init_z || !slot.undriven_mask.empty() ||
                                           ptr_arg[i] || vif_sig_[i]);
-        slot.narrow = !slot.four_state;
-        slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
+        slot.slot_ty = slot_type(slot.width, slot.four_state, slot.has_z);
         if (ty.kind == Type::Kind::UnpackedArray) {
             slot.is_array   = true;
             slot.elem_count = array_leaf_count(sigs[i].type);
@@ -408,7 +405,7 @@ void Backend::build_state_types() {
                 if (slot.nba_agg) {
                     for (AggLeaf& m : slot.static_leaves) {
                         m.sh_mm_field = static_cast<uint32_t>(sf.size());
-                        sf.push_back(int_ty(m.narrow ? m.width : 2 * m.width));
+                        sf.push_back(int_ty(m.four_state ? 2 * m.width : m.width));
                         if (m.has_z) {
                             m.sh_z_field = static_cast<uint32_t>(sf.size());
                             sf.push_back(int_ty(m.width));
@@ -418,8 +415,8 @@ void Backend::build_state_types() {
                 return;
             }
             slot.sh_mm_field = static_cast<uint32_t>(sf.size());
-            // A narrow 2-state target shadows a single iW word (no z shadow).
-            sf.push_back(int_ty(slot.narrow ? slot.width : 2 * slot.width));
+            // A 2-state target shadows a single iW word (no z shadow).
+            sf.push_back(int_ty(slot.four_state ? 2 * slot.width : slot.width));
             // A never-z target stages no z shadow; sh_z_field stays unused.
             if (slot.has_z) {
                 slot.sh_z_field = static_cast<uint32_t>(sf.size());
@@ -738,12 +735,9 @@ llvm::Value* Backend::lv_field_ptr(const LValue& lv, uint32_t field) {
 
 // The power-on image of one leaf slot: what an out-of-range read of it must
 // yield (LRM 7.4.5 / Table 7-1 -- x for a 4-state element, 0 for 2-state).
-// The element's domain decides, not the slot's shape: a 2-state element kept in
-// the packed must|may layout (it is fed from something that can be z) still
-// defaults to 0, so its image is all zero planes, as in init_state.
-llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
-                                            bool four_state, bool has_z) {
-    std::vector<llvm::Constant*> fields{ narrow ? zero(width) : (four_state ? x_mm(width) : zero(2 * width)) };
+llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
+                                            bool has_z) {
+    std::vector<llvm::Constant*> fields{ four_state ? x_mm(width) : zero(width) };
     if (has_z) {
         fields.push_back(zero(width));
     }
@@ -837,7 +831,7 @@ llvm::Value* Backend::ref_actual_ptr(const LValue& lv) {
     // this is the reading of it that keeps both halves of 7.4.5 true; the
     // alternative (aliasing real storage) is memory corruption.
     auto* sink = entry_alloca(lv.slot_ty, "ref.sink");
-    b_.CreateStore(slot_default_const(lv.slot_ty, lv.store_width, lv.narrow, /*four_state=*/!lv.narrow, lv.has_z), sink);
+    b_.CreateStore(slot_default_const(lv.slot_ty, lv.store_width, lv.four_state, lv.has_z), sink);
     emit_bounds_reports(lv, /*is_write=*/true);
     return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
 }

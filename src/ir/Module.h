@@ -235,9 +235,10 @@ struct Process {
     // rather than the active one: a continuous construct declared inside a
     // `program` (LRM 24.3.1 -- "The continuous assignment assign tclk = clk;
     // would also be scheduled in the Reactive region"), and, once ports land, a
-    // program port copy. Such a body is seeded and woken onto the reactive ring
-    // and its parks are reactive-home; nothing else about it differs from an
-    // ordinary Activation::Always process.
+    // program port copy. Such a body is seeded and woken onto the reactive CONTINUOUS
+    // ring, which the reactive drain empties before the reactive ring program code
+    // runs from (docs/design/program-blocks.md §3.1), and its parks are reactive-home;
+    // nothing else about it differs from an ordinary Activation::Always process.
     //
     // A flag rather than a new Activation, because the two questions are
     // orthogonal. Activation says WHEN a body runs, and is dispatched on

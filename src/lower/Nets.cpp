@@ -823,54 +823,88 @@ void Lowerer::emit_wire_resolvers() {
         if (pi != net_pull_.end() && !pull_injected) {
             acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);
         }
-        // Store the resolved driver fold, then overlay every active force site
-        // (LRM 10.6.2). Net force writes the net storage in place at each site's
-        // range [lo, hi], so unforced bits keep the fold and z is preserved (a
-        // positioned store, not a bitwise mask). A released site (active === 0) is
-        // skipped, so re-running the resolver reverts those bits to the fold. Each
-        // site's active/val join the sensitivity so force apply and release re-run
-        // this process.
+        // Store the resolved driver fold under every active force site (LRM 10.6.2).
+        // Net force writes at each site's range [lo, hi], so unforced bits keep the
+        // fold and z is preserved (a positioned store, not a bitwise mask). A released
+        // site (active === 0) is skipped, so re-running the resolver reverts those
+        // bits to the fold. Each site's active/val join the sensitivity so force apply
+        // and release re-run this process.
+        //
+        // A forced net takes its value in ONE store. A store wakes the net's waiters
+        // from the transition it makes, so storing the fold and then the forced bits
+        // over it showed them the fold for an instant: an edge and a change the force
+        // forbids, since under a force the drivers change nothing a reader can see.
+        // The overlay is built in a frame cell of the resolver function instead.
         const auto                          fs_it = net_force_sites_.find(net_u);
         const std::span<const NetForceSite> sites = fs_it != net_force_sites_.end()
                                                       ? std::span<const NetForceSite>(fs_it->second)
                                                       : std::span<const NetForceSite>();
-        // A net delay (LRM 28.16, `wire #5 w;`) delays the resolved fold
-        // itself, not any one driver's slot -- "the time it takes from any
-        // driver on the net changing value to the time when the net value
-        // is updated". It rides this store alone; the force overlay below
-        // stays immediate (force is an override, not a driver LRM 28.16
-        // times).
-        const auto nd_it = net_delay_.find(net_u);
-        if (nd_it != net_delay_.end()) {
+        const ir::Ref                       net_ty = module_.signal(net).type;
+        // The net's value as the overlay builds it, a fresh lvalue per use.
+        const auto cell = [&] { return b.local(0, net_ty, l); };
+        // A net delay (LRM 28.16, `wire #5 w;`) delays the resolved fold itself,
+        // not any one driver's slot -- "the time it takes from any driver on the
+        // net changing value to the time when the net value is updated". A force
+        // is not a driver but an override of all of them (LRM 10.6.2), and it is
+        // an active update event of its own (LRM 4.9.2), so it takes effect at
+        // once and the net delay does not touch it. On a net that is also forced
+        // the delayed fold therefore goes into a signal of its own, and the net is
+        // that signal with the active sites laid over it (NetDelayShadow): a driver
+        // change that is on its way lands under an active force, and a release
+        // shows what the drivers have delivered. Stored into the net itself, the
+        // delayed fold landed over the force, and the inertial store compared its
+        // fold with the forced value, so a release changed nothing.
+        const auto nd_it   = net_delay_.find(net_u);
+        const auto sh_it   = net_delay_shadow_.find(net_u);
+        const bool delayed = nd_it != net_delay_.end();
+        const bool forced  = !sites.empty();
+        assert((delayed && forced) == (sh_it != net_delay_shadow_.end()) && "a delayed forced net has its shadow");
+        ir::Index value = acc; // what the force sites are laid over
+        if (delayed && forced) {
+            const NetDelayShadow& sh    = sh_it->second;
+            const ir::Index       dst   = b.signal(sh.delayed, l);
+            const ir::Index       ticks = scaled_delay(*nd_it->second, b);
+            b.binary(ir::Inst::Tag::Store, b.signal(sh.fold, l), acc, l);
+            b.store_inertial_delay(dst, acc, ticks, l);
+            value = b.unary(ir::Inst::Tag::Load, b.signal(sh.delayed, l), l);
+        } else if (delayed) {
             const ir::Index dst   = b.signal(net, l);
             const ir::Index ticks = scaled_delay(*nd_it->second, b);
             b.store_inertial_delay(dst, acc, ticks, l);
-        } else {
+        }
+        if (forced) {
+            b.binary(ir::Inst::Tag::Store, cell(), value, l);
+            for (const NetForceSite& site : sites) {
+                const ir::Index part =
+                  (site.lo == 0 && site.hi == net_w - 1) ? cell() : b.part_select(cell(), site.hi, site.lo, l);
+                b.open_region();
+                b.binary(ir::Inst::Tag::Store, part, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
+                const ir::ExtraSlice then_r = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice else_r = b.close_region();
+                b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
+            }
+            const ir::Index result = b.unary(ir::Inst::Tag::Load, cell(), l);
+            b.binary(ir::Inst::Tag::Store, b.signal(net, l), result, l);
+        } else if (!delayed) {
             // An unpacked array net reaches here only when nothing drives it (a
             // driver's slot is refused for one), and the pull, or the z, of a
             // driverless net lands in every element alike.
-            store_every_element(b.signal(net, l), module_.signal(net).type, acc, b, l);
-        }
-        for (const NetForceSite& site : sites) {
-            const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
-                                       ? b.signal(net, l)
-                                       : b.part_select(b.signal(net, l), site.hi, site.lo, l);
-            b.open_region();
-            b.binary(ir::Inst::Tag::Store, net_lv, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
-            const ir::ExtraSlice then_r = b.close_region();
-            b.open_region();
-            const ir::ExtraSlice else_r = b.close_region();
-            b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
+            store_every_element(b.signal(net, l), net_ty, acc, b, l);
         }
 
         std::vector<ir::WaitEvent> wait_events;
-        wait_events.reserve(slots.size() + sites.size() * 2);
+        wait_events.reserve(slots.size() + sites.size() * 2 + 1);
         for (const ir::Signal s : slots) {
             wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
         for (const NetForceSite& site : sites) {
             wait_events.push_back(ir::WaitEvent{ .signal = site.active, .edge = ir::Edge::Any });
             wait_events.push_back(ir::WaitEvent{ .signal = site.val, .edge = ir::Edge::Any });
+        }
+        if (delayed && forced) {
+            // The delayed fold landing changes the net, which is built from it.
+            wait_events.push_back(ir::WaitEvent{ .signal = sh_it->second.delayed, .edge = ir::Edge::Any });
         }
         // LRM 24.3.2: "the driving and resolution of nets on the other side of
         // a program port connection also occurs in the reactive region set."
@@ -906,7 +940,7 @@ void Lowerer::emit_wire_resolvers() {
                                                .return_type = module_.pool.void_type,
                                                .param_types = {},
                                                .arg_dirs    = {},
-                                               .local_types = {},
+                                               .local_types = std::vector<ir::Ref>{ net_ty },
                                                .is_task     = false,
                                                .ir          = b.finish() });
             ir::Builder pb(module_);
@@ -940,11 +974,13 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
     const AssignmentExpression& a    = e.as<AssignmentExpression>();
     const Expression&           left = a.left();
 
-    // `assign #d lhs = rhs;` carries an inertial net delay (LRM 10.3.3). Only a
-    // single `#d` DelayControl is lowered; a rise/fall/turn-off triple selects
-    // a per-transition delay Clotho has no representation for.
-    const TimingControl* delay = sym.getDelay();
-    if (delay != nullptr && delay->kind != TimingControlKind::Delay) {
+    // `assign #d lhs = rhs;` carries an inertial net delay (LRM 10.3.3). One delay
+    // value, `#d` or `#(d)`, applies to every transition (LRM 28.16: "When one delay
+    // value is given, then this value shall be used for all propagation delays"); two
+    // or three select a per-transition delay Clotho has no representation for.
+    const TimingControl* delay_tc = sym.getDelay();
+    const Expression*    delay    = delay_tc != nullptr ? single_delay_expr(*delay_tc) : nullptr;
+    if (delay_tc != nullptr && delay == nullptr) {
         // TODO: continuous-assign rise/fall/turn-off (vector-net transition)
         // delays, LRM 10.3.3 / 28.16.
         fail("continuous assignment rise/fall/turn-off delays (assign #(a,b,c)) are "
@@ -972,8 +1008,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
         // net through `in_program_` so emit_wire_resolvers folds it from a
         // reactive-home resolver as well (LRM 24.3.2). What that costs the
         // net's design-side drivers is stated at that fold.
-        emit_resolved_driver(
-          *net, a, left, b, l, strength, delay != nullptr ? &delay->as<DelayControl>().expr : nullptr);
+        emit_resolved_driver(*net, a, left, b, l, strength, delay);
         return;
     }
     // A concatenation lvalue has no single root, so resolved_net_of misses
@@ -993,8 +1028,20 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
             fail("continuous assignment delay is only supported for a whole integral "
                  "scalar target");
         }
+        if (const ValueSymbol* root = lvalue_root(left); root != nullptr && force_info_of(*root) != nullptr) {
+            // TODO: a delayed continuous assignment onto a force-target variable. The
+            // delayed store commits from the timing wheel with no force gate, so it
+            // lands over an active force (LRM 10.6.2: the force overrides a continuous
+            // assignment until released), and what a release does with the delay is
+            // not settled: 10.6.2 has it "reestablish that assignment and schedule a
+            // reevaluation in the continuous assignment's scheduling region", 10.3.3
+            // delays every update of the assignment, and iverilog 13 takes the driver's
+            // value at once. A net with a delayed driver is unaffected: its driver
+            // stores into a slot the resolver folds under the force.
+            fail("continuous assignment delay on a force-target variable is not supported");
+        }
         const ir::Index rhs   = lower_expr(a.right(), b);
-        const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+        const ir::Index ticks = scaled_delay(*delay, b);
         b.store_inertial_delay(lower_lvalue(left, b), rhs, ticks, l);
         add_continuous_process(continuous_events(e), l, b);
         return;
@@ -1102,9 +1149,11 @@ Lowerer::ForceInfo* Lowerer::force_info_of(const ValueSymbol& sym) {
     return fit == forceable_.end() ? nullptr : &fit->second;
 }
 
-// Collect-pass scan: register the hidden per-target state for every `force` /
+// Classify-pass scan: register the hidden per-target state for every `force` /
 // `assign` site in a procedural block, so writers/resolvers lowered later in
-// Emit see the target as forceable.
+// Emit see the target as forceable. Run in Classify, once Collect has registered
+// every signal of the top, so a target named by hierarchy resolves whatever the
+// order of the instances and the block (see lower_members).
 void Lowerer::scan_force_targets(const Statement& body) {
     struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
         Lowerer* self;
@@ -1152,7 +1201,7 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
                                       const ValueSymbol&               root) {
     const auto sit = sigmap_.find(&canonical_value_symbol(root));
     if (sit == sigmap_.end()) {
-        return; // hierarchical / not-yet-collected: guarded loud
+        return; // a target in another top: lower_proc_assign refuses it (kUnregisteredForce)
     }
     if (!lhs.type->getCanonicalType().isIntegral()) {
         // A whole unpacked array or struct net: its layout width is one element's, so
@@ -1186,6 +1235,22 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     const uint32_t idx   = static_cast<uint32_t>(sites.size());
     sites.push_back(site);
     stmt_force_site_[&s] = { net_u, idx };
+    if (net_delay_.contains(net_u)) {
+        const auto [shadow, fresh] = net_delay_shadow_.try_emplace(net_u);
+        if (fresh) {
+            const std::string net_name = module_.signal(sit->second).name;
+            const ir::Ref     net_ty   = module_.signal(sit->second).type;
+            const auto        hidden   = [&](const char* suffix) {
+                ir::SignalInfo info;
+                info.name = net_name + suffix;
+                info.type = net_ty;
+                info.dir  = ir::SignalInfo::Direction::Internal;
+                return register_signal(std::move(info));
+            };
+            shadow->second.delayed = hidden("$delayed");
+            shadow->second.fold    = hidden("$fold");
+        }
+    }
     if (resolved_nets_.insert(net_u).second) {
         net_resolve_op_[net_u] = net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
     }
@@ -1213,7 +1278,7 @@ void Lowerer::register_pca_target(const Expression& lhs, bool is_force) {
     }
     const auto sit = sigmap_.find(&canonical_value_symbol(*sym));
     if (sit == sigmap_.end()) {
-        return; // not registered in this scope (hierarchical): guarded loud
+        return; // a target in another top: lower_proc_assign refuses it (kUnregisteredForce)
     }
     const auto [it, inserted] = forceable_.try_emplace(static_cast<uint32_t>(sit->second));
     ForceInfo& fi             = it->second;
@@ -1226,11 +1291,21 @@ void Lowerer::register_pca_target(const Expression& lhs, bool is_force) {
     }
 }
 
-// A continuous driver (module-level `assign`) of a forced variable must also
-// wake on `force_site` so that `release` (force_site -> 0) re-evaluates it and
-// reverts the variable to the driver's current value (LRM 10.6.2 reestablish).
-// Appends that wait event when `lhs`'s root is forceable; a no-op otherwise.
+// A continuous driver (module-level `assign`, or a port connection) of a forced
+// variable must also wake on `force_site` so that `release` (force_site -> 0)
+// re-evaluates it and reverts the variable to the driver's current value (LRM 10.6.2
+// reestablish). Appends that wait event for every forceable root `lhs` writes, each
+// operand of a concatenation (whose own root is none) included; a no-op otherwise.
 std::vector<ir::WaitEvent> Lowerer::with_force_wake(std::vector<ir::WaitEvent> ev, const Expression& lhs) {
+    if (lhs.kind == ExpressionKind::Concatenation) {
+        for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+            ev = with_force_wake(std::move(ev), *op);
+        }
+        return ev;
+    }
+    if (lhs.kind == ExpressionKind::Conversion) {
+        return with_force_wake(std::move(ev), lhs.as<ConversionExpression>().operand());
+    }
     if (const ValueSymbol* r = lvalue_root(lhs)) {
         if (ForceInfo* fi = force_info_of(*r)) {
             ev.push_back(ir::WaitEvent{ .signal = fi->site, .edge = ir::Edge::Any });
@@ -1359,6 +1434,21 @@ const ValueSymbol* Lowerer::pca_target_var(const Expression& lhs, const char* ve
     return sym;
 }
 
+namespace {
+// What a force the Classify scan did not register is refused with. The scan sees every
+// `force` in an initial / always / final block of the top, whatever the order of the
+// instances it names. It cannot meet a target in another top (each top lowers with its own
+// signals, docs/TODO.md "Cross-top hierarchical reference"), and it does not read a task or
+// function body: a net site is registered per force statement, so a net force inside a
+// subroutine is never registered, and a variable is forceable only if some block forces it.
+// TODO: a force inside a task or function (LRM 10.6.2) -- needs the scan to read the bodies
+// of the subroutines a procedural block can reach, the package and class ones included.
+constexpr const char* kUnregisteredForce =
+  "force that this top's procedural-block scan did not register is not supported (a cross-top "
+  "hierarchical reference; inside a task or function, a force of a net or of a variable that no "
+  "procedural block forces)";
+} // namespace
+
 void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder& b) {
     if (s.assignment.kind != ExpressionKind::Assignment) {
         fail("malformed force/assign statement");
@@ -1381,6 +1471,10 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
             // (emit_wire_resolvers). Track the RHS into `val` while active.
             const auto it = stmt_force_site_.find(&s);
             if (it == stmt_force_site_.end()) {
+                if (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue ||
+                    packed_bit_range(a.left())) {
+                    fail(kUnregisteredForce);
+                }
                 fail("force on a dynamic or non-constant net bit/part-select is not "
                      "supported (only a constant select, LRM 10.6.2)");
             }
@@ -1405,11 +1499,9 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
         }
         ForceInfo* fip = force_info_of(*sym);
         if (fip == nullptr) {
-            // The Collect scan registers every in-scope target; a cross-scope
-            // (hierarchical) target works when its instance was elaborated before
-            // the force was scanned, else it is not yet in sigmap here.
-            fail("force on a target not elaborated before the force statement is "
-                 "not supported (declare the instance before the forcing block)");
+            // The Classify scan registers every target of a force statement in this
+            // top's procedural blocks. What is left is a target that scan never met.
+            fail(kUnregisteredForce);
         }
         if (is_externally_driven_port(*sym)) {
             fail("force on an input or inout port variable is not supported");
@@ -1557,6 +1649,35 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
             b.cond(site_is(site.active, 1, b, l), then_r, else_r, l, /*unlikely=*/true);
         }
     }
+    // A net with a net delay (LRM 28.16): the freed bits take what the drivers say NOW,
+    // `$fold`, at once, not what the net delay has delivered so far, `$delayed`. 10.6.2:
+    // "When released, the net shall immediately be assigned the value determined by the
+    // drivers of the net". 28.16 times "any driver on the net changing value", which a
+    // release is not (38.34: a force or release is "with no delay (same as the
+    // SystemVerilog procedural force)"). `$delayed` takes the fold for those bits, so a
+    // driver change still in flight lands as a no-op when it matches, and a later one goes
+    // through the net delay as usual: the inertial store compares with `$delayed`. Only
+    // the bits of a site that is ACTIVE move; releasing what is not forced leaves the delay
+    // alone. The resolver call below folds the drivers once more and stores the net once.
+    if (const auto sh = net_delay_shadow_.find(static_cast<uint32_t>(sit->second)); sh != net_delay_shadow_.end()) {
+        for (const NetForceSite& site : fs->second) {
+            if (site.lo < rlo || site.hi > rhi) {
+                continue;
+            }
+            const auto bits = [&](ir::Signal sig) {
+                return (site.lo == 0 && site.hi == net_w - 1) ? b.signal(sig, l)
+                                                              : b.part_select(b.signal(sig, l), site.hi, site.lo, l);
+            };
+            const ir::Index delayed = bits(sh->second.delayed);
+            const ir::Index fold    = bits(sh->second.fold);
+            b.open_region();
+            b.binary(ir::Inst::Tag::Store, delayed, b.unary(ir::Inst::Tag::Load, fold, l), l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
+        }
+    }
     bool released = false;
     for (const NetForceSite& site : fs->second) {
         if (site.lo >= rlo && site.hi <= rhi) {
@@ -1621,8 +1742,9 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
     // exactly like a bare `assign #d`. The LHS is always the whole net here —
     // a net_decl_assignment forbids any indexing (LRM 10.3.1) — so unlike
     // lower_continuous_assign there is no "whole scalar" shape to check.
-    const TimingControl* delay = ns.getDelay();
-    if (delay != nullptr && delay->kind != TimingControlKind::Delay) {
+    const TimingControl* delay_tc = ns.getDelay();
+    const Expression*    delay    = delay_tc != nullptr ? single_delay_expr(*delay_tc) : nullptr;
+    if (delay_tc != nullptr && delay == nullptr) {
         // TODO: net declaration assignment rise/fall/turn-off delays
         // (`wire #(a,b,c) w = ...;`) — same gap as `assign #(a,b,c)`.
         fail("net declaration assignment rise/fall/turn-off delays (wire #(a,b,c) w = ...) "
@@ -1637,7 +1759,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
         const ir::Index  val  = b.convert(lower_expr(*init, b), lower_type(ns.getType()), ns.getType().isSigned(), l);
         if (delay != nullptr) {
             const ir::Index dst   = b.signal(slot, l);
-            const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+            const ir::Index ticks = scaled_delay(*delay, b);
             b.store_inertial_delay(dst, val, ticks, l);
         } else {
             b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
@@ -1648,7 +1770,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
     if (delay != nullptr) {
         const ir::Index dst   = value_lvalue(ns, b, l);
         const ir::Index rhs   = lower_expr(*init, b);
-        const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+        const ir::Index ticks = scaled_delay(*delay, b);
         b.store_inertial_delay(dst, rhs, ticks, l);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
         return;
@@ -2045,8 +2167,9 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         return;
     }
     check_mos_switch_strength(gi, left);
-    const TimingControl* cmos_delay = gi.getDelay();
-    if (cmos_delay != nullptr && cmos_delay->kind != TimingControlKind::Delay) {
+    const TimingControl* cmos_delay_tc = gi.getDelay();
+    const Expression*    cmos_delay    = cmos_delay_tc != nullptr ? single_delay_expr(*cmos_delay_tc) : nullptr;
+    if (cmos_delay_tc != nullptr && cmos_delay == nullptr) {
         // TODO: cmos/rcmos rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16)
         // — needs the per-transition delay selection Clotho has no
         // representation for. A single #d is lowered onto each half below.
@@ -2079,14 +2202,7 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         std::vector<ir::WaitEvent> wait_events;
         const ir::Index            folded = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
         const ir::Index            val    = gate_output_value(left, folded, b, l);
-        emit_gate_resolved_driver(left,
-                                  *net,
-                                  val,
-                                  std::move(wait_events),
-                                  b,
-                                  l,
-                                  gate_strength,
-                                  cmos_delay != nullptr ? &cmos_delay->as<DelayControl>().expr : nullptr);
+        emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, l, gate_strength, cmos_delay);
     };
     emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
     emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
@@ -2296,6 +2412,33 @@ void Lowerer::check_mos_switch_strength(const PrimitiveInstanceSymbol& gi, const
 
 void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
     const PrimitiveSymbol& prim = gi.primitiveType;
+    if (cur_pass_ == Pass::Emit) {
+        // TODO: a gate or switch output on a force-target variable. LRM 10.3 lets a
+        // variable "be driven by one continuous assignment or by one primitive
+        // output", and the gate's store below carries no force gate, so its value
+        // lands over an active force. Gating it is not enough: 10.6.2 says what a
+        // force on a variable overrides ("a procedural assignment, continuous
+        // assignment or an assign procedural continuous assignment") and which
+        // driver a release reestablishes ("a continuous assignment"), and names no
+        // primitive output in either list, so whether a release restores the gate's
+        // value or holds the forced one is open. iverilog 13 refuses a primitive
+        // driving a variable at all. A net output is unaffected: the net's resolver
+        // folds the gate under the force.
+        // The output terminals: all but the last of a buf/not, else terminal 0.
+        const auto   conns = gi.getPortConnections();
+        const size_t n_out = prim.primitiveKind == PrimitiveSymbol::NOutput && conns.size() > 1
+                               ? conns.size() - 1
+                               : std::min<size_t>(1, conns.size());
+        for (size_t i = 0; i < n_out; ++i) {
+            if (conns[i] == nullptr || conns[i]->kind != ExpressionKind::Assignment) {
+                continue;
+            }
+            const ValueSymbol* root = lvalue_root(conns[i]->as<AssignmentExpression>().left());
+            if (root != nullptr && force_info_of(*root) != nullptr) {
+                fail("a gate or switch output on a force-target variable is not supported");
+            }
+        }
+    }
     if (prim.name == "pullup" || prim.name == "pulldown") {
         lower_pull_source(gi, prim.name == "pullup");
         return;
@@ -2320,11 +2463,12 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         // Fixed — so this family must be recognized by name, not by kind.
         fail("gate primitive '" + std::string(prim.name) + "' is not supported");
     }
-    const TimingControl* gate_delay = gi.getDelay();
-    if (gate_delay != nullptr && gate_delay->kind != TimingControlKind::Delay) {
+    const TimingControl* gate_delay_tc = gi.getDelay();
+    const Expression*    gate_delay    = gate_delay_tc != nullptr ? single_delay_expr(*gate_delay_tc) : nullptr;
+    if (gate_delay_tc != nullptr && gate_delay == nullptr) {
         // TODO: gate rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16) —
         // needs the per-transition delay selection Clotho has no representation
-        // for. A single #d delay is lowered below.
+        // for. A single #d or #(d) delay is lowered below.
         fail("gate rise/fall/turn-off delays (#(a,b,c)) are not supported");
     }
     const uint16_t gate_strength = pack_strength(gi.getDriveStrength());
@@ -2394,14 +2538,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
             // 28.16): this gate's own contribution transitions inertially and
             // the resolver re-runs when the slot lands, so it rides the slot
             // store rather than the resolved net.
-            emit_gate_resolved_driver(left,
-                                      *net,
-                                      val,
-                                      std::move(wait_events),
-                                      b,
-                                      loc,
-                                      gate_strength,
-                                      gate_delay != nullptr ? &gate_delay->as<DelayControl>().expr : nullptr);
+            emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc, gate_strength, gate_delay);
         } else {
             const GateTerm output = lower_gate_output(*out);
             if (gate_delay != nullptr && module_.pool.layout(module_.signal(output.sig).type).width != 1) {
@@ -2410,12 +2547,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
                 // signal lvalue. TODO: bit-addressed gate output with a delay.
                 fail("gate delay is only supported for a whole scalar output");
             }
-            emit_gate_as_process(output,
-                                 val,
-                                 std::move(wait_events),
-                                 b,
-                                 loc,
-                                 gate_delay != nullptr ? &gate_delay->as<DelayControl>().expr : nullptr);
+            emit_gate_as_process(output, val, std::move(wait_events), b, loc, gate_delay);
         }
     }
 }

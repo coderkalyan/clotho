@@ -33,8 +33,7 @@ Backend::DynElem Backend::elem_desc(Ref elem_type) {
     e.width      = lay.width == 0 ? 1 : lay.width;
     e.four_state = lay.domain == Domain::Four;
     e.has_z      = e.four_state;
-    e.narrow     = !e.four_state; // 2-state / real element -> single iW slot
-    e.slot_ty    = slot_type(e.width, e.four_state, e.has_z, e.narrow);
+    e.slot_ty    = slot_type(e.width, e.four_state, e.has_z); // 2-state / real -> native iW
     return e;
 }
 
@@ -134,7 +133,7 @@ llvm::Constant* Backend::elem_proto_const(const DynElem& e) {
     if (e.is_handle) {
         return llvm::Constant::getNullValue(e.slot_ty);
     }
-    llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
+    llvm::Constant*              mm = e.four_state ? x_mm(e.width) : zero(e.width);
     std::vector<llvm::Constant*> fields{ mm };
     if (e.has_z) {
         fields.push_back(zero(e.width));
@@ -670,7 +669,7 @@ void Backend::lower_dyn_array_new(Index i) {
     // negative the design actually wrote and can reject it (LRM 7.5.1);
     // zero-extending would turn `new[-1]` on a 32-bit int into a 4294967295-element
     // request. The frontend zero-extends an unsigned count past its top bit.
-    llvm::Value* n = cast(must_of(value_of(da.arg)), 64, true);
+    llvm::Value* n = cast(must_of(da.arg), 64, true);
     b_.CreateCall(dynarr_new_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     elem_ops_global(da.array_type),
@@ -682,7 +681,7 @@ void Backend::lower_dyn_array_new_init(Index i) {
     const auto&   p  = ir_->payload(i).op_extra;
     const auto    da = ir_->extra_data<DynArrayNewInitInfo>(p.extra);
     // Sign-extend a signed count, as in lower_dyn_array_new.
-    llvm::Value* n = cast(must_of(value_of(da.size)), 64, true);
+    llvm::Value* n = cast(must_of(da.size), 64, true);
     // `new[n](src)` copies src's elements in, so the owner acquires every reference
     // src held. Plain `new[n]` (lower_dyn_array_new) is deliberately bare: it
     // preserves or drops elements and adds no reference. See lower_queue_push.
@@ -811,7 +810,7 @@ LValue Backend::elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
     lv.base        = ptr;
     lv.slot_ty     = e.slot_ty;
     lv.has_z       = e.has_z;
-    lv.narrow      = e.narrow;
+    lv.four_state  = e.four_state;
     lv.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     lv.elem_idx    = b_.getInt32(0);
     lv.store_width = e.width;
@@ -825,7 +824,7 @@ LValue Backend::elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
 // for 2-state / real), used to pre-fill a pop scratch so an empty-queue pop
 // yields the default.
 llvm::Constant* Backend::elem_default_const(const DynElem& e) {
-    llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
+    llvm::Constant*              mm = e.four_state ? x_mm(e.width) : zero(e.width);
     std::vector<llvm::Constant*> fields{ mm };
     if (e.has_z) {
         fields.push_back(zero(e.width));
@@ -982,7 +981,7 @@ void Backend::lower_queue_insert(Index i) {
     const auto    qi    = ir_->extra_data<QueueInsertInfo>(p.extra);
     const DynElem e     = dynarr_elem(qi.queue_type);
     llvm::Value*  ops   = elem_ops_global(qi.queue_type);
-    llvm::Value*  idx   = cast(must_of(value_of(qi.idx)), 64, false);
+    llvm::Value*  idx   = cast(must_of(qi.idx), 64, false);
     llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
     const LValue& qlv   = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
@@ -1010,7 +1009,7 @@ void Backend::lower_queue_insert(Index i) {
 void Backend::lower_queue_delete_idx(Index i) {
     const auto&   p      = ir_->payload(i).op_extra;
     const auto    qa     = ir_->extra_data<QueueArg>(p.extra);
-    llvm::Value*  idx    = cast(must_of(value_of(qa.arg)), 64, false);
+    llvm::Value*  idx    = cast(must_of(qa.arg), 64, false);
     const LValue& qlv    = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     emit_queue_bounds_check(i, handle, qa.arg, qlv, /*allow_append=*/false);
@@ -1054,8 +1053,8 @@ void Backend::lower_queue_append_range(Index i) {
     const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
     llvm::Value* bound = b_.getInt64(std::get<Type>(mod_.pool.get(qs.queue_type)).left);
     // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
-    llvm::Value* lo = cast(must_of(value_of(qs.lo)), 64, /*sign=*/true);
-    llvm::Value* hi = cast(must_of(value_of(qs.hi)), 64, /*sign=*/true);
+    llvm::Value* lo = cast(must_of(qs.lo), 64, /*sign=*/true);
+    llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
     // A slice append copies a range of elements in. See lower_queue_push.
     emit_gc_barrier_for(lvalue_of(p.op));
     b_.CreateCall(queue_append_range_fn(),
@@ -1140,7 +1139,7 @@ LValue Backend::container_elem_lvalue(llvm::Value*   handle,
     el.base        = data;
     el.slot_ty     = e.slot_ty;
     el.has_z       = e.has_z;
-    el.narrow      = e.narrow;
+    el.four_state  = e.four_state;
     el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     el.elem_idx    = cast(phys, 32, false);
     el.store_width = e.width;
@@ -1163,7 +1162,7 @@ LValue Backend::tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value
     el.base        = data;
     el.slot_ty     = e.slot_ty;
     el.has_z       = e.has_z;
-    el.narrow      = e.narrow;
+    el.four_state  = e.four_state;
     el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
     el.elem_idx    = cast(idx, 32, false);
     el.store_width = e.width;
@@ -1211,10 +1210,10 @@ Plane Backend::emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref 
     llvm::Value* k    = b_.CreateLoad(b_.getInt64Ty(), idx);
     const Plane  e_eq = lower_agg_eq(
       container_elem_lvalue(ha, ba, type, e, k), container_elem_lvalue(hb, bb, type, e, k), e.elem_type);
-    const Plane acc =
-      lower_logical(Inst::Tag::Land, bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may)), e_eq);
-    b_.CreateStore(b_.CreateTrunc(must_of(acc), i1), must);
-    b_.CreateStore(b_.CreateTrunc(may_of(acc), i1), may);
+    const Plane acc = lower_logical(Inst::Tag::Land, bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may)), true,
+                                    e_eq, agg_eq_four(e.elem_type));
+    b_.CreateStore(b_.CreateTrunc(must_of(acc, true), i1), must);
+    b_.CreateStore(b_.CreateTrunc(may_of(acc, true), i1), may);
     b_.CreateStore(b_.CreateAdd(k, b_.getInt64(1)), idx);
     b_.CreateBr(head);
 

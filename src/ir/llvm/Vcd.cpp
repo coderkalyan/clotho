@@ -264,7 +264,7 @@ void Backend::lower_dump_file(Index i) {
         const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
         path                  = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "dumpfile.path");
         len                   = b_.getInt32(fbytes);
-        b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        b_.CreateAlignedStore(must_of(fname), path, llvm::Align(1));
     }
     b_.CreateCall(vcd_open_fn(), { path, len, b_.getInt32(fwd) });
 }
@@ -273,7 +273,7 @@ void Backend::lower_dump_file(Index i) {
 // value; its known bits are widened to the runtime's 64-bit byte count.
 void Backend::lower_dump_limit(Index i) {
     const Index n = ir_->payload(i).unary;
-    b_.CreateCall(vcd_limit_fn(), { cast(must_of(value_of(n)), 64, false) });
+    b_.CreateCall(vcd_limit_fn(), { cast(must_of(n), 64, false) });
 }
 
 // $dumpvars (whole-design form): walk the design scope tree, registering every
@@ -387,7 +387,7 @@ void Backend::emit_vcd_var(Signal sig) {
     }
     // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow,
     // real; the event bit is set on the branch above.
-    const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u)
+    const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (!s.four_state ? 4u : 0u)
                          | (s.is_real ? 8u : 0u);
     llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");
     llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));

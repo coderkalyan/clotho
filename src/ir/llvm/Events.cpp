@@ -25,7 +25,7 @@ namespace clotho::ir::backend {
 // resumed in that slot's Reactive region -- which is where LRM 4.4.2.6 puts
 // it.
 void Backend::lower_delay(Index amount) {
-    llvm::Value* ticks = cast(must_of(value_of(amount)), 64, false);
+    llvm::Value* ticks = cast(must_of(amount), 64, false);
 
     if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
         if (c->isZero()) {
@@ -195,7 +195,7 @@ void Backend::lower_wait(ExtraIndex info) {
             // `@(edge vif.sig)`: park on the member's waiter list in the
             // instance the handle names. Frame-resident, so there is no
             // capacity to size -- the bucket path could not express this at all.
-            llvm::Value* ctx = b_.CreateIntToPtr(must_of(value_of(e.inst)), raw_ptr_ty());
+            llvm::Value* ctx = b_.CreateIntToPtr(must_of(e.inst), raw_ptr_ty());
             CtxOverride  ov(*this, ctx, slot_of(e.signal).anchor);
             emit_event_link(vif_head_ptr(e.signal, e.edge), event_wait_node(ev_k++),
                             parked_handle(b_, hdl_), sched_ptr_);
@@ -203,7 +203,7 @@ void Backend::lower_wait(ExtraIndex info) {
             // An event with no signal of its own -- an array element, a class
             // property, a formal. The frontend lowered its handle just before
             // this wait, so park on whatever object it names now.
-            emit_event_link(event_obj_of(must_of(value_of(e.handle))), event_wait_node(ev_k++),
+            emit_event_link(event_obj_of(must_of(e.handle)), event_wait_node(ev_k++),
                             parked_handle(b_, hdl_), sched_ptr_);
         } else if (mod_.signal(e.signal).is_event) {
             // Resolve the variable's CURRENT handle: after `a = b`, `@(a)` must
@@ -478,7 +478,7 @@ llvm::Value* Backend::event_obj_of(llvm::Value* handle) {
 }
 
 // The 64-bit handle currently stored in an event variable's own signal slot.
-// An event signal is a narrow 2-state 64-bit plane, so this is a single load of
+// An event signal is a 2-state 64-bit plane, so this is a single load of
 // field 0 of its slot.
 llvm::Value* Backend::load_event_handle(Signal sig) {
     return b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(slot_of(sig).slot_ty,
@@ -856,10 +856,10 @@ llvm::Value* Backend::load_mm(Signal sig) {
 // signal for a plain target, or one element for an unpacked-array element.
 // Used to snapshot old / new state around a blocking store so wait-queue
 // servicing detects an element-level change, not just element 0.
-// Bit width of a slot's stored value word: iW for a narrow 2-state slot, the
-// packed i(2W) otherwise.
+// Bit width of a slot's stored value word: iW for a 2-state slot, the packed
+// i(2W) of a 4-state one.
 uint32_t Backend::slot_mm_bits(const LValue& lv) const {
-    return lv.narrow ? lv.store_width : 2 * lv.store_width;
+    return lv.four_state ? 2 * lv.store_width : lv.store_width;
 }
 
 llvm::Value* Backend::load_lv_mm(const LValue& lv) {
@@ -1044,14 +1044,14 @@ std::optional<Backend::WideWindow> Backend::wide_window_snapshot(const LValue& l
     const uint32_t W     = lv.store_width;
     const uint32_t K     = ((lv.width + 62) >> 6) + 1;
     const uint32_t nw    = (W + 63) / 64; // words of one W-bit plane
-    const uint32_t total = lv.narrow ? nw : (2 * W + 63) / 64;
+    const uint32_t total = lv.four_state ? (2 * W + 63) / 64 : nw;
     if (K > nw) {
         return std::nullopt;
     }
     WideWindow w;
     w.words     = K;
     w.width     = W;
-    w.four      = !lv.narrow;
+    w.four      = lv.four_state;
     w.need_any  = signal_has_bucket(lv.sig, Edge::Any);
     w.need_edge = signal_has_bucket(lv.sig, Edge::Positive) || signal_has_bucket(lv.sig, Edge::Negative);
 
@@ -1223,12 +1223,12 @@ void Backend::service_change_notify(const LValue& lv,
                                     llvm::Value*  new_z) {
     const ChangeNotify& cn   = *lv.chg;
     const auto          have = [&](Edge e) { return cn.field[static_cast<uint32_t>(e)] != kNoNotify; };
-    // `!narrow` is exactly "the mm word is the packed must|may pair", which is what
+    // `four_state` is "the mm word is the packed must|may pair", which is what
     // emit_edge_facts means by four_state (slot_mm_bits reads the same flag).
     const EdgeFacts                                    f         = emit_edge_facts(old_mm,
                                                                                    new_mm,
                                                                                    lv.store_width,
-                                                                                   !lv.narrow,
+                                                                                   lv.four_state,
                                                                                    old_z,
                                                                                    new_z,
                                                                                    have(Edge::Positive),
@@ -1724,7 +1724,7 @@ llvm::Value* Backend::next_static_event_node() {
 Plane Backend::lower_event_triggered(llvm::Value* obj) {
     llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_field(obj, kEventTrig));
     llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
-    return { b_.CreateICmpEQ(stamp, now), nullptr, true };
+    return two_val(b_.CreateICmpEQ(stamp, now));
 }
 
 // Compacting removal of this coroutine's entries from one (signal, edge)

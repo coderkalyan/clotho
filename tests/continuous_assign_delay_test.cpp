@@ -221,3 +221,43 @@ TEST_CASE("inertial CA delay: a wide multiply-driven net is supported") {
         endmodule)";
     CHECK(run_capture_finish(src) == "t=1 y=xxxxxxxxxxx\nt=7 y=001ffffffff\n");
 }
+
+// LRM 28.16 (reached from 10.3.3): "When one delay value is given, then this value shall be
+// used for all propagation delays", so `assign #(5)` is `assign #5`; slang binds it as a
+// three-delay control with one value, which was refused as a "triple". The same lines as the
+// first test above, byte-identical to iverilog 13.
+TEST_CASE("inertial CA delay: a single value in parentheses is the same delay") {
+    for (const std::string_view spelling : { "#5", "#(5)" }) {
+        const std::string src = "module m; logic a, b, y; assign " + std::string(spelling) + " y = a | b;\n" +
+                                R"( initial begin
+                a = 0; b = 0;
+                #1 $display("t=%0t y=%b", $time, y);
+                a = 1; #2 a = 0;
+                #10 $display("t=%0t y=%b", $time, y);
+                a = 1; #2 b = 1;
+                #1 $display("t=%0t y=%b", $time, y);
+                #2 $display("t=%0t y=%b", $time, y);
+                #5 $finish;
+            end endmodule)";
+        CHECK_MESSAGE(run_capture_finish(src) == "t=1 y=x\nt=13 y=0\nt=16 y=0\nt=18 y=1\n", spelling);
+    }
+}
+
+// A real value scales as it does without the parentheses, and a delayed driver of a resolved
+// net takes the same path.
+TEST_CASE("inertial CA delay: a real single value in parentheses is scaled like the bare one") {
+    for (const std::string_view spelling : { "#1.5", "#(1.5)" }) {
+        const std::string src = "`timescale 1ns/1ps\n module m; logic a, b; wire w, r;\n assign " +
+                                std::string(spelling) + " w = a;\n assign " + std::string(spelling) +
+                                " r = a;\n assign r = b;\n"
+                                " initial begin a = 0; b = 1'bz; #1 $display(\"%0.3f w=%b r=%b\", $realtime, w, r);\n"
+                                " #1 $display(\"%0.3f w=%b r=%b\", $realtime, w, r); #1 $finish; end endmodule";
+        CHECK_MESSAGE(run_capture_finish(src) == "1.000 w=x r=x\n2.000 w=0 r=0\n", spelling);
+    }
+}
+
+// Two values are a rise and a fall delay, which stay refused.
+TEST_CASE("inertial CA delay: two values in parentheses are still rejected") {
+    const std::string err = lower_error("module m; logic a; wire w; assign #(1,2) w = a; endmodule");
+    CHECK(err.find("rise/fall/turn-off") != std::string::npos);
+}

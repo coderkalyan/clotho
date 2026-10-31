@@ -182,9 +182,15 @@ Milestones, in order; lower ones unblock higher ones:
   honour the force.
 - [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must
   be decided when the deferred update commits, but the deferred record carries no gate.
+- [ ] **Gate or switch output on a `force` target variable** (10.3, 10.6.2) — the gate's store
+  has no force gate, and 10.6.2 does not say whether a release restores a primitive output.
+- [ ] **Continuous assignment delay on a `force` target variable** (10.3.3, 10.6.2) — the
+  delayed commit has no force gate, and 10.6.2 leaves open how a release meets a pending delay.
 - [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
   bit/part-selects as the target.
 - [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
+- [ ] **`force` inside a task or function** (10.6.2) — a net force there, and a variable force
+  that no procedural block also holds, is refused: the scan reads procedural blocks only.
 
 ### Real numbers
 

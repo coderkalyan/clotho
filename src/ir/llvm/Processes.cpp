@@ -1051,13 +1051,13 @@ void Backend::lower_proc_query(Index i) {
             return;
         }
         case ProcOp::Status: {
-            llvm::Value* pcb = proc_pcb_of(must_of(value_of(args[0])), i);
+            llvm::Value* pcb = proc_pcb_of(must_of(args[0]), i);
             llvm::Value* ctl = b_.CreateLoad(i32, pcb_field(pcb, kPcbCtl));
             set_value(i, two_val(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask))));
             return;
         }
         case ProcOp::RandstateGet: {
-            llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
+            llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(args[0]), i));
             b_.CreateCall(proc_randstate_get_fn(),
                           { str_of(i), rng, alloc_site_global(loc_text(i), "string") });
             return;
@@ -1264,7 +1264,7 @@ void Backend::lower_proc_ctl(Index i) {
     const auto args = ir_->region(info.args);
     switch (info.op) {
         case ProcOp::Kill:
-            lower_proc_kill(proc_pcb_of(must_of(value_of(args[0])), i), /*with_self=*/true);
+            lower_proc_kill(proc_pcb_of(must_of(args[0]), i), /*with_self=*/true);
             return;
         case ProcOp::DisableFork:
             if (pcb_ == nullptr) {
@@ -1274,22 +1274,22 @@ void Backend::lower_proc_ctl(Index i) {
             lower_proc_kill(pcb_, /*with_self=*/false);
             return;
         case ProcOp::Suspend:
-            emit_proc_suspend(proc_pcb_of(must_of(value_of(args[0])), i));
+            emit_proc_suspend(proc_pcb_of(must_of(args[0]), i));
             return;
         case ProcOp::Resume:
-            emit_proc_resume(proc_pcb_of(must_of(value_of(args[0])), i));
+            emit_proc_resume(proc_pcb_of(must_of(args[0]), i));
             return;
         case ProcOp::Srandom: {
             // LRM 18.14: seed that thread's generator. Same splitmix64 expansion
             // `$urandom(seed)` uses, so a seed means the same thing either way.
-            llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
+            llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(args[0]), i));
             b_.CreateCall(urandom_seed_fn(),
-                          { rng, b_.CreateZExt(cast(must_of(value_of(args[1])), 32, false),
+                          { rng, b_.CreateZExt(cast(must_of(args[1]), 32, false),
                                                b_.getInt64Ty()) });
             return;
         }
         case ProcOp::RandstateSet: {
-            llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
+            llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(args[0]), i));
             llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             b_.CreateCall(proc_randstate_set_fn(),
                           { rng, str_of(args[1]),
@@ -1321,7 +1321,7 @@ void Backend::lower_proc_wait(Index i) {
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* null = llvm::ConstantPointerNull::get(ptr);
 
-    llvm::Value* pcb = proc_pcb_of(must_of(value_of(args[0])), i);
+    llvm::Value* pcb = proc_pcb_of(must_of(args[0]), i);
     // LRM 9.7: "it shall be an error to call this task on the current process".
     // Dynamic, because the handle is a value -- `process::self().await()` and a
     // handle that happens to name this thread are the same case.
