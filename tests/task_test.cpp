@@ -451,6 +451,38 @@ TEST_CASE("ref of a string aliases the actual") {
     CHECK(run_capture(src) == "hello world\n");
 }
 
+TEST_CASE("ref of a string: the instances of one module each alias their own actual") {
+    // Two instances run one lowering of the function and the task. The guard of a `ref`
+    // formal names the access it guards, so the instances' code is the same (twin mode
+    // and verify_shared_code found the guard naming a site left over from lowering
+    // another body). Oracle: LRM 13.5.2 (a ref formal is the actual itself), checked
+    // against the output of main's binary.
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic void f(ref string s);
+                s = {s, " world"};
+            endfunction
+            task automatic app(ref string a);
+                a = {a, "!"};
+            endtask
+            string t, u;
+            initial begin
+                t = "hello";
+                f(t);
+                $display("%s", t);
+                u = "hi";
+                app(u);
+                $display("%s", u);
+            end
+        endmodule
+        module top;
+            m a();
+            m b();
+        endmodule
+    )";
+    CHECK(run_capture(src) == "hello world\nhi!\nhello world\nhi!\n");
+}
+
 TEST_CASE("ref of a queue aliases the actual, mutations included") {
     constexpr std::string_view src = R"(
         module m;

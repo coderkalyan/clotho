@@ -270,6 +270,10 @@ void Backend::build_str_temps() {
         if (ir_->tag(i) == Inst::Tag::Concat && k + 2 < ir_->inst_count() &&
             forwarded_string_store(static_cast<Index>(k + 2))) {
             const Inst::Payload& lp = ir_->payload(static_cast<Index>(k + 1));
+            // Resolving a ref formal guards the dereference, and the guard names the
+            // access it guards: the Local at k + 1, not whatever instruction an earlier
+            // body left in cur_inst_ (a different site in each lowering of one body).
+            cur_inst_ = static_cast<Index>(k + 1);
             const LValue lv = ir_->tag(static_cast<Index>(k + 1)) == Inst::Tag::Signal
                                 ? signal_lvalue(lp.signal)
                                 : local_lvalue(lp.local.index);
