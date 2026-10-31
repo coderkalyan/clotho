@@ -233,7 +233,7 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
         site.pool.push_back(std::make_unique<unsigned char[]>(stride));
         p = site.pool.back().get();
     }
-    // Stamp arm order so the commit applies same-instant updates last-executed-wins.
+    // Stamp arm order: it orders the records of one release batch (intra_ready_push).
     reinterpret_cast<rt_intra_rec*>(p)->seq = intra_seq++;
     return p;
 }

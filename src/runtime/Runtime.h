@@ -1987,8 +1987,9 @@ int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 // the backend's value tail follows. `timer` is the wheel node (offset 0, so the
 // record base doubles as the rt_timer*, used by the `#d` delay path); `idx`
 // routes the record to its target site; `seq` is a monotonic arm-order stamp (set
-// by rt_intra_alloc) so same-instant commits apply in statement-execution order
-// (LRM 10.4.2, last-executed wins), which fire order does not preserve; `count`
+// by rt_intra_alloc) that orders the records of one release batch -- those created at
+// one moment -- in statement-execution order (LRM 4.6 b), 10.4.2 Examples 4 and 6),
+// which fire order does not preserve; `count`
 // is the event countdown for the `@e` / `repeat(N) @e` path (unused by `#d`).
 typedef struct rt_intra_rec {
     rt_timer timer;

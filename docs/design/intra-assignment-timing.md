@@ -175,8 +175,9 @@ the freelist, the per-signal ready lists, and the pending counter.
 // Runtime-owned record header the backend places at offset 0 of every record.
 // timer: wheel node (offset 0, so the record base is the rt_timer*). idx: target
 // signal's dense intra-NBA id. seq: monotonic arm-order stamp (set by
-// rt_intra_alloc) so same-instant commits apply last-executed-wins (LRM 10.4.2),
-// which the wheel's per-tick fire order does not preserve. The backend's value
+// rt_intra_alloc) that orders the records of one release batch -- those created at one
+// moment -- by statement execution (LRM 4.6 b), 10.4.2), which the wheel's per-tick fire
+// order does not preserve. The backend's value
 // tail (mm [+ z]) follows the header.
 typedef struct rt_intra_rec { rt_timer timer; uint32_t idx; uint32_t seq; } rt_intra_rec;
 
