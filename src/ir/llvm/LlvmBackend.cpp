@@ -139,13 +139,13 @@ void clamp_unproven_align(llvm::Module& m) {
 // non-canonical IR. Returns false (reason on errs()) only if the pipeline
 // string is rejected. Exposed (not file-local) so Jit.cpp can run it per
 // module after a bitcode context migration (parallel compilation).
-bool optimize_module(llvm::Module& m, const SimulationConfig& config) {
+bool optimize_module(llvm::Module& m, bool o3) {
     // The runtime's own functions the module calls come in first, so the pipeline
     // inlines them and folds what they are called with. A queue that is only pushed
     // and popped inline can leave its descriptor, and the kernels it points at, with
     // no reader, which tier 0 does not sweep on its own, so it ends with a global DCE
     // exactly when something was linked.
-    const bool linked = config.rt_bitcode && link_runtime_bitcode(m);
+    const bool linked = link_runtime_bitcode(m);
 
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
@@ -159,7 +159,7 @@ bool optimize_module(llvm::Module& m, const SimulationConfig& config) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::ModulePassManager mpm;
-    if (config.o3) {
+    if (o3) {
         // Aggressive tier: LLVM's full default<O3> pipeline, which contains
         // the mandatory coro passes (CoroEarly / CoroSplit in the CGSCC nest /
         // CoroCleanup) plus the loop/GVN/vectorizer stack tier 0 omits.
@@ -245,7 +245,7 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
     // Lower the coroutines per module and verify again — the second pass
     // guards against malformed coro lowering.
     for (const auto& mod : built.modules) {
-        if (!optimize_module(*mod, config)) {
+        if (!optimize_module(*mod, config.o3)) {
             return {};
         }
         if (llvm::verifyModule(*mod, &llvm::errs())) {

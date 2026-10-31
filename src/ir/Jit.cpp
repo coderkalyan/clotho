@@ -663,7 +663,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
                     fail("jit: parallel module reload failed: " + llvm::toString(parsed.takeError()));
                     return;
                 }
-                if (!optimize_module(**parsed, config)) {
+                if (!optimize_module(**parsed, config.o3)) {
                     fail("jit: parallel module optimize failed");
                     return;
                 }
@@ -718,7 +718,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     } else {
         llvm::orc::ThreadSafeContext tsc(std::move(ctx));
         for (auto& mod : built.modules) {
-            if (!optimize_module(*mod, config)) {
+            if (!optimize_module(*mod, config.o3)) {
                 llvm::errs() << "jit: module optimize failed\n";
                 return -1;
             }

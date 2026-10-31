@@ -27,7 +27,7 @@ namespace {
 // where noted: iverilog's 2-state queue support crashes and its `int` queue is
 // internally 4-state, so empty/out-of-range defaults use a 4-state (`logic`)
 // element for the oracle and a separate 2-state check for the LRM default.
-std::string run_capture(std::string_view source, const ir::SimulationConfig& config = {}) {
+std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
@@ -39,7 +39,7 @@ std::string run_capture(std::string_view source, const ir::SimulationConfig& con
     const int saved = dup(fileno(stdout));
     dup2(fileno(tmp), fileno(stdout));
 
-    ir::run_jit(*r.module, nullptr, config);
+    ir::run_jit(*r.module);
 
     std::fflush(stdout);
     dup2(saved, fileno(stdout));
@@ -66,13 +66,13 @@ void expect_fail(std::string_view source, std::string_view needle) {
 }
 
 // The optimized LLVM IR of `source`.
-std::string emit_ir(std::string_view source, const ir::SimulationConfig& config = {}) {
+std::string emit_ir(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*r.module, os, config));
+    REQUIRE(ir::emit_llvm(*r.module, os));
     return text;
 }
 
@@ -2139,8 +2139,9 @@ TEST_CASE("a signed narrow or very wide index into a queue is compared at its ow
 // descriptor and left out of line, and an element that owns heap is copied and
 // destroyed by kernels the backend generates, called directly. Without the bitcode a
 // design calls the runtime's own functions, which are the same code over the same
-// kernels, so these cases look at the IR both ways, and the A/B case holds the two
-// to the same results on every element shape the descriptor has.
+// kernels, so these cases look at the IR both ways; what the queue computes is held
+// to the output main printed before the engine moved, on every element shape the
+// descriptor has.
 
 namespace {
 
@@ -2253,13 +2254,6 @@ TEST_CASE("every queue element shape computes what it did before the engine was 
           "changed-after-the-copy last-2-heap-heap-heap-heap-heap-heap\n"
           "qq 3 3 3\n"
           "e 2\n");
-}
-
-TEST_CASE("the runtime bitcode gate changes no queue result") {
-    const std::string on  = run_capture(kShapesSource, { .rt_bitcode = true });
-    const std::string off = run_capture(kShapesSource, { .rt_bitcode = false });
-    CHECK(!on.empty());
-    CHECK(on == off);
 }
 
 TEST_CASE("push and pop are inlined and growing or truncating the ring is a call") {

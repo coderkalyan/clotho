@@ -425,7 +425,6 @@ TEST_CASE("cli: --help-all lists every option, tagged with the commands that tak
     const std::vector<std::string> developer = listed_options(all.out.substr(dev_at, source_at - dev_at));
     CHECK(developer == std::vector<std::string>{ "--stat",
                                                  "--gc-stress",
-                                                 "--no-rt-bitcode",
                                                  "--gc-nursery",
                                                  "--gc-heap-max",
                                                  "--gc-full-every",
