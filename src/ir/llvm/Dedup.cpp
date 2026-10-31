@@ -266,14 +266,10 @@ void Backend::report_dedup_shapes(const std::vector<llvm::Function*>& group_fns)
 // lowered for (a function copy only it calls, its name, a covergroup index, a
 // disable target, another instance's nonblocking staging, a process-local
 // stream or control block). Those are counted by what stopped sharing. A group
-// of no instance has no unit to share in and is counted apart.
+// of no instance has no unit to share in and is counted apart. The functions
+// and tasks are counted the same way on a line of their own: per unit and per
+// instance, with the functions emitted for them.
 void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
-    ankerl::unordered_dense::map<uint32_t, uint32_t> instances;
-    for (const Anchor& a : anchors_) {
-        if (a.unit != InstanceScope::no_unit) {
-            ++instances[a.unit];
-        }
-    }
     ankerl::unordered_dense::set<uint64_t>            unit_groups;
     ankerl::unordered_dense::set<llvm::Function*>     emitted;
     uint64_t                                          instance_groups = 0, coroutines = 0, unanchored = 0;
@@ -284,7 +280,7 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
             continue;
         }
         const uint32_t unit = anchors_[aid].unit;
-        if (unit == InstanceScope::no_unit || instances[unit] < 2) {
+        if (unit == InstanceScope::no_unit || unit_instances_.at(unit) < 2) {
             continue;
         }
         unit_groups.insert((static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]);
@@ -310,12 +306,41 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
                  (unsigned long long)unit_groups.size(), (unsigned long long)instance_groups,
                  (unsigned long long)emitted.size(), (unsigned long long)coroutines, (unsigned long long)shared,
                  (unsigned long long)rows, (unsigned long long)unanchored, why.c_str());
+
+    ankerl::unordered_dense::set<uint64_t>        unit_subs;
+    ankerl::unordered_dense::set<llvm::Function*> emitted_subs;
+    uint64_t                                      instance_subs = 0, tasks = 0;
+    for (uint32_t f = 0; f < subroutine_home_.size(); ++f) {
+        const SubroutineHome home = subroutine_home_[f];
+        const Function&      fu   = mod_.function(static_cast<FunctionId>(f));
+        if (home.anchor == SignalSlot::no_anchor || fu.is_dpi || unit_instances_.at(anchors_[home.anchor].unit) < 2) {
+            continue;
+        }
+        unit_subs.insert((static_cast<uint64_t>(anchors_[home.anchor].unit) << 32) | home.ordinal);
+        emitted_subs.insert(fn_decls_[f]);
+        ++instance_subs;
+        tasks += fu.is_task ? 1 : 0;
+    }
+    std::string why_subs;
+    for (const auto& [reason, n] : unshared_subroutines_) {
+        why_subs += std::format("\n  {} subroutines lowered per instance: {}", n, reason);
+    }
+    std::fprintf(stderr,
+                 "unit-code: %llu subroutines of multi-instance units over %llu instances' subroutines, %llu "
+                 "functions emitted (%llu of the subroutines are tasks)%s\n",
+                 (unsigned long long)unit_subs.size(), (unsigned long long)instance_subs,
+                 (unsigned long long)emitted_subs.size(), (unsigned long long)tasks, why_subs.c_str());
     if (config_.verify_shared_code) {
         std::fprintf(stderr,
                      "unit-code: %llu shared groups lowered again for their own instance and compared with "
                      "the code they share, %lld ms\n",
                      (unsigned long long)verified_groups_,
                      (long long)std::chrono::duration_cast<std::chrono::milliseconds>(verify_time_).count());
+        std::fprintf(stderr,
+                     "unit-code: %llu shared subroutines lowered again for their own instance and compared with "
+                     "the code they share, %lld ms\n",
+                     (unsigned long long)verified_subroutines_,
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(verify_subroutine_time_).count());
     }
 }
 
@@ -437,6 +462,79 @@ void Backend::verify_shared_group(uint32_t g, SharedGroup& rep) {
                                     unit, a.name, group_unit_ordinal_[g], at, anchors_[group_unit_anchor_[rep.g]].name,
                                     a.name, differs),
                         first.span };
+}
+
+// Lower subroutine `f` again, for its own instance and into a scratch module as
+// it would have been without sharing, and check it is the function `rep` shares
+// with it: the same printed code (CodeText), with nothing of its instance
+// baked in (a taint). The declaration it lowers into is a scratch one, and
+// everything the lowering marked in its instance's record is put back, so the
+// emitted modules are the same with the check on and off.
+void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
+    const auto           started = std::chrono::steady_clock::now();
+    const auto           id      = static_cast<FunctionId>(f);
+    const SubroutineHome home    = subroutine_home_[f];
+    Anchor&              a       = anchors_[home.anchor];
+    llvm::Module& scratch = *verify_modules_.emplace_back(std::make_unique<llvm::Module>("clotho.verify", ctx_));
+    scratch.setTargetTriple(root_env_->llmod.getTargetTriple());
+    scratch.setDataLayout(root_env_->llmod.getDataLayout());
+    ModuleEnv* const           real_env  = env_;
+    llvm::Function* const      real_decl = fn_decls_[f];
+    const std::vector<uint8_t> bound     = a.bind_used;
+    const std::vector<uint8_t> fbound    = a.fbind_used;
+    env_                                 = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
+    verifying_                           = true;
+    share_active_                        = true;
+    taint_why_                           = nullptr;
+    fn_decls_[f]                         = declare_function(id);
+    lower_subroutine(id);
+    llvm::Function* const own_fn = fn_decls_[f];
+    const char* const     taint  = std::exchange(taint_why_, nullptr);
+    fn_decls_[f]                 = real_decl;
+    verifying_                   = false;
+    share_active_                = false;
+    env_                         = real_env;
+    a.bind_used                  = bound;
+    a.fbind_used                 = fbound;
+
+    std::string differs;
+    if (taint != nullptr) {
+        differs += std::format("  lowered for itself, the subroutine bakes something of its instance: {}\n", taint);
+    }
+    // The shared function may have been promoted to external linkage by a caller
+    // in another module since; compared at the linkage it was declared with.
+    const llvm::GlobalValue::LinkageTypes linkage = rep.fn->getLinkage();
+    rep.fn->setLinkage(own_fn->getLinkage());
+    if (rep.text.empty()) {
+        rep.text = CodeText(rep.fn).joined();
+    }
+    const CodeText own_text(own_fn);
+    if (own_text.joined() != rep.text) {
+        differs += "  " + CodeText::difference(CodeText(rep.fn), own_text);
+    }
+    rep.fn->setLinkage(linkage);
+    ++verified_subroutines_;
+    verify_subroutine_time_ += std::chrono::steady_clock::now() - started;
+    if (differs.empty()) {
+        return;
+    }
+    const Function& fu   = mod_.function(id);
+    std::string     unit = a.ty->getName().str();
+    if (unit.ends_with(".state")) {
+        unit.resize(unit.size() - 6);
+    }
+    std::string at;
+    if (resolve_ && fu.span.valid()) {
+        at = " (" + resolve_(fu.span).where + ")";
+    }
+    throw BackendError{ std::format("internal: the code shared by the instances of unit '{}' is not what instance '{}' "
+                                    "lowers for itself\n  {} '{}'{}, lowered once for '{}' and run by '{}' too\n{}"
+                                    "  a fact of one instance is baked into code the others run: move it into the "
+                                    "instance record, add it to the family key (Backend::subroutine_key), or taint "
+                                    "the lowering (Backend::taint)",
+                                    unit, a.name, fu.is_task ? "task" : "function", fu.name, at,
+                                    anchors_[subroutine_home_[rep.f].anchor].name, a.name, differs),
+                        fu.span };
 }
 
 void Backend::report_finish_stat() const {

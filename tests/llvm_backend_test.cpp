@@ -5724,6 +5724,133 @@ TEST_CASE("a fork child of a task in a twin instance runs on its own instance") 
     )") == "top.a total 3\ntop.b total 30\n");
 }
 
+// The twins below are one specialization each (the same body, ports apart), so
+// their code is compiled once and each instance runs it with its own record.
+// Which instance a call lands in is data the record holds, never code.
+
+TEST_CASE("twin callers of one instance's subroutines each call into it") {
+    // Both drivers run one body and call `top.m` by name: its record is the
+    // callee's, whichever driver's code makes the call.
+    CHECK(run_capture(R"(
+        module mon;
+            int log_n;
+            int log_sum;
+            task automatic log(input int who, input int v);
+                log_n++;
+                log_sum += who * 100 + v;
+                #1;
+            endtask
+            function int total();
+                return log_sum;
+            endfunction
+        endmodule
+        module drv (input int id, input int v);
+            initial begin
+                #1; #(id * 10);
+                top.m.log(id, v);
+                top.m.log(id, v + 1);
+                $display("drv %0d sees %0d", id, top.m.total());
+            end
+        endmodule
+        module top;
+            mon m ();
+            drv d0 (.id(1), .v(10));
+            drv d1 (.id(2), .v(20));
+            initial #50 $display("n=%0d sum=%0d", m.log_n, m.log_sum);
+        endmodule
+    )") == "drv 1 sees 221\ndrv 2 sees 662\nn=4 sum=662\n");
+}
+
+TEST_CASE("twin modules calling their interface instance's subroutines share them") {
+    // The interface instances are twins and so are the modules that drive them:
+    // one `put` and one `get`, and one driver body, run against the record each
+    // instance passes. The static of `put` is its instance's.
+    CHECK(run_capture(R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+            function int get();
+                return last;
+            endfunction
+        endinterface
+        module drv (bus_if b, input int k);
+            initial begin
+                #1; #(k);
+                b.put(10 * k);
+                b.put(20 * k);
+                $display("drv %0d last %0d get %0d", k, b.last, b.get());
+            end
+        endmodule
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            drv d0 (b0, 1);
+            drv d1 (b1, 2);
+            initial #20 $display("%0d %0d", b0.last, b1.last);
+        endmodule
+    )") == "drv 1 last 122 get 122\ndrv 2 last 142 get 142\n122 142\n");
+}
+
+TEST_CASE("fork children of one task body run on the twin that forked them") {
+    // The children, the task that forks them and the process that calls it are
+    // one body for both instances: each child adds to its own instance's total,
+    // scaled by that instance's port.
+    CHECK(run_capture(R"(
+        module m (input int k);
+            int total;
+            int res;
+            task automatic add(int v);
+                #1 total += v * k;
+            endtask
+            task automatic run(output int r);
+                fork
+                    add(1);
+                    add(2);
+                    begin #5 add(3); end
+                join_none
+                #10;
+                r = total;
+            endtask
+            initial begin #1; #(k); run(res); end
+        endmodule
+        module top;
+            m a (.k(1));
+            m b (.k(10));
+            initial begin #30; $display("%0d %0d", a.res, b.res); end
+        endmodule
+    )") == "6 60\n");
+}
+
+TEST_CASE("a resolved net's fold, forced and released, is one function for twin instances") {
+    // The fold of a forceable net is a function of its instance that `release`
+    // reaches too. Twins share it: each folds its own drivers (the second pair
+    // conflicts, so its fold keeps x bits) and its own force value.
+    CHECK(run_capture(R"(
+        module m (input logic [3:0] a, input logic [3:0] b, input logic [3:0] f, input int id);
+            wire [3:0] w;
+            assign w = a;
+            assign w = b;
+            initial begin
+                #1; #(id);
+                $display("%0d %b", id, w);
+                force w = f;
+                #1 $display("%0d forced %b", id, w);
+                release w;
+                #1 $display("%0d released %b", id, w);
+            end
+        endmodule
+        module top;
+            m x (.a(4'd3), .b(4'bzzzz), .f(4'd9), .id(1));
+            m y (.a(4'd5), .b(4'd6), .f(4'd2), .id(10));
+            initial #30 $finish;
+        endmodule
+    )") == "1 0011\n1 forced 1001\n1 released 0011\n10 01xx\n10 forced 0010\n10 released 01xx\n");
+}
+
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     // Dispatch picks the body at run time, so the caller cannot know which override
     // it reaches: every override of a slot takes the same parameter list, with no

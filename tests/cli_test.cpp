@@ -645,6 +645,145 @@ TEST_CASE("cli: --stat=unit-code shows the groups of twin instances that use eve
     CHECK(!contains(r.err, "lowered per instance"));
 }
 
+TEST_CASE("cli: --stat=unit-code counts the functions and tasks twin instances share") {
+    // Two interface instances and two modules driving them, one body each: the
+    // interface's task and function are two functions however many instances
+    // there are, and so is the driver's code, which calls them into the
+    // record of the interface instance its port names.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+            function int get();
+                return last;
+            endfunction
+        endinterface
+        module drv (bus_if b, input int k);
+            initial begin
+                #1; #(k);
+                b.put(10 * k);
+                b.put(20 * k);
+                $display("drv %0d last %0d get %0d", k, b.last, b.get());
+            end
+        endmodule
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            drv d0 (b0, 1);
+            drv d1 (b1, 2);
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "2 groups of multi-instance units over 4 instances' groups, 2 functions emitted"));
+    CHECK(contains(r.err, "2 subroutines of multi-instance units over 4 instances' subroutines, 2 functions emitted "
+                          "(2 of the subroutines are tasks)"));
+    CHECK(!contains(r.err, "lowered per instance"));
+    if (clotho::ir::SimulationConfig{}.verify_shared_code) {
+        CHECK(contains(r.err, "2 shared subroutines lowered again for their own instance and compared with the code "
+                              "they share"));
+    }
+}
+
+TEST_CASE("cli: --stat=unit-code shows twins calling into one instance sharing their groups") {
+    // The driver's body names the monitor instance's task and function: a call
+    // into another instance is its record, held in the driver's own, so the
+    // callee being a function of one instance does not keep the twin drivers
+    // apart.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module mon;
+            int log_n;
+            task automatic log(input int who);
+                log_n += who;
+                #1;
+            endtask
+            function int total();
+                return log_n;
+            endfunction
+        endmodule
+        module drv (input int id);
+            initial begin
+                #1;
+                top.m.log(id);
+                $display("drv %0d sees %0d", id, top.m.total());
+            end
+        endmodule
+        module top;
+            mon m ();
+            drv d0 (.id(1));
+            drv d1 (.id(2));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 groups of multi-instance units over 2 instances' groups, 1 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
+TEST_CASE("cli: --stat=unit-code shows the fold of a forceable net shared by twin instances") {
+    // A forceable net folds its drivers in a function of its instance, which
+    // twin instances used to keep their groups apart by.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module m (input logic [3:0] a, input logic [3:0] b, input logic [3:0] f);
+            wire [3:0] w;
+            assign w = a;
+            assign w = b;
+            initial begin
+                #1 force w = f;
+                #1 release w;
+            end
+        endmodule
+        module top;
+            m x (.a(4'd3), .b(4'bzzzz), .f(4'd9));
+            m y (.a(4'd5), .b(4'd6), .f(4'd2));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 subroutines of multi-instance units over 2 instances' subroutines, 1 functions emitted"));
+    CHECK(!contains(r.err, "lowered per instance"));
+}
+
+TEST_CASE("cli: --stat=unit-code names what keeps a subroutine per instance") {
+    // `hello` reads its instance's name, which is the instance's own: it is
+    // lowered per instance, and so is the code that calls it. `twice` shares.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf (input int k);
+            int n;
+            task automatic hello();
+                $display("hello from %m %0d", n);
+                n++;
+            endtask
+            function int twice(int x);
+                return 2 * x + k;
+            endfunction
+            initial begin
+                #1;
+                hello();
+                $display("%0d", twice(3));
+            end
+        endmodule
+        module top;
+            leaf u0 (.k(1));
+            leaf u1 (.k(2));
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "2 subroutines of multi-instance units over 4 instances' subroutines, 3 functions emitted "
+                          "(2 of the subroutines are tasks)"));
+    CHECK(contains(r.err, "2 subroutines lowered per instance: reads the name of its instance"));
+    CHECK(contains(r.err, "2 groups lowered per instance: calls a function copy of its instance"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

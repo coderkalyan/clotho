@@ -2107,17 +2107,64 @@ private:
     // -- Code once --
 
     // The code of a unit's group is lowered once, from the first instance whose
-    // imports are alike, and every instance runs it with its own record.
-    // Lowering that bakes something of the instance it is lowered for (a symbol
-    // of its storage, a function copy only it calls, its name, a covergroup
-    // index) cannot be shared: it taints the lowering, and the instances lower
-    // their own. `taint` is a no-op outside a shared lowering.
+    // imports are alike, and every instance runs it with its own record; the
+    // functions and tasks of a unit are lowered once too (below). Lowering that
+    // bakes something of the instance it is lowered for (a symbol of its
+    // storage, a function copy only it calls, its name, a covergroup index)
+    // cannot be shared: it taints the lowering, and the instances lower their
+    // own. `taint` is a no-op outside a shared lowering.
     void taint(const char* why);
 
-    // What decides the code of the groups of the instance of `anchor`: the
-    // owner and position of every signal its bindings name, and which of them
-    // alias. Instances with equal keys lower alike.
+    // What decides the code of the groups and subroutines of the instance of
+    // `anchor`: the owner and position of every signal its bindings name, and
+    // which of them alias. Instances with equal keys lower alike.
     std::vector<uint64_t> code_key(uint32_t anchor) const;
+
+    // What decides whether group `g` of the instance of `anchor` lowers like the
+    // same group of another instance: its code key, and the functions the group
+    // names, as declared. A function is the one declaration to every instance
+    // of its family and another to an instance outside it, so instances whose
+    // calls land in different functions lower differently.
+    std::vector<uint64_t> group_key(uint32_t g, uint32_t anchor) const;
+
+    // -- Subroutines once --
+    //
+    // The functions and tasks of one unit's instances that lower alike are a
+    // family: the code is lowered once, for the first of them, into the unit's
+    // module, and every instance's subroutine is that function, called with the
+    // record of the instance it belongs to. What decides a family is
+    // `subroutine_key`; a subroutine whose key matches no earlier one starts a
+    // family, and one whose lowering bakes something of its instance (a taint)
+    // stays its own. A caller's key names the functions it calls as they were
+    // settled, so subroutines are lowered callees first (`plan_subroutines`: the
+    // order of the call graph's strongly connected components); a cycle of
+    // subroutines is never shared.
+
+    // Every function `ir` names directly: its call, task enable and fork edges,
+    // and the bodies it hands to the Postponed, Reactive and monitor machinery.
+    static void direct_callees(const Ir& ir, std::vector<FunctionId>& out);
+
+    // Where each function belongs (subroutine_home_), how many instances each
+    // unit has, and the order the functions are lowered in.
+    void plan_subroutines();
+
+    // The module a function is emitted into: its unit's, else root.
+    ModuleEnv* subroutine_env(FunctionId id);
+
+    // The symbol of a function or task (`kind` is ".fn." or ".task."): its
+    // instance's name and its own, made unique across every module.
+    std::string subroutine_symbol(const Function& f, std::string_view kind);
+
+    // What decides the code of subroutine `f`: its unit and ordinal, the code
+    // key of its instance, what the design says of it (home region, random
+    // stream, program exit) and the functions it calls as declared, with
+    // whether each may finish.
+    std::vector<uint64_t> subroutine_key(uint32_t f) const;
+
+    // Lower every function and task, callees first, once per family.
+    void lower_subroutines();
+
+    void lower_subroutine(FunctionId id);
 
     static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out);
 
@@ -4367,14 +4414,41 @@ private:
     std::vector<std::array<uint32_t, kIdFamilies>> id_ord_;
     std::vector<std::array<uint32_t, kIdFamilies>> id_val_;
     llvm::IRBuilder<>       b_;
-    // Set while a group is lowered for sharing (taint); why it cannot be.
+    // Set while a group or a subroutine is lowered for sharing (taint); why it
+    // cannot be.
     bool                                                 share_active_ = false;
     const char*                                          taint_why_    = nullptr;
     // Thunk groups lowered per instance after all, by what stopped sharing them.
     std::map<std::string, uint64_t>                      unshared_;
-    // Declarations of the functions that belong to an instance (flatten copies
-    // each function per instance), which a shared group cannot name.
+    // Subroutines of multi-instance units lowered per instance after all, by what
+    // stopped sharing them.
+    std::map<std::string, uint64_t>                      unshared_subroutines_;
+    // Declarations of the functions that are one instance's own in a unit of
+    // several (their family has no other member), which a shared group cannot
+    // name.
     ankerl::unordered_dense::set<const llvm::Function*> instance_fns_;
+
+    // Where a function belongs: the instance whose function it is, and its
+    // ordinal among its unit's functions. no_anchor for one of no unit.
+    struct SubroutineHome {
+        uint32_t anchor  = SignalSlot::no_anchor;
+        uint32_t ordinal = 0;
+    };
+    // By FunctionId (plan_subroutines).
+    std::vector<SubroutineHome> subroutine_home_;
+    // How many instances each Design unit has (by InstanceScope::unit).
+    ankerl::unordered_dense::map<uint32_t, uint32_t> unit_instances_;
+    // The functions, callees before callers, and the size of the call cycle each
+    // is in (1 when none).
+    std::vector<uint32_t> subroutine_order_;
+    std::vector<uint32_t> subroutine_cycle_;
+    // The symbols given to functions so far, with how many of each (a symbol is
+    // unique across every module: they all link into one).
+    ankerl::unordered_dense::map<std::string, uint32_t> subroutine_symbols_;
+    // (instance, instance whose code it runs) for every group and subroutine an
+    // instance runs that another lowered: the instance reads the bindings that
+    // code reads.
+    std::vector<std::pair<uint32_t, uint32_t>> shared_instances_;
     // The root thunk of each vtable entry that belongs to an instance, by FunctionId
     // (vtable_entry).
     ankerl::unordered_dense::map<uint32_t, llvm::Function*> vtable_thunks_;
@@ -5082,6 +5156,22 @@ private:
     // when it shares `rep`; empty when it does not.
     std::string shared_code_differs(uint32_t g, SharedGroup& rep, const OwnLowering& own);
 
+    // A subroutine lowered for sharing (lower_subroutines): the first of its
+    // family, whose function the rest of the family are.
+    struct SharedSubroutine {
+        uint32_t        f;     // the function, of the instance that lowered it
+        llvm::Function* fn;
+        const char*     taint; // why it cannot be shared, or null when it can
+        std::string     text;  // CodeText of fn, set by the first check
+    };
+    std::map<std::vector<uint64_t>, SharedSubroutine> subroutine_families_;
+
+    // `SimulationConfig::verify_shared_code`: lower subroutine `f` for its own
+    // instance, as it would have been without sharing, into a scratch module,
+    // and check it is the code `rep` shares with it. Throws a BackendError
+    // naming the difference. Leaves the backend as it found it.
+    void verify_shared_subroutine(uint32_t f, SharedSubroutine& rep);
+
     // The scratch modules the verification lowers into, kept until run() ends:
     // lowering caches instructions of the functions it builds (event_wait_node,
     // gc_mutator_cur), which a deleted function would leave dangling. While a
@@ -5092,6 +5182,8 @@ private:
     bool                                       verifying_       = false;
     uint64_t                                   verified_groups_ = 0;
     std::chrono::nanoseconds                   verify_time_{};
+    uint64_t                                   verified_subroutines_ = 0;
+    std::chrono::nanoseconds                   verify_subroutine_time_{};
 
     // Source-IR straight-line segment counter, bumped at every structured-region
     // boundary (lower_region entry/exit) and in-region suspend (Delay / Wait /

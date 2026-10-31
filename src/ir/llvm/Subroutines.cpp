@@ -807,13 +807,13 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     }
     auto* fnty = llvm::FunctionType::get(rty, params, false);
     auto* fn   = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
-                                        mod_.name + ".fn." + f.name, env_->llmod);
+                                        subroutine_symbol(f, ".fn."), env_->llmod);
     fn->addParamAttr(0, llvm::Attribute::NoAlias);
     return fn;
 }
 
 // A task is a switched-resume coroutine. Its signature is:
-//   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel, ptr proc,
+//   ptr @<instance>.task.<name>(ptr noalias record, ptr rng, ptr wheel, ptr proc,
 //                          i8 home, <per formal>, ptr record)
 // where each 2-state input formal contributes one iW and each 4-state one an
 // (i(2W) mm, iW z) pair, each output / inout formal one pointer to its caller
@@ -874,7 +874,7 @@ llvm::Function* Backend::declare_task(FunctionId id) {
     params.push_back(ptr); // record { ptr parent }
     auto* fnty = llvm::FunctionType::get(ptr, params, false);
     auto* fn   = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage,
-                                        mod_.name + ".task." + f.name, env_->llmod);
+                                        subroutine_symbol(f, ".task."), env_->llmod);
     fn->setPresplitCoroutine();
     fn->addParamAttr(0, llvm::Attribute::NoAlias);
     return fn;
@@ -924,7 +924,8 @@ llvm::Function* Backend::vtable_entry(FunctionId fid) {
 // package class and of a class an instance declares -- so a method of an instance
 // is entered through a thunk of the same signature that supplies it. The thunk is
 // root glue: the record it names is the only per-instance thing in it, and a
-// class an instance declares has that one instance.
+// class an instance declares has that one instance, whose function the thunk
+// calls in its unit's module.
 void Backend::make_vtable_entries() {
     ModuleEnv* const real_env = env_;
     env_                      = root_env_.get();
@@ -943,7 +944,7 @@ void Backend::make_vtable_entries() {
             args.push_back(&arg);
         }
         args[0]    = ensure_ctx(anchors_[anchor]);
-        auto* call = tb.CreateCall(callee->getFunctionType(), callee, args);
+        auto* call = tb.CreateCall(callee->getFunctionType(), sym(callee), args);
         if (callee->getReturnType()->isVoidTy()) {
             tb.CreateRetVoid();
         } else {

@@ -86,27 +86,23 @@ void Backend::run() {
     build_nba_state();
 
     // Functions and tasks: declare every one up front (so calls resolve,
-    // including recursion and forward references), then lower their bodies. A
-    // task is a coroutine (lower_task); a function is a plain call.
+    // including recursion and forward references), each where it is emitted,
+    // then lower their bodies callees first, once per family of instances
+    // (lower_subroutines). A task is a coroutine (lower_task); a function is a
+    // plain call.
     const size_t nf = mod_.function_count();
     fn_decls_.assign(nf, nullptr);
+    plan_subroutines();
     for (uint32_t i = 0; i < nf; ++i) {
+        env_         = subroutine_env(static_cast<FunctionId>(i));
         fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
-        if (mod_.function(static_cast<FunctionId>(i)).scope != Process::no_scope) {
-            instance_fns_.insert(fn_decls_[i]);
-        }
     }
+    env_ = root_env_.get();
     // Before any body: a vtable thunk and an export thunk name the record of an
     // instance, which main fills only if it exists by then.
     make_vtable_entries();
     reserve_export_records();
-    for (uint32_t i = 0; i < nf; ++i) {
-        if (mod_.function(static_cast<FunctionId>(i)).is_task) {
-            lower_task(static_cast<FunctionId>(i));
-        } else {
-            lower_function(static_cast<FunctionId>(i));
-        }
-    }
+    lower_subroutines();
 
     // Lower every process and seed every one at startup. An `initial` runs its
     // body once; an `always` with a sensitivity list immediately subscribes to
@@ -116,15 +112,8 @@ void Backend::run() {
     // continuous `assign`, whose RHS sensitivity is not yet inferred) still
     // runs its body just once — it does not re-trigger on input changes.
     std::vector<llvm::Function*> group_fns;
-    ankerl::unordered_dense::map<uint32_t, uint32_t> unit_instances;
-    for (const Anchor& a : anchors_) {
-        if (a.unit != InstanceScope::no_unit) {
-            ++unit_instances[a.unit];
-        }
-    }
-    std::vector<std::pair<uint32_t, uint32_t>> shares; // (instance, the instance whose code it runs)
-    // The first instance lowered for each (unit, group, code key): thunk groups
-    // of the other instances run its function with their own record.
+    // The first instance lowered for each (unit, group, key): thunk groups of the
+    // other instances run its function with their own record.
     std::map<std::tuple<uint32_t, uint32_t, std::vector<uint64_t>>, SharedGroup> once;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t ua = group_unit_anchor_[g];
@@ -136,7 +125,7 @@ void Backend::run() {
             group_fns.push_back(lower_group(groups_[g]));
             continue;
         }
-        auto key = std::make_tuple(anchors_[ua].unit, group_unit_ordinal_[g], code_key(ua));
+        auto key = std::make_tuple(anchors_[ua].unit, group_unit_ordinal_[g], group_key(g, ua));
         if (const auto it = once.find(key); it != once.end()) {
             // Another instance of the unit lowered this group already: run its
             // function with this instance's record, which needs the same
@@ -147,7 +136,7 @@ void Backend::run() {
             }
             rep.fn->addFnAttr(llvm::Attribute::NoInline);
             group_fns.push_back(rep.fn);
-            shares.emplace_back(ua, group_unit_anchor_[rep.g]);
+            shared_instances_.emplace_back(ua, group_unit_anchor_[rep.g]);
             const auto base = static_cast<uint32_t>(block_commits_.size());
             for (BlockCommit& bc : shared_blocks(rep, ua)) {
                 block_commits_.push_back(std::move(bc));
@@ -167,12 +156,12 @@ void Backend::run() {
         if (taint_why_ == nullptr) {
             once.emplace(std::move(key), SharedGroup{ g, fn, block_lo, static_cast<uint32_t>(block_commits_.size()),
                                                       fill_lo, ctx_blk_fills_.size(), {} });
-        } else if (unit_instances[anchors_[ua].unit] >= 2) {
+        } else if (unit_instances_.at(anchors_[ua].unit) >= 2) {
             ++unshared_[taint_why_];
         }
     }
     // An instance that runs another's code reads the bindings that code reads.
-    for (const auto& [ua, ra] : shares) {
+    for (const auto& [ua, ra] : shared_instances_) {
         Anchor& a = anchors_[ua];
         a.bind_used.resize(a.externs.size(), 0);
         for (size_t k = 0; k < anchors_[ra].bind_used.size(); ++k) {
@@ -343,21 +332,23 @@ void Backend::taint(const char* why) {
     }
 }
 
-// What decides the code of the groups of the instance of `anchor`, besides the
-// unit: for each binding, which declaration stands for it (declarations that
-// name one signal in one instance are one binding), and the owner definition and
-// def-local position of the signal it names, whose layout the code addresses
-// the owner's record and wake buckets by. Bindings that name the same member of
-// the same owner (a child's port) agree in every instance; a port the parent
-// binds to a net of its own choosing (an inout, a driver slot) does not. An
-// event port is keyed by its declaration alone: the code reads the event's
-// object from the handle in its storage and addresses nothing of the owner's
-// record or buckets, so instances bound to different events of their parents
-// still share.
+// What decides the code of the groups and subroutines of the instance of
+// `anchor`, besides the unit: for each binding, which declaration stands for it
+// (declarations that name one signal in one instance are one binding), and the
+// owner definition and def-local position of the signal it names, whose layout
+// the code addresses the owner's record and wake buckets by. Bindings that name
+// the same member of the same owner (a child's port) agree in every instance; a
+// port the parent binds to a net of its own choosing (an inout, a driver slot)
+// does not. An event port is keyed by its declaration alone: the code reads the
+// event's object from the handle in its storage and addresses nothing of the
+// owner's record or buckets, so instances bound to different events of their
+// parents still share. A function binding is keyed by which declaration stands
+// for it alone: the code passes the record the binding holds and names the
+// function it calls, which the callers' keys carry (group_key, subroutine_key).
 std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
     const Anchor&         a = anchors_[anchor];
     std::vector<uint64_t> key;
-    key.reserve(2 * a.externs.size());
+    key.reserve(2 * a.externs.size() + a.fn_externs.size());
     for (uint32_t k = 0; k < a.externs.size(); ++k) {
         const SignalSlot& s = slot_of(a.externs[k]);
         key.push_back(a.bind_of.at(static_cast<uint32_t>(a.externs[k])));
@@ -368,6 +359,9 @@ std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
                         ? ~uint64_t{ 0 }
                         : reinterpret_cast<uintptr_t>(anchors_[s.anchor].ctx_ty));
         key.push_back(s.path.empty() ? ~uint64_t{ 0 } : s.path.back());
+    }
+    for (const FunctionId e : a.fn_externs) {
+        key.push_back(a.fn_bind_of.at(static_cast<uint32_t>(e)));
     }
     return key;
 }
