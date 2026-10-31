@@ -914,7 +914,10 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
             fn_->addParamAttr(0, llvm::Attribute::NoAlias);
             fn_->getArg(1)->setName("wheel");
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-            b_.CreateCall(fnty, sym(entry), { ensure_ctx(a), fn_->getArg(1) });
+            // A tail call: the tier-0 code generator would otherwise keep a frame
+            // and a return for what is one jump per activation.
+            auto* call = b_.CreateCall(fnty, sym(entry), { ensure_ctx(a), fn_->getArg(1) });
+            call->setTailCallKind(llvm::CallInst::TCK_MustTail);
             b_.CreateRetVoid();
             fns[s] = fn_;
             continue;
