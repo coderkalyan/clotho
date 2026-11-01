@@ -249,6 +249,102 @@ TEST_CASE("%m of an instance names its generate blocks and its own path") {
            "top.b.g[0]\ntop.b.g[1]\ntop.b.g[1].inner\ntop.b.g[1].inner.f\ntop.b.cond\n");
 }
 
+// A named fork is a named block (LRM 9.3.4; 9.3.5 for a label before `fork`), so it
+// is a scope %m names, for each of its children, its declarations and the deferred
+// prints and action blocks inside them; an unnamed fork adds nothing. Nested forks
+// and begin blocks stack, and every instance of the module prints its own path.
+// Expected output is Icarus Verilog 13's, verified byte for byte with the delays
+// ordering what a scheduler leaves free.
+TEST_CASE("%m inside a named fork names the fork") {
+    CHECK(run_capture(R"(
+        module leaf #(parameter int D = 0);
+            logic x = 0;
+            initial begin : outer
+                #D;
+                fork : FJ $display("join %m"); join
+                fork : FA $display("join_any %m"); join_any
+                #1 fork : FN $display("join_none %m"); join_none
+                #1 fork $display("unnamed %m"); join
+                #1 fork : F1
+                    fork : F2
+                        begin : B
+                            $display("nested %m");
+                            #1 fork : F3 $display("deep %m"); join
+                        end
+                        #2 $display("in F2 %m");
+                    join
+                join
+                #1 fork : D1
+                    begin
+                        $display("sformatf %s", $sformatf("%m"));
+                        assert (x) else $display("assert %m");
+                    end
+                join
+                #1 fork : S $strobe("strobe %m"); join
+                #1 fork : M $monitor("monitor %m"); join
+            end
+            for (genvar i = 0; i < 2; i++) begin : g
+                initial #(D + 20 + i) fork : F begin : B $display("gen %m"); end join
+            end
+        endmodule
+        module top;
+            leaf #(0)   a();
+            leaf #(100) b();
+        endmodule
+    )") == "join top.a.outer.FJ\njoin_any top.a.outer.FA\njoin_none top.a.outer.FN\n"
+           "unnamed top.a.outer\nnested top.a.outer.F1.F2.B\ndeep top.a.outer.F1.F2.B.F3\n"
+           "in F2 top.a.outer.F1.F2\nsformatf top.a.outer.D1\nassert top.a.outer.D1\n"
+           "strobe top.a.outer.S\nmonitor top.a.outer.M\ngen top.a.g[0].F.B\ngen top.a.g[1].F.B\n"
+           "join top.b.outer.FJ\njoin_any top.b.outer.FA\njoin_none top.b.outer.FN\n"
+           "unnamed top.b.outer\nnested top.b.outer.F1.F2.B\ndeep top.b.outer.F1.F2.B.F3\n"
+           "in F2 top.b.outer.F1.F2\nsformatf top.b.outer.D1\nassert top.b.outer.D1\n"
+           "strobe top.b.outer.S\nmonitor top.b.outer.M\ngen top.b.g[0].F.B\ngen top.b.g[1].F.B\n");
+}
+
+// The same inside a task, a function and a class method: the fork's name follows the
+// subroutine's (LRM 21.2.1.5), and a task a child calls still names itself. Icarus
+// Verilog 13 is no oracle here (it drops the fork's name inside a task), so the LRM
+// decides; the method's own prefix is compared against its fork-free name.
+TEST_CASE("%m inside a named fork in a subroutine names the subroutine then the fork") {
+    CHECK(run_capture(R"(
+        module t;
+            task automatic tk; $display("tk %m"); endtask
+            task automatic tsk;
+                fork : TF
+                    $display("task fork %m");
+                    #1 tk();
+                join
+            endtask
+            task automatic tsk2;
+                fork : TF begin : B $display("task fork block %m"); end join
+            endtask
+            function automatic void fn;
+                fork : FF $display("function fork %m"); join_none
+            endfunction
+            class C;
+                task run;
+                    string outside;
+                    outside = $sformatf("%m");
+                    fork : CF
+                        $display("method fork ok=%0d", $sformatf("%m") == {outside, ".CF"});
+                    join
+                endtask
+            endclass
+            initial begin
+                C c;
+                c = new();
+                fork : F tk(); join
+                tsk();
+                tsk2();
+                fn();
+                #1;
+                c.run();
+            end
+        endmodule
+    )") == "tk t.tk\ntask fork t.tsk.TF\ntk t.tk\ntask fork block t.tsk2.TF.B\n"
+           "function fork t.fn.FF\nmethod fork ok=1\n");
+}
+
 // %m takes no argument, wherever it sits among the conversions that do.
 TEST_CASE("%m between conversions leaves their arguments alone") {
     CHECK(run_capture(R"(
