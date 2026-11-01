@@ -382,6 +382,48 @@ extern "C" void rt_divzero_report(const rt_null_site* site, uint64_t now) {
     std::fflush(stderr);
 }
 
+// ---- $fread start address outside the memory (docs/LRM_NOTES.md 55) ----
+
+extern "C" void rt_fread_range_report(const rt_null_site* site, int64_t start, int64_t decl_left,
+                                      int64_t decl_right, uint64_t now) {
+    uint32_t& hits = g_bounds_hits[reinterpret_cast<uint64_t>(site) * 2];
+    if (hits >= bounds_report_cap) {
+        return;
+    }
+    ++hits;
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+
+    std::string when;
+    append_finish_time(when, now);
+    fmt::print(stderr, label, "warning:");
+    fmt::print(stderr, head, " $fread start address {} is outside the memory range [{}:{}]", start, decl_left,
+               decl_right);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        print_snippet(snippet_text(site->line), site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } }, loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " nothing was read and the result is 0, at {}", when);
+    fmt::print(stderr, "\n");
+    if (hits == bounds_report_cap) {
+        fmt::print(stderr, tag, "  note:");
+        fmt::print(stderr, body, " further reports from this call are suppressed");
+        fmt::print(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
 // ---- Null class-handle dereference (LRM 8.4) ----
 
 extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {

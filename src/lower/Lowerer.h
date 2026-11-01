@@ -3803,6 +3803,8 @@ private:
 
     ir::Index lower_string_arg(const Expression& expr, ir::Builder& b);
 
+    ir::Index lower_address_arg(const Expression& expr, ir::Builder& b);
+
     std::vector<char> scan_conversion_chars(std::string_view fmt);
 
     ir::Index lower_scanf(const CallExpression& call, bool is_sscanf, ir::Builder& b, ir::SourceLoc l);

@@ -430,12 +430,13 @@ llvm::FunctionCallee Backend::readmem_fn() {
 }
 
 // i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
-//              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags)
+//              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags,
+//              ptr site, i64 now)
 llvm::FunctionCallee Backend::fread_fn() {
     auto* ptr = raw_ptr_ty();
     auto* i32 = b_.getInt32Ty();
     auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_fread", i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32 });
+    return rt_fn("rt_fread", i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32, ptr, i64 });
 }
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --

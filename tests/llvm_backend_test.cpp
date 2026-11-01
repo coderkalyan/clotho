@@ -4146,6 +4146,113 @@ TEST_CASE("$fread with start and count into a memory") {
     std::remove(path);
 }
 
+// LRM 21.3.4.4 says only that `start` is the address of the first element to load.
+// One outside the memory's declared range names no element: nothing is read, the
+// result is 0, the file position does not move and a warning is issued (LRM_NOTES
+// 55; iverilog 13 does the same). It used to wrap into the memory: start -1 on
+// mem[0:7] consumed 8 bytes, dropped the one for address -1 and returned 8.
+TEST_CASE("$fread with a start address outside the memory reads nothing and warns") {
+    const char* path = "clotho_fread_range_test.bin";
+    write_file(path, std::string("ABCDEFGHIJ", 10));
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, a, b, c, d, e;
+            reg [7:0] up [0:7];
+            reg [7:0] down [7:0];
+            reg [7:0] off [17:10];
+            reg [15:0] wide [0:3];
+            integer k;
+            initial begin
+                for (k = 0; k < 8; k = k + 1) begin up[k] = 8'h55; down[k] = 8'h55; end
+                fd = $fopen(")") + path + R"(", "rb");
+                a = $fread(up, fd, -1);
+                b = $fread(up, fd, 8);
+                c = $fread(down, fd, -1);
+                d = $fread(off, fd, 9);
+                e = $fread(wide, fd, 4);
+                $display("%0d %0d %0d %0d %0d pos=%0d", a, b, c, d, e, $ftell(fd));
+                $display("%h %h %h %h", up[0], up[7], down[0], down[7]);
+                // The position did not move, so a legal start still reads from byte 0.
+                a = $fread(up, fd, 7);
+                $display("%0d %h %h", a, up[0], up[7]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 0 0 0 0 pos=0\n55 55 55 55\n1 55 41\n");
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.find("warning: $fread start address -1 is outside the memory range [0:7]") != std::string::npos);
+    CHECK(err.find("warning: $fread start address 8 is outside the memory range [0:7]") != std::string::npos);
+    CHECK(err.find("warning: $fread start address -1 is outside the memory range [7:0]") != std::string::npos);
+    CHECK(err.find("warning: $fread start address 9 is outside the memory range [17:10]") != std::string::npos);
+    CHECK(err.find("warning: $fread start address 4 is outside the memory range [0:3]") != std::string::npos);
+    std::remove(path);
+}
+
+// A start inside the range is an address, not an index: it counts up from the
+// lowest address whichever way the range is written, and `count` is a maximum that
+// the end of the range clips (LRM 21.3.4.4: "the maximum number of locations in mem
+// that shall be loaded"), without a warning.
+TEST_CASE("$fread start and count follow the declared address range") {
+    const char* path = "clotho_fread_addr_test.bin";
+    write_file(path, std::string("ABCDEFGH", 8));
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, a, b, c, d;
+            reg [7:0] down [7:0];
+            reg [7:0] off [17:10];
+            reg [7:0] up [0:7];
+            integer k;
+            initial begin
+                for (k = 0; k < 8; k = k + 1) begin up[k] = 0; end
+                fd = $fopen(")") + path + R"(", "rb");
+                a = $fread(down, fd, 3, 2);       // down[3] = A, down[4] = B
+                b = $fread(off, fd, 12, 3);       // off[12..14] = C D E
+                c = $fread(up, fd, 6, 5);         // only up[6], up[7] fit: F G
+                d = $fread(up, fd, 7, 0);         // count 0 loads nothing
+                $display("%0d %0d %0d %0d", a, b, c, d);
+                $display("%h %h %h %h %h %h %h", down[3], down[4], off[12], off[14], off[15], up[6], up[7]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 3 2 0\n41 42 43 45 xx 46 47\n");
+    CHECK(run_capture_stderr(src).empty());
+    std::remove(path);
+}
+
+// An x or z bit in start or count reads as 0, as iverilog 13 does: the clause says
+// nothing about it. An unsigned operand is not sign-extended: `reg [7:0] s = 200`
+// is address 200 for $fread and for $readmemh, where it used to read as -56.
+TEST_CASE("$fread and $readmem take an unsigned start as an address") {
+    const char* path = "clotho_fread_uns_test.bin";
+    write_file(path, std::string("ABCDEF", 6));
+    const char* hex = "clotho_fread_uns_test.hex";
+    write_file(hex, "aa\nbb\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, a, b, c;
+            reg [7:0] big [0:255];
+            reg [7:0] sm [0:7];
+            reg [7:0] s;
+            initial begin
+                s  = 200;
+                fd = $fopen(")") + path + R"(", "rb");
+                a  = $fread(big, fd, s, 2);
+                $readmemh(")" + hex + R"(", big, s + 8'd10);
+                $display("%0d %h %h %h %h", a, big[200], big[201], big[210], big[211]);
+                b  = $fread(sm, fd, 32'bx, 2);             // start x reads as 0
+                c  = $fread(sm, fd, 4, 32'b1x);            // count x bit reads as 0: 2
+                $display("%0d %0d %h %h %h %h %h", b, c, sm[0], sm[1], sm[2], sm[4], sm[5]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 41 42 aa bb\n2 2 43 44 xx 45 46\n");
+    std::remove(path);
+    std::remove(hex);
+}
+
 // $ftell reports the offset, $fseek repositions (operation 0 = SEEK_SET), and
 // $rewind returns to the start (LRM §21.3.5).
 TEST_CASE("$ftell / $fseek / $rewind") {

@@ -92,6 +92,15 @@ void Lowerer::lower_dumpvars(const CallExpression& call, ir::Builder& b) {
     b.dump_vars(loc(call));
 }
 
+// A $readmem start / finish address or a $fread start / count, as the 64-bit value
+// the runtime takes. The operand widens by its own signedness (LRM 11.8.3, as
+// coerce does): an unsigned `reg [7:0]` holding 200 is address 200, not -56. It
+// keeps its domain, so the backend can still see an x or z bit.
+ir::Index Lowerer::lower_address_arg(const Expression& expr, ir::Builder& b) {
+    const ir::Ref i64 = make_int_type(64, expr.type->isFourState());
+    return coerce(lower_expr(expr, b), *expr.type, i64, b, loc(expr));
+}
+
 // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
 // Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory
 // must be a whole unpacked array (a plain name or hierarchical reference); the
@@ -123,10 +132,10 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
     const bool       has_start  = args.size() >= 3;
     const bool       has_finish = args.size() >= 4;
     if (has_start) {
-        start = lower_expr(*args[2], b);
+        start = lower_address_arg(*args[2], b);
     }
     if (has_finish) {
-        finish = lower_expr(*args[3], b);
+        finish = lower_address_arg(*args[3], b);
     }
     b.read_mem(target, filename, start, finish, hex, has_start, has_finish, loc(call));
 }
@@ -1464,10 +1473,10 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             ir::Index        start     = fd; // placeholder unless present
             ir::Index        cnt       = fd;
             if (has_start) {
-                start = lower_expr(*args[2], b);
+                start = lower_address_arg(*args[2], b);
             }
             if (has_count) {
-                cnt = lower_expr(*args[3], b);
+                cnt = lower_address_arg(*args[3], b);
             }
             return b.fread_mem(fd, mem, start, cnt, has_start, has_count, l);
         }
