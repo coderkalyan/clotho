@@ -49,7 +49,7 @@ env:
   # sv-tests with the clotho runner, from the coderkalyan/sv-tests fork until
   # the runner is upstream.
   SV_TESTS_REPO: "https://github.com/coderkalyan/sv-tests.git"
-  SV_TESTS_REF: "f419de23f5893ca23c06068ca4e1dda2b6e30c0d"
+  SV_TESTS_REF: "65c83b256c591a2f054f5fe0c0fa9ed24c679718"
 
 jobs:
   plan:
