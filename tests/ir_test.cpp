@@ -232,6 +232,41 @@ TEST_CASE("build a combinational process and query it") {
     CHECK(and_ops[1] == vb);
 }
 
+// Overwrites the stack below the caller, so a payload some Builder method leaves
+// partly uninitialized takes these bytes rather than whatever zeroes were there.
+[[gnu::noinline]] static void poison_stack() {
+    volatile unsigned char junk[8192];
+    for (volatile unsigned char& c : junk) {
+        c = 0xA5;
+    }
+}
+
+// Ir::operator== compares payloads as bytes (Ir.h), so two identical bodies must
+// come out byte-identical: an instruction with no operand carries a payload of all
+// zeroes, not a zeroed 4-byte member followed by whatever the stack held.
+TEST_CASE("an instruction with no operand has an all-zero payload") {
+    Module          m;
+    const SourceLoc loc{ 1 };
+
+    poison_stack();
+    Builder     b(m);
+    const Index path = b.inst_path(loc);
+    poison_stack();
+    const Index ev = b.event_new(loc);
+    poison_stack();
+    const Index on = b.monitor_enable(true, loc);
+    poison_stack();
+    const Index off = b.monitor_enable(false, loc);
+    const Ir    ir  = b.finish();
+
+    for (const Index i : { path, ev, on, off }) {
+        uint64_t bytes = 1;
+        static_assert(sizeof(Inst::Payload) == sizeof(bytes));
+        std::memcpy(&bytes, &ir.payload(i), sizeof(bytes));
+        CHECK_MESSAGE(bytes == 0, "instruction ", static_cast<uint32_t>(i));
+    }
+}
+
 // Sequential body:  if (c) q <= 1; else q <= 0;
 TEST_CASE("structured cond carries then/else regions") {
     Module          m;

@@ -20,6 +20,13 @@ Inst::Payload pay(M Inst::Payload::* member, M value) {
     return p;
 }
 
+// The payload of an instruction with no operand: all 8 bytes zero. `Payload{}`
+// initializes only the first member (4 bytes) and leaves the rest of the union
+// whatever the stack held.
+Inst::Payload no_payload() {
+    return Inst::Payload{ .scale = 0 };
+}
+
 } // namespace
 
 ValueType Builder::type_of(Index i) {
@@ -101,11 +108,11 @@ Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
 }
 
 Index Builder::inst_path(SourceLoc loc) {
-    return emit({ Inst::Tag::InstPath, Inst::Payload{} }, loc);
+    return emit({ Inst::Tag::InstPath, no_payload() }, loc);
 }
 
 Index Builder::event_new(SourceLoc loc) {
-    return emit({ Inst::Tag::EventNew, Inst::Payload{} }, loc);
+    return emit({ Inst::Tag::EventNew, no_payload() }, loc);
 }
 
 Index Builder::event_trigger(Index handle, SourceLoc loc) {
@@ -890,7 +897,7 @@ Index Builder::monitor_emit(Index fd, std::string_view fmt, std::span<const FmtA
 }
 
 Index Builder::monitor_enable(bool on, SourceLoc loc) {
-    return emit({ on ? Inst::Tag::MonitorOn : Inst::Tag::MonitorOff, Inst::Payload{} }, loc);
+    return emit({ on ? Inst::Tag::MonitorOn : Inst::Tag::MonitorOff, no_payload() }, loc);
 }
 
 ExtraSlice Builder::add_fmt_args(std::span<const FmtArg> args, ExtraSlice& signs) {
