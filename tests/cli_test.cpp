@@ -1176,7 +1176,6 @@ TEST_CASE("cli: instances of one module share a unit when each builds a package'
     CHECK(contains(cov, "instance top.u1.pcg "));
     CHECK(contains(cov, "instance top.u2.pcg_1 "));
 }
-#endif // !defined(_WIN32)
 
 TEST_CASE("cli: --sanitize=divzero reports a 2-state divide by zero and leaves the result alone") {
     const Scratch  s;
@@ -1248,3 +1247,4 @@ endmodule
     CHECK(free_run.code == 0);
     CHECK(free_run.out == "done 1000000\n");
 }
+#endif // !defined(_WIN32)
