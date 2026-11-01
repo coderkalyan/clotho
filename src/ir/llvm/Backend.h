@@ -3951,7 +3951,8 @@ private:
     Plane lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool four);
 
     // -- Concat / Repl / stream reversal: first operand occupies the most-significant bits.
-    // Each is built from independent terms (Ops.cpp). --
+    // Replication and block reversal are built from independent terms; a concatenation from
+    // runs of a word chained and joined as a tree (Ops.cpp). --
 
     Plane lower_concat(Index i);
 
