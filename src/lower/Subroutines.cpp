@@ -1617,6 +1617,7 @@ void Lowerer::build_function(const SubroutineSymbol& sub, ir::FunctionId id) {
 
     FnCtx ctx;
     ctx.name_prefix = std::string(sub.name) + ".";
+    ctx.sym         = &sub; // names the class a method's %m passes through
     const FnScope fn_scope(*this, &ctx);
     // Stops the enclosing construction's / default-argument's `this` at the
     // call boundary, as build_task does and for the same reason (each handle is
