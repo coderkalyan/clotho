@@ -832,6 +832,15 @@ target_compile_definitions(clotho_runtime_exe PRIVATE
   CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
   CLOTHO_LICENSES_INC="${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc")
 target_link_libraries(clotho_runtime_exe PRIVATE clotho_warnings)
+# Never -O0. The executable links no C++ library, so it depends on libc++'s header-only
+# parts being inlined; at -O0 the compiler instead emits calls to the extern-template
+# members of std::string and to the aligned operator new, which only a libc++ library
+# defines, and a Debug `clotho build` failed to link every executable. Optimized, as the
+# JIT's runtime already is in Debug (above), with every check still live.
+target_compile_options(clotho_runtime_exe PRIVATE
+  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
+  $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
+)
 
 # What `clotho build` links an executable with (docs/design/executables.md): lld,
 # run in-process, and the files every executable needs, embedded in clotho so
