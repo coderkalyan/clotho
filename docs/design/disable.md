@@ -337,6 +337,16 @@ What landed instead is a claim, on the park rather than on the process:
 - **Parked on an event, or already queued.** There is no live record, and the
   scheduled flag is the design's existing one-wake-per-process token: push only if
   it is clear, exactly as `emit_static_scan_rt` does.
+- **Parked on a `#delay` whose timer has already fired.** The trampoline claims the
+  record, pushes the handle and nulls the frame slot, so from that expiry until the
+  activation runs a disabler finds no record and falls through to the flag. An event
+  wake sets the flag when it pushes and a `#0` park sets it when it parks, but a
+  `#delay` park set nothing, so a body that had never waited on an event (an `initial`
+  with only delays, a task) still had it clear: the disabler pushed a second copy and
+  the activation resumed twice, which crashed when the first run reached the end of
+  the body and doubled a loop when it did not. `emit_delay_timer` now sets the flag
+  as it arms the record, so "no record" always means "already queued". `kill` and
+  `disable fork` wake through the same code and are covered by the same store.
 
 The scheduled flag cannot serve as the token in the first case, and finding out why
 cost a real bug: mid-body that flag is deliberately SET, so the process's own
@@ -668,7 +678,10 @@ Ranked by how much damage a naive implementation does.
     (a claim on the per-arm `#delay` record; unconditional self-removal for a wait)
     and REFUSES the rest. The trap for V2b: a per-frame record cannot carry the
     claim, because the next arm overwrites the field the stale waker is about to
-    read — the record has to be per-park.
+    read — the record has to be per-park. A third window was open until the `#delay`
+    park held the scheduled flag: the timer has fired and queued the handle, the
+    activation has not run, and the disabler sees no record and a clear flag (see
+    "Aborting").
 
 ## Phased plan
 

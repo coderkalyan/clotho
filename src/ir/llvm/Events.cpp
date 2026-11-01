@@ -66,8 +66,20 @@ void Backend::lower_delay(Index amount) {
 // arm, remembered in the frame slot so a `disable` can find and claim it; the
 // wheel frees it when it eventually fires. Fresh per arm because a force-woken
 // process can carry on with its old timer still armed, so one reused record would
-// have two owners. The scheduled flag is deliberately left alone: mid-body it is
-// set so the process's own sensitivity cannot re-wake it, and that must stay true.
+// have two owners.
+//
+// The scheduled flag is held SET across this park, as a `#0` park holds it
+// (emit_zero_delay_push). The flag is what a force-wake (`disable`, `kill`,
+// `disable fork`) reads once the park record is gone: when the timer fires, the
+// trampoline pushes the handle and nulls the frame slot, and from then until the
+// activation runs, "no record" must mean "already queued". An event wake sets the
+// flag when it pushes and a `#0` park sets it when it parks, but nothing set it
+// here, so an activation that had never waited on an event (an `initial` with
+// only delays, a task) still had it clear. A force-wake landing in that window
+// pushed a second copy of the handle, and the activation was resumed twice: the
+// second resume cut its next `#delay` short, or, when the first had run the body
+// to its end, resumed a finished coroutine (a crash). A body that holds the flag
+// mid-body already (an `always` loop) is unchanged by this store.
 void Backend::emit_delay_timer(llvm::Value* ticks) {
     auto*        aw_ty = awaiter_ty();
     auto*        slot  = awaiter();
@@ -78,6 +90,9 @@ void Backend::emit_delay_timer(llvm::Value* ticks) {
         b_.CreateStore(slot, b_.CreateStructGEP(aw_ty, aw, 3));
         b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(aw_ty, aw, 4));
         b_.CreateStore(aw, slot);
+        if (sched_ptr_ != nullptr) {
+            b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
+        }
     }
     b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(aw_ty, aw, 2));
     // Schedule-relative: the runtime adds `now` so this #delay crosses the ABI
