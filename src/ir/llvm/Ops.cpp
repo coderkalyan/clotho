@@ -1970,6 +1970,208 @@ Plane Backend::lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool f
     return { b_.CreateSelect(cond_known, sel_mm, merge), b_.CreateSelect(cond_known, sel_z, zero(w)) };
 }
 
+// -- Concatenation: runs of a word, joined as independent terms --
+//
+// The result is the OR of its operands, each shifted to a constant offset of it (LRM
+// 11.4.12). It is built a plane at a time (the value, or the must and may halves of a
+// 4-state value, and the z plane) out of runs: the longest stretches of adjacent operands
+// that fit a machine word together. The operands of a run chain through one accumulator
+// the width of the run, a native shift and OR each, and the runs are joined pairwise as a
+// balanced tree of constant shifts, so no join reads more than the two runs under it.
+//
+// The alternative is one accumulator the width of the result, shifted by each operand's
+// width before the next is OR'd in: an operation of W bits for every operand, which took
+// time quadratic in W to compile. Sixteen concatenations of 512 one-bit 4-state operands
+// took 224 G instructions to compile that way and 14 G as runs; of 256 2-state operands,
+// 21 G and 3.4 G. At a word or less the accumulator is the run, and nothing is lost. A
+// term per operand, each shifted by its own offset, was measured as well and is worse:
+// the optimizer rewrites every one (tests/perf timers, 16 concatenations of 32 one-bit
+// 4-state operands, +6.6% instructions). What does pay inside a run is to join adjacent
+// operands in pairs before they join the chain: a pair is built at the narrow width of its
+// operands, and the chain has half as many steps (timers: -3%).
+
+namespace {
+
+// The widest run: one machine word.
+constexpr uint32_t concat_run_bits = 64;
+
+// A piece of a plane under construction: `w` bits held in `v`, an integer of exactly that
+// width, or all zero when `v` is null. A plane that is zero, as z is of 2-state operands,
+// costs nothing.
+struct Piece {
+    llvm::Value* v = nullptr;
+    uint32_t     w = 0;
+};
+
+// The three planes of an operand, or of a pair of them.
+struct Pieces {
+    Piece must;
+    Piece may;
+    Piece z;
+};
+
+Piece piece_of(llvm::Value* v, uint32_t w) {
+    const auto* c = llvm::dyn_cast<llvm::ConstantInt>(v);
+    return c != nullptr && c->isZero() ? Piece{ nullptr, w } : Piece{ v, w };
+}
+
+llvm::Value* widen(llvm::IRBuilder<>& b, llvm::Value* v, uint32_t to) {
+    assert(v->getType()->getIntegerBitWidth() <= to);
+    return v->getType()->getIntegerBitWidth() == to ? v : b.CreateZExt(v, b.getIntNTy(to));
+}
+
+// `hi` above `lo`, as one piece. The shifted piece cannot overflow and the two do not
+// overlap, which the optimizer would otherwise have to prove.
+Piece join_pieces(llvm::IRBuilder<>& b, Piece hi, Piece lo) {
+    const uint32_t w = hi.w + lo.w;
+    if (hi.v == nullptr) {
+        return { lo.v != nullptr ? widen(b, lo.v, w) : nullptr, w };
+    }
+    llvm::Value* top = b.CreateShl(widen(b, hi.v, w), lo.w, "", /*HasNUW=*/true);
+    return { lo.v != nullptr ? b.CreateOr(top, widen(b, lo.v, w), "", /*IsDisjoint=*/true) : top, w };
+}
+
+// One plane of a concatenation, as its runs arrive in order, most significant first.
+class ConcatPlane {
+public:
+    explicit ConcatPlane(llvm::IRBuilder<>& b)
+      : b_(b) {}
+
+    // Starts a run of `bits` bits.
+    void open(uint32_t bits) {
+        run_      = nullptr;
+        run_bits_ = bits;
+    }
+
+    // Appends `p` to the run, below what it holds so far.
+    void append(Piece p) {
+        if (run_ != nullptr) {
+            run_ = b_.CreateShl(run_, p.w, "", /*HasNUW=*/true);
+        }
+        if (p.v != nullptr) {
+            llvm::Value* low = widen(b_, p.v, run_bits_);
+            run_             = run_ != nullptr ? b_.CreateOr(run_, low, "", /*IsDisjoint=*/true) : low;
+        }
+    }
+
+    // Ends the run and joins it to the runs before it. Two of one rank, a run being rank
+    // 0, make one of the next, as a binary counter carries, which keeps the joins a
+    // balanced tree and built as soon as their operands are.
+    void close() {
+        assert(depth_ < joined_.size());
+        joined_[depth_] = Piece{ run_, run_bits_ };
+        rank_[depth_++] = 0;
+        while (depth_ >= 2 && rank_[depth_ - 1] == rank_[depth_ - 2]) {
+            --depth_;
+            joined_[depth_ - 1] = join_pieces(b_, joined_[depth_ - 1], joined_[depth_]);
+            ++rank_[depth_ - 1];
+        }
+    }
+
+    // The plane: what is left of the tree, joined smallest first. Null when it is all zero.
+    llvm::Value* finish() {
+        while (depth_ >= 2) {
+            --depth_;
+            joined_[depth_ - 1] = join_pieces(b_, joined_[depth_ - 1], joined_[depth_]);
+        }
+        return depth_ == 1 ? joined_[0].v : nullptr;
+    }
+
+private:
+    llvm::IRBuilder<>& b_;
+    llvm::Value*       run_      = nullptr;
+    uint32_t           run_bits_ = 0;
+    // Ranks fall strictly down the stack, so a plane of up to 2^32 runs needs 33 entries.
+    std::array<Piece, 33>   joined_{};
+    std::array<uint8_t, 33> rank_{};
+    size_t                  depth_ = 0;
+};
+
+} // namespace
+
+Plane Backend::lower_concat(Index i) {
+    const uint32_t       w    = type_of(i).width;
+    const bool           four = type_of(i).four_state;
+    std::array<Index, 4> scratch;
+    const auto           parts = ir_->operands(i, scratch);
+    assert(!parts.empty());
+
+    // An operand of no bits, {0{x}}, takes no part. With one left the result is that operand.
+    size_t live = 0;
+    Index  only = parts.front();
+    for (Index part : parts) {
+        if (type_of(part).width != 0) {
+            only = part;
+            ++live;
+        }
+    }
+    if (live == 1) {
+        assert(type_of(only).width == w);
+        return four ? to_four(value_of(only), type_of(only).four_state) : value_of(only);
+    }
+
+    const auto pieces = [&](Index part) {
+        const Plane    pv = value_of(part);
+        const bool     pf = type_of(part).four_state;
+        const uint32_t pw = type_of(part).width;
+        return Pieces{ piece_of(must_of(pv, pf), pw),
+                       four ? piece_of(may_of(pv, pf), pw) : Piece{},
+                       four ? piece_of(z_of(pv, pf), pw) : Piece{} };
+    };
+
+    ConcatPlane must(b_);
+    ConcatPlane may(b_);
+    ConcatPlane z(b_);
+    uint32_t    placed = 0;
+    for (size_t at = 0; at < parts.size();) {
+        // The run from here: operands up to a word in all. One that is wider is a run alone.
+        std::array<Index, concat_run_bits> run;
+        size_t                             n    = 0;
+        uint32_t                           bits = 0;
+        for (; at < parts.size(); ++at) {
+            const uint32_t pw = type_of(parts[at]).width;
+            if (pw == 0) {
+                continue;
+            }
+            if (n != 0 && bits + pw > concat_run_bits) {
+                break;
+            }
+            run[n++] = parts[at];
+            bits += pw;
+        }
+        if (n == 0) {
+            break;
+        }
+        must.open(bits);
+        may.open(bits);
+        z.open(bits);
+        // Adjacent operands join in pairs before they join the chain.
+        for (size_t k = 0; k < n; k += 2) {
+            Pieces p = pieces(run[k]);
+            if (k + 1 < n) {
+                const Pieces q = pieces(run[k + 1]);
+                p = { join_pieces(b_, p.must, q.must), join_pieces(b_, p.may, q.may), join_pieces(b_, p.z, q.z) };
+            }
+            must.append(p.must);
+            may.append(p.may);
+            z.append(p.z);
+        }
+        must.close();
+        may.close();
+        z.close();
+        placed += bits;
+    }
+    assert(placed == w);
+
+    llvm::Value* mv = must.finish();
+    if (!four) {
+        return two_val(mv != nullptr ? mv : zero(w));
+    }
+    llvm::Value* av = may.finish();
+    llvm::Value* zv = z.finish();
+    return packed(mv != nullptr ? mv : zero(w), av != nullptr ? av : zero(w), zv != nullptr ? zv : zero(w));
+}
+
 // -- Replication and block reversal: independent terms --
 //
 // Each result is the OR of terms, pieces of the operand shifted to constant offsets of
@@ -1979,63 +2181,6 @@ Plane Backend::lower_select(Plane cond, bool cond_four, Plane a, Plane b, bool f
 // time quadratic in W to compile (79 s for 4096 bits). Where a piece pattern has an
 // instruction of its own (bit reverse, byte swap, a sign extension, a multiply by a
 // repeating constant) that is what is generated.
-
-Plane Backend::lower_concat(Index i) {
-    const uint32_t       w = type_of(i).width;
-    std::array<Index, 4> scratch;
-    const auto           parts = ir_->operands(i, scratch);
-
-    // 2-state result: every part is 2-state (a concat is 4-state if any part
-    // is). Assemble the single iW word directly.
-    if (!type_of(i).four_state) {
-        llvm::Value* acc   = zero(w);
-        bool         first = true;
-        for (Index part : parts) {
-            const uint32_t pw = type_of(part).width;
-            // Skip a zero-width part ({0{x}}): it contributes no bits and would
-            // make the next part shift by the full result width (poison).
-            if (pw == 0) {
-                continue;
-            }
-            if (!first) {
-                acc = b_.CreateShl(acc, pw);
-            }
-            acc   = b_.CreateOr(acc, cast(must_of(part), w, false));
-            first = false;
-        }
-        return two_val(acc);
-    }
-
-    llvm::Value* must = zero(w);
-    llvm::Value* may  = zero(w);
-    llvm::Value* z    = zero(w);
-    // The first part is OR'd in without a preceding shift: a shift by the
-    // full result width (which happens when the concat has a single operand,
-    // pw == w) is poison in LLVM, and shifting the still-zero accumulator is
-    // a no-op anyway. A 2-state part contributes must == may and a zero z
-    // plane (z_of), so it packs into the 4-state result unchanged.
-    bool first = true;
-    for (Index part : parts) {
-        const uint32_t pw = type_of(part).width;
-        // Skip a zero-width part ({0{x}}): it contributes no bits and would
-        // make the next part shift by the full result width (poison).
-        if (pw == 0) {
-            continue;
-        }
-        const Plane pv = value_of(part);
-        const bool  pf = type_of(part).four_state;
-        if (!first) {
-            must = b_.CreateShl(must, pw);
-            may  = b_.CreateShl(may, pw);
-            z    = b_.CreateShl(z, pw);
-        }
-        must  = b_.CreateOr(must, cast(must_of(pv, pf), w, false));
-        may   = b_.CreateOr(may, cast(may_of(pv, pf), w, false));
-        z     = b_.CreateOr(z, cast(z_of(pv, pf), w, false));
-        first = false;
-    }
-    return packed(must, may, z);
-}
 
 // The bytes of `v` in reverse order. llvm.bswap takes a whole number of 16-bit words, so
 // an odd count of bytes goes in with a zero byte on top and comes back shifted down.

@@ -76,11 +76,15 @@ when it does.
   only when one can have them. One unsigned bit stays a truth table.
 - XOR and XNOR test for unknown bits and use one native XOR when all are known.
 - `->` and `<->` are IR operations lowered from their own three-valued rules.
-- Concatenation, replication and streaming reversal build independent
-  constant-offset terms, with pattern forms (bit-reverse, byte-swap, sign
-  extension, multiply by a repeating constant). **Not yet:** concatenation,
-  which is still a serial shift-and-OR chain: independent terms measured
-  +6.6% instructions on tests/perf timers (a 32-operand 4-state concat).
+- Replication and streaming reversal build independent constant-offset terms, with
+  pattern forms (bit-reverse, byte-swap, sign extension, multiply by a repeating
+  constant). Concatenation builds runs of adjacent operands up to a machine word wide,
+  each a shift-and-OR chain with neighbors joined in pairs first, and joins the runs as
+  a balanced tree of constant shifts. No operation is wider than the runs it joins, so
+  compile time no longer grows with the square of the width (16 concatenations of 512
+  one-bit 4-state operands: 224 G instructions as one chain of the result's width,
+  14 G). A term per operand in place of a chain within a run measured +6.6%
+  instructions on tests/perf timers (a 32-operand 4-state concat).
 - `$clog2` of an argument with an x or z bit is all x, in constants and at run time:
   the LRM is silent (20.8.1) and Icarus agrees (docs/LRM_NOTES.md, note 53). An x
   where a known value is required, a width or a range bound, is slang's located
