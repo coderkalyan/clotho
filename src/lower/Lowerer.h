@@ -4770,7 +4770,8 @@ private:
         bool is_task = false;
         // The subroutine this body belongs to, or null for a synthetic body (a fork
         // child, an action block, a print thunk). Read by lower_disable to spot LRM
-        // 9.6.2 example 4: a task naming ITSELF as the disable target.
+        // 9.6.2 example 4: a task naming ITSELF as the disable target, and by
+        // hier_name for the classes a method's %m passes through.
         const SubroutineSymbol* sym = nullptr;
         // Class method context (valid iff has_this): `this` is spliced as frame
         // Local 0, `this_class` is its Kind::Class handle type. A bare property

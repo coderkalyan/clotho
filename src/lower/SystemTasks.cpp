@@ -1758,7 +1758,25 @@ Lowerer::ScopeName Lowerer::hier_name() const {
             }
         }
         if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
+            // A method is a scope of its class (LRM 8.3, 21.2.1.5): its classes,
+            // outermost first, come between the instance / package and the
+            // subroutine (iverilog and Verilator: `t.C.run`). The defining class
+            // names it, whatever handle the call went through; a specialization
+            // of a parameterized class keeps the declaration's plain name.
+            std::string  classes;
+            const Scope* from = fn_ctx_->sym != nullptr ? fn_ctx_->sym->getParentScope() : nullptr;
+            for (const Scope* s = from; s != nullptr; s = s->asSymbol().getParentScope()) {
+                const Symbol& sym = s->asSymbol();
+                if (sym.kind == SymbolKind::InstanceBody || sym.kind == SymbolKind::Package ||
+                    sym.kind == SymbolKind::CompilationUnit) {
+                    break;
+                }
+                if (sym.kind == SymbolKind::ClassType) {
+                    classes.insert(0, std::string(sym.name) + ".");
+                }
+            }
             name.text += '.';
+            name.text += classes;
             name.text.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
         }
     }

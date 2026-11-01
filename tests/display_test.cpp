@@ -304,7 +304,7 @@ TEST_CASE("%m inside a named fork names the fork") {
 // The same inside a task, a function and a class method: the fork's name follows the
 // subroutine's (LRM 21.2.1.5), and a task a child calls still names itself. Icarus
 // Verilog 13 is no oracle here (it drops the fork's name inside a task), so the LRM
-// decides; the method's own prefix is compared against its fork-free name.
+// decides.
 TEST_CASE("%m inside a named fork in a subroutine names the subroutine then the fork") {
     CHECK(run_capture(R"(
         module t;
@@ -323,10 +323,8 @@ TEST_CASE("%m inside a named fork in a subroutine names the subroutine then the 
             endfunction
             class C;
                 task run;
-                    string outside;
-                    outside = $sformatf("%m");
                     fork : CF
-                        $display("method fork ok=%0d", $sformatf("%m") == {outside, ".CF"});
+                        $display("method fork %m");
                     join
                 endtask
             endclass
@@ -342,7 +340,53 @@ TEST_CASE("%m inside a named fork in a subroutine names the subroutine then the 
             end
         endmodule
     )") == "tk t.tk\ntask fork t.tsk.TF\ntk t.tk\ntask fork block t.tsk2.TF.B\n"
-           "function fork t.fn.FF\nmethod fork ok=1\n");
+           "function fork t.fn.FF\nmethod fork t.C.run.CF\n");
+}
+
+// A method is a scope of its class (LRM 21.2.1.5 names the subroutine invoking %m;
+// 8.3 makes the class a scope): `t.C.run`, as Icarus Verilog 13 prints it. The
+// defining class names a virtual method called through a base handle. Covers
+// static, constructor-adjacent randomize callbacks, a parameterized class, an
+// extern method, a nested class, a package class and a $unit class.
+TEST_CASE("%m inside a class method names the class") {
+    CHECK(run_capture(R"(
+        package pk;
+            class P; function void run(); $display("pkg %m"); endfunction endclass
+        endpackage
+        class U; function void run(); $display("unit %m"); endfunction endclass
+        module t;
+            class B; virtual function void v(); $display("base %m"); endfunction endclass
+            class C extends B;
+                rand int x;
+                function void run();
+                    $display("run %m");
+                    begin : NB $display("block %m"); end
+                    $display("sformatf %s", $sformatf("%m"));
+                endfunction
+                task tr; fork : F $display("fork %m"); join endtask
+                static function void s(); $display("static %m"); endfunction
+                virtual function void v(); $display("derived %m"); endfunction
+                extern function void e();
+                function void pre_randomize(); $display("pre %m"); endfunction
+                function void post_randomize(); $display("post %m"); endfunction
+                class N; function void run(); $display("nested %m"); endfunction endclass
+            endclass
+            function void C::e(); $display("extern %m"); endfunction
+            class Q #(int W = 1); function void run(); $display("param %m"); endfunction endclass
+            initial begin
+                C c = new;
+                B b = c;
+                C::N n = new;
+                Q#(8) q = new;
+                pk::P p = new;
+                U u = new;
+                c.run(); c.tr(); C::s(); b.v(); c.e(); void'(c.randomize());
+                n.run(); q.run(); p.run(); u.run();
+            end
+        endmodule
+    )") == "run t.C.run\nblock t.C.run.NB\nsformatf t.C.run\nfork t.C.tr.F\nstatic t.C.s\n"
+           "derived t.C.v\nextern t.C.e\npre t.C.pre_randomize\npost t.C.post_randomize\n"
+           "nested t.C.N.run\nparam t.Q.run\npkg pk.P.run\nunit $unit.U.run\n");
 }
 
 // %m takes no argument, wherever it sits among the conversions that do.
