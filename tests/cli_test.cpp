@@ -967,6 +967,215 @@ TEST_CASE("cli: --stop-time is refused where nothing simulates") {
         CHECK(contains(r.err, std::format("--stop-time applies to 'run', not '{}'", command)));
     }
 }
+
+// How many specializations `--stat=units` reports as still lowering differently in
+// their instances (docs/design/modular-compilation.md, step 2c), or -1 when the
+// report is missing.
+long split_specializations(const std::string& report) {
+    const std::string tail = " specializations still split across instances";
+    const size_t      end  = report.find(tail);
+    if (end == std::string::npos) {
+        return -1;
+    }
+    const size_t start = report.rfind(' ', end - 1) + 1;
+    return std::strtol(report.c_str() + start, nullptr, 10);
+}
+
+// The instances of one module differ only in where they sit, so they are one unit:
+// the hidden storage a process body needs (a repeat's bound, a task call's output
+// argument) is numbered within its instance, never across the design.
+TEST_CASE("cli: instances of one module share a unit whatever hidden temporaries their bodies need") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf;
+          int n = 0;
+          task automatic bump(output int o);
+            o = n + 1;
+          endtask
+          initial begin
+            int r;
+            repeat (3) n++;
+            bump(r);
+            $display("%m n=%0d r=%0d", n, r);
+          end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    const Result   r      = s.run(std::format("run --stat=units \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(r.out == "top.u1 n=3 r=4\ntop.u2 n=3 r=4\n");
+    CHECK(split_specializations(r.err) == 0);
+}
+
+// An instance's name is data the body reads, not text in it: %m prints the path, a
+// report names its instance by it, and the instances of a module that does both,
+// with an assertion of each kind in it, still lower alike.
+TEST_CASE("cli: instances of one module share a unit whatever names they print or report") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf(input logic clk);
+          logic a = 0, b = 0;
+          initial begin
+            $display("%m");
+            $error("plain");
+            assert (a) else $error("checked");
+          end
+          ap: assert property (@(posedge clk) a |=> b);
+        endmodule
+        module top;
+          logic clk = 0;
+          leaf u1(clk);
+          leaf u2(clk);
+        endmodule
+    )");
+    const Result   r      = s.run(std::format("run --stat=units \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(r.out == "top.u1\ntop.u2\n");
+    CHECK(contains(r.err, "top.u1 at 0 s: plain"));
+    CHECK(contains(r.err, "top.u2 at 0 s: plain"));
+    CHECK(contains(r.err, "top.u1 at 0 s: checked"));
+    CHECK(contains(r.err, "top.u2 at 0 s: checked"));
+    CHECK(split_specializations(r.err) == 0);
+}
+
+// A covergroup is built per instance, but its type says nothing of the instance:
+// the prefix the report names the instance by is read when the group is built, so
+// the instances of a module that builds one still share a unit.
+TEST_CASE("cli: instances of one module share a unit when each builds a covergroup") {
+    const Scratch  s;
+    const fs::path report = s.path("coverage.txt");
+    const auto     run    = [&](std::string_view module_body) {
+        const fs::path design = s.write("design.sv", std::format(R"(
+            module leaf;
+              bit [1:0] v = 0;
+              covergroup cg; coverpoint v; endgroup
+              {}
+            endmodule
+            module top;
+              leaf u1();
+              leaf u2();
+            endmodule
+        )",
+                                                                 module_body));
+        return s.run(std::format("run --stat=units --coverage \"{}\" \"{}\"", report.string(), design.string()));
+    };
+    const auto named = [&](std::string_view instance) {
+        return contains(clotho::test::detail::read_file(report), std::format("instance {} ", instance));
+    };
+    SUBCASE("built by a procedure") {
+        const Result r = run("cg c; initial begin c = new; c.sample(); end");
+        CHECK(r.code == 0);
+        CHECK(split_specializations(r.err) == 0);
+        CHECK(named("top.u1.cg"));
+        CHECK(named("top.u2.cg"));
+    }
+    SUBCASE("built by a declaration initializer") {
+        const Result r = run("cg c = new; initial c.sample();");
+        CHECK(r.code == 0);
+        CHECK(split_specializations(r.err) == 0);
+        CHECK(named("top.u1.cg"));
+        CHECK(named("top.u2.cg"));
+    }
+}
+
+// A declaration initializer is part of its own instance, so a covergroup it builds
+// (with a coverage event, whose process lives in that instance too) and the
+// instance's %m, assertion banner and covergroup name all read that instance's own
+// path, with the instances still sharing one unit. Expected output is main's.
+TEST_CASE("cli: per-instance initializers keep %m, assertion banners and covergroup names per instance") {
+    const Scratch  s;
+    const fs::path report = s.path("coverage.txt");
+    const fs::path design = s.write("design.sv", R"(
+        module leaf(input bit clk);
+          bit [1:0] v = 0;
+          covergroup cg @(posedge clk); coverpoint v; endgroup
+          cg c = new;
+          always @(negedge clk) v <= v + 1;
+          a: assert property (@(posedge clk) v != 2'd3) else $error("v hit 3");
+          initial $display("%m up");
+        endmodule
+        module top;
+          bit clk = 0;
+          leaf u1(clk);
+          leaf u2(clk);
+          initial begin repeat (10) #1 clk = ~clk; $finish; end
+        endmodule
+    )");
+    const Result   r = s.run(
+      std::format("run --stat=units --coverage \"{}\" \"{}\"", report.string(), design.string()));
+    CHECK(r.code == 0);
+    CHECK(split_specializations(r.err) == 0);
+    CHECK(contains(r.out, "top.u1 up\n"));
+    CHECK(contains(r.out, "top.u2 up\n"));
+    CHECK(contains(r.err, "ERROR: "));
+    CHECK(contains(r.err, ": top.u1.a at 7 s: v hit 3\n"));
+    CHECK(contains(r.err, ": top.u2.a at 7 s: v hit 3\n"));
+    const std::string cov = clotho::test::detail::read_file(report);
+    CHECK(contains(cov, "instance top.u1.cg  coverage 100.00%"));
+    CHECK(contains(cov, "instance top.u2.cg  coverage 100.00%"));
+}
+
+// Declaration initializers run in the order the elaboration walks the hierarchy
+// (LRM 6.8 leaves it open; this is the order designs have always seen): a parent's
+// initializers declared before a child instance first, the child's next, the
+// parent's later ones after, whichever instance an initializer reads. Each
+// instance's initializers are part of that instance, so the two `mid` instances
+// still share one unit.
+TEST_CASE("cli: declaration initializers run in elaboration order across instances") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        package p;
+          int n = 0;
+          function int next(string who); $display("init %s n=%0d", who, n); n++; return n; endfunction
+        endpackage
+        module leaf; int id = p::next($sformatf("%m")); endmodule
+        module mid; int x = p::next("mid.x"); leaf l1(); int y = p::next("mid.y"); leaf l2(); endmodule
+        module top;
+          int t0 = p::next("top.t0"); mid m1(); int t1 = p::next("top.t1"); mid m2();
+          int early = m1.l1.id + 100;
+          int late  = m2.l2.id + 100;
+          initial $display("early=%0d late=%0d", early, late);
+        endmodule
+    )");
+    const Result   r = s.run(std::format("run --stat=units \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(split_specializations(r.err) == 0);
+    CHECK(r.out == "init top.t0 n=0\ninit mid.x n=1\ninit top.m1.l1 n=2\ninit mid.y n=3\ninit top.m1.l2 n=4\n"
+                   "init top.t1 n=5\ninit mid.x n=6\ninit top.m2.l1 n=7\ninit mid.y n=8\ninit top.m2.l2 n=9\n"
+                   "early=103 late=110\n");
+}
+
+// A covergroup type a package declares belongs to no instance: every instance that
+// builds it refers to the package's type, so the instances of a module that does
+// still share one unit, and the report names each by the instance that built it.
+TEST_CASE("cli: instances of one module share a unit when each builds a package's covergroup") {
+    const Scratch  s;
+    const fs::path report = s.path("coverage.txt");
+    const fs::path design = s.write("design.sv", R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+        endpackage
+        module leaf(input bit [1:0] hit);
+          import p::*;
+          pcg lc = new;
+          initial begin #1 pv = hit; lc.sample(); end
+        endmodule
+        module top;
+          leaf u1(2'd1);
+          leaf u2(2'd2);
+        endmodule
+    )");
+    const Result   r = s.run(std::format("run --stat=units --coverage \"{}\" \"{}\"", report.string(), design.string()));
+    CHECK(r.code == 0);
+    CHECK(split_specializations(r.err) == 0);
+    const std::string cov = clotho::test::detail::read_file(report);
+    CHECK(contains(cov, "instance top.u1.pcg "));
+    CHECK(contains(cov, "instance top.u2.pcg_1 "));
+}
 #endif // !defined(_WIN32)
 
 TEST_CASE("cli: --sanitize=divzero reports a 2-state divide by zero and leaves the result alone") {

@@ -29,8 +29,9 @@ void Lowerer::emit_deferred_action(const Statement*      action,
         // Only the fail branch of assert/assume has a default report; a
         // missing pass action (or cover) emits nothing.
         if (is_fail) {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                       severity_banner(site),
+            emit_report(b,
+                        static_cast<uint32_t>(ir::Severity::Error),
+                        banner_at(site),
                        "assertion failed",
                        {},
                        to_source_loc(site),
@@ -64,7 +65,7 @@ void Lowerer::emit_deferred_action(const Statement*      action,
     std::string            fmt;
     std::vector<ir::FmtArg> args;
     build_format(call->arguments(), fmt, args, b);
-    b.severity(static_cast<uint32_t>(sev), severity_banner(call->sourceRange.start()), fmt, args, loc(*call),
+    emit_report(b, static_cast<uint32_t>(sev), banner_at(call->sourceRange.start()), fmt, args, loc(*call),
                defer_mode);
 }
 
@@ -564,34 +565,92 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
     }
     for (const std::vector<const Symbol*>* set : { &v.lexical, &v.remote }) {
         for (const Symbol* t : *set) {
-            const bool is_task = t->kind == SymbolKind::Subroutine;
-            if (!is_task && t->kind != SymbolKind::StatementBlock) {
-                continue; // slang admits nothing else as a target
-            }
-            // Design-unique, not per-Lowerer: a multi-top design gives every
-            // top its own Lowerer sharing one Module, so the id has to come
-            // from the module the way a scope id does.
-            if (disable_targets_.try_emplace(t, module_.disable_targets).second) {
-                ++module_.disable_targets;
-                module_.disable_target_is_task.push_back(is_task ? 1 : 0);
-            }
-            if (is_task) {
-                // A task target is always "remote" in the sense that matters: it
-                // ends every activation, never just the one running. Its parks
-                // are checked against the task's own body.
-                const auto& sub = t->as<SubroutineSymbol>();
-                disable_remote_.insert(t);
-                if (hard_park(sub.getBody())) {
-                    disable_hard_.insert(t);
-                }
+            register_disable_target(t, set == &v.remote);
+        }
+    }
+}
+
+// Give a named block or task its `disable` target id (a block is lowered as an
+// ir::NamedBlock only if it has one), and mark it remote when some `disable`
+// names it from outside.
+void Lowerer::register_disable_target(const Symbol* t, bool remote) {
+    const bool is_task = t->kind == SymbolKind::Subroutine;
+    if (!is_task && t->kind != SymbolKind::StatementBlock) {
+        return; // slang admits nothing else as a target
+    }
+    // Design-unique, not per-Lowerer: a multi-top design gives every top its
+    // own Lowerer sharing one Module, so the id has to come from the module
+    // the way a scope id does.
+    if (disable_targets_.try_emplace(t, module_.disable_targets).second) {
+        ++module_.disable_targets;
+        module_.disable_target_is_task.push_back(is_task ? 1 : 0);
+        owners_->attribution.disable_target_names.push_back(import_name(*t));
+    }
+    if (is_task) {
+        // A task target is always "remote" in the sense that matters: it ends
+        // every activation, never just the one running. Its parks are checked
+        // against the task's own body.
+        const auto& sub = t->as<SubroutineSymbol>();
+        disable_remote_.insert(t);
+        if (hard_park(sub.getBody())) {
+            disable_hard_.insert(t);
+        }
+        return;
+    }
+    // A block with a `fork` inside needs the occupant bookkeeping too, even when
+    // only its own body disables it: the forked children are activations of it,
+    // and the lexical exit alone would leave them running.
+    if (remote || disable_forked_.contains(t)) {
+        disable_remote_.insert(t);
+    }
+}
+
+// Whether a block or task is a `disable` target is a fact its context imposes
+// on its specialization, and the instances of one specialization share their
+// code, so it is joined over all of them: a block some `disable` names from
+// outside its instance is lowered as a target in every instance of its
+// specialization, with the occupant bookkeeping the remote form needs. Each
+// instance's block keeps a target id of its own, so a `disable` of one still
+// ends only that instance's activations (LRM 9.6.2).
+//
+// The join runs after Collect has registered every instance and before any
+// instance is emitted. It is whole-top state today, and moves to a codegen-time
+// summary of the unit (docs/design/modular-compilation.md, "Inbound facts")
+// once units are compiled one by one. It covers the instances of the top being
+// lowered only: a `disable` cannot name a block of another top (Emit refuses
+// it), and a specialization both tops instantiate keeps one unit per shape.
+void Lowerer::join_disable_targets() {
+    // In id order: registering a twin grows disable_remote_.
+    std::vector<std::pair<uint32_t, const Symbol*>> remote;
+    remote.reserve(disable_remote_.size());
+    for (const Symbol* t : disable_remote_) {
+        remote.emplace_back(disable_targets_.at(t), t);
+    }
+    std::ranges::sort(remote);
+    for (const auto& [id, t] : remote) {
+        const Scope* s = t->getParentScope();
+        while (s != nullptr && s->asSymbol().kind != SymbolKind::InstanceBody) {
+            s = s->asSymbol().getParentScope();
+        }
+        if (s == nullptr) {
+            continue; // a package, `$unit` or class member: one instance
+        }
+        const auto& body  = s->asSymbol().as<slang::ast::InstanceBodySymbol>();
+        const auto  owner = owners_->scopes.find(&body);
+        if (owner == owners_->scopes.end()) {
+            fail("internal: a disable target's instance was not collected");
+        }
+        const uint32_t              spec = owners_->scope_specs.at(owner->second.owner.index).spec;
+        const std::vector<uint32_t> path = member_ordinal_path(*t, body);
+        for (const slang::ast::InstanceBodySymbol* other : spec_bodies_[spec]) {
+            if (other == &body) {
                 continue;
             }
-            // A block with a `fork` inside needs the occupant bookkeeping too, even
-            // when only its own body disables it: the forked children are
-            // activations of it, and the lexical exit alone would leave them running.
-            if (set == &v.remote || disable_forked_.contains(t)) {
-                disable_remote_.insert(t);
+            const Symbol* twin = symbol_at_path(*other, path);
+            if (twin == nullptr || twin->kind != t->kind || twin->name != t->name) {
+                fail("internal: an instance of a specialization lacks a disable target's twin");
             }
+            register_disable_target(twin, /*remote=*/true);
         }
     }
 }
@@ -749,7 +808,11 @@ void Lowerer::alloc_assert_control() {
         // Named by position in this table rather than by monitor id: the
         // monitor has no id yet (Emit hands those out), and an assertion
         // that later refuses to lower would leave a hole in that numbering.
-        const std::string base = "sva.ctl" + std::to_string(i) + ".";
+        uint32_t ordinal = 0;
+        for (uint32_t k = 0; k < i; ++k) {
+            ordinal += sites_[k].scope == site.scope ? 1 : 0;
+        }
+        const std::string base = "sva.ctl" + std::to_string(ordinal) + ".";
         scope_stack_.push_back(node);
         prefix_       = site.prefix;
         site.ctl.off  = new_monitor_state(base + "off", mask_type(1), site.loc);
@@ -1317,7 +1380,7 @@ void Lowerer::lower_concurrent_assertion(const slang::ast::ConcurrentAssertionSt
     monitor.span   = to_source_span(a.sourceRange);
     // A labelled assertion (`ap: assert property ...`) is lowered inside the
     // block slang makes of its label, so its report names the label as well.
-    monitor.banner = severity_banner(a.sourceRange.start());
+    monitor.banner = banner_at(a.sourceRange.start());
     // Not round-tripped through libsva, which has one cover kind: the tally
     // is clotho's own choice and this is where the choice is recorded.
     monitor.cover_matches = cover_matches;
@@ -1334,6 +1397,10 @@ void Lowerer::lower_concurrent_assertion(const slang::ast::ConcurrentAssertionSt
     // monitor would own, and there is none -- the roots are ordinary values
     // inside the process emitted here.
     const uint32_t    id    = static_cast<uint32_t>(module_.monitors.size());
+    if (monitors_per_scope_.size() <= cur_scope_id()) {
+        monitors_per_scope_.resize(cur_scope_id() + 1, 0);
+    }
+    monitor_ordinal_ = monitors_per_scope_[cur_scope_id()]++;
     const ExpectPorts ports = emit_monitor(lowered, monitor, id, actions, control_for(a));
     module_.monitors.push_back(std::move(monitor));
 
@@ -1425,8 +1492,9 @@ void Lowerer::emit_expect_wait(uint32_t                                        i
     // reaching one statement is not a static property of the source.
     b.open_region();
     const std::string banner = banner_at(a.sourceRange.start());
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-               severity_banner(a.sourceRange.start()),
+    emit_report(b,
+                static_cast<uint32_t>(ir::Severity::Fatal),
+                banner_at(a.sourceRange.start()),
                "an `expect` whose previous attempt is still in flight is not supported",
                {},
                l);
@@ -1554,7 +1622,7 @@ ir::FunctionId Lowerer::build_default_fail_body(const ir::AssertionMonitor& mon)
     const ir::SourceLoc  l  = mon.span.start;
 
     ir::Builder b(module_);
-    b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+    emit_report(b, static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
     b.ret_void(l);
 
     module_.set_function(id,
@@ -1595,8 +1663,9 @@ void Lowerer::lower_immediate_assertion(const ImmediateAssertionStatement& a, ir
         if (a.ifFalse != nullptr) {
             lower_stmt(*a.ifFalse, b);
         } else {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                       severity_banner(a.sourceRange.start()),
+            emit_report(b,
+                        static_cast<uint32_t>(ir::Severity::Error),
+                        banner_at(a.sourceRange.start()),
                        "assertion failed",
                        {},
                        loc(a));
@@ -1643,7 +1712,7 @@ void Lowerer::finalize_sva_history() {
 // expression is evaluated, so a capture is a plain copy with no operator in
 // it. One shadow per variable, shared by every assertion mentioning it --
 // including two assertions in different asserting scopes -- and copied by
-// the single Preponed process finalize_preponed emits.
+// the Preponed process of the scope that holds the variable (finalize_preponed).
 //
 // The shadow keeps the live signal's exact type -- full width, full 4-state.
 // Narrowing it to the one bit a boolean root needs would move operators into
@@ -1699,7 +1768,13 @@ ir::Signal Lowerer::sampled_shadow_of(ir::Signal live, std::string_view what) {
     }
 
     ir::SignalInfo info;
-    info.name = "sva.shadow." + live_info.name;
+    // Named under the declaring instance, like every signal it holds: the
+    // instance prefix, then the live signal's name within the instance.
+    const std::string&     prefix = declaring_scope != nullptr ? scope_prefix_.at(declaring_scope->id) : std::string();
+    const std::string_view local  = std::string_view(live_info.name).starts_with(prefix)
+                                      ? std::string_view(live_info.name).substr(prefix.size())
+                                      : std::string_view(live_info.name);
+    info.name                     = prefix + "sva.shadow." + std::string(local);
     info.loc  = live_info.loc;
     info.type = live_info.type;
     // Left a variable (is_net stays false): nothing drives a shadow but the
@@ -1798,19 +1873,37 @@ void Lowerer::sva_sample_roots(const sva::Result& lowered) {
     }
 }
 
-// Emit the Preponed process (LRM 4.4.2.1: it runs before any body of the time
-// step, and is equivalent to sampling the previous Postponed region): the copy
+// Emit the Preponed processes (LRM 4.4.2.1: they run before any body of the time
+// step, and are equivalent to sampling the previous Postponed region): the copy
 // of every sampled variable, and the clear of every per-step latch. One process
-// for the whole top, like the PreInit pass -- the copies are independent
-// whole-signal stores, so their order carries no meaning and one dispatch per
-// step beats one per scope. A design with no concurrent assertion and no
-// clocking block registers neither, and so gets no process and no state at all.
+// per scope that holds such state, owned by that instance, so the copy sits with
+// the signals it reads and writes; state of no instance (a package variable's
+// shadow) goes to one process of the top. The copies are independent
+// whole-signal stores, so neither their order nor the processes' carries any
+// meaning. A design with no concurrent assertion and no clocking block registers
+// neither, and so gets no process and no state at all.
 void Lowerer::finalize_preponed() {
     if (sva_shadow_pairs_.empty() && preponed_clears_.empty()) {
         return;
     }
-    ir::Builder b(module_);
+    struct Body {
+        uint32_t                     scope;
+        std::unique_ptr<ir::Builder> b;
+    };
+    std::vector<Body>                              bodies;
+    ankerl::unordered_dense::map<uint32_t, size_t> at;
+    // The body of the scope that holds `owned`, in order of first appearance.
+    const auto body_of = [&](ir::Signal owned) -> ir::Builder& {
+        const auto     it    = signal_scope_.find(static_cast<uint32_t>(owned));
+        const uint32_t scope = it != signal_scope_.end() ? it->second : ir::Process::no_scope;
+        const auto [pos, fresh] = at.try_emplace(scope, bodies.size());
+        if (fresh) {
+            bodies.push_back(Body{ scope, std::make_unique<ir::Builder>(module_) });
+        }
+        return *bodies[pos->second].b;
+    };
     for (const auto& [live, shadow] : sva_shadow_pairs_) {
+        ir::Builder&        b   = body_of(shadow);
         const ir::SourceLoc l   = module_.signal(shadow).loc;
         const ir::Index     dst = b.signal(shadow, l);
         const ir::Index     val = b.unary(ir::Inst::Tag::Load, b.signal(live, l), l);
@@ -1820,12 +1913,15 @@ void Lowerer::finalize_preponed() {
     // 14.11's `##0`, and the maturation window of a drive): set in Observed,
     // and false again from the top of the next step, which is here.
     for (const ir::Signal sig : preponed_clears_) {
+        ir::Builder&        b    = body_of(sig);
         const ir::SourceLoc l    = module_.signal(sig).loc;
         const ir::Index     dst  = b.signal(sig, l);
         const ir::Index     zero = zero_mask(1, b, l);
         b.binary(ir::Inst::Tag::Store, dst, zero, l);
     }
-    module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
+    for (Body& body : bodies) {
+        add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = body.b->finish(), .scope = body.scope });
+    }
     sva_shadow_pairs_.clear();
     preponed_clears_.clear();
 }

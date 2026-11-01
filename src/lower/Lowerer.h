@@ -82,6 +82,7 @@
 #include "SourceMap.h"
 #include "Sva.h"
 #include "ir/Builder.h"
+#include "ir/Partition.h"
 #include "ir/TypeModel.h"
 #include "runtime/Format.h"
 
@@ -870,6 +871,40 @@ struct IfaceIds {
     ankerl::unordered_dense::map<std::string_view, uint32_t>             slots;
 };
 
+// Which unit declares what, for partition (ir/Partition.h). Shared by every
+// Lowerer of one design, like ClassIds: the globals Lowerer registers the static
+// units, each top's Collect pass registers its instance bodies, and every
+// Lowerer attributes the functions and unscoped signals it creates.
+struct UnitOwners {
+    ir::Attribution attribution;
+    // An instance body, package or compilation unit, and the hierarchical-path
+    // prefix its members' import names drop ("top.u." for an instance; nothing
+    // for a package, whose members keep their `pkg::` qualification).
+    struct Entry {
+        ir::Owner   owner;
+        std::string strip;
+    };
+    ankerl::unordered_dense::map<const slang::ast::Scope*, Entry> scopes;
+    // Import names already given, keyed "<owner kind>:<owner index>:<name>",
+    // with how many times (own_function).
+    ankerl::unordered_dense::map<std::string, uint32_t> names;
+    // Specializations (note_specialization). Dense ids, minted per canonical
+    // body; an instance scope records its id and whether its body is a
+    // duplicate slang did not visit; a (parent specialization, child ordinal)
+    // pair names the specialization of that child.
+    struct Spec {
+        uint32_t spec      = 0;
+        bool     duplicate = false;
+    };
+    ankerl::unordered_dense::map<const slang::ast::InstanceBodySymbol*, uint32_t> body_specs;
+    ankerl::unordered_dense::map<uint32_t, Spec>                                  scope_specs;
+    ankerl::unordered_dense::map<uint64_t, uint32_t>                              child_specs;
+
+    uint32_t body_spec(const slang::ast::InstanceBodySymbol& body) {
+        return body_specs.try_emplace(&body, static_cast<uint32_t>(body_specs.size())).first->second;
+    }
+};
+
 // Design-wide registry backing virtual interfaces (LRM 25.9).
 //
 // slang resolves `vif.sig` against a PLACEHOLDER instance body it caches once per
@@ -1053,6 +1088,16 @@ public:
         iface_ids_ = ids;
     }
 
+    // Point this Lowerer at the design-wide unit ownership record (UnitOwners).
+    void set_unit_owners(UnitOwners* owners) {
+        owners_ = owners;
+    }
+
+    // The record, for lower_design to hand to partition.
+    const UnitOwners& unit_owners() const {
+        return *owners_;
+    }
+
     // Point this Lowerer at the design-wide virtual interface registry. `defs`
     // must outlive every call made through this Lowerer.
     void set_vif_defs(VifDefs* defs) {
@@ -1116,6 +1161,11 @@ private:
     }
 
     void report(Severity sev, std::string code, std::string msg, ir::SourceSpan span);
+
+    // report(), once per source location, code and text: every instance of a
+    // specialization lowers the same source once more, and a finding about that
+    // source is one finding.
+    void report_once(Severity sev, std::string code, std::string msg, ir::SourceSpan span);
 
     [[noreturn]] void fail(std::string msg);
 
@@ -1202,7 +1252,13 @@ private:
 
     std::string banner_at(slang::SourceLocation sl) const;
 
-    std::string severity_banner(slang::SourceLocation sl) const;
+    void emit_report(ir::Builder&                b,
+                     uint32_t                    level,
+                     const std::string&          where,
+                     std::string_view            fmt,
+                     std::span<const ir::FmtArg> args,
+                     ir::SourceLoc               l,
+                     uint32_t                    defer = 0);
 
     std::string case_banner(const CaseStatement& c) const;
 
@@ -1638,6 +1694,27 @@ private:
 
     void scan_net_uses();
 
+    // The simulated net of one alias class: the net type Table 23-1 gives the
+    // nets an inout port collapses, and the net that type (and its delay) is
+    // taken from.
+    struct SimNet {
+        const NetType*   type;       // the simulated net's type, folded so far
+        const NetSymbol* dominating; // the net `type` is that of
+        const NetSymbol* owner;      // the net that declared the signal
+    };
+
+    void collapse_port_net(const PortConnection& pc, const NetSymbol& internal, const NetSymbol& external, ir::Signal target);
+
+    void finalize_sim_nets();
+
+    static bool is_modeled_net_kind(NetType::NetKind kind);
+
+    // fail()'s text for a net type is_modeled_net_kind refuses.
+    static constexpr std::string_view kUnmodeledNetType =
+      "unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1/supply0/supply1 are modeled)";
+
+    NetType::NetKind simulated_kind(const NetSymbol& declared, ir::Signal net) const;
+
     void collect_signals(const InstanceBodySymbol& body);
 
     void collect_scope_signals(const Scope&                                                                  scope,
@@ -1732,6 +1809,90 @@ private:
                                  ir::SourceLoc l,
                                  uint16_t      strength       = 0x0303,
                                  bool          program_driver = false);
+
+    // The net symbol of each aliasing inout port -> the instance that declares
+    // the port and the port's name there (alias_syms_).
+    struct AliasSymbol {
+        uint32_t    scope = 0;
+        std::string port;
+    };
+
+    // A driver of `net` that goes through an aliasing port of the current
+    // instance: the port, or null when the lvalue is anything else. Only a
+    // whole integral net or a constant packed range of one qualifies; the
+    // other shapes keep storing through the port directly (and fail loudly if
+    // the net resolves, as they always have).
+    const AliasSymbol* contribution_port(const Expression& left);
+
+    // The aliasing port of the current instance that `net` is reached through, if
+    // the whole net is one a driver can contribute to (a whole integral net).
+    const AliasSymbol* contribution_port(const ValueSymbol& net);
+
+    // The net a driver stages through a slot or a contribution: the resolved
+    // net of `left`, or the net behind its aliasing port.
+    std::optional<ir::Signal> driver_net_of(const Expression& left);
+
+    // The signal one driver of `net` stores into: a contribution of the
+    // current instance when `left` goes through an aliasing port, else a
+    // fresh driver slot (alloc_driver_slot).
+    ir::Signal driver_slot(ir::Signal        net,
+                           const Expression& left,
+                           ir::SourceLoc     l,
+                           uint16_t          strength       = 0x0303,
+                           bool              program_driver = false);
+
+    // driver_slot for a driver already known to go through `port` (null: a fresh
+    // slot).
+    ir::Signal driver_slot_via(const AliasSymbol* port,
+                               ir::Signal         net,
+                               ir::SourceLoc      l,
+                               uint16_t           strength       = 0x0303,
+                               bool               program_driver = false);
+
+    // Make a contribution of the instance `depth` levels down scope_stack_,
+    // bound as Attribution::Contribution says, and return the signal its body
+    // stores through.
+    ir::Signal contribute(size_t            depth,
+                          const std::string& port,
+                          ir::Signal        net,
+                          ir::SourceLoc     l,
+                          uint16_t          strength,
+                          bool              program_driver);
+
+    // alloc_driver_slot for a slot that belongs to instance `scope`.
+    ir::Signal alloc_slot_in(uint32_t scope, ir::Signal net, ir::SourceLoc l, uint16_t strength, bool program_driver);
+
+    ir::InstanceScope* scope_node(uint32_t id);
+
+    // The node of instance `id` in the tree of the top being lowered, or null when
+    // the instance is another top's.
+    ir::InstanceScope* find_node(uint32_t id);
+
+    ir::Signal register_signal_in(ir::InstanceScope& node, ir::SignalInfo info);
+
+    // The instance a declaration belongs to, whoever lowers it first: where the
+    // storage it owns lives (a static local of a subroutine, a static class
+    // property) and what names it. LRM 13.3.1 and 13.4.2 give each instance of a
+    // module its own copy of a subroutine's statics, and 8.9 each class its own
+    // properties, so a body reached from another instance (`a.f()` from the
+    // parent) must not put them under the caller.
+    struct Home {
+        ir::InstanceScope* node = nullptr;
+        // The flat name prefix of the declaring scope: its instance's, then the
+        // generate blocks between.
+        std::string prefix;
+    };
+
+    // The home of a declaration made in `decl`; none for a declaration of no
+    // instance (a package's or `$unit`'s, which the globals Lowerer owns) and for
+    // one of another top's instances, which this Lowerer cannot reach (a
+    // hierarchical call across tops builds the callee's body under the caller's
+    // top, and its statics stay with the caller as they always have).
+    std::optional<Home> home_of(const Scope* decl);
+
+    // `register_signal` into the home's instance, or into the one being lowered
+    // without one.
+    ir::Signal register_declared_signal(const std::optional<Home>& home, ir::SignalInfo info);
 
     ir::Ref def_constant_ref(uint32_t width, bool one);
 
@@ -2059,6 +2220,8 @@ private:
 
     void wire_ports(const InstanceSymbol& child);
 
+    void check_value_port_nets(const PortSymbol& p, const Expression& expr);
+
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out);
 
     ir::Index lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b);
@@ -2287,6 +2450,10 @@ private:
     void scan_assert_control(const ProceduralBlockSymbol& blk);
 
     void scan_disable_targets(const ProceduralBlockSymbol& blk);
+
+    void register_disable_target(const Symbol* t, bool remote);
+
+    void join_disable_targets();
 
     bool hard_park(const Statement& body, bool forked_children_are_occupants = false);
 
@@ -2850,7 +3017,7 @@ private:
 
     const Expression* declaration_initializer(const VariableSymbol& vs);
 
-    void finalize_preinit();
+    void finalize_preinit(uint32_t scope);
 
     void finalize_sva_history();
 
@@ -3031,6 +3198,8 @@ private:
     TempCell make_temp_cell(ir::Ref type, std::string_view role);
 
     ir::Signal declare_temp(ir::Ref type, std::string_view role);
+
+    uint32_t next_temp_id();
 
     void lower_for_step(const Expression& e, ir::Builder& b);
 
@@ -3674,15 +3843,46 @@ private:
 
     ir::Index lower_string_method(std::string_view name, const CallExpression& call, ir::Builder& b);
 
+    // How the hierarchical name of the scope being lowered (LRM 21.2.1.3) is spelled.
+    // Code that belongs to one instance starts the name with that instance's path and
+    // reads it at run time (Inst::Tag::InstPath), so the code is the same in every
+    // instance of its specialization; `text` is then what follows the path. Anywhere
+    // else the whole name is static text: package and `$unit` code, which sits under
+    // no instance, and a subroutine reached through a virtual interface, which serves
+    // every instance.
+    struct ScopeName {
+        bool        in_instance = false;
+        std::string text;
+    };
+
+    // A conversion of a display format that has not met its value argument yet
+    // (build_format). `%m` of code in an instance brings its argument with it, the
+    // instance path, so `bound` holds that operand and the call's own arguments skip it.
+    struct PendingSpec {
+        char      conv;
+        ir::Index bound = ir::kNoIndex;
+    };
+
     std::string instance_path() const;
 
-    std::string hier_name() const;
+    bool inside_instance() const;
+
+    static std::string generate_path(const Scope* scope);
+
+    ScopeName instance_scope() const;
+
+    ScopeName hier_name() const;
 
     std::string lib_cell_name() const;
 
+    static void append_escaped(std::string& fmt, std::string_view text);
+
     char check_specifier(const clotho::FormatSpec& spec);
 
-    void append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending);
+    void append_format_literal(std::string&              fmt,
+                               std::string_view          text,
+                               std::vector<PendingSpec>& pending,
+                               ir::Builder&              b);
 
     void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::FmtArg>& args, ir::Builder& b);
 
@@ -4562,8 +4762,9 @@ private:
         // $strobe or $monitor print, an assertion action block, a randsequence
         // production -- is that of the statement that created it (LRM 21.2.1.5:
         // the scope that invokes the task). Unset for a subroutine, whose own
-        // name is part of its %m.
-        std::optional<std::string> invoking_scope;
+        // name is part of its %m. Kept in the form hier_name gives, so the body
+        // reads the creating instance's path at run time like the statement did.
+        std::optional<ScopeName> invoking_scope;
         // True while lowering a task body (a coroutine): unlike a function, timing
         // controls and $time are allowed.
         bool is_task = false;
@@ -4666,6 +4867,20 @@ private:
 
     std::vector<const ValueSymbol*> body_automatics(const SubroutineSymbol& sub, const Statement& body);
 
+    // The static-lifetime locals `sub` declares through declaration statements, in
+    // source order: the variables lower_var_decl gives persistent storage (a `for`
+    // loop's own variables are per-call and are not among them).
+    static std::vector<const VariableSymbol*> static_locals_of(const SubroutineSymbol& sub);
+
+    // The statics of an interface's subroutine, declared with the interface
+    // instance instead of at the first call (`collect`: Collect, which registers
+    // the signals), and initialized in the instance's own PreInit segment (Emit).
+    void declare_interface_statics(const SubroutineSymbol& sub, bool collect);
+
+    // The static locals whose declaration initializer declare_interface_statics
+    // already lowered: lower_var_decl must not lower it again at the first call.
+    ankerl::unordered_dense::set<const VariableSymbol*> static_init_done_;
+
     // An object handle paired with the class type that selects its layout, for
     // the two scoped implicit-`this` overrides (ctor_this_ / default_arg_this_,
     // declared with the rest of the state at the bottom of the class). Defined
@@ -4732,6 +4947,34 @@ private:
         Restore<std::vector<OpenBlock>> blocks_;
         Restore<const Symbol*>          root_;
         Restore<uint32_t>               depth_;
+    };
+
+    // The PreInit segment of the instance that declares a static, while the
+    // lowering that declares it runs somewhere else. A subroutine body is built at
+    // its first call site, which can be in another instance (`a.f()`), and a static
+    // class property at its first access or at the end of the top; the open segment
+    // belongs to whoever is being lowered, so the declaration initializer would
+    // become code of that instance's unit and store into a neighbour's storage.
+    // While one of these is alive and `home` is not the instance being lowered,
+    // preinit_ is a segment of its own, which `commit` closes into a PreInit
+    // process of `home` -- ahead of the caller's open segment, so the initializer
+    // still runs before whatever first reads the static. Without `commit` (the
+    // lowering failed) the segment is dropped. Inactive, and the open segment kept,
+    // for a declaration of the instance being lowered and for one of no instance.
+    class HomePreInit {
+    public:
+        HomePreInit(Lowerer& l, const std::optional<Home>& home);
+        ~HomePreInit();
+        HomePreInit(const HomePreInit&)            = delete;
+        HomePreInit& operator=(const HomePreInit&) = delete;
+        void commit();
+
+    private:
+        Lowerer&                   l_;
+        uint32_t                   home_   = ir::Process::no_scope;
+        bool                       active_ = false;
+        // The caller's open segment, set aside while the home's is open.
+        std::optional<ir::Builder> saved_;
     };
 
     uint32_t fn_local(const ValueSymbol& vs);
@@ -4808,6 +5051,36 @@ private:
     void apply_time_scale(const Scope& scope);
 
     ir::FunctionId vif_function_id(const SubroutineSymbol& ph_sub);
+
+    // Register the unit an instance body, package or compilation unit declares,
+    // with the path prefix its members' import names drop (UnitOwners).
+    void own_scope(const slang::ast::Scope& scope, ir::Owner owner, std::string strip);
+    // Record the specialization `inst` elaborates (UnitOwners::Spec), from
+    // Collect, once its scope is numbered and before it joins its parent.
+    void note_specialization(const slang::ast::InstanceSymbol& inst, uint32_t scope);
+    // The unit a symbol declared in `scope` belongs to: the nearest enclosing
+    // registered scope's, else the glue unit's.
+    const UnitOwners::Entry& owner_in(const slang::ast::Scope* scope) const;
+    // `decl`'s hierarchical path relative to the unit declaring it: the name
+    // another unit imports it by.
+    std::string import_name(const slang::ast::Symbol& decl) const;
+    // Attribute function `id` to the unit declaring `decl`, importable as
+    // `decl`'s path relative to that unit followed by `suffix`.
+    void own_function(ir::FunctionId id, const slang::ast::Symbol& decl, std::string_view suffix = {});
+    // Attribute function `id` to `owner`, importable as `name`.
+    void record_function(ir::FunctionId id, ir::Owner owner, std::string name);
+    // Attribute covergroup type `idx` (Module::cover_types) to the unit declaring
+    // `decl`, importable as `decl`'s path relative to that unit.
+    void own_cover_type(uint32_t idx, const slang::ast::Symbol& decl);
+    // `name` as an import name no other of its table (`table` tags it: "" for
+    // functions) names in the unit `e` owns: the nth repeat takes `#n`.
+    std::string unique_import_name(const UnitOwners::Entry& e, std::string name, std::string_view table);
+    // Attribute an unscoped signal to a unit (UnitOwners).
+    void own_signal(ir::Signal sig, ir::Owner owner);
+
+    // Append a process to the module, attributing a scope-less one to the unit
+    // of the top this Lowerer lowers (UnitOwners).
+    void add_process(ir::Process p);
 
     ir::FunctionId function_id(const SubroutineSymbol& sub);
 
@@ -5225,6 +5498,36 @@ private:
     // beside the live signal it shadows, wherever that actually is, rather
     // than wherever the asserting scope happens to be.
     ankerl::unordered_dense::map<uint32_t, uint32_t> signal_scope_;
+    // InstanceScope::id -> the flat signal-name prefix of that instance.
+    ankerl::unordered_dense::map<uint32_t, std::string> scope_prefix_;
+    // InstanceScope::id -> each aliasing port's target signal -> the port's
+    // name in that instance (build_inout_aliases), for a contribution to find
+    // the port of its parent that re-exports it (contribute).
+    ankerl::unordered_dense::map<uint32_t, ankerl::unordered_dense::map<uint32_t, std::string>> alias_ports_;
+    // A continuous driver naming such a symbol from its own instance drives
+    // through the port (contribute).
+    ankerl::unordered_dense::map<const Symbol*, AliasSymbol> alias_syms_;
+    // The simulated net (LRM 23.3.3.7) of each signal some inout port aliases a
+    // net onto, by signal id, folded as Collect meets the ports (collapse_port_net)
+    // and final once Collect ends (finalize_sim_nets). A signal absent here is
+    // reached through no inout port: its net type is the declared one.
+    ankerl::unordered_dense::map<uint32_t, SimNet> sim_nets_;
+    // report_once's keys.
+    ankerl::unordered_dense::set<std::string> reported_once_;
+    // "<InstanceScope::id>|<port>" -> contributions that instance has made
+    // through the port (contribute).
+    ankerl::unordered_dense::map<std::string, uint32_t> contribution_ordinals_;
+    // (InstanceScope::id << 32 | net) -> driver slots that instance has made for
+    // the net (alloc_driver_slot).
+    ankerl::unordered_dense::map<uint64_t, uint32_t> scope_slots_;
+    // Interface ports bound to an interface instance, as Collect meets them;
+    // lower_top resolves each instance to its scope (ir::Attribution::iface_ports).
+    struct PendingIfacePort {
+        uint32_t                              scope = 0;
+        std::string                           port;
+        const slang::ast::InstanceBodySymbol* body = nullptr;
+    };
+    std::vector<PendingIfacePort> iface_ports_;
 
     // Scope id of the instance currently being lowered, for Process::scope;
     // no_scope outside any instance (the package/$unit Lowerer).
@@ -5284,6 +5587,10 @@ private:
     // module get L0 and L1) — the remote form needs no separate instance
     // dimension.
     ankerl::unordered_dense::map<const Symbol*, uint32_t> disable_targets_;
+    // The instance bodies of each specialization this Lowerer collected, in
+    // collection order (note_specialization); join_disable_targets finds a
+    // target's twins in them.
+    ankerl::unordered_dense::map<uint32_t, std::vector<const slang::ast::InstanceBodySymbol*>> spec_bodies_;
     // The subset some `disable` names from OUTSIDE the target — a sibling block or
     // another process. Only these carry the occupant bookkeeping the remote form
     // needs, so a V1-shaped design pays exactly what it did before.
@@ -5438,11 +5745,14 @@ private:
     // ticks (time_mul_ == unit/precision * prec_over_tick_). Always 1 when
     // unitless. Saved / restored alongside time_mul_.
     uint64_t prec_over_tick_ = 1;
-    // Monotonic counter naming hidden compiler temporaries backed by a module
-    // signal (a synthesized event net, a force site, a gate input, and the loop
-    // cells of a process, which has no frame to put them in) so their flattened
-    // signal names stay unique.
-    uint32_t temp_id_ = 0;
+    // Ordinals naming hidden compiler temporaries backed by a module signal (a
+    // synthesized event net, a force site, a gate input, a task-argument temp, an
+    // unnamed clocking block, and the loop cells of a process, which has no frame
+    // to put them in), counted per name prefix (prefix_, next_temp_id): every
+    // instance and generate block numbers its own from 0, so the instances of one
+    // specialization name their temporaries alike, and the prefix keeps the flat
+    // names unique.
+    ankerl::unordered_dense::map<std::string, uint32_t> temp_ids_;
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
     // Package/$unit-scope subroutines never populate this map directly on a
@@ -5591,6 +5901,14 @@ private:
     // lower_compilation shares one registry across every top, like ClassIds.
     IfaceIds  own_iface_ids_;
     IfaceIds* iface_ids_ = &own_iface_ids_;
+    // Unit ownership (UnitOwners). Owned so a standalone Lowerer works;
+    // lower_compilation shares one across every Lowerer.
+    UnitOwners  own_owners_;
+    UnitOwners* owners_ = &own_owners_;
+    // The unit a scope-less process this Lowerer creates belongs to: its top's,
+    // once Collect has numbered the top scope; the glue unit's for the globals
+    // Lowerer.
+    ir::Owner process_owner_{ .kind = ir::Owner::Kind::Glue };
     // Design-wide virtual interface registry (see VifDefs). Owned here so a
     // standalone Lowerer works; lower_compilation shares one across every top.
     VifDefs  own_vif_defs_;
@@ -5662,12 +5980,12 @@ private:
     // default is the innermost context, and the object under construction is a
     // different object whenever the receiver was spelled out.
     std::optional<CtorThis> default_arg_this_;
-    // Monotonic counter naming anonymous output / inout task-argument temps created
-    // in a process body (where temps are module signals, not frame locals).
-    uint32_t task_temp_seq_ = 0;
-    // Accumulates static variable declaration initializers (LRM 6.8) across the
-    // whole instance hierarchy into one run-once pre-init process, finalized at the
-    // end of the top instance. Lazily engaged: absent when no initializer exists.
+    // Accumulates the declaration initializers (LRM 6.8) of the instance being lowered
+    // into a run-once pre-init process owned by that instance. lower_instance closes
+    // it (finalize_preinit) before descending into a child and at the end of the
+    // instance, so the flat process order keeps today's interleaving of a parent's
+    // initializers with its children's. Whatever Collect / Classify and the code after
+    // the walk append goes to the top's own processes. Lazily engaged.
     std::optional<ir::Builder> preinit_;
     // Live signal -> its Preponed shadow. LRM 16.5: assertion expressions read
     // sampled values, and what is sampled is the VARIABLE, not the expression.
@@ -5697,6 +6015,11 @@ private:
     // Diagnostics from members that failed and were recovered past, in the order
     // the walk hit them. Drained by lower_compilation.
     std::vector<Diagnostic> diags_;
+    // The ordinal, within its instance, of the assertion being lowered: what its state
+    // signals are named by, so twin instances name them alike (the monitor id is
+    // design-wide). `monitors_per_scope_` counts them, indexed by scope id.
+    uint32_t              monitor_ordinal_ = 0;
+    std::vector<uint32_t> monitors_per_scope_;
     // Set once any member was abandoned. The module is still returned -- it is
     // analysable, and `clotho lint` still wants it -- but it is missing
     // behaviour, so it MUST NOT reach codegen. lower_compilation turns this into

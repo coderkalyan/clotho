@@ -21,6 +21,13 @@ void Lowerer::report(Severity sev, std::string code, std::string msg, ir::Source
                                  .span     = span });
 }
 
+void Lowerer::report_once(Severity sev, std::string code, std::string msg, ir::SourceSpan span) {
+    std::string key = std::to_string(static_cast<uint64_t>(span.start)) + '|' + code + '|' + msg;
+    if (reported_once_.insert(std::move(key)).second) {
+        report(sev, std::move(code), std::move(msg), span);
+    }
+}
+
 void Lowerer::fail(std::string msg) {
     throw LowerError{ std::move(msg), to_source_span(cur_range_) };
 }
@@ -88,26 +95,39 @@ std::string Lowerer::finish_banner(const Expression& call, std::string_view task
 // Compile-time "<file>:<line>: " banner prefix at a source location. The
 // runtime appends the descriptive message and the simulation time (e.g.
 // rt_finish, the Observed-region case-violation report). A severity report
-// takes severity_banner instead, which also names the scope.
+// takes emit_report instead, which also names the scope.
 std::string Lowerer::banner_at(slang::SourceLocation sl) const {
     const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
     return sources_.shown_file(sl) + ":" + std::to_string(sm->getLineNumber(sl)) + ": ";
 }
 
-// Compile-time "<file>:<line>: <scope>" banner of a severity report. LRM 20.10
-// makes the report name where the call is and the hierarchical name of the
-// scope it is made in; the runtime adds " at <time>: <message>" (rt_severity).
-// The scope is what `%m` prints at the same place -- the instance, the
-// enclosing subroutine, and every named block or assertion label around the
-// call -- and it is as static as `%m` is, so no scope is looked up at run
-// time.
-std::string Lowerer::severity_banner(slang::SourceLocation sl) const {
-    const std::string scope  = hier_name();
-    std::string       banner = banner_at(sl);
-    if (scope.empty()) {
-        banner.pop_back(); // a scope-less call keeps no dangling space
+// A severity report (LRM 20.10, 16.3) with the banner "<file>:<line>: <scope>"; the
+// runtime adds " at <time>: <message>" (rt_severity). `where` is the
+// "<file>:<line>: " prefix. The scope is what `%m` prints at the same place -- the
+// instance, the enclosing subroutine, and every named block or assertion label
+// around the call. Inside an instance the report names the instance by reading its
+// path (inst_path) and keeps the rest of the scope as text after it, so it is the
+// same in every instance of the specialization; the runtime joins the three pieces
+// when it issues the line, and nothing is built where the report does not fire.
+// Elsewhere the banner is all text.
+void Lowerer::emit_report(ir::Builder&                b,
+                          uint32_t                    level,
+                          const std::string&          where,
+                          std::string_view            fmt,
+                          std::span<const ir::FmtArg> args,
+                          ir::SourceLoc               l,
+                          uint32_t                    defer) {
+    const ScopeName scope = hier_name();
+    if (!scope.in_instance) {
+        std::string banner = where;
+        if (scope.text.empty()) {
+            banner.pop_back(); // a scope-less call keeps no dangling space
+        }
+        b.severity(level, banner + scope.text, fmt, args, l, defer);
+        return;
     }
-    return banner + scope;
+    const ir::Index path = b.inst_path(l);
+    b.severity(level, where, fmt, args, l, defer, path, scope.text);
 }
 
 // Banner for a unique/priority case or if violation, located at the statement.
@@ -453,7 +473,7 @@ ir::Ref Lowerer::mask_type(uint32_t width) {
 Lowerer::MonitorState Lowerer::alloc_monitor_state(const ir::AssertionMonitor& mon,
                                                    uint32_t                    id,
                                                    const MonitorControl*       ctl) {
-    const std::string   base = "sva." + std::to_string(id) + ".";
+    const std::string   base = "sva." + std::to_string(monitor_ordinal_) + ".";
     const ir::SourceLoc l    = mon.span.start;
 
     MonitorState st;
@@ -746,7 +766,7 @@ Lowerer::TempCell Lowerer::make_temp_cell(ir::Ref type, std::string_view role) {
         return TempCell{ .type = type, .is_local = true, .local = idx };
     }
     ir::SignalInfo info;
-    info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+    info.name = prefix_ + "__" + std::string(role) + std::to_string(next_temp_id());
     info.type = type;
     info.dir  = ir::SignalInfo::Direction::Internal;
 
@@ -760,11 +780,19 @@ Lowerer::TempCell Lowerer::make_temp_cell(ir::Ref type, std::string_view role) {
 // the name is synthesized.
 ir::Signal Lowerer::declare_temp(ir::Ref type, std::string_view role) {
     ir::SignalInfo info;
-    info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+    info.name = prefix_ + "__" + std::string(role) + std::to_string(next_temp_id());
     info.type = type;
     info.dir  = ir::SignalInfo::Direction::Internal;
 
     return register_signal(std::move(info));
+}
+
+// The next ordinal of a hidden temporary named under the current prefix. The count
+// is per prefix, so an instance (or generate block) numbers its temporaries from 0
+// whatever else was lowered before it: the instances of one specialization then
+// name them alike, and the prefix is what keeps the names unique across instances.
+uint32_t Lowerer::next_temp_id() {
+    return temp_ids_[prefix_]++;
 }
 
 // An integer constant of the given interned type.

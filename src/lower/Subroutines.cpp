@@ -559,6 +559,51 @@ std::vector<const ValueSymbol*> Lowerer::body_automatics(const SubroutineSymbol&
     return std::move(sc.out);
 }
 
+std::vector<const VariableSymbol*> Lowerer::static_locals_of(const SubroutineSymbol& sub) {
+    struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+        std::vector<const VariableSymbol*> out;
+        void handle(const VariableDeclStatement& d) {
+            if (d.symbol.lifetime == slang::ast::VariableLifetime::Static) {
+                out.push_back(&d.symbol);
+            }
+            visitDefault(d);
+        }
+    };
+    Scan sc;
+    sub.getBody().visit(sc);
+    return std::move(sc.out);
+}
+
+// An interface instance declares the statics of its subroutines with its other
+// signals, in member order, and runs their initializers in its own PreInit
+// segment, so the instances of one interface agree on their layout and on their
+// start values however each was reached: a call through a handle runs the
+// representative's body against another instance's record, and an instance
+// nothing called directly has neither the storage nor the initializer its twin
+// got from the call. The body, when it is built, finds them already declared.
+void Lowerer::declare_interface_statics(const SubroutineSymbol& sub, bool collect) {
+    const std::vector<const VariableSymbol*> statics = static_locals_of(sub);
+    if (collect) {
+        FnCtx ctx;
+        ctx.name_prefix = std::string(sub.name) + ".";
+        const FnScope fn_scope(*this, &ctx);
+        for (const VariableSymbol* vs : statics) {
+            (void)declare_static_local(*vs);
+        }
+        if (sub.returnValVar != nullptr && sub.defaultLifetime == slang::ast::VariableLifetime::Static &&
+            static_return_needs_storage(sub)) {
+            (void)declare_static_return(sub);
+        }
+        return;
+    }
+    for (const VariableSymbol* vs : statics) {
+        if (vs->getInitializer() != nullptr || aggregate_has_field_defaults(vs->getType())) {
+            lower_var_initializer(*vs);
+            static_init_done_.insert(vs);
+        }
+    }
+}
+
 // True for a scope that depends on no module instance: inside a package or
 // `$unit`, so it has no instance multiplicity (LRM 8.9, 6.21: one static property,
 // one set of function statics). A class declared in a module is not, and neither
@@ -939,11 +984,20 @@ ir::FunctionId Lowerer::vif_function_id(const SubroutineSymbol& ph_sub) {
         for (const auto& [sym, sig] : inst.syms) {
             sigmap_.emplace(sym, sig);
         }
+
         const Restore<std::optional<ir::Signal>> ctx(vif_build_ctx_, inst.syms.begin()->second);
         const Restore<const Scope*> scope(scope_, inst.body);
         const auto&                 rep = rep_sym->as<SubroutineSymbol>();
         const ir::FunctionId                     id  = module_.reserve_function(subroutine_return_type(rep));
         vif_fnmap_[&ph_sub]                          = id;
+        // A second body of the representative's subroutine, beside the one its
+        // own direct calls use. It serves every instance through the handle,
+        // so it belongs to no one instance's unit: the glue unit holds it,
+        // under the subroutine's full path.
+        // TODO: the interface's unit, reaching members through Representative
+        // imports, once units are compiled on their own (modular-compilation.md
+        // step 3).
+        record_function(id, ir::Owner{ .kind = ir::Owner::Kind::Glue }, rep_sym->getHierarchicalPath() + ".vif");
         if (rep.subroutineKind == SubroutineKind::Task) {
             build_task(rep, id);
         } else {
@@ -980,6 +1034,7 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
     if (sub.flags.has(MethodFlags::DPIImport)) {
         const ir::FunctionId id = module_.reserve_function(subroutine_return_type(sub));
         fnmap_[&sub]            = id;
+        own_function(id, sub);
         build_dpi_import(sub, id);
         return id;
     }
@@ -993,6 +1048,7 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
 
     const ir::FunctionId id = module_.reserve_function(subroutine_return_type(sub));
     fnmap_[&sub]            = id;
+    own_function(id, sub);
     if (defer_bodies_) {
         // Reserved, not built: we are inside lowering a TYPE (compute_vtable), and
         // a body reaches arbitrary code -- another class still laying itself out,
@@ -1217,7 +1273,7 @@ void Lowerer::emit_unsupported_body_stub(const SubroutineSymbol& sub,
            e.span);
     const ir::SourceLoc el     = to_source_loc(sub.location);
     const std::string   banner = banner_at(sub.location);
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(sub.location), e.message, {}, el);
+    emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(sub.location), e.message, {}, el);
     b.finish(banner + "$fatal", 1, el);
 }
 
@@ -1541,11 +1597,12 @@ ir::Signal Lowerer::declare_static_return(const SubroutineSymbol& sub) {
     if (it != sigmap_.end()) {
         return it->second;
     }
-    ir::SignalInfo info;
-    info.name            = prefix_ + fn_ctx_->name_prefix + std::string(rv.name);
+    const std::optional<Home> home = home_of(sub.getParentScope());
+    ir::SignalInfo            info;
+    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(rv.name);
     info.type            = lower_type(rv.getType());
     info.dir             = ir::SignalInfo::Direction::Internal;
-    const ir::Signal sig = register_signal(std::move(info));
+    const ir::Signal sig = register_declared_signal(home, std::move(info));
     sigmap_[&rv]         = sig;
 
     return sig;
@@ -2276,7 +2333,7 @@ ir::Index Lowerer::make_arg_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) 
         return b.local(idx, type, l);
     }
     ir::SignalInfo info;
-    info.name = prefix_ + "__taskarg" + std::to_string(task_temp_seq_++);
+    info.name = prefix_ + "__taskarg" + std::to_string(next_temp_id());
     info.type = type;
     info.dir  = ir::SignalInfo::Direction::Internal;
     return b.signal(register_signal(std::move(info)), l);
@@ -2294,7 +2351,7 @@ ir::Index Lowerer::make_canonical_agg_temp(ir::Ref type, ir::Builder& b, ir::Sou
         return b.local(idx, type, l);
     }
     ir::SignalInfo info;
-    info.name      = prefix_ + "__aggarg" + std::to_string(task_temp_seq_++);
+    info.name      = prefix_ + "__aggarg" + std::to_string(next_temp_id());
     info.type      = type;
     info.dir       = ir::SignalInfo::Direction::Internal;
     info.force_agg = true;

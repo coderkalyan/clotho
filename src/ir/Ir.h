@@ -69,6 +69,8 @@ struct SourceSpan {
     [[nodiscard]] bool valid() const {
         return start != SourceLoc{ 0 };
     }
+
+    bool operator==(const SourceSpan&) const = default;
 };
 
 // What a resolver can say about a source construct: enough to print a location,
@@ -626,7 +628,7 @@ struct ProcCtlInfo {
 // requires a unique object representation.
 enum class CoverOp : uint32_t {
     // CoverQuery.
-    New,           // `cg_type ident = new` -> a covergroup handle
+    New,           // `cg_type ident = new` -> a covergroup handle; operands (ctx[, path])
     Ctx,           // the enclosing object captured at construction (embedded groups)
     First,         // the first live instance of a covergroup type, or null
     Next,          // the next instance after this one, or null
@@ -651,7 +653,12 @@ struct CoverInfo {
     // SSA operands, in order: the covergroup handle (absent for the type-level and
     // design-level queries, which name a type index or nothing), then the op's
     // value arguments -- for Hit the sampled value and its unknown-bit mask, for
-    // Start the 1-bit enable, for SetName the string.
+    // Start the 1-bit enable, for SetName the string. New takes no handle: its
+    // operands are the enclosing object a class-embedded group captures (0
+    // otherwise) and, when the group is built inside an instance, that instance's
+    // path (an InstPath value, borrowed), which the report names the new instance
+    // by. The path is an operand rather than part of the type, so the instances of
+    // one module share their covergroup types.
     ExtraSlice args;
     // Result type, for CoverQuery only: the 64-bit handle type for New / Ctx /
     // First / Next, the real type for a coverage percentage, 32-bit signed for a
@@ -664,7 +671,43 @@ struct CoverInfo {
     // Which coverpoint of that type, for Hit and the coverpoint-level queries.
     uint32_t point = 0;
     CoverOp  op    = CoverOp::New;
+    // New only: the packed bytes of the instance's name prefix after its path -- the
+    // generate blocks and the closing dot (".g[0]."), or all of the prefix when there
+    // is no path operand (a package's, empty outside every scope). Kept apart from
+    // the path and joined by the runtime when it copies the prefix into the new
+    // instance's name, so nothing is built here to join them.
+    ExtraIndex text = {};
+    // Length of that text in bytes.
+    uint32_t text_len = 0;
 };
+
+// Whether `op` names its covergroup type through CoverInfo::type_idx. The other
+// ops reach the type through the instance handle, or need none, and leave the
+// index unset -- so only these have a type for Ir::rebased to map.
+constexpr bool cover_op_names_type(CoverOp op) {
+    switch (op) {
+        case CoverOp::New:
+        case CoverOp::First:
+        case CoverOp::TypeCoverage:
+        case CoverOp::TypeCovered:
+        case CoverOp::TypeTotal:
+            return true;
+        case CoverOp::Ctx:
+        case CoverOp::Next:
+        case CoverOp::InstCoverage:
+        case CoverOp::InstCovered:
+        case CoverOp::InstTotal:
+        case CoverOp::PointCoverage:
+        case CoverOp::PointCovered:
+        case CoverOp::PointTotal:
+        case CoverOp::DesignCoverage:
+        case CoverOp::Hit:
+        case CoverOp::Start:
+        case CoverOp::SetName:
+            return false;
+    }
+    return false;
+}
 
 // Which wait-queue primitive a SyncWait / SyncCtl instruction performs, for the
 // built-in `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM 15.4). Split across two
@@ -696,9 +739,10 @@ struct SyncInfo {
     // lvalue. Both are ordinary members of the object's synthetic body, so the
     // backend needs no layout knowledge -- the frontend selects the field.
     ExtraSlice args;
-    // Wait SITE identity, unique design-wide. A `Park` and the `Leave` that
+    // Wait SITE identity within its body. A `Park` and the `Leave` that
     // discharges it carry the same site, which is how they share one
-    // frame-resident node (the backend allocates one per site per body).
+    // frame-resident node (the backend allocates one per site per body), so a
+    // site means nothing outside the body that holds it.
     uint32_t site = 0;
     SyncOp   op   = SyncOp::Park;
 };
@@ -926,9 +970,15 @@ enum class Severity : uint32_t {
 };
 
 // Extra payload for `severity`: an $info / $warning / $error / $fatal report
-// (LRM 20.10) or an immediate-assertion default failure (LRM 16.3). `banner` /
-// `banner_len` are the packed bytes of the compile-time "<file>:<line>: " prefix
-// the runtime completes with the message. `fmt` / `fmt_len` are the packed
+// (LRM 20.10) or an immediate-assertion default failure (LRM 16.3). The report's
+// banner "<file>:<line>: <scope>" is three pieces: the packed bytes `banner` /
+// `banner_len` (all of it for a report outside every instance), then, when `path`
+// is not kNoIndex, the instance path that value holds, then the packed bytes
+// `tail` / `tail_len` (the scope after the instance: generate blocks, subroutine,
+// named blocks). The pieces stay apart and the runtime joins them when it issues
+// the report, because most reports never fire and an activation that does not
+// issue one pays nothing for the banner. `path` is an InstPath, a borrowed string
+// the runtime reads and never keeps. `fmt` / `fmt_len` are the packed
 // $display-style format bytes; `args` the value operands its specifiers consume
 // (both empty for a bare `$error;` or a default assertion failure). `level` is
 // the ir::Severity label. `defer` selects the scheduling region for a deferred
@@ -936,9 +986,9 @@ enum class Severity : uint32_t {
 // where it is lowered), 1 = observed deferred (`assert #0`, matures + fires in
 // the Observed region), 2 = final deferred (`assert final`, Postponed region).
 struct SeverityInfo {
-    // First extra word of the packed banner-prefix bytes.
+    // First extra word of the packed bytes of the banner's leading text.
     ExtraIndex banner;
-    // Banner-prefix length in bytes.
+    // Length of that text in bytes.
     uint32_t banner_len;
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
@@ -952,6 +1002,13 @@ struct SeverityInfo {
     ExtraSlice args;
     // As DisplayInfo::signs.
     ExtraSlice signs;
+    // The path of the instance the report is made in (an InstPath value), or
+    // kNoIndex when `banner` already holds the whole banner.
+    Index path;
+    // First extra word of the packed bytes of the banner's text after the path.
+    ExtraIndex tail;
+    // Length of that text in bytes; zero when `path` is kNoIndex.
+    uint32_t tail_len;
 };
 
 // Extra payload for `fseek`: $fseek(fd, offset, operation) — the descriptor is
@@ -1368,6 +1425,26 @@ struct Inst {
         // lifetime) rather than the persistent state buffer. Holds formals, the
         // return variable, and body-local declarations of a function.
         Local,
+        // The hierarchical path of the instance this body belongs to ("top.u1"), as
+        // a string value (payload: none). An instance's name and place in the tree
+        // are per-instance DATA, so a body reads them here instead of carrying them
+        // as text: its IR then stays the same in every instance of one
+        // specialization. The flat module resolves it from the body's own instance
+        // (Process::scope, Function::scope) when it is flattened for the backend;
+        // compiling units directly will read it from a per-instance record. A body
+        // that belongs to no instance (a package or `$unit` subroutine) never holds
+        // one.
+        //
+        // The value is BORROWED: a read-only string that lives as long as the
+        // instance (a constant today, a record field later) and that nothing owns,
+        // so evaluating it costs nothing and an activation that never reports pays
+        // nothing for it. It may only be read -- a display or `$sformatf` argument,
+        // a part of a severity banner, a source operand of a concatenation,
+        // comparison or copy. A consumer that needs a string of its own copies it
+        // (a store does), and one that wants text around it keeps that text apart
+        // and joins them when it runs (SeverityInfo, display formats), because a
+        // concatenation would make a temporary of it per activation.
+        InstPath,
 
         // -- Lvalue derivation --
         // Single-bit select base[index] (payload: binary).
@@ -2174,10 +2251,11 @@ struct Inst {
         // Severity system task report ($info / $warning / $error / $fatal, LRM
         // 20.10) or the default failure of an immediate assertion (LRM 16.3),
         // both non-terminating (payload: extra -> SeverityInfo, carrying the
-        // severity level, compile-time banner prefix, and $display-style format
-        // + value args). Lowers to an rt_severity call that renders the message
-        // and writes the labelled diagnostic to stderr, then returns. $fatal's
-        // termination is a separate Finish the frontend emits after this report.
+        // severity level, the banner (compile-time text around an optional
+        // InstPath operand), and $display-style format + value args). Lowers to
+        // an rt_severity call that renders the message and writes the labelled
+        // diagnostic to stderr, then returns. $fatal's termination is a separate
+        // Finish the frontend emits after this report.
         Severity,
         // $fflush: flush a descriptor's output buffers (payload: unary, the
         // descriptor value; the no-argument form passes a constant 0, which the
@@ -2568,6 +2646,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Signal:
             return K::Signal;
         case T::EventNew:
+        case T::InstPath:
             return K::None;
         case T::Arg:
             return K::Arg;
@@ -3029,6 +3108,9 @@ enum class ExtraOperandTail : uint8_t {
     // handles are strided three words apart inside the packed WaitEdge run, so
     // they are not a slice and cannot be a span.
     WaitHandles,
+    // + SeverityInfo::path, when the report's banner names the instance it is
+    // made in: an InstPath value, read at run time.
+    SeverityPath,
 };
 
 // Constexpr for the same reason as extra_operand_shape(): operand walks inline
@@ -3052,6 +3134,8 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
             return E::InsideSetMembers;
         case T::Wait:
             return E::WaitHandles;
+        case T::Severity:
+            return E::SeverityPath;
         default:
             return E::None;
     }
@@ -3079,6 +3163,9 @@ constexpr bool extra_operand_tails_total() {
             return false;
         }
         if ((kind == Inst::PayloadKind::Sformatf) != (tail == ExtraOperandTail::SformatfFmt)) {
+            return false;
+        }
+        if ((kind == Inst::PayloadKind::Severity) != (tail == ExtraOperandTail::SeverityPath)) {
             return false;
         }
         if (tail == ExtraOperandTail::InsideSetMembers && tag != Inst::Tag::InsideSet) {
@@ -3127,6 +3214,37 @@ struct IrView {
     }
 };
 
+// A family of cross-table handles an IR body carries (Ir::rebased).
+enum class HandleFamily : uint8_t {
+    // Signal, wherever a body names one for its storage.
+    Signal,
+    // Signal that names only a layout: some instance's member, standing for
+    // that member of whichever instance a virtual interface handle supplies
+    // (IfaceMember::signal, Function::ctx_member; LRM 25.9).
+    Layout,
+    // FunctionId: callees, fork children, deferred bodies.
+    Function,
+    // IfaceInst::scope: an interface instance an IfaceRef names.
+    IfaceScope,
+    // Assertion monitor index (ExpectInfo, ExpectWake).
+    Monitor,
+    // Covergroup type index (CoverInfo::type_idx).
+    CoverType,
+    // `disable` target id; kNoDisableTarget is never mapped.
+    DisableTarget,
+};
+
+// Maps the cross-table handles of a body onto another set of tables. A unit's
+// bodies (Design.h) name the unit's own tables: flatten maps them onto the flat
+// module's, and partition maps a flat module's onto a unit's, creating extern
+// declarations as it goes -- hence non-const.
+class HandleMapper {
+public:
+    virtual ~HandleMapper() = default;
+
+    virtual uint32_t map(HandleFamily family, uint32_t handle) = 0;
+};
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -3151,6 +3269,17 @@ public:
     size_t inst_count() const {
         return tags_.size();
     }
+
+    // A copy of this body with every cross-table handle (HandleFamily) mapped
+    // through `m`. Instruction indices, constants and types are unchanged, so
+    // the copy shares this body's pool. A default-constructed body (a slot never
+    // built) copies as one.
+    Ir rebased(HandleMapper& m) const;
+
+    // Whether two bodies are the same instruction for instruction, handles,
+    // locations and side tables included, over one pool. Payloads compare as
+    // bytes, which Builder keeps fully initialized.
+    bool operator==(const Ir& other) const;
 
     // End of the source construct an instruction came from, exclusive, or
     // SourceLoc{0} when unrecorded. Sparse on purpose: a 16-byte SourceSpan per
@@ -3313,6 +3442,13 @@ public:
                 }
                 for (const Index op : index_slice(info.ranges)) {
                     fn(op);
+                }
+                return;
+            }
+            case ExtraOperandTail::SeverityPath: {
+                const auto info = extra_data<SeverityInfo>(p.extra);
+                if (info.path != kNoIndex) {
+                    fn(info.path);
                 }
                 return;
             }

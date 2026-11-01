@@ -75,7 +75,8 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
 
     // Per-member table setup, run before lowering anything of that member.
     const auto select_member = [&](uint32_t m) {
-        ir_            = &all[m].ir;
+        ir_             = &all[m].ir;
+        cur_proc_scope_ = all[m].scope;
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<Guarded>{});
@@ -188,6 +189,12 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // forks widens the population it is latent in, so fix it rather than reason
     // about it again.
     pcb_ = nullptr;
+    // Nor is a thunk group a PreInit or Preponed capture, whose stores generate
+    // no event: that is a property of the process being lowered, so it must not
+    // be inherited from the one lowered before this group (a declaration
+    // initializer of an earlier top), or every member store of the group wakes
+    // nobody. The outlined member functions below read it without ever setting it.
+    silent_stores_ = false;
     if (config_.split && config_.outline && thunk_group_[g_] &&
         members.size() > 1 && members.size() <= outline_max_members &&
         group_unit_anchor_[g_] == SignalSlot::no_anchor &&
@@ -275,7 +282,6 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         event_wait_nodes_.clear();
     sync_nodes_.clear();
         cur_is_task_      = false;
-        silent_stores_ = false;
         hdl_              = nullptr;
         auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
         b_.SetInsertPoint(entry_bb);

@@ -234,6 +234,16 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Cross-compiling an executable** — `build` writes one only for the machine it runs
   on; another target needs its executable runtime and C library startup files.
 
+### Compilation
+
+- [ ] **Per-specialization lowering (performance)** — every elaborated instance is lowered
+  separately into one flat module instead of once per specialization into a unit
+  (docs/design/modular-compilation.md).
+- [ ] **Per-unit code generation (performance)** — unit code depends on the whole design,
+  and `build` links every module into one and generates its code on one thread.
+- [ ] **Compilation caching across runs (performance)** — syntax trees, lowered units and
+  objects are rebuilt each run; needs content-addressed caches.
+
 ### File and string I/O
 
 - [ ] **`$fgets` into a part-select or non-byte-multiple target**.
@@ -250,8 +260,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Numeric conversion into a `string` destination** — `%d` and friends must store the
     converted value as an integral-to-string assignment (6.16).
   - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
-- [ ] **Parse caching across runs (performance)** — the Driver, SourceManager and syntax
-  trees are rebuilt each run; needs a content-addressed cache.
 - [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
   returned to power-on between designs in one process (docs/design/cooperative-finish.md).
 - [ ] **`-G` override naming a parameter no top-level module has** — accepted without a
@@ -279,7 +287,10 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Net types, strengths, resolution
 
-- [ ] **`trireg` nets** — strength and charge storage.
+- [ ] **`trireg` nets** — strength and charge storage; also refused as the simulated net of
+  an inout port collapse (23.3.3.7).
+- [ ] **Net delay on an inout port net that dominates the net it connects to** (23.3.3.7,
+  28.16) — the delay needs the declaring module's time unit.
 - [~] **Multiple-driver net resolution** (6.6) — missing pieces:
   - [ ] **Unpacked-array and unpacked-struct nets** — needs per-element slots and resolvers.
   - [ ] **Concatenation-operand driver** — needs a split into per-net stores.

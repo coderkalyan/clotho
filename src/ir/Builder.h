@@ -48,6 +48,9 @@ public:
     // A function-frame local slot (lvalue leaf); `index` selects the slot, `type`
     // gives its storage width / domain.
     Index local(uint32_t index, Ref type, SourceLoc loc);
+    // The hierarchical path of the instance the body belongs to, as a string value
+    // (Inst::Tag::InstPath).
+    Index inst_path(SourceLoc loc);
 
     // -- Named events (LRM 15.5) --
     // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
@@ -458,18 +461,22 @@ public:
 
     // -- Functional coverage (LRM 19, docs/design/functional-coverage.md) --
     // `args` is the operand run CoverInfo carries: the covergroup handle first
-    // (absent for the type-level and design-level queries), then the op's value
-    // arguments. `type_idx` selects the covergroup type in Module::cover_types and
-    // `point` its coverpoint, both ignored by ops that address neither.
+    // (absent for the type-level and design-level queries, and for `new`, whose
+    // operands are the enclosing object and, inside an instance, the instance's
+    // path), then the op's value arguments. `type_idx` selects the covergroup type
+    // in Module::cover_types (an op that names no type, cover_op_names_type,
+    // records none) and `point` its coverpoint (0 for an op that addresses none).
     //
     // A value-producing query (`new`, the registry walk, a coverage number);
-    // `type` is its result type.
+    // `type` is its result type. `text` is `new`'s name-prefix text after the
+    // instance's path (CoverInfo::text), and empty for every other op.
     Index cover_query(CoverOp                op,
                       std::span<const Index> args,
                       Ref                    type,
                       uint32_t               type_idx,
                       uint32_t               point,
-                      SourceLoc              loc);
+                      SourceLoc              loc,
+                      std::string_view       text = {});
     // A zero-time statement (a coverpoint sample, `start`/`stop`,
     // `set_inst_name`).
     Index cover_ctl(CoverOp                op,
@@ -587,15 +594,21 @@ public:
     Index case_violation(std::string_view banner, uint32_t kind, SourceLoc loc);
     // Severity report ($info / $warning / $error / $fatal, LRM 20.10, or an
     // immediate-assertion default failure, LRM 16.3). `level` is the ir::Severity
-    // label; `banner` the compile-time prefix "<file>:<line>: "; `fmt` + `args`
-    // the $display-style message (both empty for a bare `$error;`). Non-fatal,
-    // renders and returns; $fatal's termination is a following finish().
+    // label; `banner` the compile-time prefix "<file>:<line>: <scope>"; `fmt` +
+    // `args` the $display-style message (both empty for a bare `$error;`).
+    // Non-fatal, renders and returns; $fatal's termination is a following
+    // finish(). A report inside an instance passes `path` (an inst_path value) and
+    // the scope text after it as `tail`, with `banner` holding only the text before
+    // the path: the runtime joins the three when it reports, so an activation that
+    // does not report pays nothing for the banner (SeverityInfo).
     Index severity(uint32_t                level,
                    std::string_view        banner,
                    std::string_view        fmt,
                    std::span<const FmtArg> args,
                    SourceLoc               loc,
-                   uint32_t                defer = 0);
+                   uint32_t                defer = 0,
+                   Index                   path  = kNoIndex,
+                   std::string_view        tail  = {});
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);

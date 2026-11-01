@@ -1100,6 +1100,10 @@ struct ModuleEnv {
     // The shared zero word a `ref` through a stable place aims its epoch at
     // (no_epoch_global).
     llvm::GlobalVariable* no_epoch = nullptr;
+    // The borrowed string handle of each instance's path, keyed by the instance's
+    // anchor index (inst_path_handle). Per module like the other internal constants:
+    // every unit module that reads an instance's path holds its own.
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> inst_paths;
 };
 
 // Builds the shared state struct and lowers every process. One instance per
@@ -2877,6 +2881,10 @@ private:
 
     void lower_string_constant(Index i, Ref ref);
 
+    llvm::Value* inst_path_handle(uint32_t scope);
+
+    uint32_t body_scope() const;
+
     void lower_string_concat(Index i);
 
     Plane lower_string_relation(Inst::Tag tag, Index l, Index r);
@@ -4395,6 +4403,10 @@ private:
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
     bool                    cur_is_task_ = false;
+    // The instance (InstanceScope::id) the process being lowered belongs to, as
+    // Process::scope says: what an InstPath inside it names. Set per member by
+    // lower_group; a function or task body names its own instead (body_scope).
+    uint32_t cur_proc_scope_ = Process::no_scope;
     // LLVM arg index of each of the current function/task's formals (see
     // param_indices) — string formals make the stride non-uniform.
     std::vector<uint32_t> param_llvm_index_;

@@ -91,6 +91,10 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
         // arr[i] for an instance array).
         fresh.name     = node_rel_ + std::string(leaf_name);
         fresh.def_name = std::string(inst.getDefinition().name);
+        own_scope(
+          body, ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = fresh.id }, inst.getHierarchicalPath() + ".");
+        scope_prefix_[fresh.id] = self_prefix;
+        note_specialization(inst, fresh.id);
         if (scope_stack_.empty()) {
             top_scope_ = std::move(fresh);
             self       = &top_scope_;
@@ -98,6 +102,12 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
             scope_stack_.back()->children.push_back(std::move(fresh));
             self = &scope_stack_.back()->children.back();
         }
+    }
+    // The initializers of the instance being left, so far, run before this child's
+    // and the ones it declares after the child run after them: a parent's open
+    // segment closes here, in the parent's own scope (a no-op for the top).
+    if (pass == Pass::Emit) {
+        finalize_preinit(cur_scope_id());
     }
     scope_stack_.push_back(self);
     // This instance's own members are named relative to it, so the
@@ -125,6 +135,18 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
         // connection signals BEFORE collect_signals registers them, so the
         // shared storage is set up when the child body's signals are created.
         build_inout_aliases(inst);
+        for (const PortConnection* pc : inst.getPortConnections()) {
+            if (pc->port.kind != SymbolKind::InterfacePort) {
+                continue;
+            }
+            const Symbol* conn = pc->getIfaceConn().first;
+            if (conn != nullptr && conn->kind == SymbolKind::Instance) {
+                // Resolved to the instance's scope after Collect, once every
+                // interface instance is registered (lower_top).
+                iface_ports_.push_back(PendingIfacePort{
+                  .scope = self->id, .port = std::string(pc->port.name), .body = &conn->as<InstanceSymbol>().body });
+            }
+        }
         collect_signals(body);
     }
     size_t child_cursor = 0;
@@ -139,7 +161,152 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
     }
 
     node_rel_ = saved_node_rel;
+    if (pass == Pass::Emit) {
+        finalize_preinit(self->id);
+    }
     scope_stack_.pop_back();
+}
+
+void Lowerer::own_scope(const Scope& scope, ir::Owner owner, std::string strip) {
+    owners_->scopes.insert_or_assign(&scope, UnitOwners::Entry{ .owner = owner, .strip = std::move(strip) });
+}
+
+// Which specialization an instance elaborates, by slang's own sharing rule
+// (definition, parameter values, interface port specializations; LRM 23.10):
+// a body slang shares names its canonical body. slang never visits a duplicate
+// instance's body, so the children of one carry no canonical body of their own;
+// they elaborate exactly what the same child of the canonical instance does.
+void Lowerer::note_specialization(const InstanceSymbol& inst, uint32_t scope) {
+    UnitOwners& o         = *owners_;
+    bool        duplicate = inst.getCanonicalBody() != nullptr;
+    uint32_t    spec      = UINT32_MAX;
+    if (!scope_stack_.empty()) {
+        const UnitOwners::Spec parent  = o.scope_specs.at(scope_stack_.back()->id);
+        const uint64_t         ordinal = scope_stack_.back()->children.size();
+        const uint64_t         key     = (static_cast<uint64_t>(parent.spec) << 32) | ordinal;
+        if (parent.duplicate) {
+            duplicate = true;
+            if (const auto it = o.child_specs.find(key); it != o.child_specs.end()) {
+                spec = it->second;
+            }
+        }
+        if (spec == UINT32_MAX) {
+            spec = o.body_spec(inst.getCanonicalBody() != nullptr ? *inst.getCanonicalBody() : inst.body);
+        }
+        o.child_specs.try_emplace(key, spec);
+    } else {
+        spec = o.body_spec(inst.getCanonicalBody() != nullptr ? *inst.getCanonicalBody() : inst.body);
+    }
+    o.scope_specs[scope] = UnitOwners::Spec{ .spec = spec, .duplicate = duplicate };
+
+    std::vector<uint32_t>& specs = o.attribution.scope_specs;
+    if (specs.size() <= scope) {
+        specs.resize(scope + 1, UINT32_MAX);
+    }
+    specs[scope] = spec;
+    spec_bodies_[spec].push_back(&inst.body);
+}
+
+const UnitOwners::Entry& Lowerer::owner_in(const Scope* scope) const {
+    static const UnitOwners::Entry glue{ .owner = ir::Owner{ .kind = ir::Owner::Kind::Glue } };
+    for (const Scope* s = scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        if (const auto it = owners_->scopes.find(s); it != owners_->scopes.end()) {
+            return it->second;
+        }
+    }
+    return glue;
+}
+
+std::optional<Lowerer::Home> Lowerer::home_of(const Scope* decl) {
+    const Scope* body = enclosing_instance_scope(decl);
+    if (body == nullptr || body->asSymbol().kind != SymbolKind::InstanceBody) {
+        return std::nullopt;
+    }
+    const ir::Owner owner = owner_in(body).owner;
+    if (owner.kind != ir::Owner::Kind::Scope) {
+        return std::nullopt;
+    }
+    ir::InstanceScope* node = find_node(owner.index);
+    if (node == nullptr) {
+        return std::nullopt;
+    }
+    std::string prefix = scope_prefix_.at(owner.index);
+    if (const std::string blocks = generate_path(decl); !blocks.empty()) {
+        prefix.append(blocks, 1, std::string::npos);
+        prefix += '.';
+    }
+    return Home{ .node = node, .prefix = std::move(prefix) };
+}
+
+ir::Signal Lowerer::register_declared_signal(const std::optional<Home>& home, ir::SignalInfo info) {
+    if (home && home->node->id != cur_scope_id()) {
+        return register_signal_in(*home->node, std::move(info));
+    }
+    return register_signal(std::move(info));
+}
+
+std::string Lowerer::import_name(const Symbol& decl) const {
+    const UnitOwners::Entry& e    = owner_in(decl.getParentScope());
+    std::string              name = decl.getHierarchicalPath();
+    if (name.starts_with(e.strip)) {
+        name.erase(0, e.strip.size());
+    }
+    return name;
+}
+
+// `name` as an import name unique within its table of the unit `e` owns.
+// TODO: a class (or covergroup type) declared in a package or `$unit` is lowered
+// once per Lowerer that reaches it (its Refs are nominal per Lowerer), so its copy
+// thunk, randomize and sample bodies exist once per top. Until those lower once, in
+// their declaring unit, the later copies take an ordinal so every import name stays
+// unique within its unit.
+std::string Lowerer::unique_import_name(const UnitOwners::Entry& e, std::string name, std::string_view table) {
+    const std::string key = std::string(table) + std::to_string(static_cast<uint32_t>(e.owner.kind)) + ":" +
+                            std::to_string(e.owner.index) + ":" + name;
+    const uint32_t    seen = owners_->names[key]++;
+    if (seen != 0) {
+        name += "#" + std::to_string(seen + 1);
+    }
+    return name;
+}
+
+void Lowerer::own_function(ir::FunctionId id, const Symbol& decl, std::string_view suffix) {
+    const UnitOwners::Entry& e = owner_in(decl.getParentScope());
+    record_function(id, e.owner, unique_import_name(e, import_name(decl) + std::string(suffix), ""));
+}
+
+void Lowerer::own_cover_type(uint32_t idx, const Symbol& decl) {
+    const UnitOwners::Entry& e = owner_in(decl.getParentScope());
+    ir::Attribution&         a = owners_->attribution;
+    if (a.cover_types.size() <= idx) {
+        a.cover_types.resize(idx + 1);
+        a.cover_type_names.resize(idx + 1);
+    }
+    a.cover_types[idx]      = e.owner;
+    a.cover_type_names[idx] = unique_import_name(e, import_name(decl), "cover:");
+}
+
+void Lowerer::record_function(ir::FunctionId id, ir::Owner owner, std::string name) {
+    ir::Attribution& a = owners_->attribution;
+    const auto       i = static_cast<uint32_t>(id);
+    if (a.functions.size() <= i) {
+        a.functions.resize(i + 1);
+        a.function_names.resize(i + 1);
+    }
+    a.functions[i]      = owner;
+    a.function_names[i] = std::move(name);
+}
+
+void Lowerer::add_process(ir::Process p) {
+    if (p.scope == ir::Process::no_scope) {
+        std::vector<ir::Owner>& owners = owners_->attribution.processes;
+        const auto              i      = static_cast<uint32_t>(module_.processes().size());
+        if (owners.size() <= i) {
+            owners.resize(i + 1);
+        }
+        owners[i] = process_owner_;
+    }
+    module_.add_process(std::move(p));
 }
 
 // Every signal of one interface instance that a handle can reach, including
@@ -308,8 +475,9 @@ std::optional<VifClockVar> Lowerer::vif_clockvar(const slang::ast::ClockVarSymbo
 // well-formed target on the unreachable path after it.
 ir::Index Lowerer::vif_null_place(const slang::ast::Type& type, ir::Builder& b, ir::SourceLoc l) {
     const std::string banner = banner_at(cur_range_.start());
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-               severity_banner(cur_range_.start()),
+    emit_report(b,
+               static_cast<uint32_t>(ir::Severity::Fatal),
+               banner_at(cur_range_.start()),
                "use of a null virtual interface",
                {},
                l);
@@ -451,16 +619,34 @@ std::optional<ir::Signal> Lowerer::vif_member_signal(const slang::ast::Symbol&  
     return std::nullopt;
 }
 
-// Lower one top instance and its whole hierarchy, then emit the accumulated
-// declaration initializers as this Lowerer's pre-init process. finalize_preinit
-// runs here, per top, rather than inside lower_instance: a multi-top design
-// gives every top a "<name>." prefix, so gating on an empty prefix would drop
-// all initializers (each top gets its own Lowerer, so this covers each one).
+// Lower one top instance and its whole hierarchy. Declaration initializers become
+// run-once PreInit processes owned by the instance that declares them: lower_instance
+// closes the open one at every child boundary, so the processes keep the order of the
+// elaboration walk, and at the end of the instance; this function closes the top's
+// head (what Collect and Classify appended) and its last (what follows the walk).
+// Each top gets its own Lowerer, so a multi-top design is covered too.
 void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     top_elided_    = prefix.empty();
     top_inst_      = &top;
     reads_scanned_ = false;
     lower_instance(top, prefix, Pass::Collect, nullptr, top.name);
+    // Every inout port is met: the net type of each net they collapse is final
+    // (LRM 23.3.3.7), and nothing has consumed one yet but the registrations
+    // finalize_sim_nets corrects.
+    finalize_sim_nets();
+    process_owner_ = ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = top_scope_.id };
+    for (const PendingIfacePort& p : iface_ports_) {
+        for (const VifInstance& rec : vif_defs_->insts) {
+            if (rec.body == p.body) {
+                owners_->attribution.iface_ports.push_back({ .scope = p.scope, .port = p.port, .target = rec.scope });
+                break;
+            }
+        }
+    }
+    iface_ports_.clear();
+    // Every instance is collected: a target named from outside its instance is
+    // now known, and no instance has been emitted yet.
+    join_disable_targets();
     // Between the passes: Collect has just enumerated every assertion and
     // said whether the design calls an LRM 20.12 control task, and the
     // scope tree it built is now frozen, so the control state can be
@@ -471,6 +657,11 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // Classify reuses the scope tree Collect built (Emit has not yet moved
     // it out); it only reads node pointers to walk children in order.
     lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
+    // Whatever Collect and Classify appended (a constant table seeded or a function
+    // static first reached from a continuous driver) is the top's own head process,
+    // ahead of every process the Emit walk creates, as it was ahead of every
+    // initializer when one process held them all.
+    finalize_preinit(top_scope_.id);
     lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
     emit_wire_resolvers();
     // Static class property initializers of classes declared under this top; a
@@ -498,13 +689,14 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // access inside a class task resolves instead of warning never-bound. A
     // body drained here may append function-static initializers to the
     // globals PreInit builder, which lower_globals already finalized; flush
-    // them into a process of their own, still ahead of this top's preinit.
+    // them into a process of their own, still ahead of this top's initializers.
     if (globals_ != nullptr && globals_ != this) {
-        globals_->finalize_preinit();
+        globals_->finalize_preinit(ir::Process::no_scope);
     }
-    // Before finalize_preinit, which closes the process the seeds go into.
+    // Before finalize_preinit, which closes the process the seeds go into: the
+    // top's last one, after every instance's own initializers.
     finalize_sva_history();
-    finalize_preinit();
+    finalize_preinit(top_scope_.id);
     finalize_preponed();
     module_.add_top(std::move(top_scope_));
 }
@@ -535,6 +727,19 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
     // (and lower_compilation drains any remainder), so those bodies build once
     // the registry is complete. Initializer EXPRESSIONS still lower right
     // here -- only bodies they merely reserved wait.
+    // Every package and compilation unit is a static unit of its own.
+    const auto own_static = [&](const Scope& scope, std::string name) {
+        std::vector<std::string>& statics = owners_->attribution.statics;
+        own_scope(
+          scope, ir::Owner{ .kind = ir::Owner::Kind::Static, .index = static_cast<uint32_t>(statics.size()) }, "");
+        statics.push_back(std::move(name));
+    };
+    for (const PackageSymbol* pkg : comp.getPackages()) {
+        own_static(*pkg, std::string(pkg->name));
+    }
+    for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+        own_static(*unit, "$unit");
+    }
     for (const PackageSymbol* pkg : comp.getPackages()) {
         register_global_scope_signals(*pkg);
     }
@@ -563,7 +768,7 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
     for (const CompilationUnitSymbol* unit : root.compilationUnits) {
         init_static_class_props(*unit);
     }
-    finalize_preinit();
+    finalize_preinit(ir::Process::no_scope);
 }
 
 // The globals Lowerer's last phase, run by lower_compilation once every top
@@ -575,7 +780,7 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
 // of their own.
 void Lowerer::finalize_globals() {
     drain_pending_bodies();
-    finalize_preinit();
+    finalize_preinit(ir::Process::no_scope);
 }
 
 // Force declaration -- and thereby time-zero initialization -- of every static
@@ -821,6 +1026,16 @@ void Lowerer::lower_members(const Scope&       scope,
                 if (pass == Pass::Collect)
                     recover([&] { check_defparam_type(m.as<DefParamSymbol>()); });
                 break;
+            // Subroutines lower on demand at call sites, except that an interface's
+            // statics are declared with the instance: a virtual interface handle
+            // reaches the body of ONE instance for all of them and addresses what it
+            // touches by that instance's layout, so every instance of the interface
+            // must hold the same signals, whichever of its subroutines were called.
+            case SymbolKind::Subroutine:
+                if ((pass == Pass::Collect || emit) && is_iface_body_subroutine(m.as<SubroutineSymbol>())) {
+                    recover([&] { declare_interface_statics(m.as<SubroutineSymbol>(), pass == Pass::Collect); });
+                }
+                break;
             // Known-inert members: elaboration artifacts and declarations
             // that bear no simulation behavior of their own. Ports are wired
             // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -864,7 +1079,6 @@ void Lowerer::lower_members(const Scope&       scope,
             case SymbolKind::GenericClassDef:
             case SymbolKind::TransparentMember:
             case SymbolKind::Genvar:
-            case SymbolKind::Subroutine:
             case SymbolKind::StatementBlock:
             case SymbolKind::WildcardImport:
             case SymbolKind::ExplicitImport:
@@ -1101,6 +1315,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         const Expression* sel = p.getInternalExpr();
 
         if (cur_pass_ == Pass::Classify) {
+            check_value_port_nets(p, *expr);
             // The connection is a continuous driver: an output drives the
             // parent-side lvalue, an input drives the port's own bits of the
             // child net.
@@ -1149,7 +1364,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
             // type, so read the child net directly and convert it by that
             // conversion (lower_port_output). Wakes on the child net.
             const AssignmentExpression& a = expr->as<AssignmentExpression>();
-            if (const std::optional<ir::Signal> net = resolved_net_of(a.left())) {
+            if (const std::optional<ir::Signal> net = driver_net_of(a.left())) {
                 // The parent net has multiple drivers: stage this child's
                 // output (whole net, or a constant sub-range with a Z
                 // background) into its own slot; the resolver folds them.
@@ -1168,7 +1383,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 }
                 const ir::Index  child_val = lower_port_output(a, port_rvalue(), b);
                 const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
-                const ir::Signal slot = alloc_driver_slot(*net, l, /*strength=*/0x0303, child_is_program);
+                const ir::Signal slot = driver_slot(*net, a.left(), l, /*strength=*/0x0303, child_is_program);
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
                 add_continuous_process(std::move(sens), l, b, child_is_program);

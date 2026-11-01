@@ -418,9 +418,20 @@ diagnosed. That is a real gap, recorded in §14.
 
 `cg c = new;` lowers to a single `CoverQuery` with `CoverOp::New`
 (`src/lower/Coverage.cpp`'s `lower_new_covergroup`), which the backend turns into
-`rt_cover_new(type_idx, ctx)`. There is no synthesized constructor, because the
-bin table is static model data (§6.3) rather than per-instance state to compute:
-the only thing construction has to capture is `ctx`.
+`rt_cover_new(type_idx, ctx, path, text, text_len)`. There is no synthesized
+constructor, because the bin table is static model data (§6.3) rather than
+per-instance state to compute: all construction has to capture is `ctx` and the
+instance's name prefix.
+
+The prefix is the name of the module instance that constructs the group
+(`"top.u1."`, generate blocks included; empty when a package or `$unit` does), and
+the instance's default name starts with it (§9). It arrives in two pieces: `path`,
+the constructing instance's path, an `InstPath` operand (a borrowed string, null
+outside every instance), and `text`, the bytes after it (`".g[0]."`; `"."` for no
+generate block), which the op carries. The runtime copies both into the name, so
+nothing joins them at the `new` site. Neither is a field of the covergroup type:
+the type is the same in every instance of the module, which is what lets those
+instances share one unit (`docs/design/modular-compilation.md`).
 
 `ctx` is what makes an embedded covergroup work. LRM 19.4 requires an embedded
 covergroup to be constructed in its enclosing class's `new`, so `this` is
@@ -609,7 +620,8 @@ database tasks.** Specifically:
   report reflects the last committed state.
 - Ordered by (type index, instance creation order), never by hash or pointer
   order, so two runs of one design diff cleanly.
-- Content per instance: the instance name (`<scope><type>`, or whatever
+- Content per instance: the instance name (`<scope><type>`, the scope being the
+  constructing instance's prefix of §6.2, or whatever
   `set_inst_name` replaced it with), its percentage, then per coverpoint the
   percentage and covered/total, then one line per bin with its LRM name and hit
   count — including the bins that were never hit, which are the whole point of a

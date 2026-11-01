@@ -7,21 +7,29 @@ parallel codegen. Builds directly on the instance-anchor / instance-ctx /
 body-sharing prep: a definition's code already never embeds whole-design layout,
 and every per-instance base routes through one `@clotho.inst.<hier>.ctx` symbol.
 
+This is a partition of the backend's output, drawn after every whole-design
+decision; `modular-compilation.md` replaces it with units the frontend produces
+and the backend compiles independently.
+
 ## Partition
 
-Unit = elaborated definition content. Key: `def_name` + state-type field
-sequence + canonical process-body hash set (the twin-detector hash,
-`--stat=dedup`), NOT raw `def_name` — one def name with two
-parameterizations is two units; twin instances share one unit.
+Unit = the definition's state struct type (`Anchor::ty`, keyed on `def_name`
+plus the slot types of the definition's own signals), so two parameterizations
+with identical own-signal types share one module. The process-body hash set the
+twin detector computes (`--stat=dedup`) is not part of the key.
 
-- `M_def(key)`: single-def fusion groups anchored in instances of the def,
-  def-declared functions/tasks, per-def NBA commit functions. Exports its group
-  / commit / function symbols by stable name.
-- `M_root`: `@clotho.state` (+ power-on initializer), all `.ctx` definitions
-  and startup fills, `main` / `sim_drain` / finals, active queue,
-  `clotho.proc_sched`, NBA dispatch heads + meta + commit-fn table, wait-queue
-  globals, VCD setup, DPI export thunks, package/`$unit` (`no_scope`)
-  processes. Cross-instance fusion groups of <= 16 members OUTLINE: one plain
+- `M_def(key)`: the fusion groups whose members all belong to one scope of the
+  definition. Reused definitions address their storage through the instance
+  ctx; a `.ctx` global is created in whichever module first needs it.
+- `M_root`: everything else -- state globals and power-on initializers, wait
+  queues, every function and task, NBA commit functions, `main` / `sim_drain`
+  / finals, the seed loop, DPI export thunks, package/`$unit` (`no_scope`)
+  processes and the dispatchers of groups spanning instances. `$dumpvars` emits
+  its whole-tree registration inline in the calling process's module, and the
+  lazily created
+  singletons (`clotho.active`, `enqueue_timer`, `ev_delay`, `shadow_base`)
+  land in the first module that needs them.
+  Cross-instance fusion groups of <= 16 members OUTLINE: one plain
   function per member in the member's own unit + a root dispatcher (named
   like the merged thunk; owns the sched-flag timeline) calling them in rank
   order, so the member code is per-definition cacheable. Past the cap the

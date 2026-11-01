@@ -137,6 +137,8 @@ const char* tag_name(Inst::Tag tag) {
             return "signal";
         case T::Local:
             return "local";
+        case T::InstPath:
+            return "inst_path";
         case T::BitSelect:
             return "bit_select";
         case T::PartSelect:
@@ -901,8 +903,13 @@ private:
             }
             case Inst::PayloadKind::Severity: {
                 const auto info = ir_.extra_data<SeverityInfo>(p.extra);
-                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len)
-                    << "\", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len) << '"';
+                if (info.path != kNoIndex) {
+                    os_ << ", ";
+                    ref(info.path);
+                    os_ << ", \"" << ir_.extra_bytes(info.tail, info.tail_len) << '"';
+                }
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);
@@ -1304,6 +1311,142 @@ std::string toString(const Module& m) {
     print_module(m, os);
 
     return os.str();
+}
+
+namespace {
+
+void render_ref(const InstanceRef& r, std::ostream& os) {
+    switch (r.base) {
+        case InstanceRef::Base::Up:
+            os << "up" << r.index;
+            break;
+        case InstanceRef::Base::Root:
+            os << "root" << r.index;
+            break;
+        case InstanceRef::Base::Port:
+            os << "port" << r.index;
+            break;
+    }
+    for (const uint32_t s : r.slots) {
+        os << ".c" << s;
+    }
+}
+
+void render_waits(const Process& p, std::ostream& os) {
+    for (const WaitEvent& w : p.wait_events) {
+        os << " @";
+        switch (w.edge) {
+            case Edge::Positive:
+                os << "posedge ";
+                break;
+            case Edge::Negative:
+                os << "negedge ";
+                break;
+            case Edge::Any:
+                break;
+        }
+        os << "s" << static_cast<uint32_t>(w.signal);
+    }
+}
+
+} // namespace
+
+void print_unit(const Design& d, UnitId id, std::ostream& os) {
+    const Unit&       u    = d.unit(id);
+    const InternPool& pool = *d.pool;
+    os << "unit " << u.def_name << (u.kind == UnitKind::Module ? "" : " (static)") << "\n";
+    for (const BoundPort& b : u.bound_ports) {
+        os << "  bound " << b.name << (b.kind == BoundPort::Kind::Signal ? " signal" : " instance") << "\n";
+    }
+    for (size_t i = 0; i < u.imports.size(); ++i) {
+        const Import& imp = u.imports[i];
+        os << "  i" << i << ": ";
+        switch (imp.kind) {
+            case Import::Kind::Port:
+                os << "port " << imp.port;
+                break;
+            case Import::Kind::Member:
+                os << "member ";
+                render_ref(imp.inst, os);
+                os << " '" << imp.member << "'";
+                break;
+            case Import::Kind::Representative:
+                os << "representative " << d.unit(imp.unit).def_name << " '" << imp.member << "'";
+                break;
+        }
+        os << "\n";
+    }
+    for (size_t i = 0; i < u.inst_refs.size(); ++i) {
+        os << "  r" << i << ": ";
+        render_ref(u.inst_refs[i], os);
+        os << "\n";
+    }
+    for (const ChildSlot& c : u.children) {
+        os << "  child " << c.name << ": " << d.unit(c.unit).def_name << " at " << c.process_pos;
+        for (const uint32_t b : c.bindings) {
+            os << " " << b;
+        }
+        os << "\n";
+    }
+    for (size_t i = 0; i < u.signals.size(); ++i) {
+        const UnitSignal& s = u.signals[i];
+        os << "  s" << i << ": ";
+        render_type(pool, s.info.type, os);
+        os << " " << s.info.name << " (" << direction_name(s.info.dir) << ")";
+        if (s.import != kLocal) {
+            os << " extern i" << s.import;
+        } else if (!s.scoped) {
+            os << " unscoped";
+        }
+        os << "\n";
+    }
+    for (size_t i = 0; i < u.disable_targets.size(); ++i) {
+        const UnitDisableTarget& t = u.disable_targets[i];
+        os << "  t" << i << ": " << (t.is_task ? "task " : "block ") << t.name;
+        if (t.import != kLocal) {
+            os << " extern i" << t.import;
+        } else if (t.flush_proc != Module::no_flush_proc) {
+            os << " flushes process[" << t.flush_proc << "]";
+        }
+        os << "\n";
+    }
+    for (size_t i = 0; i < u.monitors.size(); ++i) {
+        os << "  monitor " << i << ": clock s" << static_cast<uint32_t>(u.monitors[i].clock) << " "
+           << u.monitors[i].banner << "\n";
+    }
+    for (size_t i = 0; i < u.cover_types.size(); ++i) {
+        const UnitCoverType& t = u.cover_types[i];
+        os << "  covergroup " << i << ": " << t.type.name;
+        if (!t.name.empty()) {
+            os << " '" << t.name << "'";
+        }
+        if (t.import != kLocal) {
+            os << " extern i" << t.import;
+        }
+        os << "\n";
+    }
+    for (size_t i = 0; i < u.functions.size(); ++i) {
+        const UnitFunction& f = u.functions[i];
+        os << "fn" << i << " " << f.fn.name;
+        if (!f.name.empty()) {
+            os << " '" << f.name << "'";
+        }
+        if (f.import != kLocal) {
+            os << " extern i" << f.import << "\n";
+            continue;
+        }
+        os << "\n";
+        if (f.fn.ir.inst_count() != 0) {
+            print(f.fn.ir, os);
+        }
+    }
+    for (size_t i = 0; i < u.processes.size(); ++i) {
+        const Process& p = u.processes[i];
+        os << "process[" << i << "] " << activation_name(p.activation);
+        render_waits(p, os);
+        os << "\n";
+        print(p.ir, os);
+    }
 }
 
 } // namespace clotho::ir

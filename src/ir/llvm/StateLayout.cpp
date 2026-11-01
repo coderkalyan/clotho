@@ -21,7 +21,7 @@ namespace clotho::ir::backend {
 // Words live in one array per owning instance scope
 // (@clotho.inst.<hier>.sched, indexed by a dense def-local ordinal -- twin
 // instances lower identical ordinals) plus a root @clotho.proc_sched for
-// unowned (PreInit / package) processes.
+// unowned (package / `$unit`) processes.
 void Backend::build_sched_flags() {
     const auto procs = mod_.processes();
     auto*      word  = llvm::Type::getInt64Ty(ctx_);

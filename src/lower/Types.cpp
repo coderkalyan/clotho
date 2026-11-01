@@ -1059,15 +1059,32 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
         const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
         const ir::Signal   target = signal_of(parent);
         // Two ports bound to one internal net (`module m(a, a)`, LRM 23.2.2.1) connected
-        // to one parent net share that net's alias target; connected to different nets
-        // they would make those one net, which the one target cannot express.
+        // to one parent net share that net's alias target, and the first port's bound
+        // port (below) stands for both; connected to different nets they would make those
+        // one net, which the one target cannot express.
         // TODO: two connected inout/ref ports bound to one net, connected to different
         // nets: the nets they connect become one net.
-        if (const auto prior = inout_alias_.find(p.internalSymbol);
-            prior != inout_alias_.end() && prior->second != target) {
-            fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+        if (const auto prior = inout_alias_.find(p.internalSymbol); prior != inout_alias_.end()) {
+            if (prior->second != target) {
+                fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+            }
+            continue;
+        }
+        // The two nets merge into one simulated net, whose type is not either's
+        // by default (LRM 23.3.3.7; collapse_port_net).
+        if (p.internalSymbol->kind == SymbolKind::Net && parent.kind == SymbolKind::Net) {
+            collapse_port_net(*pc, p.internalSymbol->as<NetSymbol>(), parent.as<NetSymbol>(), target);
         }
         inout_alias_[p.internalSymbol] = target;
+        // The child holds no storage for the port; partition binds it to the
+        // parent's signal (ir::Attribution::port_aliases).
+        const uint32_t scope = cur_scope_id();
+        owners_->attribution.port_aliases.push_back(
+          { .scope = scope, .port = std::string(p.internalSymbol->name), .target = target });
+        alias_ports_[scope].try_emplace(static_cast<uint32_t>(target), std::string(p.internalSymbol->name));
+        if (p.internalSymbol->kind == SymbolKind::Net) {
+            alias_syms_.try_emplace(p.internalSymbol, AliasSymbol{ scope, std::string(p.internalSymbol->name) });
+        }
     }
 }
 
@@ -1350,30 +1367,19 @@ void Lowerer::collect_scope_signals(
                 ir::SignalInfo info;
                 if (m.kind == SymbolKind::Net) {
                     const NetSymbol& net = m.as<NetSymbol>();
-                    // Modeled net kinds: wire/tri (+ uwire, single-driver
-                    // per slang's MultipleUWireDrivers pass) resolve to X on
-                    // conflict; wand/triand and wor/trior carry wired-AND /
+                    // Modeled net kinds (is_modeled_net_kind): wire/tri (+ uwire,
+                    // single-driver per slang's MultipleUWireDrivers pass) resolve
+                    // to X on conflict; wand/triand and wor/trior carry wired-AND /
                     // wired-OR resolution (net_resolve_tag); tri0/tri1 carry a
                     // resistive pull to 0 / 1 (net_pull_value); supply0/supply1
                     // carry a Supply-strength pull. All Z-default when undriven,
                     // except tri0/tri1/supply0/supply1 which pull to 0 / 1.
+                    // This is the DECLARED kind: a net an inout port collapses
+                    // onto another takes the simulated net's type (collapse_port_net),
+                    // which finalize_sim_nets applies once Collect has met every port.
                     // TODO: trireg carries charge semantics clotho does not model.
-                    switch (net.netType.netKind) {
-                        case NetType::Wire:
-                        case NetType::Tri:
-                        case NetType::UWire:
-                        case NetType::WAnd:
-                        case NetType::TriAnd:
-                        case NetType::WOr:
-                        case NetType::TriOr:
-                        case NetType::Tri0:
-                        case NetType::Tri1:
-                        case NetType::Supply0:
-                        case NetType::Supply1:
-                            break;
-                        default:
-                            fail("unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1/"
-                                 "supply0/supply1 are modeled)");
+                    if (!is_modeled_net_kind(net.netType.netKind)) {
+                        fail(std::string(kUnmodeledNetType));
                     }
                     // A delay3 on the net_declaration syntax is either a
                     // true net delay (LRM 28.16, no net_decl_assignment) or,
@@ -1491,9 +1497,22 @@ ir::Signal Lowerer::register_signal(ir::SignalInfo info) {
     if (!scope_stack_.empty()) {
         scope_stack_.back()->signals.push_back(sig);
         signal_scope_[static_cast<uint32_t>(sig)] = scope_stack_.back()->id;
+    } else {
+        // Package / $unit state, and the statics reached through it: the
+        // static unit of the scope being lowered (partition).
+        own_signal(sig, owner_in(scope_).owner);
     }
 
     return sig;
+}
+
+void Lowerer::own_signal(ir::Signal sig, ir::Owner owner) {
+    std::vector<ir::Owner>& owners = owners_->attribution.signals;
+    const auto              i      = static_cast<uint32_t>(sig);
+    if (owners.size() <= i) {
+        owners.resize(i + 1);
+    }
+    owners[i] = owner;
 }
 
 ir::Signal Lowerer::signal_of(const ValueSymbol& sym) {
@@ -1610,6 +1629,7 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
 
     const ir::Signal sig = module_.add_signal(std::move(info));
     sigmap_[&vs]         = sig;
+    own_signal(sig, owner_in(vs.getParentScope()).owner);
 
     if (seeded) {
         // The handles this value needs only exist at run time, so the table is
@@ -1631,18 +1651,22 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
 // A static-lifetime function local: it persists across calls (LRM 13.4.2), so
 // it gets persistent module-signal storage, initialized once at time zero —
 // not the per-call frame. Named with the function qualifier to avoid clashes.
+// It belongs to the instance that declares the subroutine, not to whichever
+// instance's code first calls it (`a.f()` from the parent): every instance has
+// its own copy (LRM 13.4.2), under its own name.
 ir::Signal Lowerer::declare_static_local(const ValueSymbol& vs) {
     const auto it = sigmap_.find(&vs);
     if (it != sigmap_.end()) {
         return it->second;
     }
-    ir::SignalInfo info;
-    info.name            = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
+    const std::optional<Home> home = home_of(vs.getParentScope());
+    ir::SignalInfo            info;
+    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(vs.name);
     info.loc             = to_source_loc(vs.location);
     info.type            = lower_type(vs.getType());
     info.is_event        = vs.getType().isEvent(); // see declare_local
     info.dir             = ir::SignalInfo::Direction::Internal;
-    const ir::Signal sig = register_signal(std::move(info));
+    const ir::Signal sig = register_declared_signal(home, std::move(info));
     sigmap_[&vs]         = sig;
 
     return sig;
@@ -1680,24 +1704,33 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
         sigmap_.emplace(&prop, sig);
         return sig;
     }
+    // The class's own rendering, which carries a specialization's arguments
+    // (bind_class_type): each specialization has its own statics (LRM 8.25), and
+    // their signals need distinct names to be imported by name. A class a module
+    // declares keeps its statics in that instance, whoever reaches them first.
     std::string cls;
     if (const slang::ast::Scope* sc = prop.getParentScope()) {
-        cls = std::string(sc->asSymbol().name) + "::";
+        const slang::ast::Symbol& owner = sc->asSymbol();
+        cls = (owner.kind == SymbolKind::ClassType ? owner.as<slang::ast::ClassType>().toString()
+                                                   : std::string(owner.name)) +
+              "::";
     }
-    const ir::Ref  pty = lower_type(prop.getType());
-    ir::SignalInfo info;
-    info.name            = prefix_ + cls + std::string(prop.name);
+    const std::optional<Home> home = home_of(prop.getParentScope());
+    const ir::Ref             pty  = lower_type(prop.getType());
+    ir::SignalInfo            info;
+    info.name            = (home ? home->prefix : prefix_) + cls + std::string(prop.name);
     info.loc             = to_source_loc(prop.location);
     info.type            = pty;
     info.is_event        = prop.getType().isEvent(); // see declare_local
     info.dir             = ir::SignalInfo::Direction::Internal;
-    const ir::Signal sig = register_signal(std::move(info));
+    const ir::Signal sig = register_declared_signal(home, std::move(info));
     sigmap_[&prop]       = sig;
 
     // Queue the initializer once (this is the first-access path). LRM 8.9's own
     // example initializes a static property with `$fopen("data", "r")`, so this
     // is not restricted to constant expressions.
     if (const Expression* init = prop.getInitializer()) {
+        HomePreInit home_init(*this, home);
         if (!preinit_) {
             preinit_.emplace(module_);
         }
@@ -1733,6 +1766,7 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
             const ir::Index val = coerce(lower_expr(*init, pb), *init->type, pty, pb, il);
             pb.binary(ir::Inst::Tag::Store, dst, val, il);
         }
+        home_init.commit();
     }
     return sig;
 }

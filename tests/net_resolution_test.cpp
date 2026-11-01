@@ -30,9 +30,8 @@ LowerResult lower_ok(std::string_view src) {
     return r;
 }
 
-std::string run_capture(std::string_view source) {
-    const LowerResult r = lower_ok(source);
-
+std::string run_capture(const LowerResult& r) {
+    REQUIRE(r.module != nullptr);
     std::FILE* tmp = std::tmpfile();
     REQUIRE(tmp != nullptr);
     std::fflush(stdout);
@@ -54,6 +53,20 @@ std::string run_capture(std::string_view source) {
     }
     std::fclose(tmp);
     return out;
+}
+
+std::string run_capture(std::string_view source) {
+    return run_capture(lower_ok(source));
+}
+
+const Diagnostic* find_diag(const LowerResult& r, std::string_view code) {
+    for (const Diagnostic& d : r.diagnostics) {
+        if (d.code == code) {
+            return &d;
+        }
+    }
+
+    return nullptr;
 }
 
 } // namespace
@@ -1231,4 +1244,508 @@ TEST_CASE("the order of three drivers does not change a strength resolution") {
         endmodule
     )");
     CHECK(out == "x x x\n");
+}
+
+// -- Net types across inout ports (LRM 23.3.3.7, Table 23-1) --
+//
+// An inout port merges the net the parent connects (the external net) and the
+// net the child declares (the internal net) into one simulated net, whose type
+// is the external net's unless Table 23-1 gives the internal one. Resolution,
+// pull and supply strength follow that type, not the type of whichever driver
+// reaches the net. Each expected value is derived from the table and was
+// cross-checked against iverilog 13, except the trireg cases (iverilog 13:
+// "sorry: trireg nets not supported"), which are derived from the table alone.
+
+// Internal wire, external wand/wor: the table gives "external", so the net
+// resolves wired-AND / wired-OR (6.6.3) although every driver is a wire port.
+TEST_CASE("an external wand or wor net resolves the drivers of inout wire ports") {
+    const std::string out = run_capture(R"(
+        module drv(inout wire io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          wand wa;
+          wor  wo;
+          logic a = 1, b = 0;
+          drv d1(wa, a);
+          drv d2(wa, b);
+          drv d3(wo, a);
+          drv d4(wo, b);
+          initial begin
+            #1 $display("wand=%b wor=%b", wa, wo);
+            a = 0; #1 $display("wand=%b wor=%b", wa, wo);
+            b = 1; #1 $display("wand=%b wor=%b", wa, wo);
+          end
+        endmodule
+    )");
+    CHECK(out == "wand=0 wor=1\nwand=0 wor=0\nwand=0 wor=1\n");
+}
+
+// Internal wand/wor, external wire: the table gives "internal", so the
+// child's net type is the simulated net's.
+TEST_CASE("an inout wand or wor port makes an external wire resolve wired-AND or wired-OR") {
+    const std::string out = run_capture(R"(
+        module dand(inout wand io, input logic v);
+          assign io = v;
+        endmodule
+        module dor(inout wor io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          wire wa, wo;
+          logic a = 1, b = 0;
+          dand d1(wa, a);
+          dand d2(wa, b);
+          dor  d3(wo, a);
+          dor  d4(wo, b);
+          initial begin
+            #1 $display("wire/wand=%b wire/wor=%b", wa, wo);
+            a = 0; #1 $display("wire/wand=%b wire/wor=%b", wa, wo);
+            b = 1; #1 $display("wire/wand=%b wire/wor=%b", wa, wo);
+          end
+        endmodule
+    )");
+    CHECK(out == "wire/wand=0 wire/wor=1\nwire/wand=0 wire/wor=0\nwire/wand=0 wire/wor=1\n");
+}
+
+// The reducer is the net's, so it cannot depend on which driver Classify meets
+// first: a net's own driver and one through a port, in either order.
+TEST_CASE("a net's own driver and an inout port driver fold by the simulated net type in either order") {
+    const std::string out = run_capture(R"(
+        module dwire(inout wire io, input logic v);
+          assign io = v;
+        endmodule
+        module dand(inout wand io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          wand w1;
+          wire w2;
+          wire w3;
+          logic a = 1, b = 0;
+          assign w1 = a;      // wand, its own driver first, a wire port after
+          dwire d1(w1, b);
+          dand  d2(w2, b);    // wire, a wand port first, its own driver after
+          assign w2 = a;
+          assign w3 = a;      // wire, its own driver first, a wand port after
+          dand  d3(w3, b);
+          initial #1 $display("w1=%b w2=%b w3=%b", w1, w2, w3);
+        endmodule
+    )");
+    CHECK(out == "w1=0 w2=0 w3=0\n");
+}
+
+// Internal tri0/tri1, external wire: the table gives "internal", so the net
+// pulls (6.6.4) when the port's driver is off.
+TEST_CASE("an inout tri0 or tri1 port pulls an undriven external wire") {
+    const std::string out = run_capture(R"(
+        module drv1(inout tri1 io, input logic en);
+          assign io = en ? 1'b0 : 1'bz;
+        endmodule
+        module drv0(inout tri0 io, input logic en);
+          assign io = en ? 1'b1 : 1'bz;
+        endmodule
+        module top;
+          wire w1, w0;
+          logic e = 0;
+          drv1 d1(w1, e);
+          drv0 d0(w0, e);
+          initial begin
+            #1 $display("tri1 port=%b tri0 port=%b", w1, w0);
+            e = 1; #1 $display("tri1 port=%b tri0 port=%b", w1, w0);
+            e = 0; #1 $display("tri1 port=%b tri0 port=%b", w1, w0);
+          end
+        endmodule
+    )");
+    CHECK(out == "tri1 port=1 tri0 port=0\ntri1 port=0 tri0 port=1\ntri1 port=1 tri0 port=0\n");
+}
+
+// Internal wire, external tri0/tri1: the table gives "external". The net's pull
+// is its own, and a driver through a wire port must not bypass it.
+TEST_CASE("an external tri0 or tri1 net pulls through inout wire ports") {
+    const std::string out = run_capture(R"(
+        module drv(inout wire io, input logic en, input logic v);
+          assign io = en ? v : 1'bz;
+        endmodule
+        module top;
+          tri1 t1;
+          tri0 t0;
+          logic e = 0, v = 0;
+          drv d1(t1, e, v);
+          drv d0(t0, e, ~v);
+          initial begin
+            #1 $display("tri1=%b tri0=%b", t1, t0);
+            e = 1; #1 $display("tri1=%b tri0=%b", t1, t0);
+            e = 0; #1 $display("tri1=%b tri0=%b", t1, t0);
+          end
+        endmodule
+    )");
+    CHECK(out == "tri1=1 tri0=0\ntri1=0 tri0=1\ntri1=1 tri0=0\n");
+}
+
+// supply0/supply1 dominate every other type but the other supply. Internal over
+// an external wire, and external under a wire port: a supply driver beats a
+// strong one (28.11).
+TEST_CASE("a supply net dominates the strong drivers of an inout port, internal or external") {
+    const std::string out = run_capture(R"(
+        module g0(inout supply0 io);
+        endmodule
+        module g1(inout supply1 io);
+        endmodule
+        module drv(inout wire io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          wire a, b;
+          supply1 vdd;
+          supply0 gnd;
+          assign a = 1'b1;    // a strong 1 against an internal supply0
+          g0 u0(a);
+          assign b = 1'b0;    // a strong 0 against an internal supply1
+          g1 u1(b);
+          drv d1(vdd, 1'b0);  // an external supply1 against a strong 0 through a wire port
+          drv d0(gnd, 1'b1);
+          initial #1 $display("a=%b b=%b vdd=%b gnd=%b", a, b, vdd, gnd);
+        endmodule
+    )");
+    CHECK(out == "a=0 b=1 vdd=1 gnd=0\n");
+}
+
+// A net reaches a leaf through several ports; each is one collapse and the next
+// takes the type so far as its external net (collapse_port_net).
+TEST_CASE("the simulated net folds outside-in through several inout levels") {
+    const std::string out = run_capture(R"(
+        module leaf_wand(inout wand io, input logic v);
+          assign io = v;
+        endmodule
+        module leaf_wire(inout wire io, input logic v);
+          assign io = v;
+        endmodule
+        module leaf_en(inout wire io, input logic en);
+          assign io = en ? 1'b0 : 1'bz;
+        endmodule
+        module mid_wand(inout wire io, input logic v);
+          leaf_wand l(io, v);
+        endmodule
+        module mid_wire(inout wire io, input logic v);
+          leaf_wire l(io, v);
+        endmodule
+        module mid_tri1(inout tri1 io, input logic en);
+          leaf_en l(io, en);
+        endmodule
+        module top;
+          wire w1;            // wire, wire, wand: the leaf's wand dominates
+          wand w2;            // wand, wire, wire: the net's wand dominates
+          wire w3;            // wire, tri1, wire: the middle tri1 dominates the net and the leaf
+          logic a = 1, b = 0, e = 0;
+          mid_wand m1(w1, a);
+          mid_wand m2(w1, b);
+          mid_wire m3(w2, a);
+          mid_wire m4(w2, b);
+          mid_tri1 m5(w3, e);
+          initial begin
+            #1 $display("w1=%b w2=%b w3=%b", w1, w2, w3);
+            b = 1; e = 1; #1 $display("w1=%b w2=%b w3=%b", w1, w2, w3);
+          end
+        endmodule
+    )");
+    CHECK(out == "w1=0 w2=0 w3=1\nw1=1 w2=1 w3=0\n");
+}
+
+// The simulated type is a fact of each net's owner: one module connected to nets
+// of six types resolves and pulls as each net says.
+TEST_CASE("one module on wand, wor, tri1, tri0, wire and supply1 nets") {
+    const std::string out = run_capture(R"(
+        module leaf(inout wire io, input logic v, input logic en);
+          assign io = en ? v : 1'bz;
+        endmodule
+        module wrap(inout wire io, input logic v, input logic en);
+          leaf l(.io(io), .v(v), .en(en));
+        endmodule
+        module top;
+          wand w1;
+          wor  w2;
+          tri1 w3;
+          tri0 w4;
+          wire w5;
+          supply1 w6;
+          logic e = 1, v0 = 0, v1 = 1;
+          wrap a(w1, v0, e);
+          wrap b(w1, v1, e);
+          wrap c(w2, v0, e);
+          wrap d(w3, v0, 1'b0);
+          wrap f(w4, v1, 1'b0);
+          wrap g(w5, v1, e);
+          wrap h(w6, v0, e);
+          initial #1 $display("%b %b %b %b %b %b", w1, w2, w3, w4, w5, w6);
+        endmodule
+    )");
+    CHECK(out == "0 0 1 0 1 1\n");
+}
+
+// tri, triand and trior are the table's wire, wand and wor ("wire, tri", "wand,
+// triand", "wor, trior"): they dominate, and are dominated, alike.
+TEST_CASE("tri, triand and trior take the table cells of wire, wand and wor") {
+    const std::string out = run_capture(R"(
+        module dwire(inout tri io, input logic v);
+          assign io = v;
+        endmodule
+        module dand(inout triand io, input logic v);
+          assign io = v;
+        endmodule
+        module dor(inout trior io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          triand ta;    // triand over tri ports
+          trior  to;    // trior over tri ports
+          tri    t1;    // tri under triand ports
+          tri    t2;    // tri under trior ports
+          logic a = 1, b = 0;
+          dwire d1(ta, a);
+          dwire d2(ta, b);
+          dwire d3(to, a);
+          dwire d4(to, b);
+          dand  d5(t1, a);
+          dand  d6(t1, b);
+          dor   d7(t2, a);
+          dor   d8(t2, b);
+          initial #1 $display("%b %b %b %b", ta, to, t1, t2);
+        endmodule
+    )");
+    CHECK(out == "0 1 0 1\n");
+}
+
+// "The simulated net shall take the delay specified for the dominating net"
+// (23.3.3.7). An external wand dominates an internal wire, so its #5 stays: a
+// change of the driver reaches the net 5 later (28.16). iverilog 13 has no net
+// delays ("sorry: Net delays not supported"), so the oracle is the LRM text, and
+// the same net with a driver of its own is the metamorphic check.
+TEST_CASE("the delay of an external net that dominates an inout port stays on the simulated net") {
+    const std::string through_port = run_capture(R"(
+        module c(inout wire io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          wand #5 w;
+          logic a = 0;
+          c u(w, a);
+          initial begin
+            #10 $display("t=%0d w=%b", $time, w);
+            a = 1; #1 $display("t=%0d w=%b", $time, w);
+            #5 $display("t=%0d w=%b", $time, w);
+          end
+        endmodule
+    )");
+    const std::string own_driver = run_capture(R"(
+        module top;
+          wand #5 w;
+          logic a = 0;
+          assign w = a;
+          initial begin
+            #10 $display("t=%0d w=%b", $time, w);
+            a = 1; #1 $display("t=%0d w=%b", $time, w);
+            #5 $display("t=%0d w=%b", $time, w);
+          end
+        endmodule
+    )");
+    CHECK(through_port == "t=10 w=0\nt=11 w=0\nt=16 w=1\n");
+    CHECK(own_driver == through_port);
+}
+
+// An internal wand dominates an external wire, so the simulated net is the
+// child's wand, which has no delay: the external wire's #5 is not the net's.
+TEST_CASE("the delay of an external net that an inout port dominates is dropped") {
+    const std::string through_port = run_capture(R"(
+        module c(inout wand io, input logic v);
+          assign io = v;
+        endmodule
+        module top;
+          wire #5 w;
+          logic a = 0;
+          c u(w, a);
+          initial begin
+            #10 $display("t=%0d w=%b", $time, w);
+            a = 1; #1 $display("t=%0d w=%b", $time, w);
+            #5 $display("t=%0d w=%b", $time, w);
+          end
+        endmodule
+    )");
+    const std::string undelayed = run_capture(R"(
+        module top;
+          wand w;
+          logic a = 0;
+          assign w = a;
+          initial begin
+            #10 $display("t=%0d w=%b", $time, w);
+            a = 1; #1 $display("t=%0d w=%b", $time, w);
+            #5 $display("t=%0d w=%b", $time, w);
+          end
+        endmodule
+    )");
+    CHECK(through_port == "t=10 w=0\nt=11 w=1\nt=16 w=1\n");
+    CHECK(undelayed == through_port);
+}
+
+// A net delay on the net that dominates cannot be lowered in the owner's context.
+TEST_CASE("a net delay on an inout port net that dominates its owner fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module c(io);
+          inout io;
+          wand #3 io;
+        endmodule
+        module top;
+          wire w;
+          c u(w);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("a net delay on a net that dominates") != std::string::npos);
+}
+
+// A `warn` cell: external wand, internal tri1 (neither dominates). The external
+// type is used, so there is no pull, and slang reports the connection.
+TEST_CASE("a Table 23-1 warn cell takes the external type and warns at the port connection") {
+    const LowerResult r = lower_ok(R"(
+        module drv(inout tri1 io, input logic v, input logic en);
+          assign io = en ? v : 1'bz;
+        endmodule
+        module top;
+          wand w;
+          logic a = 1, b = 0, ea = 1, eb = 0;
+          drv d1(w, a, ea);
+          drv d2(w, b, eb);
+          initial begin
+            #1 $display("%b", w);
+            eb = 1; #1 $display("%b", w);
+            ea = 0; eb = 0; #1 $display("%b", w);
+          end
+        endmodule
+    )");
+    const Diagnostic* d = find_diag(r, "net-inconsistent");
+    REQUIRE(d != nullptr);
+    CHECK(d->severity == Severity::Warning);
+    CHECK(d->span.valid());
+    CHECK(run_capture(r) == "1\n0\nz\n");
+}
+
+// Wand, wire, wor: both declared pairs are fine (slang is silent), but the
+// leaf's external net has taken on wand, and (wor, wand) is a `warn` cell.
+TEST_CASE("a pair that is a warn cell only for the merged type is reported") {
+    const LowerResult r = lower_ok(R"(
+        module leaf(inout wor io, input logic v);
+          assign io = v;
+        endmodule
+        module mid(inout wire io, input logic v);
+          leaf l(io, v);
+        endmodule
+        module top;
+          wand w;
+          logic a = 1, b = 0;
+          mid m1(w, a);
+          mid m2(w, b);
+          initial #1 $display("%b", w);
+        endmodule
+    )");
+    CHECK(find_diag(r, "net-inconsistent") == nullptr);
+    const Diagnostic* d = find_diag(r, "net-type-conflict");
+    REQUIRE(d != nullptr);
+    CHECK(d->severity == Severity::Warning);
+    CHECK(d->origin == DiagnosticOrigin::Analysis);
+    CHECK(d->span.valid());
+    CHECK(run_capture(r) == "0\n");
+}
+
+// (trireg, tri0) gives "external": the trireg is dominated, so the simulated net
+// is the tri0 and nothing stores charge.
+TEST_CASE("a trireg port dominated by the external net behaves as that net") {
+    const std::string out = run_capture(R"(
+        module drv(io, en);
+          inout io;
+          input en;
+          trireg io;
+          assign io = en ? 1'b1 : 1'bz;
+        endmodule
+        module top;
+          tri0 t0;
+          logic e = 0;
+          drv d(t0, e);
+          initial begin
+            #1 $display("%b", t0);
+            e = 1; #1 $display("%b", t0);
+            e = 0; #1 $display("%b", t0);
+          end
+        endmodule
+    )");
+    CHECK(out == "0\n1\n0\n");
+}
+
+// (trireg, wire) gives "internal": the simulated net would be a trireg, which
+// stores charge (6.6.4), and Clotho does not model that.
+TEST_CASE("a trireg port that dominates the simulated net fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module drv(inout trireg io, input logic en);
+          assign io = en ? 1'b1 : 1'bz;
+        endmodule
+        module top;
+          wire w;
+          logic e = 1;
+          drv d(w, e);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("unsupported net type") != std::string::npos);
+    CHECK(r.diagnostic_text().find("trireg") != std::string::npos);
+}
+
+// The uwire row and column of the table never reach an inout collapse: slang
+// rejects a uwire on either side of an inout port.
+TEST_CASE("a uwire on either side of an inout port is a frontend error") {
+    const LowerResult internal = lower_text(R"(
+        module drv(inout uwire io);
+        endmodule
+        module top;
+          wire w;
+          drv d(w);
+        endmodule
+    )");
+    CHECK_FALSE(internal.ok);
+    CHECK(internal.diagnostic_text().find("'uwire' port 'io' cannot have direction 'inout'") != std::string::npos);
+
+    const LowerResult external = lower_text(R"(
+        module drv(inout wire io);
+        endmodule
+        module top;
+          uwire w;
+          drv d(w);
+        endmodule
+    )");
+    CHECK_FALSE(external.ok);
+    CHECK(external.diagnostic_text().find("'uwire' net 'w' cannot be connected to 'inout' port") != std::string::npos);
+}
+
+// 23.3.3 makes an input or output port a continuous assignment from source to
+// sink, and 23.3.3.7 only lets the nets on both sides take one type ("it is
+// permissible to merge"). Clotho keeps them apart (check_value_port_nets in
+// src/lower/Nets.cpp), so the sink resolves by its own type. Both values below
+// hold merged or not, and iverilog 13, which merges, agrees.
+TEST_CASE("input and output ports resolve the sink net by its own type") {
+    const std::string out = run_capture(R"(
+        module c(input tri1 a);
+          initial #1 $display("child sees %b", a);
+        endmodule
+        module drv(output wire o, input logic v);
+          assign o = v;
+        endmodule
+        module top;
+          wire w;
+          wand wa;
+          logic a = 1, b = 0;
+          c u(w);
+          drv d1(wa, a);
+          drv d2(wa, b);
+          initial #2 $display("wand=%b", wa);
+        endmodule
+    )");
+    CHECK(out == "child sees 1\nwand=0\n");
 }

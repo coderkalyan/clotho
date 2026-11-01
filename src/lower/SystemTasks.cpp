@@ -165,10 +165,10 @@ void Lowerer::lower_timeformat(const CallExpression& call, ir::Builder& b) {
 
 // $printtimescale [hier]: print "Time scale of (<path>) is <unit> / <prec>"
 // for a scope (LRM §21.3.1.2). With no argument the scope is the calling
-// module; the timescale and path are compile-time constants, so this folds to
-// a literal $display.
+// module, whose path is read at run time like %m's; the timescale is a
+// compile-time constant, and so is the path of a scope the argument names.
 void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
-    std::string                     path = instance_path();
+    ScopeName                       path = instance_scope();
     std::optional<slang::TimeScale> ts   = scope_->getTimeScale();
     if (!call.arguments().empty()) {
         // The argument names another scope. That scope's timescale is one
@@ -185,13 +185,13 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
         switch (sym.kind) {
             case SymbolKind::Instance:
                 ts   = sym.as<InstanceSymbol>().body.getTimeScale();
-                path = sym.getHierarchicalPath();
+                path = ScopeName{ .text = sym.getHierarchicalPath() };
                 break;
             case SymbolKind::CompilationUnit:
                 // getHierarchicalPath() spells this scope "$unit"; the symbol
                 // itself is unnamed.
                 ts   = sym.as<CompilationUnitSymbol>().timeScale;
-                path = sym.getHierarchicalPath();
+                path = ScopeName{ .text = sym.getHierarchicalPath() };
                 break;
             case SymbolKind::Root:
                 // $root declares no timescale of its own, so it reports the
@@ -199,7 +199,7 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
                 // slang's path formatter escapes the leading '$' of the root
                 // symbol's name into "\$root ".
                 ts   = scope_->getCompilation().getDefaultTimeScale();
-                path = "$root";
+                path = ScopeName{ .text = "$root" };
                 break;
             default:
                 fail("$printtimescale argument must name a module instance, $unit or $root");
@@ -210,8 +210,16 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
     // Clotho is the unitless base: one tick is one second (see the tick fold
     // in lower_compilation). iverilog prints the same "1s / 1s" here.
     const std::string scale = ts ? ts->toString() : "1s / 1s";
-    const std::string text  = "Time scale of (" + path + ") is " + scale;
-    b.display(text, /*newline=*/true, {}, loc(call));
+    std::string             fmt = "Time scale of (";
+    std::vector<ir::FmtArg> args;
+    if (path.in_instance) {
+        fmt += "%s";
+        args.push_back(ir::FmtArg{ b.inst_path(loc(call)) });
+    }
+    append_escaped(fmt, path.text);
+    fmt += ") is ";
+    append_escaped(fmt, scale);
+    b.display(fmt, /*newline=*/true, args, loc(call));
 }
 
 // A real count of ticks as the unsigned 64-bit one the wheel takes, times
@@ -689,8 +697,9 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
 // function form never reports: it answers 0.
 void Lowerer::emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
     const std::string banner = banner_at(call.sourceRange.start());
-    b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-               severity_banner(call.sourceRange.start()),
+    emit_report(b,
+                static_cast<uint32_t>(ir::Severity::Fatal),
+                banner_at(call.sourceRange.start()),
                "$cast: the source is not assignment compatible with the destination",
                {},
                l);
@@ -1659,49 +1668,119 @@ std::string Lowerer::instance_path() const {
     return path;
 }
 
-// Hierarchical name of the scope invoking the statement currently being
-// lowered (LRM §21.2.1.5 %m): the instance path plus the enclosing
-// subroutine and named begin blocks. Static per lowering site, because
-// instances are flattened per-instance and subroutine bodies are lowered
-// per defining instance.
-std::string Lowerer::hier_name() const {
+// Whether the scope being lowered sits inside an instance body rather than in a
+// package or `$unit`. The DECLARING scope decides, not whoever happens to be
+// lowering it: a package class's method is built by the first top that reaches
+// it, and still belongs to no instance.
+bool Lowerer::inside_instance() const {
+    for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
+        switch (s->asSymbol().kind) {
+            case SymbolKind::InstanceBody:
+                return true;
+            case SymbolKind::Package:
+            case SymbolKind::CompilationUnit:
+                return false;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+// The generate blocks between `scope` and the instance body that holds it
+// (".gen[0].blk"), spelled as the flattened signal names spell them. A block is
+// part of the instance's body, so these are static text after the path.
+std::string Lowerer::generate_path(const Scope* scope) {
     std::string path;
+    for (const Scope* s = scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        const Symbol& sym = s->asSymbol();
+        if (sym.kind == SymbolKind::InstanceBody) {
+            break;
+        }
+        if (sym.kind != SymbolKind::GenerateBlock) {
+            continue;
+        }
+        const auto&  block = sym.as<GenerateBlockSymbol>();
+        const Scope* up    = sym.getParentScope();
+        const bool   entry = up != nullptr && up->asSymbol().kind == SymbolKind::GenerateBlockArray;
+        path.insert(0,
+                    "." + (entry ? gen_entry_name(up->asSymbol().as<GenerateBlockArraySymbol>(), block)
+                                 : std::string(block.getExternalName())));
+    }
+    return path;
+}
+
+// The scope name up to the end of the instance's own scopes: the path of the
+// instance the code belongs to, then its generate blocks. Empty text outside every
+// instance. Code in an instance reads the path at run time (a declaration
+// initializer included: each instance's initializers are a process of its own),
+// except a subroutine reached through a virtual interface, which serves every
+// instance and keeps the path as text.
+Lowerer::ScopeName Lowerer::instance_scope() const {
+    if (!inside_instance()) {
+        return {};
+    }
+    if (in_vif_body_) {
+        return ScopeName{ .in_instance = false, .text = instance_path() };
+    }
+    return ScopeName{ .in_instance = true, .text = generate_path(scope_) };
+}
+
+// Hierarchical name of the scope invoking the statement currently being lowered
+// (LRM §21.2.1.5 %m): the instance, then the enclosing subroutine and named begin
+// blocks. The instance part is what differs between instances of one
+// specialization, so it is the part left to run time; the rest is as static as
+// the body. A synthetic body that is not a scope of its own (a fork child, a
+// deferred print, an assertion action block, a production) names the scope that
+// created it (FnCtx::invoking_scope), whose instance part it reads the same way.
+Lowerer::ScopeName Lowerer::hier_name() const {
+    ScopeName name;
     if (fn_ctx_ != nullptr && fn_ctx_->invoking_scope) {
-        path = *fn_ctx_->invoking_scope;
+        name = *fn_ctx_->invoking_scope;
     } else {
-        path = instance_path();
-        if (path.empty() && scope_ != nullptr) {
-            // A package / $unit subroutine sits under no instance, so the instance
-            // path is empty; %m still owes the scope chain (LRM 21.2.1.3, Verilator
-            // renders `pkg.fn`). UVM's uvm_instance_scope (base/uvm_misc.svh) scans
-            // %m backwards for a '.' / ':' separated prefix and reports SCPSTR --
-            // 128 times, then a BUILDERR fatal -- when there is none, so the
-            // package segment is load-bearing, not cosmetic.
+        name = instance_scope();
+        if (!name.in_instance && name.text.empty() && scope_ != nullptr) {
+            // A package / $unit subroutine sits under no instance, so %m still owes the
+            // scope chain (LRM 21.2.1.3, Verilator renders `pkg.fn`). UVM's
+            // uvm_instance_scope (base/uvm_misc.svh) scans %m backwards for a '.' / ':'
+            // separated prefix and reports SCPSTR -- 128 times, then a BUILDERR fatal --
+            // when there is none, so the package segment is load-bearing, not cosmetic.
             for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
                 const Symbol& sym = s->asSymbol();
                 if (sym.kind == SymbolKind::Package) {
-                    path = std::string(sym.name);
+                    name.text = std::string(sym.name);
                     break;
                 }
                 if (sym.kind == SymbolKind::CompilationUnit) {
-                    path = "$unit";
+                    name.text = "$unit";
                     break;
                 }
             }
         }
         if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
-            path += '.';
-            path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+            name.text += '.';
+            name.text.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
         }
     }
     for (const OpenBlock& nb : named_blocks_) {
         if (nb.inherited) {
             continue; // already in invoking_scope
         }
-        path += '.';
-        path += nb.sym->name;
+        name.text += '.';
+        name.text += nb.sym->name;
     }
-    return path;
+    return name;
+}
+
+// `text` as literal format text: a `%` in it (an escaped identifier may hold one)
+// must not read as a conversion.
+void Lowerer::append_escaped(std::string& fmt, std::string_view text) {
+    for (const char c : text) {
+        fmt += c;
+        if (c == '%') {
+            fmt += '%';
+        }
+    }
 }
 
 // "library.cell" of the instance invoking the statement currently being
@@ -1797,10 +1876,16 @@ char Lowerer::check_specifier(const clotho::FormatSpec& spec) {
     return conv;
 }
 
-// Copy one string-literal argument into `fmt`, validating every specifier,
-// splicing %m as literal text, and appending each argument-consuming
-// conversion char to `pending`.
-void Lowerer::append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending) {
+// Copy one string-literal argument into `fmt`, validating every specifier and
+// appending each argument-consuming conversion to `pending`. %m and %l consume no
+// argument of the call: %l is static text, spliced in, and so is %m outside an
+// instance; %m inside one is a `%s` whose argument, the instance's path, rides in
+// `pending` already built, with the rest of the name as text after it. slang
+// refuses a width or justification on either (SFormat.cpp), so none is handled.
+void Lowerer::append_format_literal(std::string&              fmt,
+                                    std::string_view          text,
+                                    std::vector<PendingSpec>& pending,
+                                    ir::Builder&              b) {
     for (size_t i = 0; i < text.size();) {
         if (text[i] != '%') {
             fmt += text[i++];
@@ -1813,22 +1898,19 @@ void Lowerer::append_format_literal(std::string& fmt, std::string_view text, std
             continue;
         }
         const char conv = check_specifier(spec);
-        if (conv == 'm' || conv == 'l') {
-            // %m / %l consume no argument; both are static at lower time
-            // (the invoking scope's hierarchical name, or its library.cell),
-            // so splice the text in directly (width-padded).
-            std::string name = conv == 'm' ? hier_name() : lib_cell_name();
-            if (spec.has_width && name.size() < spec.width) {
-                if (spec.left_justify) {
-                    name.append(spec.width - name.size(), ' ');
-                } else {
-                    name.insert(0, spec.width - name.size(), ' ');
-                }
+        if (conv == 'm') {
+            const ScopeName name = hier_name();
+            if (name.in_instance) {
+                fmt += "%s";
+                pending.push_back(
+                  PendingSpec{ .conv = 's', .bound = b.inst_path(to_source_loc(cur_range_.start())) });
             }
-            fmt += name;
+            append_escaped(fmt, name.text);
+        } else if (conv == 'l') {
+            append_escaped(fmt, lib_cell_name());
         } else {
             fmt.append(text, i, 1 + spec.len);
-            pending.push_back(conv);
+            pending.push_back(PendingSpec{ .conv = conv });
         }
         i += 1 + spec.len;
     }
@@ -2464,16 +2546,24 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                            ir::Builder&                       b,
                            char                               default_conv,
                            std::string_view                   lead_text) {
-    // Conversion chars (lowercase) of specifiers seen but not yet matched to
-    // a value arg, in order (FIFO). Needed so a `%t` argument can be scaled
-    // to ticks and a string object checked against %s.
-    std::vector<char> pending;
-    size_t            next = 0; // front of `pending`
+    // Conversions (lowercase) of specifiers seen but not yet matched to a value
+    // arg, in order (FIFO). Needed so a `%t` argument can be scaled to ticks and a
+    // string object checked against %s. A conversion that brings its own argument
+    // (`%m` inside an instance) waits in line like the rest, and `bind` hands that
+    // argument over the moment everything ahead of it has been matched.
+    std::vector<PendingSpec> pending;
+    size_t                   next = 0; // front of `pending`
+    const auto               bind = [&] {
+        while (next < pending.size() && pending[next].bound != ir::kNoIndex) {
+            args.push_back(ir::FmtArg{ pending[next++].bound });
+        }
+    };
 
     if (!lead_text.empty()) {
-        append_format_literal(fmt, lead_text, pending);
+        append_format_literal(fmt, lead_text, pending, b);
     }
     for (const Expression* arg : format_args) {
+        bind();
         if (arg->kind == ExpressionKind::EmptyArgument) {
             // An empty argument (adjacent commas) displays one space
             // (LRM §21.2.1).
@@ -2489,13 +2579,13 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             lit = &lit->as<ConversionExpression>().operand();
         }
         if (lit->kind == ExpressionKind::StringLiteral && next >= pending.size()) {
-            append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending);
+            append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending, b);
         } else {
             const bool str  = is_string_expr(*arg);
             const bool fl   = arg->type->isFloating();
             char       conv = str ? 's' : (fl ? 'g' : default_conv);
             if (next < pending.size()) {
-                conv = pending[next++]; // consumed by an earlier specifier
+                conv = pending[next++].conv; // consumed by an earlier specifier
             } else if (fl) {
                 // Bare real: the "default decimal format" (LRM §21.2.1.1)
                 // is unpinned for reals; %#g (6 significant digits,
@@ -2575,6 +2665,7 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             args.push_back({ v, v_signed });
         }
     }
+    bind();
     if (next < pending.size()) {
         fail("display format has more format specifiers than arguments (LRM 21.2.1.1)");
     }
@@ -2609,7 +2700,7 @@ void Lowerer::emit_severity(ir::Severity                       level,
     std::string            fmt;
     std::vector<ir::FmtArg> args;
     build_format(msg_args, fmt, args, b);
-    b.severity(static_cast<uint32_t>(level), banner, fmt, args, loc(call));
+    emit_report(b, static_cast<uint32_t>(level), banner, fmt, args, loc(call));
 }
 
 // Lower a severity system task: $info / $warning / $error / $fatal (LRM
@@ -2617,7 +2708,7 @@ void Lowerer::emit_severity(ir::Severity                       level,
 // argument is the $finish verbosity level (a constant 0/1/2), the rest the
 // message; it reports, then terminates via $finish(level).
 void Lowerer::lower_severity_task(const CallExpression& call, std::string_view name, ir::Builder& b) {
-    const std::string banner = severity_banner(call.sourceRange.start());
+    const std::string banner = banner_at(call.sourceRange.start());
     const auto        args   = call.arguments();
     if (name == "$fatal") {
         uint32_t                           level = 1;

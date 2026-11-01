@@ -231,13 +231,25 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     // "source:4: ". Measured the way the case above describes: with the banner put
     // back to its old text the old digest came back, so the instruction count (18)
     // and order are untouched and the banner is the whole difference.
+    //
+    // Re-established again when the banner began to read the instance's path at run
+    // time: the default failure built it from four more instructions (the two text
+    // constants, inst_path and their concat), so the final process was 18 + 4 = 22
+    // instructions. And once more when the report stopped building the banner at
+    // all: the severity keeps the pieces apart ("source:4: ", the inst_path operand,
+    // ".ap") for the runtime to join when it reports, so the final process is 18 + 1
+    // = 19 instructions -- the one inst_path -- as the IR printer shows. The step
+    // process, which holds the counting arithmetic this case guards, keeps its digest
+    // through both. Measured the way the case above describes: the `--emit ir` dumps
+    // before and after each change differ in those instructions and the severity's
+    // banner operands, and in nothing else but the renumbering after them.
     LowerResult       r;
     const ir::Module& m = lower_for_monitor(counted_implication, r);
 
     REQUIRE(m.monitors.size() == 1);
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
     CHECK(monitor_shape(m) == "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-                              "step:114:8500337446600503064 final:18:785728055792284918 ");
+                              "step:114:8500337446600503064 final:19:18196170908955638981 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {
@@ -1275,7 +1287,7 @@ endmodule
 )", r);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     const ir::Process& p = monitor_process(m);
-    CHECK(touches(m, p, "sva.shadow.dif.v"));
+    CHECK(touches(m, p, "dif.sva.shadow.v"));
     CHECK_FALSE(touches(m, p, "dif.v"));
 }
 
@@ -1759,13 +1771,18 @@ namespace {
 size_t shadow_count(const ir::Module& m) {
     size_t n = 0;
     for (const ir::SignalInfo& s : m.signals()) {
-        n += s.name.starts_with("sva.shadow.") ? 1 : 0;
+        n += s.name.find("sva.shadow.") != std::string::npos ? 1 : 0;
     }
     return n;
 }
 
+// A shadow is named under the instance declaring the variable it samples:
+// `s.a` is shadowed by `s.sva.shadow.a`.
 bool has_shadow(const ir::Module& m, std::string_view live) {
-    const std::string want = "sva.shadow." + std::string(live);
+    const size_t      dot  = live.rfind('.');
+    const std::string want = dot == std::string_view::npos ? "sva.shadow." + std::string(live)
+                                                           : std::string(live.substr(0, dot + 1)) + "sva.shadow." +
+                                                               std::string(live.substr(dot + 1));
     for (const ir::SignalInfo& s : m.signals()) {
         if (s.name == want) {
             return true;
@@ -1880,7 +1897,7 @@ endmodule
     const ir::Process* p = nullptr;
     for (const ir::Process& proc : m.processes()) {
         if (proc.activation == ir::Activation::Preponed) {
-            REQUIRE(p == nullptr); // one process for the whole top
+            REQUIRE(p == nullptr); // one process for the one scope
             p = &proc;
         }
     }
@@ -2034,12 +2051,13 @@ endmodule
     CHECK(shadow_count(m) == 1);
     CHECK(has_shadow(m, "dif.sig"));
 
-    // The single Preponed process still copies it exactly once per timestep --
+    // The single Preponed process (one scope holds the shadow) still copies it
+    // exactly once per timestep --
     // not once per asserting instance.
     const ir::Process* preponed = nullptr;
     for (const ir::Process& proc : m.processes()) {
         if (proc.activation == ir::Activation::Preponed) {
-            REQUIRE(preponed == nullptr); // one process for the whole top
+            REQUIRE(preponed == nullptr); // one process for the one scope
             preponed = &proc;
         }
     }
@@ -2967,6 +2985,26 @@ module t;
   end
 endmodule
 )") == "5 15");
+}
+
+// An instance whose only process is the Preponed copy of a variable another
+// instance samples (an interface with no initializer) places nothing: its
+// siblings stay where the body declares them, ahead of the parent's own initial.
+TEST_CASE("a scope holding only a sampling copy does not move its siblings") {
+    CHECK(sva_run_capture(R"(
+interface bus_if; logic sig; endinterface
+module watcher(bus_if b, input bit clk);
+  a: assert property (@(posedge clk) !b.sig);
+  initial $display("watcher %m");
+endmodule
+module top;
+  bit clk;
+  bus_if b();
+  watcher w1(b, clk);
+  watcher w2(b, clk);
+  initial $display("top");
+endmodule
+)") == "watcher top.w1\nwatcher top.w2\ntop\n");
 }
 
 TEST_CASE("$past on a hierarchically-referenced signal is the previous tick, cross-scope") {

@@ -81,8 +81,7 @@ llvm::Constant* Backend::cover_config_global() {
                                                     cover_array(cover_point_ty(), points, tn + ".points"),
                                                     b_.getInt32(ct.weight),
                                                     b_.getInt32(ct.goal),
-                                                    b_.getInt32(ct.per_instance ? 1u : 0u),
-                                                    b_.CreateGlobalString(ct.scope) }));
+                                                    b_.getInt32(ct.per_instance ? 1u : 0u) }));
     }
     llvm::Constant* path = config_.coverage_report.empty()
                              ? llvm::Constant::getNullValue(raw_ptr_ty())
@@ -408,10 +407,12 @@ void Backend::lower_finish(Index i) {
     // the drain's existing head != tail test falls through to its finished
     // edge, so no queued process runs after the $finish and the hot path
     // needs no test of its own.
-    if (active_head_gv_ != nullptr) {
-        b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)),
-                       sym(active_head_gv_));
-    }
+    // The ring exists in every design (emit_active_run makes it), so it is made
+    // here rather than tested for: a body lowered before the first push to it
+    // would otherwise lack this reset, and two instances of one unit lowered
+    // either side of that push would be different code.
+    ensure_active_queue();
+    b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)), sym(active_head_gv_));
     // Same for the reactive rings and the batch: a $fatal in an action block
     // would otherwise leave the rest of this instant's pass/fail code queued,
     // and the reactive drain tests the finish flag only on its empty edge.
@@ -448,19 +449,30 @@ void Backend::lower_case_viol(Index i) {
 
 // Lower a severity report ($info / $warning / $error / $fatal, or an
 // immediate-assertion default failure): build the message descriptor array
-// and call the runtime, passing the severity label, compile-time banner, and
-// format string. Needs no wheel (the report carries no simulation time), so
+// and call the runtime, passing the severity label, the banner's pieces, and
+// the format string. Needs no wheel (the report carries no simulation time), so
 // it lowers cleanly inside a pure function too.
+//
+// The banner is not built here. Its leading text, the instance's path (the
+// borrowed handle of an InstPath, null when the banner is all text) and its
+// trailing text (null when empty) go to the runtime as they are, which joins them
+// when it issues the line. Building the banner at the call site would put its
+// temporaries in the prologue of every body that holds a report, paid by every
+// activation, to name an instance on the rare one that fires.
 void Backend::lower_severity(Index i) {
-    const auto  info = ir_->extra_data<SeverityInfo>(ir_->payload(i).extra);
+    const auto        info   = ir_->extra_data<SeverityInfo>(ir_->payload(i).extra);
     const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+    const std::string tail   = ir_->extra_bytes(info.tail, info.tail_len);
     const std::string fmt    = ir_->extra_bytes(info.fmt, info.fmt_len);
 
+    auto*        null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    llvm::Value* path = info.path != kNoIndex ? str_of(info.path) : static_cast<llvm::Value*>(null);
+    llvm::Value* text = tail.empty() ? static_cast<llvm::Value*>(null) : b_.CreateGlobalString(tail);
     const std::span<const Index> args = ir_->region(info.args);
     llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     if (info.defer == 0) {
         b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
-                                       b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                                       b_.CreateGlobalString(banner), path, text, b_.CreateGlobalString(fmt),
                                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
         return;
     }
@@ -477,12 +489,11 @@ void Backend::lower_severity(Index i) {
                      : static_cast<llvm::Value*>(b_.getInt64(0));
     llvm::Value* gen_arg =
       gen != nullptr ? gen
-                     : static_cast<llvm::Value*>(
-                         llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+                     : static_cast<llvm::Value*>(null);
     b_.CreateCall(defer_report_fn(),
                   { b_.getInt32(static_cast<int32_t>(info.level)),
                     b_.getInt64(info.defer == 2 ? 1 : 0), gen_arg, gen_val,
-                    b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                    b_.CreateGlobalString(banner), path, text, b_.CreateGlobalString(fmt),
                     b_.getInt32(static_cast<uint32_t>(args.size())), arr });
 }
 
@@ -550,14 +561,29 @@ void Backend::lower_cover_query(Index i) {
     const auto ival = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     const auto hval = [&](llvm::Value* v) { set_value(i, two_val(v)); };
     switch (info.op) {
-        case CoverOp::New:
+        case CoverOp::New: {
             // `ctx` is the enclosing object for a class-embedded covergroup, so
             // the generated sample body can reach the class properties its
-            // coverpoints name, and null otherwise.
+            // coverpoints name, and null otherwise. The constructing instance's
+            // name prefix arrives in two pieces the runtime joins when it copies
+            // them into the new instance's name: the instance's path (the
+            // borrowed handle of an InstPath, null outside every instance) and
+            // the text after it.
+            if (args.empty() || args.size() > 2) {
+                throw BackendError{ "internal: cover_query new takes a context and at most an instance path" };
+            }
+            const std::string text = ir_->extra_bytes(info.text, info.text_len);
+            llvm::Value* path = args.size() == 2 ? str_of(args[1])
+                                                 : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(
+                                                     llvm::PointerType::getUnqual(ctx_)));
             hval(b_.CreateCall(cover_new_fn(),
                                { b_.getInt32(info.type_idx),
-                                 args.empty() ? b_.getInt64(0) : cast(must_of(args[0]), 64, false) }));
+                                 cast(must_of(args[0]), 64, false),
+                                 path,
+                                 b_.CreateGlobalString(text),
+                                 b_.getInt64(text.size()) }));
             return;
+        }
         case CoverOp::Ctx:
             hval(b_.CreateCall(cover_ctx_fn(), { handle() }));
             return;

@@ -516,7 +516,8 @@ LowerResult lower_design(slang::ast::Compilation&                            com
                          Timings*                                            timings,
                          ir::SystemAccess                                    allow_system,
                          bool                                                partial,
-                         bool                                                allow_port_coercion) {
+                         bool                                                allow_port_coercion,
+                         uint32_t                                            stats) {
     // (allow_port_coercion reaches each Lowerer below.)
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
@@ -791,6 +792,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     WaitPropScan wait_prop_scan;
     wait_prop_scan.out = &waited_props;
     root.visit(wait_prop_scan);
+    UnitOwners unit_owners;
     try {
         Lowerer globals(*module, *result.sources, tick_fs, allow_system);
         globals.set_events_merge(events_merge);
@@ -798,6 +800,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_iface_ids(&iface_ids);
         globals.set_vif_defs(&vif_defs);
         globals.set_waited_props(&waited_props);
+        globals.set_unit_owners(&unit_owners);
         globals.lower_globals(comp, root);
 
         for (const InstanceSymbol* top : root.topInstances) {
@@ -811,6 +814,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_vif_defs(&vif_defs);
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
+            lw.set_unit_owners(&unit_owners);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions resolve in the scope that owns them: this top's
@@ -875,6 +879,18 @@ LowerResult lower_design(slang::ast::Compilation&                            com
                                                  .message  = e.message,
                                                  .span     = e.span });
         return result;
+    }
+    // The frontend's output is a design of units; the backend still consumes
+    // the flat module, so flatten expands the units back into one
+    // (docs/design/modular-compilation.md).
+    {
+        std::vector<uint32_t>       unit_specs;
+        std::unique_ptr<ir::Design> design =
+          ir::partition(*module, unit_owners.attribution, ir::stat_on(stats, ir::Stat::Units) ? &unit_specs : nullptr);
+        if (ir::stat_on(stats, ir::Stat::Units)) {
+            std::fputs(ir::describe_sharing(*design, unit_specs).c_str(), stderr);
+        }
+        module = ir::flatten(std::move(*design));
     }
     // The dump has to represent every declared signal, and the answer needs the
     // whole design, so it is checked here rather than at the $dumpvars call.
@@ -1033,11 +1049,12 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               ir::SystemAccess               allow_system,
                               bool                           partial             = false,
                               DiagStyle                      style               = {},
-                              bool                           allow_port_coercion = false) {
+                              bool                           allow_port_coercion = false,
+                              uint32_t                       stats               = 0) {
     const slang::SourceManager* const sm = comp.getSourceManager();
     if (sm == nullptr) {
-        LowerResult bare =
-          lower_design(comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial, allow_port_coercion);
+        LowerResult bare = lower_design(
+          comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial, allow_port_coercion, stats);
         assert_well_typed(bare);
 
         return bare;
@@ -1049,7 +1066,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     }
     engine.addClient(style.client);
     LowerResult result =
-      lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion);
+      lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion, stats);
     assert_well_typed(result);
 
     // slang's own items arrive rendered (lower_design harvests them one by one).
@@ -1111,7 +1128,8 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          Timings*                               timings,
                          ir::SystemAccess                       allow_system,
                          PathPrefixMap                          path_prefix_map,
-                         bool                                   allow_port_coercion) {
+                         bool                                   allow_port_coercion,
+                         uint32_t                               stats) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`
@@ -1169,7 +1187,7 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // colour and `--diag-source`, `--diag-column`, `--diag-location`, ... apply to
     // them alike.
     return lower_compilation(
-      cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr), allow_port_coercion);
+      cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr), allow_port_coercion, stats);
 }
 
 LowerResult lower_sources(std::span<const std::string_view> args,

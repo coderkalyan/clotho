@@ -234,6 +234,73 @@ TEST_CASE("a tri-state bus driven from two different instance scopes resolves co
                               "conflict=x\n");
 }
 
+// Drivers reached through inout ports at several depths, with a different number
+// of drivers on each net: one in total, two from different instances, two from
+// one instance (its own and its child's), and a net's owner driving it too.
+// Every `leaf` stores through a contribution of its own that its parent binds
+// to the net or to a driver of the owner's, so the answer cannot depend on how
+// many drivers the net has. Verified against iverilog 13.
+TEST_CASE("inout drivers through several levels resolve per net") {
+    constexpr std::string_view src = R"(
+        module leaf(inout wire [7:0] io, input logic [7:0] v, input logic en);
+          assign io = en ? v : 8'bz;
+        endmodule
+        module both(inout wire [7:0] io, input logic [7:0] v, input logic en);
+          assign io = en ? v : 8'bz;
+          leaf l(.io(io), .v(v + 8'd1), .en(en));
+        endmodule
+        module mid(inout wire [7:0] io, input logic [7:0] v, input logic en);
+          leaf l(.io(io), .v(v), .en(en));
+        endmodule
+        module outer(inout wire [7:0] io, input logic [7:0] v, input logic en);
+          mid m(.io(io), .v(v), .en(en));
+        endmodule
+        module top;
+          wire [7:0] a, b, c, d;
+          logic ea = 1, eb = 0, ec = 1;
+          outer o0(a, 8'd5, ea);
+          outer o1(b, 8'd6, eb);
+          outer o2(b, 8'd7, ec);
+          both  b0(c, 8'd9, ec);
+          outer o3(d, 8'd1, ec);
+          assign d = 8'hzz;
+          initial begin
+            #1 $display("a=%0d b=%0d c=%b d=%0d", a, b, c, d);
+            ea = 0; eb = 1;
+            #1 $display("a=%b b=%b", a, b);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=5 b=7 c=000010xx d=1\n"
+                              "a=zzzzzzzz b=0000011x\n");
+}
+
+// Constant partial drivers through an inout port: two instances each drive half
+// of one net (disjoint, but the net must still fold them), and a third drives
+// half of a net by itself, leaving the other half z. Verified against iverilog 13.
+TEST_CASE("partial inout drivers fold per net") {
+    constexpr std::string_view src = R"(
+        module half #(parameter HI = 0) (inout wire [7:0] io, input logic [3:0] v);
+          if (HI) begin : g assign io[7:4] = v; end
+          else    begin : g assign io[3:0] = v; end
+        endmodule
+        module top;
+          wire [7:0] w, s;
+          logic [3:0] a = 4'hA, b = 4'h5;
+          half #(1) h0(w, a);
+          half #(0) h1(w, b);
+          half #(0) h2(s, b);
+          initial begin
+            #1 $display("w=%h s=%b", w, s);
+            a = 4'h3; b = 4'hC;
+            #1 $display("w=%h s=%b", w, s);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "w=a5 s=zzzz0101\n"
+                              "w=3c s=zzzz1100\n");
+}
+
 TEST_CASE("bit-select inout connection fails loudly") {
     const LowerResult r = lower_text(R"(
         module leaf(inout wire b);

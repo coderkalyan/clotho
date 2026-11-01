@@ -409,10 +409,6 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
     ir::CoverType ct;
     ct.name   = cover_group_name(cgt);
     ct.banner = banner_at(cgt.location);
-    ct.scope  = instance_path();
-    if (!ct.scope.empty()) {
-        ct.scope += '.';
-    }
     CoverOpts gopts;
     for (const slang::ast::CoverageOptionSetter& set : body.options) {
         cover_apply_option(set, gopts);
@@ -453,6 +449,7 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
 
     const uint32_t idx = static_cast<uint32_t>(module_.cover_types.size());
     module_.cover_types.push_back(std::move(ct));
+    own_cover_type(idx, cgt);
     // Insert BEFORE building the sample body: a coverpoint expression cannot
     // reach this covergroup, but the body build reads cover_decls_ for the
     // index, and an exception from it must not leave a half-built entry that a
@@ -575,6 +572,7 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
                                            uint32_t                                                type_idx,
                                            const std::vector<const slang::ast::CoverpointSymbol*>& points) {
     const ir::FunctionId id   = module_.reserve_function(module_.pool.void_type);
+    own_function(id, cgt, ".sample");
     const ir::Ref        word = make_int_type(64, false);
     const ir::SourceLoc  l    = to_source_loc(cgt.location);
 
@@ -636,7 +634,7 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
     }
     b.ret_void(l);
     module_.set_function(id,
-                         ir::Function{ .name        = "cover.sample." + std::to_string(type_idx),
+                         ir::Function{ .name        = "cover.sample." + cover_group_name(cgt),
                                        .return_type = module_.pool.void_type,
                                        .param_types = { word },
                                        .arg_dirs    = { ir::ArgDir::In },
@@ -739,18 +737,24 @@ void Lowerer::cover_event_process(const slang::ast::CovergroupType& cgt, uint32_
     const ir::ExtraSlice no_else = b.close_region();
     b.cond(fired, then_region, no_else, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
-                                     // Not a subscription -- an Observed process is resumed once per settled
-                                     // point, never woken by a net event. Kept as the record of which event
-                                     // delimits this covergroup's sampling.
-                                     .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
-                                     .self_start  = false,
-                                     .span        = { l, l },
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::Observed,
+                             // Not a subscription -- an Observed process is resumed once per settled
+                             // point, never woken by a net event. Kept as the record of which event
+                             // delimits this covergroup's sampling.
+                             .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
+                             .self_start  = false,
+                             .span        = { l, l },
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 }
 
-// `covergroup_type ident = new;` (LRM 19.3).
+// `covergroup_type ident = new;` (LRM 19.3). The new instance is named after the
+// module instance that constructs it ("top.u1.cg"), so the report tells the
+// instances of one module apart. The prefix is an operand, read when the group is
+// built, rather than a field of the covergroup type: the type is then the same in
+// every instance of the module, and so is this body. Outside every instance (a
+// package or `$unit` constructs it) the prefix is empty, and what the type's own
+// name makes of it is the whole name.
 ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpression& nc, ir::Builder& b) {
     const slang::ast::Type& t = nc.type->getCanonicalType();
     if (!t.isCovergroup()) {
@@ -769,14 +773,29 @@ ir::Index Lowerer::lower_new_covergroup(const slang::ast::NewCovergroupExpressio
     // class's constructor, which is what makes `this` available here).
     const bool embedded =
       cgt.getParentScope() != nullptr && cgt.getParentScope()->asSymbol().kind == SymbolKind::ClassType;
-    std::vector<ir::Index> args;
+    ir::Index ctx = int_const(0, 64, b, l);
     if (embedded) {
         if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
             fail("an embedded covergroup must be constructed from a method of its class");
         }
-        args.push_back(this_handle(b, l));
+        ctx = this_handle(b, l);
     }
-    return b.cover_query(ir::CoverOp::New, args, word, idx, 0, l);
+    // The name prefix the report names the instance by: the constructing instance's
+    // path, read from the instance, then the text after it (generate blocks and the
+    // closing dot). Inside an instance they travel apart, the path as an operand and
+    // the text on the op, and the runtime joins them as it copies them into the
+    // instance's name; a package's prefix is all text. Joining them here would make
+    // string temporaries of a body that only constructs the group.
+    const ScopeName        scope = instance_scope();
+    std::vector<ir::Index> args{ ctx };
+    std::string            text;
+    if (scope.in_instance) {
+        args.push_back(b.inst_path(l));
+        text = scope.text + ".";
+    } else if (!scope.text.empty()) {
+        text = scope.text + ".";
+    }
+    return b.cover_query(ir::CoverOp::New, args, word, idx, 0, l, text);
 }
 
 // Whether `sub` is one of a covergroup's, coverpoint's or cross's built-in

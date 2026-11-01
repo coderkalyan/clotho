@@ -366,7 +366,13 @@ ir::Signal Lowerer::sva_history_slot(ir::Signal live, const Expression* gate, ui
         // carries which; an ungated ring keeps the name every monitor without
         // a gate already emits.
         ir::SignalInfo info;
-        info.name = hist.base + "past." + module_.signal(live).name +
+        const std::string live_name = module_.signal(live).name;
+        const auto        pre       = scope_prefix_.find(cur_scope_id());
+        const std::string_view local =
+          pre != scope_prefix_.end() && live_name.starts_with(pre->second)
+            ? std::string_view(live_name).substr(pre->second.size())
+            : std::string_view(live_name);
+        info.name = hist.base + "past." + std::string(local) +
                     (gate != nullptr ? ".gate" + std::to_string(at) : std::string()) + "." +
                     std::to_string(entries.size());
         info.loc  = hist.loc;
@@ -864,8 +870,11 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
 
     // The $past rings this monitor needs, filled in on demand while the roots
     // below are evaluated: a sampled value function reaches them through
-    // sva_history_, and nothing else creates one.
-    SvaHistory hist{ .base = "sva." + std::to_string(id) + ".", .loc = l };
+    // sva_history_, and nothing else creates one. Named by the monitor's ordinal
+    // within its instance, never the design-wide id, so instances of one
+    // specialization name their state alike, under the instance's prefix like every
+    // signal it holds.
+    SvaHistory hist{ .base = prefix_ + "sva." + std::to_string(monitor_ordinal_) + ".", .loc = l };
 
     // Roots, one definite bit each. Every one reads the Preponed shadows of
     // the variables it names except the ones root_reads_live names: the
@@ -1538,16 +1547,16 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     // previous tick's sample rather than this one's.
     emit_history_shift(hist, edge, b, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
-                                     // Not a subscription: an Observed process is resumed once
-                                     // per time slot, never woken by a net event. Kept as the
-                                     // record of which event delimits this monitor's cycle --
-                                     // it is what the edge detection above is derived from.
-                                     .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
-                                     .self_start  = false,
-                                     .span        = mon.span,
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::Observed,
+                             // Not a subscription: an Observed process is resumed once
+                             // per time slot, never woken by a net event. Kept as the
+                             // record of which event delimits this monitor's cycle --
+                             // it is what the edge detection above is derived from.
+                             .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
+                             .self_start  = false,
+                             .span        = mon.span,
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 
     // A restrict is silent at the end of the trace for the same reason it is
     // silent during one: it has no verdict to drain. So is a COVER, and for the
@@ -2030,12 +2039,12 @@ void Lowerer::emit_counted_step(const ir::AssertionMonitor& mon,
     // read the pre-shift rings.
     emit_history_shift(hist, edge, b, l);
 
-    module_.add_process(ir::Process{ .activation  = ir::Activation::Observed,
-                                     .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
-                                     .self_start  = false,
-                                     .span        = mon.span,
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation  = ir::Activation::Observed,
+                             .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
+                             .self_start  = false,
+                             .span        = mon.span,
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 
     // `verdicts` and not the kind, for emit_monitor's reason: a cover has no
     // failure to drain, and a counted cover is the shape that exposed it. An
@@ -2084,7 +2093,7 @@ void Lowerer::emit_counted_finish(const ir::AssertionMonitor& mon,
           if (act.fail != nullptr) {
               lower_stmt(*act.fail, b);
           } else {
-              b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+              emit_report(b, static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
           }
       },
       b,
@@ -2271,7 +2280,7 @@ void Lowerer::emit_monitor_finish(const ir::AssertionMonitor& mon,
 
     if (mon.tracking == ir::AssertionTracking::Counted) {
         emit_counted_finish(mon, st, act, b, l);
-        module_.add_process(ir::Process{
+        add_process(ir::Process{
           .activation = ir::Activation::Final, .span = mon.span, .ir = b.finish(), .scope = cur_scope_id() });
         return;
     }
@@ -2321,7 +2330,7 @@ void Lowerer::emit_monitor_finish(const ir::AssertionMonitor& mon,
         if (act.fail != nullptr) {
             lower_stmt(*act.fail, b);
         } else {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+            emit_report(b, static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
         }
         const ir::ExtraSlice then_region = b.close_region();
 
@@ -2331,8 +2340,8 @@ void Lowerer::emit_monitor_finish(const ir::AssertionMonitor& mon,
         b.cond(held, then_region, else_region, l, /*unlikely=*/true);
     }
 
-    module_.add_process(ir::Process{
-      .activation = ir::Activation::Final, .span = mon.span, .ir = b.finish(), .scope = cur_scope_id() });
+    add_process(
+      ir::Process{ .activation = ir::Activation::Final, .span = mon.span, .ir = b.finish(), .scope = cur_scope_id() });
 }
 
 } // namespace clotho::lower

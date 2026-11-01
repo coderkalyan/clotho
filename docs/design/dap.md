@@ -296,10 +296,12 @@ This is the best-supported mapping and the reason it is D1: **four choke points
 already exist, and all four already carry a compile-time `file:line` banner.**
 
 ```c
-void rt_severity(int32_t level, const char* banner, const char* fmt,
+void rt_severity(int32_t level, const char* banner, const rt_string* path,
+                 const char* tail, const char* fmt,
                  uint32_t argc, const rt_arg* argv);                  /* Runtime.h:150 */
 void rt_defer_report(int32_t level, uint64_t is_final, const void* gen,
-                     uint64_t gen_val, const char* banner, const char* fmt,
+                     uint64_t gen_val, const char* banner,
+                     const rt_string* path, const char* tail, const char* fmt,
                      uint32_t argc, const rt_arg* argv);              /* Runtime.h:159 */
 void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind); /* Runtime.h:137 */
 void rt_finish_coop(const char* banner, uint64_t now, int32_t arg);   /* Runtime.h:119 */

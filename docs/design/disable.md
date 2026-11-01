@@ -238,8 +238,8 @@ close.
    The two are different shapes, and V2 wants the second: `defer.gen` is a flat
    per-group `i64` global with no anchor, whereas the per-instance anchored
    array is `build_sched_flags` (`:793-829`) — dense def-local ordinals,
-   per-anchor `clotho.inst.<hier>.sched` arrays, a root array for unowned /
-   PreInit / package processes, and a constant-GEP accessor `sched_flag_ptr`
+   per-anchor `clotho.inst.<hier>.sched` arrays, a root array for unowned
+   (package / `$unit`) processes, and a constant-GEP accessor `sched_flag_ptr`
    (`:832-838`) valid in any block. A `build_disable_epochs` /
    `disable_epoch_ptr` pair is a near-literal transcription of that with `i32`
    → `i64` and "process index" → "target index".
@@ -279,6 +279,13 @@ one module get `L0` and `L1`, which `--emit ir` shows directly. The earlier clai
 that `Symbol*` identity does not distinguish instances was wrong, and load-bearing:
 it is why the design reached for the per-instance anchored-array shape `proc_sched`
 uses. Nothing anchored is needed.
+
+Whether a block is a remote target is joined over its specialization
+(`join_disable_targets`): if a `disable` names it from outside its instance,
+the same block in every instance of that specialization gets an id and the
+occupant bookkeeping too, because instances share code and so must share its
+shape. Each instance's id is still its own, so `disable u1.blk` leaves `u2.blk`
+alone; the other instances only pay for the bookkeeping they never use.
 
 One flat array indexed by target id does it: `@clotho.disable.head[t]`, the head of
 the list of activations currently inside that block, or currently running that task.

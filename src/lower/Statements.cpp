@@ -217,20 +217,20 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
             module_.disable_flush_proc[id->second] = static_cast<uint32_t>(module_.processes().size());
         }
     }
-    module_.add_process(ir::Process{ .activation  = activation,
-                                     .wait_events = std::move(wait_events),
-                                     .self_start  = self_start,
-                                     // LRM 9.2.2.2: the time-zero run of always_comb /
-                                     // always_latch follows every initial / always start.
-                                     .starts_after_procedures = self_start,
-                                     // LRM 13.4.4: an `initial` / `always` procedure is a thread
-                                     // whose calls may spawn background processes. A `final`
-                                     // block is not one of the two, and its children could never
-                                     // run anyway (the drain has ended by then).
-                                     .spawn_root = activation != ir::Activation::Final,
-                                     .span       = span_of(sym),
-                                     .ir         = std::move(body_ir),
-                                     .scope      = cur_scope_id() });
+    add_process(ir::Process{ .activation  = activation,
+                             .wait_events = std::move(wait_events),
+                             .self_start  = self_start,
+                             // LRM 9.2.2.2: the time-zero run of always_comb /
+                             // always_latch follows every initial / always start.
+                             .starts_after_procedures = self_start,
+                             // LRM 13.4.4: an `initial` / `always` procedure is a thread
+                             // whose calls may spawn background processes. A `final`
+                             // block is not one of the two, and its children could never
+                             // run anyway (the drain has ended by then).
+                             .spawn_root = activation != ir::Activation::Final,
+                             .span       = span_of(sym),
+                             .ir         = std::move(body_ir),
+                             .scope      = cur_scope_id() });
 }
 
 void Lowerer::lower_stmt(const Statement& stmt, ir::Builder& b) {
@@ -926,8 +926,14 @@ void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool forc
         // expression, so it needs no function frame; clear fn_ctx_ so a stray
         // non-constant reference fails loudly rather than mis-resolving to a
         // frame local.
-        const Restore<FnCtx*> no_frame(fn_ctx_, nullptr);
+        if (static_init_done_.contains(&vs)) {
+            return; // an interface instance lowered it with the instance (declare_interface_statics)
+        }
+        const Restore<FnCtx*>     no_frame(fn_ctx_, nullptr);
+        const std::optional<Home> home = home_of(vs.getParentScope());
+        HomePreInit               init(*this, home);
         lower_var_initializer(vs);
+        init.commit();
         return;
     }
     // An AUTOMATIC declaration is initialized on every entry to its block (LRM
@@ -1097,15 +1103,46 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
     }
 }
 
-// Emit the accumulated declaration initializers as one run-once PreInit
-// process. Called once after the top instance and all its children are lowered;
-// a no-op when the design has no variable initializers.
-void Lowerer::finalize_preinit() {
+// Close the open declaration initializers into a run-once PreInit process of
+// `scope` (Process::no_scope for the package / `$unit` Lowerer, whose process
+// belongs to no instance); a no-op when none is open.
+void Lowerer::finalize_preinit(uint32_t scope) {
     if (!preinit_) {
         return;
     }
-    module_.add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
+    add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish(), .scope = scope });
     preinit_.reset();
+}
+
+Lowerer::HomePreInit::HomePreInit(Lowerer& l, const std::optional<Home>& home)
+  : l_(l) {
+    if (!home || home->node->id == l.cur_scope_id()) {
+        return;
+    }
+    home_   = home->node->id;
+    active_ = true;
+    if (l.preinit_) {
+        saved_.emplace(std::move(*l.preinit_));
+        l.preinit_.reset();
+    }
+}
+
+// The home's segment becomes its process, and the caller's segment is back before
+// anything else runs.
+void Lowerer::HomePreInit::commit() {
+    if (active_) {
+        l_.finalize_preinit(home_);
+    }
+}
+
+Lowerer::HomePreInit::~HomePreInit() {
+    if (!active_) {
+        return;
+    }
+    l_.preinit_.reset();
+    if (saved_) {
+        l_.preinit_.emplace(std::move(*saved_));
+    }
 }
 
 // for-loop. The initialization runs once in the enclosing region; the

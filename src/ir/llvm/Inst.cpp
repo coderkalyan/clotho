@@ -173,7 +173,8 @@ llvm::Value* Backend::str_empty_global() {
 }
 
 // Whether an instruction produces a fresh string value that needs its own
-// 32-byte handle (as opposed to yielding a pointer at existing storage).
+// 32-byte handle (as opposed to yielding a pointer at existing storage, which is
+// what a signal read, a select and an InstPath's borrowed handle do).
 bool Backend::produces_string_temp(Index i) {
     switch (ir_->tag(i)) {
         case Inst::Tag::StrUpper:
@@ -238,13 +239,6 @@ bool Backend::forwarded_string_store(Index j) {
     }
 }
 
-// Alloca + init one handle per string-producing instruction, in the body
-// prologue (entry block of a function; right after coro.begin of a process /
-// task). Producers overwrite their temp in place, so a loop reuses its
-// capacity instead of allocating each iteration. Paired with
-// deinit_body_strings at the body's exits. A concat consumed by an adjacent
-// forwarded store gets the store target's handle instead of a temp (never
-// init'd — the target already holds a live string).
 // The callee's (statically-resolved) FunctionId for a Call or CallVirtual — its
 // signature / return type, shared by every override of a virtual method.
 FunctionId Backend::call_func_id(Index i) const {
@@ -253,10 +247,23 @@ FunctionId Backend::call_func_id(Index i) const {
                : ir_->extra_data<CallInfo>(ir_->payload(i).extra).func;
 }
 
+// Alloca + init one handle per string-producing instruction, in the body
+// prologue (entry block of a function; right after coro.begin of a process /
+// task). Producers overwrite their temp in place, so a loop reuses its
+// capacity instead of allocating each iteration. Paired with
+// deinit_body_strings at the body's exits. A concat consumed by an adjacent
+// forwarded store gets the store target's handle instead of a temp (never
+// init'd — the target already holds a live string). An InstPath gets no temp
+// either: its value is the instance's borrowed path handle (inst_path_handle),
+// which exists before the body does and is never released.
 void Backend::build_str_temps() {
     str_temp_list_.clear();
     for (size_t k = 0; k < ir_->inst_count(); ++k) {
         const auto i = static_cast<Index>(k);
+        if (ir_->tag(i) == Inst::Tag::InstPath) {
+            set_str(i, inst_path_handle(body_scope()));
+            continue;
+        }
         if (!produces_string_temp(i)) {
             continue;
         }
@@ -2178,6 +2185,11 @@ void Backend::lower_inst(Index i) {
             lower_sformatf(i);
             return;
 
+        // Bound to the instance's borrowed path handle in the prologue
+        // (build_str_temps): there is nothing to emit where it is evaluated.
+        case Inst::Tag::InstPath:
+            return;
+
         case Inst::Tag::Ferror:
             lower_ferror(i);
             return;
@@ -2435,6 +2447,56 @@ void Backend::lower_string_constant(Index i, Ref ref) {
       llvm::StringRef(reinterpret_cast<const char*>(bytes.data()), bytes.size()), "str.lit");
     b_.CreateCall(str_assign_bytes_fn(), { str_of(i), glob, b_.getInt64(bytes.size()),
                                            alloc_site_global(loc_text(i), "string") });
+}
+
+// The scope whose instance an InstPath in the body being lowered names: a function
+// or task body's own, otherwise the process member's.
+uint32_t Backend::body_scope() const {
+    return cur_fn_ != nullptr ? cur_fn_->scope : cur_proc_scope_;
+}
+
+// The path of the instance `scope` names, as the BORROWED string handle an InstPath
+// evaluates to: a read-only rt_string in its heap form whose buffer is the path's own
+// constant bytes. It needs no temp, no init and no release, so a body that reads it
+// only on a rare path (a report) pays nothing for it on the others. The flat module
+// knows each instance's hierarchical name (the anchor of its scope, which is how its
+// state global is named), so for now the handle is a constant of the module that
+// reads it. Compiling units directly will have the instance's record hold the same
+// handle in a field and read it from there, which is why the instruction exists at
+// all -- and why nothing may write through the handle.
+llvm::Value* Backend::inst_path_handle(uint32_t scope) {
+    if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
+        anchor_of_scope_[scope] == SignalSlot::no_anchor) {
+        throw BackendError{ "internal: inst_path in a body that belongs to no instance" };
+    }
+    const uint32_t         anchor = anchor_of_scope_[scope];
+    llvm::GlobalVariable*& slot   = env_->inst_paths[anchor];
+    if (slot != nullptr) {
+        return slot;
+    }
+
+    // The handle is { ptr, len, cap, padding, flag } with no padding of its own, which
+    // is what rt_string_heap plus the flag byte come to.
+    static_assert(sizeof(char*) == 8 && offsetof(rt_string_heap, ptr) == 0 && offsetof(rt_string_heap, len) == 8 &&
+                  offsetof(rt_string_heap, cap) == 16 && sizeof(rt_string_heap) == 24);
+    auto*              i8     = b_.getInt8Ty();
+    auto*              i64    = b_.getInt64Ty();
+    auto*              pad_ty = llvm::ArrayType::get(i8, sizeof(rt_string) - sizeof(rt_string_heap) - 1);
+    auto*              ty     = llvm::StructType::get(ctx_, { raw_ptr_ty(), i64, i64, pad_ty, i8 }, /*isPacked=*/true);
+    const std::string& path   = anchors_[anchor].name;
+
+    // The bytes keep their NUL terminator: a handle's data is also a valid C string.
+    llvm::Constant* text  = llvm::ConstantDataArray::getString(ctx_, path, /*AddNull=*/true);
+    auto*           bytes = new llvm::GlobalVariable(env_->llmod, text->getType(), /*isConstant=*/true,
+                                                     llvm::GlobalValue::PrivateLinkage, text, "inst.path.str");
+    bytes->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+    llvm::Constant* init = llvm::ConstantStruct::get(
+      ty, { bytes, b_.getInt64(path.size()), b_.getInt64(path.size()), llvm::ConstantAggregateZero::get(pad_ty),
+            b_.getInt8(rt_string_heap_flag) });
+    slot = new llvm::GlobalVariable(env_->llmod, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init,
+                                    "inst.path");
+    slot->setAlignment(llvm::Align(alignof(rt_string)));
+    return slot;
 }
 
 // String concatenation: gather the part handles into a stack array and hand

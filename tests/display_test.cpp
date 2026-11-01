@@ -221,6 +221,123 @@ TEST_CASE("%l reports the invoking instance's library.cell") {
     )") == "sub scope: work.sub\ntop scope: work.top\n");
 }
 
+// The instance part of a name is the one thing instances of one definition do not
+// share, so each prints its own while the generate blocks and named scopes after
+// it stay the definition's (LRM 21.2.1.3).
+TEST_CASE("%m of an instance names its generate blocks and its own path") {
+    CHECK(run_capture(R"(
+        module leaf;
+            for (genvar i = 0; i < 2; i++) begin : g
+                initial $display("%m");
+                if (i == 1) begin : inner
+                    initial $display("%m");
+                    function automatic string f();
+                        return $sformatf("%m");
+                    endfunction
+                    initial $display("%s", f());
+                end
+            end
+            if (1) begin : cond
+                initial $display("%m");
+            end
+        endmodule
+        module top;
+            leaf a();
+            leaf b();
+        endmodule
+    )") == "top.a.g[0]\ntop.a.g[1]\ntop.a.g[1].inner\ntop.a.g[1].inner.f\ntop.a.cond\n"
+           "top.b.g[0]\ntop.b.g[1]\ntop.b.g[1].inner\ntop.b.g[1].inner.f\ntop.b.cond\n");
+}
+
+// %m takes no argument, wherever it sits among the conversions that do.
+TEST_CASE("%m between conversions leaves their arguments alone") {
+    CHECK(run_capture(R"(
+        module leaf;
+            initial $display("[%0d] %m [%0d] %m", 7, 8);
+            initial $display("%m %0d", 9);
+        endmodule
+        module top;
+            leaf a();
+            leaf b();
+        endmodule
+    )") == "[7] top.a [8] top.a\ntop.a 9\n[7] top.b [8] top.b\ntop.b 9\n");
+}
+
+// A `%` in an instance's name is text, not a conversion: the name may be an escaped
+// identifier.
+TEST_CASE("%m prints the % of an escaped instance name literally") {
+    CHECK(run_capture(R"(
+        module leaf;
+            initial $display("in %m");
+        endmodule
+        module top;
+            leaf \u%d ();
+            leaf \v%s ();
+        endmodule
+    )") == "in top.u%d\nin top.v%s\n");
+}
+
+// The path is read in place from the instance, not copied into a string of the
+// body's own, so nothing about its length matters: this one is past what a string
+// holds inline (30 bytes), and a copy of it is what $sformatf makes of %m.
+TEST_CASE("%m prints an instance path longer than a string holds inline") {
+    CHECK(run_capture(R"(
+        module leaf;
+            function automatic string who();
+                return $sformatf("<%m>");
+            endfunction
+            initial $display("[%m] %s", who());
+        endmodule
+        module top;
+            leaf an_instance_name_well_past_thirty_bytes_long ();
+            leaf s ();
+        endmodule
+    )") == "[top.an_instance_name_well_past_thirty_bytes_long] <top.an_instance_name_well_past_thirty_bytes_long.who>\n"
+           "[top.s] <top.s.who>\n");
+}
+
+// The scope is where the subroutine is declared, not where it is called from
+// (LRM 21.2.1.3: the scope that holds the $display call).
+TEST_CASE("%m in a subroutine called through a hierarchical name names its own instance") {
+    CHECK(run_capture(R"(
+        module m;
+            function automatic string who();
+                return $sformatf("fn[%m]");
+            endfunction
+            task automatic hello();
+                $display("task[%m]");
+            endtask
+        endmodule
+        module caller;
+            initial begin
+                $display("%s", top.u1.who());
+                top.u1.hello();
+                $display("%s", top.u2.who());
+                $display("here %m");
+            end
+        endmodule
+        module top;
+            m u1();
+            m u2();
+            caller c();
+        endmodule
+    )") == "fn[top.u1.who]\ntask[top.u1.hello]\nfn[top.u2.who]\nhere top.c\n");
+}
+
+// $printtimescale with no argument names the calling instance, like %m.
+TEST_CASE("$printtimescale names each instance of one definition") {
+    CHECK(run_capture(R"(
+        `timescale 1ns/1ps
+        module leaf;
+            initial $printtimescale;
+        endmodule
+        module top;
+            leaf a();
+            leaf b();
+        endmodule
+    )") == "Time scale of (top.a) is 1ns / 1ps\nTime scale of (top.b) is 1ns / 1ps\n");
+}
+
 // An explicit %t width overrides $timeformat's minimum width; %0t is minimal.
 TEST_CASE("%t honors explicit widths over $timeformat") {
     CHECK(run_capture(R"(

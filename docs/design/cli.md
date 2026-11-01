@@ -93,7 +93,7 @@ see "One parser".
 | `--cpu <name>` | build | the processor an `exe` or `obj` is compiled for: by default a baseline every machine of the kind has (`x86-64-v2`, `apple-m1` on Apple Silicon, `generic` Armv8-A on other AArch64), `native` for the machine building it, or any processor name LLVM knows for the target (an unknown one is a usage error). Refused for text targets |
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
-| `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`. `parallel` reports only under `run` |
+| `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`, `units`. `parallel` reports only under `run`; `units` reports how many instances each specialization has and which specializations' instances still do not lower to identical unit IR |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `divzero` (a 2-state divide or modulo by zero: the design still gets 0, the x of LRM 11.4.3 made 0 by LRM 6.3.1, and the report says where it happened), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
 | `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled in -- the emitted coverage model names its own -- so an executable writes its report to the file `build` was given |
 | `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so an executable keeps the setting `build` was given |
@@ -380,7 +380,7 @@ behaviour change; docs quoting the old spellings were migrated with this commit.
 `--coverage` is the one carve-out from the `--stat=` rule above, and the line is
 whose result it is. A `Stat` bit is a *compiler* statistic: `--stat` is
 documented as "for working on clotho", and every bit it has (`dedup`,
-`dedup-sets`, `comb-fuse`, `finish`, `parallel`) fires at compile time, prints to
+`dedup-sets`, `comb-fuse`, `finish`, `parallel`, `units`) fires at compile time, prints to
 stderr and changes nothing about the emitted code. Functional coverage is a
 *design* result — what the design's own stimulus reached (LRM 19) — produced
 while the design runs and written to a file the operator names, so it gets its

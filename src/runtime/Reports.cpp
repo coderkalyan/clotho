@@ -100,15 +100,30 @@ ankerl::unordered_dense::set<const void*>        g_ref_stale_seen;
 // The line of one severity report (LRM 20.10), newline included:
 // "<LABEL>: <banner> at <time>[: <message>]". LRM 20.10 requires the report to
 // carry the call's location, the hierarchical name of the scope it is made in and
-// the simulation time; the first two arrive in `banner`, resolved when the design
-// was lowered. The time is the current one, written as the $finish banner writes
+// the simulation time; the first two arrive as the pieces of the banner, resolved
+// when the design was lowered except for the instance's path, which the instance
+// holds. They are only joined here, so a call site that does not report builds
+// nothing. The time is the current one, written as the $finish banner writes
 // it. The layout is not LRM-mandated (docs/LRM_NOTES.md, note 28).
-std::string severity_line(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv) {
+std::string severity_line(int32_t           level,
+                          const char*       banner,
+                          const rt_string*  path,
+                          const char*       tail,
+                          const char*       fmt,
+                          uint32_t          argc,
+                          const rt_arg*     argv) {
     static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
     std::string line = labels[level >= 0 && level < 4 ? level : 2];
     line += ": ";
-    if (banner[0] != '\0') {
-        line += banner;
+    const size_t head = line.size();
+    line += banner;
+    if (path != nullptr) {
+        line.append(str_data(path), str_len(path));
+    }
+    if (tail != nullptr) {
+        line += tail;
+    }
+    if (line.size() != head) {
         line += ' ';
     }
     line += "at ";
@@ -127,8 +142,8 @@ std::string severity_line(int32_t level, const char* banner, const char* fmt, ui
 
 } // namespace rt_internal
 
-extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc,
-                            const rt_arg* argv) {
+extern "C" void rt_severity(int32_t level, const char* banner, const rt_string* path, const char* tail,
+                            const char* fmt, uint32_t argc, const rt_arg* argv) {
     // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
     // default failure (LRM 16.3). A simulator diagnostic, not design output, so
     // it goes to stderr like the $finish / case-violation banners; flush stdout
@@ -141,7 +156,7 @@ extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, 
         // the run's exit status.
         g_fatal_seen = true;
     }
-    const std::string line = severity_line(level, banner, fmt, argc, argv);
+    const std::string line = severity_line(level, banner, path, tail, fmt, argc, argv);
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
 }

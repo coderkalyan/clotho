@@ -6,14 +6,15 @@
 // handles to names / types and holds the lowered processes together.
 //
 // Ownership: a Module owns the InternPool shared by every process it holds, so
-// each Process's `Ir.pool()` stays valid for the module's lifetime. The pool
-// (and thus the Module) is non-movable, so a Module is the owning root,
+// each Process's `Ir.pool()` stays valid for the module's lifetime. The pool is
+// heap-held and the Module non-movable, so a Module is the owning root,
 // typically held behind a unique_ptr by the front-end.
 
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -71,6 +72,8 @@ struct SignalInfo {
     // bytes into its state field's static initializer and skips the power-on
     // fill, so materializing a table costs no instructions at any point.
     Ref const_data = Ref::Invalid;
+
+    bool operator==(const SignalInfo&) const = default;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every
@@ -204,6 +207,8 @@ struct WaitEvent {
     // naming which member -- and this says which instance is actually waited on.
     // kNoWaitHandle otherwise. Mutually exclusive with `handle`.
     Index inst = kNoWaitHandle;
+
+    bool operator==(const WaitEvent&) const = default;
 };
 
 // One lowered process plus the metadata the IR body itself does not carry: how
@@ -286,9 +291,12 @@ struct Process {
     Ir ir;
     // Scope id (InstanceScope::id) of the instance whose definition declared
     // this process, or no_scope for a process that belongs to no single
-    // instance (a per-top PreInit pass, package/$unit lowering).
+    // instance (package/$unit lowering, a resolver of a net driven from several
+    // scopes).
     static constexpr uint32_t no_scope = ~0u;
     uint32_t scope = no_scope;
+
+    bool operator==(const Process&) const = default;
 };
 
 
@@ -382,6 +390,8 @@ enum class AssertionTracking : uint8_t { Ring, Counted };
 struct AssertionLiteral {
     uint32_t root = 0;
     bool negated = false;
+
+    bool operator==(const AssertionLiteral&) const = default;
 };
 
 // A guard cube: the conjunction of literals[start .. start + len). An empty cube
@@ -389,6 +399,8 @@ struct AssertionLiteral {
 struct AssertionCube {
     uint32_t start = 0;
     uint32_t len = 0;
+
+    bool operator==(const AssertionCube&) const = default;
 };
 
 // One automaton: a Glushkov position automaton. One state per letter occurrence,
@@ -417,6 +429,8 @@ struct AssertionAutomaton {
     // cubes.size() * words: per guard, the mask of states carrying it. Lets the
     // satisfied-state mask fold over guards instead of gathering per state.
     std::vector<uint64_t> guard_states;
+
+    bool operator==(const AssertionAutomaton&) const = default;
 };
 
 // What an abort does to the attempts it covers, once its condition holds. The
@@ -451,6 +465,8 @@ struct AssertionAbort {
     // state in here, which is what confines it to the cycles the property
     // beneath it is really being evaluated in.
     std::vector<uint64_t> mask;
+
+    bool operator==(const AssertionAbort&) const = default;
 };
 
 struct AssertionMonitor {
@@ -521,10 +537,12 @@ struct AssertionMonitor {
 
     // Full extent of the assert/cover statement, for the failure report.
     SourceSpan span;
-    // Precomputed "<file>:<line>: <scope>" prefix of the failure report, the
-    // scope being the assertion's own (its instance and label), so the backend
-    // stays slang-free.
+    // Precomputed "<file>:<line>: " prefix of the failure report, so the backend stays
+    // slang-free. The scope after it (the instance, which differs between instances,
+    // and the assertion's label) is added where the report is emitted.
     std::string banner;
+
+    bool operator==(const AssertionMonitor&) const = default;
 };
 
 // Direction of a subroutine formal argument (LRM 13.5). Out / Inout copy the
@@ -662,8 +680,16 @@ struct Function {
     // Full source extent of the subroutine declaration. Empty for a
     // compiler-synthesized body (a $strobe/$monitor thunk, a fork child).
     SourceSpan span;
+    // InstanceScope::id of the instance whose definition declared this body, which is
+    // what Inst::Tag::InstPath names inside it; Process::no_scope for a body that
+    // belongs to no instance (package / `$unit` code). The frontend leaves it unset:
+    // a unit's functions are its instance's by position, and flatten, which makes
+    // one copy per instance, assigns it.
+    uint32_t scope = Process::no_scope;
     // The lowered body.
     Ir ir;
+
+    bool operator==(const Function&) const = default;
 };
 
 // An `export "DPI-C"` directive (LRM 35.5 / 35.8): a SystemVerilog function or
@@ -736,6 +762,8 @@ struct ClassDesc {
 struct CoverRange {
     uint64_t lo;
     uint64_t hi;
+
+    bool operator==(const CoverRange&) const = default;
 };
 
 // Bin kinds, mirroring RT_COVER_BIN_* in src/runtime/Coverage.h.
@@ -756,6 +784,8 @@ struct CoverBin {
     std::string             name;
     CoverBinKind            kind = CoverBinKind::Normal;
     std::vector<CoverRange> ranges;
+
+    bool operator==(const CoverBin&) const = default;
 };
 
 struct CoverPoint {
@@ -773,6 +803,8 @@ struct CoverPoint {
     bool     is_auto    = false;
     uint32_t auto_total = 0;
     bool     is_signed  = false;
+
+    bool operator==(const CoverPoint&) const = default;
 };
 
 struct CoverType {
@@ -780,15 +812,15 @@ struct CoverType {
     // covergroup, whose type is anonymous in slang.
     std::string name;
     std::string banner;
-    // The instance path of the scope that declared it ("top.u1."), so one
-    // covergroup type in a module instantiated twice reports two distinguishable
-    // instances. A covergroup declaration is lowered once per instance, so this is
-    // fixed per entry.
-    std::string             scope;
+    // The type says nothing of where it is instantiated: the instance path a report
+    // names an instance by ("top.u1.") is read when the covergroup is constructed
+    // (CoverOp::New), so the instances of one module share the one type.
     std::vector<CoverPoint> points;
     uint32_t                weight       = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
+
+    bool operator==(const CoverType&) const = default;
 };
 
 // `ChangeNotify::field` entry for an edge no `@` / `wait` in the design asks for,
@@ -826,10 +858,23 @@ struct ChangeNotify {
 };
 
 class Module {
+    // Owner of `pool`. Declared first so it is constructed before the reference.
+    std::unique_ptr<InternPool> pool_owner_;
+
 public:
+    Module()
+      : Module(std::make_unique<InternPool>()) {}
+    // Adopt the pool an already-built IR references (flatten hands over its
+    // Design's).
+    explicit Module(std::unique_ptr<InternPool> pool)
+      : pool_owner_(std::move(pool))
+      , pool(*pool_owner_) {}
+    Module(const Module&)            = delete;
+    Module& operator=(const Module&) = delete;
+
     // Shared intern pool backing every process's constant / type handles. Owned
     // here so all processes outlive their pool reference.
-    InternPool pool;
+    InternPool& pool;
     // DPI-C exports (LRM 35.5): SV functions exposed as C-callable thunks.
     std::vector<DpiExport> dpi_exports;
     // Compiled concurrent assertions (LRM 16). Indexed by the monitor id a
@@ -1066,6 +1111,27 @@ public:
             }
         }
         return nullptr;
+    }
+
+    // Every interface class bitmap bit, in registration order.
+    [[nodiscard]] std::span<const std::pair<Ref, uint32_t>> iface_type_ids() const {
+        return iface_type_ids_;
+    }
+
+    // Every Ref registered as the built-in `process` class, in registration order.
+    [[nodiscard]] std::span<const Ref> process_classes() const {
+        return process_classes_;
+    }
+
+    // Every waited-on class property's notifiers.
+    [[nodiscard]] std::span<const ChangeNotify> change_notifies() const {
+        return change_notifies_;
+    }
+
+    // Hand the pool to a new owner, as partition does once it has copied every
+    // body out. The module must not be used afterwards except to be destroyed.
+    [[nodiscard]] std::unique_ptr<InternPool> release_pool() {
+        return std::move(pool_owner_);
     }
 
 private:

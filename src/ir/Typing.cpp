@@ -422,6 +422,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::StrLower:
         case Inst::Tag::StrSubstr:
         case Inst::Tag::StrFromPacked:
+        case Inst::Tag::InstPath:
         case Inst::Tag::Sformatf:
         case Inst::Tag::EnumName:
         case Inst::Tag::ContainerFmtP:

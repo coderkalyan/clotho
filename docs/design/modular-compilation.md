@@ -1,0 +1,400 @@
+# Modular compilation
+
+Status: steps 1 and 2a/2b/2c are on this branch (2d, lowering a specialization
+once, is not); step 3, the backend per unit (instance records, groups and
+functions lowered once per unit, one LLVM module per unit), is on the
+`modular-ir` branch and is described here as the design it implements, not as
+what this branch does. The frontend's output is a `Design` (src/ir/Design.h)
+with one unit per specialization wherever its instances lower identically, which
+`flatten` expands back into the flat module the backend consumes (`clotho run
+--stat=units` reports what is still split: none on rocket-chip, nor on a design
+whose instances print `%m`, report through assertions and build covergroups).
+The frontend still lowers every instance, and everything below the IR is still
+whole-design; `module-split.md` describes the LLVM-level partition that exists
+today. An instance's own path is read through `inst_path`, which the flat
+backend resolves from the instance a body belongs to (a borrowed constant
+string); it costs a body nothing until a report fires.
+
+Goal: compile an SV design as a composition of small units, so compilation can
+be incremental, cached and parallel. The aim is an architecture whose unit
+boundaries follow SV semantics, not a compile-time speedup of the current
+pipeline. The speedup follows from the boundaries.
+
+## Where the pipeline is today
+
+Every stage up to and including LLVM IR construction is one whole-design pass:
+
+- slang parses with `singleUnit` and elaborates the whole design.
+- Lowering walks every elaborated **instance** into one flat `ir::Module`. A
+  definition instantiated N times is lowered N times; `getCanonicalBody` is not
+  used. Signal, process, function and scope ids are positions in design-wide
+  tables and appear verbatim in IR bodies.
+- `analyze()` runs whole-design fixpoints (may-z, undriven, pointer arguments)
+  whose results decide state layout.
+- The backend builds every LLVM module in one serial pass, then splits the
+  output into a root module and one module per state struct type. Functions,
+  NBA commit functions, initializers and the seed loop stay in root.
+- Nothing is cached. `clotho build` links every module back into one.
+
+The partition is drawn after every whole-design decision, so no stage above
+LLVM can be incremental, and the LLVM units are not a function of their own
+source: a reader added in one module changes the wake code of another, and
+global ids leak into unit code as immediates.
+
+## Granularity
+
+What decides a module body's meaning is its definition, the definitions it
+imports (packages, classes, `$unit`), its parameter values, the
+specializations of the interfaces on its interface ports, and whatever
+elaboration injects (`bind`, `defparam` and configuration targets). Elaboration
+computes exactly these (LRM 3.12, 23.10.4); an instance's name, where its ports
+lead and who references it are context.
+
+That tuple is slang's `InstanceCacheKey` (definition, parameter values, type
+parameters, interface port keys). slang refuses to share a body in exactly the
+cases where context leaks into it: targets of `defparam`, `bind` or a
+configuration, and bodies with upward hierarchical names.
+
+| Level | Role |
+|---|---|
+| File | Parsing only. |
+| Specialization (slang canonical body), package, `$unit`, class specialization | **Unit**: the grain of lowering, code, caching and parallelism. |
+| Instance | Data (state storage) and bindings. Never code. |
+| Design | Link: hierarchy, bindings, global numbering, scheduling plan. |
+
+Rejected grains:
+
+- Files carry no semantics; macros cross files within a compilation unit.
+- An unparameterized definition compiled like a template: type parameters and
+  generate constructs change structure, so there is no single body to compile.
+- Instances: code grows with instance count, every copy is a separate cache
+  entry, and N copies of one body cost instruction-cache pressure at run time.
+- Processes: a process's code is loads, stores and wakeups against its unit's
+  layout (field offsets and slot shapes over every signal the unit declares,
+  scheduling-flag and wait-queue slots, the wake code of every sibling that
+  reads what it writes, calls to the unit's functions). An edit to a module
+  usually changes that layout, so a per-process boundary buys no reuse, and
+  making each process independent means one relocation per signal access.
+  Splitting a large unit into several LLVM modules for codegen parallelism stays
+  available underneath the unit.
+
+No stage compiles per instance. Everything that differs between instances of one
+specialization is data: the instance name (`%m`, VCD scopes, report banners),
+bindings, RNG seeds, and covergroup and assertion instance records.
+
+## The boundary
+
+LRM 23.3.3 splits every cross-unit edge into one of two kinds.
+
+**Value flow.** Input and output ports: "each port connection shall be a
+continuous assignment of source to sink". The assignment is a process in the
+parent's unit, reading or writing the child's port. Value flow composes through
+the scheduler.
+
+**Name binding.** A ref port is "treated as hierarchical references to the
+variable to which it is connected"; an inout is a bidirectional connection;
+connections of user-defined nettypes on both sides "shall be merged into a
+single simulated net"; an interface port is connected to an interface instance.
+Hierarchical references, package items and `$unit` items are bindings too. A
+unit imports a binding by name; the link step resolves it per instance. Binding
+composes through the linker.
+
+## Invariants
+
+1. A unit's IR, and later its object code, is a pure function of its key. No
+   design-global index appears in a unit's IR; global numbering exists only at
+   link time.
+2. Whole-design work reads unit summaries and the hierarchy, never unit bodies.
+3. A fact a unit's context imposes on it (an outside writer, a `force` from
+   another unit, a waiter on an exported signal) is either data the unit's code
+   reads at run time, or an entry in a small explicit summary that is part of
+   the unit's codegen key. Facts are joined over every instance of the unit:
+   code is shared, so it must be correct for all of them.
+4. A specialization's layout depends only on the specialization and on the port
+   facts in its summary. Virtual interfaces and body sharing both rely on this.
+
+## IR shape
+
+`ir::Design` (src/ir/Design.h) is the frontend's output:
+
+```
+Design
+  pool       InternPool        shared by every unit until per-unit pools land
+  units      deque<Unit>
+  roots      vector<Root>      top-level instances, and the static instance of
+                               every package, $unit and class unit
+Unit
+  kind, def_name
+  signals    UnitSignal{SignalInfo, import, scoped}  local definitions and extern declarations
+  functions  UnitFunction{Function, name, import}    ditto, with the name others import by
+  processes  vector<Process>
+  imports    vector<Import>
+  inst_refs  vector<InstanceRef>   instances named by IfaceRef
+  children   vector<ChildSlot>     the instances this body declares
+  bound_ports                      ports the instantiating parent binds
+  disable_targets                  UnitDisableTarget{is_task, flush_proc, name, import}
+  cover_types                      UnitCoverType{CoverType, name, import}
+  monitors, class descriptors, DPI exports
+```
+
+### Handles
+
+`Signal` and `FunctionId` stay `u32` handles in instruction payloads, but they
+index the unit's own tables. A handle whose entry carries an import is an
+**extern declaration**, like an LLVM external global: its `SignalInfo` /
+`Function` gives the expected shape and the import says where the definition
+lives. Instruction bodies therefore keep their shape; only the table behind the
+handle changes.
+
+Every other cross-table id in a body is unit-local too: assertion monitors,
+covergroup types (importable: an instance builds a package's type), `disable` targets (importable, because a remote `disable` can
+name a block in another instance), and the interface instances `IfaceRef` names
+(an index into `inst_refs` instead of a global scope id). `Ir::rebased` moves a
+body between handle spaces through a `HandleMapper`, one entry point per
+`HandleFamily`; its switch lists every tag, so a new tag carrying a handle
+cannot be missed. A synchronization wait site is not a handle: it identifies a
+park within its own body only.
+
+A unit signal that is not `scoped` is storage the compiler adds to the unit
+without declaring it there, such as a constant table: it is not listed in the
+instance's scope, so the VCD dump does not show it.
+
+### Imports
+
+An import names its target by **unit-relative name**, never by the target
+unit's local handle, so a unit's IR does not change when an unrelated part of
+another unit does, and units can be lowered in any order. A unit's members, by
+name, are what it defines plus its bound ports; its own extern declarations are
+not members. A name two members share cannot be imported.
+
+| Import | Target |
+|---|---|
+| `Port(k)` | Whatever the instantiating parent binds to this unit's bound port `k`: a signal for an inout, ref or merged-nettype port, or for a contribution to one (below). |
+| `Member(ref, name)` | The member `name` of the instance `ref` reaches: a child's port read by a port copy, a downward or upward hierarchical reference, a package item, a package's covergroup type, a hierarchical task call. |
+| `Representative(unit, name)` | The member `name` of any instance of `unit`. Supplies layout only, for a member reached through a virtual interface handle. |
+
+An `InstanceRef` is a base followed by a path of child slots. The base is the
+importing instance itself or an ancestor `n` levels up (`Up(n)`), a root
+(`Root(i)`: a top, a package or a class unit), or the instance bound to one of
+the unit's interface ports (`Port(k)`).
+
+A `ChildSlot` records the child's unit, its instance name and the binding for
+each of the child's bound ports, as a handle in the **parent's** space (a
+signal, or an `inst_refs` entry for an interface port). Bindings belong to the
+parent unit, not to an instance, so the instance tree is fully determined by the
+roots and the units' child slots; an `Instance` adds only its name.
+
+Upward references are relative (`Up(n)`), which is what lets a body that
+contains one be shared once its imports are keyed on what they resolve to.
+Until then such bodies, like the other bodies slang will not share, get a unit
+of their own.
+
+A `ChildSlot` also records how many of the parent's processes precede the child
+(`process_pos`), so flatten emits processes in the body's source order rather
+than all of a parent's before its children's.
+
+### Contributions
+
+A driver through an inout port stores into a **contribution**: a bound port the
+driving unit declares for that driver (`io$drv0`, `io$drv1`, ... per port, in
+body order), so the body is the same whether the net has one driver or many.
+Contributions are part of the unit's interface, like the port itself. The store
+is full width (a partial driver carries z in the bits it does not drive), and a
+contribution overlaps every other driver of its net, so a net with one is
+resolved as soon as it has a second.
+
+The instantiating parent binds each contribution. A parent that reaches the
+net through a port of its own re-exports the contribution as one of its own, so
+nothing names a grandchild's. Otherwise the parent is the net's owner (or
+reaches it by a hierarchical name) and binds it to the net itself when this is
+the net's only driver, so the store lands in the net with no run-time cost, and
+to a fresh driver slot of the net's owner when the net resolves; the resolver
+is the owner's too. The owner's IR therefore depends on its own drivers and its
+children's interfaces, never on a descendant's body. `flatten` resolves the
+chain of `Port` imports to the net or the slot, so the flat module is the one
+a direct store or a slot owned by the driver gave.
+
+### Net types across ports
+
+LRM 23.3.3.7 lets the nets on both sides of a port "take on the same type", and
+Table 23-1 gives which. How Clotho reads it depends on the direction.
+
+**Inout.** The port merges the two nets (both symbols share one signal), and the
+merged **simulated net** has the type the table gives for the pair (the
+external net's unless the table says internal) and the dominating net's delay.
+The simulated net is a fact of the net's owner, the symbol that declared the
+signal: its resolution function, the pull of a tri0/tri1 net, the strength of a
+supply net and its delay are all decided there, once every port is met
+(`finalize_sim_nets`), and no driver's own net type is consulted. A child never
+reads it, because its drivers store into contributions the owner binds, so
+instances of one specialization stay one unit however differently typed the nets
+they connect to are.
+
+`NetType::getSimulatedNetType` is the table; it agrees with all 81 cells of
+Table 23-1, type and `warn` flag, as printed in the LRM. The clause leaves some
+readings open, decided in `collapse_port_net`:
+
+- A net reaches a leaf through a chain of ports, and each is one pairwise
+  collapse whose external net is the net the ports above it have made: the
+  table is applied outside-in with the type so far as the external type. Ports
+  are met in elaboration order, an instance's before its children's and
+  siblings in declaration order.
+- A pair where neither type dominates (wand against wor, tri0 against tri1, a
+  trireg against a wand) goes to "external" and is a `warn` cell, so a result
+  that depends on the order is always reported. slang reports each port
+  connection whose declared types make a `warn` cell (`net-inconsistent`); a
+  pair that is one only for the type the net has taken on is reported by Clotho
+  (`net-type-conflict`). iverilog resolves such conflicts between siblings in
+  favor of the later port, which the LRM does not require.
+- A uwire never reaches an inout collapse (slang rejects it on either side). An
+  interconnect net merges with the other net's type (23.3.3.7.1), but Clotho
+  models none, so one that declares a signal fails at its declaration.
+- A simulated net of a type Clotho does not model (a trireg that dominates)
+  fails loudly, and so does a net delay on a collapsed net that dominates its
+  owner, which would need the declaring module's time unit.
+
+**Input and output.** 23.3.3 makes the port "a continuous assignment from source
+to sink", and that is what Clotho lowers: the sink net keeps its own type and
+resolves its drivers, the port copy among them, as that type says. 23.3.3.7 only
+calls merging the two nets "permissible", so a design that connects dissimilar
+nets through an input or output port is conforming without it, and where the LRM
+allows both behaviors Clotho takes the cheaper. What the LRM attaches to not
+merging is warnings: Table 23-1's `warn` cells are slang's, for a port of any
+direction, and 23.3.3.6 asks for one when a uwire is on either side of a port
+whose nets are not merged (`uwire-port-not-merged`).
+
+## Inbound facts and summaries
+
+Each unit gets a summary computed from its body alone: per port and exported
+signal, whether it is read, written, waited on, forced or may carry z (and how
+z propagates from input to output ports); the combinational dependencies from
+input to output ports; the runtime features it uses; and its calls to imports.
+The link step solves the cross-unit fixpoints over the instance graph using only
+summaries, and hands each unit the joined facts its instances impose on it.
+
+Decisions that today change IR in other modules at lowering time move to
+codegen, keyed on those facts: `forceable_` writer gating, nets resolved with
+drivers outside the unit, `events_merge_`, `WaitedProps` notifier fields in
+class layouts, and `assert_control_used_`. The IR then stays a function of the
+unit, which is also what the no-IR-rewriting rule asks
+(synthesis-and-lsp-scoping.md §2).
+
+## Code generation
+
+- Unit code is instance-relative: it addresses storage as instance base plus
+  offset, never through per-instance symbols. The constant-anchor form measured
+  faster under FastISel on picorv32 (module-split.md), so the cost is measured
+  before anything is keyed on instance count.
+- No inlining across units. Comb fusion across instances composes through a
+  dispatcher calling each unit's member functions, which generalizes today's
+  outlining. A flattening, LTO-style `-O` mode can come later without changing
+  units.
+- Root holds link glue only: instance storage, binding tables, the scheduling
+  plan and global numbering as tables.
+
+## Staging
+
+1. **IR containers and the flatten adapter.** `Design`, `Unit`, imports and
+   child slots, plus `flatten(Design) -> Module`, which expands units into
+   instances and reproduces the flat module the backend consumes today. The
+   adapter is per-instance only on the backend side, as the backend already is,
+   and it is deleted in step 3.
+2. **Lowering per specialization**, in four sub-steps that each keep the suite
+   and the perf corpus simulating identically:
+   - **2a, partition (landed).** The Lowerer records which unit owns what
+     (`UnitOwners`), and `partition` (src/ir/Partition.h) splits the flat module
+     it lowers into units: one per instance, one per package and `$unit`, and a
+     glue unit for what belongs to no unit yet. Every reference across units
+     becomes an import by name. `flatten(partition(m))` reproduces `m` up to
+     numbering and process order within a body.
+   - **2b, merge (landed).** partition gives the instances of one
+     specialization (slang's canonical body, `note_specialization`) one unit
+     wherever their whole subtrees lowered to identical unit IR, and keeps the
+     rest apart, so the merge is correct by construction whatever leaks remain.
+     `--stat=units` reports the specializations still split and their first
+     difference. On rocket-chip, 558 instances become 266 units with none
+     split; the leaks below show up in constructs RTL like it does not use.
+   - **2c, instance-independent bodies.** Remove the leaks below until no
+     specialization stays split. Landed: a subroutine's static locals and a
+     class's static properties belong to the instance whose body declares them
+     (`Lowerer::home_of`), whichever instance's code reaches them first
+     (`a.f()` from the parent), named under that instance; their declaration
+     initializers close into a PreInit process of it rather than of the
+     caller. A body reached across tops keeps them with the caller. An interface
+     instance declares the statics of its subroutines with its other signals,
+     and runs their initializers in its own PreInit segment, whether or not
+     anything called them there: a virtual interface handle runs one instance's
+     body against any instance's record, so the instances of one interface
+     have to agree on layout and on start values (`declare_interface_statics`).
+   - **2d, lower once.** The Lowerer lowers each specialization's canonical
+     body only; per-instance lowering and the comparison go.
+3. **Backend per unit** (not on this branch; it is on `modular-ir`). Code is a function of (unit, inbound facts, config);
+   functions, commit functions and initializers move into units; root becomes
+   link glue; the adapter goes. Gate: an edit to one definition changes only
+   that unit's object bytes and root's.
+4. **Summaries and the link step** replace the whole-design `analyze()`.
+5. **Caches and parallelism.** Per-unit intern pools (cross-unit types match by
+   structure, nominal types by unit and name), content keys, an object cache,
+   an IR unit cache, parallel lowering and codegen, and per-unit objects handed
+   straight to lld by `clotho build`.
+
+## Known leaks step 2 removes
+
+Each of these makes lowered IR depend on something outside the unit:
+
+- Signal, process, function, scope, monitor, cover-type and `disable` target
+  ids minted in design-wide tables (partition renumbers them per unit).
+- A package or `$unit` class lowered once per Lowerer that reaches it, so its
+  synthesized functions exist once per top and take an ordinal in their import
+  name (`own_function`).
+- Resolvers with no scope for nets driven from several scopes other than through
+  inout ports (hierarchical drivers, interface nets). A Preponed process belongs
+  to the scope that holds the variable it samples (its shadow's scope), so an
+  instance's sampling state is its own; only a package variable's shadow is
+  copied by a process of the top, which is never shared.
+- A top's own PreInit processes hold what is no child's: what Collect and
+  Classify append (constant-table seeds, a function static of the instance
+  being lowered that a continuous driver reaches first) and what follows the
+  walk (the statics of the top's own classes, `$past` seeds). They store into
+  children's state by import; a root is never shared, so no specialization
+  splits on it, but the top's unit depends on its children's internals. Every
+  other declaration initializer is a PreInit process of the instance that
+  declares it, closed at each child boundary so the processes run in
+  elaboration order.
+- An instance's name in `%m` strings, severity banners, `$printtimescale` and
+  covergroup instance names is read through `inst_path` (flat bridge: resolved
+  from `Process::scope` / `Function::scope`; a covergroup takes it as an operand
+  of `CoverOp::New` with the text after it on the op, so `CoverType` carries no
+  scope; a declaration initializer reads it like any other body), hidden
+  temporaries are numbered per name prefix, and assertion state is named by an
+  instance-relative ordinal. `inst_path` is a borrowed string, a read-only
+  handle over constant bytes today (a record field later), so evaluating it
+  takes no temporary and no init or release, and a severity report or a
+  covergroup name keeps it apart from the text around it (`SeverityInfo`:
+  banner, path, tail; `CoverInfo::text`) for the runtime to join when the line
+  is issued or the name is made, so a report that does not fire costs its body
+  nothing. Still text: virtual-interface bodies and `$printtimescale(inst)`. A
+  covergroup type belongs to the unit that declares it and instances build it
+  through an import, so a package's type built by two instances no longer
+  aborts partition. Still lowered once per Lowerer that reaches it (a second top
+  gets an ordinal in its import name, like a package class), and the
+  coverage-event process of a package type stays with the first instance that
+  builds it, which splits that specialization.
+- Whole-top facts that change other modules' IR: `forceable_`, resolved nets,
+  `events_merge_`, `WaitedProps`, `assert_control_used_`, and which blocks are
+  `disable` targets. The last is joined over the instances of a specialization
+  by `join_disable_targets` (a block some `disable` names from outside its
+  instance is a target in every instance, each with its own target id), for the
+  top being lowered only; it moves to a codegen-time summary with the others.
+- Design-wide registries: class ids, interface-class ids and slot numbering,
+  the virtual interface registry, and the time-precision GCD baked into every
+  delay and `$time` as a multiplier.
+
+Two questions step 2 must answer before a unit holding either is instantiated
+twice (flatten refuses both today, by assertion):
+
+- A class declared in a module body. slang gives twin instances one canonical
+  body and so one class type, where today each instance lowers its own class
+  with its own descriptor and static properties. Which reading the LRM requires
+  is to be checked against its text before the class moves into the unit.
+- An `export "DPI-C"` in a module body: one C symbol per instance would collide.

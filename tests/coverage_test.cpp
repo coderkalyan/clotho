@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -106,6 +108,23 @@ long bin_count(const std::string& report, std::string_view bin) {
         return -1;
     }
     return std::strtol(line.c_str() + sp + 1, nullptr, 10);
+}
+
+// One covergroup instance's part of a report: its line and the coverpoints and bins
+// under it, up to the next instance or the type rollup. Empty when the report names
+// no such instance.
+std::string instance_block(const std::string& report, std::string_view name) {
+    const std::string head = "  instance " + std::string(name) + " ";
+    const size_t      at   = report.find(head);
+    if (at == std::string::npos) {
+        return {};
+    }
+    size_t end = report.size();
+    for (const char* next : { "\n  instance ", "\n  type " }) {
+        const size_t n = report.find(next, at + head.size());
+        end            = std::min(end, n == std::string::npos ? end : n);
+    }
+    return report.substr(at, end - at);
 }
 
 } // namespace
@@ -813,4 +832,223 @@ TEST_CASE("the report lists every bin with its hit count") {
     CHECK(bin_count(report, "hi") == 1); // took 7
     CHECK(report.find("coverpoint cp") != std::string::npos);
     CHECK(report.find("100.00%") != std::string::npos);
+}
+
+// A covergroup instance is named by the hierarchical path of the module
+// instance that constructed it, top name included, so the report tells two
+// instances of one module apart (LRM 19.8 leaves the naming to the tool).
+TEST_CASE("the report names each covergroup instance by its module instance's path") {
+    const std::string report = report_of(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c;
+          initial begin c = new; c.sample(); end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    CHECK(report.find("instance top.u1.cg ") != std::string::npos);
+    CHECK(report.find("instance top.u2.cg ") != std::string::npos);
+}
+
+// The instance's path is copied into the name as it is, so neither a length past what
+// a string holds inline (30 bytes) nor a `%` in an escaped name takes any care.
+TEST_CASE("the report names a covergroup by an instance path of any shape") {
+    const std::string report = report_of(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c = new;
+          initial c.sample();
+        endmodule
+        module top;
+          leaf an_instance_name_well_past_thirty_bytes_long ();
+          leaf \c%d ();
+        endmodule
+    )");
+    CHECK(report.find("instance top.an_instance_name_well_past_thirty_bytes_long.cg ") != std::string::npos);
+    CHECK(report.find("instance top.c%d.cg ") != std::string::npos);
+}
+
+// A declaration initializer builds the covergroup from the module's own
+// elaboration, before any process runs, and builds one per instance: the report
+// names each by the instance that holds it and keeps its bin counts apart.
+TEST_CASE("a covergroup built by a declaration initializer is named and counted per instance") {
+    const std::string report = report_of(R"(
+        module leaf(input bit [1:0] seed);
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c = new;
+          initial #1 begin v = seed; c.sample(); end
+        endmodule
+        module top;
+          leaf u1(2'd0);
+          leaf u2(2'd1);
+          leaf u3(2'd2);
+        endmodule
+    )");
+    for (uint32_t k = 0; k < 3; ++k) {
+        const std::string block = instance_block(report, "top.u" + std::to_string(k + 1) + ".cg");
+        CAPTURE(k);
+        CAPTURE(block);
+        REQUIRE_FALSE(block.empty());
+        for (uint32_t bin = 0; bin < 4; ++bin) {
+            CAPTURE(bin);
+            CHECK(bin_count(block, "auto[" + std::to_string(bin) + "]") == (bin == k ? 1 : 0));
+        }
+    }
+}
+
+// The same with a coverage event (LRM 19.3): the process that samples the group
+// belongs to the module too, and each instance's group is sampled by its own
+// clock. Fast clocks the first instance through three samples (bins 0, 1 and 2)
+// and slow the second through one.
+TEST_CASE("a covergroup with a coverage event, built by a declaration initializer, samples per instance") {
+    const std::string report = report_of(R"(
+        module leaf(input bit clk);
+          bit [1:0] v = 0;
+          covergroup cg @(posedge clk); coverpoint v; endgroup
+          cg c = new;
+          always @(negedge clk) v <= v + 1;
+        endmodule
+        module top;
+          bit fast = 0, slow = 0;
+          leaf u1(fast);
+          leaf u2(slow);
+          initial begin
+            #1 fast = 1; slow = 1;
+            #1 fast = 0; slow = 0;
+            #1 fast = 1;
+            #1 fast = 0;
+            #1 fast = 1;
+            #1 $finish;
+          end
+        endmodule
+    )");
+    const std::string u1 = instance_block(report, "top.u1.cg");
+    const std::string u2 = instance_block(report, "top.u2.cg");
+    CAPTURE(report);
+    REQUIRE_FALSE(u1.empty());
+    REQUIRE_FALSE(u2.empty());
+    for (uint32_t bin = 0; bin < 4; ++bin) {
+        CAPTURE(bin);
+        CHECK(bin_count(u1, "auto[" + std::to_string(bin) + "]") == (bin < 3 ? 1 : 0));
+        CHECK(bin_count(u2, "auto[" + std::to_string(bin) + "]") == (bin == 0 ? 1 : 0));
+    }
+}
+
+// The generate blocks between an instance and its covergroup are part of the name,
+// whether the group is built by a procedure or by a declaration initializer.
+TEST_CASE("the report names a covergroup in a generate block by the block too") {
+    const std::string report = report_of(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          if (1) begin : g
+            covergroup cg; coverpoint v; endgroup
+            cg c;
+            initial begin c = new; c.sample(); end
+          end
+          for (genvar i = 0; i < 2; i++) begin : arr
+            covergroup cg2; coverpoint v; endgroup
+            cg2 c2 = new;
+            initial c2.sample();
+          end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    for (const char* inst : { "u1", "u2" }) {
+        CAPTURE(inst);
+        const std::string path = std::string("instance top.") + inst;
+        CHECK(report.find(path + ".g.cg ") != std::string::npos);
+        CHECK(report.find(path + ".arr[0].cg2 ") != std::string::npos);
+        CHECK(report.find(path + ".arr[1].cg2 ") != std::string::npos);
+    }
+}
+
+// A covergroup type declared in a package belongs to no instance: built by the
+// package it is named by its type alone, and built by a module instance it is
+// named by that instance.
+TEST_CASE("a package covergroup is named by the instance that builds it, if any") {
+    const std::string report = report_of(R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+          pcg pc = new;
+        endpackage
+        module leaf;
+          import p::*;
+          pcg lc;
+          initial begin lc = new; lc.sample(); pc.sample(); end
+        endmodule
+        module top;
+          leaf u1();
+        endmodule
+    )");
+    CHECK(report.find("instance pcg ") != std::string::npos);
+    CHECK(report.find("instance top.u1.pcg ") != std::string::npos);
+}
+
+// A package's covergroup type is one type however many instances build it. Each
+// instance is named by the instance that built it (the second of a type takes the
+// creation ordinal, `_1`), keeps its own bin counts, and the type's coverage
+// aggregates them (LRM 19.11.3). Main names the second one `top.u1.pcg_1`.
+TEST_CASE("a package covergroup built by two instances is one type named by each") {
+    const std::string report = report_of(R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+        endpackage
+        module leaf(input bit [1:0] hit);
+          import p::*;
+          pcg lc = new;
+          initial begin #1 pv = hit; lc.sample(); end
+        endmodule
+        module top;
+          leaf u1(2'd1);
+          leaf u2(2'd2);
+        endmodule
+    )");
+    const std::string u1 = instance_block(report, "top.u1.pcg");
+    const std::string u2 = instance_block(report, "top.u2.pcg_1");
+    CAPTURE(report);
+    REQUIRE_FALSE(u1.empty());
+    REQUIRE_FALSE(u2.empty());
+    for (uint32_t bin = 0; bin < 4; ++bin) {
+        CAPTURE(bin);
+        CHECK(bin_count(u1, "auto[" + std::to_string(bin) + "]") == (bin == 1 ? 1 : 0));
+        CHECK(bin_count(u2, "auto[" + std::to_string(bin) + "]") == (bin == 2 ? 1 : 0));
+    }
+    CHECK(report.find("  type pcg  coverage  25.00%  bins 2/8  instances 2") != std::string::npos);
+}
+
+// The same type built at package level and by two instances of a module: the
+// package's own group is named by the type alone, each module instance by its
+// path. (The package and the top that builds it each lower the type, and both
+// copies are the package unit's.)
+TEST_CASE("a package covergroup built by the package and by two instances") {
+    const std::string report = report_of(R"(
+        package p;
+          bit [1:0] pv = 0;
+          covergroup pcg; coverpoint pv; endgroup
+          pcg pc = new;
+        endpackage
+        module leaf;
+          import p::*;
+          pcg lc;
+          initial begin lc = new; lc.sample(); pc.sample(); end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    CHECK(report.find("instance pcg ") != std::string::npos);
+    CHECK(report.find("instance top.u1.pcg ") != std::string::npos);
+    CHECK(report.find("instance top.u2.pcg") != std::string::npos);
 }

@@ -450,7 +450,7 @@ void register_options(Registry& r, Options& o) {
                     "--stat",
                     o.stats,
                     "Print a compiler statistic while building, for working on clotho: dedup, "
-                    "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
+                    "dedup-sets, comb-fuse, finish, parallel or units (repeatable, comma-separated)",
                     "<name>",
                     slang::CommandLineFlags::CommaList);
     r.add(kBuildRun,
@@ -1311,9 +1311,11 @@ int main(int argc, char** argv) {
             config.stats |= static_cast<uint32_t>(Stat::Finish);
         } else if (name == "parallel") {
             config.stats |= static_cast<uint32_t>(Stat::Parallel);
+        } else if (name == "units") {
+            config.stats |= static_cast<uint32_t>(Stat::Units);
         } else {
             return usage_error(std::format("unknown --stat '{}'; expected dedup, dedup-sets, comb-fuse, "
-                                           "finish or parallel",
+                                           "finish, parallel or units",
                                            name));
         }
     }
@@ -1427,8 +1429,12 @@ int main(int argc, char** argv) {
         path_prefix_map.emplace_back(std::move(dir), entry.substr(eq + 1));
     }
 
-    const clotho::LowerResult result = clotho::lower_driver(
-      std::move(driver), tp, config.allow_system, std::move(path_prefix_map), options.allow_port_coercion == true);
+    const clotho::LowerResult result = clotho::lower_driver(std::move(driver),
+                                                            tp,
+                                                            config.allow_system,
+                                                            std::move(path_prefix_map),
+                                                            options.allow_port_coercion == true,
+                                                            config.stats);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
     }

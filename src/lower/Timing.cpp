@@ -758,8 +758,8 @@ void Lowerer::lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Buil
         // LRM 15.5.4: "If the fail statement is not specified, a failure
         // generates a run-time error." $error is the located, non-fatal
         // severity the LRM's wording matches.
-        b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                   severity_banner(s.sourceRange.start()),
+        emit_report(b, static_cast<uint32_t>(ir::Severity::Error),
+                    banner_at(s.sourceRange.start()),
                    "wait_order: events triggered out of order", {}, l);
     }
     const ir::ExtraSlice on_fail = b.close_region();
@@ -1256,7 +1256,7 @@ void Lowerer::collect_clocking_block(const ClockingBlockSymbol& cb) {
     // cannot be referenced (LRM 14.3), so this name reaches nothing but the
     // state field and the dump.
     const std::string base =
-      cb.name.empty() ? "__clocking" + std::to_string(temp_id_++) : std::string(cb.name);
+      cb.name.empty() ? "__clocking" + std::to_string(next_temp_id()) : std::string(cb.name);
     for (const Symbol& m : cb.members()) {
         if (m.kind != SymbolKind::ClockVar) {
             // TODO: an `assertion_item_declaration` inside a clocking block
@@ -1376,16 +1376,16 @@ void Lowerer::lower_clocking_block(const ClockingBlockSymbol& cb) {
     const ir::ExtraSlice else_r = b.close_region(); // empty
     b.cond(fired, then_r, else_r, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
-                                     // Not a subscription: an Observed process is resumed once per
-                                     // time slot, never woken by a net event. Kept as the record of
-                                     // which event steps this block, which is what the edge
-                                     // detection above is derived from.
-                                     .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
-                                     .self_start  = false,
-                                     .span        = ir::SourceSpan{ l, l },
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::Observed,
+                             // Not a subscription: an Observed process is resumed once per
+                             // time slot, never woken by a net event. Kept as the record of
+                             // which event steps this block, which is what the edge
+                             // detection above is derived from.
+                             .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
+                             .self_start  = false,
+                             .span        = ir::SourceSpan{ l, l },
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 }
 
 // Emit: the block's Re-NBA process, which performs the synchronous drives that
@@ -1444,11 +1444,11 @@ void Lowerer::lower_clocking_drives(const ClockingBlockSymbol& cb) {
     const ir::ExtraSlice else_r = b.close_region(); // empty
     b.cond(fired, then_r, else_r, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::ReNba,
-                                     .self_start = false,
-                                     .span       = ir::SourceSpan{ l, l },
-                                     .ir         = b.finish(),
-                                     .scope      = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::ReNba,
+                             .self_start = false,
+                             .span       = ir::SourceSpan{ l, l },
+                             .ir         = b.finish(),
+                             .scope      = cur_scope_id() });
 }
 
 // The `default clocking` in scope (LRM 14.12), which is what a cycle delay

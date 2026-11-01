@@ -3074,6 +3074,31 @@ TEST_CASE("interface class: randomize() through an interface handle") {
     CHECK(run_capture(src) == "ok 1 same 1\n");
 }
 
+// The same dispatch from two instances of one module: the stub that types it
+// serves every class implementing the interface, so neither instance owns it.
+TEST_CASE("interface class: randomize() through an interface handle in two instances") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class Obj implements I;
+            rand bit [7:0] x;
+            virtual function int v(); return x; endfunction
+        endclass
+        module m;
+            initial begin
+                Obj o = new;
+                I   h = o;
+                int ok = h.randomize();
+                $display("ok %0d same %0d", ok, o.x == h.v());
+            end
+        endmodule
+        module top;
+            m u0();
+            m u1();
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ok 1 same 1\nok 1 same 1\n");
+}
+
 // LRM 8.26.9: "Use of rand_mode and constraint_mode shall not be legal" through an
 // interface class handle. slang installs both built-ins on every class including an
 // interface one, so the refusal is clotho's.

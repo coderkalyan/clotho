@@ -100,6 +100,10 @@ Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Local, Inst::Payload{ .local = { index, type } } }, loc);
 }
 
+Index Builder::inst_path(SourceLoc loc) {
+    return emit({ Inst::Tag::InstPath, Inst::Payload{} }, loc);
+}
+
 Index Builder::event_new(SourceLoc loc) {
     return emit({ Inst::Tag::EventNew, Inst::Payload{} }, loc);
 }
@@ -287,7 +291,7 @@ Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, 
 Index Builder::iface_ref(uint32_t scope, SourceLoc loc) {
     const ExtraIndex extra = add_extra(IfaceInst{ scope });
 
-    return emit({ Inst::Tag::IfaceRef, Inst::Payload{ .extra = extra } }, loc);
+    return emit({ Inst::Tag::IfaceRef, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::iface_signal(Index handle, Signal rep, SourceLoc loc) {
@@ -297,7 +301,7 @@ Index Builder::iface_signal(Index handle, Signal rep, SourceLoc loc) {
 }
 
 Index Builder::class_new(Ref class_type, SourceLoc loc) {
-    return emit({ Inst::Tag::ClassNew, Inst::Payload{ .ref = class_type } }, loc);
+    return emit({ Inst::Tag::ClassNew, pay(&Inst::Payload::ref, class_type) }, loc);
 }
 
 Index Builder::handle_deref(Index handle, Ref class_type, SourceLoc loc) {
@@ -590,11 +594,11 @@ Index Builder::defer_flush(uint32_t target, SourceLoc loc) {
 }
 
 Index Builder::disable_abort(SourceLoc loc) {
-    return emit({ Inst::Tag::DisableAbort, Inst::Payload{ .none = 0 } }, loc);
+    return emit({ Inst::Tag::DisableAbort, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
 Index Builder::program_exit(SourceLoc loc) {
-    return emit({ Inst::Tag::ProgramExit, Inst::Payload{ .none = 0 } }, loc);
+    return emit({ Inst::Tag::ProgramExit, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
 Index Builder::str_putc(Index str, Index index, Index ch, SourceLoc loc) {
@@ -813,18 +817,30 @@ Index Builder::proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc) 
     return emit({ Inst::Tag::ProcWait, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+// An op that reaches its covergroup type through the instance handle names no type
+// index, so none is recorded: a design-wide index in the body would make the body
+// differ from the same body in the next instance of its module.
 Index Builder::cover_query(CoverOp                op,
                            std::span<const Index> args,
                            Ref                    type,
                            uint32_t               type_idx,
                            uint32_t               point,
-                           SourceLoc              loc) {
-    const ExtraIndex extra = add_extra(CoverInfo{ add_slice(args), type, type_idx, point, op });
+                           SourceLoc              loc,
+                           std::string_view       text) {
+    const ExtraIndex text_at = text.empty() ? ExtraIndex{} : add_bytes(text);
+    const ExtraIndex extra   = add_extra(CoverInfo{ add_slice(args),
+                                                    type,
+                                                    cover_op_names_type(op) ? type_idx : 0,
+                                                    point,
+                                                    op,
+                                                    text_at,
+                                                    static_cast<uint32_t>(text.size()) });
     return emit({ Inst::Tag::CoverQuery, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::cover_ctl(CoverOp op, std::span<const Index> args, uint32_t type_idx, uint32_t point, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(CoverInfo{ add_slice(args), Ref::Invalid, type_idx, point, op });
+    const ExtraIndex extra =
+      add_extra(CoverInfo{ add_slice(args), Ref::Invalid, cover_op_names_type(op) ? type_idx : 0, point, op });
     return emit({ Inst::Tag::CoverCtl, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
@@ -1024,10 +1040,15 @@ Index Builder::severity(uint32_t                level,
                         std::string_view        fmt,
                         std::span<const FmtArg> args,
                         SourceLoc               loc,
-                        uint32_t                defer) {
-    // Order in the extra buffer: banner bytes, format bytes, then the arg-index
-    // slice and its flags, then the SeverityInfo record pointing at all of them.
+                        uint32_t                defer,
+                        Index                   path,
+                        std::string_view        tail) {
+    assert((path != kNoIndex || tail.empty()) && "text after the path needs a path");
+    // Order in the extra buffer: banner bytes, tail bytes, format bytes, then the
+    // arg-index slice and its flags, then the SeverityInfo record pointing at all
+    // of them.
     const ExtraIndex banner_at = add_bytes(banner);
+    const ExtraIndex tail_at   = add_bytes(tail);
     const ExtraIndex fmt_at    = add_bytes(fmt);
     ExtraSlice       signs;
     const ExtraSlice slice = add_fmt_args(args, signs);
@@ -1038,7 +1059,10 @@ Index Builder::severity(uint32_t                level,
                                                      level,
                                                      defer,
                                                      slice,
-                                                     signs });
+                                                     signs,
+                                                     path,
+                                                     tail_at,
+                                                     static_cast<uint32_t>(tail.size()) });
     return emit({ Inst::Tag::Severity, pay(&Inst::Payload::extra, extra) }, loc);
 }
 

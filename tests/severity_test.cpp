@@ -188,6 +188,30 @@ TEST_CASE("a subroutine's report names the instance whose copy ran") {
     CHECK_EQ(count_occ(c.err, "ERROR: "), 2u);
 }
 
+// The banner is joined when the report is issued, from the instance's path and the
+// compile-time text on both sides of it, so nothing about the path may matter: a
+// length past a string's 30 inline bytes, a `%` in an escaped name, and a generate
+// block, a subroutine and a named block after it.
+TEST_CASE("a severity report joins the instance path to the scope text after it") {
+    const Captured c = run_capture("module leaf;\n"
+                                   "  if (1) begin : g\n"
+                                   "    task automatic t;\n"
+                                   "      begin : blk\n"
+                                   "        $error(\"deep\");\n"
+                                   "      end\n"
+                                   "    endtask\n"
+                                   "    initial t();\n"
+                                   "  end\n"
+                                   "endmodule\n"
+                                   "module top;\n"
+                                   "  leaf an_instance_name_well_past_thirty_bytes_long ();\n"
+                                   "  leaf \\v%s ();\n"
+                                   "endmodule\n");
+    CHECK(contains(c.err, "ERROR: source:5: top.an_instance_name_well_past_thirty_bytes_long.g.t.blk at 0 s: deep\n"));
+    CHECK(contains(c.err, "ERROR: source:5: top.v%s.g.t.blk at 0 s: deep\n"));
+    CHECK_EQ(count_occ(c.err, "ERROR: "), 2u);
+}
+
 TEST_CASE("a severity report from a final block carries the time the run ended at") {
     const Captured c = run_capture("`timescale 1ns/1ns\n"
                                    "module m;\n"
@@ -443,6 +467,23 @@ TEST_CASE("deferred #0 assertion: per-instance flush across module instances") {
     CHECK(contains(c.err, "inst v=2"));
     CHECK(contains(c.err, "inst v=3"));
     CHECK_EQ(count_occ(c.err, "inst v="), 3u);
+}
+
+// A deferred report is queued with the same pieces and rendered at once, so it names
+// its own instance and label as an immediate one does.
+TEST_CASE("deferred #0 assertion: the report names the instance and the label") {
+    const Captured c = run_capture("module chk(input logic clk, input logic [7:0] v);\n"
+                                   "  always @(posedge clk) a: assert #0 (v == 0) else $error(\"v=%0d\", v);\n"
+                                   "endmodule\n"
+                                   "module top;\n"
+                                   "  logic clk = 0; logic [7:0] p = 1, q = 2;\n"
+                                   "  chk c1(clk, p); chk c2(clk, q);\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  initial #7 $finish;\n"
+                                   "endmodule");
+    CHECK(contains(c.err, "ERROR: source:2: top.c1.a at 5 s: v=1\n"));
+    CHECK(contains(c.err, "ERROR: source:2: top.c2.a at 5 s: v=2\n"));
+    CHECK_EQ(count_occ(c.err, "ERROR: "), 2u);
 }
 
 // Phase 1 guards: a deferred action that is not a severity report, or a deferred

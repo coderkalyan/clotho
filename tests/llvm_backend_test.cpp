@@ -1471,6 +1471,69 @@ TEST_CASE("$finish inside a function reports the current simulation time") {
     CHECK(run_capture_stderr(src) == "source:5: $finish called at 7 ns\n");
 }
 
+// A $finish ends the settle wave it is in: the processes it woke before it ran
+// do not run afterwards (lower_finish empties the active ring). The function is
+// lowered before anything that pushes onto that ring, so the reset cannot depend
+// on the ring having been made by something lowered earlier.
+TEST_CASE("$finish inside a function leaves nothing queued to run after it") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a = 0;
+            function void stop(); $finish; endfunction
+            always @(a) $display("ran after $finish");
+            initial begin #1 a = 1; stop(); end
+        endmodule
+    )";
+    CHECK(run_capture(src).empty());
+}
+
+// The same body in two instances of one unit is one code, whatever was lowered
+// between them: the second instance's $finish is not lowered after a push onto
+// the ring that the first was lowered before. Whichever instance finishes
+// first, the other is queued and does not run.
+TEST_CASE("instances of a unit that finishes run the same code") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0, en = 0;
+            int hits = 0;
+            initial forever begin
+                @(posedge clk iff en);
+                hits++;
+                if (hits == 2) begin $display("hits=%0d", hits); $finish; end
+            end
+            initial begin
+                en = 0; clk = 1; #1 clk = 0; #1;
+                en = 1; clk = 1; #1 clk = 0; #1;
+                clk = 1; #1 clk = 0; #1;
+            end
+        endmodule
+        module top; m u0(); m u1(); endmodule
+    )";
+    CHECK(run_capture(src) == "hits=2\n");
+}
+
+// A declaration initializer's stores generate no event (LRM 6.8), and that is a
+// property of the process being lowered, not of whatever is lowered after it. A
+// comb chain through three instances fuses into one group whose members are
+// functions of their own, and it is lowered after the initializer of the other
+// top ahead of it: every member store has to wake its reader all the same.
+TEST_CASE("a fused group lowered after a declaration initializer still wakes its readers") {
+    constexpr std::string_view src = R"(
+        module early; logic q = 1; endmodule
+        module leaf(input logic [7:0] v, output logic [7:0] o); assign o = v; endmodule
+        module mid(input logic [7:0] v, output logic [7:0] o); leaf l(v, o); endmodule
+        module top;
+            logic [7:0] x;
+            wire  [7:0] y;
+            mid m(x, y);
+            initial begin x = 5; #1 $display("y=%0d", y); x = 7; #1 $display("y=%0d", y); end
+        endmodule
+    )";
+    const std::string expected = "y=5\ny=7\n";
+    CHECK(run_capture(src) == expected);
+    CHECK(run_capture(src, { .fuse = false }) == expected);
+}
+
 TEST_CASE("$time and $stime read the simulation clock") {
     // With no timescale the wheel tick count is the time-unit-scaled value, so
     // $time returns the raw clock and $stime mirrors it (truncated to 32 bits).
@@ -1751,6 +1814,49 @@ TEST_CASE("$printtimescale names the $unit and $root scopes") {
 
     CHECK(out == "Time scale of ($unit) is 1ns / 1ps\n"
                  "Time scale of ($root) is 1s / 1s\n");
+}
+
+// An instance's path is a borrowed, read-only string (Inst::Tag::InstPath), so a body
+// that names its instance on a rare path owns no string for it: no handle to
+// initialize at entry and none to release at exit. Both instances share the body
+// text, so this is also what keeps the cost off every activation.
+TEST_CASE("%m of an instance costs its body no string handle") {
+    const std::string ir = emit(R"(
+        module leaf(input logic clk, input logic c);
+            always @(posedge clk) if (c) $display("at %m");
+        endmodule
+        module top;
+            logic clk, c;
+            leaf a(clk, c);
+            leaf b(clk, c);
+        endmodule
+    )");
+
+    CHECK(ir.find("@rt_string_init") == std::string::npos);
+    CHECK(ir.find("@rt_string_deinit") == std::string::npos);
+    CHECK(ir.find("@rt_string_assign_bytes") == std::string::npos);
+}
+
+// The instance's name a covergroup is built under is read from the instance and handed
+// to the runtime apart from the text after it, so building one in an instance makes no
+// string temporary of the body either.
+TEST_CASE("a covergroup built in an instance costs its body no string handle") {
+    const std::string ir = emit(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c;
+          initial begin c = new; c.sample(); end
+        endmodule
+        module top;
+          leaf a();
+          leaf b();
+        endmodule
+    )");
+
+    CHECK(ir.find("@rt_cover_new(") != std::string::npos);
+    CHECK(ir.find("@rt_string_init") == std::string::npos);
+    CHECK(ir.find("@rt_string_deinit") == std::string::npos);
 }
 
 TEST_CASE("%t formats time per $timeformat units, precision, suffix, and width") {
@@ -5091,6 +5197,147 @@ TEST_CASE("one ref formal reached by both actual shapes stays fat at every call"
     CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0)") == 1);
     CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 0);
     CHECK(run_capture(src) == "2 6\n");
+}
+
+TEST_CASE("twin instances calling their own tasks and functions keep their statics apart") {
+    // Each instance of one module has its own copy of a subroutine's static
+    // locals (LRM 13.4.2), whichever instance's code runs. Staggered by a
+    // parameter so the output order does not depend on the scheduler.
+    CHECK(run_capture(R"(
+        module m #(parameter int D = 1, parameter int K = 1);
+            task automatic bump(output int r);
+                static int calls = 0;
+                calls++;
+                r = calls * K;
+            endtask
+            function int f(int x);
+                static int fc = 0;
+                fc++;
+                return x + fc * K;
+            endfunction
+            initial begin
+                int r;
+                #D;
+                bump(r); $display("%m %0d", r);
+                bump(r); $display("%m %0d", r);
+                $display("%m f %0d", f(10));
+                $display("%m f %0d", f(10));
+            end
+        endmodule
+        module top;
+            m #(.D(1), .K(1)) a ();
+            m #(.D(5), .K(10)) b ();
+            initial #20 $finish;
+        endmodule
+    )") == "top.a 1\ntop.a 2\ntop.a f 11\ntop.a f 12\ntop.b 10\ntop.b 20\ntop.b f 20\ntop.b f 30\n");
+}
+
+TEST_CASE("a subroutine its parent calls by hierarchical name keeps the statics of its own instance") {
+    // `a.bump` and `b.f` run in the parent's code but belong to the instances that
+    // declare them: each has its own `calls` / `fc` (LRM 13.3.1, 13.4.2), however
+    // the calls interleave, and neither lands in the parent.
+    CHECK(run_capture(R"(
+        module m (input logic clk);
+            task automatic bump(output int r);
+                static int calls = 0;
+                calls++;
+                r = calls;
+            endtask
+            function int f(int x);
+                static int fc = 0;
+                fc++;
+                return x + fc;
+            endfunction
+        endmodule
+        module top;
+            logic clk = 0;
+            m a (clk);
+            m b (clk);
+            initial begin
+                int r;
+                #1;
+                a.bump(r); $display("a.bump %0d", r);
+                a.bump(r); $display("a.bump %0d", r);
+                b.bump(r); $display("b.bump %0d", r);
+                $display("a.f %0d", a.f(10));
+                $display("a.f %0d", a.f(10));
+                $display("b.f %0d", b.f(10));
+                $finish;
+            end
+        endmodule
+    )") == "a.bump 1\na.bump 2\nb.bump 1\na.f 11\na.f 12\nb.f 11\n");
+}
+
+TEST_CASE("twin parents calling their own child's subroutine keep its statics and their initializers apart") {
+    // The child's static starts at its declared value in every instance, and each
+    // parent instance drives its own child's copy.
+    CHECK(run_capture(R"(
+        module m;
+            task automatic bump(output int r);
+                static int calls = 100;
+                calls++;
+                r = calls;
+            endtask
+        endmodule
+        module mid #(parameter int D = 1);
+            m c ();
+            initial begin
+                int r;
+                #D;
+                c.bump(r); $display("%m %0d", r);
+                c.bump(r); $display("%m %0d", r);
+            end
+        endmodule
+        module top;
+            mid #(.D(1)) x ();
+            mid #(.D(5)) y ();
+            initial #20 $finish;
+        endmodule
+    )") == "top.x 101\ntop.x 102\ntop.y 101\ntop.y 102\n");
+}
+
+TEST_CASE("an interface task's statics are per instance, however the instance was reached") {
+    // The statics of an interface subroutine belong to each instance (LRM 13.4.2) and
+    // start at their declared value there. A handle runs one body against any
+    // instance's record, so an instance that only handles reached has the storage
+    // and the initializer its twin got from a direct call.
+    constexpr std::string_view decl = R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+        endinterface
+    )";
+    CHECK(run_capture(std::string(decl) + R"(
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            virtual bus_if vi0 = b0;
+            virtual bus_if vi1 = b1;
+            initial begin
+                vi0.put(10); vi0.put(20); vi1.put(1000);
+                $display("%0d %0d", b0.last, b1.last);
+            end
+        endmodule
+    )") == "122 1101\n");
+    CHECK(run_capture(std::string(decl) + R"(
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            virtual bus_if vi0 = b0;
+            virtual bus_if vi1 = b1;
+            initial begin
+                vi0.put(10); vi0.put(20); vi1.put(1000);
+                $display("%0d %0d", b0.last, b1.last);
+                b0.put(5);
+                b1.put(6);
+                $display("%0d %0d", b0.last, b1.last);
+            end
+        endmodule
+    )") == "122 1101\n108 108\n");
 }
 
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
