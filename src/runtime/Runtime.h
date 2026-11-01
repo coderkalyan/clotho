@@ -851,10 +851,17 @@ int32_t rt_sscanf(const char* buf, uint32_t len, int32_t fwd, const char* fmt, u
 // `decl_left` / `decl_right`. `start` / `max_count` (valid per `flags` bit0 / bit1)
 // bound the address range; `flags` bit2 marks a narrow 2-state destination (bare
 // iW elements, null `z_base`). Returns the number of bytes read. `width` must be
-// <= 64.
+// <= 64. A `start` outside the declared range reads nothing and returns 0 after a
+// run-time warning located by `site` (null for the scalar form, which has no start)
+// at simulation time `now`.
 int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
                  uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right, int64_t start,
-                 int64_t max_count, uint32_t flags);
+                 int64_t max_count, uint32_t flags, const rt_null_site* site, uint64_t now);
+
+// The warning behind rt_fread's out-of-range `start` (docs/LRM_NOTES.md 55). Goes quiet
+// after a few reports from one site, like the divide-by-zero report.
+void rt_fread_range_report(const rt_null_site* site, int64_t start, int64_t decl_left, int64_t decl_right,
+                           uint64_t now);
 
 // $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
 // The no-argument $fflush passes 0, which flushes every open stream (LRM

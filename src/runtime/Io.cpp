@@ -1088,12 +1088,15 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
 
 extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
                             uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right,
-                            int64_t start, int64_t max_count, uint32_t flags) {
+                            int64_t start, int64_t max_count, uint32_t flags, const rt_null_site* site,
+                            uint64_t now) {
     // $fread (LRM §21.3.4): read raw bytes from `fd` into a memory (or a scalar,
     // count == 1), MSB-first per element. Fills from the `start` declared address
-    // (default the lowest) upward, at most `max_count` elements. Shares the memory
-    // destination substrate with $readmem; only the byte source differs. Returns the
-    // number of bytes read.
+    // (default the lowest) toward the highest, at most `max_count` elements and never
+    // past the highest address. Shares the memory destination substrate with
+    // $readmem; only the byte source differs. Returns the number of bytes read.
+    // A `start` outside the declared range reads nothing, returns 0 and warns
+    // (docs/LRM_NOTES.md 55); `site` / `now` locate that warning.
     io_ensure_init();
     std::FILE* f = fd_stream(fd);
     if (f == nullptr) {
@@ -1109,6 +1112,12 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
     const int64_t hi        = decl_left < decl_right ? decl_right : decl_left;
     int64_t       addr      = has_start ? start : lo;
     int64_t       remaining = has_count ? max_count : static_cast<int64_t>(count);
+    if (addr < lo || addr > hi) {
+        // The file position stays where it was: no byte is consumed for an address
+        // that names no element.
+        rt_fread_range_report(site, addr, decl_left, decl_right, now);
+        return 0;
+    }
 
     // Bytes accumulate into a word array; a <= 64-bit element uses one word and
     // reduces to the scalar (val << 8) | byte path.

@@ -1059,7 +1059,9 @@ void Backend::lower_fread_word(Index i) {
     llvm::Value*   r      = b_.CreateCall(fread_fn(),
                                           { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(dest.store_width),
                                             b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
-                                            b_.getInt64(0), b_.getInt32(flags) });
+                                            b_.getInt64(0), b_.getInt32(flags),
+                                            llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
+                                            b_.getInt64(0) });
     service_after_write(lv, old);
     set_value(i, two_val(r));
 }
@@ -1093,10 +1095,14 @@ void Backend::lower_fread_mem(Index i) {
     llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
     const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (!s.four_state ? 4u : 0u);
 
-    llvm::Value* r = b_.CreateCall(
+    // Only a start address the memory does not have is reported, so the site is the
+    // call and the time is read once, ahead of the runtime call.
+    llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+    llvm::Value* r   = b_.CreateCall(
       fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
                     b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
-                    b_.getInt64(at.right), start, cnt, b_.getInt32(flags) });
+                    b_.getInt64(at.right), start, cnt, b_.getInt32(flags),
+                    null_site_global(loc_text(i), NullKind::Class), now });
     // A whole-array write has no per-element edge facts; wake the memory's
     // Any-edge readers when any byte landed, mirroring the deferred
     // array-NBA commit (rt_nba_arr_dirty -> service_any_waiters).

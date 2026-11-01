@@ -691,3 +691,30 @@ flush it. Clotho takes 16.4.4's explicit sentence. Disabling "a specific deferre
 by its label cancels its reports; that is refused (docs/TODO.md).
 
 Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`subroutine_waits_on_event`), `src/lower/Subroutines.cpp` (`lower_task_call`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: shapes whose flush points are not reachable are refused", "deferred assertion: a virtual task called through another task is refused like a direct one"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.
+
+## 55. `$fread` start address outside the memory (21.3.4.4)
+
+21.3.4.4 says `start` "shall be used as the address of the first element in the memory
+to be loaded" and its example (`up[10:20]`, start 12 loads `up[12]`) makes it an address
+in the declared range, whichever way the range is written. It does not say what a
+`start` outside that range means. Clotho reads it as naming no element: nothing is read,
+the result is 0, the file position does not move, the memory is untouched, and a run-time
+warning (`$fread start address -1 is outside the memory range [0:31]`) is issued. A
+`start` of -1 on `mem[0:31]` used to load 32 bytes from address 0 up, losing the byte for
+-1, and a `start` of 40 already read nothing. iverilog 13 gives the same result and warning.
+
+The rest of the clause does decide the neighbouring cases, and Clotho follows it. `count`
+is "the maximum number of locations in mem that shall be loaded", so a `count` that runs
+past the highest address is cut off at the end of the range, silently (iverilog warns); a
+`count` of 0 or below loads nothing. Loading counts up from `start` through the highest
+address for an ascending and a descending range alike. The clause is silent on an x or z
+bit in `start` or `count`: Clotho reads it as 0, as iverilog does, so an all-x `start` is
+the lowest address.
+
+`start` and `count` are unsigned when their expression is (11.8.3 widens by the operand's
+own signedness). `reg [7:0] s = 200` is address 200, not -56; that was also wrong for the
+`start` and `finish` of `$readmemh` / `$readmemb`, which share the operand lowering.
+
+What a short final element holds is note 34, which the clause does not decide either.
+
+Code: `src/runtime/Io.cpp` (`rt_fread`), `src/runtime/Reports.cpp` (`rt_fread_range_report`), `src/lower/SystemTasks.cpp` (`lower_address_arg`), `src/ir/llvm/SystemTasks.cpp` (`lower_fread_mem`). Tests: `tests/llvm_backend_test.cpp` ("$fread with a start address outside the memory reads nothing and warns", "$fread start and count follow the declared address range", "$fread and $readmem take an unsigned start as an address"). Oracle: iverilog 13 (`ivltests/fread.v`).
