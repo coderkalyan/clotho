@@ -19,19 +19,24 @@
 
 namespace {
 
+// A child mode's output is compared byte for byte by the parent. cmd.exe's `>` and
+// `2>` redirects hand the child text-mode stdout and stderr, which rewrite every \n
+// as \r\n -- so the captured output would not match what was actually printed. Put
+// both back to binary.
+void binary_std_streams() {
+#if defined(_WIN32)
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
+}
+
 // Single-design mode: lower and simulate one source file, then exit. This is how
 // run_design_subprocess runs a design in its own process; see Subprocess.h for
 // when that is needed. Lowers the file's *text* rather than going
 // through lower_files so the buffer is named "source", matching what the same
 // design produces in-process.
 int run_design(const char* path) {
-#if defined(_WIN32)
-    // cmd.exe's `>` and `2>` redirects hand this process text-mode stdout and
-    // stderr, which rewrite every \n as \r\n -- so the captured output would not
-    // match what the design actually printed. Put both back to binary.
-    _setmode(_fileno(stdout), _O_BINARY);
-    _setmode(_fileno(stderr), _O_BINARY);
-#endif
+    binary_std_streams();
     const std::string         text = clotho::test::detail::read_file(path);
     const clotho::LowerResult r    = clotho::lower_text(text);
     if (!r.ok || r.module == nullptr) {
@@ -50,6 +55,7 @@ int run_design(const char* path) {
 // generated code would, from line 7 column 12 of a file whose text is the file's
 // first line. See encoding_check_test.cpp.
 int report_encoding_violation(const char* path) {
+    binary_std_streams();
     std::string line = clotho::test::detail::read_file(path);
     const rt_null_site site{ .where      = "design.sv:7:12",
                              .line       = line.c_str(),
