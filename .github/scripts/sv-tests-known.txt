@@ -42,7 +42,7 @@ oracle regress-vlg_nb_ec_multi_ev_iv 4.9.4/10.4.2: same as nb_ec_concat (checks 
 oracle regress-sv_sv_class9_iv 7.6: assigning a dynamic array copies its elements; iverilog shares storage between the two, the test expects that
 oracle regress-sv_sv_typedef_nested_array_iv 7.4.4/20.7: with staged typedefs the dimension added in T2 x[D] is the slowest, so $size(x,1) is D; the test expects the other order
 oracle regress-sv_sv_packed_port1_iv 6.8/23.3.3.2: a foo_s [1:0][3:0] oval is a variable, so its unwritten half is x, not z as the test expects
-oracle regress-sv_sv_packed_port2_iv 6.8/5.7.1: same z-for-x expectation as packed_port1; the unextended 'hx3x2x1x0 into 64 bits also shows a Clotho x-extension defect that this test does not expose
+oracle regress-sv_sv_packed_port2_iv 6.8/5.7.1: same z-for-x expectation as packed_port1; Clotho prints the LRM value xxxxxxxxxxxdxxxf
 oracle regress-sv_br_gh307_iv 23.2.2.3: an output with an explicit data type is a variable port, so its unassigned member is x and resolves with 0 to 1x; iverilog treats it as a net (z)
 oracle regress-sv_cfunc_assign_op_mixed_iv 11.4.1/6.12.1: x /= 2.0 is x = x / 2.0, a real that rounds (5/2.0 to 3, 5/3.0 to 2); the test expects iverilog's truncation
 oracle regress-vlg_pr2172606b_iv 11.4.11 (Table 11-20): sel=x ? z : z is x; the test expects z, and without __ICARUS__ requires both x and z
