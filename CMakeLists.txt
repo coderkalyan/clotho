@@ -928,15 +928,19 @@ else()
   set(clotho_rt_bitcode_image_return "{}")
   set(clotho_rt_bitcode_image_deps "")
 endif()
-# Embedded the way the kit is, and for the same reason copied from a template on every
-# change to the embedded file: #embed is not a dependency the build tool sees.
+# Embedded the way the kit is: generated from a template, on every change to the embedded
+# file, because #embed is not a dependency the build tool sees, and with a digest of the
+# file's bytes, because ccache does not see it either (cmake/StampEmbeds.cmake).
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in" CONTENT
 "#include \"ir/llvm/RuntimeBitcode.h\"\n\nnamespace clotho::ir {\nnamespace {\n\n${clotho_rt_bitcode_image}\n} // namespace\n\nstd::span<const unsigned char> runtime_bitcode_image() {\n    return ${clotho_rt_bitcode_image_return};\n}\n\n} // namespace clotho::ir\n")
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp"
-  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in"
-          "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp"
+  COMMAND ${CMAKE_COMMAND} "-DTEMPLATE=${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in"
+          "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp"
+          "-DEMBEDS=${clotho_rt_bitcode_image_deps}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StampEmbeds.cmake"
   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in" ${clotho_rt_bitcode_image_deps}
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StampEmbeds.cmake"
   VERBATIM)
 target_sources(clotho_ir PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp")
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp" TARGET_DIRECTORY clotho_ir PROPERTIES
@@ -981,6 +985,7 @@ endif()
 set(clotho_kit_source "#include \"link/Link.h\"\n\nnamespace clotho::link {\nnamespace {\n")
 set(clotho_kit_table "")
 set(clotho_kit_paths "")
+set(clotho_kit_embeds "")
 set(index 0)
 foreach(entry IN LISTS clotho_kit)
   string(FIND "${entry}" "=" eq)
@@ -989,6 +994,7 @@ foreach(entry IN LISTS clotho_kit)
   string(SUBSTRING "${entry}" ${start} -1 path)
   string(APPEND clotho_kit_source "const unsigned char kFile${index}[] = {\n#embed \"${path}\"\n};\n")
   string(APPEND clotho_kit_table "    { \"${name}\", kFile${index}, sizeof(kFile${index}) },\n")
+  list(APPEND clotho_kit_embeds "${path}")
   if(NOT name STREQUAL "runtime.a")
     list(APPEND clotho_kit_paths "${path}")
   endif()
@@ -996,14 +1002,18 @@ foreach(entry IN LISTS clotho_kit)
 endforeach()
 string(APPEND clotho_kit_source "} // namespace\n\nconst KitFile kKitFiles[] = {\n${clotho_kit_table}};\n"
        "const size_t kKitFileCount = ${index};\n\n} // namespace clotho::link\n")
-# Copied from the generated template on every change to an embedded file, so the
-# table recompiles with it: #embed is not a dependency the build tool sees.
+# Generated from the template on every change to an embedded file, so the table recompiles
+# with it, and with a digest of the files' bytes, so ccache does too: #embed is not a
+# dependency the build tool or ccache sees (cmake/StampEmbeds.cmake).
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in" CONTENT "${clotho_kit_source}")
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
-  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in"
-          "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
+  COMMAND ${CMAKE_COMMAND} "-DTEMPLATE=${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in"
+          "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
+          "-DEMBEDS=${clotho_kit_embeds}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StampEmbeds.cmake"
   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in" clotho_runtime_exe ${clotho_kit_paths}
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StampEmbeds.cmake"
   VERBATIM)
 
 add_library(clotho_link STATIC src/link/Link.cpp "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp")
