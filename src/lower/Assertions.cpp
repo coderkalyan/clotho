@@ -767,22 +767,66 @@ bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupant
     return p.found;
 }
 
+namespace {
+
+using CallMemo = ankerl::unordered_dense::map<const SubroutineSymbol*, bool>;
+
+// Whether `scan` finds its property in `root` or in any subroutine reachable from it through
+// the calls it makes. `scan(sub, callees)` reads ONE body: it returns whether the body shows the
+// property on its own, and appends the user subroutines the body calls.
+//
+// Exact on a call graph with cycles: the walk is a worklist over a seen set, so a subroutine
+// is read once and the answer cannot depend on the order the graph is entered in. A recursion
+// that answered "no" for a callee while its caller was still being read, and kept that answer,
+// reported a member of a cycle as clean whenever the property sat behind the call back into
+// the cycle. Only a final answer is memoized: a true one for the root (nothing is known about
+// the other nodes then), a false one for every node seen, since each of them reaches only nodes
+// that were seen. A memoized node is not read again.
+template<class Scan>
+bool reaches_property(const SubroutineSymbol& root, CallMemo& memo, Scan&& scan) {
+    if (const auto it = memo.find(&root); it != memo.end()) {
+        return it->second;
+    }
+    std::vector<const SubroutineSymbol*>                  work{ &root };
+    ankerl::unordered_dense::set<const SubroutineSymbol*> seen{ &root };
+    bool                                                  found = false;
+    while (!work.empty() && !found) {
+        const SubroutineSymbol* const sub = work.back();
+        work.pop_back();
+        if (const auto it = memo.find(sub); it != memo.end()) {
+            found = it->second;
+            continue;
+        }
+        std::vector<const SubroutineSymbol*> callees;
+        found = scan(*sub, callees);
+        for (const SubroutineSymbol* const callee : callees) {
+            if (seen.insert(callee).second) {
+                work.push_back(callee);
+            }
+        }
+    }
+    memo[&root] = found;
+    if (!found) {
+        for (const SubroutineSymbol* const s : seen) {
+            memo[s] = false;
+        }
+    }
+
+    return found;
+}
+
+} // namespace
+
 // Whether calling this subroutine can suspend the caller: a timing control, a wait, a fork or
 // an `expect` anywhere in its body, the timing control on a blocking assignment (`x = #d y`,
 // `x = @(e) y`), a `wait_order`, a call to a task whose body cannot be read (task_parks_unseen),
-// and all of these transitively through the calls it makes. Memoized, and a recursive cycle
-// answers "no" on the way back in — the cycle itself parks only if some member does, which
-// that member reports.
+// and all of these transitively through the calls it makes (reaches_property: exact over a
+// recursive cycle, whatever order the cycle is entered in).
 bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
-    if (const auto it = sub_parks_.find(&sub); it != sub_parks_.end()) {
-        return it->second;
-    }
-    // Provisional false breaks recursion; overwritten below.
-    sub_parks_.emplace(&sub, false);
-
     struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
-        Lowerer* self  = nullptr;
-        bool     found = false;
+        Lowerer*                              self  = nullptr;
+        std::vector<const SubroutineSymbol*>* calls = nullptr;
+        bool                                  found = false;
 
         void handle(const slang::ast::TimedStatement& s) {
             found = true;
@@ -817,18 +861,23 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
         void handle(const CallExpression& c) {
             if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
                 const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
-                found = found || (callee != nullptr && (self->task_parks_unseen(*callee, /*direct=*/false) ||
-                                                        self->subroutine_parks(*callee)));
+                if (callee != nullptr) {
+                    found = found || self->task_parks_unseen(*callee, /*direct=*/false);
+                    calls->push_back(callee);
+                }
             }
             visitDefault(c);
         }
     };
-    Park p;
-    p.self = this;
-    sub.getBody().visit(p);
-    sub_parks_[&sub] = p.found;
+    return reaches_property(
+      sub, sub_parks_, [this](const SubroutineSymbol& s, std::vector<const SubroutineSymbol*>& callees) {
+          Park p;
+          p.self  = this;
+          p.calls = &callees;
+          s.getBody().visit(p);
 
-    return p.found;
+          return p.found;
+      });
 }
 
 // Whether calling this subroutine can wait on an event control or a wait statement: anywhere in
@@ -837,18 +886,12 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
 // task yet: resuming inside it is a flush point of the calling process, which the task cannot
 // name (lower_task_call). A virtual task called anywhere along the way counts as waiting, as
 // lower_task_call counts a direct virtual call: the body read here is the declared method's, and
-// any override may be the one that runs and waits. Memoized, and a recursive cycle answers "no"
-// on the way back in -- the cycle waits only if some member does, which that member reports.
+// any override may be the one that runs and waits. Transitive by reaches_property, like
+// subroutine_parks.
 bool Lowerer::subroutine_waits_on_event(const SubroutineSymbol& sub) {
-    if (const auto it = sub_event_waits_.find(&sub); it != sub_event_waits_.end()) {
-        return it->second;
-    }
-    // Provisional false breaks recursion; overwritten below.
-    sub_event_waits_.emplace(&sub, false);
-
     struct Waits : ASTVisitor<Waits, VisitFlags::AllGood> {
-        Lowerer* self  = nullptr;
-        bool     found = false;
+        std::vector<const SubroutineSymbol*>* calls = nullptr;
+        bool                                  found = false;
 
         void handle(const slang::ast::TimedStatement& s) {
             found = found || Lowerer::is_event_control(s.timing);
@@ -876,22 +919,25 @@ bool Lowerer::subroutine_waits_on_event(const SubroutineSymbol& sub) {
         void handle(const CallExpression& c) {
             if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
                 const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
-                // The same classification lower_task_call makes: a `super.` call binds statically,
-                // so its body is the one that runs and is read like any other.
-                const bool dispatched = callee != nullptr &&
-                                        callee->subroutineKind == slang::ast::SubroutineKind::Task &&
-                                        Lowerer::is_user_virtual(*callee) && !Lowerer::is_super_call(c);
-                found = found || dispatched || (callee != nullptr && self->subroutine_waits_on_event(*callee));
+                if (callee != nullptr) {
+                    // The same classification lower_task_call makes: a `super.` call binds
+                    // statically, so its body is the one that runs and is read like any other.
+                    found = found || (callee->subroutineKind == slang::ast::SubroutineKind::Task &&
+                                      Lowerer::is_user_virtual(*callee) && !Lowerer::is_super_call(c));
+                    calls->push_back(callee);
+                }
             }
             visitDefault(c);
         }
     };
-    Waits w;
-    w.self = this;
-    sub.getBody().visit(w);
-    sub_event_waits_[&sub] = w.found;
+    return reaches_property(
+      sub, sub_event_waits_, [](const SubroutineSymbol& s, std::vector<const SubroutineSymbol*>& callees) {
+          Waits w;
+          w.calls = &callees;
+          s.getBody().visit(w);
 
-    return w.found;
+          return w.found;
+      });
 }
 
 void Lowerer::record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,

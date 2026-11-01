@@ -837,6 +837,27 @@ TEST_CASE("deferred assertion: a virtual task called through another task is ref
     }
 }
 
+// The wait walk is transitive over a recursive cycle too, from either member, and the same walk as
+// the remote-disable park walk (reaches_property). The wait is in Y after its call back into the
+// cycle. Such a design was already refused before the walk was made exact (a refused answer ends
+// the compile, so a stale "no" never decided anything), so these pin the walk rather than flip. A
+// cycle that waits nowhere is accepted and keeps its report.
+TEST_CASE("deferred assertion: the wait walk is exact over a recursive cycle") {
+    const auto holds = [](std::string_view decls, std::string_view body) {
+        return std::string("module t;\n  logic x = 0; event e;\n") + std::string(decls) +
+               "\n  initial begin\n    assert #0 (x) else $error(\"r\");\n" + std::string(body) + "\n  end\nendmodule";
+    };
+    const std::string wait_refusal = "that holds a deferred assertion is not supported yet";
+    const std::string cycle = "task X(int n); Y(n); endtask\n  task Y(int n); if (n > 0) X(n - 1); @(e); endtask";
+
+    CHECK(contains(reject(holds(cycle, "X(1);")), wait_refusal));
+    CHECK(contains(reject(holds(cycle, "Y(1);")), wait_refusal));
+
+    const Captured c =
+      run_capture(holds("task X(int n); Y(n); endtask\n  task Y(int n); if (n > 0) X(n - 1); endtask", "X(2);"));
+    CHECK_EQ(count_occ(c.err, "ERROR: "), 1u);
+}
+
 // -- Concurrent assertions (LRM 16.14): the default failure action is a $error --
 
 // An assertion's report is made in its own scope: the instance, plus the label

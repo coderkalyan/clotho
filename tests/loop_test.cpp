@@ -1070,6 +1070,78 @@ TEST_CASE("a remote disable refuses a block whose called task parks in any form"
     )") == "after B 1\nafter C 3 y=0\n");
 }
 
+// The park walk (`subroutine_parks`) must give a task the same answer whatever order the call graph
+// is entered in. It used to memoize a callee's "no" while its caller was still being read, so in a
+// recursive cycle the member reached SECOND was reported clean whenever the park sat behind the call
+// back into the cycle: the block that called it was a legal remote target, and the disable took
+// effect when the task chain returned (`after B2 5`; iverilog 13 gives `after B2 1`). The park here
+// is in X after its call to Y, and B1 (never disabled, but every named block's body is read) enters
+// the cycle at X before B2 enters it at Y. Entered the other way round it was already right, so both
+// orders are checked, and a cycle of three, where two members were wrongly clean.
+TEST_CASE("a remote disable's park walk gives a recursive cycle the same answer from every entry point") {
+    const auto refused = [](std::string_view src) {
+        const LowerResult r = lower_text(src);
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("can park on a #0, a time-consuming task call") != std::string::npos);
+    };
+
+    SUBCASE("the member with the park is entered first") {
+        refused(R"(
+            module t;
+              task Y(int n); if (n > 0) X(n - 1); endtask
+              task X(int n); Y(n); #5; endtask
+              initial begin : P1 begin : B1 X(1); end end
+              initial begin : P2 begin : B2 Y(1); end $display("after B2 %0t", $time); end
+              initial #1 disable t.P2.B2;
+            endmodule
+        )");
+    }
+
+    SUBCASE("the other member is entered first") {
+        refused(R"(
+            module t;
+              task Y(int n); if (n > 0) X(n - 1); endtask
+              task X(int n); Y(n); #5; endtask
+              initial begin : P2 begin : B2 Y(1); end $display("after B2 %0t", $time); end
+              initial begin : P1 begin : B1 X(1); end end
+              initial #1 disable t.P2.B2;
+            endmodule
+        )");
+    }
+
+    SUBCASE("a cycle of three") {
+        for (const char* target : { "t.P2.B2", "t.P3.B3" }) {
+            refused(std::string(R"(
+                module t;
+                  task Z(int n); if (n > 0) X(n - 1); endtask
+                  task Y(int n); Z(n); endtask
+                  task X(int n); Y(n); #5; endtask
+                  initial begin : P1 begin : B1 X(1); end end
+                  initial begin : P2 begin : B2 Y(1); end end
+                  initial begin : P3 begin : B3 Z(1); end end
+                  initial #1 disable )") +
+                    target + R"(;
+                endmodule
+            )");
+        }
+    }
+
+    // A cycle that parks nowhere is not refused, and the disable ends the block at once.
+    SUBCASE("a cycle with no park is still a legal target") {
+        CHECK(run_capture(R"(
+            module t;
+              task Y(int n); if (n > 0) X(n - 1); endtask
+              task X(int n); Y(n); endtask
+              initial begin : P
+                begin : B X(2); #10 $display("never"); end
+                $display("after B %0t", $time);
+              end
+              initial #1 disable t.P.B;
+            endmodule
+        )") == "after B 1\n");
+    }
+}
+
 // A block in a body that can have SEVERAL activations at once. A bare branch would
 // end only the one running it; LRM 9.6.2 ends them all, so the block keeps a list
 // of the activations currently inside it, exactly as a task target does. Two
