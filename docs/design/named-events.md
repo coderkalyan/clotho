@@ -26,8 +26,10 @@ module-global arrays, all keyed by a `Signal` handle:
 
 - Per-signal wait buckets `clotho.wait.<sig>.{sta,dyn}.{pos,neg,any}`
   (`build_wait_queues`, `ir/llvm/Events.cpp`), entry `{ ptr handle, ptr sched_flag }`.
-- Subscribe: `emit_static_subscribe` (always @), `emit_dynamic_register`
-  (intra-body @).
+- Subscribe: a static one (`always @`) is a row of the seed's tables, planned by
+  `plan_static_subscribe` (`ir/llvm/Events.cpp`) and stored by `clotho.seed` — a bucket
+  slot for a signal, an entry of `clotho.seed.events` for a named event;
+  `emit_dynamic_register` (intra-body @) emits the store inline in the process.
 - Wake: a blocking store calls `service_wait_queue(sig, old, new, …)` →
   `emit_edge_facts` classifies the transition → per-bucket
   `service_static_queue` / `service_dynamic_queue` push coroutine handles onto

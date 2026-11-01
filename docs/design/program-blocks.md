@@ -193,8 +193,9 @@ already pin against Active-region cascades.
 Gaps A and B are the same missing thing. Clotho has exactly two flavours of
 Reactive-region body today, and neither is a continuous process:
 
-- `Activation::Reactive` — a program `initial`: seeded onto the reactive ring
-  (`src/ir/llvm/Scheduler.cpp, emit_active_run`), **never subscribed**, one-shot.
+- `Activation::Reactive` — a program `initial`: a row of `clotho.seed`'s table
+  (`src/ir/llvm/RootTables.cpp`) whose ring is the reactive one, **never subscribed**,
+  one-shot.
 - reactive *pend* thunks — an assertion action block, pushed by
   `Inst::Tag::ReactivePend`.
 
@@ -215,13 +216,13 @@ both; A3 inherits the corrections.
 
 1. **A static subscription is NOT tagged by `parked_handle`.** Only an
    *intra-body* wait is (`emit_dynamic_register`). A process with a static
-   sensitivity list is subscribed once, from the seed loop, with the bare ramp
+   sensitivity list is subscribed once, by `clotho.seed`, with the bare ramp
    handle, and its always-loop park never re-records it (`emit_wait_suspend`
    only suspends) — so the subscription record is the *only* place a
    continuously-active process can state its home. Left untagged, every wake of
    a program's continuous assign pushes it onto the **active** ring, i.e. the
-   whole feature silently does nothing. The seed loop now tags it
-   (`tag_reactive_home`).
+   whole feature silently does nothing. The seed now tags it: the row's tag bit
+   makes the subscription loop OR `kReactiveContTag` into the recorded handle.
 2. **A reactive-home group must not be thunk-eligible.** `kReactiveHomeTag` is
    bit 1 and the thunk tag is bit 0, and the scheduler's reactive test is "bit 1
    set AND bit 0 clear" precisely because the two are documented as mutually
@@ -250,8 +251,8 @@ would fork all of them. Concretely:
 |---|---|
 | `ir::Process` (`src/ir/Module.h:210`) | add `bool reactive_home = false` |
 | `add_continuous_process` (`src/lower/Nets.cpp`) | set it from `in_program_` |
-| seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) | `self_start` push → `emit_reactive_cont_push` when reactive-home, so the time-zero settle happens in slot 0's Reactive, ahead of every program thread (§3.1) |
-| subscribe loop (`:12013`) | unchanged predicate, but the recorded handle must be tagged — see correction 1 above |
+| seed rows (`emit_seed`, `src/ir/llvm/RootTables.cpp`) | a reactive-home group's `self_start` row names the reactive continuous ring (`emit_reactive_cont_push`), so the time-zero settle happens in slot 0's Reactive, ahead of every program thread (§3.1) |
+| subscription rows (`clotho.seed.slots`) | unchanged predicate, but the recorded handle must be tagged: the row's tag bit makes `clotho.seed` OR the continuous home tag into it — see correction 1 above |
 | `reactive_home()` (`:11399`) | include the current process's flag |
 | `compute_fusion_groups` | make the group key home-homogeneous — never fuse a reactive-home process with an Active one |
 | `has_program()` (`:6901`) | must also report a reactive-home process, so `design_uses_reactive_` is set for a program that has only an `assign` |
@@ -261,7 +262,7 @@ would fork all of them. Concretely:
 | `lower_continuous_assign` | a program driver of a **resolved** net was refused here, because its slots are written in Reactive while an Active-home resolver folds them, one region later than 24.3.2. **Retired by A5**, which makes such a net's resolver reactive-home; the same question ports raise, reachable without ports via a hierarchical `assign` |
 
 Cost to a design with no program: one `bool` in `Process` (fits existing
-padding), one already-taken branch in the seed loop. No new region, no new
+padding), one tag bit in a seed row. No new region, no new
 runtime entry point, no IR opcode.
 
 ### 3.1 Order inside the Reactive region: continuous before procedural
@@ -286,7 +287,7 @@ choice is made in the order of events inside the region, which 4.7 leaves free
 |---|---|
 | `clotho.reactive_cont` + head/tail | second ring, shape and capacity of `clotho.reactive`; exists only when a reactive-home process does (`design_uses_reactive_cont_`) |
 | `kReactiveContTag` | bit 2 on the home tag. Put on the static subscription of a reactive-home group, the one place a continuous process records its home; `emit_wake_push` reads it and picks the ring |
-| seed loop | a reactive-home `self_start` push goes to the continuous ring (`deferred_comb` too) |
+| seed rows | a reactive-home `self_start` row names the continuous ring, a late (always_comb) row of such a group too |
 | `reactive.check` | strict priority: while the continuous ring is non-empty the next pop is from it |
 | `lower_finish`, `emit_program_end`, ring reset | empty / reset it with the others |
 
@@ -887,7 +888,7 @@ All three are in `emit_active_run` (`src/ir/llvm/Scheduler.cpp`):
 
 | Block | What it does | Where it can go |
 |---|---|---|
-| `wheel.check` | runs `emit_observed_run`, then the Observed/Postponed flushes | `check` (the active drain) when the active ring is non-empty, else `observed.settled` and on into the reactive drain |
+| `wheel.check` | runs the Observed table through `clotho.run_once`, then the Observed/Postponed flushes | `check` (the active drain) when the active ring is non-empty, else `observed.settled` and on into the reactive drain |
 | `observed.settled` | the fall-through when Observed woke nothing | straight on to the Observed/Postponed flushes and the reactive drain |
 | `reactive.done` | the reactive drain's re-settle, after Re-Inactive and Re-NBA | `check` when the active ring is non-empty, else `reactive.settled` → Postponed → the wheel |
 
