@@ -511,6 +511,40 @@ TEST_CASE("deferred assertion: unsupported action / context rejected") {
                    "deferred assertion inside a function"));
 }
 
+// LRM 16.4.4: disabling "a specific deferred assertion" cancels its pending reports. A label is
+// a block (9.3.5), and `disable a1;` used to compile as a disable of a block nobody is ever in:
+// it did nothing and the reports matured. The reports are a process's queue with no identity per
+// assertion to cancel by, so the disable is refused; a block that merely holds an assertion is
+// an ordinary target and still works. Expected values are LRM-derived (no oracle implements
+// deferred assertions).
+TEST_CASE("deferred assertion: disable of an assertion's label is refused") {
+    for (const char* spelling : { "a1: assert #0 (x) else $error(\"r\");",
+                                  "a1: assert final (x) else $error(\"r\");",
+                                  "a1: assume #0 (x) else $error(\"r\");",
+                                  "a1: cover #0 (!x) $info(\"r\");" }) {
+        CAPTURE(spelling);
+        const std::string src = std::string("module t;\n  logic x = 0;\n  initial begin : P\n    ") + spelling +
+                                "\n    disable a1;\n  end\nendmodule";
+        CHECK(contains(reject(src), "disable of a deferred assertion is not supported yet"));
+    }
+
+    // A block that merely holds the assertion is an ordinary disable target, not its label: the
+    // disable ends nothing it is not in, and the report, from a scope that is not the process's
+    // outermost, matures.
+    const Captured held = run_capture(R"(
+        module t;
+          logic x = 0;
+          initial begin : P
+            B: begin assert #0 (x) else $error("kept"); end
+            disable B;
+            $display("after");
+          end
+        endmodule
+    )");
+    CHECK(held.out == "after\n");
+    CHECK_EQ(count_occ(held.err, "kept"), 1u);
+}
+
 // -- Concurrent assertions (LRM 16.14): the default failure action is a $error --
 
 // An assertion's report is made in its own scope: the instance, plus the label

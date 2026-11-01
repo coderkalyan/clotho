@@ -45,6 +45,24 @@ const Symbol* Lowerer::outermost_named_block(const Statement& body) {
     return s->as<BlockStatement>().blockSymbol;
 }
 
+namespace {
+
+// The implicit block a label gives a deferred assertion (`a1: assert #0 (...) ...;`, LRM 9.3.5).
+// slang builds it from the statement's own syntax, where `begin : a1 ... end` builds a block
+// from the block's, so a block that merely holds one assertion is not mistaken for it.
+bool is_deferred_assertion_label(const Symbol& sym) {
+    if (sym.kind != SymbolKind::StatementBlock) {
+        return false;
+    }
+    const slang::syntax::SyntaxNode* syntax = sym.getSyntax();
+    const auto*                      assertion =
+      syntax != nullptr ? syntax->as_if<slang::syntax::ImmediateAssertionStatementSyntax>() : nullptr;
+
+    return assertion != nullptr && assertion->delay != nullptr;
+}
+
+} // namespace
+
 void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     // A concurrent assertion in this body may need the procedure's own event
     // control as its inferred clock (LRM 16.14.6), so publish it for
@@ -423,6 +441,17 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
     const auto it = disable_targets_.find(&target);
     if (it == disable_targets_.end()) {
         fail("internal: disable target was not labelled in the Collect pass");
+    }
+
+    if (is_deferred_assertion_label(target)) {
+        // TODO: LRM 16.4.4 cancels "any pending assertion reports for that assertion". A pending
+        // report carries only its process's generation, which is the whole queue's identity, so
+        // one assertion's reports cannot be told from the rest; it needs a tag per assertion
+        // on each report. Until then `disable a1;` would compile, do nothing, and leave the
+        // reports to mature, so it is refused. Disabling a block that holds the assertion is not
+        // this: that follows the outermost-scope rule further down.
+        fail("disable of a deferred assertion is not supported yet (its pending reports cannot "
+             "be cancelled one assertion at a time)");
     }
 
     if (target.kind != SymbolKind::StatementBlock) {

@@ -537,11 +537,12 @@ deferred assertion LABEL (16.4.4's first bullet). Two deferred assertions in one
 process share one counter, so a bump cancels both, and `DeferReport`
 (`src/runtime/Scheduler.cpp`) carries `{line, gen, gen_val, is_final}` —
 no statement identity whatsoever, with `line` already rendered at queue time.
-A statement label on an `assert #0` is also never pushed onto `named_blocks_`
-(only `StatementKind::Block` with a `blockSymbol` is, `:6570`), so such a
-`disable` does not even reach a 16.4.4-aware path today: it hits the generic
-non-enclosing-target message. This needs both a target-recognition path and a
-per-report tag, and is out of scope for V2.
+A labelled assertion is an implicit block (9.3.5) and a `disable` of it lowered as a
+remote disable of a block nobody is ever in, which compiled to nothing and left the
+reports to mature. `lower_disable` now refuses it by name (the label's block is told
+from a `begin : name` block by its syntax: slang builds the first from the statement
+itself). Cancelling one assertion's reports needs a per-report tag (`SeverityInfo`,
+`rt_defer_report`, the unit remap of target ids), which is out of scope for V2.
 
 `ReactiveSafetyChecker` keeps rejecting `disable` inside assertion action blocks,
 but not for a region reason: a `disable` suspends nothing, so no wake is
