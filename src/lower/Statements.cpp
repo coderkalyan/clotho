@@ -587,6 +587,19 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
     const ir::SourceLoc             l = loc(blk);
     std::vector<const ValueSymbol*> captures;
 
+    // A named fork is a named block (LRM 9.3.4, and 9.3.5 for a label before
+    // `fork`): a hierarchy scope of its own, which %m names (LRM 21.2.1.5) in its
+    // declarations' initializers and in every child, and a `disable` target. It is
+    // open in the parent's stack for the whole fork, so each child's invoking scope
+    // (build_fork_child, from hier_name) ends in it and each child inherits it as
+    // an enclosing targeted block when a `disable` names it.
+    const bool named = blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty();
+    if (named) {
+        const auto targeted = disable_targets_.find(blk.blockSymbol);
+        named_blocks_.push_back(
+          { blk.blockSymbol, targeted != disable_targets_.end() ? targeted->second : kNoBlockLabel });
+    }
+
     // The fork's own block_item_declarations, materialized IN THE PARENT before any
     // child is built or spawned, in declaration order (LRM 9.3.2: "initialized to
     // their initialization value expression whenever execution enters their scope
@@ -686,6 +699,9 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
         // Their initializers have run above -- LRM 9.3.2 initializes them on entry to
         // the scope, so a side-effecting initializer still happens -- and there is
         // nothing to spawn and nothing to join.
+        if (named) {
+            named_blocks_.pop_back();
+        }
         return;
     }
 
@@ -693,21 +709,19 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
     ids.reserve(children.size());
     // The targeted blocks every child is activity within (LRM 9.6.2: "all activities
     // enabled within the named block ... shall be terminated as well"): the ones
-    // open around this fork, and the fork block itself when a `disable` names it.
-    // Each child becomes an activation of them (build_fork_child).
+    // open around this fork, the fork block itself among them when a `disable`
+    // names it. Each child becomes an activation of them (build_fork_child).
     std::vector<OpenBlock> enclosing;
     for (const OpenBlock& ob : named_blocks_) {
         if (ob.label != kNoBlockLabel) {
             enclosing.push_back({ ob.sym, ob.label, true });
         }
     }
-    if (blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty()) {
-        if (const auto own = disable_targets_.find(blk.blockSymbol); own != disable_targets_.end()) {
-            enclosing.push_back({ blk.blockSymbol, own->second, true });
-        }
-    }
     for (const Statement* c : children) {
         ids.push_back(build_fork_child(*c, captures, kind, enclosing));
+    }
+    if (named) {
+        named_blocks_.pop_back();
     }
 
     // The capture actuals, in the order the children took their formals: each is
