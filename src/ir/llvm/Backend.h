@@ -2091,7 +2091,21 @@ private:
 
     void emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr);
 
-    void emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* handle, llvm::Value* flag_ptr);
+    // One persistent subscription as the seed's tables hold it (plan_static_subscribe):
+    // a bucket's slot, or an event's node and the object it links onto.
+    struct StaticSub {
+        // A bucket: the address of the slot of the (signal, edge)'s static bucket that
+        // takes the group's { handle, flag } entry. An event: the node of the
+        // persistent pool that links onto the object's list.
+        llvm::Constant* slot = nullptr;
+        // An event only: the address of the object, or, when the variable's own
+        // handle decides it (`by_handle`), the address of that handle.
+        llvm::Constant* obj       = nullptr;
+        bool            is_event  = false;
+        bool            by_handle = false;
+    };
+
+    StaticSub plan_static_subscribe(Signal sig, uint32_t edge);
 
     void emit_dynamic_register(Signal sig, uint32_t edge);
 
@@ -2099,12 +2113,29 @@ private:
 
     void lower_wait(ExtraIndex info);
 
-    void emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
+    // -- Root from tables (RootTables.cpp) --
+    //
+    // What differs per instance or per group is data root's loops walk, so the code
+    // of root is the same size for any design: the instance records are initializers
+    // of their globals, and the creation, start and subscription of every group, the
+    // run-once regions and the dump registration are tables behind one loop each.
+
+    // The power-on value of every instance record (and the other link-time constants
+    // of root's globals), as the initializers of the globals themselves.
+    void fill_instance_records(const std::vector<llvm::Function*>& procs);
+
+    // Run the groups of one activation once each, in order, from a table: a call of
+    // `clotho.run_once` and no code of its own per group. Nothing is emitted when the
+    // design has none.
+    void emit_run_once(Activation which, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
+
+    llvm::Function* run_once_fn();
+
+    // The seed (emit_active_run): create every group's handle, start the ones that
+    // start now and subscribe the sensitive ones, from tables behind `clotho.seed`.
+    void emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
     bool has_preponed() const;
-
-    void emit_preponed_run(llvm::Value* state, llvm::Value* wheel,
-                           const std::vector<llvm::Function*>& procs);
 
     bool has_observed() const;
 
@@ -2114,13 +2145,7 @@ private:
 
     bool has_reactive_continuous() const;
 
-    void emit_observed_run(llvm::Value* state, llvm::Value* wheel,
-                           const std::vector<llvm::Function*>& procs);
-
     bool has_renba() const;
-
-    void emit_renba_run(llvm::Value* state, llvm::Value* wheel,
-                        const std::vector<llvm::Function*>& procs);
 
     bool is_reactive_fn(FunctionId id) const;
 
@@ -2188,11 +2213,6 @@ private:
     void reject_resume_once(const Ir& ir, std::string_view region, std::string_view what);
 
     void emit_main(const std::vector<llvm::Function*>& procs);
-
-    // The power-on value of every instance record, and the other link-time constants
-    // of root's globals, as the initializers of the globals themselves
-    // (RootTables.cpp): what differs per instance is data, and no code of root fills it.
-    void fill_instance_records(const std::vector<llvm::Function*>& procs);
 
     // -- Precise global roots (docs/design/garbage-collection.md §5) -------------
 
@@ -2598,8 +2618,6 @@ private:
 
     void emit_event_unlink(llvm::Value* node, llvm::Value* obj = nullptr);
 
-    llvm::Value* next_static_event_node();
-
     Plane lower_event_triggered(llvm::Value* obj);
 
     void emit_dynamic_remove(Signal sig, uint32_t edge);
@@ -2856,7 +2874,9 @@ private:
 
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
-    llvm::Value* ramp_arg(uint32_t sched, llvm::Value* state);
+    // The first argument of the ramp of schedule group `sched`: the record of the
+    // instance its code belongs to, or the root state for a group of no instance.
+    llvm::Constant* ramp_arg(uint32_t sched);
 
     // -- Coroutine intrinsics / frame allocator --
 
@@ -4084,13 +4104,17 @@ private:
 
     void lower_dump_vars();
 
-    void emit_vcd_scope(std::string_view name);
+    // The dump registration is a table (Vcd.cpp, VcdRows) that one loop of root walks:
+    // a scope, an upscope, a scalar $var or an unpacked array's $vars per row.
+    struct VcdRows;
 
-    void emit_vcd_scope_tree(const InstanceScope& sc);
+    void vcd_plan_scope(VcdRows& rows, std::string_view name);
+
+    void vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc);
 
     const char* vcd_unrepresentable(Ref type) const;
 
-    void emit_vcd_var(Signal sig);
+    void vcd_plan_var(VcdRows& rows, Signal sig);
 
     // The function of root that registers every dumped signal (lower_dump_vars).
     llvm::Function* vcd_register_fn();
@@ -5321,6 +5345,11 @@ private:
     // Root scheduled-flag array (clotho.proc_sched) for unowned processes.
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;
+    // `clotho.run_once(table, count, wheel)` (run_once_fn), and the table of each
+    // activation emit_run_once has built, with its row count: the Preponed table is
+    // walked from two sites and built once.
+    llvm::Function* run_once_fn_ = nullptr;
+    std::map<Activation, std::pair<llvm::GlobalVariable*, uint32_t>> run_tables_;
 
     // Nonblocking-assignment update state, built in build_nba_state(). A StoreNb
     // stages its RHS into the target's shadow and registers its block; the NBA region

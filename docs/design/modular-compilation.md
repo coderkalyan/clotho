@@ -1,10 +1,11 @@
 # Modular compilation
 
-Status: steps 1 and 2a/2b/2c are on this branch (2d, lowering a specialization
-once, is not), and step 3, the backend per unit, is under way: layout, records,
+Status: steps 1, 2a/2b/2c and 3 are on this branch (2d, lowering a specialization
+once, is not): layout, records,
 groups, functions and tasks are lowered once per unit (3a-3c), each unit has
-its own LLVM module named by the unit with the instance glue in root, and the
-gate test passes (3e; see each below for what is left). The frontend's output
+its own LLVM module named by the unit with the instance glue in root, root's
+per-instance work is tables behind loops (3e), and the
+gate test passes. The frontend's output
 is a `Design` (src/ir/Design.h) with one unit per specialization wherever its
 instances lower identically, which `flatten` expands back into the flat module
 the backend consumes (`clotho run --stat=units` reports what is still split:
@@ -584,7 +585,7 @@ code go.
      bucket. What a park or self-start stores into the scheduled flag is every
      trigger bit whether or not the design guards a group, so no unit's code
      depends on that.
-  - **3e, root as link glue (partly landed).** Landed: one LLVM module per
+  - **3e, root as link glue (landed).** Landed: one LLVM module per
     Design unit, named by the unit's key (`InstanceScope::unit_key`: the
     definition name, plus a body hash when several units share it) and holding
     only that unit's code under unit-key symbols; instance storage, records,
@@ -616,10 +617,42 @@ code go.
     link-time constant (the addresses of the instance's storage, the ports' wake
     buckets and ids, the bindings, the entry of each thunk group's wake pair), so
     `clotho_main` holds no code per instance and a record costs data only.
-    Still open: the seed loop is root code rather than a table built from the
-    instance table, and flatten still copies bodies per
-    instance. What still makes a unit module depend on outside it: lowerings
-    the taint list keeps per instance (they name `clotho.inst.<hier>.*`
+    The rest of root's per-instance work is tables behind one loop each
+    (ir/llvm/RootTables.cpp, Vcd.cpp). The groups that run once (PreInit,
+    Preponed, Observed, Re-NBA, Final) are rows `{ ramp, first argument }` of a
+    table walked by `clotho.run_once`. The seed is `clotho.seed`: a row per schedule
+    group `{ ramp, first argument, wake word, kind, subscriptions }` (kind: set the
+    wake word, which ring it is queued on, queued late, continuous home tag), the
+    handle array, the list of the slot each bucket subscription fills (row after
+    row), the always_comb rows queued last and the persistent event waiters
+    (node, object or the address of the variable's handle) in link order. The
+    tables are built in the order the straight-line code was emitted in, so ring
+    contents, bucket slots, event waiter order and region homes are unchanged. The
+    dump registration is a table of scope / upscope / `$var` / array rows behind
+    `clotho.vcd.register`. Measured on rocket-chip (558 instances, 266 units): root's
+    text 116.1 MB / 662k instructions (`sim_drain` 420k, `clotho_main` 242k) became
+    48.3 MB / 21.7k (`sim_drain` 18.2k, `clotho_main` 3.4k, `clotho.seed` 73); the
+    gate test checks that the size of root's functions does not depend on the
+    instance count. What is still code of root that grows with the design: the
+    dispatcher of a schedule group of several rows (a call per row), the whole-signal
+    commits of deferred writes through a runtime index (`emit_nba_commit`: array,
+    aggregate, handle, string, intra-assignment; 431 of them are the 18k
+    instructions of `sim_drain`), the power-on loops of memories and strings
+    (`init_state`), their teardown, and one `gc_roots_add` call per region with class
+    handles. Flatten still copies bodies per instance.
+
+    Inbound facts that still reach unit modules (step 4 replaces them with
+    summaries): the design-wide feature flags that gate or reshape unit code and
+    every record -- process control (`design_uses_process_`, `design_uses_disable_`,
+    so claimable parks, ring guards and the `n_proc` fields), the reactive region set
+    and its continuous ring (`design_uses_reactive_`, `_reactive_cont_`: wake tags),
+    the VCD dump (`design_uses_vcd_`: touches in every writer and a port field),
+    the process-home argument, `may_finish_`, nonblocking event triggers and
+    detached events, deferred assertions (`any_defer_`), guarded groups
+    (`any_guarded_`: mask fields), a program `initial` (`n_prog`) -- and the facts
+    other units impose on a signal (its set of waiters, may-z, forced, event
+    monomorphism, trigger colours). What still makes a unit module depend on outside
+    it: lowerings the taint list keeps per instance (they name `clotho.inst.<hier>.*`
     globals) and the intern pool's type and class numbers (step 5).
 
     What the entry costs at tier 0. A root trampoline per instance (`lea

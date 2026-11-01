@@ -892,7 +892,7 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     // The disable condition (LRM 16.15), and the clocking edge. The monitor
     // runs in the Observed region, which resumes every process it holds once
     // per time slot rather than subscribing them to net events (LlvmBackend's
-    // emit_observed_run), so the edge is detected here instead of by a
+    // emit_run_once), so the edge is detected here instead of by a
     // sensitivity list: this slot's clock against the value it held at the
     // previous slot's Observed point. Taking it at the settled point is what
     // makes the monitor step once per cycle however many deltas the clock's

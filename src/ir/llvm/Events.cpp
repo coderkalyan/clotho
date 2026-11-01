@@ -115,28 +115,42 @@ void Backend::emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* han
     b_.CreateStore(flag_ptr, b_.CreateStructGEP(elem, slot, 1));
 }
 
-// Persistent (always-block) subscription: write a process's entry into the
-// signal's static queue at a compile-time slot. Slots are handed out in
-// process / wait-event order, matching the capacities build_wait_queues
-// computed, so each array fills exactly once and is never compacted. Issued
-// from the seed loop (emit_active_run) with the process's ramp handle and
-// scheduled-flag pointer — by plain stores, never by resuming the coroutine,
-// so it does not inhibit coro-elide of other processes. All subscriptions land
-// before any servicing, so the fixed-trip scans never read an empty slot.
-void Backend::emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* handle, llvm::Value* flag_ptr) {
+// Persistent (always-block) subscription, planned: where a process's entry goes. The
+// seed's tables hold it (emit_seed), and one loop of root makes the stores. A static
+// bucket takes the entry at a compile-time slot; slots are handed out in process /
+// wait-event order, matching the capacities build_wait_queues computed, so each array
+// fills exactly once and is never compacted. The store is a plain one of the
+// process's ramp handle and scheduled-flag pointer, never a resume of the coroutine,
+// so it does not inhibit coro-elide of other processes. All subscriptions land before
+// any servicing, so the fixed-trip scans never read an empty slot.
+//
+// An event has no buckets: a node of the contiguous persistent array links onto the
+// event object's waiter list. Edge is meaningless for an event (a trigger is not a
+// transition), so it is ignored here -- every event subscription is recorded once, on
+// the one list. The object is a constant only for an event of no instance that no
+// store reaches; any other is the one its variable's own handle names when the links
+// are made, which a declaration initializer (`event e2 = e1`) may have changed.
+Backend::StaticSub Backend::plan_static_subscribe(Signal sig, uint32_t edge) {
     const auto i = static_cast<uint32_t>(sig);
+    StaticSub  sub;
     if (mod_.signal(sig).is_event) {
-        // An event has no buckets: link a node from the contiguous persistent
-        // array onto the event object's waiter list. Edge is meaningless for an
-        // event (a trigger is not a transition), so it is ignored here -- every
-        // event subscription is recorded once, on the one list.
-        // A persistent subscription is never unlinked, so it needs no owner.
-        emit_event_link(event_obj_for(sig), next_static_event_node(), handle, flag_ptr,
-                        /*record_owner=*/false);
-        return;
+        sub.is_event = true;
+        sub.slot     = llvm::ConstantExpr::getInBoundsGetElementPtr(
+          event_nodes_arr_ty_, event_nodes_gv_,
+          llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(event_node_next_++) });
+        if (event_is_mono(sig) && slots_[i].anchor == SignalSlot::no_anchor) {
+            sub.obj = llvm::ConstantExpr::getInBoundsGetElementPtr(
+              events_arr_ty_, events_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(event_slot_[i]) });
+        } else {
+            sub.obj       = storage_address(slots_[i]);
+            sub.by_handle = true;
+        }
+        return sub;
     }
     const uint32_t slot = sta_next_[i][edge]++;
-    emit_entry(sym(wait_sta_gv_[i][edge]), b_.getInt32(slot), handle, flag_ptr);
+    sub.slot            = llvm::ConstantExpr::getInBoundsGetElementPtr(
+      wait_elem_ty(), sym(wait_sta_gv_[i][edge]), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(slot) });
+    return sub;
 }
 
 // One-shot (intra-body @(sig)) registration: append this coroutine to the
@@ -1828,15 +1842,6 @@ void Backend::emit_event_unlink(llvm::Value* node, llvm::Value* obj) {
     b_.SetInsertPoint(tail);
     b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodeNext));
     b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodePrev));
-}
-
-// A persistent (`always @(e)`) waiter's node: the next slot of the contiguous
-// clotho.event_nodes array. Handed out in the same subscription order the
-// static bucket slots used to be, so the count build_wait_queues reserved is
-// filled exactly once.
-llvm::Value* Backend::next_static_event_node() {
-    return b_.CreateInBoundsGEP(event_nodes_arr_ty_, sym(event_nodes_gv_),
-                                { b_.getInt32(0), b_.getInt32(event_node_next_++) });
 }
 
 // Lower `e.triggered` (LRM 15.5.3) to a definite 2-state 1-bit: 1 iff the last

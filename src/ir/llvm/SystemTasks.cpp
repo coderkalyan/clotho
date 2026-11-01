@@ -324,7 +324,7 @@ void Backend::lower_expect_wake(Index i) {
 // The task-call record a pended body ($strobe, an action block) is ramped with.
 // It CANNOT be an alloca in the pending body's frame: that frame can be freed
 // before the drain resumes the pended body -- an Observed process is ramped,
-// resumed and destroyed in one go (emit_observed_run), and an `initial` that
+// resumed and destroyed in one go (emit_run_once), and an `initial` that
 // pends a $strobe and runs off its end in the same time step is destroyed
 // before Postponed -- and a task's epilogue loads the parent handle back out of
 // the record to resume whoever called it (lower_task), so reading it there

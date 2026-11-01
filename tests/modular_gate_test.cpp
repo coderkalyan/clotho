@@ -493,10 +493,15 @@ TEST_CASE("root's code does not grow with the number of instances") {
     // would have stored for each instance is not code.
     const auto few  = root_code(tiles(2));
     const auto many = root_code(tiles(7));
-    for (const char* name : { "clotho_main" }) {
+    for (const std::string name : { "clotho_main", "sim_drain", "sim_finals", "clotho.seed", "clotho.run_once",
+                                    "clotho.vcd.register" }) {
         INFO("function ", name);
         REQUIRE(few.contains(name));
         REQUIRE(many.contains(name));
-        CHECK(few.at(name) == many.at(name));
+        // A constant of the design (a ring's capacity, a table's length) can fold an
+        // instruction or two differently; five more instances add hundreds.
+        const auto a = static_cast<int64_t>(few.at(name));
+        const auto b = static_cast<int64_t>(many.at(name));
+        CHECK(std::abs(a - b) <= 2);
     }
 }

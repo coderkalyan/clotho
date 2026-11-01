@@ -73,11 +73,11 @@ bool Backend::design_uses_vcd() const {
 }
 
 // Assign each dumped scalar signal its runtime dump-var index, in the exact
-// order rt_vcd_var / rt_vcd_array register variables (the emit_vcd_var walk):
+// order rt_vcd_var / rt_vcd_array register variables (the vcd_plan_var walk):
 // an unpacked array consumes elem_count indices (its always-scanned elements),
 // a scalar consumes one. Precomputed before any process body so a store's touch
-// uses a compile-time-constant index. Kept in lockstep with emit_vcd_var /
-// emit_vcd_scope_tree; a byte-diff of the dump verifies the two match.
+// uses a compile-time-constant index. Kept in lockstep with vcd_plan_var /
+// vcd_plan_scope_tree; a byte-diff of the dump verifies the two match.
 void Backend::build_vcd_index() {
     design_uses_vcd_ = design_uses_vcd();
     if (!design_uses_vcd_) {
@@ -118,7 +118,7 @@ void Backend::vcd_index_signal(Signal sig, uint32_t& next) {
         return;
     }
     if (vcd_unrepresentable(info.type) != nullptr) {
-        // Never registers: emit_vcd_var refuses a declared one and skips a
+        // Never registers: vcd_plan_var refuses a declared one and skips a
         // compiler-synthesized one, so neither consumes a dump-var index.
         return;
     }
@@ -297,79 +297,148 @@ void Backend::lower_dump_vars() {
     b_.CreateCall(vcd_start_fn(), {});
 }
 
+// The dump registration table: one row per call the registration makes of the runtime,
+// in the order it makes them. A row is
+//
+//   { kind, name length, name, width, flags, value plane, z plane, count, stride, left, right }
+//
+// and the fields a kind does not use are zero. The leaf names are interned: the same
+// `clk` or `valid` of a thousand instances is one string.
+struct Backend::VcdRows {
+    enum Kind : uint32_t { Scope, Upscope, Var, Array };
+
+    explicit VcdRows(llvm::Module& m)
+      : mod(m)
+      , i32(llvm::Type::getInt32Ty(m.getContext()))
+      , i64(llvm::Type::getInt64Ty(m.getContext()))
+      , ptr(llvm::PointerType::getUnqual(m.getContext()))
+      , ty(llvm::StructType::get(m.getContext(), { i32, i32, ptr, i32, i32, ptr, ptr, i32, i32, i64, i64 })) {}
+
+    llvm::Constant* name(std::string_view s) {
+        if (const auto it = names.find(s); it != names.end()) {
+            return it->second;
+        }
+        auto* const init = llvm::ConstantDataArray::getString(mod.getContext(), llvm::StringRef(s.data(), s.size()), true);
+        auto* const gv   = new llvm::GlobalVariable(mod, init->getType(), /*isConstant=*/true,
+                                                    llvm::GlobalValue::PrivateLinkage, init, "vcd.name");
+        gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        return names.emplace(std::string(s), gv).first->second;
+    }
+
+    void add(Kind kind, std::string_view label, uint32_t width = 0, uint32_t flags = 0, llvm::Constant* value = nullptr,
+             llvm::Constant* z = nullptr, uint32_t count = 0, uint32_t stride = 0, uint64_t left = 0, uint64_t right = 0) {
+        llvm::Constant* const none = llvm::ConstantPointerNull::get(ptr);
+        rows.push_back(llvm::ConstantStruct::get(
+          ty, { llvm::ConstantInt::get(i32, kind), llvm::ConstantInt::get(i32, label.size()),
+                label.empty() ? none : name(label), llvm::ConstantInt::get(i32, width), llvm::ConstantInt::get(i32, flags),
+                value != nullptr ? value : none, z != nullptr ? z : none, llvm::ConstantInt::get(i32, count),
+                llvm::ConstantInt::get(i32, stride), llvm::ConstantInt::get(i64, left), llvm::ConstantInt::get(i64, right) }));
+    }
+
+    llvm::Module&                                       mod;
+    llvm::Type*                                         i32;
+    llvm::Type*                                         i64;
+    llvm::PointerType*                                  ptr;
+    llvm::StructType*                                   ty;
+    std::vector<llvm::Constant*>                        rows;
+    std::map<std::string, llvm::Constant*, std::less<>> names;
+};
+
 // The function of root that registers the design's dumped signals, built on first
-// use whichever body asks: the walk of the scope tree emit_vcd_scope_tree makes,
-// addressing every instance absolutely (no record, no sharing watch), into root.
+// use whichever body asks: the walk of the scope tree vcd_plan_scope_tree makes,
+// addressing every instance absolutely (no record, no sharing watch), into root, and
+// the one loop that makes the runtime calls the table's rows stand for.
 llvm::Function* Backend::vcd_register_fn() {
     if (vcd_register_fn_ != nullptr) {
         return vcd_register_fn_;
     }
-    auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), {}, false);
-    vcd_register_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.vcd.register",
-                                              root_env_->llmod);
-    // Everything the caller's lowering holds that the walk must not see.
-    const auto ip            = b_.saveIP();
-    ModuleEnv* const env     = env_;
-    llvm::Function* const fn = fn_;
-    llvm::Value* const state = state_;
-    const uint32_t own       = own_anchor_;
-    llvm::Value* const ctx   = own_ctx_;
-    llvm::Value* const ovr   = ctx_override_;
-    const uint32_t ovr_a     = ctx_override_anchor_;
-    const bool share         = share_active_;
-    const bool verifying     = verifying_;
-    env_                 = root_env_.get();
-    fn_                  = vcd_register_fn_;
-    state_               = sym(state_global_);
-    own_anchor_          = SignalSlot::no_anchor;
-    own_ctx_             = nullptr;
-    ctx_override_        = nullptr;
-    ctx_override_anchor_ = SignalSlot::no_anchor;
+    // What the caller's lowering holds that the walk must not see.
+    InRoot     in_root(*this);
+    const bool share     = share_active_;
+    const bool verifying = verifying_;
     share_active_        = false;
     verifying_           = false;
-    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", vcd_register_fn_));
 
+    VcdRows    rows(env_->llmod);
     const auto tops = mod_.tops();
     if (tops.empty()) {
-        emit_vcd_scope(mod_.name);
+        vcd_plan_scope(rows, mod_.name);
         for (uint32_t s = 0; s < mod_.signals().size(); ++s) {
-            emit_vcd_var(static_cast<Signal>(s));
+            vcd_plan_var(rows, static_cast<Signal>(s));
         }
-        b_.CreateCall(vcd_upscope_fn(), {});
+        rows.add(VcdRows::Upscope, {});
     } else {
         for (const InstanceScope& top : tops) {
-            emit_vcd_scope_tree(top);
+            vcd_plan_scope_tree(rows, top);
         }
     }
-    b_.CreateRetVoid();
+    auto* const arr   = llvm::ArrayType::get(rows.ty, rows.rows.size());
+    auto* const table = new llvm::GlobalVariable(env_->llmod, arr, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage,
+                                                 llvm::ConstantArray::get(arr, rows.rows), "clotho.vcd.rows");
 
-    verifying_           = verifying;
-    share_active_        = share;
-    ctx_override_anchor_ = ovr_a;
-    ctx_override_        = ovr;
-    own_ctx_             = ctx;
-    own_anchor_          = own;
-    state_               = state;
-    fn_                  = fn;
-    env_                 = env;
-    b_.restoreIP(ip);
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32 = b_.getInt32Ty();
+    vcd_register_fn_ = llvm::Function::Create(llvm::FunctionType::get(b_.getVoidTy(), {}, false),
+                                              llvm::Function::InternalLinkage, "clotho.vcd.register", env_->llmod);
+    llvm::IRBuilder<> tb(ctx_);
+    const auto        block = [&](const char* name) { return llvm::BasicBlock::Create(ctx_, name, vcd_register_fn_); };
+    auto* const       entry = block("entry");
+    auto* const       head  = block("vcd.head");
+    auto* const       body  = block("vcd.row");
+    auto* const       latch = block("vcd.next");
+    auto* const       done  = block("vcd.done");
+    tb.SetInsertPoint(entry);
+    tb.CreateBr(head);
+    tb.SetInsertPoint(head);
+    auto* const i = tb.CreatePHI(i32, 2);
+    i->addIncoming(tb.getInt32(0), entry);
+    tb.CreateCondBr(tb.CreateICmpULT(i, tb.getInt32(static_cast<uint32_t>(rows.rows.size()))), body, done);
+    tb.SetInsertPoint(body);
+    llvm::Value* const row   = tb.CreateInBoundsGEP(rows.ty, table, i);
+    const auto         field = [&](uint32_t f, llvm::Type* t) { return tb.CreateLoad(t, tb.CreateStructGEP(rows.ty, row, f)); };
+    auto* const        sw    = tb.CreateSwitch(field(0, i32), latch, 4);
+    const auto         arm   = [&](VcdRows::Kind kind, const char* name) {
+        auto* const bb = block(name);
+        sw->addCase(tb.getInt32(kind), bb);
+        tb.SetInsertPoint(bb);
+    };
+    arm(VcdRows::Scope, "vcd.scope");
+    tb.CreateCall(vcd_scope_fn(), { field(2, ptr), field(1, i32) });
+    tb.CreateBr(latch);
+    arm(VcdRows::Upscope, "vcd.upscope");
+    tb.CreateCall(vcd_upscope_fn(), {});
+    tb.CreateBr(latch);
+    arm(VcdRows::Var, "vcd.var");
+    tb.CreateCall(vcd_var_fn(), { field(2, ptr), field(1, i32), field(3, i32), field(4, i32), field(5, ptr), field(6, ptr) });
+    tb.CreateBr(latch);
+    arm(VcdRows::Array, "vcd.array");
+    tb.CreateCall(vcd_array_fn(), { field(2, ptr), field(1, i32), field(7, i32), field(3, i32), field(4, i32), field(5, ptr),
+                                    field(6, ptr), field(8, i32), field(9, b_.getInt64Ty()), field(10, b_.getInt64Ty()) });
+    tb.CreateBr(latch);
+    tb.SetInsertPoint(latch);
+    i->addIncoming(tb.CreateAdd(i, tb.getInt32(1)), latch);
+    tb.CreateBr(head);
+    tb.SetInsertPoint(done);
+    tb.CreateRetVoid();
+
+    verifying_    = verifying;
+    share_active_ = share;
     return vcd_register_fn_;
 }
 
-void Backend::emit_vcd_scope(std::string_view name) {
-    llvm::Value* np = b_.CreateGlobalString(llvm::StringRef(name.data(), name.size()), "vcd.scope");
-    b_.CreateCall(vcd_scope_fn(), { np, b_.getInt32(static_cast<uint32_t>(name.size())) });
+void Backend::vcd_plan_scope(VcdRows& rows, std::string_view name) {
+    rows.add(VcdRows::Scope, name);
 }
 
-void Backend::emit_vcd_scope_tree(const InstanceScope& sc) {
-    emit_vcd_scope(sc.name);
+void Backend::vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc) {
+    vcd_plan_scope(rows, sc.name);
     for (const Signal sig : sc.signals) {
-        emit_vcd_var(sig);
+        vcd_plan_var(rows, sig);
     }
     for (const InstanceScope& child : sc.children) {
-        emit_vcd_scope_tree(child);
+        vcd_plan_scope_tree(rows, child);
     }
-    b_.CreateCall(vcd_upscope_fn(), {});
+    rows.add(VcdRows::Upscope, {});
 }
 
 // Why a signal's type has no $var form, or nullptr when it has one. Mirrors
@@ -401,8 +470,8 @@ const char* Backend::vcd_unrepresentable(Ref type) const {
     }
 }
 
-// Register one dumped signal: leaf name, width/flags, and live plane pointers.
-// An unpacked array expands to one $var per element (rt_vcd_array); a real /
+// Plan the registration of one dumped signal: leaf name, width/flags, and live plane
+// pointers. An unpacked array expands to one $var per element (rt_vcd_array); a real /
 // shortreal carries RT_VCD_FLAG_REAL and dumps as `$var real` (the runtime
 // formats the slot's IEEE-754 bit pattern as a decimal); a named event carries
 // RT_VCD_FLAG_EVENT and dumps as `$var event` (see below). A whole-design dump
@@ -410,7 +479,7 @@ const char* Backend::vcd_unrepresentable(Ref type) const {
 // container, aggregate, class handle, multidimensional array) loud-fails rather
 // than being silently omitted (PRINCIPLES.md); an unnamed compiler temporary is not
 // a declared variable and is skipped.
-void Backend::emit_vcd_var(Signal sig) {
+void Backend::vcd_plan_var(VcdRows& rows, Signal sig) {
     const SignalInfo& info = mod_.signal(sig);
     if (info.name.empty()) {
         return;
@@ -419,17 +488,23 @@ void Backend::emit_vcd_var(Signal sig) {
     if (const auto pos = leaf.rfind('.'); pos != std::string::npos) {
         leaf = leaf.substr(pos + 1);
     }
-    auto* nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    const auto gep = [&](llvm::Type* ty, llvm::Constant* base, std::initializer_list<uint32_t> idx) {
+        std::vector<llvm::Constant*> v;
+        for (const uint32_t i : idx) {
+            v.push_back(b_.getInt32(i));
+        }
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(ty, base, v);
+    };
     if (info.is_event) {
         // A named event (LRM 15.5) has no value -- its 1-bit placeholder slot
         // is never written -- so what the dump carries is occurrences. The
         // runtime watches the event's last-trigger tick (clotho.event_trig,
         // stamped by emit_event_fire for every trigger form) and emits `1<id>`
-        // at each instant that stamp moves.
-        llvm::Value* np   = b_.CreateGlobalString(leaf, "vcd.var");
-        llvm::Value* nlen = b_.getInt32(static_cast<uint32_t>(leaf.size()));
-        b_.CreateCall(vcd_var_fn(), { np, nlen, b_.getInt32(1), b_.getInt32(16),
-                                      event_field(event_obj(sig), kEventTrig), nullp });
+        // at each instant that stamp moves. The object is the declared one, by
+        // number: a variable no store reaches holds it for the whole run, and the
+        // dump of a reassigned one names it all the same.
+        llvm::Constant* obj = gep(events_arr_ty_, sym(events_gv_), { 0, event_slot_[static_cast<uint32_t>(sig)] });
+        rows.add(VcdRows::Var, leaf, 1, 16, gep(event_obj_ty(), obj, { 0, kEventTrig }));
         return;
     }
     const SignalSlot& s = slot_of(sig);
@@ -449,14 +524,10 @@ void Backend::emit_vcd_var(Signal sig) {
     // real; the event bit is set on the branch above.
     const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (!s.four_state ? 4u : 0u)
                          | (s.is_real ? 8u : 0u);
-    llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");
-    llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));
-
+    llvm::Constant* storage = storage_address(s);
     if (!s.is_array) {
-        llvm::Value* storage = storage_ptr(s);
-        llvm::Value* mm      = b_.CreateStructGEP(s.slot_ty, storage, 0);
-        llvm::Value* zp = s.has_z ? b_.CreateStructGEP(s.slot_ty, storage, 1) : llvm::cast<llvm::Value>(nullp);
-        b_.CreateCall(vcd_var_fn(), { np, nlen, b_.getInt32(s.width), b_.getInt32(flags), mm, zp });
+        rows.add(VcdRows::Var, leaf, s.width, flags, gep(s.slot_ty, storage, { 0, 0 }),
+                 s.has_z ? gep(s.slot_ty, storage, { 0, 1 }) : nullptr);
         return;
     }
 
@@ -467,16 +538,10 @@ void Backend::emit_vcd_var(Signal sig) {
     if (std::get<Type>(mod_.pool.get(at.element)).kind == Type::Kind::UnpackedArray) {
         throw BackendError{ "VCD dump of multidimensional array '" + info.name + "' is not supported" };
     }
-    auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
-    llvm::Value* base    = storage_ptr(s);
-    llvm::Value* mm_base = b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
-    llvm::Value* z_base =
-      s.has_z ? b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
-              : llvm::cast<llvm::Value>(nullp);
-    const auto stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
-    b_.CreateCall(vcd_array_fn(), { np, nlen, b_.getInt32(s.elem_count), b_.getInt32(s.width),
-                                    b_.getInt32(flags), mm_base, z_base, b_.getInt32(stride),
-                                    b_.getInt64(at.left), b_.getInt64(at.right) });
+    auto* const arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
+    const auto  stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
+    rows.add(VcdRows::Array, leaf, s.width, flags, gep(arr_ty, storage, { 0, 0, 0 }),
+             s.has_z ? gep(arr_ty, storage, { 0, 0, 1 }) : nullptr, s.elem_count, stride, at.left, at.right);
 }
 
 // $dumpoff / $dumpon / $dumpall / $dumpflush: forward to the matching runtime

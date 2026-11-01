@@ -734,7 +734,7 @@ bool Backend::reaches_fork(const Ir& ir) {
 }
 
 // What a resume-once region process may not contain -- an Observed body
-// (emit_observed_run) or a Re-NBA one (emit_renba_run). Both are run to
+// (an emit_run_once region) or a Re-NBA one (the same). Both are run to
 // completion by a single resume at a point where the NBA region has already
 // committed, so neither may suspend, and neither is in the reactive region set
 // that LRM 4.4.2.8 scopes the update region to.

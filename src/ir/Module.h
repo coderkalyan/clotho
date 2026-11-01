@@ -180,7 +180,7 @@ enum class Activation : uint8_t {
     // time slot, which is what Inst::Tag::ReactivePend does.
     //
     // Emitted like Preponed and for the same reason: the backend runs it
-    // explicitly (emit_observed_run), so it is filtered out of the seed and
+    // explicitly (emit_run_once), so it is filtered out of the seed and
     // subscribe loops and its wait_events are never consulted. A body detects
     // its own clocking event from the values Preponed sampled, per LRM 16.5.
     //
@@ -197,7 +197,7 @@ enum class Activation : uint8_t {
     // could issue one -- an Active-region process woken by the clocking block
     // event, and a program's Reactive code alike.
     //
-    // Emitted like Observed (emit_renba_run), so it is filtered out of the seed and
+    // Emitted like Observed (emit_run_once), so it is filtered out of the seed and
     // subscribe loops and its wait_events are never consulted. Its stores are
     // ordinary design writes: the reactive drain re-settles the active set when one
     // wakes a process, which is what makes the driven value visible in the same

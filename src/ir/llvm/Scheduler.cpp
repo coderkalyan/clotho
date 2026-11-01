@@ -189,31 +189,12 @@ void Backend::emit_suspend(const char* label) {
 // instance a coroutine group of an instance runs for, which is what lets one
 // ramp serve every instance of its unit; the state pointer for a group of no
 // instance. (A thunk group is not ramped.)
-llvm::Value* Backend::ramp_arg(uint32_t s, llvm::Value* state) {
+llvm::Constant* Backend::ramp_arg(uint32_t s) {
     const uint32_t aid = group_unit_anchor_[sched_[s].rows.front()];
     if (sched_[s].thunk || aid == SignalSlot::no_anchor) {
-        return state;
+        return sym(state_global_);
     }
     return ensure_ctx(anchors_[aid]);
-}
-
-// Run every `final` block once, in source order, at the end of simulation
-// (LRM 9.2.3). A final block is zero-time, so — like the pre-init pass — one
-// resume runs its body to completion; destroy reclaims the frame. Emitted as
-// a separate `sim_finals(state, wheel)` so rt_sim_run can invoke it on both
-// the natural-drain and $finish exit paths.
-void Backend::emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[sched_[g].front].activation != Activation::Final) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
 }
 
 // Whether the design has anything to sample. A design with no concurrent
@@ -225,27 +206,6 @@ bool Backend::has_preponed() const {
         }
     }
     return false;
-}
-
-// Run every Preponed process once (LRM 4.4.2.1). Called at the top of a new
-// time step -- after the wheel has fired its timers, which only enqueues
-// handles, and before any body of that step executes -- and once from
-// emit_main so time zero is sampled too.
-//
-// A Preponed body has no timing, so one resume runs it to completion, and its
-// stores generate no events (silent_stores_), so nothing wakes on a shadow.
-void Backend::emit_preponed_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[sched_[g].front].activation != Activation::Preponed) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
 }
 
 // Whether any process runs in the Observed region. A design with no
@@ -308,30 +268,6 @@ bool Backend::has_program_initial() const {
     return false;
 }
 
-// Run every Observed process once (LRM 4.4.2.5), at the settled point where
-// the Active / Inactive / NBA set has drained. This is where a concurrent
-// assertion steps its automaton; the pass/fail code a verdict calls for is
-// not run here but pended onto the reactive ring (lower_reactive_pend), which
-// the drain just past this call site empties.
-//
-// An Observed body has no timing, so one resume runs it to completion (a
-// suspension is rejected in build_reactive_fns). Unlike Preponed its stores
-// are ordinary design writes, NOT silent_stores_: it may wake an Active
-// process, and emit_active_run re-settles the active set when it does.
-void Backend::emit_observed_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[sched_[g].front].activation != Activation::Observed) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
-}
-
 // Whether any process runs in the Re-NBA region. A design with no clocking
 // block pays nothing for the region existing, exactly like has_observed.
 bool Backend::has_renba() const {
@@ -341,28 +277,6 @@ bool Backend::has_renba() const {
         }
     }
     return false;
-}
-
-// Run every Re-NBA process once (LRM 4.4.2.8), at the point where the reactive
-// region set has settled -- so after every process that could have issued a
-// clocking block synchronous drive this time slot, which is what LRM 14.16
-// requires of one.
-//
-// Emitted like emit_observed_run, and its stores are ordinary design writes for
-// the same reason: a driven signal must wake its readers. The caller re-settles
-// the active set afterwards.
-void Backend::emit_renba_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[sched_[g].front].activation != Activation::ReNba) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
 }
 
 // Whether `id` is reachable as reactive code (build_reactive_fns).
@@ -812,10 +726,13 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     emit_active_run(drain->getArg(0), drain->getArg(1), procs);
     b_.CreateRetVoid();
 
-    // sim_finals(state, wheel): run every `final` block once.
+    // sim_finals(state, wheel): run every `final` block once, in source order, at the end
+    // of simulation (LRM 9.2.3). A final block is zero-time, so -- like the pre-init pass
+    // -- one resume runs its body to completion; destroy reclaims the frame. A function of
+    // its own so rt_sim_run can invoke it on both the natural-drain and $finish exit paths.
     auto* finals = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_finals", env_->llmod);
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", finals));
-    emit_finals_run(finals->getArg(0), finals->getArg(1), procs);
+    emit_run_once(Activation::Final, finals->getArg(1), procs);
     b_.CreateRetVoid();
 
     // The constant an executable's main reads beside clotho_main: rt_design
@@ -1531,7 +1448,6 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     ensure_active_queue();
     auto* ptr_ty        = llvm::PointerType::getUnqual(ctx_);
     auto* i32           = b_.getInt32Ty();
-    auto* proc_fnty     = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
     const bool uses_vcd = design_uses_vcd();
 
     // Init: empty the stack, then create every process (the ramp call builds
@@ -1577,193 +1493,33 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     if (!intra_nba_sigs_.empty()) {
         b_.CreateCall(intra_reset_fn(), {});
     }
-    const auto all = mod_.processes();
 
     // Pre-init pass first (LRM 6.8): apply variable declaration initializers
     // before any Initial / Always process is created or subscribed. A PreInit
     // body has no timing, so resuming it once runs it to completion; its stores
     // generate no events (see lower_process), so the always blocks created
-    // below subscribe to already-settled values. Run before the seed loop so no
+    // below subscribe to already-settled values. Run before the seed so no
     // wait queue is scanned before priming.
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[sched_[g].front].activation != Activation::PreInit) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
+    emit_run_once(Activation::PreInit, wheel, procs);
 
     // Time zero has no preceding wheel tick, so its Preponed sample happens
     // here rather than in the post-tick block. After PreInit, so a sample sees
-    // declaration initializers; before the seed loop, so it precedes every
+    // declaration initializers; before the seed, so it precedes every
     // body of the first step. This is also the default sampled value LRM
     // 16.5.1 wants for a value-change function called at or before the first
-    // clocking event.
-    emit_preponed_run(state, wheel, procs);
+    // clocking event. A Preponed body has no timing, so one resume runs it to
+    // completion, and its stores generate no events (silent_stores_), so nothing
+    // wakes on a shadow.
+    emit_run_once(Activation::Preponed, wheel, procs);
 
-    // One handle per schedule group; its activation facts come from the first
-    // process of its first row (identical across the rows by the group key).
-    std::vector<llvm::Value*> hdls(procs.size(), nullptr);
-    // Schedule groups with an always_comb / always_latch member, seeded after every other
-    // body (below). A fused group is ONE body, so a continuous assignment fused with such a
-    // procedure starts with it: 4.9.1 and 4.7 leave the order of its time-zero evaluation
-    // open, and keeping the fusion is what the procedure's cone is worth. `g` numbers
-    // SCHEDULE groups, whose rows are fusion groups, so the members are those of the
-    // group's rows, never `groups_[g]`. The rows of a schedule group share one handle and
-    // one seed decision, so one late row starts them all late.
-    std::vector<uint32_t> deferred_comb;
-    const auto            starts_late = [&](uint32_t g) {
-        return std::any_of(sched_[g].rows.begin(), sched_[g].rows.end(), [&](uint32_t row) {
-            return std::any_of(groups_[row].begin(), groups_[row].end(),
-                               [&](uint32_t m) { return all[m].starts_after_procedures; });
-        });
-    };
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        const uint32_t k = sched_[g].front;
-        const Process& p = all[k];
-        if (p.activation == Activation::PreInit) {
-            continue; // already run above
-        }
-        if (p.activation == Activation::Preponed) {
-            continue; // run once per timestep from the post-tick block
-        }
-        if (p.activation == Activation::Observed) {
-            continue; // run explicitly at each settled point (emit_observed_run)
-        }
-        if (p.activation == Activation::ReNba) {
-            continue; // run explicitly in the Re-NBA region (emit_renba_run)
-        }
-        if (p.activation == Activation::Final) {
-            continue; // deferred to emit_finals_run at end of simulation
-        }
-        // A thunk group is not ramped (no frame): its "handle" is the address of
-        // its wake pair with the low bit set, so the drain calls the entry stored
-        // there directly instead of resuming a coroutine. Pairs are aligned, so
-        // bit 0 is a free tag; coro handles (rt_alloc) leave it clear. The tagged
-        // pointer flows through subscription / self_start push unchanged.
-        llvm::Value* hdl = sched_[g].thunk
-          ? b_.CreateIntToPtr(
-              b_.CreateOr(b_.CreatePtrToInt(sched_flag_ptr(k), b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
-          : b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
-        hdls[g]          = hdl;
-        if (p.activation == Activation::Always && !p.wait_events.empty()) {
-            // Subscribed in the topo-ordered pass below.
-            //
-            // A continuously-active process (continuous assign / port copy /
-            // always_comb) also runs once now, so it settles from the pre-init
-            // values rather than waiting for an input edge that a declaration
-            // initializer never generates. It runs body-first then parks on its
-            // (subscribed-below) wait, so later input changes still wake it.
-            //
-            // Mark it scheduled as it is enqueued: a seed-time store from a
-            // process draining earlier in the same first drain (an initial
-            // block) services this static subscription and would re-push the
-            // already-queued handle without the flag, so N such processes
-            // overflow the nproc-sized active queue. The flag is cleared
-            // when the body reaches its wait-suspend (lower_process always-loop).
-            if (p.self_start) {
-                llvm::Constant* flag = sched_flag_ptr(k);
-                // The time-zero settle run must evaluate every member.
-                b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
-                // A reactive-home group -- a program's continuous assign (LRM
-                // 24.3.1) -- settles in slot 0's REACTIVE region rather than its
-                // Active one, so its stores land after the design has settled and
-                // design readers of what it drives are woken into the Active
-                // region of the next iteration of 4.4.2's loop. That is 24.3.2's
-                // own sentence. A ring entry is a bare handle either way: the
-                // home tag belongs to a PARKED handle, and the seed loop created
-                // this one so it knows the ring without reading a tag back.
-                // Its ring is the reactive CONTINUOUS one, which the reactive drain
-                // empties before the reactive ring a program `initial` is seeded on,
-                // so no program code starts ahead of the copy that feeds it.
-                if (starts_late(g)) {
-                    // always_comb / always_latch (LRM 9.2.2.2): enqueued behind every
-                    // other body, below, so it runs once they have all started.
-                    deferred_comb.push_back(g);
-                } else if (p.reactive_home) {
-                    emit_reactive_cont_push(b_, hdl);
-                } else {
-                    emit_active_push(b_, hdl);
-                }
-            }
-        } else if (p.activation == Activation::Reactive) {
-            // A program `initial` (LRM 24.3) starts in the Reactive region, so
-            // it is seeded onto the reactive ring instead of the active one.
-            // Its body keeps itself there across every suspend (emit_suspend).
-            //
-            // Mark it scheduled as it is enqueued, for the reason the self_start
-            // arm above gives -- it is QUEUED from here, so anything that pushes
-            // it again before it runs double-queues it -- which for this arm is
-            // not a static subscription (a sensitivity-less body has none) but a
-            // FORCE-WAKE. `$exit` (LRM 24.7) names every `initial` of its program
-            // instance by static control block, so a `fork ... join` child that
-            // exits during its parent's FIRST activation force-wakes a parent that
-            // is running on the stack rather than parked: its park record is null,
-            // so emit_node_force_wake falls to the flag, and with the flag clear it
-            // would push the handle of a coroutine that is about to reach its final
-            // suspend and be destroyed by the resumer -- the drain would then resume
-            // a freed frame. The flag is cleared by the body itself before each
-            // park (lower_wait, emit_delay), so "set while running, clear while
-            // parked" holds for this arm exactly as it does for an always loop.
-            b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_flag_ptr(k));
-            emit_reactive_push(b_, hdl);
-        } else if (starts_late(g)) {
-            // An always_comb / always_latch that reads nothing has no wait list, so
-            // the arm above never sees it; it still runs once, after the others.
-            deferred_comb.push_back(g);
-        } else {
-            emit_active_push(b_, hdl);
-        }
-    }
-
-    // The time-zero run of an always_comb / always_latch (LRM 9.2.2.2, 9.2.2.3): "after
-    // all initial and always procedures have been started so that the outputs of the
-    // procedure are consistent with the inputs". Both rings are FIFO, so enqueuing
-    // these after every other body makes each of them run after those have started.
-    // A continuous assignment is not a procedure and keeps its source position above.
-    for (const uint32_t g : deferred_comb) {
-        if (all[sched_[g].front].reactive_home) {
-            emit_reactive_cont_push(b_, hdls[g]);
-        } else {
-            emit_active_push(b_, hdls[g]);
-        }
-    }
-
-    // Static subscriptions, in topological order of the blocking-write wake
-    // graph (compute_subscription_order): bucket entry order is subscription
-    // order, the FIFO drain pops in bucket order, so a settle wave runs
-    // producers before consumers and each acyclic cascade settles in one
-    // wave. A separate pass so only wake order changes — creation and
-    // enqueue order above stay declaration order. All subscriptions still
-    // land before the drain, so no scan reads an empty slot.
-    // A schedule group subscribes once, at its earliest member's rank, with its
-    // canonical event set and its flag/handle.
-    std::vector<bool> subscribed(procs.size(), false);
-    for (const uint32_t k : sub_order_) {
-        const uint32_t g = sched_of_[group_of_[k]];
-        const uint32_t f = sched_[g].front;
-        if (subscribed[g] || all[f].activation != Activation::Always || all[f].wait_events.empty()) {
-            continue;
-        }
-        subscribed[g]        = true;
-        llvm::Constant* flag = sched_flag_ptr(f);
-        // A reactive-home group needs no separate subscription path: the
-        // predicate above selects it like any other Always group, and the ring
-        // is picked at WAKE time from the handle's home tag (emit_wake_push).
-        // What it does need is the tag ON the handle recorded here. A static
-        // subscription records a handle exactly once, from this loop, and the
-        // always-loop's park never re-records it (emit_wait_suspend only
-        // suspends) -- so unlike an intra-body wait, which parks through
-        // parked_handle at each `@`, this is the only place the home can be
-        // stated. Untagged, every wake of a program's continuous assign would
-        // push it onto the active ring, which is the bug this phase fixes. The tag is
-        // the CONTINUOUS one, so the wake lands on the reactive continuous ring.
-        llvm::Value* sub_hdl = tag_reactive_home(b_, hdls[g], all[f].reactive_home, /*continuous=*/true);
-        for (const WaitEvent& w : sched_[g].events) {
-            emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), sub_hdl, flag);
-        }
-    }
+    // The seed: one handle per schedule group (its activation facts come from the
+    // first process of its first row, identical across the rows by the group key),
+    // the groups that start now queued, and the sensitive ones subscribed, in the
+    // order the groups were created in -- the static subscriptions in topological
+    // order of the blocking-write wake graph (compute_subscription_order), so a settle
+    // wave runs producers before consumers and each acyclic cascade settles in one
+    // wave. All subscriptions land before the drain, so no scan reads an empty slot.
+    emit_seed(wheel, procs);
 
     auto* fn      = b_.GetInsertBlock()->getParent();
     auto* check   = llvm::BasicBlock::Create(ctx_, "active.check", fn);
@@ -1926,10 +1682,17 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     b_.SetInsertPoint(wcheck);
     // Observed region (LRM 4.4.2.5): run the processes that evaluate property
     // expressions, ahead of the flushes below that mature this instant's
-    // reports. Emitted like emit_preponed_run and for the same reason -- an
-    // Observed process is in no queue and no event wakes it.
+    // reports. Run like the Preponed ones and for the same reason -- an
+    // Observed process is in no queue and no event wakes it. This is where a
+    // concurrent assertion steps its automaton; the pass/fail code a verdict calls
+    // for is not run here but pended onto the reactive ring (lower_reactive_pend),
+    // which the drain just past this call site empties. An Observed body has no
+    // timing, so one resume runs it to completion (a suspension is rejected in
+    // build_reactive_fns). Unlike Preponed its stores are ordinary design writes,
+    // NOT silent_stores_: it may wake an Active process, and the active set is
+    // re-settled when it does.
     if (has_observed()) {
-        emit_observed_run(state, wheel, procs);
+        emit_run_once(Activation::Observed, wheel, procs);
         // An Observed body's stores are ordinary design writes, so it can wake
         // an Active process. The LRM's time-slot loop always re-enters the
         // highest-priority non-empty region, so settle the active set again
@@ -2136,8 +1899,10 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             // commit below is the separate business of the update region, and
             // LRM 14.16.2 leaves the order between a drive and a same-slot
             // nonblocking write to the same variable arbitrary.
+            // Run once (LRM 4.4.2.8), like the Observed ones; their stores are ordinary
+            // design writes for the same reason: a driven signal must wake its readers.
             if (has_renba()) {
-                emit_renba_run(state, wheel, procs);
+                emit_run_once(Activation::ReNba, wheel, procs);
             }
             if (has_nba) {
                 b_.CreateCondBr(emit_nba_any_staged(), rncommit, rdone);
@@ -2286,7 +2051,10 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), post_tick, wdone);
         b_.SetInsertPoint(post_tick);
         if (preponed) {
-            emit_preponed_run(state, wheel, procs);
+            // Preponed (LRM 4.4.2.1): run once at the top of a new time step -- after the
+            // wheel has fired its timers, which only enqueues handles, and before any body
+            // of that step executes -- and once from the seed so time zero is sampled too.
+            emit_run_once(Activation::Preponed, wheel, procs);
         }
         for (const Signal sig : inertial_sigs_) {
             emit_intra_commit(sig);
