@@ -4099,3 +4099,148 @@ TEST_CASE("gc: a handle staged by a nonblocking assignment through a virtual int
     const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
     CHECK(ss.emergency_collections > 0u);
 }
+
+// A handle in a struct member and a whole queue of handles, both written through a virtual
+// interface to twin instances: the aggregate record (with its pad and instance pointer) and
+// the container record are both queues the collector reads.
+TEST_CASE("gc: handles staged through a virtual interface in a struct member and a queue survive") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; string tag; endclass
+          class Junk; int v; string tag; endclass
+          typedef struct { int a; C h; } S_t;
+          interface bus_if; S_t s; C q[$]; endinterface
+          virtual bus_if vifs[4];
+          for (genvar g = 0; g < 4; g++) begin : gen
+            bus_if bi();
+            initial vifs[g] = bi;
+          end
+          Junk sink;
+          function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
+          task automatic churn();
+            for (int i = 0; i < 3000; i++) begin
+              sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
+            end
+          endtask
+          task automatic stage();
+            C src[$];
+            foreach (vifs[i]) begin
+              vifs[i].s.h <= make(i);
+              src.delete();
+              src.push_back(make(20 + i));
+              vifs[i].q <= src;
+            end
+          endtask
+          initial begin
+            int bad;
+            bad = 0;
+            #1;
+            stage();
+            churn();
+            #1;
+            churn();
+            foreach (vifs[i]) begin
+              if (vifs[i].s.h == null || vifs[i].s.h.v != i || vifs[i].s.h.tag != $sformatf("kept%0d", i)) bad++;
+              if (vifs[i].q.size() != 1 || vifs[i].q[0].v != 20 + i || vifs[i].q[0].tag != $sformatf("kept%0d", 20 + i)) bad++;
+            end
+            $display("vif agg %0d", bad);
+          end
+        endmodule
+    )";
+    const std::string expected = "vif agg 0\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}
+
+// A class handle driven through a clocking block (LRM 14.16) is held by the block's pending
+// drive state from the drive to the clocking event, and an input sample holds one after the
+// source variable has been cleared. Both live in compiler-made design signals, which are
+// precise roots; this pins that, for a module block and for one reached through a handle.
+TEST_CASE("gc: handles held by a clocking block's drive and sample state survive") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; string tag; endclass
+          class Junk; int v; string tag; endclass
+          interface cb_if(input bit clk);
+            C h; C hin;
+            clocking cb @(posedge clk); output h; input hin; endclocking
+          endinterface
+          bit clk;
+          cb_if ifc(clk);
+          virtual cb_if vif;
+          C mh, min;
+          clocking mcb @(posedge clk); output mh; input min; endclocking
+          Junk sink;
+          function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
+          task automatic churn();
+            for (int i = 0; i < 3000; i++) begin
+              sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
+            end
+          endtask
+          initial begin
+            int bad;
+            bad = 0;
+            vif = ifc;
+            ifc.hin = make(5);
+            min = make(6);
+            #1;
+            vif.cb.h <= make(1);
+            mcb.mh <= make(2);
+            churn();
+            #1;
+            clk = 1;
+            #0;
+            ifc.hin = null;
+            min = null;
+            churn();
+            #1;
+            churn();
+            if (ifc.h == null || ifc.h.v != 1 || ifc.h.tag != "kept1") bad++;
+            if (mh == null || mh.v != 2 || mh.tag != "kept2") bad++;
+            if (vif.cb.hin == null || vif.cb.hin.v != 5 || vif.cb.hin.tag != "kept5") bad++;
+            if (mcb.min == null || mcb.min.v != 6 || mcb.min.tag != "kept6") bad++;
+            $display("clocking %0d", bad);
+          end
+        endmodule
+    )";
+    const std::string expected = "clocking 0\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}
+
+// $strobe and $monitor evaluate their arguments in the Postponed region, here across
+// emergency collections: each argument calls a function that allocates a handle and then
+// churns, so the handle is held only by the evaluation in flight (a register or a stack
+// slot) while the collector runs. The pended body's frame is a registered frame.
+TEST_CASE("gc: $strobe and $monitor arguments evaluated across emergency collections") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; string tag; endclass
+          class Junk; int v; endclass
+          int cnt;
+          function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
+          function automatic int churnf();
+            Junk j;
+            for (int i = 0; i < 3000; i++) begin j = new; j.v = 32'h5A5A5A5A; end
+            return 1;
+          endfunction
+          function automatic int sum2(C a, int b); return a.v + b; endfunction
+          function automatic string tag2(C a, int b); return a.tag; endfunction
+          initial begin
+            $strobe("strobe %0d %s", sum2(make(41), churnf()), tag2(make(7), churnf()));
+            $monitor("monitor %0d %s", sum2(make(cnt), churnf()), tag2(make(cnt + 100), churnf()));
+            repeat (2) begin #1; cnt++; end
+          end
+        endmodule
+    )";
+    const std::string expected =
+      "strobe 42 kept7\nmonitor 1 kept100\nmonitor 2 kept101\nmonitor 3 kept102\n";
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}

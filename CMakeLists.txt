@@ -832,6 +832,15 @@ target_compile_definitions(clotho_runtime_exe PRIVATE
   CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
   CLOTHO_LICENSES_INC="${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc")
 target_link_libraries(clotho_runtime_exe PRIVATE clotho_warnings)
+# Never -O0. The executable links no C++ library, so it depends on libc++'s header-only
+# parts being inlined; at -O0 the compiler instead emits calls to the extern-template
+# members of std::string and to the aligned operator new, which only a libc++ library
+# defines, and a Debug `clotho build` failed to link every executable. Optimized, as the
+# JIT's runtime already is in Debug (above), with every check still live.
+target_compile_options(clotho_runtime_exe PRIVATE
+  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
+  $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
+)
 
 # What `clotho build` links an executable with (docs/design/executables.md): lld,
 # run in-process, and the files every executable needs, embedded in clotho so
@@ -1231,6 +1240,24 @@ if(NOT WIN32)
   set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
 endif()
 
+# A class handle held by an SV frame across a DPI import that calls an exported subroutine
+# which allocates: collections run from inside the allocation, under the JIT (an export
+# needs a relocatable object linked into it), in the three collection cadences. Class
+# handles cannot cross DPI, so the frames on either side of the C frame are what is tested.
+if(NOT WIN32)
+  add_library(clotho_gc_dpi_object OBJECT tests/gc_dpi/gc_dpi.c)
+  set_target_properties(clotho_gc_dpi_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  add_dependencies(clotho_test clotho_gc_dpi_object)
+  foreach(cadence IN ITEMS "default;-G;N=1000000" "nursery;--gc-nursery=32768;-G;N=20000"
+                           "stress;--gc-stress;-G;N=300")
+    list(POP_FRONT cadence name)
+    add_test(NAME gc_dpi_${name}
+             COMMAND clotho_cli run --dpi-lib $<TARGET_OBJECTS:clotho_gc_dpi_object> ${cadence}
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gc_dpi/gc_dpi.sv")
+    set_tests_properties(gc_dpi_${name} PROPERTIES PASS_REGULAR_EXPRESSION "gc dpi: 7 8 9 10")
+  endforeach()
+endif()
+
 # A --dpi-lib definition wins over a same-named libc symbol, under the JIT and
 # in a linked executable alike. getpid is the probe: libc defines it, LLVM never
 # synthesizes it, and the real value cannot be 31337.
@@ -1250,7 +1277,8 @@ endif()
 # carries no sanitizer runtime (docs/design/executables.md), so instrumented code
 # there could neither link nor load. The compiler that builds it is sanitized.
 if(CLOTHO_SANITIZE)
-  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared clotho_dpi_shadow)
+  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared clotho_dpi_shadow
+                 clotho_gc_dpi_object)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -fno-sanitize=all)
       target_link_options(${target} PRIVATE -fno-sanitize=all)
