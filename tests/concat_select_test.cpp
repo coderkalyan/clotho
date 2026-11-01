@@ -7,9 +7,12 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <regex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Lower.h"
 #include "PosixIo.h"
@@ -450,4 +453,155 @@ TEST_CASE("replication code shapes") {
     for (const char* shift : { "shl i800 ", ", 100", ", 200", ", 400" }) {
         CHECK(dbl.find(shift) != std::string::npos);
     }
+}
+
+namespace {
+
+// A generated concatenation: the operands' bits, most significant first, and whether each is 4-state.
+struct CatPart {
+    std::string bits;
+    bool        four = false;
+};
+
+// Unoptimized LLVM IR: the shapes below are what the backend writes, which the optimizer is free to
+// rewrite.
+std::string emit_raw(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false }));
+    return text;
+}
+
+// How many shifts in `ir` are of more than `bits` bits.
+size_t shifts_wider_than(const std::string& ir, unsigned bits) {
+    static const std::regex shl(R"(\bshl (?:nuw )?(?:nsw )?i(\d+) )");
+    size_t                  n = 0;
+    for (auto it = std::sregex_iterator(ir.begin(), ir.end(), shl); it != std::sregex_iterator(); ++it) {
+        n += std::stoul((*it)[1]) > bits ? 1 : 0;
+    }
+    return n;
+}
+
+// `name[0], name[1], ..., name[n-1]`: the n bits of a vector, as the operands of a concatenation that
+// reverses it.
+std::string selects(std::string_view name, size_t n) {
+    std::string ops;
+    for (size_t k = 0; k < n; ++k) {
+        ops += (k != 0 ? ", " : "") + std::string(name) + "[" + std::to_string(k) + "]";
+    }
+    return ops;
+}
+
+std::string reversed_by_concat(std::string_view decl, size_t n) {
+    const std::string range = " [" + std::to_string(n - 1) + ":0] ";
+    return "module m(input " + std::string(decl) + range + "v, output " + std::string(decl) + range +
+           "y);\n  assign y = {" + selects("v", n) + "};\nendmodule\n";
+}
+
+} // namespace
+
+// LRM 11.4.12 against a bit-string model: the operands' bits in order. The shapes put operand widths
+// and counts at and around every edge of the backend's runs (up to 64 bits chained in one word, then
+// joined as a tree): one operand, a pair, a word exactly, a word and one bit, a single operand wider
+// than a word, many one-bit operands, odd counts, and 2- and 4-state operands mixed, x and z included.
+TEST_CASE("concatenation matches the bit-string model at every shape") {
+    uint64_t   state = 20260531;
+    const auto next  = [&] {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return state >> 33;
+    };
+    const auto ones = [](size_t n, size_t w) { return std::vector<size_t>(n, w); };
+    const auto cat  = [](std::vector<size_t> a, const std::vector<size_t>& b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return a;
+    };
+    // clang-format off
+    const std::vector<std::vector<size_t>> shapes = {
+        { 1, 1 }, { 1, 1, 1 }, { 3, 5, 8 }, { 4, 1, 7, 2 }, { 32, 32 }, { 31, 33 },
+        { 63, 1 }, { 1, 63 }, { 64, 1 }, { 1, 64 }, { 64, 64 }, { 65, 1 }, { 1, 65 }, { 2, 63, 1 },
+        { 40, 40 }, { 40, 24, 1 }, { 100, 100 }, { 129, 3, 1, 200 }, { 5, 70, 5, 70, 5 }, { 7, 9, 11, 13, 17, 19, 23 },
+        ones(5, 64), ones(7, 1), ones(63, 1), ones(64, 1), ones(65, 1), ones(127, 1), ones(130, 1), ones(9, 8),
+        ones(200, 1), ones(33, 3), cat(ones(70, 1), { 130 }), cat({ 130 }, ones(70, 1)), cat(ones(31, 2), { 66, 1 }),
+    };
+    // clang-format on
+    for (const bool four_result : { false, true }) {
+        std::string src  = "module t;\n";
+        std::string body = "  initial begin\n";
+        std::string want;
+        size_t      id = 0;
+        for (const auto& widths : shapes) {
+            std::vector<CatPart> parts;
+            bool                 any_four = false;
+            for (const size_t w : widths) {
+                CatPart p;
+                p.four   = four_result && next() % 3 != 0;
+                any_four = any_four || p.four;
+                for (size_t k = 0; k < w; ++k) {
+                    p.bits += p.four ? "01xz0101"[next() % 8] : "01"[next() % 2];
+                }
+                parts.push_back(std::move(p));
+            }
+            if (four_result && !any_four) {
+                // The result is 4-state only if an operand is: make the first one so.
+                parts[0].four    = true;
+                parts[0].bits[0] = 'x';
+            }
+            std::string ops;
+            std::string bits;
+            size_t      total = 0;
+            for (size_t k = 0; k < parts.size(); ++k) {
+                const std::string name = "p" + std::to_string(id) + "_" + std::to_string(k);
+                src += "  " + std::string(parts[k].four ? "logic" : "bit") + " [" + std::to_string(widths[k] - 1) +
+                       ":0] " + name + ";\n";
+                body += "    " + name + " = " + std::to_string(widths[k]) + "'b" + parts[k].bits + ";\n";
+                ops += (k != 0 ? ", " : "") + name;
+                bits += parts[k].bits;
+                total += widths[k];
+            }
+            const std::string res = "r" + std::to_string(id);
+            src += "  " + std::string(four_result ? "logic" : "bit") + " [" + std::to_string(total - 1) + ":0] " + res +
+                   ";\n";
+            body += "    " + res + " = {" + ops + "}; $display(\"%b\", " + res + ");\n";
+            want += bits + "\n";
+            ++id;
+        }
+        CAPTURE(four_result);
+        CHECK(run_capture(src + body + "  end\nendmodule\n") == want);
+    }
+}
+
+// Sixteen concatenations of 512 one-bit 4-state operands took 224 G instructions to compile as a
+// shift-and-OR chain of the full width, whose time grew with the square of the width. As runs of a
+// word joined as a tree, 4096 of them is a moment.
+TEST_CASE("a 4096-operand concatenation compiles and is right") {
+    std::string bits;
+    std::string bits4;
+    for (size_t k = 0; k < 4096; ++k) {
+        bits += (k * 7 + k / 3) % 5 < 2 ? '1' : '0';
+        bits4 += "01xz0110"[(k * 5 + k / 7) % 8];
+    }
+    const std::string out =
+      run_capture("module t;\n  bit [4095:0] v, r;\n  logic [4095:0] u, s;\n  initial begin\n    v = 4096'b" + bits +
+                  "; u = 4096'b" + bits4 + ";\n    r = {" + selects("v", 4096) + "};\n    s = {" + selects("u", 4096) +
+                  "};\n    $display(\"%b\", r); $display(\"%b\", s);\n  end\nendmodule\n");
+    CHECK(out == std::string(bits.rbegin(), bits.rend()) + "\n" + std::string(bits4.rbegin(), bits4.rend()) + "\n");
+}
+
+// The chain of a run is one word wide; only the joins are wider, and there is one fewer of them than
+// there are words of result, however many operands. A chain of the whole result's width has a shift
+// of that width for every operand.
+TEST_CASE("concatenation code shapes: shifts wider than a word are the joins of its runs") {
+    for (const size_t n : { 128, 256, 512 }) {
+        CAPTURE(n);
+        const std::string ir = emit_raw(reversed_by_concat("bit", n));
+        CHECK(shifts_wider_than(ir, 64) == n / 64 - 1);
+        // 4-state: each of the must, may and z planes is joined the same, and the planes are then packed.
+        const std::string ir4 = emit_raw(reversed_by_concat("logic", n));
+        CHECK(shifts_wider_than(ir4, 64) <= 3 * (n / 64 - 1) + 1);
+    }
+    // At a word or less there is nothing to join: no shift is wider than its result.
+    CHECK(shifts_wider_than(emit_raw(reversed_by_concat("bit", 64)), 64) == 0);
+    CHECK(shifts_wider_than(emit_raw(reversed_by_concat("bit", 64)), 63) > 0);
 }
