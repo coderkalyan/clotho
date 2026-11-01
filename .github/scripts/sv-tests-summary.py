@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify an sv-tests report for clotho and fail on any crash.
+"""Classify an sv-tests report for clotho and fail on anything unexplained.
 
 Usage: sv-tests-summary.py REPORT_CSV LOGS_DIR
 
@@ -16,8 +16,10 @@ ExitCode columns (tools/BaseRunner.py in sv-tests) and each test's log:
               invalid design accepted
   rejected    clotho refused the design with a diagnostic
 
-self-check and ran are where silent miscompiles show up. Exits 1 if any test
-crashed (docs/VERIFICATION.md: never crash); the other classes only report.
+self-check and ran are where silent miscompiles show up. Exits 1 on any crash
+or timeout, on any self-check or ran outcome not explained by the known list,
+and on an out-of-date known entry, so a nightly that exits 0 has no unexplained
+failure (docs/VERIFICATION.md).
 
 sv-tests-known.txt, next to this script, lists tests whose self-check or ran
 outcome is understood and is not a Clotho defect to fix now. A listed test
@@ -137,7 +139,8 @@ def main():
         print(f"Fix or remove these entries in `{KNOWN_LIST.name}`:\n")
         for name, why in sorted(stale):
             print(f"- `{name}`: {why}")
-    return 1 if counts["crash"] else 0
+    unexplained = counts["crash"] + counts["timeout"] + counts["self-check"] + counts["ran"]
+    return 1 if unexplained or stale else 0
 
 
 if __name__ == "__main__":

@@ -37,7 +37,8 @@ with the clotho runner from the `coderkalyan/sv-tests` fork, pinned by
 pass, self-check (sv-tests counts a pass but the design printed `FAILED`, as
 ivtest designs do when their own checks fail), crash, timeout, ran (exit 0 but
 failed: a wrong result or an accepted invalid design) or rejected, and fails
-the job on any crash. The report and
+the job on any crash, timeout, self-check or ran outcome the known list below
+does not explain, or on an out-of-date known entry. The report and
 logs are uploaded as the `sv-tests-report` artifact.
 
 `.github/scripts/sv-tests-known.txt` lists the self-check and ran tests that are
