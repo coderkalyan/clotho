@@ -655,6 +655,65 @@ void Lowerer::join_disable_targets() {
     }
 }
 
+// Whether a call to this TASK can park its caller although the body that would run shows
+// nothing that does, so that reading the body would answer "no" for a call that parks: a
+// built-in class task (mailbox put / get / peek, semaphore get, process await), whose body is
+// the runtime's; a DPI import, which can call an exported task that consumes time; and a
+// virtual task (a pure one has no body at all), because the override that runs is not the body
+// that was read -- taken to park when any virtual task of the design does
+// (design_virtual_parks). An allowlist of the shapes known to park would let every other one
+// through to a `disable` that then wakes the caller a second time, so the unknown is taken to park.
+//
+// `direct` is a call written in the target block itself. A built-in's park is then the block's
+// own (`mb.get(v)` is a wait the disable wakes), which is supported; inside another task it is
+// behind that task's activation, which is not.
+bool Lowerer::task_parks_unseen(const SubroutineSymbol& callee, bool direct) {
+    using slang::ast::MethodFlags;
+    if (callee.subroutineKind != slang::ast::SubroutineKind::Task) {
+        return false;
+    }
+    if (callee.flags.has(MethodFlags::BuiltIn)) {
+        return !direct;
+    }
+    if (callee.flags.has(MethodFlags::DPIImport)) {
+        return true;
+    }
+
+    return callee.isVirtual() && design_virtual_parks(callee.getParentScope()->getCompilation());
+}
+
+// Whether some user virtual task of the design can park, directly or through the subroutines it
+// calls: the question a virtual call's static callee cannot answer, as design_virtual_forks
+// does for a fork. Walked once, from the compilation root, skipping procedural blocks, which hold
+// no class. A virtual call met while the answer is computed assumes none park, so when that
+// proves wrong the park answers recorded meanwhile are dropped rather than left to say "no".
+bool Lowerer::design_virtual_parks(slang::ast::Compilation& comp) {
+    if (design_virtual_parks_) {
+        return *design_virtual_parks_;
+    }
+    design_virtual_parks_ = false;
+    struct Virtuals : ASTVisitor<Virtuals, VisitFlags::AllGood> {
+        Lowerer* self  = nullptr;
+        bool     found = false;
+        void     handle(const ProceduralBlockSymbol&) {}
+        void     handle(const SubroutineSymbol& s) {
+            if (!found && s.subroutineKind == slang::ast::SubroutineKind::Task && s.isVirtual() &&
+                !s.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+                found = self->subroutine_parks(s);
+            }
+        }
+    };
+    Virtuals v;
+    v.self = this;
+    comp.getRoot().visit(v);
+    if (v.found) {
+        sub_parks_.clear();
+    }
+    design_virtual_parks_ = v.found;
+
+    return v.found;
+}
+
 // Whether a block's body can park in a way an abort cannot yet neutralize, which
 // is what decides whether the REMOTE form may name it. A `#delay` and an
 // `@event` wait are fine: a `disable` claims the delay's park record, so the
@@ -694,7 +753,8 @@ bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupant
                 // runs to completion inside the call, so the process is never
                 // suspended behind it and there is nothing to double-wake — which
                 // is most helper tasks, and refusing them was over-broad.
-                found = found || (sub != nullptr && self->subroutine_parks(*sub));
+                found = found || (sub != nullptr &&
+                                  (self->task_parks_unseen(*sub, /*direct=*/true) || self->subroutine_parks(*sub)));
             }
             visitDefault(c);
         }
@@ -707,11 +767,12 @@ bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupant
     return p.found;
 }
 
-// Whether calling this subroutine can suspend the caller: a timing control, a
-// wait, a fork or an `expect` anywhere in its body, transitively through the
-// calls it makes. Memoized, and a recursive cycle answers "no" on the way back
-// in — the cycle itself parks only if some member does, which that member
-// reports.
+// Whether calling this subroutine can suspend the caller: a timing control, a wait, a fork or
+// an `expect` anywhere in its body, the timing control on a blocking assignment (`x = #d y`,
+// `x = @(e) y`), a `wait_order`, a call to a task whose body cannot be read (task_parks_unseen),
+// and all of these transitively through the calls it makes. Memoized, and a recursive cycle
+// answers "no" on the way back in — the cycle itself parks only if some member does, which
+// that member reports.
 bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
     if (const auto it = sub_parks_.find(&sub); it != sub_parks_.end()) {
         return it->second;
@@ -735,6 +796,16 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
             found = true;
             visitDefault(s);
         }
+        // The process suspends on a blocking assignment's own timing control; a nonblocking
+        // one schedules the update and goes on.
+        void handle(const slang::ast::AssignmentExpression& a) {
+            found = found || (a.timingControl != nullptr && !a.isNonBlocking());
+            visitDefault(a);
+        }
+        void handle(const slang::ast::WaitOrderStatement& s) {
+            found = true;
+            visitDefault(s);
+        }
         void handle(const BlockStatement& s) {
             found = found || s.blockKind != StatementBlockKind::Sequential;
             visitDefault(s);
@@ -746,7 +817,8 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
         void handle(const CallExpression& c) {
             if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
                 const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
-                found = found || (callee != nullptr && self->subroutine_parks(*callee));
+                found = found || (callee != nullptr && (self->task_parks_unseen(*callee, /*direct=*/false) ||
+                                                        self->subroutine_parks(*callee)));
             }
             visitDefault(c);
         }

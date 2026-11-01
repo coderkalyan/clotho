@@ -1015,6 +1015,61 @@ TEST_CASE("a target that calls a zero-time task is still a legal remote target")
     )") == "helper 1 at 0\nafter blk at 5\n");
 }
 
+// A remote `disable` refuses a block whose body calls a task that can park, because the park is
+// behind that task's activation and the abort cannot claim it. The predicate knew a timing
+// statement and a task call, and let every other way a task parks through: the block then ended
+// when the task did, long after the disable (`after B 5` for a disable at 1). Each of these is
+// refused now: a blocking assignment's own timing control, a `wait_order`, a built-in blocking
+// method (mailbox get, semaphore get) and a virtual task that delays. The same parks written
+// in the block itself work and end it at once (oracle: iverilog 13 for the assignment forms).
+TEST_CASE("a remote disable refuses a block whose called task parks in any form") {
+    const auto refused = [](std::string_view decls) {
+        const LowerResult r = lower_text(std::string("module t;\n  event e, f;\n") + std::string(decls) +
+                                         R"(
+          initial begin : P
+            begin : B
+              T();
+              $display("B end");
+            end
+          end
+          initial #1 disable t.P.B;
+        endmodule)");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("can park on a #0, a time-consuming task call") != std::string::npos);
+    };
+    refused("logic y; task T; y = #5 1'b1; endtask");
+    refused("logic y; task T; y = @(e) 1'b1; endtask");
+    refused("logic y; task T; y = repeat (2) @(e) 1'b1; endtask");
+    refused("task T; wait_order (e, f) $display(\"ok\"); else $display(\"bad\"); endtask");
+    refused("mailbox #(int) mb = new(); task T; int v; mb.get(v); endtask");
+    refused("semaphore sm = new(0); task T; sm.get(); endtask");
+    refused("class A; virtual task v(); endtask endclass class D extends A; virtual task v(); #5; endtask endclass\n"
+            "  D dd = new; A h = dd; task T; h.v(); endtask");
+
+    // The same parks in the block itself, not behind a task, are woken by the disable.
+    CHECK(run_capture(R"(
+        module t;
+          mailbox #(int) mb = new();
+          logic y = 0;
+          initial begin : P
+            begin : B
+              int v;
+              mb.get(v);
+              $display("never");
+            end
+            $display("after B %0t", $time);
+            begin : C
+              y = #5 1;
+              $display("never");
+            end
+            $display("after C %0t y=%b", $time, y);
+          end
+          initial #1 disable t.P.B;
+          initial #3 disable t.P.C;
+        endmodule
+    )") == "after B 1\nafter C 3 y=0\n");
+}
+
 // A block in a body that can have SEVERAL activations at once. A bare branch would
 // end only the one running it; LRM 9.6.2 ends them all, so the block keeps a list
 // of the activations currently inside it, exactly as a task target does. Two
@@ -2043,11 +2098,12 @@ TEST_CASE("disable of a block that may fork through a virtual call or a randsequ
     CHECK_FALSE(rs.ok);
     CHECK(rs.diagnostic_text().find("calls a subroutine that forks") != std::string::npos);
 
-    // A virtual call is not refused when no virtual method of the design forks.
+    // A virtual call is not refused when no virtual method of the design forks or parks. (The
+    // override once delayed, which is a time-consuming task call and is refused as such.)
     const LowerResult quiet = lower_text(R"(
         class Base; virtual task start(); endtask endclass
         class Quiet extends Base;
-          virtual task start(); #1; endtask
+          virtual task start(); $display("quiet"); endtask
         endclass
         module t;
           Base h;

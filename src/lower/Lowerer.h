@@ -2465,6 +2465,10 @@ private:
 
     bool design_virtual_forks(slang::ast::Compilation& comp);
 
+    bool design_virtual_parks(slang::ast::Compilation& comp);
+
+    bool task_parks_unseen(const SubroutineSymbol& callee, bool direct);
+
     void record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
                             const Symbol*                                  owner,
                             const Symbol*                                  label);
@@ -5626,6 +5630,9 @@ private:
     // Whether any user virtual method of the design forks (design_virtual_forks);
     // computed on first use.
     std::optional<bool> design_virtual_forks_;
+    // Whether any user virtual task of the design can park (design_virtual_parks); computed on
+    // first use.
+    std::optional<bool> design_virtual_parks_;
     // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
     // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
     // hard_park. The remote form refuses one, the lexical form does not care -- it
