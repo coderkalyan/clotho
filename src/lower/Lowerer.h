@@ -2459,7 +2459,15 @@ private:
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
+    bool subroutine_waits_on_event(const SubroutineSymbol& sub);
+
+    void flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l);
+
     bool design_virtual_forks(slang::ast::Compilation& comp);
+
+    bool design_virtual_parks(slang::ast::Compilation& comp);
+
+    bool task_parks_unseen(const SubroutineSymbol& callee, bool direct);
 
     void record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
                             const Symbol*                                  owner,
@@ -4929,25 +4937,29 @@ private:
     // full further down, next to the statement lowering that pushes it).
     struct OpenBlock;
 
-    // The four pieces of state every subroutine / action / fork-child body swaps:
-    // its own frame context, a fresh named-block stack (a `disable` inside the body
-    // may only name blocks the body itself opened), no procedure root — a body is
-    // built at its first call site, whose enclosing procedure is not its own, so
-    // the 16.4.4 outermost-scope question has no answer here — and a loop nesting
-    // depth of zero, since a `break` in this body cannot bind to a loop outside it.
+    // The state every subroutine / action / fork-child body swaps: its own frame
+    // context, a fresh named-block stack (a `disable` inside the body may only name
+    // blocks the body itself opened), no procedure root — a body is built at its
+    // first call site, whose enclosing procedure is not its own, so the 16.4.4
+    // outermost-scope question has no answer here — a loop nesting depth of zero,
+    // since a `break` in this body cannot bind to a loop outside it, and no deferred
+    // assertions of its own to flush: a body that waits is a flush point of the
+    // PROCESS that called it, which the body cannot name (see lower_task_call).
     class FnScope {
     public:
         FnScope(Lowerer& l, FnCtx* ctx)
           : ctx_(l.fn_ctx_, ctx)
           , blocks_(l.named_blocks_, {})
           , root_(l.proc_root_block_, nullptr)
-          , depth_(l.loop_depth_, 0) {}
+          , depth_(l.loop_depth_, 0)
+          , defers_(l.proc_defers_, false) {}
 
     private:
         Restore<FnCtx*>                 ctx_;
         Restore<std::vector<OpenBlock>> blocks_;
         Restore<const Symbol*>          root_;
         Restore<uint32_t>               depth_;
+        Restore<bool>                   defers_;
     };
 
     // The PreInit segment of the instance that declares a static, while the
@@ -5619,6 +5631,9 @@ private:
     // Whether any user virtual method of the design forks (design_virtual_forks);
     // computed on first use.
     std::optional<bool> design_virtual_forks_;
+    // Whether any user virtual task of the design can park (design_virtual_parks); computed on
+    // first use.
+    std::optional<bool> design_virtual_parks_;
     // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
     // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
     // hard_park. The remote form refuses one, the lexical form does not care -- it
@@ -5629,6 +5644,14 @@ private:
     // The named block that is the current procedure's outermost scope, or null;
     // see outermost_named_block. Set per procedural block, read by lower_disable.
     const Symbol* proc_root_block_ = nullptr;
+    // Whether the procedure being lowered holds a deferred immediate assertion. Then
+    // every event control and wait statement in its own body is a flush point for the
+    // reports it queued (LRM 16.4.2), and lower_event_wait / lower_wait_stmt say so.
+    // Set per procedural block; false inside a subroutine body (FnScope).
+    bool proc_defers_ = false;
+    // Memoized "calling this can wait on an event control or a wait statement", see
+    // subroutine_waits_on_event.
+    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_event_waits_;
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;

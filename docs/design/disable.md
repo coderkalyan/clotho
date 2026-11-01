@@ -66,7 +66,8 @@ What V2a actually cost, and what it did NOT need: no epoch counter, no handle
 array, no zombie stage, no `Wheel.h` change, no runtime change. Three flat
 per-target tables (occupant handle, its scheduled-flag slot, its published park
 slot) plus a pending mark; a claim field on the `#delay` park record, which becomes
-a fresh heap allocation per arm only in a design that has a remote `disable`; and a
+a fresh heap allocation per arm only where `park_claim_wanted()` holds (a remote
+`disable`, or process control, which shares the claim); and a
 poll after each suspend inside a targeted region. The epoch the original design
 proposed was for "all activations of a task", which V2a does not implement — for a
 single-activation process-body target a live-occupant slot is both cheaper and
@@ -327,8 +328,11 @@ process body does not end — it carries on after the block.
 
 What landed instead is a claim, on the park rather than on the process:
 
-- **Parked on a `#delay`.** The park record carries a `state` claim, and — only in
-  a design that has a remote `disable` — is a fresh heap allocation per arm, so a
+- **Parked on a `#delay`.** The park record carries a `state` claim, and — only where
+  `park_claim_wanted()` holds, which is a design with a remote `disable` or with
+  process control (a `process` class operation, `disable fork`, `wait fork`, or a
+  program `initial` in a design that forks), because `kill` and `disable fork` wake
+  through the same code — is a fresh heap allocation per arm, so a
   stale record and a live one cannot be the same memory. (One reused per-frame
   record defeats every filter: the next arm overwrites the field the stale timer is
   about to read.) The disabler reads the occupant's published park slot, claims the
@@ -337,6 +341,18 @@ What landed instead is a claim, on the park rather than on the process:
 - **Parked on an event, or already queued.** There is no live record, and the
   scheduled flag is the design's existing one-wake-per-process token: push only if
   it is clear, exactly as `emit_static_scan_rt` does.
+- **Parked on a `#delay` whose timer has already fired.** The trampoline claims the
+  record, pushes the handle and nulls the frame slot, so from that expiry until the
+  activation runs a disabler finds no record and falls through to the flag. An event
+  wake sets the flag when it pushes and a `#0` park sets it when it parks, but a
+  `#delay` park set nothing, so a body that had never waited on an event (an `initial`
+  with only delays, a task) still had it clear: the disabler pushed a second copy and
+  the activation resumed twice, which crashed when the first run reached the end of
+  the body and doubled a loop when it did not. `emit_delay_timer` now sets the flag
+  as it arms the record, under the same `park_claim_wanted()` gate as the record (a
+  design with neither a remote `disable` nor process control emits no store, and its
+  LLVM is unchanged), so "no record" always means "already queued". `kill` and
+  `disable fork` wake through the same code and are covered by the same store.
 
 The scheduled flag cannot serve as the token in the first case, and finding out why
 cost a real bug: mid-body that flag is deliberately SET, so the process's own
@@ -527,11 +543,12 @@ deferred assertion LABEL (16.4.4's first bullet). Two deferred assertions in one
 process share one counter, so a bump cancels both, and `DeferReport`
 (`src/runtime/Scheduler.cpp`) carries `{line, gen, gen_val, is_final}` —
 no statement identity whatsoever, with `line` already rendered at queue time.
-A statement label on an `assert #0` is also never pushed onto `named_blocks_`
-(only `StatementKind::Block` with a `blockSymbol` is, `:6570`), so such a
-`disable` does not even reach a 16.4.4-aware path today: it hits the generic
-non-enclosing-target message. This needs both a target-recognition path and a
-per-report tag, and is out of scope for V2.
+A labelled assertion is an implicit block (9.3.5) and a `disable` of it lowered as a
+remote disable of a block nobody is ever in, which compiled to nothing and left the
+reports to mature. `lower_disable` now refuses it by name (the label's block is told
+from a `begin : name` block by its syntax: slang builds the first from the statement
+itself). Cancelling one assertion's reports needs a per-report tag (`SeverityInfo`,
+`rt_defer_report`, the unit remap of target ids), which is out of scope for V2.
 
 `ReactiveSafetyChecker` keeps rejecting `disable` inside assertion action blocks,
 but not for a region reason: a `disable` suspends nothing, so no wake is
@@ -544,6 +561,34 @@ leave. Note the backend's independent backstop `reject_unsupported_reactive`
 (`src/ir/llvm/Analyses.cpp`) has NO `disable` arm — the tag never reaches
 reactive code because the frontend refuses first, so if V2 lifts the frontend
 refusal the backstop silently accepts.
+
+### 16.4.2's other flush point: resuming from an event control or a wait
+
+The outermost-scope `disable` is one of the three flush points 16.4.2 lists. The
+first is a process "having been suspended earlier due to reaching an event control or
+wait statement" that "resumes execution", and the generation counter alone did not
+cover it: it is bumped at an activation start (an `always @(...)` body's top, which is
+that resume) and by `DeferFlush`, so an event control or `wait` in the middle of a
+body, or `always begin @(e); ... end`, never flushed.
+
+The frontend now emits `DeferFlush` (the existing tag, no new IR) after the resume,
+in a procedure that holds a deferred assertion and nowhere else. `wait (cond)` flushes
+only on the path that suspended -- `if (cond) {} else { forever { @(reads); if (cond)
+break; } flush }` -- because a condition that is already true never suspends the
+process and a wake that finds it still false does not resume it; the same holds for an
+`iff` guard. A delay and `##n` are not flush points (the clause names neither, and its
+own a3 / a4 example relies on a delay not flushing). `wait fork` and `wait_order` are
+`wait_statement`s in the grammar but the clause does not say they are meant, so a
+process holding a deferred assertion is refused them.
+
+A task cannot reach its caller's counter, so a process holding a deferred assertion is
+refused a call to a task that can wait on an event control or a wait statement
+(`subroutine_waits_on_event`, transitive; a virtual task called anywhere along the way
+counts, directly or through another task or method, since the body read is the declared
+method's and any override may be the one that waits). A task that only delays is
+unaffected. Closing this takes
+the generation threaded through the task ABI, the same gap as a deferred assertion
+inside a task.
 
 ## Hazards
 
@@ -668,7 +713,10 @@ Ranked by how much damage a naive implementation does.
     (a claim on the per-arm `#delay` record; unconditional self-removal for a wait)
     and REFUSES the rest. The trap for V2b: a per-frame record cannot carry the
     claim, because the next arm overwrites the field the stale waker is about to
-    read — the record has to be per-park.
+    read — the record has to be per-park. A third window was open until the `#delay`
+    park held the scheduled flag: the timer has fired and queued the handle, the
+    activation has not run, and the disabler sees no record and a clear flag (see
+    "Aborting").
 
 ## Phased plan
 

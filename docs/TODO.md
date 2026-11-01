@@ -487,7 +487,10 @@ Milestones, in order; lower ones unblock higher ones:
     refused.
   - [ ] **`$display` / `$write` / `$fatal` action** — refused.
   - [ ] **Deferred assertion inside a function or task** — refused.
-  - [ ] **`disable` as a flush point** (16.4.4) — refused.
+  - [ ] **`disable` of one deferred assertion** (16.4.4) — `disable a1;` naming an assertion's
+    label is refused: a pending report carries no identity of its assertion to cancel by.
+  - [ ] **Flush at a resume the process cannot see** (16.4.2) — a process holding a deferred
+    assertion is refused `wait fork`, `wait_order` and a call to a task that can wait on an event.
   - [ ] **Action block scheduled in the Reactive region** — the report matures through the
     deferred queue instead of scheduling the action block in Reactive.
 - [ ] **`$countbits` with a non-constant control bit** — refused.

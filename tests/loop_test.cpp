@@ -78,6 +78,16 @@ bool any_process_has_tag(const ir::Module& m, ir::Inst::Tag tag) {
     return false;
 }
 
+// How many times `needle` occurs in `text`: the reports a run wrote to stderr.
+size_t occurrences(const std::string& text, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) {
+        ++n;
+    }
+
+    return n;
+}
+
 } // namespace
 
 // IEEE 1800-2023 12.7.1: the three-step for-loop — init once, test, body, step,
@@ -1005,6 +1015,61 @@ TEST_CASE("a target that calls a zero-time task is still a legal remote target")
     )") == "helper 1 at 0\nafter blk at 5\n");
 }
 
+// A remote `disable` refuses a block whose body calls a task that can park, because the park is
+// behind that task's activation and the abort cannot claim it. The predicate knew a timing
+// statement and a task call, and let every other way a task parks through: the block then ended
+// when the task did, long after the disable (`after B 5` for a disable at 1). Each of these is
+// refused now: a blocking assignment's own timing control, a `wait_order`, a built-in blocking
+// method (mailbox get, semaphore get) and a virtual task that delays. The same parks written
+// in the block itself work and end it at once (oracle: iverilog 13 for the assignment forms).
+TEST_CASE("a remote disable refuses a block whose called task parks in any form") {
+    const auto refused = [](std::string_view decls) {
+        const LowerResult r = lower_text(std::string("module t;\n  event e, f;\n") + std::string(decls) +
+                                         R"(
+          initial begin : P
+            begin : B
+              T();
+              $display("B end");
+            end
+          end
+          initial #1 disable t.P.B;
+        endmodule)");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("can park on a #0, a time-consuming task call") != std::string::npos);
+    };
+    refused("logic y; task T; y = #5 1'b1; endtask");
+    refused("logic y; task T; y = @(e) 1'b1; endtask");
+    refused("logic y; task T; y = repeat (2) @(e) 1'b1; endtask");
+    refused("task T; wait_order (e, f) $display(\"ok\"); else $display(\"bad\"); endtask");
+    refused("mailbox #(int) mb = new(); task T; int v; mb.get(v); endtask");
+    refused("semaphore sm = new(0); task T; sm.get(); endtask");
+    refused("class A; virtual task v(); endtask endclass class D extends A; virtual task v(); #5; endtask endclass\n"
+            "  D dd = new; A h = dd; task T; h.v(); endtask");
+
+    // The same parks in the block itself, not behind a task, are woken by the disable.
+    CHECK(run_capture(R"(
+        module t;
+          mailbox #(int) mb = new();
+          logic y = 0;
+          initial begin : P
+            begin : B
+              int v;
+              mb.get(v);
+              $display("never");
+            end
+            $display("after B %0t", $time);
+            begin : C
+              y = #5 1;
+              $display("never");
+            end
+            $display("after C %0t y=%b", $time, y);
+          end
+          initial #1 disable t.P.B;
+          initial #3 disable t.P.C;
+        endmodule
+    )") == "after B 1\nafter C 3 y=0\n");
+}
+
 // A block in a body that can have SEVERAL activations at once. A bare branch would
 // end only the one running it; LRM 9.6.2 ends them all, so the block keeps a list
 // of the activations currently inside it, exactly as a task target does. Two
@@ -1690,6 +1755,300 @@ TEST_CASE("a fork child's disable of the outermost block drops its deferred repo
     CHECK(matured.err.find("matured") != std::string::npos);
 }
 
+// LRM 9.6.2: a `disable` ends the activity of a block once, at the instant it runs. A `#delay`
+// park is resumed by a wheel timer whose expiry only QUEUES the activation, so a `disable` that
+// runs between that expiry and the activation's own resume finds its target already queued and
+// must leave it so. It read the activation's scheduled flag instead, found it clear in a body
+// that had never waited on an event, and queued the activation a second time. The first resume
+// ran the body on; the second resumed a coroutine that had finished (a crash) or one that had
+// parked again (its next `#delay` ended early). `kill` and `disable fork` wake through the same
+// code.
+//
+// The disablers are armed on both sides of the target's timer. The LRM leaves the order of
+// processes that wake in one time step open (4.7), and the wheel fires timers of one tick last
+// armed first, so one of them runs ahead of the target whichever way the order falls. Each design
+// therefore has two legal outputs, and the test accepts both: the target runs first (the disable
+// then ends a block it is parked in), or a disabler does (the target never reaches the code the
+// block is disabled out of). Oracle: iverilog, which prints the second form for the block and the
+// task; it has no `process` class.
+TEST_CASE("a disable that runs after its target's timer expired wakes the target once") {
+    SUBCASE("a named block") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              initial #1 disable t.P.B;
+              initial begin : P
+                begin : B
+                  #1 $display("in B %0t", $time);
+                  #5 $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial #1 disable t.P.B;
+              initial #10 $display("end");
+            endmodule
+        )");
+        CHECK(test::design_exit_code(run) == 0);
+        CHECK_MESSAGE((run.out == "after B 1\nend\n" || run.out == "in B 1\nafter B 1\nend\n"), run.out);
+    }
+
+    SUBCASE("a task, which ends in every activation") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              task T;
+                #1 $display("T in %0t", $time);
+                #5 $display("T never");
+              endtask
+              initial #1 disable T;
+              initial begin
+                T();
+                $display("after T %0t", $time);
+              end
+              initial #1 disable T;
+              initial #10 $display("end");
+            endmodule
+        )");
+        CHECK(test::design_exit_code(run) == 0);
+        CHECK_MESSAGE((run.out == "after T 1\nend\n" || run.out == "T in 1\nafter T 1\nend\n"), run.out);
+    }
+
+    SUBCASE("process::kill") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              process p;
+              initial #1 p.kill();
+              initial begin
+                p = process::self();
+                #1 $display("P in %0t", $time);
+                #5 $display("P never");
+              end
+              initial #1 p.kill();
+              initial #10 $display("end");
+            endmodule
+        )");
+        CHECK(test::design_exit_code(run) == 0);
+        CHECK_MESSAGE((run.out == "end\n" || run.out == "P in 1\nend\n"), run.out);
+    }
+
+    // The parent arms its `#1` after the child has armed its own (the `#0` lets the child run
+    // first), so the parent's `disable fork` can run with the child's timer already expired.
+    SUBCASE("disable fork") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              initial begin : P
+                fork
+                  begin
+                    #1 $display("C in %0t", $time);
+                    #5 $display("C never");
+                  end
+                join_none
+                #0;
+                #1 disable fork;
+                $display("after disable fork %0t", $time);
+              end
+              initial #10 $display("end");
+            endmodule
+        )");
+        CHECK(test::design_exit_code(run) == 0);
+        CHECK_MESSAGE((run.out == "after disable fork 1\nend\n" || run.out == "C in 1\nafter disable fork 1\nend\n"),
+                      run.out);
+    }
+}
+
+// The same collision with a deferred assertion in the disabled block. A disabled-out-of block
+// that was resumed twice ran its assertion twice, so the report came twice -- once from each
+// timer's resume -- at every time after the disable.
+TEST_CASE("a disable that runs after its target's timer expired does not repeat a deferred report") {
+    // The loop body is disabled at time 2, as its timer expires, and again as the disablers
+    // see it. Every legal order has one report at time 4 and one at 6 (the iterations that
+    // started after the disable), and a report at 2 only when the target ran its assertion
+    // ahead of the disablers. `$finish` at 7 ends the run after the report at 6 has matured.
+    SUBCASE("a loop body disabled at the instant its timer expires") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0;
+              initial #2 disable t.P.B;
+              initial begin : P
+                forever begin : B
+                  #2 assert final (x) else $error("report at %0t", $time);
+                end
+              end
+              initial #2 disable t.P.B;
+              initial #7 $finish;
+            endmodule
+        )");
+        CHECK(test::design_exit_code(run) == 0);
+        CHECK_MESSAGE(occurrences(run.err, "report at 4") == 1, run.err);
+        CHECK_MESSAGE(occurrences(run.err, "report at 6") == 1, run.err);
+        CHECK_MESSAGE(occurrences(run.err, "report at 2") <= 1, run.err);
+        CHECK_MESSAGE(occurrences(run.err, "report at ") <= 3, run.err);
+    }
+
+    // A disabler that runs first ends the block before its assertion executes, so there is
+    // nothing to report; one that runs after leaves the (non-outermost) block's report pending,
+    // and it matures. Either way the block is left once and the output is the same.
+    SUBCASE("the disable lands before the assertion executes") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0;
+              initial #1 disable t.P.B;
+              initial begin : P
+                begin : B
+                  #1 assert #0 (x) else $error("report");
+                  #5 $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial #1 disable t.P.B;
+              initial #10 $display("end");
+            endmodule
+        )");
+        CHECK(test::design_exit_code(run) == 0);
+        CHECK(run.out == "after B 1\nend\n");
+        CHECK_MESSAGE(occurrences(run.err, "report") <= 1, run.err);
+    }
+}
+
+// LRM 16.4.4: disabling the OUTERMOST scope of a procedure flushes its deferred report queue;
+// "disabling a task or a non-outermost scope of a procedure does not cause flushing of any
+// pending reports". Both directions, for every deferred statement the LRM defines (16.4:
+// assert, assume and cover, each in its `#0` and `final` form), from another process. The
+// disabler waits out the target's own time step with `#0`, so the statement has executed and
+// its report is pending when the `disable` runs. Not a bug fix: these forms were already
+// right, and the test pins them (LRM-derived; no oracle implements deferred assertions).
+TEST_CASE("a disable flushes a deferred report only at the outermost scope, for every deferred statement") {
+    struct Kind {
+        std::string name;
+        std::string stmt;
+    };
+    const Kind kinds[] = {
+        { "assert #0", R"(assert #0 (x) else $error("late report");)" },
+        { "assert final", R"(assert final (x) else $error("late report");)" },
+        { "assume #0", R"(assume #0 (x) else $error("late report");)" },
+        { "assume final", R"(assume final (x) else $error("late report");)" },
+        { "cover #0", R"(cover #0 (!x) $info("late report");)" },
+        { "cover final", R"(cover final (!x) $info("late report");)" },
+    };
+
+    for (const Kind& k : kinds) {
+        CAPTURE(k.name);
+        // The design text with the statement under test spliced in at STMT.
+        const auto with_stmt = [&](std::string text) {
+            text.replace(text.find("STMT"), 4, k.stmt);
+            return text;
+        };
+
+        // B is nested in P: not the outermost scope, so the report survives the disable.
+        const test::DesignRun nested = test::run_design_captured(with_stmt(R"(
+            module t;
+              logic x = 0;
+              initial begin : P
+                begin : B
+                  #1 STMT
+                  #5 $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial begin #1; #0; disable t.P.B; end
+              initial #10 $display("end");
+            endmodule
+        )"));
+        CHECK(nested.out == "after B 1\nend\n");
+        CHECK_MESSAGE(occurrences(nested.err, "late report") == 1, nested.err);
+
+        // P is the outermost scope: its pending report is dropped.
+        const test::DesignRun outer = test::run_design_captured(with_stmt(R"(
+            module t;
+              logic x = 0;
+              initial begin : P
+                #1 STMT
+                #5 $display("never");
+              end
+              initial begin #1; #0; disable t.P; $display("disabled %0t", $time); end
+              initial #10 $display("end");
+            endmodule
+        )"));
+        CHECK(outer.out == "disabled 1\nend\n");
+        CHECK_MESSAGE(occurrences(outer.err, "late report") == 0, outer.err);
+
+        // Without the disable the same report matures, so the drop above is a drop and not a
+        // statement that never reported.
+        const test::DesignRun kept = test::run_design_captured(with_stmt(R"(
+            module t;
+              logic x = 0;
+              initial begin : P
+                #1 STMT
+                #5 $display("never");
+              end
+              initial begin #1; #0; $display("not disabled %0t", $time); end
+              initial #10 $display("end");
+            endmodule
+        )"));
+        CHECK(kept.out == "not disabled 1\nnever\nend\n");
+        CHECK_MESSAGE(occurrences(kept.err, "late report") == 1, kept.err);
+    }
+}
+
+// The same rule for a process parked on an event control or a `wait` inside the disabled
+// block. It resumes, so 16.4.2's first flush point could be read to apply, but 16.4.4 says in
+// so many words that disabling a non-outermost scope does not flush, and the process is
+// leaving the block because of the disable, not because its event occurred: the report stays.
+// The outermost scope still drops it. (docs/LRM_NOTES.md, note 54.) LRM-derived.
+TEST_CASE("a disabled block's process parked on an event keeps its pending report unless it is the outermost") {
+    SUBCASE("an event control in a nested block") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0; event e;
+              initial begin : P
+                begin : B
+                  assert #0 (x) else $error("kept");
+                  @(e);
+                  $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial begin #0; disable t.P.B; end
+            endmodule
+        )");
+        CHECK(run.out == "after B 0\n");
+        CHECK_MESSAGE(occurrences(run.err, "kept") == 1, run.err);
+    }
+
+    SUBCASE("a wait statement in a nested block") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0, go = 0;
+              initial begin : P
+                begin : B
+                  assert #0 (x) else $error("kept");
+                  wait (go);
+                  $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial begin #0; disable t.P.B; end
+            endmodule
+        )");
+        CHECK(run.out == "after B 0\n");
+        CHECK_MESSAGE(occurrences(run.err, "kept") == 1, run.err);
+    }
+
+    SUBCASE("the outermost scope") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0; event e;
+              initial begin : P
+                assert #0 (x) else $error("dropped");
+                @(e);
+                $display("never");
+              end
+              initial begin #0; disable t.P; end
+            endmodule
+        )");
+        CHECK(run.out.empty());
+        CHECK_MESSAGE(occurrences(run.err, "dropped") == 0, run.err);
+    }
+}
+
 // The children of a fork a block holds are ended with it only when the fork is lexically
 // inside the block. One reached through a virtual call (any override in the design may
 // be the one that runs) or a randsequence production (lowered to a function of its own)
@@ -1739,11 +2098,12 @@ TEST_CASE("disable of a block that may fork through a virtual call or a randsequ
     CHECK_FALSE(rs.ok);
     CHECK(rs.diagnostic_text().find("calls a subroutine that forks") != std::string::npos);
 
-    // A virtual call is not refused when no virtual method of the design forks.
+    // A virtual call is not refused when no virtual method of the design forks or parks. (The
+    // override once delayed, which is a time-consuming task call and is refused as such.)
     const LowerResult quiet = lower_text(R"(
         class Base; virtual task start(); endtask endclass
         class Quiet extends Base;
-          virtual task start(); #1; endtask
+          virtual task start(); $display("quiet"); endtask
         endclass
         module t;
           Base h;

@@ -1854,6 +1854,18 @@ void Lowerer::lower_task_call(const CallExpression&    call,
     // no body to lower — its prototype stub supplies the signature instead
     // (virtual_sig_id).
     const bool is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
+    // LRM 16.4.2: the process resuming from an event control or wait statement inside the task is
+    // a flush point for the reports the PROCESS queued, and the task, shared by every caller,
+    // cannot reach them. Refused rather than left to report what the LRM says is flushed. A
+    // virtual call is refused whenever it is made from such a process, since any override may be
+    // the one that waits; a task that only delays is not affected.
+    if (proc_defers_ && (is_virtual || subroutine_waits_on_event(sub))) {
+        // TODO: thread the calling process's deferred-assertion generation through the task ABI
+        // (the same gap as a deferred assertion inside a task, lower_immediate_assertion).
+        fail("call of a task that can wait on an event control or a wait statement from a process "
+             "that holds a deferred assertion is not supported yet (resuming inside the task is a "
+             "flush point of the process's pending reports)");
+    }
     // A receiver that is a virtual interface handle, or a bare sibling call from
     // inside a ctx-parameterized body, both dispatch to the one shared body.
     const bool           through_vif = is_vif_call(call) || vif_ctx_arg_wanted(sub);
