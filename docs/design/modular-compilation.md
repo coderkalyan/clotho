@@ -1,16 +1,19 @@
 # Modular compilation
 
-Status: steps 1 and 2 are on this branch (2c partly: see below); step 3, the
-backend per unit (instance records, groups and functions lowered once per unit,
-one LLVM module per unit), is on the `modular-ir` branch and is described here as
-the design it implements, not as what this branch does. The frontend's output is
-a `Design` (src/ir/Design.h) with one unit per specialization wherever its
-instances lower identically, which `flatten` expands back into the flat module
-the backend consumes (`clotho run --stat=units` reports what is still split).
+Status: steps 1 and 2a/2b/2c are on this branch (2d, lowering a specialization
+once, is not); step 3, the backend per unit (instance records, groups and
+functions lowered once per unit, one LLVM module per unit), is on the
+`modular-ir` branch and is described here as the design it implements, not as
+what this branch does. The frontend's output is a `Design` (src/ir/Design.h)
+with one unit per specialization wherever its instances lower identically, which
+`flatten` expands back into the flat module the backend consumes (`clotho run
+--stat=units` reports what is still split: none on rocket-chip, nor on a design
+whose instances print `%m`, report through assertions and build covergroups).
 The frontend still lowers every instance, and everything below the IR is still
 whole-design; `module-split.md` describes the LLVM-level partition that exists
-today. `inst_path`, the instance's own path as a string value, exists in the IR;
-nothing emits it yet on this branch.
+today. An instance's own path is read through `inst_path`, which the flat
+backend resolves from the instance a body belongs to (a borrowed constant
+string); it costs a body nothing until a report fires.
 
 Goal: compile an SV design as a composition of small units, so compilation can
 be incremental, cached and parallel. The aim is an architecture whose unit
