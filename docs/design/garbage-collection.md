@@ -530,7 +530,7 @@ collection fails to satisfy the request.
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
 | Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
 | NBA record queues (`rt_nba_arr_slot`: array element, virtual-interface member, aggregate leaf, whole container) | Registered by shape at start-up (`rt_gc_nba_words_add` / `rt_gc_nba_container_add`); the staged records are read at each collection | conservative words, or precise through the container's element descriptor |
-| `$strobe` / `$monitor` argument images, deferred-report queues | Registered with their element descriptor | precise |
+| `$strobe` / `$monitor` pended bodies | No image of their own: the body is a zero-formal coroutine whose frame is registered (above), and it evaluates its arguments in the Postponed region on the native stack. `$monitor` keeps only the last rendered text. | conservative frame / stack |
 | Detached `->> #d e` timer node (`src/ir/llvm/`), later `rt_event` waiter lists | Explicit root registration at creation | precise |
 | Wheel timers, wait buckets, the active ring, fork/disable records | Nothing to do — they hold *frame* pointers, and frames are enumerated above | — |
 | VCD var tables, `rt_ref_names`, `chandle` | **Not roots.** VCD caches only pointers into `clotho.state`; `chandle` is foreign | — |
@@ -720,7 +720,7 @@ said so, and what now holds:
 | vptr stored before any collection sees the object | still true: nothing allocates between `rt_gc_alloc` and the vptr store |
 | deferred (`<= #d`) targets are design state | unchanged: asserted, and the records are roots |
 | class-property NBA | refused by the frontend, so no staging record names an object body |
-| `$strobe` / `$monitor` argument images | precise roots; they hold values that are printed, never dereferenced |
+| `$strobe` / `$monitor` argument images | there are none that outlive a collection (the first version claimed precise roots for them): arguments are evaluated in Postponed on the stack an emergency collection scans, and `gc_test` evaluates both across collections |
 | the safepoint comment in `emit_active_run` | describes the region-boundary collection, which is unchanged; the emergency one is additional |
 | `new` as a blocker in `Scans.cpp` | already treated as a safepoint, so no purity analysis relied on its absence |
 
