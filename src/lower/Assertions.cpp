@@ -835,8 +835,10 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
 // its body, transitively through the calls it makes. A delay is not one (LRM 16.4.2), so a task
 // that only delays does not count. A process that holds a deferred assertion cannot call such a
 // task yet: resuming inside it is a flush point of the calling process, which the task cannot
-// name (lower_task_call). Memoized, and a recursive cycle answers "no" on the way back in -- the
-// cycle waits only if some member does, which that member reports.
+// name (lower_task_call). A virtual task called anywhere along the way counts as waiting, as
+// lower_task_call counts a direct virtual call: the body read here is the declared method's, and
+// any override may be the one that runs and waits. Memoized, and a recursive cycle answers "no"
+// on the way back in -- the cycle waits only if some member does, which that member reports.
 bool Lowerer::subroutine_waits_on_event(const SubroutineSymbol& sub) {
     if (const auto it = sub_event_waits_.find(&sub); it != sub_event_waits_.end()) {
         return it->second;
@@ -874,7 +876,12 @@ bool Lowerer::subroutine_waits_on_event(const SubroutineSymbol& sub) {
         void handle(const CallExpression& c) {
             if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
                 const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
-                found              = found || (callee != nullptr && self->subroutine_waits_on_event(*callee));
+                // The same classification lower_task_call makes: a `super.` call binds statically,
+                // so its body is the one that runs and is read like any other.
+                const bool dispatched = callee != nullptr &&
+                                        callee->subroutineKind == slang::ast::SubroutineKind::Task &&
+                                        Lowerer::is_user_virtual(*callee) && !Lowerer::is_super_call(c);
+                found = found || dispatched || (callee != nullptr && self->subroutine_waits_on_event(*callee));
             }
             visitDefault(c);
         }

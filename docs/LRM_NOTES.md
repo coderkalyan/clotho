@@ -677,7 +677,10 @@ example relies on a delay not flushing.
 not say it means them, and whether a `wait fork` that finds no child suspended is not known
 to the frontend, so a process that holds a deferred assertion is refused both. It is
 refused a call to a task that can wait on an event control too, because the resume inside
-the task is the calling process's and the task cannot reach the process's reports.
+the task is the calling process's and the task cannot reach the process's reports. That
+covers a task that waits itself, one that calls a task that waits, and a virtual task called
+anywhere along the way, directly or through another task or method: the body read for the
+callee is the declared method's, and any override may be the one that runs and waits.
 
 16.4.4 says disabling "a non-outermost scope of a procedure does not cause flushing", so a
 `disable` of a block nested in the process, from the process or from another one, leaves the
@@ -687,4 +690,4 @@ disable and not because its event occurred, and 16.4.2's first bullet, read alon
 flush it. Clotho takes 16.4.4's explicit sentence. Disabling "a specific deferred assertion"
 by its label cancels its reports; that is refused (docs/TODO.md).
 
-Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`subroutine_waits_on_event`), `src/lower/Subroutines.cpp` (`lower_task_call`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: shapes whose flush points are not reachable are refused"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.
+Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`subroutine_waits_on_event`), `src/lower/Subroutines.cpp` (`lower_task_call`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: shapes whose flush points are not reachable are refused", "deferred assertion: a virtual task called through another task is refused like a direct one"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.

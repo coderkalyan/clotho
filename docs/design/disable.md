@@ -577,8 +577,10 @@ process holding a deferred assertion is refused them.
 
 A task cannot reach its caller's counter, so a process holding a deferred assertion is
 refused a call to a task that can wait on an event control or a wait statement
-(`subroutine_waits_on_event`, transitive; a virtual call always, since any override
-may be the one that waits). A task that only delays is unaffected. Closing this takes
+(`subroutine_waits_on_event`, transitive; a virtual task called anywhere along the way
+counts, directly or through another task or method, since the body read is the declared
+method's and any override may be the one that waits). A task that only delays is
+unaffected. Closing this takes
 the generation threaded through the task ABI, the same gap as a deferred assertion
 inside a task.
 

@@ -778,6 +778,65 @@ TEST_CASE("deferred assertion: shapes whose flush points are not reachable are r
                    "wait_order in a process"));
 }
 
+// A virtual task reached THROUGH another task is as unreachable as a direct virtual call: the
+// body read for the callee is the declared method's, and any override may be the one that runs and
+// waits, so a virtual task called anywhere along the way counts as waiting, as the direct call is
+// refused. Only the direct call was: a non-virtual task that called `h.v()` was accepted, and the
+// process printed the report that its resume from the override's event control flushes. A
+// virtual FUNCTION cannot wait, a `super.` call binds statically to the base method, and a task
+// that only delays does not wait, so those stay accepted and keep their report. LRM-derived; no
+// oracle implements deferred assertions.
+TEST_CASE("deferred assertion: a virtual task called through another task is refused like a direct one") {
+    const auto holds = [](std::string_view decls, std::string_view body) {
+        return std::string("module t;\n  logic x = 0; event e;\n") + std::string(decls) +
+               "\n  initial begin\n    assert #0 (x) else $error(\"r\");\n" + std::string(body) + "\n  end\nendmodule";
+    };
+    const std::string wait_refusal = "that holds a deferred assertion is not supported yet";
+    const std::string classes      = "class A; virtual task v(); endtask endclass\n"
+                                     "  class D extends A; virtual task v(); @(e); endtask endclass\n"
+                                     "  D d = new;\n";
+    // Accepted: the design runs and its one report matures.
+    const auto kept = [&](std::string_view decls, std::string_view body) {
+        const Captured c = run_capture(holds(decls, body));
+        CHECK_EQ(count_occ(c.err, "ERROR: "), 1u);
+    };
+
+    SUBCASE("through a non-virtual task") {
+        CHECK(contains(reject(holds(classes + "  task T(A h); h.v(); endtask", "T(d);")), wait_refusal));
+    }
+
+    SUBCASE("two tasks down") {
+        CHECK(
+          contains(reject(holds(classes + "  task T2(A h); h.v(); endtask\n  task T1(A h); T2(h); endtask", "T1(d);")),
+                   wait_refusal));
+    }
+
+    SUBCASE("through a method that calls it on its own object") {
+        CHECK(contains(reject(holds("class B; virtual task v(); endtask task w(); v(); endtask endclass\n"
+                                    "  class C extends B; virtual task v(); @(e); endtask endclass\n"
+                                    "  C c = new;",
+                                    "c.w();")),
+                       wait_refusal));
+    }
+
+    SUBCASE("a chain of tasks that only delays is not refused") {
+        kept("task T2; #1; endtask\n  task T1; T2(); endtask", "T1();");
+    }
+
+    SUBCASE("a virtual function, which cannot wait, is not refused") {
+        kept("class A; virtual function int f(); return 1; endfunction endclass\n  A a = new;\n"
+             "  task T; int y; y = a.f(); endtask",
+             "T();");
+    }
+
+    SUBCASE("a super call, which binds to the base method, is not refused") {
+        kept("class A; virtual task v(); #1; endtask endclass\n"
+             "  class D extends A; virtual task v(); super.v(); endtask task w(); super.v(); endtask endclass\n"
+             "  D d = new;",
+             "d.w();");
+    }
+}
+
 // -- Concurrent assertions (LRM 16.14): the default failure action is a $error --
 
 // An assertion's report is made in its own scope: the instance, plus the label
