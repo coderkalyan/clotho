@@ -300,6 +300,55 @@ TEST_CASE("always_comb and always_latch run once at time zero after every initia
         check_all_lowerings(comb_first, "y=x\n");
         check_all_lowerings(comb_last, "y=x\n");
     }
+    // The seed numbers its groups by SCHEDULE group, and instances of one unit whose
+    // clocked always wait on the very same signal (`t.clk`) share one. Those merged
+    // rows shift every later number down, so the seed once asked "does this start late"
+    // of a different fusion group than the one it was seeding, and an always_comb that
+    // sat behind such instances ran in source order, before the initial it disables.
+    SUBCASE("behind instances that share a schedule group, always_comb") {
+        check_all_lowerings(R"(
+            module ff;
+                logic q = 0;
+                always @(posedge t.clk) q <= ~q;
+            endmodule
+            module late;
+                always_comb disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+            endmodule
+            module t;
+                logic clk = 0;
+                ff u0();
+                ff u1();
+                ff u2();
+                late l();
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
+    SUBCASE("behind instances that share a schedule group, always_latch") {
+        check_all_lowerings(R"(
+            module ff;
+                logic q = 0;
+                always @(posedge t.clk) q <= ~q;
+            endmodule
+            module late;
+                always_latch disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+            endmodule
+            module t;
+                logic clk = 0;
+                ff u0();
+                ff u1();
+                ff u2();
+                late l();
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
 }
 
 // Deferring an always_comb's time-zero run (above) must not cost the fusion of an
