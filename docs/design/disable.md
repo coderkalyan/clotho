@@ -66,7 +66,8 @@ What V2a actually cost, and what it did NOT need: no epoch counter, no handle
 array, no zombie stage, no `Wheel.h` change, no runtime change. Three flat
 per-target tables (occupant handle, its scheduled-flag slot, its published park
 slot) plus a pending mark; a claim field on the `#delay` park record, which becomes
-a fresh heap allocation per arm only in a design that has a remote `disable`; and a
+a fresh heap allocation per arm only where `park_claim_wanted()` holds (a remote
+`disable`, or process control, which shares the claim); and a
 poll after each suspend inside a targeted region. The epoch the original design
 proposed was for "all activations of a task", which V2a does not implement — for a
 single-activation process-body target a live-occupant slot is both cheaper and
@@ -327,8 +328,11 @@ process body does not end — it carries on after the block.
 
 What landed instead is a claim, on the park rather than on the process:
 
-- **Parked on a `#delay`.** The park record carries a `state` claim, and — only in
-  a design that has a remote `disable` — is a fresh heap allocation per arm, so a
+- **Parked on a `#delay`.** The park record carries a `state` claim, and — only where
+  `park_claim_wanted()` holds, which is a design with a remote `disable` or with
+  process control (a `process` class operation, `disable fork`, `wait fork`, or a
+  program `initial` in a design that forks), because `kill` and `disable fork` wake
+  through the same code — is a fresh heap allocation per arm, so a
   stale record and a live one cannot be the same memory. (One reused per-frame
   record defeats every filter: the next arm overwrites the field the stale timer is
   about to read.) The disabler reads the occupant's published park slot, claims the
@@ -345,7 +349,9 @@ What landed instead is a claim, on the park rather than on the process:
   with only delays, a task) still had it clear: the disabler pushed a second copy and
   the activation resumed twice, which crashed when the first run reached the end of
   the body and doubled a loop when it did not. `emit_delay_timer` now sets the flag
-  as it arms the record, so "no record" always means "already queued". `kill` and
+  as it arms the record, under the same `park_claim_wanted()` gate as the record (a
+  design with neither a remote `disable` nor process control emits no store, and its
+  LLVM is unchanged), so "no record" always means "already queued". `kill` and
   `disable fork` wake through the same code and are covered by the same store.
 
 The scheduled flag cannot serve as the token in the first case, and finding out why

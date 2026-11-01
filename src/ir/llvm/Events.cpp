@@ -62,14 +62,17 @@ void Backend::lower_delay(Index amount) {
 // wheel. Parked, so the trampoline knows which ring to wake it into. Caller
 // emits the suspend.
 //
-// With a remote `disable` in the design the record is a fresh heap allocation per
-// arm, remembered in the frame slot so a `disable` can find and claim it; the
-// wheel frees it when it eventually fires. Fresh per arm because a force-woken
-// process can carry on with its old timer still armed, so one reused record would
-// have two owners.
+// Where park_claim_wanted() holds -- a design with a remote `disable`, or with process
+// control (a `process` class operation, `disable fork`, `wait fork`, or a program `initial`
+// in a design that forks) -- the record is a fresh heap allocation per arm, remembered in
+// the frame slot so a force-waker can find and claim it; the wheel frees it when it
+// eventually fires. Fresh per arm because a force-woken process can carry on with its old
+// timer still armed, so one reused record would have two owners.
 //
 // The scheduled flag is held SET across this park, as a `#0` park holds it
-// (emit_zero_delay_push). The flag is what a force-wake (`disable`, `kill`,
+// (emit_zero_delay_push), and under the same gate: only a force-waker reads it here, and a
+// design with neither a remote `disable` nor process control has none. The flag is what a
+// force-wake (`disable`, `kill`,
 // `disable fork`) reads once the park record is gone: when the timer fires, the
 // trampoline pushes the handle and nulls the frame slot, and from then until the
 // activation runs, "no record" must mean "already queued". An event wake sets the
