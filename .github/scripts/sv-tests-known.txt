@@ -1,0 +1,58 @@
+# Tests the sv-tests nightly reports that are understood and not a Clotho defect
+# to fix now. Read by sv-tests-summary.py, which reports each in its own section,
+# keeps it out of the self-check / ran counts, and flags an entry whose outcome
+# has changed (it passes, fails otherwise, or left the report) so it gets removed.
+#
+# One entry per line: <category> <test name> <reason, to end of line>
+#
+#   race       self-check: the outcome depends on an order the LRM leaves open
+#              (4.7). Listed apart, for manual review.
+#   oracle     self-check: the design's own expectation contradicts the LRM, and
+#              Clotho follows the LRM. NN is a docs/LRM_NOTES.md note.
+#   known-ran  ran: clotho exits 0 but sv-tests marks the test failed.
+#
+# Test names are the report's TestName column: ivtest's are
+# regress-<list>_<name>_iv, <list> being vlg or sv.
+
+# --- race (LRM 4.7) ---------------------------------------------------------
+race regress-vlg_always315A_iv 4.7: at t=5 the checking initial (#5) and the always loop's fifth #1 wakeup are both active; Clotho runs the always first, iverilog the initial
+race regress-vlg_always315B_iv 4.7: same t=5 collision as always315A (the empty else is irrelevant)
+race regress-vlg_always315C_iv 4.7: same t=5 collision as always315A (the else branch never runs)
+race regress-vlg_always315D_iv 4.7: same t=5 collision as always315A (condition 1'b1 && 1'b1)
+race regress-vlg_always315E_iv 4.7: same t=5 collision as always315A (condition 1'b1 & 1'b1)
+race regress-vlg_always315F_iv 4.7: same t=5 collision as always315A (condition 1'b1 | 1'b1)
+race regress-vlg_fork319A_iv 4.7: at t=23 the fork's #22 assignment (scheduled t=1) and the checker's #10 (scheduled t=13) are both active; Clotho runs the later-scheduled first, iverilog FIFO
+race regress-vlg_fork319B_iv 4.7: same t=23 collision as fork319A (@(ret1) #12 against the checker's #10)
+race regress-sv_br_gh756_iv 4.7/4.9.1: an initial reads input x at t=0, unordered against the port connection '1, a continuous assignment evaluated at time zero
+race regress-sv_sv_ps_array_cassign_iv 4.7/4.8: checks x right after the task writes P::y with no delay, the 4.8 example where either value is correct
+race regress-sv_sv_var_module_input1_iv 4.7/4.9.1: an initial reads a var input port at t=0, unordered against the implied continuous assignment (23.3.3.2)
+race regress-sv_sv_var_module_input2_iv 4.7/4.9.1: same as sv_var_module_input1 (input var ports read at t=0)
+race regress-vlg_pr1662508_iv 4.7/9.2: the order in which always and initial start at t=0 is open; Clotho arms the always first, so the initial's clk=0 (x to 0) is a negedge it sees, iverilog starts in source order and misses it
+race regress-vlg_pr587_iv 4.7/4.9.1: fails only at the t=0 negedge clk, where x is already 0 but the input-port copy has not propagated; net collapsing is only permissible (23.3.3.7)
+race regress-vlg_sdw_dsbl_iv 4.7: at t=15 working=0 (resumed from a #5 set at t=10) and disable my_block (resumed from #15 set at t=0) are both active
+race regress-vlg_vardly_iv 4.7: at t=7 the always block's #tdelay wakeup and the checker's #1 wakeup are both active
+
+# --- oracle (the test contradicts the LRM) ----------------------------------
+oracle regress-sv_pv_wr_vec2_nb_ec_iv 4.9.4/10.4.2: checks right after -> e with no delay; the event-controlled nonblocking update lands in the NBA region, so the unchanged value is correct
+oracle regress-sv_pv_wr_vec2a_nb_ec_iv 4.9.4/10.4.2: same as pv_wr_vec2_nb_ec, on an array element
+oracle regress-vlg_pv_wr_vec4_nb_ec_iv 4.9.4/10.4.2: same as pv_wr_vec2_nb_ec; iverilog applies the update inside the active region
+oracle regress-vlg_pv_wr_vec4a_nb_ec_iv 4.9.4/10.4.2: same as pv_wr_vec4_nb_ec, on an array element
+oracle regress-vlg_nb_ec_concat_iv 4.9.4/10.4.2: expects the new value right after -> e, before the NBA region; a #1 after each trigger is the LRM-clean form
+oracle regress-vlg_nb_ec_multi_ev_iv 4.9.4/10.4.2: same as nb_ec_concat (checks right after each ->eN)
+oracle regress-sv_sv_class9_iv 7.6: assigning a dynamic array copies its elements; iverilog shares storage between the two, the test expects that
+oracle regress-sv_sv_typedef_nested_array_iv 7.4.4/20.7: with staged typedefs the dimension added in T2 x[D] is the slowest, so $size(x,1) is D; the test expects the other order
+oracle regress-sv_sv_packed_port1_iv 6.8/23.3.3.2: a foo_s [1:0][3:0] oval is a variable, so its unwritten half is x, not z as the test expects
+oracle regress-sv_sv_packed_port2_iv 6.8/5.7.1: same z-for-x expectation as packed_port1; the unextended 'hx3x2x1x0 into 64 bits also shows a Clotho x-extension defect that this test does not expose
+oracle regress-sv_br_gh307_iv 23.2.2.3: an output with an explicit data type is a variable port, so its unassigned member is x and resolves with 0 to 1x; iverilog treats it as a net (z)
+oracle regress-sv_cfunc_assign_op_mixed_iv 11.4.1/6.12.1: x /= 2.0 is x = x / 2.0, a real that rounds (5/2.0 to 3, 5/3.0 to 2); the test expects iverilog's truncation
+oracle regress-vlg_pr2172606b_iv 11.4.11 (Table 11-20): sel=x ? z : z is x; the test expects z, and without __ICARUS__ requires both x and z
+oracle regress-vlg_string13_iv LRM_NOTES 33 (21.2.1.7): %s never prints leading zeros of a packed operand; the test expects iverilog's padded output
+oracle regress-vlg_string14_iv LRM_NOTES 33 (21.2.1.7): "" is 8'h00 (11.10.3) and a leading NUL is not printed by %s; the test expects iverilog's ": ::"
+oracle regress-vlg_task_omemw3_iv 13.3: an output argument is copied out at the end of the call, so arr[1] is 1; ivtest lists it compile-only (CO) and iverilog prints the same FAILED line
+oracle regress-sv_svconstants_iv LRM_NOTES 45 (6.20.2, 5.7.1): an untyped parameter set to '1 is at least 32 bits of ones in Clotho and slang, one bit in iverilog and Verilator
+oracle regress-sv_program3_iv LRM_NOTES 35 (24.3): the LRM does not say whether work woken by the last program initial runs before the implicit $finish; Clotho stops at once
+oracle regress-vlg_pr2792897_iv 21.2.1.2: no width rule for a real argument under %d; Clotho and Verilator pad to the 64-bit width, iverilog prints it minimal
+
+# --- known-ran --------------------------------------------------------------
+known-ran basic-tagged-union the test's :assert: expression has unbalanced quotes (''{valid:10}'), so sv-tests' Python eval of it raises SyntaxError and no tool can pass; broken upstream
+known-ran property_disable_iff_fail_test expects the tool to fail on a failed property; $error and a failed assertion leave exit status 0 (LRM_NOTES 28), only $fatal exits 1
