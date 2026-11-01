@@ -759,6 +759,62 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
     return p.found;
 }
 
+// Whether calling this subroutine can wait on an event control or a wait statement: anywhere in
+// its body, transitively through the calls it makes. A delay is not one (LRM 16.4.2), so a task
+// that only delays does not count. A process that holds a deferred assertion cannot call such a
+// task yet: resuming inside it is a flush point of the calling process, which the task cannot
+// name (lower_task_call). Memoized, and a recursive cycle answers "no" on the way back in -- the
+// cycle waits only if some member does, which that member reports.
+bool Lowerer::subroutine_waits_on_event(const SubroutineSymbol& sub) {
+    if (const auto it = sub_event_waits_.find(&sub); it != sub_event_waits_.end()) {
+        return it->second;
+    }
+    // Provisional false breaks recursion; overwritten below.
+    sub_event_waits_.emplace(&sub, false);
+
+    struct Waits : ASTVisitor<Waits, VisitFlags::AllGood> {
+        Lowerer* self  = nullptr;
+        bool     found = false;
+
+        void handle(const slang::ast::TimedStatement& s) {
+            found = found || Lowerer::is_event_control(s.timing);
+            visitDefault(s);
+        }
+        void handle(const slang::ast::WaitStatement& s) {
+            found = true;
+            visitDefault(s);
+        }
+        void handle(const slang::ast::WaitOrderStatement& s) {
+            found = true;
+            visitDefault(s);
+        }
+        void handle(const slang::ast::WaitForkStatement& s) {
+            found = true;
+            visitDefault(s);
+        }
+        // `x = @(e) y` and `x = repeat (n) @(e) y` wait on the assignment itself.
+        void handle(const slang::ast::AssignmentExpression& a) {
+            const TimingControl* t = a.timingControl;
+            found =
+              found || (t != nullptr && (Lowerer::is_event_control(*t) || t->kind == TimingControlKind::RepeatedEvent));
+            visitDefault(a);
+        }
+        void handle(const CallExpression& c) {
+            if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
+                const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
+                found              = found || (callee != nullptr && self->subroutine_waits_on_event(*callee));
+            }
+            visitDefault(c);
+        }
+    };
+    Waits w;
+    w.self = this;
+    sub.getBody().visit(w);
+    sub_event_waits_[&sub] = w.found;
+
+    return w.found;
+}
+
 void Lowerer::record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
                                  const Symbol*                                   owner,
                                  const Symbol*                                   label) {

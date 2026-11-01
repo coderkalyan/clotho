@@ -659,3 +659,32 @@ so a constant gave a number and `logic [$clog2(8'bx)-1:0]` was a two-bit vector.
 `patches/slang-clog2-unknown.patch` makes it x, as the run-time lowering already was.
 
 Code: `patches/slang-clog2-unknown.patch` (slang's `Clog2Function::eval`), `src/ir/llvm/Ops.cpp` (`lower_clog2`). Tests: `tests/llvm_backend_test.cpp` ("$clog2 propagates X when the operand has unknown bits", "$clog2 of a constant with an x or z bit is x in a localparam", "$clog2 of a constant with an x or z bit is x in a procedural statement", "an x result of $clog2 where a known value is required is an error at the declaration"). Oracle: iverilog 13; Verilator 5.050 differs at run time.
+
+## 54. What flushes a deferred assertion's reports (16.4.2, 16.4.4, 9.4.3, 9.6.1, 14.11)
+
+16.4.2 lists three flush points, and for the first, a process "having been suspended earlier
+due to reaching an event control or wait statement" that "resumes execution", says neither
+which constructs those are nor when a wake is a resume. Clotho flushes when a process
+resumes from an event control (including one on an assignment, and `@(e iff g)` once the
+guard holds) and from a `wait (expr)` that suspended it. It does not flush for a `wait`
+whose condition is already true (the process never suspended), for a wake that finds the
+condition or the `iff` guard still false (the process stays suspended, and a report queued
+before it matures in the instant it is in), for a delay (`#n`, `#0`), or for a cycle delay
+`##n`: the clause names only event controls and wait statements, and its own a3 / a4
+example relies on a delay not flushing.
+
+`wait fork` and `wait_order` are `wait_statement`s in the grammar (A.6.5), but the clause does
+not say it means them, and whether a `wait fork` that finds no child suspended is not known
+to the frontend, so a process that holds a deferred assertion is refused both. It is
+refused a call to a task that can wait on an event control too, because the resume inside
+the task is the calling process's and the task cannot reach the process's reports.
+
+16.4.4 says disabling "a non-outermost scope of a procedure does not cause flushing", so a
+`disable` of a block nested in the process, from the process or from another one, leaves the
+report to mature even though the process resumes from it. That holds whatever the process was
+parked on: one parked on an event control inside the block is also leaving it because of the
+disable and not because its event occurred, and 16.4.2's first bullet, read alone, would
+flush it. Clotho takes 16.4.4's explicit sentence. Disabling "a specific deferred assertion"
+by its label cancels its reports; that is refused (docs/TODO.md).
+
+Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`subroutine_waits_on_event`), `src/lower/Subroutines.cpp` (`lower_task_call`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: shapes whose flush points are not reachable are refused"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.

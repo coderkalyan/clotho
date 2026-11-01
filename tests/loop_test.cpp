@@ -1933,6 +1933,67 @@ TEST_CASE("a disable flushes a deferred report only at the outermost scope, for 
     }
 }
 
+// The same rule for a process parked on an event control or a `wait` inside the disabled
+// block. It resumes, so 16.4.2's first flush point could be read to apply, but 16.4.4 says in
+// so many words that disabling a non-outermost scope does not flush, and the process is
+// leaving the block because of the disable, not because its event occurred: the report stays.
+// The outermost scope still drops it. (docs/LRM_NOTES.md, note 54.) LRM-derived.
+TEST_CASE("a disabled block's process parked on an event keeps its pending report unless it is the outermost") {
+    SUBCASE("an event control in a nested block") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0; event e;
+              initial begin : P
+                begin : B
+                  assert #0 (x) else $error("kept");
+                  @(e);
+                  $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial begin #0; disable t.P.B; end
+            endmodule
+        )");
+        CHECK(run.out == "after B 0\n");
+        CHECK_MESSAGE(occurrences(run.err, "kept") == 1, run.err);
+    }
+
+    SUBCASE("a wait statement in a nested block") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0, go = 0;
+              initial begin : P
+                begin : B
+                  assert #0 (x) else $error("kept");
+                  wait (go);
+                  $display("never");
+                end
+                $display("after B %0t", $time);
+              end
+              initial begin #0; disable t.P.B; end
+            endmodule
+        )");
+        CHECK(run.out == "after B 0\n");
+        CHECK_MESSAGE(occurrences(run.err, "kept") == 1, run.err);
+    }
+
+    SUBCASE("the outermost scope") {
+        const test::DesignRun run = test::run_design_captured(R"(
+            module t;
+              logic x = 0; event e;
+              initial begin : P
+                assert #0 (x) else $error("dropped");
+                @(e);
+                $display("never");
+              end
+              initial begin #0; disable t.P; end
+            endmodule
+        )");
+        CHECK(run.out.empty());
+        CHECK_MESSAGE(occurrences(run.err, "dropped") == 0, run.err);
+    }
+}
+
 // The children of a fork a block holds are ended with it only when the fork is lexically
 // inside the block. One reached through a virtual call (any override in the design may
 // be the one that runs) or a randsequence production (lowered to a function of its own)

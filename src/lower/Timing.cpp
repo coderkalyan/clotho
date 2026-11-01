@@ -621,6 +621,22 @@ void Lowerer::lower_vif_clocking_drive(const MemberAccessExpression& ma,
     b.binary(ir::Inst::Tag::Store, pend, yes, l);
 }
 
+// LRM 16.4.2: a process that resumes from an event control or a wait statement has reached a
+// deferred assertion flush point, so the reports it queued before it suspended are dropped and
+// never mature. Only a procedure that holds a deferred assertion emits this, so any other design
+// is unchanged, and a subroutine body never does: a body that waits is a flush point of the
+// process that called it, which the body cannot name (lower_task_call refuses the call).
+//
+// A delay (`#n`, `#0`) and a cycle delay (`##n`) are not flush points: the clause names event
+// controls and wait statements, and a report queued ahead of a delay matures in the Observed
+// region the delay lets pass (the LRM's own a3 / a4 example under 16.4.2). Whether `##n`, which
+// waits for clocking events, should count as an event control is not said.
+void Lowerer::flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l) {
+    if (proc_defers_ && fn_ctx_ == nullptr) {
+        b.defer_flush(ir::kNoDisableTarget, l);
+    }
+}
+
 // Lower an intra-body event control `@(...)` to a Wait instruction. A
 // multi-signal list (@(a or posedge b)) registers the process on every listed
 // (signal, edge) queue at once; it wakes when any of them fires.
@@ -629,6 +645,7 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
         const auto& ev = tc.as<SignalEventControl>();
         if (reads_vif(ev.expr) && ev.expr.kind != ExpressionKind::MemberAccess) {
             lower_vif_expr_wait(ev, b, l);
+            flush_deferred_on_resume(b, l);
             return;
         }
     }
@@ -666,6 +683,7 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
     } else {
         b.wait(edges, l);
     }
+    flush_deferred_on_resume(b, l);
 }
 
 // Lower `wait_order(a, b, c) pass; else fail;` (LRM 15.5.4): suspend until every
@@ -692,6 +710,14 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
 // list can wait for the persistent triggered event").
 void Lowerer::lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b) {
     const ir::SourceLoc l = loc(s);
+    if (proc_defers_ && fn_ctx_ == nullptr) {
+        // TODO: LRM 16.4.2 makes a process resuming from "an event control or wait statement" a
+        // flush point, and the grammar's wait_statement includes `wait_order` (15.5.4), but a
+        // violation resumes the process too and the clause does not say how that counts. It is
+        // refused rather than guessed at.
+        fail("wait_order in a process that holds a deferred assertion is not supported yet "
+             "(whether resuming from it flushes the process's pending reports is not settled)");
+    }
     const auto          n = s.events.size();
 
     const TempCell  failed = make_temp_cell(module_.pool.bit_type, "wait_order");
@@ -1735,20 +1761,9 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
              "property cannot be waited on)");
     }
 
-    // forever { if (cond) break; @(reads); }
-    b.open_region();
-    const ir::Index      lpred = true_const(b, l);
-    const ir::ExtraSlice lcond = b.close_region();
-
-    b.open_region();
-    {
-        const ir::Index c = lower_predicate(w.cond, b);
-        b.open_region();
-        b.break_(l);
-        const ir::ExtraSlice then_r = b.close_region();
-        b.open_region();
-        const ir::ExtraSlice else_r = b.close_region(); // empty
-        b.cond(c, then_r, else_r, l);
+    // The edges to park on, lowered where the caller has its region open: a handle is
+    // evaluated at the park, so a reassigned one is re-read on every pass.
+    const auto park = [&] {
         std::vector<ir::WaitEdge> edges;
         edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size() +
                       prop_reads.event_props.size());
@@ -1792,13 +1807,58 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
         // An empty list is legal and meaningful: `wait(0)` reads nothing and
         // parks the process for the rest of the run.
         b.wait(edges, l);
+    };
+    // `if (cond) break;` for the loop below.
+    const auto test_and_break = [&] {
+        const ir::Index c = lower_predicate(w.cond, b);
+        b.open_region();
+        b.break_(l);
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region(); // empty
+        b.cond(c, then_r, else_r, l);
+    };
+    // forever { if (cond) break; @(reads); }, or with the park first when the caller
+    // has already tested the condition.
+    const auto wait_loop = [&](bool park_first) {
+        b.open_region();
+        const ir::Index      lpred = true_const(b, l);
+        const ir::ExtraSlice lcond = b.close_region();
+
+        b.open_region();
+        if (park_first) {
+            park();
+            test_and_break();
+        } else {
+            test_and_break();
+            park();
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+    };
+
+    if (proc_defers_ && fn_ctx_ == nullptr) {
+        // LRM 16.4.2: resuming from a wait statement flushes the reports the process queued, but
+        // a condition that is already true never suspends it, and a wake that finds the condition
+        // still false does not resume it. So the flush follows the loop, on the path that
+        // suspended: `if (cond) {} else { forever { @(reads); if (cond) break; } flush }`.
+        // The entry test runs once and each wake tests once, exactly as in the plain loop, and an
+        // X condition still takes the else path (see above).
+        const ir::Index c = lower_predicate(w.cond, b);
+        b.open_region();
+        const ir::ExtraSlice then_r = b.close_region(); // true already: no suspension, no flush
+        b.open_region();
+        wait_loop(/*park_first*/ true);
+        flush_deferred_on_resume(b, l);
+        const ir::ExtraSlice else_r = b.close_region();
+        b.cond(c, then_r, else_r, l);
+    } else {
+        wait_loop(/*park_first*/ false);
     }
-    const ir::ExtraSlice body = b.close_region();
-
-    b.open_region();
-    const ir::ExtraSlice step = b.close_region(); // empty
-
-    b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
 
     lower_stmt(w.stmt, b);
 }

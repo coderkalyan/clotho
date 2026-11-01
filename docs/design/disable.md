@@ -556,6 +556,32 @@ leave. Note the backend's independent backstop `reject_unsupported_reactive`
 reactive code because the frontend refuses first, so if V2 lifts the frontend
 refusal the backstop silently accepts.
 
+### 16.4.2's other flush point: resuming from an event control or a wait
+
+The outermost-scope `disable` is one of the three flush points 16.4.2 lists. The
+first is a process "having been suspended earlier due to reaching an event control or
+wait statement" that "resumes execution", and the generation counter alone did not
+cover it: it is bumped at an activation start (an `always @(...)` body's top, which is
+that resume) and by `DeferFlush`, so an event control or `wait` in the middle of a
+body, or `always begin @(e); ... end`, never flushed.
+
+The frontend now emits `DeferFlush` (the existing tag, no new IR) after the resume,
+in a procedure that holds a deferred assertion and nowhere else. `wait (cond)` flushes
+only on the path that suspended -- `if (cond) {} else { forever { @(reads); if (cond)
+break; } flush }` -- because a condition that is already true never suspends the
+process and a wake that finds it still false does not resume it; the same holds for an
+`iff` guard. A delay and `##n` are not flush points (the clause names neither, and its
+own a3 / a4 example relies on a delay not flushing). `wait fork` and `wait_order` are
+`wait_statement`s in the grammar but the clause does not say they are meant, so a
+process holding a deferred assertion is refused them.
+
+A task cannot reach its caller's counter, so a process holding a deferred assertion is
+refused a call to a task that can wait on an event control or a wait statement
+(`subroutine_waits_on_event`, transitive; a virtual call always, since any override
+may be the one that waits). A task that only delays is unaffected. Closing this takes
+the generation threaded through the task ABI, the same gap as a deferred assertion
+inside a task.
+
 ## Hazards
 
 Ranked by how much damage a naive implementation does.
