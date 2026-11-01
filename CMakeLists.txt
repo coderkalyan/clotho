@@ -551,6 +551,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/LlvmBackend.cpp
   src/ir/llvm/Ops.cpp
   src/ir/llvm/Processes.cpp
+  src/ir/llvm/RootTables.cpp
   src/ir/llvm/RuntimeAbi.cpp
   src/ir/llvm/RuntimeBitcode.cpp
   src/ir/llvm/Sanitizers.cpp

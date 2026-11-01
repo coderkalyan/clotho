@@ -2189,6 +2189,11 @@ private:
 
     void emit_main(const std::vector<llvm::Function*>& procs);
 
+    // The power-on value of every instance record, and the other link-time constants
+    // of root's globals, as the initializers of the globals themselves
+    // (RootTables.cpp): what differs per instance is data, and no code of root fills it.
+    void fill_instance_records(const std::vector<llvm::Function*>& procs);
+
     // -- Precise global roots (docs/design/garbage-collection.md §5) -------------
 
     void emit_gc_root_tables();

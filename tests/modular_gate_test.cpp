@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <map>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -407,5 +408,95 @@ TEST_CASE("a module that writes another unit's signals names no instance") {
         INFO("module ", name);
         CHECK(text.find("clotho.inst.") == std::string::npos);
         CHECK(text.find("top.c") == std::string::npos); // an instance path of the design
+    }
+}
+
+namespace {
+
+// A module with every kind of thing root has to set up for an instance: a
+// declaration initializer, processes that start at time zero and ones that wait, a
+// static and an event subscription, an always_comb, a final block and an assertion.
+// `@N@` instances of it under one parent, so a design of 2 and a design of 7 differ
+// in nothing but how many times the module is instantiated.
+constexpr std::string_view kTiles = R"(
+module tile (input logic clk, input logic [7:0] d, output logic [7:0] q);
+  logic [7:0] r = 8'd3;
+  logic [7:0] v = 0;
+  event ev;
+  int seen = 0;
+  always @(v) seen = seen + 1;
+  always @(posedge clk) seen = seen + 2;
+  always @(ev) seen = seen + 3;
+  always_ff @(posedge clk) begin r <= r + d; -> ev; end
+  always_comb q = r ^ d;
+  assert property (@(posedge clk) d != 8'hfd) else $error("tile");
+  final $display("%0d", seen);
+endmodule
+
+module top;
+  logic       clk = 0;
+  logic [7:0] d   = 1;
+  for (genvar i = 0; i < @N@; i++) begin : g
+    logic [7:0] q;
+    tile t (.clk, .d, .q);
+  end
+  always #5 clk = ~clk;
+  initial begin
+    $dumpvars(0, top);
+    #50 $finish;
+  end
+endmodule
+)";
+
+std::string tiles(unsigned n) {
+    std::string text(kTiles);
+    const size_t at = text.find("@N@");
+    REQUIRE(at != std::string::npos);
+    text.replace(at, 3, std::to_string(n));
+    return text;
+}
+
+// The instructions of each function of root's module, by name.
+std::map<std::string, size_t> root_code(const std::string& source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+    std::vector<ir::ModuleIr> modules;
+    REQUIRE(ir::emit_llvm_modules(*r.module, modules));
+    REQUIRE(!modules.empty());
+    std::map<std::string, size_t> counts;
+    std::istringstream            in(modules.front().ir); // [0] is root
+    std::string                   line;
+    std::string                   current;
+    while (std::getline(in, line)) {
+        if (line.starts_with("define ")) {
+            const size_t at  = line.find('@');
+            const size_t end = line.find('(', at);
+            current          = line.substr(at + 1, end - at - 1);
+            if (current.starts_with('"')) {
+                current = current.substr(1, current.size() - 2);
+            }
+            counts[current] = 0;
+        } else if (line.starts_with("}")) {
+            current.clear();
+        } else if (!current.empty() && line.starts_with("  ") && !line.starts_with("  ;")) {
+            ++counts[current];
+        }
+    }
+    return counts;
+}
+
+} // namespace
+
+TEST_CASE("root's code does not grow with the number of instances") {
+    // Link glue is data walked by loops: the records are initializers, and what main
+    // would have stored for each instance is not code.
+    const auto few  = root_code(tiles(2));
+    const auto many = root_code(tiles(7));
+    for (const char* name : { "clotho_main" }) {
+        INFO("function ", name);
+        REQUIRE(few.contains(name));
+        REQUIRE(many.contains(name));
+        CHECK(few.at(name) == many.at(name));
     }
 }

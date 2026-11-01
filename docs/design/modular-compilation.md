@@ -611,8 +611,13 @@ code go.
     commit function tail-calls the next one's. The instances that share a
     group's code share its commit functions, each block with a descriptor of
     its own, and `verify_shared_code` compares the commit functions' code too.
-    Still open: the seed loop and record fills are root code rather than tables
-    built from the instance table, and flatten still copies bodies per
+    The instance records are initializers of their globals
+    (`fill_instance_records`, ir/llvm/RootTables.cpp): every field of one is a
+    link-time constant (the addresses of the instance's storage, the ports' wake
+    buckets and ids, the bindings, the entry of each thunk group's wake pair), so
+    `clotho_main` holds no code per instance and a record costs data only.
+    Still open: the seed loop is root code rather than a table built from the
+    instance table, and flatten still copies bodies per
     instance. What still makes a unit module depend on outside it: lowerings
     the taint list keeps per instance (they name `clotho.inst.<hier>.*`
     globals) and the intern pool's type and class numbers (step 5).
