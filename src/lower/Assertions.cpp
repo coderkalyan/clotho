@@ -640,7 +640,7 @@ void Lowerer::join_disable_targets() {
         if (owner == owners_->scopes.end()) {
             fail("internal: a disable target's instance was not collected");
         }
-        const uint32_t              spec = owners_->scope_specs.at(owner->second.owner.index).spec;
+        const uint32_t              spec = owners_->scope_specs.at(owner->second.index).spec;
         const std::vector<uint32_t> path = member_ordinal_path(*t, body);
         for (const slang::ast::InstanceBodySymbol* other : spec_bodies_[spec]) {
             if (other == &body) {
