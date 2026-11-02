@@ -1674,6 +1674,27 @@ endmodule
     CHECK(free_run.out == "done 1000000\n");
 }
 
+// A body a class owns -- randomize, copy, sample -- is lowered by whichever Lowerer
+// first reaches the class and used to name the instance that Lowerer stood in: a
+// package class's `$randomize`, built from a module, read the module's path, and the
+// package's unit, which has no instance, refused it (an internal error, "inst_path in
+// a body that belongs to no instance"). It names the scope that declares the class.
+TEST_CASE("cli: a package class's randomize reports in the package, not in an instance") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(package p;
+  class item; rand int x; constraint c { x > 0; } endclass
+endpackage
+module top;
+  import p::*;
+  item i = new;
+  initial void'(i.randomize());
+endmodule
+)");
+    const Result   r      = s.run(std::format("run \"{}\"", design.string()));
+    CHECK_FALSE(contains(r.err, "internal"));
+    CHECK(contains(r.err, "constraint blocks are not supported"));
+}
+
 // uvm_pkg is the design the specialization names came from: a registry class per
 // registered class, each naming the next with the enclosing generic's parameters.
 // The sources are not in this tree; CLOTHO_UVM_SRC names a directory holding

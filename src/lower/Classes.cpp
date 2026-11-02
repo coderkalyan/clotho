@@ -1144,6 +1144,9 @@ ir::FunctionId Lowerer::copy_thunk_id(const slang::ast::ClassType& clt, ir::Ref 
 // materialized because it is never instantiated, so the body is unreachable, and
 // filling the slot uniformly keeps the numbering identical across the hierarchy.
 void Lowerer::build_copy_thunk(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
+    // The declaring scope, not whichever one this Lowerer reached the class from: a
+    // package class's body names no instance, a module class's names its own.
+    const Restore<const Scope*> decl_scope(scope_, clt.getParentScope());
     // The parameter occupies frame Local 0, as in build_pure_stub / build_function.
     std::vector<ir::Ref>    param_types{ class_ref };
     std::vector<ir::ArgDir> arg_dirs{ ir::ArgDir::In };

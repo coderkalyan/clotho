@@ -4236,3 +4236,17 @@ TEST_CASE("package generics specialized with a module's class keep their method 
         endmodule
     )") == "101 201 102 202 301\n");
 }
+
+// %m inside a package class method called from a module is the method's own path.
+TEST_CASE("%m in a package class method called from a module is the method's path") {
+    CHECK(run_capture(R"(
+        package p;
+            class C; function void who(); $display("%m"); endfunction endclass
+        endpackage
+        module top;
+            import p::*;
+            C c = new;
+            initial c.who();
+        endmodule
+    )") == "p.C.who\n");
+}
