@@ -26,6 +26,7 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/SubtargetFeature.h>
@@ -1096,6 +1097,38 @@ bool write_artifact(const clotho::LowerResult&                result,
           objects, config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), scratch.path);
     }
     if (emit == Emit::Obj) {
+#if defined(__linux__)
+        // The same per-module objects, joined into the one the user asked for.
+        const ScratchDir scratch;
+        if (scratch.path.empty()) {
+            return false;
+        }
+        std::vector<std::string> objects;
+        if (!clotho::ir::emit_objects(*result.module, scratch.path, objects, *target, config, timings, resolve)) {
+            return false;
+        }
+        if (!to_stdout) {
+            return clotho::link::link_relocatable(objects, std::string(out));
+        }
+        // lld writes a file, and a pipe is not one it can seek in.
+        llvm::SmallString<128> joined(scratch.path);
+        llvm::sys::path::append(joined, "design.o");
+        if (!clotho::link::link_relocatable(objects, std::string(joined))) {
+            return false;
+        }
+        auto buffer = llvm::MemoryBuffer::getFile(joined);
+        if (!buffer) {
+            std::println(stderr, "clotho: cannot read '{}': {}", std::string_view(joined), buffer.getError().message());
+            return false;
+        }
+        llvm::outs().write((*buffer)->getBufferStart(), (*buffer)->getBufferSize());
+        return true;
+#else
+        // TODO: one object per module, as above. lld's Mach-O driver has no
+        // relocatable link (`-r` is "not yet implemented", and then links an
+        // executable) and its MinGW driver rejects `-r`, so here the modules are
+        // optimized in parallel but linked into one and generated on one thread
+        // (docs/TODO.md, "Per-unit code generation").
         if (to_stdout) {
             return clotho::ir::emit_object(*result.module, llvm::outs(), *target, config, timings, resolve);
         }
@@ -1106,6 +1139,7 @@ bool write_artifact(const clotho::LowerResult&                result,
             return false;
         }
         return clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve);
+#endif
     }
     if (emit == Emit::LlvmUnits) {
         if (to_stdout) {

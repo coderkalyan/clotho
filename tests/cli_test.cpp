@@ -1245,6 +1245,38 @@ TEST_CASE("cli: build writes an executable named after the top module by default
     CHECK(clotho::test::detail::read_file(s.path("sim.txt")) == "W=4 S=dflt\n");
 }
 
+// The modules of a design are compiled to one object each, and `--emit=obj` still
+// writes one file, the same bytes to a file as to a pipe.
+TEST_CASE("cli: build --emit=obj writes one object, to a file or to stdout") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module child(input logic clk, output logic [7:0] q);
+            always_ff @(posedge clk) q <= q + 1;
+        endmodule
+        module top;
+            logic clk = 0;
+            logic [7:0] q;
+            child c(.clk(clk), .q(q));
+            initial begin #1 clk = 1; #1 $display("%0d", q); end
+        endmodule
+    )");
+    const fs::path file    = s.path("design.o");
+    const Result   to_file = s.run(std::format("build --emit=obj -o \"{}\" \"{}\"", file.string(), design.string()));
+    const Result   to_pipe = s.run(std::format("build --emit=obj -o - \"{}\"", design.string()));
+    CHECK(to_file.code == 0);
+    CHECK(to_file.out.empty());
+    CHECK(to_pipe.code == 0);
+    const std::string object = clotho::test::detail::read_file(file);
+    REQUIRE(object.size() > 20);
+    CHECK(to_pipe.out == object);
+#if defined(__linux__)
+    // ELF, relocatable (ET_REL), not an executable or a library.
+    CHECK(object.starts_with("\x7f"
+                             "ELF"));
+    CHECK(static_cast<unsigned char>(object[16]) == 1);
+#endif
+}
+
 TEST_CASE("cli: build will not write text or an object to a terminal by default") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

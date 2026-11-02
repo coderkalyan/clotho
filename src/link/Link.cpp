@@ -407,4 +407,12 @@ bool link_executable(std::span<const std::string> objects,
     return extract_kit(scratch) && link_host(objects, dpi_libs, exports_dpi, output, scratch);
 }
 
+#if defined(__linux__)
+bool link_relocatable(std::span<const std::string> objects, const std::string& output) {
+    std::vector<std::string> args = { "ld.lld", "-m", kEmulation, "-r", "-o", output };
+    args.insert(args.end(), objects.begin(), objects.end());
+    return run_lld(args, { lld::Gnu, &lld::elf::link });
+}
+#endif
+
 } // namespace clotho::link

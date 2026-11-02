@@ -37,4 +37,13 @@ bool link_executable(std::span<const std::string> objects,
                      const std::string&           output,
                      const std::string&           scratch);
 
+#if defined(__linux__)
+// Join the relocatable objects `objects` into one relocatable object at `output`
+// (`ld -r`), for `build --emit obj`. Only on Linux: lld's Mach-O driver accepts
+// `-r` and then links an executable ("not yet implemented"), and its MinGW and
+// COFF drivers have no such mode. On failure, lld's messages are on stderr and
+// the return is false.
+bool link_relocatable(std::span<const std::string> objects, const std::string& output);
+#endif
+
 } // namespace clotho::link

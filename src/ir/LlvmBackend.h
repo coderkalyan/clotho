@@ -152,11 +152,12 @@ SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve = 
 // object defines `clotho_main`, the entry rt_run takes, and `clotho_design`, the
 // rt_design an executable's main reads; every runtime symbol it references is
 // left undefined, for a link against the runtime. The modules are optimized in
-// parallel (for_each_optimized_module), then linked back into the root module,
-// so the object holds exactly the code `run` would compile, and generated as one
-// on the calling thread. Code generation uses `config.o3` as run_jit does, the
-// platform's default code model and position-independent code, so the object
-// links into a PIE. Returns false with the reason on llvm::errs().
+// parallel (for_each_optimized_module), then linked back into the root module
+// and generated as one on the calling thread: for platforms whose lld cannot
+// link objects relocatably, which is how emit_objects' files become one object
+// on Linux. Code generation uses `config.o3` as run_jit does, the platform's
+// default code model and position-independent code, so the object links into a
+// PIE. Returns false with the reason on llvm::errs().
 bool emit_object(const Module&                             m,
                  llvm::raw_ostream&                        os,
                  const llvm::orc::JITTargetMachineBuilder& target,
