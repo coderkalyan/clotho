@@ -1246,7 +1246,8 @@ TEST_CASE("cli: build writes an executable named after the top module by default
 }
 
 // The modules of a design are compiled to one object each, and `--emit=obj` still
-// writes one file, the same bytes to a file as to a pipe.
+// writes one file: the same bytes to a file as to a pipe, and whatever the number
+// of threads the modules were compiled on.
 TEST_CASE("cli: build --emit=obj writes one object, to a file or to stdout") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", R"(
@@ -1269,6 +1270,12 @@ TEST_CASE("cli: build --emit=obj writes one object, to a file or to stdout") {
     const std::string object = clotho::test::detail::read_file(file);
     REQUIRE(object.size() > 20);
     CHECK(to_pipe.out == object);
+    for (const std::string_view jobs : { "1", "3" }) {
+        CAPTURE(jobs);
+        const Result r = s.run(std::format("build --emit=obj -j {} -o - \"{}\"", jobs, design.string()));
+        CHECK(r.code == 0);
+        CHECK(r.out == object);
+    }
 #if defined(__linux__)
     // ELF, relocatable (ET_REL), not an executable or a library.
     CHECK(object.starts_with("\x7f"
