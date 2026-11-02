@@ -1030,6 +1030,29 @@ bool write_text(std::string_view out, const std::string& text) {
 }
 #endif
 
+// A fresh temporary directory for the objects of a build and the files embedded
+// for its link, removed with this object. `path` is empty, with the reason on
+// stderr, if there is none.
+struct ScratchDir {
+    std::string path;
+
+    ScratchDir() {
+        llvm::SmallString<128> dir;
+        if (const std::error_code ec = llvm::sys::fs::createUniqueDirectory("clotho-build", dir)) {
+            std::println(stderr, "clotho: cannot create a temporary directory: {}", ec.message());
+            return;
+        }
+        path = std::string(dir);
+    }
+    ScratchDir(const ScratchDir&)            = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+    ~ScratchDir() {
+        if (!path.empty()) {
+            llvm::sys::fs::remove_directories(path);
+        }
+    }
+};
+
 // `build`: write the requested artifact. `-o -` means stdout. `target` is the
 // build_target for an object or executable, null for anything else.
 bool write_artifact(const clotho::LowerResult&                result,
@@ -1058,35 +1081,19 @@ bool write_artifact(const clotho::LowerResult&                result,
         return true;
     }
     if (emit == Emit::Exe) {
-        // The object and the embedded link files go in a directory of their own,
-        // removed once the executable is written.
-        llvm::SmallString<128> scratch;
-        if (const std::error_code ec = llvm::sys::fs::createUniqueDirectory("clotho-build", scratch)) {
-            std::println(stderr, "clotho: cannot create a temporary directory: {}", ec.message());
+        // One object per module, generated in parallel, and the embedded link
+        // files, in a directory of their own removed once the executable is
+        // written.
+        const ScratchDir scratch;
+        if (scratch.path.empty()) {
             return false;
         }
-        const std::string dir(scratch);
-        const struct Remove {
-            const std::string& dir;
-            ~Remove() {
-                llvm::sys::fs::remove_directories(dir);
-            }
-        } remove{ dir };
-        llvm::SmallString<128> object(scratch);
-        llvm::sys::path::append(object, "design.o");
-        {
-            std::error_code      ec;
-            llvm::raw_fd_ostream os(object, ec);
-            if (ec) {
-                std::println(stderr, "clotho: cannot open '{}': {}", std::string_view(object), ec.message());
-                return false;
-            }
-            if (!clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve)) {
-                return false;
-            }
+        std::vector<std::string> objects;
+        if (!clotho::ir::emit_objects(*result.module, scratch.path, objects, *target, config, timings, resolve)) {
+            return false;
         }
         return clotho::link::link_executable(
-          std::string(object), config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), dir);
+          objects, config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), scratch.path);
     }
     if (emit == Emit::Obj) {
         if (to_stdout) {

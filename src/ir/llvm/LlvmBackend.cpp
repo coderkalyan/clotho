@@ -8,11 +8,14 @@
 
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/ThreadPool.h>
 #include <llvm/Support/Threading.h>
 
@@ -731,6 +734,64 @@ bool emit_object(const Module&                             m,
         return false;
     }
     os.write(object->data(), object->size());
+    if (timings != nullptr) {
+        timings->llvm_ms += ms_since(t_llvm);
+    }
+    return true;
+}
+
+bool emit_objects(const Module&                             m,
+                  const std::string&                        dir,
+                  std::vector<std::string>&                 objects,
+                  const llvm::orc::JITTargetMachineBuilder& target,
+                  const SimulationConfig&                   config,
+                  Timings*                                  timings,
+                  const LocResolver&                        resolve) {
+    assert(config.lower_coro && "an object needs the coroutines lowered");
+    const auto t_llvm = std::chrono::steady_clock::now();
+    auto       layout = object_machine(target, config.o3);
+    if (!layout) {
+        llvm::errs() << "llvm backend: " << llvm::toString(layout.takeError()) << "\n";
+        return false;
+    }
+    auto ctx   = std::make_unique<llvm::LLVMContext>();
+    auto built = build_modules_unoptimized(m, *ctx, **layout, config, resolve);
+    if (built.modules.empty()) {
+        return false;
+    }
+
+    objects.clear();
+    for (size_t i = 0; i < built.modules.size(); ++i) {
+        llvm::SmallString<256> path(dir);
+        llvm::sys::path::append(path, "design." + std::to_string(i) + ".o");
+        objects.emplace_back(path);
+    }
+    if (auto err = for_each_optimized_module(built, std::move(ctx), config, [&](size_t i, OwnedModule&& unit) -> llvm::Error {
+            auto tm = object_machine(target, config.o3);
+            if (!tm) {
+                return tm.takeError();
+            }
+            auto object = generate_object(*unit.module, **tm);
+            if (!object) {
+                return object.takeError();
+            }
+            std::error_code      ec;
+            llvm::raw_fd_ostream file(objects[i], ec, llvm::sys::fs::OF_None);
+            if (ec) {
+                return llvm::createStringError(ec, "cannot open '" + objects[i] + "': " + ec.message());
+            }
+            file.write(object->data(), object->size());
+            file.close();
+            if (file.has_error()) {
+                ec = file.error();
+                file.clear_error();
+                return llvm::createStringError(ec, "cannot write '" + objects[i] + "': " + ec.message());
+            }
+            return llvm::Error::success();
+        })) {
+        llvm::errs() << "llvm backend: " << llvm::toString(std::move(err)) << "\n";
+        return false;
+    }
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
     }

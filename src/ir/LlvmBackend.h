@@ -164,4 +164,20 @@ bool emit_object(const Module&                             m,
                  Timings*                                  timings = nullptr,
                  const LocResolver&                        resolve = {});
 
+// Compile the design as emit_object does, but write each module as an object file
+// of its own into the existing directory `dir`, generated in parallel on
+// `config.compile_jobs` threads (for_each_optimized_module, so the same pool and
+// pipeline `run` uses). `objects` is set to the files' paths, root first: the
+// order a link takes them in. Between them they define `clotho_main` and
+// `clotho_design`; a symbol one module takes from another is undefined in the
+// one and defined in the other, to be resolved by a link of them all. Returns false
+// with the reason on llvm::errs().
+bool emit_objects(const Module&                             m,
+                  const std::string&                        dir,
+                  std::vector<std::string>&                 objects,
+                  const llvm::orc::JITTargetMachineBuilder& target,
+                  const SimulationConfig&                   config  = {},
+                  Timings*                                  timings = nullptr,
+                  const LocResolver&                        resolve = {});
+
 } // namespace clotho::ir

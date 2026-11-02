@@ -1,6 +1,6 @@
 #pragma once
 
-// Linking an executable from the design's object: lld, run in-process, with
+// Linking an executable from the design's objects: lld, run in-process, with
 // the files every executable needs embedded in clotho itself, so that `clotho
 // build` needs no compiler, linker or C library development files on the
 // machine (docs/design/executables.md).
@@ -23,14 +23,15 @@ struct KitFile {
 extern const KitFile kKitFiles[];
 extern const size_t  kKitFileCount;
 
-// Link the design's relocatable object at `object` and the DPI-C libraries
-// `dpi_libs` (objects and archives linked in; shared libraries linked
-// dynamically, found at run time beside where they are now) into an executable
-// for this machine at `output`. `exports_dpi` says the design has export
-// "DPI-C" functions, which a shared library can only reach if the executable
-// exports them. `scratch` is an existing directory for the embedded files. On
-// failure, lld's messages are on stderr and the return is false.
-bool link_executable(const std::string&           object,
+// Link the design's relocatable objects `objects` (one per module, in the order
+// given) and the DPI-C libraries `dpi_libs` (objects and archives linked in;
+// shared libraries linked dynamically, found at run time beside where they are
+// now) into an executable for this machine at `output`. `exports_dpi` says the
+// design has export "DPI-C" functions, which a shared library can only reach if
+// the executable exports them. `scratch` is an existing directory for the
+// embedded files. On failure, lld's messages are on stderr and the return is
+// false.
+bool link_executable(std::span<const std::string> objects,
                      std::span<const std::string> dpi_libs,
                      bool                         exports_dpi,
                      const std::string&           output,
