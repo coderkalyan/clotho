@@ -1673,4 +1673,23 @@ endmodule
     CHECK(free_run.code == 0);
     CHECK(free_run.out == "done 1000000\n");
 }
+
+// uvm_pkg is the design the specialization names came from: a registry class per
+// registered class, each naming the next with the enclosing generic's parameters.
+// The sources are not in this tree; CLOTHO_UVM_SRC names a directory holding
+// `uvm_pkg.sv` and `uvm_macros.svh` (sv-tests' third_party/tests/uvm/src), and the
+// case is skipped without it.
+TEST_CASE("cli: uvm_pkg flattens" * doctest::skip(std::getenv("CLOTHO_UVM_SRC") == nullptr)) {
+    const Scratch  s;
+    const fs::path src(std::getenv("CLOTHO_UVM_SRC"));
+    const fs::path design = s.write("top.sv", R"(`include "uvm_macros.svh"
+import uvm_pkg::*;
+module top;
+  initial $display("hi");
+endmodule
+)");
+    const Result   r = s.run(std::format("lint -I\"{0}\" \"{0}/uvm_pkg.sv\" \"{1}\"", src.string(), design.string()));
+    CHECK(r.code == 0);
+    CHECK_FALSE(contains(r.err, "flatten:"));
+}
 #endif // !defined(_WIN32)

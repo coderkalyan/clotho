@@ -4115,3 +4115,124 @@ TEST_CASE("each module's class gets its own specialization of a global generic")
     )") == "top1 count=2 made=2\n"
            "top2 count=1 made=1\n");
 }
+
+// A design names what one unit imports from another by a name relative to the unit,
+// so everything a unit holds under a class's name has to have a name of its own: a
+// specialization is one class (LRM 8.25), with statics of its own, as long as its
+// arguments differ in any way. UVM's registry is the shape that did not: a class
+// names `Reg#(this_type, S)` with the enclosing generic's own parameters, so slang
+// prints `p::Comp::this_type` whichever specialization of `Comp` it is in, and the
+// two statics, which a time-zero initializer and a module both reach from other
+// units, shared one name (uvm_registry_common#(...)::m__initialized, one per
+// registered class). Verilator 5.050 agrees.
+TEST_CASE("specializations named by an enclosing generic's parameters have statics of their own") {
+    CHECK(run_capture(R"(
+        package p;
+            class Reg #(type T = int, string S = "");
+                static int hits = 10;
+                static function int touch(); hits++; return hits; endfunction
+            endclass
+            class Comp #(type T = int, string S = "<unknown>");
+                typedef Comp#(T, S) this_type;
+                static function int go(); return Reg#(this_type, S)::touch(); endfunction
+            endclass
+            class D; endclass
+            class E; endclass
+        endpackage
+        module top;
+            import p::*;
+            initial begin
+                $display("%0d %0d %0d", Comp#(D)::go(), Comp#(E)::go(), Comp#(D)::go());
+                $display("%0d %0d", Reg#(Comp#(D)::this_type, "<unknown>")::hits,
+                         Reg#(Comp#(E)::this_type, "<unknown>")::hits);
+            end
+        endmodule
+    )") == "11 11 12\n"
+           "12 11\n");
+}
+
+// slang prints a class argument by its name alone, so `R#(q1::D)` and `R#(q2::D)`
+// printed alike. They are two classes, so two specializations (LRM 8.25). Verilator
+// 5.050 runs them as one (it prints `2 3 4`), which the LRM does not allow.
+TEST_CASE("classes of one name in two packages are different arguments") {
+    CHECK(run_capture(R"(
+        package q1; class D; endclass endpackage
+        package q2; class D; endclass endpackage
+        package p;
+            class R #(type T = int);
+                static int n = 1;
+                static function int bump(); n++; return n; endfunction
+            endclass
+        endpackage
+        module top;
+            initial $display("%0d %0d %0d", p::R#(q1::D)::bump(), p::R#(q2::D)::bump(), p::R#(q1::D)::bump());
+        endmodule
+    )") == "2 2 3\n");
+}
+
+// slang names a nested class by its own name, so the `N` of `A` and the `N` of `B`
+// were one name, and so were the `In` of every specialization of `G`.
+TEST_CASE("classes nested in two classes, or in two specializations of one, have statics of their own") {
+    CHECK(run_capture(R"(
+        package p;
+            class A; class N; static int x = 1; endclass endclass
+            class B; class N; static int x = 2; endclass endclass
+            class G #(int V = 1);
+                class In; static int y = V; endclass
+                static function int get(); return In::y; endfunction
+            endclass
+        endpackage
+        module top;
+            initial $display("%0d %0d %0d %0d", p::A::N::x, p::B::N::x, p::G#(1)::get(), p::G#(2)::get());
+        endmodule
+    )") == "1 2 1 2\n");
+}
+
+// A static local is named by its subroutine, so two subroutines of one name in a
+// unit named their statics alike: methods of two classes, two specializations of one
+// (each has its own copies, LRM 8.25), and a package's or a module's own function
+// beside them. Verilator 5.050 agrees.
+TEST_CASE("a static local of a method belongs to its class and specialization") {
+    CHECK(run_capture(R"(
+        package p;
+            class G #(type T = int);
+                static function int f(); static int n = 10; n++; return n; endfunction
+            endclass
+            class H;
+                static function int f(); static int n = 20; n++; return n; endfunction
+            endclass
+            function int f(); static int n = 30; n++; return n; endfunction
+        endpackage
+        module top;
+            function int f(); static int n = 40; n++; return n; endfunction
+            class L;
+                static function int f(); static int n = 50; n++; return n; endfunction
+            endclass
+            initial $display("%0d %0d %0d %0d %0d %0d %0d %0d", p::G#(int)::f(), p::G#(bit)::f(), p::H::f(), p::f(),
+                             f(), L::f(), p::G#(int)::f(), L::f());
+        endmodule
+    )") == "11 11 21 31 41 51 12 52\n");
+}
+
+// Specialized with the module's own class, a package generic keeps its statics in
+// the module, and its method bodies, which the package holds, reach them by name
+// from there. Two generics with a method of one name are two sets of statics in
+// one unit. Verilator 5.050 agrees.
+TEST_CASE("package generics specialized with a module's class keep their method statics apart") {
+    CHECK(run_capture(R"(
+        package p;
+            class Factory #(type T = int);
+                static function int make(); static int n = 100; n++; return n; endfunction
+            endclass
+            class Maker #(type T = int);
+                static function int make(); static int n = 200; n++; return n; endfunction
+            endclass
+            function int make(); static int n = 300; n++; return n; endfunction
+        endpackage
+        module tb;
+            class Packet; endclass
+            initial $display("%0d %0d %0d %0d %0d", p::Factory#(Packet)::make(), p::Maker#(Packet)::make(),
+                             p::Factory#(Packet)::make(), p::Maker#(Packet)::make(), p::make());
+        endmodule
+    )") == "101 201 102 202 301\n");
+}

@@ -1599,7 +1599,7 @@ ir::Signal Lowerer::declare_static_return(const SubroutineSymbol& sub) {
     }
     const std::optional<Home> home = home_of(sub.getParentScope());
     ir::SignalInfo            info;
-    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(rv.name);
+    info.name            = subroutine_static_prefix(home, &sub) + std::string(rv.name);
     info.type            = lower_type(rv.getType());
     info.dir             = ir::SignalInfo::Direction::Internal;
     const ir::Signal sig = register_declared_signal(home, std::move(info));

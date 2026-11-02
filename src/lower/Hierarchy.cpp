@@ -91,8 +91,7 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
         // arr[i] for an instance array).
         fresh.name     = node_rel_ + std::string(leaf_name);
         fresh.def_name = std::string(inst.getDefinition().name);
-        own_scope(
-          body, ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = fresh.id }, inst.getHierarchicalPath() + ".");
+        own_scope(body, ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = fresh.id });
         scope_prefix_[fresh.id] = self_prefix;
         note_specialization(inst, fresh.id);
         if (scope_stack_.empty()) {
@@ -167,8 +166,8 @@ void Lowerer::lower_instance(const InstanceSymbol& inst,
     scope_stack_.pop_back();
 }
 
-void Lowerer::own_scope(const Scope& scope, ir::Owner owner, std::string strip) {
-    owners_->scopes.insert_or_assign(&scope, UnitOwners::Entry{ .owner = owner, .strip = std::move(strip) });
+void Lowerer::own_scope(const Scope& scope, ir::Owner owner) {
+    owners_->scopes.insert_or_assign(&scope, owner);
 }
 
 // Which specialization an instance elaborates, by slang's own sharing rule
@@ -207,8 +206,8 @@ void Lowerer::note_specialization(const InstanceSymbol& inst, uint32_t scope) {
     spec_bodies_[spec].push_back(&inst.body);
 }
 
-const UnitOwners::Entry& Lowerer::owner_in(const Scope* scope) const {
-    static const UnitOwners::Entry glue{ .owner = ir::Owner{ .kind = ir::Owner::Kind::Glue } };
+const ir::Owner& Lowerer::owner_in(const Scope* scope) const {
+    static const ir::Owner glue{ .kind = ir::Owner::Kind::Glue };
     for (const Scope* s = scope; s != nullptr; s = s->asSymbol().getParentScope()) {
         if (const auto it = owners_->scopes.find(s); it != owners_->scopes.end()) {
             return it->second;
@@ -217,12 +216,21 @@ const UnitOwners::Entry& Lowerer::owner_in(const Scope* scope) const {
     return glue;
 }
 
+const Scope* Lowerer::owner_frame(const Scope* scope) const {
+    for (const Scope* s = scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        if (const auto it = owners_->scopes.find(s); it != owners_->scopes.end()) {
+            return it->second.kind == ir::Owner::Kind::Scope ? s : nullptr;
+        }
+    }
+    return nullptr;
+}
+
 std::optional<Lowerer::Home> Lowerer::home_of(const Scope* decl) {
     const Scope* body = enclosing_instance_scope(decl);
     if (body == nullptr || body->asSymbol().kind != SymbolKind::InstanceBody) {
         return std::nullopt;
     }
-    const ir::Owner owner = owner_in(body).owner;
+    const ir::Owner owner = owner_in(body);
     if (owner.kind != ir::Owner::Kind::Scope) {
         return std::nullopt;
     }
@@ -230,12 +238,13 @@ std::optional<Lowerer::Home> Lowerer::home_of(const Scope* decl) {
     if (node == nullptr) {
         return std::nullopt;
     }
-    std::string prefix = scope_prefix_.at(owner.index);
+    std::string instance = scope_prefix_.at(owner.index);
+    std::string prefix   = instance;
     if (const std::string blocks = generate_path(decl); !blocks.empty()) {
         prefix.append(blocks, 1, std::string::npos);
         prefix += '.';
     }
-    return Home{ .node = node, .prefix = std::move(prefix) };
+    return Home{ .node = node, .instance_prefix = std::move(instance), .prefix = std::move(prefix) };
 }
 
 ir::Signal Lowerer::register_declared_signal(const std::optional<Home>& home, ir::SignalInfo info) {
@@ -246,23 +255,18 @@ ir::Signal Lowerer::register_declared_signal(const std::optional<Home>& home, ir
 }
 
 std::string Lowerer::import_name(const Symbol& decl) const {
-    const UnitOwners::Entry& e    = owner_in(decl.getParentScope());
-    std::string              name = decl.getHierarchicalPath();
-    if (name.starts_with(e.strip)) {
-        name.erase(0, e.strip.size());
-    }
-    return name;
+    return unit_path(decl, owner_frame(decl.getParentScope()));
 }
 
-// `name` as an import name unique within its table of the unit `e` owns.
+// `name` as an import name unique within its table of the unit `owner` names.
 // TODO: a class (or covergroup type) declared in a package or `$unit` is lowered
 // once per Lowerer that reaches it (its Refs are nominal per Lowerer), so its copy
 // thunk, randomize and sample bodies exist once per top. Until those lower once, in
 // their declaring unit, the later copies take an ordinal so every import name stays
 // unique within its unit.
-std::string Lowerer::unique_import_name(const UnitOwners::Entry& e, std::string name, std::string_view table) {
-    const std::string key = std::string(table) + std::to_string(static_cast<uint32_t>(e.owner.kind)) + ":" +
-                            std::to_string(e.owner.index) + ":" + name;
+std::string Lowerer::unique_import_name(ir::Owner owner, std::string name, std::string_view table) {
+    const std::string key  = std::string(table) + std::to_string(static_cast<uint32_t>(owner.kind)) + ":" +
+                             std::to_string(owner.index) + ":" + name;
     const uint32_t    seen = owners_->names[key]++;
     if (seen != 0) {
         name += "#" + std::to_string(seen + 1);
@@ -271,19 +275,19 @@ std::string Lowerer::unique_import_name(const UnitOwners::Entry& e, std::string 
 }
 
 void Lowerer::own_function(ir::FunctionId id, const Symbol& decl, std::string_view suffix) {
-    const UnitOwners::Entry& e = owner_in(decl.getParentScope());
-    record_function(id, e.owner, unique_import_name(e, import_name(decl) + std::string(suffix), ""));
+    const ir::Owner owner = owner_in(decl.getParentScope());
+    record_function(id, owner, unique_import_name(owner, import_name(decl) + std::string(suffix), ""));
 }
 
 void Lowerer::own_cover_type(uint32_t idx, const Symbol& decl) {
-    const UnitOwners::Entry& e = owner_in(decl.getParentScope());
-    ir::Attribution&         a = owners_->attribution;
+    const ir::Owner  owner = owner_in(decl.getParentScope());
+    ir::Attribution& a     = owners_->attribution;
     if (a.cover_types.size() <= idx) {
         a.cover_types.resize(idx + 1);
         a.cover_type_names.resize(idx + 1);
     }
-    a.cover_types[idx]      = e.owner;
-    a.cover_type_names[idx] = unique_import_name(e, import_name(decl), "cover:");
+    a.cover_types[idx]      = owner;
+    a.cover_type_names[idx] = unique_import_name(owner, import_name(decl), "cover:");
 }
 
 void Lowerer::record_function(ir::FunctionId id, ir::Owner owner, std::string name) {
@@ -730,8 +734,7 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
     // Every package and compilation unit is a static unit of its own.
     const auto own_static = [&](const Scope& scope, std::string name) {
         std::vector<std::string>& statics = owners_->attribution.statics;
-        own_scope(
-          scope, ir::Owner{ .kind = ir::Owner::Kind::Static, .index = static_cast<uint32_t>(statics.size()) }, "");
+        own_scope(scope, ir::Owner{ .kind = ir::Owner::Kind::Static, .index = static_cast<uint32_t>(statics.size()) });
         statics.push_back(std::move(name));
     };
     for (const PackageSymbol* pkg : comp.getPackages()) {

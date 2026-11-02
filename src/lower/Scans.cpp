@@ -2,6 +2,8 @@
 
 #include "lower/Lowerer.h"
 
+#include <slang/text/CharInfo.h>
+
 namespace clotho::lower {
 
 // Resolve an interface modport-port proxy to the interface instance's own
@@ -410,20 +412,29 @@ void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out)
                 break;
             }
             case SymbolKind::GenericClassDef: {
-                std::vector<std::pair<std::string, const ClassType*>> specs;
+                // By the name slang prints and then by the path: two specializations
+                // the first cannot tell apart would otherwise come out in whatever order
+                // slang's table holds them, which is the initialization order of their
+                // statics.
+                struct Spec {
+                    std::string      printed;
+                    std::string      path;
+                    const ClassType* cls;
+                };
+                std::vector<Spec> specs;
                 for (const Type& spec : m.as<GenericClassDefSymbol>().specializations()) {
                     // A specialization whose arguments failed to elaborate is an
                     // ErrorType, and has no members to initialize.
                     if (const auto* cls = spec.as_if<ClassType>()) {
-                        specs.emplace_back(cls->toString(), cls);
+                        specs.push_back(Spec{ cls->toString(), unit_path(*cls, nullptr), cls });
                     }
                 }
-                std::ranges::stable_sort(specs, [](const auto& a, const auto& b) {
-                    return a.first < b.first;
+                std::ranges::stable_sort(specs, [](const Spec& a, const Spec& b) {
+                    return a.printed != b.printed ? a.printed < b.printed : a.path < b.path;
                 });
-                for (const auto& [name, cls] : specs) {
-                    out.push_back(cls);
-                    collect_class_types(*cls, out);
+                for (const Spec& spec : specs) {
+                    out.push_back(spec.cls);
+                    collect_class_types(*spec.cls, out);
                 }
                 break;
             }
@@ -991,6 +1002,185 @@ const Scope* enclosing_instance_scope(const Scope* s) {
         }
     }
     return nullptr;
+}
+
+const Scope* unit_frame(const Scope* scope) {
+    if (const Scope* body = enclosing_instance_scope(scope);
+        body != nullptr && body->asSymbol().kind == SymbolKind::InstanceBody) {
+        return body;
+    }
+    for (const Scope* s = scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        const SymbolKind kind = s->asSymbol().kind;
+        if (kind == SymbolKind::Package || kind == SymbolKind::CompilationUnit) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+namespace {
+
+// A name as slang writes it in a path: escaped when it is not a plain identifier.
+std::string path_name(std::string_view name) {
+    const auto escaped = [&] {
+        if (name.empty()) {
+            return false;
+        }
+        if (!slang::isValidCIdChar(name[0]) || slang::isDecimalDigit(name[0])) {
+            return true;
+        }
+        return std::ranges::any_of(name.substr(1), [](char c) { return !slang::isValidCIdChar(c) && c != '$'; });
+    };
+
+    return escaped() ? "\\" + std::string(name) + " " : std::string(name);
+}
+
+// The typedef that declares an anonymous struct, union or enum type: the alias in its
+// scope that names it directly (an alias of that alias names the same type again).
+const Symbol* declaring_typedef(const slang::ast::Type& t) {
+    const Scope* scope = t.getParentScope();
+    if (scope == nullptr) {
+        return nullptr;
+    }
+    for (const Symbol& m : scope->members()) {
+        if (const auto* alias = m.as_if<slang::ast::TypeAliasType>();
+            alias != nullptr && &alias->targetType.getType() == &t) {
+            return alias;
+        }
+    }
+
+    return nullptr;
+}
+
+// A type as an argument of a specialization writes it. Types are matched by their
+// canonical form (the key slang caches a specialization under), so a typedef is
+// followed to what it names: one type has one spelling, whichever alias reached it.
+// A class is written by its path and the types an array holds by theirs, since those
+// are the types that two scopes can each declare under one name; a struct, union or
+// enum by the typedef that declares it, in the scope that holds it.
+std::string type_path(const slang::ast::Type& type, const Scope* frame) {
+    const slang::ast::Type& t = type.getCanonicalType();
+    switch (t.kind) {
+        case SymbolKind::ClassType:
+            return unit_path(t, frame);
+        case SymbolKind::FixedSizeUnpackedArrayType: {
+            const auto& a = t.as<slang::ast::FixedSizeUnpackedArrayType>();
+            return type_path(a.elementType, frame) + "$[" + std::to_string(a.range.left) + ":" +
+                   std::to_string(a.range.right) + "]";
+        }
+        case SymbolKind::DynamicArrayType:
+            return type_path(t.as<slang::ast::DynamicArrayType>().elementType, frame) + "$[]";
+        case SymbolKind::QueueType: {
+            const auto& q = t.as<slang::ast::QueueType>();
+            return type_path(q.elementType, frame) + "$[$" +
+                   (q.maxBound != 0 ? ":" + std::to_string(q.maxBound) : std::string()) + "]";
+        }
+        case SymbolKind::AssociativeArrayType: {
+            const auto& a = t.as<slang::ast::AssociativeArrayType>();
+            return type_path(a.elementType, frame) + "$[" +
+                   (a.indexType != nullptr ? type_path(*a.indexType, frame) : std::string("*")) + "]";
+        }
+        case SymbolKind::EnumType:
+        case SymbolKind::PackedStructType:
+        case SymbolKind::UnpackedStructType:
+        case SymbolKind::PackedUnionType:
+        case SymbolKind::UnpackedUnionType:
+            if (const Symbol* alias = declaring_typedef(t)) {
+                return unit_path(*alias, frame);
+            }
+            // Declared where no typedef names it: it names itself with a number of its
+            // own (`s$12`), which no other type shares.
+            return t.toString();
+        default:
+            return t.toString();
+    }
+}
+
+// The arguments of a specialization (LRM 8.25), `#(a,b)`: a type parameter as
+// type_path writes it and a value parameter as the whole of its value, which
+// slang's own rendering shortens past 128 bits.
+std::string class_arguments(const ClassType& cls, const Scope* frame) {
+    std::string out   = "#(";
+    bool        first = true;
+    for (const Symbol* param : cls.genericParameters) {
+        if (!first) {
+            out += ',';
+        }
+        first = false;
+        if (const auto* type_param = param->as_if<TypeParameterSymbol>()) {
+            out += type_path(type_param->targetType.getType(), frame);
+        } else {
+            out += param->as<ParameterSymbol>().getValue().toString(slang::SVInt::MAX_BITS, /*exactUnknowns=*/true);
+        }
+    }
+    out += ')';
+
+    return out;
+}
+
+// One symbol's own segment of a path.
+std::string own_segment(const Symbol& sym, const Scope* frame) {
+    switch (sym.kind) {
+        case SymbolKind::GenerateBlockArray:
+            return sym.name.empty() ? sym.as<GenerateBlockArraySymbol>().getExternalName() : path_name(sym.name);
+        case SymbolKind::GenerateBlock: {
+            const auto& block = sym.as<GenerateBlockSymbol>();
+            if (const slang::SVInt* index = block.getArrayIndex()) {
+                return "[" + index->toString(slang::LiteralBase::Decimal, false) + "]";
+            }
+            return sym.name.empty() ? block.getExternalName() : path_name(sym.name);
+        }
+        case SymbolKind::ClassType: {
+            const auto& cls = sym.as<ClassType>();
+            return path_name(sym.name) + (cls.genericClass != nullptr ? class_arguments(cls, frame) : std::string());
+        }
+        default:
+            return path_name(sym.name);
+    }
+}
+
+} // namespace
+
+std::string unit_path(const Symbol& sym, const Scope* frame) {
+    std::string  own    = own_segment(sym, frame);
+    const Scope* parent = sym.getParentScope();
+    if (parent == nullptr || parent == frame) {
+        return own;
+    }
+    const Symbol& ps = parent->asSymbol();
+    std::string   up;
+    switch (ps.kind) {
+        case SymbolKind::Root:
+            return own;
+        case SymbolKind::CompilationUnit:
+            // slang leaves `$unit` out of a path, which is only unambiguous while the
+            // path is absolute: from a frame, a name of `$unit` has to differ from one
+            // the frame declares. A package is a member of `$unit` and named alone.
+            return frame == nullptr || sym.kind == SymbolKind::Package ? own : "$unit::" + own;
+        case SymbolKind::InstanceBody: {
+            // The body is not the frame, so this is another instance's member: named
+            // by where that instance is.
+            const InstanceSymbol* inst = ps.as<InstanceBodySymbol>().parentInstance;
+            up                         = inst != nullptr ? inst->getHierarchicalPath() : path_name(ps.name);
+            break;
+        }
+        default:
+            up = unit_path(ps, frame);
+            break;
+    }
+    if (own.empty()) {
+        return up;
+    }
+    if (up.empty()) {
+        return own;
+    }
+    if (own.front() == '[') {
+        return up + own;
+    }
+    const bool scoped =
+      ps.kind == SymbolKind::Package || ps.kind == SymbolKind::ClassType || ps.kind == SymbolKind::CovergroupType;
+
+    return up + (scoped ? "::" : ".") + own;
 }
 
 namespace {
