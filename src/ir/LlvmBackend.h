@@ -14,9 +14,12 @@
 //   * A 4-state SSA value is lowered as a (must|may, z) plane pair so X/Z
 //     propagate; a 2-state value is one native integer.
 
+#include <cstddef>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -62,12 +65,13 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
 
 // Same construction + first-verification pass as build_modules, but returns
 // before running optimize_module (coro intrinsics intact regardless of
-// `config.lower_coro`) and before the second verify. run_jit uses this to
-// migrate each module into its own LLVMContext (a bitcode round-trip, see
-// Jit.cpp) before optimizing, so unrelated modules can be optimized/codegen'd
-// concurrently — LLVMContext is not thread-safe, so this can't happen while
-// modules still share `ctx`. build_modules itself is unchanged (single shared
-// context, sequential optimize_module loop) for emit_llvm / tests.
+// `config.lower_coro`) and before the second verify. run_jit and the object
+// emitters use this and hand the result to for_each_optimized_module, which
+// migrates each module into its own LLVMContext (a bitcode round-trip) before
+// optimizing, so unrelated modules can be optimized and code-generated
+// concurrently -- LLVMContext is not thread-safe, so this can't happen while
+// modules still share `ctx`. build_modules itself keeps the single shared
+// context and a sequential optimize_module loop, for emit_llvm and tests.
 BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
                                       const llvm::TargetMachine& target,
                                       const SimulationConfig&    config  = {},
@@ -79,6 +83,33 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
 // if the pipeline string is rejected; see build_modules for the call sequence
 // (optimize_module then re-verify).
 bool optimize_module(llvm::Module& m, bool o3);
+
+// A module and the LLVMContext it lives in. The context is declared first, so it
+// is destroyed after the module.
+struct OwnedModule {
+    std::unique_ptr<llvm::LLVMContext> ctx;
+    std::unique_ptr<llvm::Module>      module;
+};
+
+// What becomes of one module `for_each_optimized_module` has finished with: `index`
+// is its place in `BuiltDesign::modules` (root is 0). Called on a worker thread,
+// concurrently with the calls for other modules.
+using ModuleConsumer = llvm::function_ref<llvm::Error(size_t index, OwnedModule&& optimized)>;
+
+// The per-module half of compilation, shared by `run` (the consumer hands the module
+// to the JIT) and `build` (it generates an object), so the two cannot drift. The
+// modules of `built`, an unoptimized build_modules_unoptimized result, are written
+// to bitcode on the calling thread (`build_ctx`, the context that holds them, is
+// not thread-safe) and both are released: `built` is left empty and `build_ctx`
+// is destroyed. Then, on `config.compile_jobs` worker threads (0 means the
+// machine's), each module is read back into a context of its own, run through
+// optimize_module (`config.o3`), verified, and passed to `consume`. The first
+// failure is returned, with its reason, and modules not yet started are
+// skipped. `config.stats` `parallel` reports the phase's timings on stderr.
+llvm::Error for_each_optimized_module(BuiltDesign&                       built,
+                                      std::unique_ptr<llvm::LLVMContext> build_ctx,
+                                      const SimulationConfig&            config,
+                                      ModuleConsumer                     consume);
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR for
 // the host target to `os`. Returns false (and writes the reason to
@@ -117,14 +148,15 @@ struct SharedCodeCheck {
 SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve = {});
 
 // Compile the design for `target`'s triple, CPU and features and write it to
-// `os` as one relocatable object file. The object defines `clotho_main`, the
-// entry rt_run takes, and `clotho_design`, the rt_design an executable's main
-// reads; every runtime symbol it references is left undefined, for a link
-// against the runtime. Per-definition units are linked back into the root
-// module first, so the object holds exactly the code `run` would
-// compile. Code generation uses `config.o3` as run_jit does, the platform's
-// default code model and position-independent code, so the object links into a
-// PIE. Returns false with the reason on llvm::errs().
+// `os` as one relocatable object file, holding the code of every module. The
+// object defines `clotho_main`, the entry rt_run takes, and `clotho_design`, the
+// rt_design an executable's main reads; every runtime symbol it references is
+// left undefined, for a link against the runtime. The modules are optimized in
+// parallel (for_each_optimized_module), then linked back into the root module,
+// so the object holds exactly the code `run` would compile, and generated as one
+// on the calling thread. Code generation uses `config.o3` as run_jit does, the
+// platform's default code model and position-independent code, so the object
+// links into a PIE. Returns false with the reason on llvm::errs().
 bool emit_object(const Module&                             m,
                  llvm::raw_ostream&                        os,
                  const llvm::orc::JITTargetMachineBuilder& target,

@@ -2,6 +2,10 @@
 
 #include "ir/llvm/Backend.h"
 
+#include <atomic>
+#include <cstdio>
+#include <mutex>
+
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -9,6 +13,8 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/Support/ThreadPool.h>
+#include <llvm/Support/Threading.h>
 
 #include "ir/Verify.h"
 #include "ir/llvm/RuntimeBitcode.h"
@@ -362,6 +368,27 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
     return built;
 }
 
+// A built module written to bitcode, under the identifier it goes by.
+struct ModuleBitcode {
+    llvm::SmallVector<char, 0> bytes;
+    std::string                name;
+};
+
+// Every module of `built`, in order, as bitcode; `built` is left empty. A
+// read-only traversal of the context the modules share, so it is done on one
+// thread: nothing is written into the context's uniquing tables, but concurrent
+// readers of one LLVMContext are not worth the risk.
+static std::vector<ModuleBitcode> serialize_modules(BuiltDesign& built) {
+    std::vector<ModuleBitcode> bitcode(built.modules.size());
+    for (size_t i = 0; i < built.modules.size(); ++i) {
+        llvm::raw_svector_ostream bits(bitcode[i].bytes);
+        llvm::WriteBitcodeToFile(*built.modules[i], bits);
+        bitcode[i].name = built.modules[i]->getModuleIdentifier();
+    }
+    built.modules.clear();
+    return bitcode;
+}
+
 // The built modules, each moved by a bitcode round trip into `shared` -- or, with
 // none, into a context of its own, kept in `owned` -- so a module reloaded alone
 // names its types as its own text says, where modules still sharing the building
@@ -369,16 +396,9 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
 static bool reload_modules(BuiltDesign& built, llvm::LLVMContext* shared,
                            std::vector<std::unique_ptr<llvm::LLVMContext>>& owned,
                            std::vector<std::unique_ptr<llvm::Module>>&      out) {
-    std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
-    std::vector<std::string>                names;
-    for (size_t i = 0; i < built.modules.size(); ++i) {
-        llvm::raw_svector_ostream bits(bitcode[i]);
-        llvm::WriteBitcodeToFile(*built.modules[i], bits);
-        names.push_back(built.modules[i]->getModuleIdentifier());
-    }
-    built.modules.clear();
-    for (size_t i = 0; i < bitcode.size(); ++i) {
-        const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
+    const std::vector<ModuleBitcode> bitcode = serialize_modules(built);
+    for (const ModuleBitcode& unit : bitcode) {
+        const llvm::MemoryBufferRef buf(llvm::StringRef(unit.bytes.data(), unit.bytes.size()), unit.name);
         llvm::LLVMContext*          ctx = shared;
         if (ctx == nullptr) {
             ctx = owned.emplace_back(std::make_unique<llvm::LLVMContext>()).get();
@@ -391,6 +411,109 @@ static bool reload_modules(BuiltDesign& built, llvm::LLVMContext* shared,
         out.push_back(std::move(*parsed));
     }
     return true;
+}
+
+llvm::Error for_each_optimized_module(BuiltDesign&                       built,
+                                      std::unique_ptr<llvm::LLVMContext> build_ctx,
+                                      const SimulationConfig&            config,
+                                      ModuleConsumer                     consume) {
+    const bool stat = stat_on(config.stats, Stat::Parallel);
+
+    // Each buffer below is reparsed into its own fresh LLVMContext, so optimize_module,
+    // verification and `consume` for different modules run concurrently instead of
+    // serializing on one shared context's lock. The modules and the context that
+    // holds them go now: only the bitcode is needed, and a large design's IR is
+    // many times its bitcode.
+    const auto                       t_serialize = std::chrono::steady_clock::now();
+    const std::vector<ModuleBitcode> bitcode     = serialize_modules(built);
+    build_ctx.reset();
+    if (stat) {
+        fprintf(stderr, "PARALLEL_STAT serialize: %.1f ms\n", ms_since(t_serialize));
+    }
+
+    const auto          t_parallel = std::chrono::steady_clock::now();
+    std::vector<double> stat_ms(stat ? bitcode.size() : 0);
+    std::mutex          err_mu;
+    std::string         first_err;
+    std::atomic<bool>   failed = false;
+    const auto          fail   = [&](std::string message) {
+        const std::lock_guard<std::mutex> lock(err_mu);
+        if (first_err.empty()) {
+            first_err = std::move(message);
+        }
+        failed = true;
+    };
+
+    {
+        llvm::DefaultThreadPool pool(llvm::hardware_concurrency(config.compile_jobs));
+        for (size_t i = 0; i < bitcode.size(); ++i) {
+            pool.async([&, i] {
+                if (failed) {
+                    return;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                OwnedModule unit;
+                unit.ctx = std::make_unique<llvm::LLVMContext>();
+                const llvm::MemoryBufferRef buf(
+                  llvm::StringRef(bitcode[i].bytes.data(), bitcode[i].bytes.size()), bitcode[i].name);
+                auto parsed = llvm::parseBitcodeFile(buf, *unit.ctx);
+                if (!parsed) {
+                    fail("module '" + bitcode[i].name + "' reload failed: " + llvm::toString(parsed.takeError()));
+                    return;
+                }
+                unit.module = std::move(*parsed);
+                if (!optimize_module(*unit.module, config.o3)) {
+                    fail("module '" + bitcode[i].name + "' optimize failed");
+                    return;
+                }
+                if (llvm::verifyModule(*unit.module, &llvm::errs())) {
+                    fail("module '" + bitcode[i].name + "' failed verification after optimize");
+                    return;
+                }
+                if (auto err = consume(i, std::move(unit))) {
+                    fail(llvm::toString(std::move(err)));
+                    return;
+                }
+                if (stat) {
+                    stat_ms[i] = ms_since(t0);
+                }
+            });
+        }
+        pool.wait();
+    }
+
+    if (stat) {
+        fprintf(stderr, "PARALLEL_STAT parallel section wall: %.1f ms\n", ms_since(t_parallel));
+        double sum = 0.0, max_ms = 0.0;
+        size_t max_i = 0;
+        for (size_t i = 0; i < stat_ms.size(); ++i) {
+            sum += stat_ms[i];
+            if (stat_ms[i] > max_ms) {
+                max_ms = stat_ms[i];
+                max_i  = i;
+            }
+        }
+        // max_ms is the longest single module's optimize+verify+consume time -- a
+        // hard wall-time floor no thread count can beat. sum/max_ms is the speedup
+        // ceiling (vs a hypothetical fully-serial run of just this phase); compare
+        // against the measured speedup to see how much headroom load imbalance (a
+        // few big modules dominating) is costing.
+        fprintf(stderr,
+                "PARALLEL_STAT modules=%zu jobs=%u sum_ms=%.1f max_ms=%.1f (module %zu) ceiling=%.2fx\n",
+                stat_ms.size(),
+                llvm::hardware_concurrency(config.compile_jobs).compute_thread_count(),
+                sum,
+                max_ms,
+                max_i,
+                sum / std::max(max_ms, 1e-6));
+        for (size_t i = 0; i < stat_ms.size(); ++i) {
+            fprintf(stderr, "  module %zu: %.1f ms (bitcode %zu B)\n", i, stat_ms[i], bitcode[i].bytes.size());
+        }
+    }
+    if (!first_err.empty()) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), first_err);
+    }
+    return llvm::Error::success();
 }
 
 SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve) {
@@ -509,6 +632,48 @@ bool emit_llvm_modules(const Module& m, std::vector<ModuleIr>& out, const Simula
     return true;
 }
 
+// The machine objects are generated for. Not target.createTargetMachine(): that
+// asks for a JIT target machine, and on x86-64 a JIT one defaults to the large code
+// model, whose absolute 64-bit addresses in the code are text relocations a macOS
+// link refuses. Only the triple, CPU and features carry over; the code model and
+// target options are the platform's defaults for ordinary compiled code. One per
+// thread: a TargetMachine is not meant to be shared.
+static llvm::Expected<std::unique_ptr<llvm::TargetMachine>>
+object_machine(const llvm::orc::JITTargetMachineBuilder& target, bool o3) {
+    std::string error;
+    const auto* llvm_target = llvm::TargetRegistry::lookupTarget(target.getTargetTriple(), error);
+    if (llvm_target == nullptr) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), error);
+    }
+    std::unique_ptr<llvm::TargetMachine> tm(
+      llvm_target->createTargetMachine(target.getTargetTriple(),
+                                       target.getCPU(),
+                                       target.getFeatures().getString(),
+                                       llvm::TargetOptions(),
+                                       llvm::Reloc::PIC_,
+                                       std::nullopt,
+                                       o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None));
+    if (tm == nullptr) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "cannot generate code for " + target.getTargetTriple().str());
+    }
+    return tm;
+}
+
+// The object code of `module`, in memory first: an object writer may seek back to
+// patch headers, which a pipe on stdout cannot do.
+static llvm::Expected<llvm::SmallVector<char, 0>> generate_object(llvm::Module& module, llvm::TargetMachine& tm) {
+    llvm::SmallVector<char, 0> object;
+    llvm::raw_svector_ostream  object_os(object);
+    llvm::legacy::PassManager  pm;
+    if (tm.addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "target " + tm.getTargetTriple().str() + " cannot write an object file");
+    }
+    pm.run(module);
+    return object;
+}
+
 bool emit_object(const Module&                             m,
                  llvm::raw_ostream&                        os,
                  const llvm::orc::JITTargetMachineBuilder& target,
@@ -516,55 +681,56 @@ bool emit_object(const Module&                             m,
                  Timings*                                  timings,
                  const LocResolver&                        resolve) {
     assert(config.lower_coro && "an object needs the coroutines lowered");
-    const auto  t_llvm = std::chrono::steady_clock::now();
-    std::string error;
-    const auto* llvm_target = llvm::TargetRegistry::lookupTarget(target.getTargetTriple(), error);
-    if (llvm_target == nullptr) {
-        llvm::errs() << "llvm backend: " << error << "\n";
+    const auto t_llvm = std::chrono::steady_clock::now();
+    auto       tm     = object_machine(target, config.o3);
+    if (!tm) {
+        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
         return false;
     }
-    // Not target.createTargetMachine(): that asks for a JIT target machine, and
-    // on x86-64 a JIT one defaults to the large code model, whose absolute
-    // 64-bit addresses in the code are text relocations a macOS link refuses.
-    // Only the triple, CPU and features carry over; the code model and target
-    // options are the platform's defaults for ordinary compiled code.
-    const std::unique_ptr<llvm::TargetMachine> tm(
-      llvm_target->createTargetMachine(target.getTargetTriple(),
-                                       target.getCPU(),
-                                       target.getFeatures().getString(),
-                                       llvm::TargetOptions(),
-                                       llvm::Reloc::PIC_,
-                                       std::nullopt,
-                                       config.o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None));
-    if (tm == nullptr) {
-        llvm::errs() << "llvm backend: cannot generate code for " << target.getTargetTriple().str() << "\n";
-        return false;
-    }
-    llvm::LLVMContext ctx;
-    auto              built = build_modules(m, ctx, *tm, config, resolve);
+    auto ctx   = std::make_unique<llvm::LLVMContext>();
+    auto built = build_modules_unoptimized(m, *ctx, **tm, config, resolve);
     if (built.modules.empty()) {
         return false;
     }
-    llvm::Module& root = *built.modules.front();
-    llvm::Linker  linker(root);
-    for (size_t i = 1; i < built.modules.size(); ++i) {
+
+    // The modules are optimized apart and in parallel, then linked into one, which
+    // the Linker can only do inside one context: each goes back through bitcode.
+    std::vector<llvm::SmallVector<char, 0>> optimized(built.modules.size());
+    if (auto err = for_each_optimized_module(built, std::move(ctx), config, [&](size_t i, OwnedModule&& unit) -> llvm::Error {
+            llvm::raw_svector_ostream bits(optimized[i]);
+            llvm::WriteBitcodeToFile(*unit.module, bits);
+            return llvm::Error::success();
+        })) {
+        llvm::errs() << "llvm backend: " << llvm::toString(std::move(err)) << "\n";
+        return false;
+    }
+    llvm::LLVMContext             linked_ctx;
+    std::unique_ptr<llvm::Module> root;
+    for (size_t i = 0; i < optimized.size(); ++i) {
+        const llvm::MemoryBufferRef buf(llvm::StringRef(optimized[i].data(), optimized[i].size()), "clotho.unit");
+        auto                        parsed = llvm::parseBitcodeFile(buf, linked_ctx);
+        if (!parsed) {
+            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
+            return false;
+        }
+        llvm::SmallVector<char, 0>().swap(optimized[i]);
+        if (i == 0) {
+            root = std::move(*parsed);
+            continue;
+        }
+        llvm::Linker linker(*root);
         // Reports its own diagnostic through the context's handler.
-        if (linker.linkInModule(std::move(built.modules[i]))) {
+        if (linker.linkInModule(std::move(*parsed))) {
             return false;
         }
     }
 
-    // Emitted into memory first: an object writer may seek back to patch
-    // headers, which a pipe on stdout cannot do.
-    llvm::SmallVector<char, 0> object;
-    llvm::raw_svector_ostream  object_os(object);
-    llvm::legacy::PassManager  pm;
-    if (tm->addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
-        llvm::errs() << "llvm backend: target " << tm->getTargetTriple().str() << " cannot write an object file\n";
+    auto object = generate_object(*root, **tm);
+    if (!object) {
+        llvm::errs() << "llvm backend: " << llvm::toString(object.takeError()) << "\n";
         return false;
     }
-    pm.run(root);
-    os.write(object.data(), object.size());
+    os.write(object->data(), object->size());
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
     }
