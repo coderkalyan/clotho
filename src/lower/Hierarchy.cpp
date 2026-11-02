@@ -681,6 +681,7 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // And the package / $unit generics this top specializes with its own classes,
     // which the globals pass left to it.
     init_local_class_specializations(top);
+    build_foreign_subroutines(top);
     scope_stack_.pop_back();
     // Every body compute_vtable reserved while lowering this top's types, now
     // that the top's signals and scope tree are complete. Before the finalizers,

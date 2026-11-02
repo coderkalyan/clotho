@@ -308,8 +308,9 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Hierarchy reach
 
-- [ ] **Cross-top hierarchical reference** — `top2.sig` from `top1`; each top lowers with
-  its own signal map.
+- [ ] **Cross-top hierarchical reference** — `top2.sig` from `top1`; each top lowers with its
+  own signal map. Calls into another top work; `$unit` code or a method calling `top.f()` is
+  refused, and so is a later top's function returning a class handle.
 - [ ] **Hierarchical path through a generate-block instance or an instance-array element**
   — `g.u.sig` and `arr[i].sig` fail at elaboration.
 - [~] **`inout` / `ref` port aliasing** (23.2.2.1, 23.3.3) — a port and its connection must be

@@ -1004,6 +1004,94 @@ const Scope* enclosing_instance_scope(const Scope* s) {
     return nullptr;
 }
 
+// The root (top-level) instance whose hierarchy ultimately contains `scope`, or
+// null when it sits in no elaborated instance. A module's members hang off an
+// InstanceBodySymbol whose own parent scope is the *declaration* site, so
+// climbing a level steps across the body/InstanceSymbol pair through
+// parentInstance — the same walk control_depth uses.
+const InstanceSymbol* owning_top(const Scope* scope) {
+    const InstanceSymbol* top = nullptr;
+    while (scope != nullptr) {
+        const Symbol& sym = scope->asSymbol();
+        if (sym.kind != SymbolKind::InstanceBody) {
+            scope = sym.getParentScope();
+            continue;
+        }
+        const InstanceSymbol* parent = sym.as<InstanceBodySymbol>().parentInstance;
+        if (parent == nullptr) {
+            return nullptr; // a body slang elaborated without an instance
+        }
+        top   = parent;
+        scope = parent->getParentScope();
+    }
+    return top;
+}
+
+const InstanceSymbol* owning_top(const SubroutineSymbol& sub) {
+    return owning_top(sub.getParentScope());
+}
+
+namespace {
+
+// Every call, in any top or outside them all, of a task or function that a
+// different top-level module's instances declare (`a.f()` in `top`).
+struct ForeignCallScan : ASTVisitor<ForeignCallScan, VisitFlags::AllGood> {
+    ForeignCalls& out;
+    // The top-level instance being walked; null in a package or `$unit`.
+    const InstanceSymbol* top = nullptr;
+
+    explicit ForeignCallScan(ForeignCalls& o)
+      : out(o) {}
+
+    void handle(const InstanceSymbol& inst) {
+        if (top == nullptr && inst.getParentScope()->asSymbol().kind == SymbolKind::Root) {
+            top = &inst;
+            visitDefault(inst);
+            top = nullptr;
+            return;
+        }
+        visitDefault(inst);
+    }
+
+    void handle(const CallExpression& call) {
+        if (!call.isSystemCall()) {
+            const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+            if (const InstanceSymbol* callee = owning_top(sub);
+                callee != nullptr && callee != top && is_instance_subroutine(sub)) {
+                if (out.fns.try_emplace(&sub).second) {
+                    out.order.push_back(&sub);
+                }
+            }
+        }
+        visitDefault(call);
+    }
+
+    // Whether `sub` is a subroutine of an instance's own scope, which is what a
+    // hierarchical call names: not a method (an object carries its own class) and
+    // not a DPI import (a declaration of a C function, with no state).
+    static bool is_instance_subroutine(const SubroutineSymbol& sub) {
+        if (sub.flags.has(slang::ast::MethodFlags::DPIImport)) {
+            return false;
+        }
+        for (const Scope* s = sub.getParentScope(); s != nullptr; s = s->asSymbol().getParentScope()) {
+            if (s->asSymbol().kind == SymbolKind::ClassType) {
+                return false;
+            }
+            if (s->asSymbol().kind == SymbolKind::InstanceBody) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+} // namespace
+
+void collect_foreign_calls(const slang::ast::RootSymbol& root, ForeignCalls& out) {
+    ForeignCallScan scan(out);
+    root.visit(scan);
+}
+
 const Scope* unit_frame(const Scope* scope) {
     if (const Scope* body = enclosing_instance_scope(scope);
         body != nullptr && body->asSymbol().kind == SymbolKind::InstanceBody) {

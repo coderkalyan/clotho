@@ -887,6 +887,34 @@ struct IfaceIds {
     ankerl::unordered_dense::map<std::string_view, uint32_t>             slots;
 };
 
+// The root instance whose hierarchy contains `scope` (a subroutine's, or the scope
+// of a declaration), null when it sits in none: a package's or `$unit`'s.
+const InstanceSymbol* owning_top(const slang::ast::Scope* scope);
+const InstanceSymbol* owning_top(const slang::ast::SubroutineSymbol& sub);
+
+// The tasks and functions one top-level module's instances declare and something
+// outside that top calls by hierarchical name (LRM 23.7): `same.check_time()` in
+// `top`. One body serves every caller, and the top that declares it lowers it, so
+// its statics belong to that instance (LRM 13.4.2) whichever top reaches it first.
+// A caller lowered before that top reserves the function and the owner fills it.
+// Filled by collect_foreign_calls before any top is lowered and shared by every
+// Lowerer, like UnitOwners.
+struct ForeignCalls {
+    struct Fn {
+        ir::FunctionId id{};
+        bool           reserved = false;
+        bool           built    = false;
+    };
+    ankerl::unordered_dense::map<const slang::ast::SubroutineSymbol*, Fn> fns;
+    // The keys of `fns` in the order the design names them, so the owner builds
+    // them in the same order every run.
+    std::vector<const slang::ast::SubroutineSymbol*> order;
+};
+
+// Every foreign call of a design with several tops. A design with one top has none
+// a hierarchical name could make: it is the only top there is.
+void collect_foreign_calls(const slang::ast::RootSymbol& root, ForeignCalls& out);
+
 // Which unit declares what, for partition (ir/Partition.h). Shared by every
 // Lowerer of one design, like ClassIds: the globals Lowerer registers the static
 // units, each top's Collect pass registers its instance bodies, and every
@@ -1101,6 +1129,11 @@ public:
     // Point this Lowerer at the design-wide unit ownership record (UnitOwners).
     void set_unit_owners(UnitOwners* owners) {
         owners_ = owners;
+    }
+
+    // Point this Lowerer at the design's foreign calls (ForeignCalls).
+    void set_foreign_calls(ForeignCalls* calls) {
+        foreign_ = calls;
     }
 
     // The record, for lower_design to hand to partition.
@@ -5040,10 +5073,6 @@ private:
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
 
-    static const InstanceSymbol* owning_top(const Scope* scope);
-
-    static const InstanceSymbol* owning_top(const SubroutineSymbol& sub);
-
     // Collect `export "DPI-C"` directives (LRM 35.5 / 35.8): for each, force-lower
     // the SV subroutine and record a DpiExport so the backend emits its C-callable
     // thunk. slang resolves the export -> subroutine binding and the c_identifier
@@ -5116,6 +5145,12 @@ private:
     void add_process(ir::Process p);
 
     ir::FunctionId function_id(const SubroutineSymbol& sub);
+
+    // `function_id` for a subroutine another top calls: the id every Lowerer shares.
+    ir::FunctionId foreign_function_id(const SubroutineSymbol& sub, ForeignCalls::Fn& fn);
+
+    // Build what other tops call that this top declares and nothing here called.
+    void build_foreign_subroutines(const InstanceSymbol& top);
 
     // The return type `sub`'s function is reserved with: void for a task and a void
     // function, else its lowered return type.
@@ -5949,6 +5984,9 @@ private:
     // lower_compilation shares one across every Lowerer.
     UnitOwners  own_owners_;
     UnitOwners* owners_ = &own_owners_;
+    // The subroutines other tops call (ForeignCalls); none for a standalone Lowerer.
+    ForeignCalls  own_foreign_;
+    ForeignCalls* foreign_ = &own_foreign_;
     // The unit a scope-less process this Lowerer creates belongs to: its top's,
     // once Collect has numbered the top scope; the glue unit's for the globals
     // Lowerer.
