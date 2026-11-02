@@ -71,17 +71,19 @@ llvm::Value* Backend::awaiter() {
 // same working footing: the address materialized into the timer is a local
 // symbol, and reaching the runtime is an ordinary call.
 llvm::Function* Backend::native_cb_trampoline(const char* name, llvm::FunctionCallee target, llvm::Function*& cache) {
-    if (cache != nullptr) {
-        return sym(cache);
-    }
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
-    cache      = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
+    if (cache == nullptr) {
+        InRoot in_root(*this);
+        auto*  ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto*  fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        cache       = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
 
-    llvm::IRBuilder<> tb(ctx_);
-    tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", cache));
-    tb.CreateCall(target, { cache->getArg(0), cache->getArg(1) });
-    tb.CreateRetVoid();
+        llvm::IRBuilder<> tb(ctx_);
+        tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", cache));
+        // `target` was declared in the module that asked; root declares its own.
+        tb.CreateCall(env_->llmod.getOrInsertFunction(target.getCallee()->getName(), target.getFunctionType()),
+                      { cache->getArg(0), cache->getArg(1) });
+        tb.CreateRetVoid();
+    }
     return sym(cache);
 }
 
@@ -98,9 +100,14 @@ llvm::Function* Backend::inertial_cb_trampoline() {
 // timer in the design, so the region cannot be baked in here -- a program
 // `initial` and an ordinary always block both come through this function.
 llvm::Function* Backend::enqueue_trampoline() {
-    if (enqueue_fn_ != nullptr) {
-        return sym(enqueue_fn_);
+    if (enqueue_fn_ == nullptr) {
+        InRoot in_root(*this);
+        build_enqueue_trampoline();
     }
+    return sym(enqueue_fn_);
+}
+
+void Backend::build_enqueue_trampoline() {
     auto* ptr   = llvm::PointerType::getUnqual(ctx_);
     auto* fnty  = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
     enqueue_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.enqueue_timer", env_->llmod);
@@ -112,7 +119,7 @@ llvm::Function* Backend::enqueue_trampoline() {
         llvm::Value* hdl = tb.CreateLoad(ptr, hp);
         emit_wake_push(tb, hdl);
         tb.CreateRetVoid();
-        return sym(enqueue_fn_);
+        return;
     }
     // A design with a remote `disable` owns each record on the heap, and a
     // `disable` may already have claimed this park to wake the activation early.
@@ -139,7 +146,6 @@ llvm::Function* Backend::enqueue_trampoline() {
     tb.SetInsertPoint(done);
     tb.CreateCall(free_fn(), { rec });
     tb.CreateRetVoid();
-    return sym(enqueue_fn_);
 }
 
 // Suspend the coroutine and continue in a fresh resume block named `label`.
@@ -179,23 +185,16 @@ void Backend::emit_suspend(const char* label) {
     emit_proc_state(kProcWaiting, kProcRunning);
 }
 
-// Run every `final` block once, in source order, at the end of simulation
-// (LRM 9.2.3). A final block is zero-time, so — like the pre-init pass — one
-// resume runs its body to completion; destroy reclaims the frame. Emitted as
-// a separate `sim_finals(state, wheel)` so rt_sim_run can invoke it on both
-// the natural-drain and $finish exit paths.
-void Backend::emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::Final) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+// The first argument of the ramp of schedule group `s`: the record of the
+// instance a coroutine group of an instance runs for, which is what lets one
+// ramp serve every instance of its unit; the state pointer for a group of no
+// instance. (A thunk group is not ramped.)
+llvm::Constant* Backend::ramp_arg(uint32_t s) {
+    const uint32_t aid = group_unit_anchor_[sched_[s].rows.front()];
+    if (sched_[s].thunk || aid == SignalSlot::no_anchor) {
+        return sym(state_global_);
     }
+    return ensure_ctx(anchors_[aid]);
 }
 
 // Whether the design has anything to sample. A design with no concurrent
@@ -207,27 +206,6 @@ bool Backend::has_preponed() const {
         }
     }
     return false;
-}
-
-// Run every Preponed process once (LRM 4.4.2.1). Called at the top of a new
-// time step -- after the wheel has fired its timers, which only enqueues
-// handles, and before any body of that step executes -- and once from
-// emit_main so time zero is sampled too.
-//
-// A Preponed body has no timing, so one resume runs it to completion, and its
-// stores generate no events (silent_stores_), so nothing wakes on a shadow.
-void Backend::emit_preponed_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::Preponed) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
 }
 
 // Whether any process runs in the Observed region. A design with no
@@ -290,30 +268,6 @@ bool Backend::has_program_initial() const {
     return false;
 }
 
-// Run every Observed process once (LRM 4.4.2.5), at the settled point where
-// the Active / Inactive / NBA set has drained. This is where a concurrent
-// assertion steps its automaton; the pass/fail code a verdict calls for is
-// not run here but pended onto the reactive ring (lower_reactive_pend), which
-// the drain just past this call site empties.
-//
-// An Observed body has no timing, so one resume runs it to completion (a
-// suspension is rejected in build_reactive_fns). Unlike Preponed its stores
-// are ordinary design writes, NOT silent_stores_: it may wake an Active
-// process, and emit_active_run re-settles the active set when it does.
-void Backend::emit_observed_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::Observed) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
-}
-
 // Whether any process runs in the Re-NBA region. A design with no clocking
 // block pays nothing for the region existing, exactly like has_observed.
 bool Backend::has_renba() const {
@@ -323,28 +277,6 @@ bool Backend::has_renba() const {
         }
     }
     return false;
-}
-
-// Run every Re-NBA process once (LRM 4.4.2.8), at the point where the reactive
-// region set has settled -- so after every process that could have issued a
-// clocking block synchronous drive this time slot, which is what LRM 14.16
-// requires of one.
-//
-// Emitted like emit_observed_run, and its stores are ordinary design writes for
-// the same reason: a driven signal must wake its readers. The caller re-settles
-// the active set afterwards.
-void Backend::emit_renba_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
-    auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-    auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-    const auto all  = mod_.processes();
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::ReNba) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
 }
 
 // Whether `id` is reachable as reactive code (build_reactive_fns).
@@ -370,7 +302,7 @@ bool Backend::is_reactive_fn(FunctionId id) const {
 llvm::Constant* Backend::program_live_ptr() {
     if (program_live_gv_ == nullptr) {
         auto* i32        = llvm::Type::getInt32Ty(ctx_);
-        program_live_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false,
+        program_live_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false,
                                                     llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantInt::get(i32, program_proc_count_),
                                                     "clotho.program_live");
@@ -387,15 +319,13 @@ llvm::Constant* Backend::program_live_ptr() {
 // partition apart for free and each gets its own countdown and its own
 // termination root.
 //
-// The instance index is folded into each body as a COMPILE-TIME constant. That
-// is sound because a program `initial` body is never shared between instances:
-// the only body sharing in the backend is share_twin_groups, which takes only
-// thunk groups, and thunk eligibility is is_simple_always, which requires
-// Activation::Always (src/ir/Analysis.cpp) -- so an Activation::Reactive
-// process is always a coroutine of its own, one per instance, exactly as
-// lower_group's deferred-assertion note already relies on. No instance-context
-// plumbing is needed, and docs/design/program-blocks.md §5 is wrong to say it
-// is.
+// A body of the instance reads its program instance's index from the instance's
+// record (Anchor::ctx_prog_base, filled at startup), and the control blocks of
+// the instance's `initial`s from the process indices the record holds, so a
+// program `initial` is the same code in every instance of its unit. The index
+// stays a compile-time constant only in a body that does not belong to the
+// instance (a subroutine of another instance that a program's `initial` calls),
+// which is not shared.
 void Backend::build_program_instances() {
     const auto   all   = mod_.processes();
     const size_t nproc = all.size();
@@ -516,6 +446,40 @@ uint32_t Backend::program_exit_owner_of(FunctionId id) const {
     return k < program_exit_owner_.size() ? program_exit_owner_[k] : kNoProgramInst;
 }
 
+// The anchor of the instance whose program `initial`s make up program instance
+// `inst`; they share a scope, so any one answers.
+uint32_t Backend::program_inst_anchor(uint32_t inst) const {
+    const uint32_t first = program_inst_procs_[inst].front();
+    return proc_sched_anchor_[first];
+}
+
+// What a subroutine's key holds of the program its `$exit` ends. The instance it
+// names is only a fact of the subroutine when it is another instance's: the
+// subroutine's own instance is read from the record, so twin instances' subroutines
+// agree on it however the program instances are numbered.
+uint32_t Backend::program_exit_relation(FunctionId id, uint32_t anchor) const {
+    const uint32_t owner = program_exit_owner_of(id);
+    if (owner == kNoProgramInst || owner == kAmbiguousProgramInst) {
+        return owner;
+    }
+    return program_inst_anchor(owner) == anchor ? kOwnProgramInst : owner;
+}
+
+// Program instance `inst` as an IR value: a body of the instance whose program it
+// is reads it from its record, any other body has it as a constant (and is not
+// shared).
+llvm::Value* Backend::program_inst_value(uint32_t inst) {
+    const uint32_t pa = program_inst_anchor(inst);
+    if (pa != SignalSlot::no_anchor && pa == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[pa];
+        return ctx_field(a, a.ctx_prog_base, b_.getInt32Ty());
+    }
+    if (pa != SignalSlot::no_anchor) {
+        taint("names a program instance of another instance");
+    }
+    return b_.getInt32(inst);
+}
+
 // `$exit()` (LRM 24.7): "Calling $exit from a thread or its descendent thread
 // originating in an initial procedure of a program block shall terminate all
 // initial procedures and their descendent threads within that originating program
@@ -590,7 +554,7 @@ void Backend::lower_program_exit(Index i) {
         lower_proc_kill(proc_pcb_slot(p), /*with_self=*/true, /*branch_on_self=*/false);
     }
     // ... and the descendants that outlived an `initial` which already ended.
-    lower_proc_kill(program_root_pcb(cur_program_inst_),
+    lower_proc_kill(program_root_pcb(program_inst_value(cur_program_inst_)),
                     /*with_self=*/false,
                     /*branch_on_self=*/false);
     // The calling thread is in the marked set but is RUNNING, so no wake can reach
@@ -615,7 +579,7 @@ uint32_t Backend::program_inst_of(uint32_t proc_index) const {
 // how many `initial` procedures of instance `inst` have not yet reached their
 // end. One i32 per program instance, initialized to that instance's count.
 // Created on first use, so a design with no program never emits it.
-llvm::Value* Backend::program_inst_live_ptr(uint32_t inst) {
+llvm::Value* Backend::program_inst_live_ptr(llvm::Value* inst) {
     if (program_inst_live_gv_ == nullptr) {
         auto* i32 = llvm::Type::getInt32Ty(ctx_);
         auto* ty  = llvm::ArrayType::get(i32, std::max<size_t>(program_inst_procs_.size(), 1));
@@ -635,8 +599,7 @@ llvm::Value* Backend::program_inst_live_ptr(uint32_t inst) {
                                                              llvm::ConstantArray::get(ty, init),
                                                              "clotho.program_inst_live");
     }
-    return b_.CreateInBoundsGEP(
-      program_inst_live_arr_ty_, sym(program_inst_live_gv_), { b_.getInt32(0), b_.getInt32(inst) });
+    return b_.CreateInBoundsGEP(program_inst_live_arr_ty_, sym(program_inst_live_gv_), { b_.getInt32(0), inst });
 }
 
 // Everything LRM 24.3 requires when ONE program `initial` procedure reaches its
@@ -656,8 +619,8 @@ llvm::Value* Backend::program_inst_live_ptr(uint32_t inst) {
 //
 // So: a per-INSTANCE countdown that terminates that instance's descendants, and
 // a DESIGN-WIDE one that ends the run. Both are plain counters -- nothing here
-// walks the process table at run time -- and the instance index is a compile-time
-// constant (build_program_instances).
+// walks the process table at run time -- and the instance is read from the record
+// of the instance whose body this is (program_inst_value).
 void Backend::emit_program_end(uint32_t proc_index) {
     auto*          i32  = b_.getInt32Ty();
     const uint32_t inst = program_inst_of(proc_index);
@@ -684,9 +647,10 @@ void Backend::emit_program_end(uint32_t proc_index) {
         // program_root_pcb), and it puts them under the single node the kill
         // below is rooted at, so one subtree walk covers every descendant of
         // every `initial` of this instance, transitively.
-        llvm::Value* root = program_root_pcb(inst);
+        llvm::Value* inst_value = program_inst_value(inst);
+        llvm::Value* root       = program_root_pcb(inst_value);
         b_.CreateCall(proc_adopt_fn(), { root, pcb_ });
-        llvm::Value* ilive = program_inst_live_ptr(inst);
+        llvm::Value* ilive = program_inst_live_ptr(inst_value);
         llvm::Value* ni    = b_.CreateSub(b_.CreateLoad(i32, ilive), b_.getInt32(1));
         b_.CreateStore(ni, ilive);
         auto* term = llvm::BasicBlock::Create(ctx_, "program.inst.last", fn_);
@@ -747,7 +711,7 @@ void Backend::emit_program_end(uint32_t proc_index) {
 // delayed/woken processes) until idle, then run the `final` blocks. Returns
 // 0. Not `main`: a linked executable has its own, which calls rt_run.
 void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
-    sched_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
+    own_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
     auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
     auto* subfnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
 
@@ -762,10 +726,13 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     emit_active_run(drain->getArg(0), drain->getArg(1), procs);
     b_.CreateRetVoid();
 
-    // sim_finals(state, wheel): run every `final` block once.
+    // sim_finals(state, wheel): run every `final` block once, in source order, at the end
+    // of simulation (LRM 9.2.3). A final block is zero-time, so -- like the pre-init pass
+    // -- one resume runs its body to completion; destroy reclaims the frame. A function of
+    // its own so rt_sim_run can invoke it on both the natural-drain and $finish exit paths.
     auto* finals = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_finals", env_->llmod);
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", finals));
-    emit_finals_run(finals->getArg(0), finals->getArg(1), procs);
+    emit_run_once(Activation::Final, finals->getArg(1), procs);
     b_.CreateRetVoid();
 
     // The constant an executable's main reads beside clotho_main: rt_design
@@ -828,53 +795,16 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     // emitted (only arrays keep a runtime fill loop; see `init_state`).
     // 64-byte aligned to cover any packed-vector alignment in the struct.
     // Created up front by emit_state_global (bodies address it through the
-    // instance anchors); reused-definition anchor bases are stored here,
-    // before init_state and any process, so every later load sees them.
+    // instance anchors). The instance records, which hold what a body needs of
+    // its instance (bases, ids, bindings, ports), are initializers of their own
+    // globals: link-time constants, so no code of root fills them.
     llvm::Value* state = sym(state_global_);
-    const auto ctx_ptr = [&](Anchor& a, uint32_t field) {
-        return b_.CreateInBoundsGEP(a.ctx_ty, sym(a.ctx_gv), { b_.getInt32(0), b_.getInt32(field) });
-    };
-    for (Anchor& a : anchors_) {
-        if (a.ctx_gv == nullptr) {
-            continue;
-        }
-        b_.CreateStore(sym(a.state_gv), ctx_ptr(a, 0));
-        if (a.shadow_ty != nullptr) {
-            b_.CreateStore(sym(a.shadow_gv), ctx_ptr(a, 1));
-        }
-        if (a.sched_gv != nullptr) {
-            b_.CreateStore(sym(a.sched_gv), ctx_ptr(a, 2));
-        }
-        if (a.first_vcd >= 0) {
-            b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, 3));
-        }
-        for (const Signal sj : anchor_signals_[static_cast<size_t>(&a - anchors_.data())]) {
-            if (sj == Signal{ ~0u }) {
-                continue;
-            }
-            const auto si = static_cast<uint32_t>(sj);
-            for (uint32_t e = 0; e < 3; ++e) {
-                if (wait_slot_sta_[si][e] != no_wait_slot) {
-                    b_.CreateStore(sym(wait_sta_gv_[si][e]),
-                                   ctx_ptr(a, a.ctx_wait_base + wait_slot_sta_[si][e]));
-                }
-                if (wait_slot_dyn_[si][e] != no_wait_slot) {
-                    b_.CreateStore(sym(wait_dyn_gv_[si][e]),
-                                   ctx_ptr(a, a.ctx_wait_base + wait_slot_dyn_[si][e]));
-                    b_.CreateStore(sym(wait_dyn_len_gv_[si][e]),
-                                   ctx_ptr(a, a.ctx_wait_base + wait_slot_len_[si][e]));
-                }
-            }
-        }
-    }
-    for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
-        b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
-    }
+    fill_instance_records(procs);
     init_state();
     // Shadow bases fill only when some shadow access loaded them (lazy):
     // the root base covers unscoped targets, the per-instance bases each
     // scope's unshared accesses; shareable reused-definition accesses go
-    // through the ctx fills above instead.
+    // through the instance records instead.
     if (shadow_global_ != nullptr && shadow_base_gv_ != nullptr) {
         b_.CreateStore(sym(shadow_global_), sym(shadow_base_gv_));
     }
@@ -986,21 +916,23 @@ void Backend::ensure_active_queue() {
     const auto cap =
       std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_ring_slots(), 1));
     active_mask_   = static_cast<uint32_t>(cap - 1);
+    ring_mask_gv_  = new llvm::GlobalVariable(root_env_->llmod, i32, true, llvm::GlobalValue::InternalLinkage,
+                                              llvm::ConstantInt::get(i32, active_mask_), "clotho.ring_mask");
 
     queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
-    active_gv_    = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+    active_gv_    = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                              llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.active");
     // Ring indices: pop at head, push at tail, empty iff equal. Monotone
     // u32s (masked on access), so u32 wraparound is harmless.
-    active_head_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    active_head_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                llvm::ConstantInt::get(i32, 0), "clotho.active_head");
-    active_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    active_tail_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                llvm::ConstantInt::get(i32, 0), "clotho.active_tail");
     // Count of process activations at the current time instant. Reset when the
     // wheel advances time; a runaway count means a zero-delay oscillation the
     // scheduler cannot converge, caught in the drain loop (rt_oscillation_abort).
     auto* i64      = llvm::Type::getInt64Ty(ctx_);
-    osc_count_gv_  = new llvm::GlobalVariable(env_->llmod, i64, false, llvm::GlobalValue::InternalLinkage,
+    osc_count_gv_  = new llvm::GlobalVariable(root_env_->llmod, i64, false, llvm::GlobalValue::InternalLinkage,
                                               llvm::ConstantInt::get(i64, 0), "clotho.osc_count");
 }
 
@@ -1013,9 +945,9 @@ void Backend::ensure_inactive_queue() {
     }
     ensure_active_queue(); // queue_arr_ty_ is shared by both queues
     auto* i32    = llvm::Type::getInt32Ty(ctx_);
-    inactive_gv_ = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+    inactive_gv_ = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                             llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.inactive");
-    inactive_top_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    inactive_top_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                 llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
 }
 
@@ -1043,15 +975,22 @@ void Backend::emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, 
         return;
     }
     llvm::Function* fn   = b.GetInsertBlock()->getParent();
-    const uint32_t  cap  = active_mask_ + 1;
+    llvm::Value*    cap  = b.CreateAdd(ring_mask(b), b.getInt32(1));
     llvm::Value*    live = b.CreateSub(tail, b.CreateLoad(b.getInt32Ty(), head_ptr));
     auto*           bad  = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
     auto*           ok   = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
-    b.CreateCondBr(b.CreateICmpUGE(live, b.getInt32(cap)), bad, ok);
+    b.CreateCondBr(b.CreateICmpUGE(live, cap), bad, ok);
     b.SetInsertPoint(bad);
-    b.CreateCall(ring_overflow_fn(), { ring, b.getInt32(cap) });
+    b.CreateCall(ring_overflow_fn(), { ring, cap });
     b.CreateUnreachable();
     b.SetInsertPoint(ok);
+}
+
+llvm::Value* Backend::ring_mask(llvm::IRBuilder<>& b) {
+    if (env_ == root_env_.get()) {
+        return b.getInt32(active_mask_);
+    }
+    return b.CreateLoad(b.getInt32Ty(), sym(ring_mask_gv_));
 }
 
 // The same guard for a buffer whose index IS its live count: the two `#0`
@@ -1065,16 +1004,16 @@ void Backend::emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, 
 // call chain, so it can hold at most one `#0` and one wait entry at a time, and
 // capacity is at least the process count. A fork child is an extra chain, which
 // is what breaks that and why the check appears exactly when a fork does.
-void Backend::emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, uint32_t cap, uint32_t which) {
+void Backend::emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, llvm::Value* cap, uint32_t which) {
     if (!ring_guard_wanted()) {
         return;
     }
     llvm::Function* fn  = b.GetInsertBlock()->getParent();
     auto*           bad = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
     auto*           ok  = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
-    b.CreateCondBr(b.CreateICmpUGE(len, b.getInt32(cap)), bad, ok);
+    b.CreateCondBr(b.CreateICmpUGE(len, cap), bad, ok);
     b.SetInsertPoint(bad);
-    b.CreateCall(ring_overflow_fn(), { b.getInt32(which), b.getInt32(cap) });
+    b.CreateCall(ring_overflow_fn(), { b.getInt32(which), cap });
     b.CreateUnreachable();
     b.SetInsertPoint(ok);
 }
@@ -1104,8 +1043,8 @@ void Backend::emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     auto*        i32  = b.getInt32Ty();
     llvm::Value* tl   = b.CreateLoad(i32, sym(active_tail_gv_));
     emit_ring_full_check(b, sym(active_head_gv_), tl, b.getInt32(kRingActive));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(active_gv_), idx);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(active_tail_gv_));
 }
@@ -1115,8 +1054,8 @@ void Backend::emit_inactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     ensure_inactive_queue();
     auto*        i32  = b.getInt32Ty();
     llvm::Value* sp   = b.CreateLoad(i32, sym(inactive_top_gv_));
-    emit_len_full_check(b, sp, active_mask_ + 1, kRingInactive);
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(inactive_gv_), { b.getInt32(0), sp });
+    emit_len_full_check(b, sp, b.CreateAdd(ring_mask(b), b.getInt32(1)), kRingInactive);
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(inactive_gv_), sp);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(inactive_top_gv_));
 }
@@ -1144,13 +1083,13 @@ void Backend::ensure_reactive_queue() {
     }
     ensure_active_queue(); // queue_arr_ty_ and active_mask_ are shared
     auto* i32         = llvm::Type::getInt32Ty(ctx_);
-    reactive_gv_      = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
+    reactive_gv_      = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false,
                                                  llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(queue_arr_ty_),
                                                  "clotho.reactive");
-    reactive_head_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    reactive_head_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_head");
-    reactive_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    reactive_tail_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_tail");
 }
 
@@ -1176,19 +1115,19 @@ void Backend::ensure_reactive_cont_queue() {
     }
     ensure_reactive_queue(); // queue_arr_ty_ and active_mask_ are shared
     auto* i32              = llvm::Type::getInt32Ty(ctx_);
-    reactive_cont_gv_      = new llvm::GlobalVariable(env_->llmod,
+    reactive_cont_gv_      = new llvm::GlobalVariable(root_env_->llmod,
                                                       queue_arr_ty_,
                                                       false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantAggregateZero::get(queue_arr_ty_),
                                                       "clotho.reactive_cont");
-    reactive_cont_head_gv_ = new llvm::GlobalVariable(env_->llmod,
+    reactive_cont_head_gv_ = new llvm::GlobalVariable(root_env_->llmod,
                                                       i32,
                                                       false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantInt::get(i32, 0),
                                                       "clotho.reactive_cont_head");
-    reactive_cont_tail_gv_ = new llvm::GlobalVariable(env_->llmod,
+    reactive_cont_tail_gv_ = new llvm::GlobalVariable(root_env_->llmod,
                                                       i32,
                                                       false,
                                                       llvm::GlobalValue::InternalLinkage,
@@ -1205,11 +1144,11 @@ void Backend::ensure_re_inactive_queue() {
     }
     ensure_reactive_queue(); // queue_arr_ty_ is shared by every queue
     auto* i32           = llvm::Type::getInt32Ty(ctx_);
-    re_inactive_gv_     = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
+    re_inactive_gv_     = new llvm::GlobalVariable(root_env_->llmod, queue_arr_ty_, false,
                                                    llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantAggregateZero::get(queue_arr_ty_),
                                                    "clotho.re_inactive");
-    re_inactive_top_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+    re_inactive_top_gv_ = new llvm::GlobalVariable(root_env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantInt::get(i32, 0), "clotho.re_inactive_top");
 }
 
@@ -1219,8 +1158,8 @@ void Backend::emit_reactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     auto*        i32  = b.getInt32Ty();
     llvm::Value* tl   = b.CreateLoad(i32, sym(reactive_tail_gv_));
     emit_ring_full_check(b, sym(reactive_head_gv_), tl, b.getInt32(kRingReactive));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(reactive_gv_), idx);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(reactive_tail_gv_));
 }
@@ -1231,8 +1170,8 @@ void Backend::emit_reactive_cont_push(llvm::IRBuilder<>& b, llvm::Value* handle)
     auto*        i32 = b.getInt32Ty();
     llvm::Value* tl  = b.CreateLoad(i32, sym(reactive_cont_tail_gv_));
     emit_ring_full_check(b, sym(reactive_cont_head_gv_), tl, b.getInt32(kRingReactive));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_cont_gv_), { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(reactive_cont_gv_), idx);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), sym(reactive_cont_tail_gv_));
 }
@@ -1242,8 +1181,8 @@ void Backend::emit_re_inactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
     ensure_re_inactive_queue();
     auto*        i32  = b.getInt32Ty();
     llvm::Value* sp   = b.CreateLoad(i32, sym(re_inactive_top_gv_));
-    emit_len_full_check(b, sp, active_mask_ + 1, kRingReInactive);
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(re_inactive_gv_), { b.getInt32(0), sp });
+    emit_len_full_check(b, sp, b.CreateAdd(ring_mask(b), b.getInt32(1)), kRingReInactive);
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), sym(re_inactive_gv_), sp);
     b.CreateStore(handle, slot);
     b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(re_inactive_top_gv_));
 }
@@ -1363,13 +1302,13 @@ bool Backend::in_coroutine_body() const {
 
 // The home region to hand a callee: whatever this thread's is at the call, so a
 // task that calls a task passes its own CURRENT answer down rather than its
-// lexical one. That is what makes 24.3.1's "inherits the scheduling region of
-// the thread that calls it" transitive -- by induction over the call chain, and
+// lexical one. That is what makes 24.3.1's "inherits the scheduling region of the
+// thread that calls it" transitive -- by induction over the call chain, and
 // over an `expect` too, since the store lands before any later call reads it.
-// Null when the parameter is not in the signature, which is every design with
-// no shared body.
+// Always an i8, folded to the lexical answer in a body that does not carry its
+// home: the parameter is in every signature.
 llvm::Value* Backend::callee_home() {
-    return design_uses_home_arg_ ? current_home(b_) : nullptr;
+    return current_home(b_);
 }
 
 // The value to record when parking this coroutine for a later wake. Folded at
@@ -1467,8 +1406,8 @@ void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked) {
     // fatal names the ring the handle was actually headed for.
     emit_ring_full_check(b, hp, tl,
                          b.CreateSelect(home, b.getInt32(kRingReactive), b.getInt32(kRingActive)));
-    llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
-    llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, arr, { b.getInt32(0), idx });
+    llvm::Value* idx  = b.CreateAnd(tl, ring_mask(b));
+    llvm::Value* slot = b.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), arr, idx);
     b.CreateStore(hdl, slot);
     b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), tp);
 }
@@ -1509,7 +1448,6 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     ensure_active_queue();
     auto* ptr_ty        = llvm::PointerType::getUnqual(ctx_);
     auto* i32           = b_.getInt32Ty();
-    auto* proc_fnty     = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
     const bool uses_vcd = design_uses_vcd();
 
     // Init: empty the stack, then create every process (the ramp call builds
@@ -1555,189 +1493,33 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     if (!intra_nba_sigs_.empty()) {
         b_.CreateCall(intra_reset_fn(), {});
     }
-    const auto all = mod_.processes();
 
     // Pre-init pass first (LRM 6.8): apply variable declaration initializers
     // before any Initial / Always process is created or subscribed. A PreInit
     // body has no timing, so resuming it once runs it to completion; its stores
     // generate no events (see lower_process), so the always blocks created
-    // below subscribe to already-settled values. Run before the seed loop so no
+    // below subscribe to already-settled values. Run before the seed so no
     // wait queue is scanned before priming.
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        if (all[groups_[g].front()].activation != Activation::PreInit) {
-            continue;
-        }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
-    }
+    emit_run_once(Activation::PreInit, wheel, procs);
 
     // Time zero has no preceding wheel tick, so its Preponed sample happens
     // here rather than in the post-tick block. After PreInit, so a sample sees
-    // declaration initializers; before the seed loop, so it precedes every
+    // declaration initializers; before the seed, so it precedes every
     // body of the first step. This is also the default sampled value LRM
     // 16.5.1 wants for a value-change function called at or before the first
-    // clocking event.
-    emit_preponed_run(state, wheel, procs);
+    // clocking event. A Preponed body has no timing, so one resume runs it to
+    // completion, and its stores generate no events (silent_stores_), so nothing
+    // wakes on a shadow.
+    emit_run_once(Activation::Preponed, wheel, procs);
 
-    // One handle per fusion group; a group's activation facts come from its
-    // first member (identical across fused members by the group key).
-    std::vector<llvm::Value*> hdls(procs.size(), nullptr);
-    // Groups with an always_comb / always_latch member, seeded after every other body
-    // (below). A fused group is ONE body, so a continuous assignment fused with such a
-    // procedure starts with it: 4.9.1 and 4.7 leave the order of its time-zero
-    // evaluation open, and keeping the fusion is what the procedure's cone is worth.
-    std::vector<uint32_t> deferred_comb;
-    const auto            starts_late = [&](uint32_t g) {
-        return std::any_of(
-          groups_[g].begin(), groups_[g].end(), [&](uint32_t m) { return all[m].starts_after_procedures; });
-    };
-    for (uint32_t g = 0; g < procs.size(); ++g) {
-        const uint32_t k = groups_[g].front();
-        const Process& p = all[k];
-        if (p.activation == Activation::PreInit) {
-            continue; // already run above
-        }
-        if (p.activation == Activation::Preponed) {
-            continue; // run once per timestep from the post-tick block
-        }
-        if (p.activation == Activation::Observed) {
-            continue; // run explicitly at each settled point (emit_observed_run)
-        }
-        if (p.activation == Activation::ReNba) {
-            continue; // run explicitly in the Re-NBA region (emit_renba_run)
-        }
-        if (p.activation == Activation::Final) {
-            continue; // deferred to emit_finals_run at end of simulation
-        }
-        // A thunk group is not ramped (no frame): its "handle" is the thunk
-        // function pointer with the low bit set, so the drain calls it
-        // directly instead of resuming a coroutine. Function addresses are
-        // aligned, so bit 0 is a free tag; coro handles (rt_alloc) leave it
-        // clear. The tagged pointer flows through subscription / self_start
-        // push unchanged.
-        llvm::Value* hdl = thunk_group_[g]
-          ? b_.CreateIntToPtr(
-              b_.CreateOr(b_.CreatePtrToInt(sym(procs[g]), b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
-          : b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
-        hdls[g]          = hdl;
-        if (p.activation == Activation::Always && !p.wait_events.empty()) {
-            // Subscribed in the topo-ordered pass below.
-            //
-            // A continuously-active process (continuous assign / port copy /
-            // always_comb) also runs once now, so it settles from the pre-init
-            // values rather than waiting for an input edge that a declaration
-            // initializer never generates. It runs body-first then parks on its
-            // (subscribed-below) wait, so later input changes still wake it.
-            //
-            // Mark it scheduled as it is enqueued: a seed-time store from a
-            // process draining earlier in the same first drain (an initial
-            // block) services this static subscription and would re-push the
-            // already-queued handle without the flag, so N such processes
-            // overflow the nproc-sized active queue. The flag is cleared
-            // when the body reaches its wait-suspend (lower_process always-loop).
-            if (p.self_start) {
-                llvm::Constant* flag = sched_flag_ptr(k);
-                // The time-zero settle run must evaluate every member.
-                b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
-                // A reactive-home group -- a program's continuous assign (LRM
-                // 24.3.1) -- settles in slot 0's REACTIVE region rather than its
-                // Active one, so its stores land after the design has settled and
-                // design readers of what it drives are woken into the Active
-                // region of the next iteration of 4.4.2's loop. That is 24.3.2's
-                // own sentence. A ring entry is a bare handle either way: the
-                // home tag belongs to a PARKED handle, and the seed loop created
-                // this one so it knows the ring without reading a tag back.
-                // Its ring is the reactive CONTINUOUS one, which the reactive drain
-                // empties before the reactive ring a program `initial` is seeded on,
-                // so no program code starts ahead of the copy that feeds it.
-                if (starts_late(g)) {
-                    // always_comb / always_latch (LRM 9.2.2.2): enqueued behind every
-                    // other body, below, so it runs once they have all started.
-                    deferred_comb.push_back(g);
-                } else if (p.reactive_home) {
-                    emit_reactive_cont_push(b_, hdl);
-                } else {
-                    emit_active_push(b_, hdl);
-                }
-            }
-        } else if (p.activation == Activation::Reactive) {
-            // A program `initial` (LRM 24.3) starts in the Reactive region, so
-            // it is seeded onto the reactive ring instead of the active one.
-            // Its body keeps itself there across every suspend (emit_suspend).
-            //
-            // Mark it scheduled as it is enqueued, for the reason the self_start
-            // arm above gives -- it is QUEUED from here, so anything that pushes
-            // it again before it runs double-queues it -- which for this arm is
-            // not a static subscription (a sensitivity-less body has none) but a
-            // FORCE-WAKE. `$exit` (LRM 24.7) names every `initial` of its program
-            // instance by static control block, so a `fork ... join` child that
-            // exits during its parent's FIRST activation force-wakes a parent that
-            // is running on the stack rather than parked: its park record is null,
-            // so emit_node_force_wake falls to the flag, and with the flag clear it
-            // would push the handle of a coroutine that is about to reach its final
-            // suspend and be destroyed by the resumer -- the drain would then resume
-            // a freed frame. The flag is cleared by the body itself before each
-            // park (lower_wait, emit_delay), so "set while running, clear while
-            // parked" holds for this arm exactly as it does for an always loop.
-            b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_flag_ptr(k));
-            emit_reactive_push(b_, hdl);
-        } else if (starts_late(g)) {
-            // An always_comb / always_latch that reads nothing has no wait list, so
-            // the arm above never sees it; it still runs once, after the others.
-            deferred_comb.push_back(g);
-        } else {
-            emit_active_push(b_, hdl);
-        }
-    }
-
-    // The time-zero run of an always_comb / always_latch (LRM 9.2.2.2, 9.2.2.3): "after
-    // all initial and always procedures have been started so that the outputs of the
-    // procedure are consistent with the inputs". Both rings are FIFO, so enqueuing
-    // these after every other body makes each of them run after those have started.
-    // A continuous assignment is not a procedure and keeps its source position above.
-    for (const uint32_t g : deferred_comb) {
-        if (all[groups_[g].front()].reactive_home) {
-            emit_reactive_cont_push(b_, hdls[g]);
-        } else {
-            emit_active_push(b_, hdls[g]);
-        }
-    }
-
-    // Static subscriptions, in topological order of the blocking-write wake
-    // graph (compute_subscription_order): bucket entry order is subscription
-    // order, the FIFO drain pops in bucket order, so a settle wave runs
-    // producers before consumers and each acyclic cascade settles in one
-    // wave. A separate pass so only wake order changes — creation and
-    // enqueue order above stay declaration order. All subscriptions still
-    // land before the drain, so no scan reads an empty slot.
-    // A fused group subscribes once, at its earliest member's rank, with the
-    // group's canonical event set and the group's flag/handle.
-    std::vector<bool> subscribed(procs.size(), false);
-    for (const uint32_t k : sub_order_) {
-        const uint32_t g = group_of_[k];
-        const uint32_t f = groups_[g].front();
-        if (subscribed[g] || all[f].activation != Activation::Always || all[f].wait_events.empty()) {
-            continue;
-        }
-        subscribed[g]        = true;
-        llvm::Constant* flag = sched_flag_ptr(f);
-        // A reactive-home group needs no separate subscription path: the
-        // predicate above selects it like any other Always group, and the ring
-        // is picked at WAKE time from the handle's home tag (emit_wake_push).
-        // What it does need is the tag ON the handle recorded here. A static
-        // subscription records a handle exactly once, from this loop, and the
-        // always-loop's park never re-records it (emit_wait_suspend only
-        // suspends) -- so unlike an intra-body wait, which parks through
-        // parked_handle at each `@`, this is the only place the home can be
-        // stated. Untagged, every wake of a program's continuous assign would
-        // push it onto the active ring, which is the bug this phase fixes. The tag is
-        // the CONTINUOUS one, so the wake lands on the reactive continuous ring.
-        llvm::Value* sub_hdl = tag_reactive_home(b_, hdls[g], all[f].reactive_home, /*continuous=*/true);
-        for (const WaitEvent& w : group_events_[g]) {
-            emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), sub_hdl, flag);
-        }
-    }
+    // The seed: one handle per schedule group (its activation facts come from the
+    // first process of its first row, identical across the rows by the group key),
+    // the groups that start now queued, and the sensitive ones subscribed, in the
+    // order the groups were created in -- the static subscriptions in topological
+    // order of the blocking-write wake graph (compute_subscription_order), so a settle
+    // wave runs producers before consumers and each acyclic cascade settles in one
+    // wave. All subscriptions land before the drain, so no scan reads an empty slot.
+    emit_seed(wheel, procs);
 
     auto* fn      = b_.GetInsertBlock()->getParent();
     auto* check   = llvm::BasicBlock::Create(ctx_, "active.check", fn);
@@ -1750,8 +1532,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // Any thunk group present means the active queue can carry tagged thunk
     // pointers, so the drain must discriminate; a coro-only design keeps the
     // straight resume path (no per-pop tag test).
-    const bool has_thunk = std::any_of(thunk_group_.begin(), thunk_group_.end(),
-                                        [](bool t) { return t; });
+    const bool has_thunk = std::any_of(sched_.begin(), sched_.end(),
+                                        [](const SchedGroup& sg) { return sg.thunk; });
     auto* thunk_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
     // NBA region: only when the design has nonblocking assignments. Entered when
     // the active queue drains; if any update is staged it commits them all and
@@ -1828,8 +1610,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateCondBr(b_.CreateTrunc(addr, b_.getInt1Ty()), thunk_bb, coro_bb);
 
         b_.SetInsertPoint(thunk_bb);
-        auto* fnp = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
-        b_.CreateCall(thunk_fnty, fnp, { state, wheel });
+        auto* wake  = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
+        auto* entry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), wake, 1));
+        b_.CreateCall(thunk_fnty, entry, { wake, wheel });
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(coro_bb);
@@ -1899,10 +1682,17 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     b_.SetInsertPoint(wcheck);
     // Observed region (LRM 4.4.2.5): run the processes that evaluate property
     // expressions, ahead of the flushes below that mature this instant's
-    // reports. Emitted like emit_preponed_run and for the same reason -- an
-    // Observed process is in no queue and no event wakes it.
+    // reports. Run like the Preponed ones and for the same reason -- an
+    // Observed process is in no queue and no event wakes it. This is where a
+    // concurrent assertion steps its automaton; the pass/fail code a verdict calls
+    // for is not run here but pended onto the reactive ring (lower_reactive_pend),
+    // which the drain just past this call site empties. An Observed body has no
+    // timing, so one resume runs it to completion (a suspension is rejected in
+    // build_reactive_fns). Unlike Preponed its stores are ordinary design writes,
+    // NOT silent_stores_: it may wake an Active process, and the active set is
+    // re-settled when it does.
     if (has_observed()) {
-        emit_observed_run(state, wheel, procs);
+        emit_run_once(Activation::Observed, wheel, procs);
         // An Observed body's stores are ordinary design writes, so it can wake
         // an Active process. The LRM's time-slot loop always re-enters the
         // highest-priority non-empty region, so settle the active set again
@@ -2034,8 +1824,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             b_.CreateCondBr(b_.CreateTrunc(raddr, b_.getInt1Ty()), rthunk, rcoro);
 
             b_.SetInsertPoint(rthunk);
-            auto* rfnp = b_.CreateIntToPtr(b_.CreateAnd(raddr, ~static_cast<uint64_t>(1)), ptr_ty);
-            b_.CreateCall(thunk_fnty, rfnp, { state, wheel });
+            auto* rwake  = b_.CreateIntToPtr(b_.CreateAnd(raddr, ~static_cast<uint64_t>(1)), ptr_ty);
+            auto* rentry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), rwake, 1));
+            b_.CreateCall(thunk_fnty, rentry, { rwake, wheel });
             b_.CreateBr(rcont);
 
             b_.SetInsertPoint(rcoro);
@@ -2108,8 +1899,10 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             // commit below is the separate business of the update region, and
             // LRM 14.16.2 leaves the order between a drive and a same-slot
             // nonblocking write to the same variable arbitrary.
+            // Run once (LRM 4.4.2.8), like the Observed ones; their stores are ordinary
+            // design writes for the same reason: a driven signal must wake its readers.
             if (has_renba()) {
-                emit_renba_run(state, wheel, procs);
+                emit_run_once(Activation::ReNba, wheel, procs);
             }
             if (has_nba) {
                 b_.CreateCondBr(emit_nba_any_staged(), rncommit, rdone);
@@ -2182,8 +1975,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // suspends (timing controls in the arg list are rejected), so one resume
     // runs it to completion. Ramping is indirect: rt_monitor_active_ramp yields
     // the registered body's ramp function pointer (or null), which we call with
-    // the task ABI (state, rng, wheel, record). There is no calling process
-    // here, so the body seeds its own state from the module-wide one.
+    // the task ABI (instance record, rng, wheel, proc, home, completion record). There is no calling
+    // process here, so the body seeds its own state from the module-wide one.
     if (design_uses_monitor_) {
         auto* fn      = b_.GetInsertBlock()->getParent();
         auto* run_bb  = llvm::BasicBlock::Create(ctx_, "monitor.run", fn);
@@ -2197,31 +1990,14 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
         // Reconstructed rather than read off a declaration, because the callee
         // arrives as an opaque pointer from the runtime -- so it MUST track
-        // declare_task's gated parameters exactly. It did not: `proc` was pushed
-        // into margv but never into this type, so a design with both $monitor
-        // and process control built a call whose argument count did not match
-        // its signature (an assert in a debug LLVM, malformed IR in a release
-        // one). Both gates are honoured below now.
-        std::vector<llvm::Type*> rampparams{ ptr_ty, ptr_ty, ptr_ty }; // state, rng, wheel
-        if (design_uses_process_) {
-            rampparams.push_back(ptr_ty); // proc
-        }
-        if (design_uses_home_arg_) {
-            rampparams.push_back(llvm::Type::getInt8Ty(ctx_)); // home
-        }
-        rampparams.push_back(ptr_ty); // record
-        auto*                     rampty = llvm::FunctionType::get(ptr_ty, rampparams, false);
-        std::vector<llvm::Value*> margv{ state, sym(rng_global_), wheel };
-        if (design_uses_process_) {
-            margv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
-        }
+        // declare_task's parameters exactly.
+        auto* rampty = llvm::FunctionType::get(
+          ptr_ty, { ptr_ty, ptr_ty, ptr_ty, ptr_ty, llvm::Type::getInt8Ty(ctx_), ptr_ty }, false);
         // No calling thread on this path either (the Postponed drain ramps the
-        // registered body from main), so the region it would inherit is the
-        // default Active one.
-        if (design_uses_home_arg_) {
-            margv.push_back(b_.getInt8(0));
-        }
-        margv.push_back(record);
+        // registered body from main), so it names no control block and the region
+        // it would inherit is the default Active one.
+        std::vector<llvm::Value*> margv{ b_.CreateCall(monitor_active_record_fn(), {}), sym(rng_global_), wheel,
+                                         llvm::ConstantPointerNull::get(ptr_ty), b_.getInt8(0), record };
         llvm::Value* hdl = b_.CreateCall(rampty, ramp, margv);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
@@ -2275,7 +2051,10 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), post_tick, wdone);
         b_.SetInsertPoint(post_tick);
         if (preponed) {
-            emit_preponed_run(state, wheel, procs);
+            // Preponed (LRM 4.4.2.1): run once at the top of a new time step -- after the
+            // wheel has fired its timers, which only enqueues handles, and before any body
+            // of that step executes -- and once from the seed so time zero is sampled too.
+            emit_run_once(Activation::Preponed, wheel, procs);
         }
         for (const Signal sig : inertial_sigs_) {
             emit_intra_commit(sig);

@@ -3,9 +3,12 @@
 #include <cassert>
 #include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <utility>
 
 #include <ankerl/unordered_dense.h>
+
+#include "Printer.h"
 
 namespace clotho::ir {
 
@@ -43,13 +46,53 @@ struct FlatInstance {
     std::vector<uint32_t> targets;
     // Unit-local covergroup type -> flat index into Module::cover_types.
     std::vector<uint32_t> cover_types;
+    // The instance's own monitors, flat: [monitor_base, monitor_base + monitor_count).
+    uint32_t monitor_base  = 0;
+    uint32_t monitor_count = 0;
 };
+
+// Each unit's key (InstanceScope::unit_key), which names its LLVM module and the
+// symbols of its code. A definition that is one unit is named by its definition
+// name alone, so what calls into it (a hierarchical or package call names the
+// callee's symbol) does not change when its body is edited. Units that share a
+// definition name (parameterizations, a class specialization) add a hash of their
+// printed body, children by definition name, and units that still print alike
+// without being merged (the same body over different subtrees) take a count, in
+// unit order, so keys stay unique.
+std::vector<std::string> name_units(const Design& design) {
+    std::vector<std::string>                            keys(design.units.size());
+    ankerl::unordered_dense::map<std::string, uint32_t> by_name;
+    for (const Unit& u : design.units) {
+        ++by_name[u.def_name];
+    }
+    ankerl::unordered_dense::map<std::string, uint32_t> seen;
+    for (uint32_t u = 0; u < design.units.size(); ++u) {
+        std::string key = design.units[u].def_name;
+        if (by_name[key] > 1) {
+            std::ostringstream os;
+            print_unit(design, UnitId{ u }, os);
+            uint64_t h = 1469598103934665603ull; // FNV-1a
+            for (const char c : os.str()) {
+                h = (h ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+            }
+            static constexpr char digits[] = "0123456789abcdef";
+            key += ".";
+            for (int shift = 28; shift >= 0; shift -= 4) {
+                key += digits[((h ^ (h >> 32)) >> shift) & 0xf];
+            }
+        }
+        const uint32_t n = seen[key]++;
+        keys[u]          = n == 0 ? key : key + "." + std::to_string(n);
+    }
+    return keys;
+}
 
 class Flattener {
 public:
-    Flattener(Design& design, Module& module)
+    Flattener(Design& design, Module& module, std::vector<std::string> unit_keys)
       : d_(design)
-      , m_(module) {}
+      , m_(module)
+      , unit_keys_(std::move(unit_keys)) {}
 
     void run() {
         expand();
@@ -452,7 +495,9 @@ private:
                 assert(insts_[target].scope != Process::no_scope && "an interface reference names a static unit");
                 mapper.iface_scopes.push_back(insts_[target].scope);
             }
-            mapper.monitor_base = static_cast<uint32_t>(m_.monitors.size());
+            mapper.monitor_base      = static_cast<uint32_t>(m_.monitors.size());
+            insts_[ii].monitor_base  = mapper.monitor_base;
+            insts_[ii].monitor_count = static_cast<uint32_t>(u.monitors.size());
 
             for (uint32_t h = 0; h < u.functions.size(); ++h) {
                 if (u.functions[h].import != kLocal) {
@@ -463,6 +508,7 @@ private:
                 Function copy = signature_of(src);
                 copy.ir       = src.ir.rebased(mapper);
                 copy.scope    = fi.scope;
+                copy.unit_key = unit_keys_[static_cast<uint32_t>(fi.unit)];
                 if (src.takes_iface_ctx) {
                     copy.ctx_member =
                       static_cast<Signal>(mapper.map(HandleFamily::Layout, static_cast<uint32_t>(src.ctx_member)));
@@ -586,11 +632,41 @@ private:
             s.id       = fi.scope;
             s.name     = fi.name;
             s.def_name = u.def_name;
+            s.unit_key = unit_keys_[static_cast<uint32_t>(fi.unit)];
+            s.unit     = static_cast<uint32_t>(fi.unit);
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
-                if (u.signals[h].import == kLocal && u.signals[h].scoped) {
+                const uint32_t imp = u.signals[h].import;
+                if (imp != kLocal) {
+                    s.externs.push_back(u.imports[imp].kind == Import::Kind::Representative ? InstanceScope::no_extern
+                                                                                            : fi.signals[h]);
+                    continue;
+                }
+                s.locals.push_back(fi.signals[h]);
+                if (u.signals[h].scoped) {
                     s.signals.push_back(fi.signals[h]);
                 }
             }
+            for (uint32_t h = 0; h < u.functions.size(); ++h) {
+                const uint32_t imp = u.functions[h].import;
+                if (imp == kLocal) {
+                    s.fn_locals.push_back(fi.functions[h]);
+                    continue;
+                }
+                assert(u.imports[imp].kind == Import::Kind::Member && "a function is imported by member, never as a layout");
+                s.fn_externs.push_back(fi.functions[h]);
+            }
+            for (uint32_t h = 0; h < u.disable_targets.size(); ++h) {
+                if (u.disable_targets[h].import == kLocal) {
+                    s.disable_locals.push_back(fi.targets[h]);
+                }
+            }
+            for (uint32_t h = 0; h < u.cover_types.size(); ++h) {
+                if (u.cover_types[h].import == kLocal) {
+                    s.cover_locals.push_back(fi.cover_types[h]);
+                }
+            }
+            s.monitor_base  = fi.monitor_base;
+            s.monitor_count = fi.monitor_count;
             s.children.reserve(fi.children.size());
             for (const uint32_t ci : fi.children) {
                 s.children.push_back(std::move(*scopes[ci]));
@@ -640,6 +716,7 @@ private:
     Design&                             d_;
     Module&                             m_;
     std::vector<FlatInstance>           insts_;
+    std::vector<std::string>            unit_keys_;
     std::vector<uint32_t>               root_inst_;
     std::vector<std::vector<uint32_t>>  instances_of_;
     std::vector<std::optional<NameMap>> signal_names_;
@@ -683,8 +760,10 @@ Function signature_of(const Function& f) {
 }
 
 std::unique_ptr<Module> flatten(Design&& design) {
+    // Before the module takes the design's pool: printing a unit reads it.
+    auto keys   = name_units(design);
     auto module = std::make_unique<Module>(std::move(design.pool));
-    Flattener(design, *module).run();
+    Flattener(design, *module, std::move(keys)).run();
     return module;
 }
 

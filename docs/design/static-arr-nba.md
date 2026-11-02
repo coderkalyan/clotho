@@ -42,8 +42,8 @@ Delay/Wait/TaskCall). The first NBA of a segment calls the enqueue stub once
 as a `BlockSig{sig, mask, dynamic}`. At the NBA region the pending blocks
 musttail-chain their commit fns; `emit_block_commit_body` copies each
 target's shadow → live (`storage_ptr`, no element index) and services its
-per-signal wait queue via `emit_nba_service` + `nba_meta` (indexed by
-`s.nba_id`).
+per-signal wait queue through the signal's port (`service_wait_queue`, in the
+commit function of the block).
 
 **Array record path.** Array targets are collected in `array_nba_sigs_`
 (`nba_classify_ir`) and never marked `nba`. `emit_array_nba`
@@ -57,9 +57,8 @@ write to an array element (`mem[i] <= #5 v`, LRM 9.4.5) uses its own deferred
 records (`intra_nba_sigs_`, `docs/design/intra-assignment-timing.md`) and must obey
 the same rule: `classify_intra_target` skips `nba` for an array target, and
 `emit_intra_commit` wakes it through `service_any_waiters` plus a whole-range VCD
-touch rather than the `nba_meta` comparison. Marking an array `nba` would index
-`nba_meta` by an `nba_id` it never received — an out-of-bounds read with no compile
-error. The cross-region ordering caveat below applies to that path too.
+touch rather than the block commit's per-signal service. Marking an array `nba` would
+give the block commit a shadow field the array never received. The cross-region ordering caveat below applies to that path too.
 
 **Array waiter semantics (key simplifier).** Memory elements carry only
 **Any-edge (level)** sensitivity — slang rejects `@(posedge mem[i])` — so

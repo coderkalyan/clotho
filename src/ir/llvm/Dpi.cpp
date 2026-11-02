@@ -395,7 +395,7 @@ llvm::Value* Backend::build_dpi_open_array_desc(Index                       a,
 // thunk. Created on first use, so a design with no DPI tasks emits none.
 llvm::GlobalVariable* Backend::dpi_caller_gv(llvm::GlobalVariable*& slot, llvm::Type* ty, const char* name) {
     if (slot == nullptr) {
-        slot = new llvm::GlobalVariable(env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
+        slot = new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
                                         llvm::Constant::getNullValue(ty), name);
     }
     return sym(slot);
@@ -693,7 +693,9 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
 
     auto*                     ptr_ty = llvm::PointerType::getUnqual(ctx_);
     std::vector<llvm::Value*> argv;
-    argv.push_back(sym(state_global_));
+    // The record of the instance that declares the subroutine (reserved before main
+    // filled it), or the root state for a package's.
+    argv.push_back(callee_record(ex.func));
     // The RNG stream the exported subroutine draws from (LRM 18.13). A FUNCTION
     // has no calling process -- native C drove the call -- so it draws from the
     // module-wide state main seeds at startup. A TASK does have one: it runs on
@@ -712,21 +714,18 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
     // exported function has no answer and reports a located fatal rather than
     // inventing one. A task has one, and carrying it is the whole point of the
     // caller-identity globals: `process::self()` inside an exported task names
-    // the process that entered the import task.
-    if (design_uses_process_) {
-        argv.push_back(ex.is_task ? static_cast<llvm::Value*>(
-                                      b_.CreateLoad(ptr_ty, dpi_caller_proc_gv(), "dpi.proc"))
-                                  : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)));
-    }
+    // the process that entered the import task. (The import call site publishes
+    // it only in a design with control blocks, so no other design has one.)
+    argv.push_back(ex.is_task && design_uses_process_
+                     ? static_cast<llvm::Value*>(b_.CreateLoad(ptr_ty, dpi_caller_proc_gv(), "dpi.proc"))
+                     : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)));
     // Its scheduling home region (LRM 24.3.1), the same split: an exported
     // function inherits nothing because no thread called it; an exported task
     // inherits the region of the thread that did, which is what decides where a
     // `#0` inside it would land.
-    if (design_uses_home_arg_) {
-        argv.push_back(ex.is_task ? static_cast<llvm::Value*>(
-                                      b_.CreateLoad(b_.getInt8Ty(), dpi_caller_home_gv(), "dpi.home"))
-                                  : static_cast<llvm::Value*>(b_.getInt8(0)));
-    }
+    argv.push_back(ex.is_task && design_uses_home_arg_
+                     ? static_cast<llvm::Value*>(b_.CreateLoad(b_.getInt8Ty(), dpi_caller_home_gv(), "dpi.home"))
+                     : static_cast<llvm::Value*>(b_.getInt8(0)));
     for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
         const DpiCType ct     = ex.arg_ctypes[k];
         const ArgDir   dir    = ex.arg_dirs[k];

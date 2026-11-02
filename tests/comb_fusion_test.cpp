@@ -247,7 +247,7 @@ endmodule
     // No fused comb unit is emitted: a `.fN` symbol exists only for a group of
     // N > 1. Before the call edge reached `BodyFacts::calls` this design emitted
     // exactly one `.f2` (measured), so this is the assertion that flips.
-    CHECK(count_substr(emit(src), ".f2.thunk(ptr noalias %state") == 0);
+    CHECK(count_substr(emit(src), ".f2.entry(ptr %wake") == 0);
     CHECK(count_substr(emit(src, { .thunk = false }), ".f2(ptr %state") == 0);
 
     // And the loop still settles, identically under every lowering — excluding
@@ -300,6 +300,55 @@ TEST_CASE("always_comb and always_latch run once at time zero after every initia
         check_all_lowerings(comb_first, "y=x\n");
         check_all_lowerings(comb_last, "y=x\n");
     }
+    // The seed numbers its groups by SCHEDULE group, and instances of one unit whose
+    // clocked always wait on the very same signal (`t.clk`) share one. Those merged
+    // rows shift every later number down, so the seed once asked "does this start late"
+    // of a different fusion group than the one it was seeding, and an always_comb that
+    // sat behind such instances ran in source order, before the initial it disables.
+    SUBCASE("behind instances that share a schedule group, always_comb") {
+        check_all_lowerings(R"(
+            module ff;
+                logic q = 0;
+                always @(posedge t.clk) q <= ~q;
+            endmodule
+            module late;
+                always_comb disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+            endmodule
+            module t;
+                logic clk = 0;
+                ff u0();
+                ff u1();
+                ff u2();
+                late l();
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
+    SUBCASE("behind instances that share a schedule group, always_latch") {
+        check_all_lowerings(R"(
+            module ff;
+                logic q = 0;
+                always @(posedge t.clk) q <= ~q;
+            endmodule
+            module late;
+                always_latch disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+            endmodule
+            module t;
+                logic clk = 0;
+                ff u0();
+                ff u1();
+                ff u2();
+                late l();
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
 }
 
 // Deferring an always_comb's time-zero run (above) must not cost the fusion of an
@@ -322,6 +371,6 @@ TEST_CASE("an assign and always_comb cone still fuses, and starts after the init
             end
         endmodule
     )";
-    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
+    CHECK(count_substr(emit(src), ".f3.entry(ptr %wake") == 1);
     check_all_lowerings(src, "10 80 90 89\n");
 }

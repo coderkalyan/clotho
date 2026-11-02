@@ -118,9 +118,9 @@ per-instance descriptor the module-deduplication work already builds. Its layout
 is per *definition*, so twin instances present identical field constants:
 
 ```
-  0             ptr  state base            3             i32  first dump-var index
-  1             ptr  NBA shadow base       ctx_blk_base  i32  NBA block ids
-  2             ptr  sched-flag base       ctx_wait_base ptr  wait-bucket bases
+  0             i32  first dump-var index   ctx_blk_base   i32  NBA block ids
+  1             ptr  NBA shadow base        ctx_wait_base  ptr  wait-bucket bases
+  2             ptr  state base             ctx_sched_base { i64, ptr } wake pairs
 ```
 
 That is exactly the set of bases a member access needs, which is why the whole
@@ -129,8 +129,14 @@ ordinary signal lvalue with its base taken from the handle instead of from the
 owning instance's symbol. `CtxOverride` installs the handle's record for the
 duration of one lvalue's access, and every def-relative base — storage, shadow,
 wait buckets, dump-var index — then resolves against it. A reused module's own
-body already emits that exact code for itself (`storage_ptr`'s `ctx_field(a, 0)`
-arm); a virtual interface only chooses the record at run time.
+body already emits that exact code for itself (`storage_ptr`'s
+`ctx_field(a, kCtxState)` arm); a virtual interface only chooses the record at run time.
+
+The id fields (`ctx_id_base`) hold up the same promise: they are laid out per
+state type, as the union of what the instances of the definition have ids for
+(two instances of one definition can be units of their own), and a member a
+handle nonblocking-writes carries the representative's ids in every twin's
+record, since the code reads them through whichever instance the handle names.
 
 **The representative.** slang resolves `vif.sig` against a PLACEHOLDER instance
 body it caches once per (definition, parameter values) — `InstanceSymbol::

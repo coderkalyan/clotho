@@ -449,10 +449,10 @@ TEST_CASE("deferred #0 assertion: a passing check reports nothing") {
     CHECK_FALSE(contains(c.err, "ERROR: "));
 }
 
-// Each instance of a module with a deferred assertion gets its own per-process
-// generation counter (Clotho flattens instances into distinct processes, and
-// coroutines are never deduplicated), so the flush is per-instance: all three
-// instances report their own failing value, none flushed by another's activation.
+// Each instance of a module with a deferred assertion has its own generation
+// counter (a field of its record, though the unit's code is shared), so the flush
+// is per-instance: all three instances report their own failing value, none
+// flushed by another's activation.
 TEST_CASE("deferred #0 assertion: per-instance flush across module instances") {
     const Captured c = run_capture("module chk(input logic clk, input logic [7:0] v);\n"
                                    "  always @(posedge clk) a: assert #0 (v == 0) else $error(\"inst v=%0d\", v);\n"
@@ -467,6 +467,27 @@ TEST_CASE("deferred #0 assertion: per-instance flush across module instances") {
     CHECK(contains(c.err, "inst v=2"));
     CHECK(contains(c.err, "inst v=3"));
     CHECK_EQ(count_occ(c.err, "inst v="), 3u);
+}
+
+// The generation counter that drops a pending report is the instance's own: one
+// instance disables its procedure and loses its report, its twin (the same code)
+// keeps its own.
+TEST_CASE("deferred #0 assertion: twin instances flush their own pending reports") {
+    const Captured c = run_capture("module chk(input int k);\n"
+                                   "  int x;\n"
+                                   "  initial begin : whole\n"
+                                   "    #1;\n"
+                                   "    x = 0;\n"
+                                   "    assert #0 (x == 1) else $error(\"k=%0d\", k);\n"
+                                   "    if (k == 2) disable whole;\n"
+                                   "  end\n"
+                                   "endmodule\n"
+                                   "module top;\n"
+                                   "  chk c1(.k(1)); chk c2(.k(2)); chk c3(.k(3));\n"
+                                   "endmodule");
+    CHECK(contains(c.err, "k=1"));
+    CHECK_FALSE(contains(c.err, "k=2"));
+    CHECK(contains(c.err, "k=3"));
 }
 
 // A deferred report is queued with the same pieces and rendered at once, so it names

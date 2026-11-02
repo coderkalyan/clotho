@@ -98,6 +98,56 @@ struct InstanceScope {
     std::vector<Signal> signals;
     // Child instances, in declaration order.
     std::vector<InstanceScope> children;
+
+    static constexpr uint32_t no_unit = UINT32_MAX;
+    // The Design unit this instance expands (flatten), or no_unit for a module
+    // built without one, whose every scope is a unit of its own.
+    uint32_t unit = no_unit;
+    // What the unit's LLVM module and the symbols of its code are named, the
+    // same for every instance of the unit: the definition name and a hash of
+    // the unit's own content (flatten), so an edit to another unit renames
+    // nothing here and no instance name or design-wide number appears in it.
+    // Empty when `unit` is no_unit.
+    std::string unit_key;
+    // Every signal the instance defines, in its unit's signal order: `signals`
+    // and the storage the compiler adds to the unit without declaring it in the
+    // scope (driver slots, constant tables, assertion state). Empty when
+    // `unit` is no_unit; the scope then defines exactly `signals`.
+    std::vector<Signal> locals;
+    // The flat signal each extern signal declaration of the unit is bound to in
+    // this instance, in the unit's signal order: one entry per UnitSignal whose
+    // import is not kLocal (a signal of another instance, of a package, or the
+    // net a bound port aliases), so every instance of a unit has the same
+    // entries and a unit's code can name its imports by position. A
+    // declaration that only supplies a layout (Import::Kind::Representative)
+    // names no storage of this instance's and holds `no_extern`. Empty when
+    // `unit` is no_unit.
+    static constexpr Signal no_extern = static_cast<Signal>(UINT32_MAX);
+    std::vector<Signal>     externs;
+    // The flat function each of the unit's own function declarations is in this
+    // instance, in the unit's function order: the unit's code names its
+    // functions by position (a function's ordinal), and the instances of one
+    // unit hold the same ones. Empty when `unit` is no_unit.
+    std::vector<FunctionId> fn_locals;
+    // The flat function each extern function declaration of the unit is bound
+    // to in this instance (a hierarchical call, a call through an interface
+    // port, a package subroutine), in the unit's function order, so a unit's
+    // code names its imported functions by position. Empty when `unit` is
+    // no_unit.
+    std::vector<FunctionId> fn_externs;
+    // The flat `disable` target (Module::disable_targets) and the flat covergroup
+    // type (Module::cover_types) each of the unit's own declarations is in this
+    // instance, in the unit's order (imported ones left out), so a unit's code
+    // names its own by position. Empty when `unit` is no_unit.
+    std::vector<uint32_t> disable_locals;
+    std::vector<uint32_t> cover_locals;
+    // The assertion monitors (Module::monitors) the instance's unit declares, in
+    // the unit's order: `monitor_count` of them from flat monitor `monitor_base`,
+    // so a unit's code names a monitor of its own by position (an `expect`'s
+    // waiter queue is a field of the instance's record). 0 when `unit` is
+    // no_unit.
+    uint32_t monitor_base  = 0;
+    uint32_t monitor_count = 0;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the
@@ -130,7 +180,7 @@ enum class Activation : uint8_t {
     // time slot, which is what Inst::Tag::ReactivePend does.
     //
     // Emitted like Preponed and for the same reason: the backend runs it
-    // explicitly (emit_observed_run), so it is filtered out of the seed and
+    // explicitly (emit_run_once), so it is filtered out of the seed and
     // subscribe loops and its wait_events are never consulted. A body detects
     // its own clocking event from the values Preponed sampled, per LRM 16.5.
     //
@@ -147,7 +197,7 @@ enum class Activation : uint8_t {
     // could issue one -- an Active-region process woken by the clocking block
     // event, and a program's Reactive code alike.
     //
-    // Emitted like Observed (emit_renba_run), so it is filtered out of the seed and
+    // Emitted like Observed (emit_run_once), so it is filtered out of the seed and
     // subscribe loops and its wait_events are never consulted. Its stores are
     // ordinary design writes: the reactive drain re-settles the active set when one
     // wakes a process, which is what makes the driven value visible in the same
@@ -686,6 +736,10 @@ struct Function {
     // a unit's functions are its instance's by position, and flatten, which makes
     // one copy per instance, assigns it.
     uint32_t scope = Process::no_scope;
+    // InstanceScope::unit_key of the unit that declares the function, which names
+    // its symbol; flatten sets it, like `scope`. Empty for a body built without a
+    // unit.
+    std::string unit_key;
     // The lowered body.
     Ir ir;
 

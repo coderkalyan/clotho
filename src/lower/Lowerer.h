@@ -623,8 +623,8 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     //    underneath a failure, and Final is past the last time slot's Reactive
     //    drain, so emit_monitor_finish lowers the action straight into a Final
     //    process instead of pending a body nothing would resume. That process is
-    //    resumed exactly once and then destroyed (emit_finals_run in
-    //    ir/llvm/Scheduler.cpp), and no later region exists to bring it back -- so a
+    //    resumed exactly once and then destroyed (emit_run_once in
+    //    ir/llvm/RootTables.cpp), and no later region exists to bring it back -- so a
     //    suspension there drops everything after it without a word, which is the
     //    one outcome PRINCIPLES.md forbids outright.
     //

@@ -538,16 +538,20 @@ add_library(clotho_ir STATIC
   src/ir/llvm/Analyses.cpp
   src/ir/llvm/AssocArrays.cpp
   src/ir/llvm/Backend.cpp
+  src/ir/llvm/CodeText.cpp
   src/ir/llvm/Containers.cpp
   src/ir/llvm/Dedup.cpp
   src/ir/llvm/Dpi.cpp
   src/ir/llvm/ElemKernels.cpp
   src/ir/llvm/Events.cpp
+  src/ir/llvm/Families.cpp
   src/ir/llvm/GcEmit.cpp
+  src/ir/llvm/Groups.cpp
   src/ir/llvm/Inst.cpp
   src/ir/llvm/LlvmBackend.cpp
   src/ir/llvm/Ops.cpp
   src/ir/llvm/Processes.cpp
+  src/ir/llvm/RootTables.cpp
   src/ir/llvm/RuntimeAbi.cpp
   src/ir/llvm/RuntimeBitcode.cpp
   src/ir/llvm/Sanitizers.cpp
@@ -1071,6 +1075,9 @@ set(CLOTHO_TEST_SOURCES
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
+  tests/modular_gate_test.cpp
+  tests/twin_test.cpp
+  tests/code_text_test.cpp
   tests/two_state_test.cpp
   tests/real_test.cpp
   tests/wheel_test.cpp

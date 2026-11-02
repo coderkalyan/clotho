@@ -129,13 +129,9 @@ void Backend::lower_strobe_pend(Index i) {
     const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-    std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    std::vector<llvm::Value*> argv{ callee_record(info.func), rng_slot_, wheel_ };
+    argv.push_back(proc_arg());
+    argv.push_back(callee_home());
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     b_.CreateCall(strobe_pend_fn(), { hdl });
@@ -156,48 +152,76 @@ void Backend::lower_reactive_pend(Index i) {
     const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
     llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-    std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    std::vector<llvm::Value*> argv{ callee_record(info.func), rng_slot_, wheel_ };
+    argv.push_back(proc_arg());
     // NOT the pending body's home. LRM 4.4.2.5 hands an action block to the
     // Reactive region of this time slot no matter which region decided the
     // verdict -- the pend below pushes straight onto the reactive ring -- so the
     // thread this ramp starts is reactive-home by construction rather than by
     // inheritance from the Observed process that pended it.
-    if (design_uses_home_arg_) {
-        argv.push_back(b_.getInt8(kReactiveHomeTag));
-    }
+    argv.push_back(b_.getInt8(kReactiveHomeTag));
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     emit_reactive_push(b_, hdl);
 }
 
-// The waiter queue of one `expect` (LRM 16.17): an array of parked handles and
-// a count, created on first use and keyed by monitor index -- which is what
-// both halves of an expect name, the wait to push and the wake to drain.
+// The waiter queue of one `expect` (LRM 16.17): `{ i32 count, [cap x ptr] parked
+// handles }`, created on first use as a root global and keyed by flat monitor
+// index. Both halves of an `expect` name it, the wait to push and the wake to
+// drain, and both are code of the unit that declares it, which reads the queue's
+// address from a field of its instance's record (expect_queue_ptr) rather than
+// name the monitor's number.
 //
 // Shaped like the inactive batch rather than like a ring, because a cohort is
 // drained whole and never partially: the count goes back to zero in the same
 // step that empties it, so there is no wraparound to mask for.
-std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*> Backend::expect_queue(uint32_t monitor) {
+llvm::GlobalVariable* Backend::expect_queue(uint32_t monitor) {
     if (const auto it = expect_queue_.find(monitor); it != expect_queue_.end()) {
         return it->second;
     }
     // queue_arr_ty_ is shared by every queue, and the drain pushes onto the
     // reactive ring, so both must exist before the first waiter parks.
     ensure_reactive_queue();
-    auto*             i32  = llvm::Type::getInt32Ty(ctx_);
-    const std::string base = "clotho.expect" + std::to_string(monitor);
-    auto*             arr  = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
-                                                      llvm::GlobalValue::InternalLinkage,
-                                                      llvm::ConstantAggregateZero::get(queue_arr_ty_), base);
-    auto*             top  = new llvm::GlobalVariable(env_->llmod, i32, false,
-                                                      llvm::GlobalValue::InternalLinkage,
-                                                      llvm::ConstantInt::get(i32, 0), base + "_top");
-    const std::pair   entry{ arr, top };
-    expect_queue_.emplace(monitor, entry);
-    return entry;
+    auto* ty = expect_queue_ty();
+    auto* gv = new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
+                                        llvm::ConstantAggregateZero::get(ty),
+                                        "clotho.expect" + std::to_string(monitor));
+    expect_queue_.emplace(monitor, gv);
+    return gv;
+}
+
+// The queue of `monitor` as the body being lowered reaches it: the field of the
+// own instance's record that holds its address (a unit's code, which names no
+// monitor of the design), or the global itself for a monitor no instance
+// declares (a static unit's).
+llvm::Value* Backend::expect_queue_ptr(uint32_t monitor) {
+    const auto [owner, ordinal] = expect_owner_.at(monitor);
+    if (owner == SignalSlot::no_anchor) {
+        return sym(expect_queue(monitor));
+    }
+    if (owner != own_anchor_) {
+        taint("names the `expect` queue of another instance");
+        return sym(expect_queue(monitor));
+    }
+    // The queue is created where the record is filled; the bodies that reach it
+    // need the ring it drains onto.
+    ensure_reactive_queue();
+    return own_field(anchors_[owner].ctx_expect_base + ordinal, llvm::PointerType::getUnqual(ctx_));
+}
+
+// The type of an `expect` queue: the count, then the parked handles.
+llvm::StructType* Backend::expect_queue_ty() {
+    return llvm::StructType::get(ctx_, { llvm::Type::getInt32Ty(ctx_), queue_arr_ty_ });
+}
+
+// The slot of parked handle `idx` of an `expect` queue: the handles follow the
+// count, kExpectHandlesOffset bytes in, so the code that reaches the queue through
+// a record field names no capacity.
+llvm::Value* Backend::expect_handle_slot(llvm::Value* queue, llvm::Value* idx) {
+    assert(root_env_->llmod.getDataLayout().getStructLayout(expect_queue_ty())->getElementOffset(1) ==
+           kExpectHandlesOffset);
+    auto* handles = b_.CreateInBoundsGEP(b_.getInt8Ty(), queue, b_.getInt64(kExpectHandlesOffset));
+    return b_.CreateInBoundsGEP(llvm::PointerType::getUnqual(ctx_), handles, idx);
 }
 
 // Lower an `expect_wait` (LRM 16.17): park this process in the monitor's
@@ -225,14 +249,14 @@ void Backend::lower_expect_wait(Index i) {
         throw BackendError{ "an `expect` inside a task or function is not supported: the process it "
                             "blocks would resume in the Active region" };
     }
-    const auto info      = ir_->extra_data<ExpectInfo>(ir_->payload(i).extra);
-    const auto [arr, top] = expect_queue(info.monitor);
+    const auto info = ir_->extra_data<ExpectInfo>(ir_->payload(i).extra);
+    llvm::Value* q  = expect_queue_ptr(info.monitor);
 
     auto*        i32  = b_.getInt32Ty();
-    llvm::Value* sp   = b_.CreateLoad(i32, sym(top));
-    llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(arr), { b_.getInt32(0), sp });
+    llvm::Value* sp   = b_.CreateLoad(i32, q);
+    llvm::Value* slot = expect_handle_slot(q, sp);
     b_.CreateStore(hdl_, slot);
-    b_.CreateStore(b_.CreateAdd(sp, b_.getInt32(1)), sym(top));
+    b_.CreateStore(b_.CreateAdd(sp, b_.getInt32(1)), q);
     // Armed for the same reason a `wait` arms: while parked here this process
     // sits in no other queue, so the flag must say "not scheduled" or a later
     // event wake would be dropped as a duplicate.
@@ -260,10 +284,9 @@ void Backend::lower_expect_wait(Index i) {
 // pass/fail action blocks: the ring drains in push order, so an `expect`'s own
 // action runs before the statements that follow the `expect`.
 void Backend::lower_expect_wake(Index i) {
-    const auto&  p        = ir_->payload(i).op_imm;
-    const auto [arr, top] = expect_queue(p.imm);
-    auto*        i32      = b_.getInt32Ty();
-    auto*        ptr_ty   = llvm::PointerType::getUnqual(ctx_);
+    const auto&  p      = ir_->payload(i).op_imm;
+    auto*        i32    = b_.getInt32Ty();
+    auto*        ptr_ty = llvm::PointerType::getUnqual(ctx_);
 
     auto* drain = llvm::BasicBlock::Create(ctx_, "expect.drain", fn_);
     auto* head  = llvm::BasicBlock::Create(ctx_, "expect.drain.head", fn_);
@@ -275,11 +298,12 @@ void Backend::lower_expect_wake(Index i) {
     b_.CreateCondBr(b_.CreateICmpNE(must_of(p.op), zero(1)), drain, done);
 
     b_.SetInsertPoint(drain);
-    llvm::Value* n = b_.CreateLoad(i32, sym(top));
+    llvm::Value* q = expect_queue_ptr(p.imm);
+    llvm::Value* n = b_.CreateLoad(i32, q);
     // Emptied before the pushes, not after: a woken process may execute this
     // very `expect` again once it runs, and that push must land in an empty
     // queue rather than be swallowed by this drain's own store.
-    b_.CreateStore(b_.getInt32(0), sym(top));
+    b_.CreateStore(b_.getInt32(0), q);
     b_.CreateBr(head);
 
     b_.SetInsertPoint(head);
@@ -288,7 +312,7 @@ void Backend::lower_expect_wake(Index i) {
     b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(arr), { b_.getInt32(0), idx });
+    llvm::Value* slot = expect_handle_slot(q, idx);
     emit_reactive_push(b_, b_.CreateLoad(ptr_ty, slot));
     llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
     idx->addIncoming(next, b_.GetInsertBlock());
@@ -300,7 +324,7 @@ void Backend::lower_expect_wake(Index i) {
 // The task-call record a pended body ($strobe, an action block) is ramped with.
 // It CANNOT be an alloca in the pending body's frame: that frame can be freed
 // before the drain resumes the pended body -- an Observed process is ramped,
-// resumed and destroyed in one go (emit_observed_run), and an `initial` that
+// resumed and destroyed in one go (emit_run_once), and an `initial` that
 // pends a $strobe and runs off its end in the same time step is destroyed
 // before Postponed -- and a task's epilogue loads the parent handle back out of
 // the record to resume whoever called it (lower_task), so reading it there
@@ -312,7 +336,7 @@ void Backend::lower_expect_wake(Index i) {
 llvm::Value* Backend::pend_record_slot() {
     if (pend_record_gv_ == nullptr) {
         auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-        pend_record_gv_ = new llvm::GlobalVariable(env_->llmod,
+        pend_record_gv_ = new llvm::GlobalVariable(root_env_->llmod,
                                                    ptr_ty,
                                                    false,
                                                    llvm::GlobalValue::InternalLinkage,
@@ -545,6 +569,25 @@ void Backend::lower_system(Index i) {
 // collector: a covergroup instance is runtime-owned storage that outlives the
 // design (LRM 19.11.3 aggregates dropped instances), so its handle is an
 // opaque 2-state 64-bit word and never a traced root.
+
+// The flat covergroup type `t` as an IR value: a type the instance whose code is
+// being lowered declares is its unit's ordinal-th, whose index sits in the
+// instance's record (so the code names no type); a type of no instance (a
+// package's, a class's) is the same in every instance and is the constant; another
+// instance's is that instance's own, which a shared lowering cannot have.
+llvm::Value* Backend::cover_type_value(uint32_t t) {
+    const auto [owner, ordinal] = cover_owner_.at(t);
+    if (owner == SignalSlot::no_anchor) {
+        return b_.getInt32(t);
+    }
+    if (owner == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[owner];
+        return ctx_field(a, a.ctx_cov_base + ordinal, b_.getInt32Ty());
+    }
+    taint("names a covergroup type of another instance");
+    return b_.getInt32(t);
+}
+
 void Backend::lower_cover_query(Index i) {
     const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
     const auto args = ir_->region(info.args);
@@ -577,7 +620,7 @@ void Backend::lower_cover_query(Index i) {
                                                  : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(
                                                      llvm::PointerType::getUnqual(ctx_)));
             hval(b_.CreateCall(cover_new_fn(),
-                               { b_.getInt32(info.type_idx),
+                               { cover_type_value(info.type_idx),
                                  cast(must_of(args[0]), 64, false),
                                  path,
                                  b_.CreateGlobalString(text),
@@ -588,7 +631,7 @@ void Backend::lower_cover_query(Index i) {
             hval(b_.CreateCall(cover_ctx_fn(), { handle() }));
             return;
         case CoverOp::First:
-            hval(b_.CreateCall(cover_first_fn(), { b_.getInt32(info.type_idx) }));
+            hval(b_.CreateCall(cover_first_fn(), { cover_type_value(info.type_idx) }));
             return;
         case CoverOp::Next:
             hval(b_.CreateCall(cover_next_fn(), { handle() }));
@@ -619,13 +662,13 @@ void Backend::lower_cover_query(Index i) {
         case CoverOp::TypeCoverage:
             set_value(i,
                       real_plane(b_.CreateCall(cover_type_query_fn("rt_cover_type_coverage", dbl),
-                                               { b_.getInt32(info.type_idx) })));
+                                               { cover_type_value(info.type_idx) })));
             return;
         case CoverOp::TypeCovered:
-            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_covered", i32), { b_.getInt32(info.type_idx) }));
+            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_covered", i32), { cover_type_value(info.type_idx) }));
             return;
         case CoverOp::TypeTotal:
-            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { b_.getInt32(info.type_idx) }));
+            ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { cover_type_value(info.type_idx) }));
             return;
         case CoverOp::DesignCoverage:
             set_value(i, real_plane(b_.CreateCall(cover_design_coverage_fn(), {})));
@@ -1210,9 +1253,27 @@ llvm::Value* Backend::defer_gen_ptr() {
 
 // The same counter named by GROUP rather than by "the one being lowered", which
 // is what a `disable` of another procedure's outermost scope needs (LRM 16.4.4):
-// the bump has to land on the TARGET's counter. Created in the root unit so
+// the bump has to land on the TARGET's counter. The counter of a group of an
+// instance is a field of that instance's record, at the def-local ordinal of its
+// front process: the own instance's record when it is the code's own, so the
+// code names no counter, else the owner's record global (a hierarchical disable
+// of another instance's procedure, which names a symbol of that instance and so
+// is not shared). A group of no instance has a global of root, created there so
 // either side can be lowered first and still get the same global.
 llvm::Value* Backend::defer_gen_ptr_for(uint32_t g) {
+    const uint32_t ga = group_unit_anchor_[g];
+    if (ga != SignalSlot::no_anchor) {
+        Anchor&      a   = anchors_[ga];
+        llvm::Value* rec = nullptr;
+        if (ga == own_anchor_ && own_ctx_ != nullptr) {
+            rec = own_ctx_;
+        } else {
+            taint("names the deferred-assertion counter of another instance");
+            rec = ensure_ctx(a);
+        }
+        return b_.CreateInBoundsGEP(
+          a.ctx_ty, rec, { b_.getInt32(0), b_.getInt32(a.ctx_defer_base + proc_sched_ord_[groups_[g].front()]) });
+    }
     if (defer_gen_gv_.size() <= g) {
         defer_gen_gv_.resize(g + 1, nullptr);
     }

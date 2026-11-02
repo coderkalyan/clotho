@@ -2121,6 +2121,32 @@ TEST_CASE("a disabled block's process parked on an event keeps its pending repor
     }
 }
 
+// The counter that drops a pending report belongs to the instance whose procedure holds
+// the assertion, whichever instance's code disables the procedure (LRM 16.4.4).
+TEST_CASE("a disable from another instance drops the deferred reports of the procedure") {
+    const test::DesignRun dropped = test::run_design_captured(R"(
+        module child;
+          bit a = 0;
+          initial begin : P
+            #5;
+            assert #0 (a) else $error("pending report of child.P");
+            #20 $display("FAILED: P not disabled");
+          end
+        endmodule
+        module t;
+          child c();
+          initial begin
+            #5;
+            fork #0 ; join
+            disable c.P;
+          end
+          initial #10 $display("end %0t", $time);
+        endmodule
+    )");
+    CHECK(dropped.out == "end 10\n");
+    CHECK(dropped.err.find("pending report") == std::string::npos);
+}
+
 // The children of a fork a block holds are ended with it only when the fork is lexically
 // inside the block. One reached through a virtual call (any override in the design may
 // be the one that runs) or a randsequence production (lowered to a function of its own)
@@ -2779,4 +2805,30 @@ TEST_CASE("foreach over an assoc of queues, reading each element") {
             end
         endmodule
     )") == "3 2 1 size=3\n");
+}
+
+// Twin instances run one body (cli_test: --stat=unit-code), and a `disable` that names a
+// block or a task from another process finds the target of its own instance: m0 ends its
+// block before it prints and m1's prints; m1 ends its task activation and m0's runs on.
+TEST_CASE("a remote disable in twin instances ends the target of its own instance") {
+    CHECK(run_capture(R"(
+        module m(input int k);
+          initial begin : P
+            #10 $display("%m done");
+          end
+          initial begin #5 if (k == 1) disable m.P; end
+          task automatic tk();
+            #20 $display("%m task done");
+          endtask
+          initial begin
+            fork tk(); join_none
+            #6;
+            if (k == 2) disable m.tk;
+          end
+        endmodule
+        module t;
+          m m0(.k(1));
+          m m1(.k(2));
+        endmodule
+    )") == "t.m1.P done\nt.m0.tk task done\n");
 }

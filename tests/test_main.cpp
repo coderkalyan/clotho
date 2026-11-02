@@ -14,6 +14,7 @@
 
 #include "Lower.h"
 #include "Subprocess.h"
+#include "Twin.h"
 #include "ir/Jit.h"
 #include "runtime/Runtime.h"
 
@@ -80,6 +81,26 @@ int main(int argc, char** argv) {
     const auto      self = std::filesystem::absolute(argv[0], ec);
     clotho::test::self_exe = ec ? argv[0] : self.string();
 
+    // Twin mode is a detector for builds that carry the shared-code check (see
+    // Twin.h): every design the suite lowers is lowered again with each top twice.
+    // CLOTHO_NO_TWIN=1 turns it off, to time the suite without it.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (std::getenv("CLOTHO_NO_TWIN") == nullptr) {
+        clotho::set_twin_check(clotho::test::suite_twin_check);
+    }
+#endif
+
     doctest::Context ctx(argc, argv);
-    return ctx.run();
+    const int        rc = ctx.run();
+
+    const clotho::TwinStats& twin = clotho::twin_stats();
+    if (twin.twinned != 0 || !twin.skipped.empty()) {
+        std::fprintf(stderr, "twin mode: %llu designs lowered with each top twice and checked\n",
+                     static_cast<unsigned long long>(twin.twinned));
+        for (const auto& [why, n] : twin.skipped) {
+            std::fprintf(stderr, "twin mode: %llu designs skipped: %s\n", static_cast<unsigned long long>(n),
+                         why.c_str());
+        }
+    }
+    return rc;
 }

@@ -1,6 +1,7 @@
-// Module deduplication: twin-group sharing and the dedup and fusion statistics.
+// Module deduplication: twin-group sharing, the check of shared code, and the dedup and fusion statistics.
 
 #include "ir/llvm/Backend.h"
+#include "ir/llvm/CodeText.h"
 
 namespace clotho::ir::backend {
 
@@ -170,7 +171,11 @@ void Backend::report_dedup_stat() {
 // per-instance bake the def-relative families missed; sharing must not
 // proceed past a DIFF. Only singleton fusion groups compare — a fused
 // function mixes members, so per-process comparison is meaningless there.
-std::string Backend::normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst) {
+//
+// With `number_inst_symbols` off only the function's own name is normalized:
+// two functions that print the same then name the very same symbols, which is
+// what merging them into one function needs.
+std::string Backend::normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst, bool number_inst_symbols) {
     std::string raw;
     {
         llvm::raw_string_ostream os(raw);
@@ -199,12 +204,12 @@ std::string Backend::normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker
             ++j;
         }
         const std::string tok = raw.substr(i, j - i);
-        if (tok.starts_with("@clotho.inst.")) {
+        if (tok == "@" + fn->getName().str()) {
+            out += "@FN";
+        } else if (number_inst_symbols && tok.starts_with("@clotho.inst.")) {
             const auto [it, fresh] =
               inst_ids.try_emplace(tok, static_cast<uint32_t>(inst_ids.size()));
             out += "@INST" + std::to_string(it->second);
-        } else if (tok == "@" + fn->getName().str()) {
-            out += "@FN";
         } else {
             out += tok;
         }
@@ -252,220 +257,364 @@ void Backend::report_dedup_shapes(const std::vector<llvm::Function*>& group_fns)
                  (unsigned long long)skipped);
 }
 
-// The single @clotho.inst.* global a function references, or null when it
-// references none, more than one, or one from a PHI operand (a shape the
-// ctx-to-parameter rewrite below does not handle). Eligible bodies
-// reference exactly their own instance context: every def-relative site
-// routes through ctx_field and def_relative_for restricts that to the
-// group's own anchor.
-llvm::GlobalVariable* Backend::only_inst_global(llvm::Function* fn) {
-    llvm::GlobalVariable* found = nullptr;
-    bool                  bad   = false;
-    auto scan = [&](auto&& self, llvm::Constant* c) -> void {
-        if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(c)) {
-            if (gv->getName().starts_with("clotho.inst.")) {
-                bad   = bad || (found != nullptr && found != gv);
-                found = gv;
-            }
-            return;
-        }
-        if (llvm::isa<llvm::GlobalValue>(c)) {
-            return;
-        }
-        for (const llvm::Use& op : c->operands()) {
-            if (auto* oc = llvm::dyn_cast<llvm::Constant>(op)) {
-                self(self, oc);
-            }
-        }
-    };
-    for (llvm::BasicBlock& bb : *fn) {
-        for (llvm::Instruction& in : bb) {
-            for (const llvm::Use& op : in.operands()) {
-                auto* c = llvm::dyn_cast<llvm::Constant>(op);
-                if (c == nullptr) {
-                    continue;
-                }
-                llvm::GlobalVariable* before = found;
-                scan(scan, c);
-                bad = bad || (llvm::isa<llvm::PHINode>(in) && found != before);
-            }
-        }
-    }
-    return bad ? nullptr : found;
-}
-
-bool Backend::constant_uses(const llvm::Constant* c, const llvm::GlobalVariable* gv) {
-    if (c == gv) {
-        return true;
-    }
-    if (llvm::isa<llvm::GlobalValue>(c)) {
-        return false;
-    }
-    for (const llvm::Use& op : c->operands()) {
-        if (auto* oc = llvm::dyn_cast<llvm::Constant>(op); oc != nullptr && constant_uses(oc, gv)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Clone `rep` into the definition's shared body: same (ptr, ptr) -> void
-// signature, with every constant reference to the rep instance's ctx
-// global rewritten to the first parameter. noinline keeps ONE compiled
-// copy — the inliner would otherwise re-expand the body into every stub,
-// undoing the compile-time win.
-llvm::Function* Backend::clone_with_ctx_param(llvm::Function* rep, llvm::GlobalVariable* ctx_gv) {
-    auto* shared = llvm::Function::Create(rep->getFunctionType(), llvm::Function::InternalLinkage,
-                                          rep->getName() + ".shared", *rep->getParent());
-    llvm::ValueToValueMapTy vmap;
-    auto                    ni = shared->arg_begin();
-    for (llvm::Argument& a : rep->args()) {
-        vmap[&a] = &*ni;
-        ++ni;
-    }
-    llvm::SmallVector<llvm::ReturnInst*, 4> rets;
-    llvm::CloneFunctionInto(shared, rep, vmap, llvm::CloneFunctionChangeType::LocalChangesOnly, rets);
-    // After the clone: CloneFunctionInto copies the rep's attributes,
-    // which would reset these.
-    shared->setDSOLocal(true);
-    shared->addFnAttr(llvm::Attribute::NoInline);
-    llvm::Argument* ctx_arg = shared->getArg(0);
-    ctx_arg->setName("ictx");
-    for (llvm::BasicBlock& bb : *shared) {
-        for (llvm::Instruction& in : bb) {
-            for (unsigned i = 0; i < in.getNumOperands(); ++i) {
-                llvm::Value* op = in.getOperand(i);
-                if (op == ctx_gv) {
-                    in.setOperand(i, ctx_arg);
-                    continue;
-                }
-                auto* ce = llvm::dyn_cast<llvm::ConstantExpr>(op);
-                if (ce == nullptr || !constant_uses(ce, ctx_gv)) {
-                    continue;
-                }
-                llvm::Instruction* repl = ce->getAsInstruction();
-                repl->insertBefore(in.getIterator());
-                for (unsigned k = 0; k < repl->getNumOperands(); ++k) {
-                    if (repl->getOperand(k) == ctx_gv) {
-                        repl->setOperand(k, ctx_arg);
-                    }
-                }
-                in.setOperand(i, repl);
-            }
-        }
-    }
-    return shared;
-}
-
-// Replace `fn`'s body with a musttail stub into the shared body, passing
-// this instance's ctx global as the first argument (identical (ptr, ptr)
-// prototypes, so the subscription/dispatch ABI is untouched).
-void Backend::rewrite_to_stub(llvm::Function* fn, llvm::Function* shared, llvm::GlobalVariable* ctx_gv) {
-    fn->deleteBody();
-    llvm::IRBuilderBase::InsertPoint saved = b_.saveIP();
-    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
-    auto* call = b_.CreateCall(shared->getFunctionType(), shared, { ctx_gv, fn->getArg(1) });
-    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-    b_.CreateRetVoid();
-    b_.restoreIP(saved);
-}
-
-// Share one compiled body across twin instances of a reused definition.
-// Candidates: thunk groups attributed to a reused-definition instance
-// (group_anchor_of_) whose lowered function leaves the state argument
-// unused (thunk bodies address storage through the anchors) and
-// references exactly its own instance-context global. Groups bucket by
-// normalize_shape — literal IR identity modulo the function's own name
-// and that one symbol — so the transformation applies only where it is
-// provably exact; the canonical-hash detector (report_dedup_stat) is a
-// statistic, not the gate. Each bucket of >= 2 keeps one shared body (a
-// clone of the first member with the ctx global replaced by a parameter)
-// and every member becomes a two-instruction musttail stub passing its
-// own ctx. Per-member NBA blocks / commit functions / ctx fills, VCD
-// indices, and wait machinery are untouched — members registered their
-// own during lowering; only body code is shared. Runs before
-// finalize_block_nba / emit_main (nothing reads group function bodies,
-// only their addresses). Disabled by --no-dedup.
-void Backend::share_twin_groups(const std::vector<llvm::Function*>& group_fns) {
-    const auto t0 = std::chrono::steady_clock::now();
-    uint64_t   eligible = 0;
-    struct Cand {
-        uint32_t              g;
-        llvm::GlobalVariable* ctx;
-    };
-    // Cheap structural pre-key: definition identity (ctx type) and size
-    // counts — NOT the def-local ordinal: twins whose ordinal never
-    // reaches the IR (no NBA block, sched constant equal by shape) may
-    // share across ordinals, and shape equality is the actual gate. Only
-    // pre-buckets of >= 2 pay the IR print — a singleton can share with
-    // nothing.
-    struct PreKey {
-        const void* ctx_ty;
-        uint64_t    sizes;
-        bool        operator==(const PreKey&) const = default;
-    };
-    struct PreKeyHash {
-        uint64_t operator()(const PreKey& k) const {
-            return ankerl::unordered_dense::detail::wyhash::hash(
-              reinterpret_cast<uintptr_t>(k.ctx_ty) ^ k.sizes);
-        }
-    };
-    ankerl::unordered_dense::map<PreKey, std::vector<Cand>, PreKeyHash> pre;
+// `--stat=unit-code`: what is still emitted once per instance of a unit rather
+// than once per unit (docs/design/modular-compilation.md, step 3). For every
+// unit with several instances, the groups are counted per unit (its fusion
+// groups) and per instance, with the functions emitted for them: a group is
+// lowered once per unit and every instance runs it with its own record, so the
+// two numbers agree unless the code names something of the instance it was
+// lowered for (a function copy only it calls, its name, a covergroup index, a
+// disable target, another instance's nonblocking staging, a process-local
+// stream or control block). Those are counted by what stopped sharing. A group
+// of no instance has no unit to share in and is counted apart. The functions
+// and tasks are counted the same way on a line of their own: per unit and per
+// instance, with the functions emitted for them.
+void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
+    ankerl::unordered_dense::set<uint64_t>            unit_groups;
+    ankerl::unordered_dense::set<llvm::Function*>     emitted;
+    uint64_t                                          instance_groups = 0, coroutines = 0, unanchored = 0;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
-        if (!thunk_group_[g] || group_anchor_of_[g] == SignalSlot::no_anchor) {
+        const uint32_t aid = group_unit_anchor_[g];
+        if (aid == SignalSlot::no_anchor) {
+            ++unanchored;
             continue;
         }
-        llvm::Function* fn = group_fns[g];
-        if (!fn->getArg(0)->use_empty()) {
+        const uint32_t unit = anchors_[aid].unit;
+        if (unit == InstanceScope::no_unit || unit_instances_.at(unit) < 2) {
             continue;
         }
-        llvm::GlobalVariable* ctx = only_inst_global(fn);
-        if (ctx == nullptr || ctx != anchors_[group_anchor_of_[g]].ctx_gv) {
-            continue;
-        }
-        ++eligible;
-        uint64_t insts = 0, bbs = 0;
-        for (const llvm::BasicBlock& bb : *fn) {
-            ++bbs;
-            insts += bb.size();
-        }
-        const Anchor& a = anchors_[group_anchor_of_[g]];
-        pre[PreKey{ a.ctx_ty, bbs << 24 | insts << 40 }].push_back({ g, ctx });
+        unit_groups.insert((static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]);
+        emitted.insert(group_fns[g]);
+        ++instance_groups;
+        coroutines += thunk_group_[g] ? 0 : 1;
     }
-    llvm::ModuleSlotTracker mst(&env_->llmod, /*ShouldInitializeAllMetadata=*/false);
-    ankerl::unordered_dense::map<std::string, std::vector<Cand>> buckets;
-    for (auto& [pk, cs] : pre) {
-        if (cs.size() < 2) {
-            continue;
-        }
-        for (const Cand& c : cs) {
-            buckets[normalize_shape(group_fns[c.g], &mst)].push_back(c);
+    uint64_t shared = 0, rows = 0;
+    for (const SchedGroup& sg : sched_) {
+        if (sg.rows.size() > 1) {
+            ++shared;
+            rows += sg.rows.size();
         }
     }
-    const auto t1 = std::chrono::steady_clock::now();
-    uint64_t sets = 0, members = 0;
-    for (auto& [shape, cs] : buckets) {
-        if (cs.size() < 2) {
+    std::string why;
+    for (const auto& [reason, n] : unshared_) {
+        why += std::format("\n  {} groups lowered per instance: {}", n, reason);
+    }
+    std::fprintf(stderr,
+                 "unit-code: %llu groups of multi-instance units over %llu instances' groups, %llu functions "
+                 "emitted (%llu of the groups are coroutines); %llu schedule groups run several "
+                 "groups (%llu rows), %llu groups belong to no instance%s\n",
+                 (unsigned long long)unit_groups.size(), (unsigned long long)instance_groups,
+                 (unsigned long long)emitted.size(), (unsigned long long)coroutines, (unsigned long long)shared,
+                 (unsigned long long)rows, (unsigned long long)unanchored, why.c_str());
+
+    ankerl::unordered_dense::set<uint64_t>        unit_subs;
+    ankerl::unordered_dense::set<llvm::Function*> emitted_subs;
+    uint64_t                                      instance_subs = 0, tasks = 0;
+    for (uint32_t f = 0; f < subroutine_home_.size(); ++f) {
+        const SubroutineHome home = subroutine_home_[f];
+        const Function&      fu   = mod_.function(static_cast<FunctionId>(f));
+        if (home.anchor == SignalSlot::no_anchor || fu.is_dpi || unit_instances_.at(anchors_[home.anchor].unit) < 2) {
             continue;
         }
-        ++sets;
-        members += cs.size();
-        llvm::Function* shared = clone_with_ctx_param(group_fns[cs.front().g], cs.front().ctx);
-        for (const Cand& c : cs) {
-            rewrite_to_stub(group_fns[c.g], shared, c.ctx);
-        }
+        unit_subs.insert((static_cast<uint64_t>(anchors_[home.anchor].unit) << 32) | home.ordinal);
+        emitted_subs.insert(fn_decls_[f]);
+        ++instance_subs;
+        tasks += fu.is_task ? 1 : 0;
     }
-    if (stat_on(config_.stats, Stat::Dedup)) {
-        const auto t2 = std::chrono::steady_clock::now();
-        const auto ms = [](auto d) {
-            return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
-        };
+    std::string why_subs;
+    for (const auto& [reason, n] : unshared_subroutines_) {
+        why_subs += std::format("\n  {} subroutines lowered per instance: {}", n, reason);
+    }
+    std::fprintf(stderr,
+                 "unit-code: %llu subroutines of multi-instance units over %llu instances' subroutines, %llu "
+                 "functions emitted (%llu of the subroutines are tasks)%s\n",
+                 (unsigned long long)unit_subs.size(), (unsigned long long)instance_subs,
+                 (unsigned long long)emitted_subs.size(), (unsigned long long)tasks, why_subs.c_str());
+    if (config_.verify_shared_code) {
         std::fprintf(stderr,
-                     "dedup-share: %llu bodies -> %llu shared (%llu eligible; bucket %lld ms, "
-                     "rewrite %lld ms)\n",
-                     (unsigned long long)members, (unsigned long long)sets,
-                     (unsigned long long)eligible, (long long)ms(t1 - t0), (long long)ms(t2 - t1));
+                     "unit-code: %llu shared groups lowered again for their own instance and compared with "
+                     "the code they share, %lld ms\n",
+                     (unsigned long long)verified_groups_,
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(verify_time_).count());
+        std::fprintf(stderr,
+                     "unit-code: %llu shared subroutines lowered again for their own instance and compared with "
+                     "the code they share, %lld ms\n",
+                     (unsigned long long)verified_subroutines_,
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(verify_subroutine_time_).count());
     }
+}
+
+// -- Verifying shared code --
+//
+// SimulationConfig::verify_shared_code. A unit's group is lowered once and run
+// by every instance whose imports are alike, so what an instance's own lowering
+// would have baked (and the taint list missed) is silently wrong code for the
+// others. The check lowers the group again for each such instance, the way it
+// was lowered before groups were shared, and compares.
+
+// The last global and the last function root's module holds now (both lists only
+// ever get appended to), and the names of what follows them after.
+Backend::RootMark Backend::root_mark() const {
+    const llvm::Module& mod = root_env_->llmod;
+    return RootMark{ mod.global_empty() ? nullptr : &*std::prev(mod.global_end()),
+                     mod.empty() ? nullptr : &*std::prev(mod.end()) };
+}
+
+std::string Backend::root_added_since(const RootMark& mark) const {
+    std::string         out;
+    const llvm::Module& mod = root_env_->llmod;
+    // Newest first, so each name goes in front of the ones after it.
+    const auto add = [&](const llvm::GlobalValue& gv) { out = "@" + gv.getName().str() + (out.empty() ? "" : ", ") + out; };
+    for (auto it = mod.global_end(); it != mod.global_begin() && &*std::prev(it) != mark.last_global;) {
+        add(*--it);
+    }
+    for (auto it = mod.end(); it != mod.begin() && &*std::prev(it) != mark.last_function;) {
+        add(*--it);
+    }
+    return out;
+}
+
+// Lower group `g` for its own instance into a scratch module and take back out
+// of the backend what lowering registers outside it. The function stays in the
+// scratch module (see verify_modules_).
+Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
+    Anchor&        a = anchors_[group_unit_anchor_[g]];
+    llvm::Module&  scratch = *verify_modules_.emplace_back(std::make_unique<llvm::Module>("clotho.verify", ctx_));
+    scratch.setTargetTriple(root_env_->llmod.getTargetTriple());
+    scratch.setDataLayout(root_env_->llmod.getDataLayout());
+    ModuleEnv* const           real_env = env_;
+    env_                                = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
+    const auto                 block_lo = static_cast<std::ptrdiff_t>(block_commits_.size());
+    const auto                 fill_lo  = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
+    const std::vector<uint8_t> bound    = a.bind_used;
+    const RootMark             mark     = root_mark();
+    const std::vector<uint8_t> fbound   = a.fbind_used;
+    verifying_                          = true;
+    share_active_                       = true;
+    taint_why_                          = nullptr;
+    OwnLowering own;
+    own.fn        = lower_group(groups_[g]);
+    own.taint     = std::exchange(taint_why_, nullptr);
+    own.root_added = root_added_since(mark);
+    verifying_    = false;
+    share_active_ = false;
+    env_          = real_env;
+    own.blocks.assign(std::make_move_iterator(block_commits_.begin() + block_lo),
+                      std::make_move_iterator(block_commits_.end()));
+    block_commits_.erase(block_commits_.begin() + block_lo, block_commits_.end());
+    own.fills.assign(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
+    ctx_blk_fills_.erase(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
+    a.bind_used  = bound;
+    a.fbind_used = fbound;
+    return own;
+}
+
+// How the own lowering of group `g` differs from the code its instance runs when
+// it shares `rep`'s: the printed code, the NBA blocks the shared code registers
+// for it against the ones it registers itself, and the record fields that hold
+// their first ids. Empty when it does not.
+std::string Backend::shared_code_differs(uint32_t g, SharedGroup& rep, const OwnLowering& own) {
+    const uint32_t ua = group_unit_anchor_[g];
+    std::string    differs;
+    if (own.taint != nullptr) {
+        differs += std::format("  lowered for itself, the group bakes something of its instance: {}\n", own.taint);
+    }
+    if (!own.root_added.empty()) {
+        differs += std::format("  lowered for itself, the group makes in root what the shared code did not: {}\n",
+                               own.root_added);
+    }
+    if (rep.text.empty()) {
+        rep.text = CodeText(rep.fn).joined();
+    }
+    const CodeText own_text(own.fn);
+    if (own_text.joined() != rep.text) {
+        differs += "  " + CodeText::difference(CodeText(rep.fn), own_text);
+    }
+    const std::vector<BlockCommit> shared = shared_blocks(rep, ua);
+    const auto                     describe = [&](const BlockCommit& bc) {
+        std::string out = "{";
+        for (const BlockSig& bs : bc.sigs) {
+            out += std::format("{}{} #{}{}", out.size() > 1 ? ", " : "", mod_.signals()[static_cast<size_t>(bs.sig)].name,
+                               static_cast<uint32_t>(bs.sig), bs.dynamic ? " (dynamic mask)" : "");
+        }
+        return out + "}";
+    };
+    const auto same_block = [](const BlockCommit& x, const BlockCommit& y) {
+        return x.sigs.size() == y.sigs.size() &&
+               std::equal(x.sigs.begin(), x.sigs.end(), y.sigs.begin(), [](const BlockSig& p, const BlockSig& q) {
+                   return p.sig == q.sig && p.dynamic == q.dynamic && p.mask.getBitWidth() == q.mask.getBitWidth() &&
+                          p.mask == q.mask;
+               });
+    };
+    if (shared.size() != own.blocks.size()) {
+        differs += std::format("  it registers {} NBA blocks, and the shared code {}\n", own.blocks.size(), shared.size());
+    }
+    for (size_t b = 0; b < shared.size() && b < own.blocks.size(); ++b) {
+        if (!same_block(shared[b], own.blocks[b])) {
+            differs += std::format("  NBA block {} of the group commits {} for it, and its own lowering {}\n", b,
+                                   describe(shared[b]), describe(own.blocks[b]));
+            break;
+        }
+    }
+    // The code that commits each block: the function the shared lowering emitted
+    // against the one this instance's own lowering did.
+    for (size_t b = 0; b < shared.size() && b < own.blocks.size(); ++b) {
+        const CodeText theirs(shared[b].fn);
+        const CodeText mine(own.blocks[b].fn);
+        if (theirs.joined() != mine.joined()) {
+            differs += std::format("  the commit function of NBA block {}: ", b) + CodeText::difference(theirs, mine);
+            break;
+        }
+    }
+    // Its own lowering numbered its blocks from where the backend stood.
+    if (shared_fills(rep, ua, static_cast<uint32_t>(block_commits_.size())) != own.fills) {
+        differs += "  the record fields that hold the first id of its NBA blocks differ from the ones the shared "
+                   "code's blocks are filled into\n";
+    }
+    return differs;
+}
+
+void Backend::verify_shared_group(uint32_t g, SharedGroup& rep) {
+    const auto         started = std::chrono::steady_clock::now();
+    const OwnLowering  own     = lower_for_own_instance(g);
+    const std::string  differs = shared_code_differs(g, rep, own);
+    ++verified_groups_;
+    verify_time_ += std::chrono::steady_clock::now() - started;
+    if (differs.empty()) {
+        return;
+    }
+    const Anchor& a    = anchors_[group_unit_anchor_[g]];
+    std::string   unit = a.ty->getName().str();
+    if (unit.ends_with(".state")) {
+        unit.resize(unit.size() - 6);
+    }
+    const Process& first = mod_.processes()[groups_[g].front()];
+    std::string    at;
+    if (resolve_ && first.span.valid()) {
+        at = " (" + resolve_(first.span).where + ")";
+    }
+    throw BackendError{ std::format("internal: the code shared by the instances of unit '{}' is not what instance '{}' "
+                                    "lowers for itself\n  group {}{}, lowered once for '{}' and run by '{}' too\n{}"
+                                    "  a fact of one instance is baked into code the others run: move it into the "
+                                    "instance record, or taint the lowering (Backend::taint)",
+                                    unit, a.name, group_unit_ordinal_[g], at, anchors_[group_unit_anchor_[rep.g]].name,
+                                    a.name, differs),
+                        first.span };
+}
+
+// Lower subroutine `f` again, for its own instance and into a scratch module as
+// it would have been without sharing, and check it is the function `rep` shares
+// with it: the same printed code (CodeText), with nothing of its instance
+// baked in (a taint). The declaration it lowers into is a scratch one, and
+// everything the lowering marked in its instance's record is put back, so the
+// emitted modules are the same with the check on and off.
+void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
+    const auto           started = std::chrono::steady_clock::now();
+    const auto           id      = static_cast<FunctionId>(f);
+    const SubroutineHome home    = subroutine_home_[f];
+    Anchor&              a       = anchors_[home.anchor];
+    llvm::Module& scratch = *verify_modules_.emplace_back(std::make_unique<llvm::Module>("clotho.verify", ctx_));
+    scratch.setTargetTriple(root_env_->llmod.getTargetTriple());
+    scratch.setDataLayout(root_env_->llmod.getDataLayout());
+    ModuleEnv* const           real_env  = env_;
+    llvm::Function* const      real_decl = fn_decls_[f];
+    const std::vector<uint8_t> bound     = a.bind_used;
+    const RootMark             mark      = root_mark();
+    const std::vector<uint8_t> fbound    = a.fbind_used;
+    const auto                 block_lo  = static_cast<std::ptrdiff_t>(block_commits_.size());
+    const auto                 fill_lo   = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
+    env_                                 = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
+    verifying_                           = true;
+    share_active_                        = true;
+    taint_why_                           = nullptr;
+    fn_decls_[f]                         = declare_function(id);
+    lower_subroutine(id);
+    llvm::Function* const own_fn = fn_decls_[f];
+    const char* const     taint  = std::exchange(taint_why_, nullptr);
+    const std::string     root_added = root_added_since(mark);
+    fn_decls_[f]                 = real_decl;
+    verifying_                   = false;
+    share_active_                = false;
+    env_                         = real_env;
+    a.bind_used                  = bound;
+    a.fbind_used                 = fbound;
+    std::vector<BlockCommit> own_blocks(std::make_move_iterator(block_commits_.begin() + block_lo),
+                                        std::make_move_iterator(block_commits_.end()));
+    block_commits_.erase(block_commits_.begin() + block_lo, block_commits_.end());
+    const std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> own_fills(ctx_blk_fills_.begin() + fill_lo,
+                                                                          ctx_blk_fills_.end());
+    ctx_blk_fills_.erase(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
+
+    std::string differs;
+    if (taint != nullptr) {
+        differs += std::format("  lowered for itself, the subroutine bakes something of its instance: {}\n", taint);
+    }
+    if (!root_added.empty()) {
+        differs += std::format("  lowered for itself, the subroutine makes in root what the shared code did not: {}\n",
+                               root_added);
+    }
+    // The shared function may have been promoted to external linkage by a caller
+    // in another module since; compared at the linkage it was declared with.
+    const llvm::GlobalValue::LinkageTypes linkage = rep.fn->getLinkage();
+    rep.fn->setLinkage(own_fn->getLinkage());
+    if (rep.text.empty()) {
+        rep.text = CodeText(rep.fn).joined();
+    }
+    const CodeText own_text(own_fn);
+    if (own_text.joined() != rep.text) {
+        differs += "  " + CodeText::difference(CodeText(rep.fn), own_text);
+    }
+    rep.fn->setLinkage(linkage);
+    // The NBA blocks it registers for the instance, and the record fields that hold their
+    // first ids, against the ones the shared code's blocks give it.
+    const auto shared_bl = shared_blocks_of(subroutine_home_[rep.f].anchor, rep.block_lo, rep.block_hi, home.anchor);
+    const auto same_block = [](const BlockCommit& x, const BlockCommit& y) {
+        return x.sigs.size() == y.sigs.size() &&
+               std::equal(x.sigs.begin(), x.sigs.end(), y.sigs.begin(), [](const BlockSig& p, const BlockSig& q) {
+                   return p.sig == q.sig && p.dynamic == q.dynamic && p.mask.getBitWidth() == q.mask.getBitWidth() &&
+                          p.mask == q.mask;
+               });
+    };
+    if (shared_bl.size() != own_blocks.size() ||
+        !std::equal(shared_bl.begin(), shared_bl.end(), own_blocks.begin(), same_block)) {
+        differs += std::format("  it registers {} NBA blocks, and the shared code's differ ({}) from them\n",
+                               own_blocks.size(), shared_bl.size());
+    }
+    for (size_t b = 0; b < shared_bl.size() && b < own_blocks.size(); ++b) {
+        const CodeText theirs(shared_bl[b].fn);
+        const CodeText mine(own_blocks[b].fn);
+        if (theirs.joined() != mine.joined()) {
+            differs += std::format("  the commit function of NBA block {}: ", b) + CodeText::difference(theirs, mine);
+            break;
+        }
+    }
+    if (shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, home.anchor,
+                        static_cast<uint32_t>(block_commits_.size())) != own_fills) {
+        differs += "  the record fields that hold the first id of its NBA blocks differ from the ones the shared "
+                   "code's blocks are filled into\n";
+    }
+    ++verified_subroutines_;
+    verify_subroutine_time_ += std::chrono::steady_clock::now() - started;
+    if (differs.empty()) {
+        return;
+    }
+    const Function& fu   = mod_.function(id);
+    std::string     unit = a.ty->getName().str();
+    if (unit.ends_with(".state")) {
+        unit.resize(unit.size() - 6);
+    }
+    std::string at;
+    if (resolve_ && fu.span.valid()) {
+        at = " (" + resolve_(fu.span).where + ")";
+    }
+    throw BackendError{ std::format("internal: the code shared by the instances of unit '{}' is not what instance '{}' "
+                                    "lowers for itself\n  {} '{}'{}, lowered once for '{}' and run by '{}' too\n{}"
+                                    "  a fact of one instance is baked into code the others run: move it into the "
+                                    "instance record, add it to the family key (Backend::subroutine_key), or taint "
+                                    "the lowering (Backend::taint)",
+                                    unit, a.name, fu.is_task ? "task" : "function", fu.name, at,
+                                    anchors_[subroutine_home_[rep.f].anchor].name, a.name, differs),
+                        fu.span };
 }
 
 void Backend::report_finish_stat() const {

@@ -24,8 +24,9 @@ void Backend::run() {
         report_dedup_stat();
     }
     build_rng_fns();         // before compute_fusion_groups: gates thunk eligibility
+    build_sched_flags();     // before compute_fusion_groups: a group is a list of def-local process ordinals
     compute_subscription_order();
-    compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
+    compute_fusion_groups(); // before build_wait_queues: bucket capacities count schedule-group subscriptions
     compute_trigger_masks(); // after fusion: colours come from the group event unions
     if (stat_on(config_.stats, Stat::CombFuse)) {
         report_comb_fuse_stat();
@@ -81,32 +82,27 @@ void Backend::run() {
     }
     build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
     build_wait_queues();
-    build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
-    build_sched_flags();
+    build_instance_ctx_layout(); // after build_wait_queues (ctx sizes need wait slots) and build_sched_flags
     build_nba_state();
 
     // Functions and tasks: declare every one up front (so calls resolve,
-    // including recursion and forward references), then lower their bodies. A
-    // task is a coroutine (lower_task); a function is a plain call.
+    // including recursion and forward references), each where it is emitted,
+    // then lower their bodies callees first, once per family of instances
+    // (lower_subroutines). A task is a coroutine (lower_task); a function is a
+    // plain call.
     const size_t nf = mod_.function_count();
-    // Identify functions by address: the ABI helpers below take a `const
-    // Function&` and need its id to ask the analysis about a formal. The
-    // function table is a deque, so these addresses are stable.
-    fn_ids_.reserve(nf);
-    for (uint32_t i = 0; i < nf; ++i) {
-        fn_ids_.emplace(&mod_.function(static_cast<FunctionId>(i)), i);
-    }
     fn_decls_.assign(nf, nullptr);
+    plan_subroutines();
     for (uint32_t i = 0; i < nf; ++i) {
+        env_         = subroutine_env(static_cast<FunctionId>(i));
         fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
     }
-    for (uint32_t i = 0; i < nf; ++i) {
-        if (mod_.function(static_cast<FunctionId>(i)).is_task) {
-            lower_task(static_cast<FunctionId>(i));
-        } else {
-            lower_function(static_cast<FunctionId>(i));
-        }
-    }
+    env_ = root_env_.get();
+    // Before any body: a vtable thunk and an export thunk name the record of an
+    // instance, which main fills only if it exists by then.
+    make_vtable_entries();
+    reserve_export_records();
+    lower_subroutines();
 
     // Lower every process and seed every one at startup. An `initial` runs its
     // body once; an `always` with a sensitivity list immediately subscribes to
@@ -116,19 +112,75 @@ void Backend::run() {
     // continuous `assign`, whose RHS sensitivity is not yet inferred) still
     // runs its body just once — it does not re-trigger on input changes.
     std::vector<llvm::Function*> group_fns;
+    // The first instance lowered for each (unit, group, key): thunk groups of the
+    // other instances run its function with their own record.
+    std::map<std::tuple<uint32_t, uint32_t, std::vector<uint64_t>>, SharedGroup> once;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t ua = group_unit_anchor_[g];
         env_ = config_.split && ua != SignalSlot::no_anchor ? &unit_env(anchors_[ua])
                                                             : root_env_.get();
-        group_fns.push_back(lower_group(groups_[g]));
+        const bool candidate = config_.dedup && ua != SignalSlot::no_anchor &&
+                               anchors_[ua].unit != InstanceScope::no_unit;
+        if (!candidate) {
+            group_fns.push_back(lower_group(groups_[g]));
+            continue;
+        }
+        auto key = std::make_tuple(anchors_[ua].unit, group_unit_ordinal_[g], group_key(g, ua));
+        if (const auto it = once.find(key); it != once.end()) {
+            // Another instance of the unit lowered this group already: run its
+            // function with this instance's record, which needs the same
+            // bindings filled, and NBA blocks of its own signals.
+            SharedGroup& rep = it->second;
+            if (config_.verify_shared_code) {
+                verify_shared_group(g, rep);
+            }
+            group_fns.push_back(rep.fn);
+            shared_instances_.emplace_back(ua, group_unit_anchor_[rep.g]);
+            const auto base = static_cast<uint32_t>(block_commits_.size());
+            for (BlockCommit& bc : shared_blocks(rep, ua)) {
+                block_commits_.push_back(std::move(bc));
+            }
+            for (auto& fill : shared_fills(rep, ua, base)) {
+                ctx_blk_fills_.push_back(std::move(fill));
+            }
+            continue;
+        }
+        const auto block_lo = static_cast<uint32_t>(block_commits_.size());
+        const auto fill_lo  = ctx_blk_fills_.size();
+        share_active_       = true;
+        taint_why_          = nullptr;
+        llvm::Function* fn  = lower_group(groups_[g]);
+        share_active_       = false;
+        group_fns.push_back(fn);
+        if (taint_why_ == nullptr) {
+            once.emplace(std::move(key), SharedGroup{ g, fn, block_lo, static_cast<uint32_t>(block_commits_.size()),
+                                                      fill_lo, ctx_blk_fills_.size(), {} });
+        } else if (unit_instances_.at(anchors_[ua].unit) >= 2) {
+            ++unshared_[taint_why_];
+        }
+    }
+    // An instance that runs another's code reads the bindings that code reads.
+    for (const auto& [ua, ra] : shared_instances_) {
+        Anchor& a = anchors_[ua];
+        a.bind_used.resize(a.externs.size(), 0);
+        for (size_t k = 0; k < anchors_[ra].bind_used.size(); ++k) {
+            a.bind_used[k] |= anchors_[ra].bind_used[k];
+        }
+        a.fbind_used.resize(a.fn_externs.size(), 0);
+        for (size_t k = 0; k < anchors_[ra].fbind_used.size(); ++k) {
+            a.fbind_used[k] |= anchors_[ra].fbind_used[k];
+        }
     }
     env_ = root_env_.get();
     if (!shape_sets_.empty()) {
         report_dedup_shapes(group_fns);
     }
-    if (config_.dedup && config_.thunk) {
-        share_twin_groups(group_fns);
+    if (stat_on(config_.stats, Stat::UnitCode)) {
+        report_unit_code(group_fns);
     }
+    // What the scheduler holds: each coroutine group's ramp, and for every
+    // thunk schedule group the entry that runs its rows.
+    const std::vector<llvm::Function*> sched_fns = emit_sched_entries(group_fns);
     // Every interface instance a virtual interface can name needs its context
     // record to exist before main fills it, whether or not any body happened
     // to address that instance def-relatively: the handle IS the context
@@ -142,10 +194,14 @@ void Backend::run() {
     // globals and emit the commit / enqueue functions now, before emit_main
     // wires the NBA-region drain that references them.
     finalize_block_nba();
-    emit_main(group_fns);
+    emit_main(sched_fns);
     // Export thunks come last: they reference @clotho.state (created in
     // emit_main) and every SV function's declaration.
     emit_dpi_exports();
+    // The scratch modules of the verification (see verify_modules_): nothing
+    // below run() reads what lowering cached in them.
+    verify_envs_.clear();
+    verify_modules_.clear();
 }
 
 // Use a global (defined in whichever unit created it) as an operand in the
@@ -155,14 +211,19 @@ void Backend::run() {
 // Every use of a cached GlobalVariable*/Function* member as an IR operand
 // must route through here so the per-definition split can relink it.
 llvm::Function* Backend::sym(llvm::Function* f) {
+    if (share_active_ && instance_fns_.contains(f)) {
+        taint("calls a function copy of its instance");
+    }
     if (f->getParent() == &env_->llmod) {
         return f;
     }
     auto [it, inserted] = env_->decls.try_emplace(f, nullptr);
     if (inserted) {
         // First cross-unit use: the definition must be visible to the JIT
-        // linker, so promote it out of local linkage.
-        if (f->hasLocalLinkage()) {
+        // linker, so promote it out of local linkage. Not for a scratch module
+        // (verify_shared_group): it is never linked, and the definition is the
+        // real modules' business.
+        if (f->hasLocalLinkage() && !verifying_) {
             f->setLinkage(llvm::GlobalValue::ExternalLinkage);
         }
         auto* decl = llvm::Function::Create(f->getFunctionType(), llvm::GlobalValue::ExternalLinkage,
@@ -177,15 +238,33 @@ llvm::Function* Backend::sym(llvm::Function* f) {
 }
 
 llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
+    // A global of one instance (its state, record, flags, shadow): shared code
+    // names it only through a record.
+    if (share_active_ && g->getName().starts_with("clotho.inst.")) {
+        taint("names a symbol of one instance");
+    }
     if (g->getParent() == &env_->llmod) {
         return g;
     }
     auto [it, inserted] = env_->decls.try_emplace(g, nullptr);
     if (inserted) {
-        if (g->hasLocalLinkage()) {
+        if (g->hasLocalLinkage() && !verifying_) {
             g->setLinkage(llvm::GlobalValue::ExternalLinkage);
         }
-        auto* decl = new llvm::GlobalVariable(env_->llmod, g->getValueType(), g->isConstant(),
+        // A unit's module names root's global by its symbol and nothing of its
+        // size: the root state's layout and every array's length (a ring's
+        // capacity, a bucket's) are design-wide facts, and a declaration's type
+        // is part of the module's text. An unsized declaration only tells LLVM
+        // less (what is dereferenceable), never more.
+        llvm::Type* type = g->getValueType();
+        if (env_ != root_env_.get()) {
+            if (g == state_global_) {
+                type = llvm::ArrayType::get(b_.getInt8Ty(), 0);
+            } else if (auto* arr = llvm::dyn_cast<llvm::ArrayType>(type)) {
+                type = llvm::ArrayType::get(arr->getElementType(), 0);
+            }
+        }
+        auto* decl = new llvm::GlobalVariable(env_->llmod, type, g->isConstant(),
                                               llvm::GlobalValue::ExternalLinkage, nullptr, g->getName());
         decl->setAlignment(g->getAlign());
         decl->setDSOLocal(true);
@@ -194,82 +273,54 @@ llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
     return llvm::cast<llvm::GlobalVariable>(it->second);
 }
 
-// True while emission targets a definition-unit module (split mode);
-// root-module code keeps plain immediates for the id families below.
-bool Backend::unit_emission() const {
-    return env_ != root_env_.get();
-}
-
-// A design-numbering integer id, referenced from unit-module code without
-// baking the number: a load of a root-defined i32 value global
-// (@clotho.idval.<key>), named by hierarchy + def-local ordinal, so the
-// unit's bytes stay independent of whole-design numbering (root always
-// recompiles and carries the value). Deliberately NOT an absolute-symbol
-// relocation: a truncating-ptrtoint constant in operand position measured
-// ~+3KB codegen per hot pico thunk -- SelectionDAG (the -O0 fallback for
-// blocks FastISel misses) keeps the symbol address live across the whole
-// function and spills it, costing more executed instructions per
-// activation than this one L1-hot 4-byte load per site (llc A/B on the
-// extracted thunk: constexpr 72248 B, instruction-form 72169 B, this load
-// form 70992 B, literal floor 69298 B).
-llvm::Value* Backend::abs_id_const(const std::string& key, uint32_t value, uint32_t addend) {
-    std::string name = "clotho.idval." + key;
-    if (addend != 0) {
-        name += "+" + std::to_string(addend);
+// A design-numbering id the code being lowered uses, as an IR value. The ids of
+// a signal's instance sit in the signal's port in that instance's record
+// (assign_id_fields), so the code that uses one names no number and the unit's
+// code is the same whichever instance it runs for: the own instance's record, the
+// port a binding names for a signal of another instance, or the record of the
+// instance an installed context names. Where no port describes the signal --
+// code outside a group, a signal of no instance -- the id is the immediate it has
+// always been.
+llvm::Value* Backend::id_value(Signal sig, IdFamily family, uint32_t id) {
+    const SignalSlot& s = slot_of(sig);
+    if (port_reachable(s)) {
+        const uint32_t elem = port_of(s)->id[static_cast<uint32_t>(family)];
+        if (elem != no_port_elem) {
+            return b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, elem));
+        }
     }
-    auto [it, inserted] = idval_gvs_.try_emplace(name, nullptr);
-    if (inserted) {
-        auto* i32  = b_.getInt32Ty();
-        it->second = new llvm::GlobalVariable(root_env_->llmod, i32, /*isConstant=*/true,
-                                              llvm::GlobalValue::InternalLinkage,
-                                              llvm::ConstantInt::get(i32, value + addend), name);
-        it->second->setAlignment(llvm::Align(4));
-    } else if (llvm::cast<llvm::ConstantInt>(it->second->getInitializer())->getZExtValue() !=
-               value + addend) {
-        throw BackendError{ "id value global '" + name + "' bound to two values" };
+    // The design-wide number of a signal of some instance is that instance's own:
+    // shared code that reaches it by no record or binding would run it for the
+    // others.
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names a design-wide id of a signal of one instance");
     }
-    return b_.CreateLoad(b_.getInt32Ty(), sym(it->second));
-}
-
-// Whether `s`'s design-numbering ids should emit as absolute-symbol
-// relocations in the current emission context: unit-module code only, and
-// only for scope-owned signals (an unscoped signal referenced from a unit
-// keeps the immediate — rare, costs only that unit's cache stability).
-bool Backend::abs_id_eligible(const SignalSlot& s) const {
-    return config_.split && unit_emission() && s.anchor != SignalSlot::no_anchor;
+    return b_.getInt32(id);
 }
 
 // rt_nba_arr_* buffer index of an array-NBA signal, as an IR value.
 llvm::Value* Backend::arr_id_value(Signal sig) {
-    const uint32_t    id = arr_idx(sig);
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("arr." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, IdFamily::Arr, arr_idx(sig));
 }
 
 // rt_nba_arr_* buffer index of an aggregate-NBA signal, as an IR value.
 llvm::Value* Backend::agg_id_value(Signal sig) {
-    const uint32_t    id = agg_buf_idx(sig);
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("agg." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, IdFamily::Agg, agg_buf_idx(sig));
+}
+
+// rt_nba_arr_* buffer index of a whole-container NBA signal, as an IR value.
+llvm::Value* Backend::handle_id_value(Signal sig) {
+    return id_value(sig, IdFamily::Handle, handle_buf_idx(sig));
+}
+
+// rt_nba_arr_* buffer index of a whole-string NBA signal, as an IR value.
+llvm::Value* Backend::str_id_value(Signal sig) {
+    return id_value(sig, IdFamily::Str, str_buf_idx(sig));
 }
 
 // rt_intra_* record-buffer index of an intra-assignment target, as an IR value.
 llvm::Value* Backend::intra_id_value(Signal sig) {
-    const uint32_t    id = intra_idx(sig);
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("intra." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, IdFamily::Intra, intra_idx(sig));
 }
 
 // Trigger id of (signal, edge), as an IR value. A dense `<= @e` id for a value
@@ -278,32 +329,146 @@ llvm::Value* Backend::intra_id_value(Signal sig) {
 // executes), which is what emit_event_fire counts down.
 llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
     if (event_slot_[static_cast<uint32_t>(sig)] != 0) {
-        llvm::Value* slot = event_is_mono(sig)
-                              ? static_cast<llvm::Value*>(b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]))
-                              : b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+        llvm::Value* slot = event_slot_value(sig);
         return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
     }
-    const auto        id = static_cast<uint32_t>(trigger_id(sig, edge));
-    const SignalSlot& s  = slot_of(sig);
-    if (abs_id_eligible(s)) {
-        return abs_id_const("trig." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()) +
-                              ".e" + std::to_string(edge),
-                            id, 0);
-    }
-    return b_.getInt32(id);
+    return id_value(sig, static_cast<IdFamily>(static_cast<uint32_t>(IdFamily::TrigPos) + edge),
+                    static_cast<uint32_t>(trigger_id(sig, edge)));
 }
 
-// The definition unit's env for an anchored scope, created (with its
-// llvm::Module) on first use. Units are keyed by definition state-struct
-// identity: twin instances of one definition land in one unit.
-ModuleEnv& Backend::unit_env(const Anchor& a) {
-    auto [it, inserted] = unit_env_of_.try_emplace(a.ty, nullptr);
-    if (inserted) {
-        std::string name = a.ty->getName().str();
-        if (name.ends_with(".state")) {
-            name.resize(name.size() - 6);
+// A lowering for sharing found something it cannot share (see `taint`).
+void Backend::taint(const char* why) {
+    if (share_active_ && taint_why_ == nullptr) {
+        taint_why_ = why;
+    }
+}
+
+// What decides the code of the groups and subroutines of the instance of
+// `anchor`, besides the unit: for each binding, which declaration stands for it
+// (declarations that name one signal in one instance are one binding), and the
+// owner definition and def-local position of the signal it names, whose layout
+// the code addresses the owner's record and wake buckets by. Bindings that name
+// the same member of the same owner (a child's port) agree in every instance; a
+// port the parent binds to a net of its own choosing (an inout, a driver slot)
+// does not. An event port is keyed by its declaration alone: the code reads the
+// event's object from the handle in its storage and addresses nothing of the
+// owner's record or buckets, so instances bound to different events of their
+// parents still share. A function binding is keyed by which declaration stands
+// for it alone: the code passes the record the binding holds and names the
+// function it calls, which the callers' keys carry (group_key, subroutine_key).
+std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
+    const Anchor&         a = anchors_[anchor];
+    std::vector<uint64_t> key;
+    key.reserve(2 * a.externs.size() + a.fn_externs.size());
+    for (uint32_t k = 0; k < a.externs.size(); ++k) {
+        const SignalSlot& s = slot_of(a.externs[k]);
+        key.push_back(a.bind_of.at(static_cast<uint32_t>(a.externs[k])));
+        if (mod_.signal(a.externs[k]).is_event) {
+            continue;
         }
-        auto m = std::make_unique<llvm::Module>("clotho.def." + name, ctx_);
+        key.push_back(s.anchor == SignalSlot::no_anchor
+                        ? ~uint64_t{ 0 }
+                        : reinterpret_cast<uintptr_t>(anchors_[s.anchor].ctx_ty));
+        key.push_back(s.path.empty() ? ~uint64_t{ 0 } : s.path.back());
+    }
+    for (const FunctionId e : a.fn_externs) {
+        key.push_back(a.fn_bind_of.at(static_cast<uint32_t>(e)));
+    }
+    return key;
+}
+
+// The NBA blocks an instance registers when it runs the code `rep` lowered: the
+// same blocks, of the signals that sit at the same def-local fields of its own
+// instance, and of the signals that its bindings name at the positions the
+// representative's did (a signal of another instance, written through a port or a
+// hierarchical name). A signal of no instance is the same one for everybody.
+std::vector<Backend::BlockCommit> Backend::shared_blocks(const SharedGroup& rep, uint32_t anchor) const {
+    return shared_blocks_of(group_unit_anchor_[rep.g], rep.block_lo, rep.block_hi, anchor);
+}
+
+std::vector<Backend::BlockCommit> Backend::shared_blocks_of(uint32_t rep_anchor, uint32_t block_lo, uint32_t block_hi,
+                                                            uint32_t anchor) const {
+    std::vector<BlockCommit> blocks;
+    blocks.reserve(block_hi - block_lo);
+    for (uint32_t b = block_lo; b < block_hi; ++b) {
+        // The instance runs the representative's commit function over its own record.
+        BlockCommit bc;
+        bc.fn     = block_commits_[b].fn;
+        bc.anchor = anchor;
+        for (const BlockSig& bs : block_commits_[b].sigs) {
+            const SignalSlot& s      = slots_[static_cast<uint32_t>(bs.sig)];
+            Signal            mapped = bs.sig;
+            if (s.anchor == rep_anchor) {
+                mapped = anchor_signals_[anchor][s.path.back()];
+            } else if (s.anchor != SignalSlot::no_anchor) {
+                const auto at = anchors_[rep_anchor].bind_of.find(static_cast<uint32_t>(bs.sig));
+                assert(at != anchors_[rep_anchor].bind_of.end() && "a signal of another instance is staged through a binding");
+                mapped = anchors_[anchor].externs[at->second];
+            }
+            bc.sigs.push_back({ mapped, bs.mask, bs.dynamic });
+        }
+        blocks.push_back(std::move(bc));
+    }
+    return blocks;
+}
+
+// The record fills of those blocks' first ids, for an instance whose blocks
+// start at id `base`: the field of the same def-local ordinal (a group's process
+// or a subroutine), in the instance's own record.
+std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> Backend::shared_fills(const SharedGroup& rep, uint32_t anchor,
+                                                                            uint32_t base) const {
+    return shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, anchor, base);
+}
+
+std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> Backend::shared_fills_of(uint32_t block_lo, size_t fill_lo,
+                                                                               size_t fill_hi, uint32_t anchor,
+                                                                               uint32_t base) const {
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fills;
+    fills.reserve(fill_hi - fill_lo);
+    for (size_t f = fill_lo; f < fill_hi; ++f) {
+        const auto& fill = ctx_blk_fills_[f];
+        fills.emplace_back(anchor, std::get<1>(fill), base + (std::get<2>(fill) - block_lo));
+    }
+    return fills;
+}
+
+// An instance that runs the subroutine `rep` lowered registers the same NBA blocks
+// for its own signals, numbered from where the backend stands, and the record
+// fields that hold their first ids.
+void Backend::adopt_shared_blocks(const SharedSubroutine& rep, uint32_t anchor) {
+    const auto base = static_cast<uint32_t>(block_commits_.size());
+    for (BlockCommit& bc : shared_blocks_of(subroutine_home_[rep.f].anchor, rep.block_lo, rep.block_hi, anchor)) {
+        block_commits_.push_back(std::move(bc));
+    }
+    for (auto& fill : shared_fills_of(rep.block_lo, rep.fill_lo, rep.fill_hi, anchor, base)) {
+        ctx_blk_fills_.push_back(std::move(fill));
+    }
+}
+
+void Backend::note_blocks(SharedSubroutine& s, uint32_t block_lo, size_t fill_lo) const {
+    s.block_lo = block_lo;
+    s.block_hi = static_cast<uint32_t>(block_commits_.size());
+    s.fill_lo  = fill_lo;
+    s.fill_hi  = ctx_blk_fills_.size();
+}
+
+// The unit's env for an anchored scope, created (with its llvm::Module) on first
+// use: one module per Design unit, named by the unit's key. A scope built without
+// a unit is a unit of its own, keyed by its definition state type.
+ModuleEnv& Backend::unit_env(const Anchor& a) {
+    auto [it, inserted] = unit_env_of_.try_emplace(
+      a.unit != InstanceScope::no_unit ? std::pair{ a.unit, static_cast<llvm::StructType*>(nullptr) }
+                                       : std::pair{ InstanceScope::no_unit, a.ty },
+      nullptr);
+    if (inserted) {
+        std::string name = a.unit_key;
+        if (name.empty()) {
+            name = a.ty->getName().str();
+            if (name.ends_with(".state")) {
+                name.resize(name.size() - 6);
+            }
+        }
+        auto m = std::make_unique<llvm::Module>(name, ctx_);
         m->setTargetTriple(root_env_->llmod.getTargetTriple());
         m->setDataLayout(root_env_->llmod.getDataLayout());
         unit_envs_.push_back(std::make_unique<ModuleEnv>(*m));
@@ -311,6 +476,10 @@ ModuleEnv& Backend::unit_env(const Anchor& a) {
         it->second = unit_envs_.back().get();
     }
     return *it->second;
+}
+
+std::string Backend::unit_symbol(const Anchor& a) const {
+    return a.unit_key.empty() ? "clotho.inst." + a.name : a.unit_key;
 }
 
 // Every value's width reaches here through the frontend's check against this limit, so the

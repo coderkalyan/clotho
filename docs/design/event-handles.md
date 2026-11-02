@@ -174,9 +174,9 @@ Why `{slot, gen}` and not a bare pointer:
 
 The generation half is what makes "strictly managed lifetimes" enforceable rather
 than aspirational. Releasing a slot bumps its generation, so every stale handle
-is *detected*. The precedent is exact: the fat `ref` ABI already carries
-`{ptr, epoch, expect}` (`RefBinding`, `ir/llvm/Backend.h`) to catch a
-container reference invalidated by relocation, and `rt_null_handle`
+is *detected*. The precedent is exact: the `ref` ABI already carries a witness
+chain of `{epoch, expect}` pairs (`ref_witness_chain`, `ir/llvm/StateLayout.cpp`) to
+catch a container reference invalidated by relocation, and `rt_null_handle`
 (`Runtime.h:312`) is the located-fatal shape to copy.
 
 ### 3.2 The object
@@ -261,8 +261,8 @@ word. The fat-ref ABI comment already anticipates this:
 > aggregate image — so `ref` has one shape.
 > — `src/ir/llvm/Subroutines.cpp, lower_call_common`
 
-`ref_needs_epoch` is false for a stable place, so a `ref event` costs one pointer
-argument and no epoch words.
+A `ref` to a stable place passes a null witness chain, so a `ref event` costs its
+pointer and one null word.
 
 ### 4.1 Ports
 
@@ -325,6 +325,12 @@ through a table base instead of a named global, and the list walk of §6 instead
 of a fixed-trip array scan. Both are measurable and both are small; if the table
 base load shows up, it is loadable once per function into a register, since the
 table only ever grows and never moves the *slots* (see §9 note on reallocation).
+
+Under modular compilation (docs/design/modular-compilation.md, step 3c) a
+declared event of an instance is no longer an immediate: unit code is shared
+by the unit's instances, so the slot is the handle the variable's storage holds
+(the instance's own, or an event port's through its binding), and only an event
+of no instance (a package's) keeps the constant.
 
 Non-monomorphic events pay the full path: load the handle word, split
 `{slot, gen}`, bounds+generation check, deref. That is the price of

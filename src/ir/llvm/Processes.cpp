@@ -195,7 +195,7 @@ void Backend::lower_fork_inst(Index i) {
     const std::span<const Index> caps = ir_->region(fi.args);
     std::vector<llvm::Value*>    argv;
     argv.reserve(caps.size() + 4);
-    argv.push_back(state_);
+    argv.push_back(nullptr); // the child's record, set per child (ramp below)
     // The child seeds its OWN state from this one at its ramp (lower_task): a
     // join_none / join_any child can outlive this frame, so it must not hold a
     // pointer into it.
@@ -204,14 +204,10 @@ void Backend::lower_fork_inst(Index i) {
     // The spawning thread's block: the child's ramp takes a pooled block of its
     // own and links itself in as a child of this one (LRM 9.6.3's descendant
     // relation).
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // ... and its home region: a child inherits the spawning thread's, which is
     // this body's CURRENT one, not its lexical one (LRM 24.3.1).
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(callee_home());
     // An `In` scalar formal crosses in its domain, exactly as an ordinary call
     // marshals one (lower_task_call_inst's In arm).
     for (const Index cap : caps) {
@@ -227,8 +223,10 @@ void Backend::lower_fork_inst(Index i) {
     const bool ramp_first =
       !kids.empty() && !mod_.function(static_cast<FunctionId>(static_cast<uint32_t>(kids[0]))).fork_targets.empty();
     const auto ramp = [&](Index kid) {
-        llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(kid)]);
-        return b_.CreateCall(cf->getFunctionType(), cf, argv);
+        llvm::Function*           cf = sym(fn_decls_[static_cast<uint32_t>(kid)]);
+        std::vector<llvm::Value*> args = argv;
+        args[0] = callee_record(static_cast<FunctionId>(static_cast<uint32_t>(kid)));
+        return b_.CreateCall(cf->getFunctionType(), cf, args);
     };
     std::vector<llvm::Value*> ramped;
     if (ramp_first) {
@@ -648,10 +646,25 @@ llvm::GlobalVariable* Backend::proc_pcb_table() {
     return proc_pcb_gv_;
 }
 
+// The design-wide index of process `k` as an IR value. A process of the instance
+// whose code is being lowered reads it from that instance's record at its
+// def-local ordinal, so the code names no process. A process of another instance
+// is a constant, and a body that names one is not shared.
+llvm::Value* Backend::proc_index_value(uint32_t k) {
+    const uint32_t pa = proc_sched_anchor_[k];
+    if (pa != SignalSlot::no_anchor && pa == own_anchor_ && own_ctx_ != nullptr && anchors_[pa].n_proc != 0) {
+        Anchor& a = anchors_[pa];
+        return ctx_field(a, a.ctx_proc_base + proc_sched_ord_[k], b_.getInt32Ty());
+    }
+    if (pa != SignalSlot::no_anchor) {
+        taint("names a process of another instance");
+    }
+    return b_.getInt32(k);
+}
+
 llvm::Value* Backend::proc_pcb_slot(uint32_t proc_index) {
     auto* gv = proc_pcb_table();
-    return b_.CreateInBoundsGEP(proc_pcb_arr_ty_, sym(gv),
-                                { b_.getInt32(0), b_.getInt32(proc_index) });
+    return b_.CreateInBoundsGEP(proc_pcb_arr_ty_, sym(gv), { b_.getInt32(0), proc_index_value(proc_index) });
 }
 
 // The per-program-instance TERMINATION ROOT (LRM 24.3): one static control block
@@ -678,7 +691,7 @@ llvm::Value* Backend::proc_pcb_slot(uint32_t proc_index) {
 // kProcStatic keeps it off the pool freelist (proc_maybe_free), like every block
 // in clotho.proc_pcb. Created on first use, so a design with no program never
 // emits it.
-llvm::Value* Backend::program_root_pcb(uint32_t inst) {
+llvm::Value* Backend::program_root_pcb(llvm::Value* inst) {
     if (program_root_gv_ == nullptr) {
         const auto                   n    = std::max<size_t>(program_inst_procs_.size(), 1);
         auto*                        ty   = llvm::ArrayType::get(pcb_ty(), n);
@@ -700,7 +713,7 @@ llvm::Value* Backend::program_root_pcb(uint32_t inst) {
                                    llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, one)),
                                    "clotho.program_root");
     }
-    return b_.CreateInBoundsGEP(program_root_arr_ty_, sym(program_root_gv_), { b_.getInt32(0), b_.getInt32(inst) });
+    return b_.CreateInBoundsGEP(program_root_arr_ty_, sym(program_root_gv_), { b_.getInt32(0), inst });
 }
 
 // Move this thread's LRM 9.7 state from `from` to `to`, preserving the flag bits
@@ -1714,15 +1727,30 @@ llvm::GlobalVariable* Backend::disable_table(llvm::GlobalVariable*& gv,
         const auto n  = static_cast<size_t>(mod_.disable_targets);
         auto*      ty = llvm::ArrayType::get(elem, n);
         // Defined in the root unit and referenced through sym(), like every
-        // other cross-unit global. A group holding either half of the remote
-        // form is forced to a real coroutine (is_simple_always), and only a
-        // thunk group is ever shared across instances, so a baked per-instance
-        // target id can never reach a shared body.
+        // other cross-unit global.
         gv = new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
                                       llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, init)),
                                       std::string("clotho.disable.") + name);
     }
     return gv;
+}
+
+// The flat id of `disable` target `t` as an IR value. A target the instance whose
+// code is being lowered declares is its unit's ordinal-th, whose id sits in the
+// instance's record, so the code names no target; one of no instance has the same
+// id in every instance and is the constant, and another instance's is that
+// instance's own, which a shared lowering cannot have.
+llvm::Value* Backend::disable_target_value(uint32_t t) {
+    const auto [owner, ordinal] = disable_owner_.at(t);
+    if (owner == SignalSlot::no_anchor) {
+        return b_.getInt32(t);
+    }
+    if (owner == own_anchor_ && own_ctx_ != nullptr) {
+        Anchor& a = anchors_[owner];
+        return ctx_field(a, a.ctx_dis_base + ordinal, b_.getInt32Ty());
+    }
+    taint("names a disable target of another instance");
+    return b_.getInt32(t);
 }
 
 llvm::Value* Backend::disable_slot(llvm::IRBuilder<>&     b,
@@ -1733,7 +1761,7 @@ llvm::Value* Backend::disable_slot(llvm::IRBuilder<>&     b,
                                    uint32_t               target) {
     auto* ty = llvm::ArrayType::get(elem, static_cast<size_t>(mod_.disable_targets));
     return b.CreateInBoundsGEP(ty, sym(disable_table(gv, name, elem, init)),
-                               { b.getInt32(0), b.getInt32(target) });
+                               { b.getInt32(0), disable_target_value(target) });
 }
 
 // One live activation of a `disable`-targeted task (LRM 9.6.2), frame-resident

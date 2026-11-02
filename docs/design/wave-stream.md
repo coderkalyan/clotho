@@ -295,7 +295,8 @@ End
 
 **The header is complete before the first `Time`.** This is a protocol
 invariant, not an accident: `$dumpvars` registers the whole design in one burst
-inside an `initial` block, then calls `rt_vcd_start`
+inside an `initial` block (a call of `clotho.vcd.register`, which walks the
+registration table), then calls `rt_vcd_start`
 (`src/ir/llvm/Vcd.cpp, lower_dump_limit/lower_dump_vars`), and only whole-design `$dumpvars` is
 accepted (`src/lower/SystemTasks.cpp, lower_dumpvars`). A consumer may therefore build its
 hierarchy once and never grow it. Incremental declaration after `HeaderEnd` is
@@ -451,9 +452,11 @@ contains no `$dumpvars`, emit the whole-design form into an implicit initial
 process. Note there is nothing to reuse in the frontend: `lower_dumpvars`
 (`src/lower/SystemTasks.cpp`) only *validates* and emits a bare
 `b.dump_vars(loc(call))`. The whole-design enumeration lives in the
-backend — `lower_dump_vars` walking `mod_.tops()` through `emit_vcd_scope_tree`
-and `emit_vcd_var` (`src/ir/llvm/Vcd.cpp`), exactly as
-`docs/VCD.md` §9 describes — and it is reached unchanged.
+backend — `lower_dump_vars` calls `clotho.vcd.register`, whose table
+`vcd_register_fn` builds by walking `mod_.tops()` through `vcd_plan_scope_tree`
+and `vcd_plan_var` (`src/ir/llvm/Vcd.cpp`), and which one loop turns into the
+`rt_vcd_scope` / `rt_vcd_var` / `rt_vcd_array` / `rt_vcd_upscope` calls, in the
+order `docs/VCD.md` §9 describes — and it is reached unchanged.
 
 ### 4.4 Composable sinks
 
@@ -519,8 +522,8 @@ one compare per settled instant when not streaming.
 
 ### 4.7 Signal classes clotho refuses
 
-`emit_vcd_var` throws `BackendError` for events, strings and multidimensional
-arrays (`src/ir/llvm/Vcd.cpp, emit_vcd_var`), which **fails the whole
+`vcd_plan_var` throws `BackendError` for strings, containers, aggregates, class
+handles and multidimensional arrays (`src/ir/llvm/Vcd.cpp, vcd_plan_var`), which **fails the whole
 compilation**. Today that is tolerable because dumping is opt-in in the source.
 With `--dump`/`--wave-stream` it becomes a trap: a user asks for waves and their
 design stops building.

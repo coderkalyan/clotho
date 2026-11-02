@@ -177,12 +177,12 @@ compile error under `--gc`** (`elem_ops_for`, `:1503-1516`).
 | # | Move | Why |
 |---|---|---|
 | **A** | **Split the control block from the object.** A thread's control block (status word, activation stack, `await` waiters, RNG pointer, tree links) is **native, untraced** storage: a `[nproc x %clotho.pcb]` array in module state for statically created processes — no allocation at all — and a chunked runtime pool with a freelist for fork children, the only genuinely dynamic tier. The `process` **object** is a small GC class object whose single property is a `chandle` to a control block, created **lazily at the first `self()`** and memoized weakly in the block. | Processes are static, so their control blocks are static; only fork children are unbounded (§4.0). Allocation then scales with `self()` calls, not with threads spawned, and the tree/park state the scheduler walks never touches the collector. |
-| **B** | **Identity travels the call ABI**, as argument 2 beside `rng`, gated on `DesignUses::process`; the argument is the control-block pointer, not a handle. | `rng` proves the pattern. A "current process" global would need a store at every resume site, and a missed site is a *silent* wrong identity (Verilator pays exactly this: `t_currentp`, `verilated_types.h:315`). |
+| **B** | **Identity travels the call ABI**, as an argument beside `rng` present in every signature (null unless `DesignUses::process`); the argument is the control-block pointer, not a handle. | `rng` proves the pattern. A "current process" global would need a store at every resume site, and a missed site is a *silent* wrong identity (Verilator pays exactly this: `t_currentp`, `verilated_types.h:315`). |
 | **C** | Each parking activation links a **frame-resident node onto its thread's PCB stack**, innermost first, reusing `disable_node_ty` verbatim. | Gives kill a claimable park for a thread parked *behind a task call or a fork* — the case remote `disable` refuses today (`hard_park`, `src/lower/Assertions.cpp`). |
 | **D** | **`kill` = the landed `disable` abort, per thread instead of per target**: mark, force-wake once, poll after each park, leave through the ordinary epilogue. Nothing is destroyed from outside. | It is the only shape that unwinds a nested frame chain and releases frame-owned heap. §12 rejects the alternatives. |
 | **E** | The tree **re-parents live grandchildren on a thread's completion**, so `first_child == null` means "no live descendants". | LRM 9.6.3 requires descendants of already-terminated children; the invariant then makes `wait fork` a one-word test rather than a walk. Verilator does *not* do this (`verilated_types.h:338-343` detaches in the destructor), which is a spec deviation to avoid inheriting. |
 | **F** | `suspend`/`resume` are a **status word plus a pending-wake bit**, checked at the same poll point as the abort. No desensitisation, no queue surgery. | Nothing can be removed from the wheel or from a static bucket; the LRM's own resume wording (§1) is satisfied exactly by "the wake already happened, replay it". |
-| **G** | One `DesignUses::process` gate; when clear, **zero bytes emitted**, verified by byte-identical `--emit llvm`. | The rule every scheduler feature in the tree has held (`disable.md` Hazard 17). |
+| **G** | One `DesignUses::process` gate; when clear, **no control-block machinery emitted** (the ABI argument stays in every signature, passed null), verified by comparing `--emit llvm`. | The rule every scheduler feature in the tree has held (`disable.md` Hazard 17). |
 
 ---
 
@@ -345,9 +345,10 @@ Consequences that must be handled rather than discovered:
   `NamedBlock(remote)` / `DisableRemote`). A *killable* process is by definition one
   whose handle escaped through `self()`, so the payload test is sufficient — there
   is no need to deoptimise every process in the design.
-- **Thunk groups are the only bodies shared across instances**
-  (`share_twin_groups`, `:7280-7325`), so forcing a coroutine also removes the
-  cross-instance sharing question for PCB-bearing bodies.
+- **A body that names a process control block is lowered per instance**: unit
+  groups are lowered once and run by every instance with its own record, but a
+  PCB slot is a process index, so lowering one (`proc_pcb_slot`) taints the
+  group and each instance lowers its own.
 - **Non-Active processes get PCBs too** (PreInit, Preponed, Observed, ReNba,
   Final, Reactive — `src/ir/Module.h:100-172`). They are processes; `self()` inside
   one is legal and rare. Cost is `nproc` objects at startup.

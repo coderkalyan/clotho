@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -163,6 +164,64 @@ size_t count_substr(const std::string& hay, std::string_view needle) {
     return n;
 }
 
+// Count the definitions (lines starting with "define") whose line holds both `a`
+// and `b`: what a function is named and how it is declared, without the calls and
+// declarations of it other modules print.
+size_t count_defs(const std::string& ir, std::string_view a, std::string_view b) {
+    size_t n = 0;
+    for (size_t start = 0; start < ir.size();) {
+        size_t end = ir.find('\n', start);
+        end        = end == std::string::npos ? ir.size() : end;
+        const std::string_view line(ir.data() + start, end - start);
+        n += line.starts_with("define ") && line.find(a) != std::string_view::npos &&
+                 line.find(b) != std::string_view::npos
+               ? 1
+               : 0;
+        start = end + 1;
+    }
+    return n;
+}
+
+// The text of the function whose definition line holds `header`, or empty when no
+// definition does.
+std::string function_text(const std::string& ir, std::string_view header) {
+    const size_t at = ir.find(header);
+    if (at == std::string::npos) {
+        return {};
+    }
+    const size_t nl    = ir.rfind('\n', at);
+    const size_t start = nl == std::string::npos ? 0 : nl + 1;
+    if (!std::string_view(ir).substr(start).starts_with("define ")) {
+        return {};
+    }
+    const size_t end = ir.find("\n}\n", at);
+    return ir.substr(start, end == std::string::npos ? std::string::npos : end + 3 - start);
+}
+
+// The argument count of the one call `ir` makes to a function whose symbol ends
+// with `callee` (e.g. ".fn.f"; a unit's symbols lead with its key), or ~0 when it
+// makes none or several.
+size_t call_arity(const std::string& ir, std::string_view callee) {
+    const std::string head  = "call void @";
+    size_t            found = std::string::npos;
+    size_t            n     = 0;
+    for (size_t at = ir.find(head); at != std::string::npos; at = ir.find(head, at + head.size())) {
+        const size_t           open = ir.find('(', at);
+        const std::string_view name(ir.data() + at + head.size() - 1, open - (at + head.size() - 1));
+        if (name.ends_with(callee)) {
+            found = open;
+            ++n;
+        }
+    }
+    if (n != 1) {
+        return ~size_t{ 0 };
+    }
+    const size_t close = ir.find(')', found);
+    return 1 + static_cast<size_t>(std::count(ir.begin() + static_cast<std::ptrdiff_t>(found),
+                                              ir.begin() + static_cast<std::ptrdiff_t>(close),
+                                              ','));
+}
+
 constexpr std::string_view kAlu = R"(
     module alu(
         input            clk,
@@ -199,33 +258,34 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // initializer is the whole power-on state (X = 0xFF00 for a 4-state byte),
     // so main emits no rt_alloc and no per-signal init stores.
     CHECK(raw.find("%alu.state = type") != std::string::npos);
-    CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
+    CHECK(raw.find("@clotho.state = ") != std::string::npos);
     CHECK(raw.find("i16 -256") != std::string::npos);
 
     // One process per @<module>.p<index>: two combinational assigns + one
     // sequential always block. All three are suspension-free, so by default they
-    // lower to plain per-activation thunks — void, taking the state ptr plus the
-    // timing-wheel ptr, no coroutine. Under --no-thunk each is instead a
-    // switched-resume coroutine ramp returning the handle (CoroSplit then emits
-    // .resume/.destroy/.cleanup parts, which don't match "define ptr @alu.p").
-    CHECK(count_substr(ir, "define void @clotho.inst.alu.p") == 3);
-    // Definitions only: the root module's seed loop re-declares each thunk
-    // (split emission), and declarations print without argument names.
-    CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 3);
-    CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
+    // lower to plain per-activation thunks -- the entry of each process's schedule
+    // group, in the module of its unit: void, taking the address of the process's
+    // wake pair plus the timing-wheel ptr, no coroutine. Under --no-thunk each is
+    // instead a switched-resume coroutine ramp returning the handle (CoroSplit
+    // then emits .resume/.destroy/.cleanup parts, which don't match "define ptr
+    // @alu.p").
+    // Definitions only: declarations print without argument names.
+    CHECK(count_defs(ir, "@alu.p0.entry(", "(ptr %wake, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p1.entry(", "(ptr %wake, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p2.entry(", "(ptr %wake, ptr %wheel)") == 1);
     const std::string co = emit(kAlu, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @clotho.inst.alu.p") == 3);
-    CHECK(co.find("(ptr %state, ptr %wheel)") != std::string::npos);
+    CHECK(count_substr(co, "define ptr @alu.") == 3);
+    CHECK(co.find("(ptr %ctx, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant typed GEPs, anchored at the owning instance
-    // scope's own state global: def-relative (%alu.state) off
-    // @clotho.inst.alu.state, folded link-time constant (asserted on raw IR;
-    // instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") != std::string::npos);
+    // Signal access via constant typed GEPs off a base the instance's record
+    // holds, def-relative (%alu.state): a unit's code names no instance's state
+    // global (asserted on raw IR; instcombine canonicalizes GEP shapes).
+    CHECK(raw.find("%alu.state, ptr %") != std::string::npos);
+    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -256,10 +316,10 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(raw.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
     CHECK(raw.find("%bit.4 = type { i4 }") != std::string::npos);
     CHECK(raw.find("%logic.nz.8 = type { i16 }") != std::string::npos);
-    CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
+    CHECK(raw.find("@clotho.state = ") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
-    CHECK(ir.find("define ptr @clotho.inst.m.p") != std::string::npos);
+    CHECK(ir.find("define ptr @m.") != std::string::npos);
 }
 
 TEST_CASE("instance state structs replicate per instantiation as per-scope globals") {
@@ -286,11 +346,14 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
     // drops it).
     CHECK(raw.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
     CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
-    // Referenced from the definition-unit modules, so the split emission
-    // promotes them out of internal linkage (plain external `global`).
-    CHECK(raw.find("@clotho.inst.top.state = dso_local global %top.state") != std::string::npos);
-    CHECK(raw.find("@clotho.inst.top.u0.state = dso_local global %leaf.state") != std::string::npos);
-    CHECK(raw.find("@clotho.inst.top.u1.state = dso_local global %leaf.state") != std::string::npos);
+    // Whether a global is internal or external depends on whether another module
+    // names it, which is not what this test is about.
+    const auto global_line = [&](std::string_view name) {
+        const size_t at = raw.find(name);
+        return at == std::string::npos ? std::string() : raw.substr(at, raw.find('\n', at) - at);
+    };
+    CHECK(global_line("@clotho.inst.top.u0.state = ").find(" global %leaf.state") != std::string::npos);
+    CHECK(global_line("@clotho.inst.top.u1.state = ").find(" global %leaf.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u0.shadow = internal global %leaf.state.shadow") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u1.shadow = internal global %leaf.state.shadow") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
@@ -944,7 +1007,7 @@ TEST_CASE("delay suspends and reschedules on the wheel") {
     CHECK(ir.find("call void @rt_wheel_schedule_rel") != std::string::npos);
     // The timer callback that wakes the suspended coroutine by pushing its handle
     // onto the active queue.
-    CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
+    CHECK(!define_params(ir, "@clotho.enqueue_timer").empty());
     // main drains the wheel: advance while timers are pending (the pending-check
     // is folded into the tick, one ABI crossing per timestep).
     CHECK(ir.find("call i32 @rt_wheel_advance") != std::string::npos);
@@ -1212,7 +1275,7 @@ TEST_CASE("delay inside a conditional splits cleanly") {
     // The conditional's branch and both delays' schedules survive lowering.
     CHECK(ir.find("br i1") != std::string::npos);
     CHECK(count_substr(ir, "call void @rt_wheel_schedule") == 2);
-    CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
+    CHECK(!define_params(ir, "@clotho.enqueue_timer").empty());
 }
 
 TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
@@ -1247,13 +1310,11 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     // doubled's dynamic any-change bucket (with a length). Each queue is named for
     // its edge and emitted only when used; the per-process scheduled-flag array
     // backs the wake-once dedup.
-    // Root-defined, promoted to external (dso_local) linkage where the
-    // definition-unit module's bodies reference them (split emission).
-    CHECK(ir.find("@clotho.wait.clk.sta.pos = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.d.sta.any = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.q.sta.any = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled.dyn.any = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = dso_local global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.clk.sta.pos = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.d.sta.any = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.q.sta.any = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.any = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = ") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
     // Both always blocks are suspension-free, so by default they lower to plain
     // per-activation thunks (no forever wait loop); servicing still has a static
@@ -1261,9 +1322,9 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     // form appears under --no-thunk. Labels asserted on raw IR (simplifycfg
     // merges and renames blocks).
     const std::string raw = emit_raw(src);
-    CHECK(raw.find("sta.head") != std::string::npos);
+    CHECK(raw.find("nsta.body") != std::string::npos);
     CHECK(raw.find("dyn.head") != std::string::npos);
-    CHECK(count_substr(raw, ".thunk(ptr noalias %state") == 2);
+    CHECK(count_substr(raw, ".entry(ptr %wake") == 2);
     CHECK(raw.find("always.loop") == std::string::npos);
     CHECK(emit_raw(src, { .thunk = false }).find("always.loop") != std::string::npos);
 }
@@ -2124,18 +2185,193 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     // (cnt). The two clk input-port copies share the identical sensitivity
     // (@top clk) and fuse into one unit (`.f2`); the clocked always blocks watch
     // per-instance clk locals and stay separate. 6 processes emit as 5 distinct
-    // @top.p<N> units. All are suspension-free, so by default they are thunks
-    // (the fused pair is `.f2.thunk`); under --no-thunk they are coroutine ramps.
+    // @top.p<N> units. All are suspension-free, so by default they are thunks, the
+    // entries of their schedule groups, which sit in the module of their unit: the
+    // two counters' always blocks are one entry named by their unit, and the fused
+    // pair is `top.p0.f2.entry`; under --no-thunk they are coroutine ramps.
     // Definitions only (split emission re-declares cross-module symbols;
     // declarations and calls print without argument names).
-    CHECK(count_substr(ir, "define void @clotho.inst.top.") == 5);
-    CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 5);
-    CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
+    CHECK(count_defs(ir, "@top.", ".entry(ptr %wake") == 3);
+    CHECK(count_defs(ir, "@counter.", ".entry(ptr %wake") == 1);
+    CHECK(count_substr(ir, ".f2.entry(ptr %wake") == 1);
     const std::string co = emit(src, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @clotho.inst.top.") == 5);
-    CHECK(count_substr(co, ".f2(ptr %state") == 1);
+    // The two counters run one ramp of their unit, named by it.
+    CHECK(count_substr(co, "define ptr @top.") == 3);
+    CHECK(count_substr(co, "define ptr @counter.") == 1);
+    CHECK(count_substr(co, ".f2(ptr %ctx") == 1);
 }
 
+// A fused coroutine is ONE function over ONE frame, so unlike a thunk group it
+// cannot be split into per-member functions when its members live in different
+// instances: a process that is not a thunk fuses only within its own instance.
+// The four clocked blocks below share one sensitivity (the interface's clk) and
+// belong to two instances.
+TEST_CASE("a coroutine fusion group stays inside one instance") {
+    SUBCASE("under --no-thunk every group is a coroutine") {
+        constexpr std::string_view src = R"(
+            interface bus_if; logic clk = 0; endinterface
+            module leaf(bus_if b);
+                reg [7:0] x = 0, y = 0;
+                always @(posedge b.clk) x <= x + 8'd1;
+                always @(posedge b.clk) y <= y + 8'd2;
+            endmodule
+            module top;
+                bus_if bus();
+                leaf u0(bus);
+                leaf u1(bus);
+                initial begin
+                    #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1;
+                    #1 $display("%0d %0d %0d %0d", u0.x, u0.y, u1.x, u1.y);
+                end
+            endmodule
+        )";
+        const std::string co = emit(src, { .thunk = false });
+        CHECK(count_substr(co, ".f4(ptr noalias %ctx") == 0);
+        // One fused ramp for the two instances: each runs it with its own record.
+        CHECK(count_substr(co, ".f2(ptr %ctx") == 1);
+        CHECK(run_capture(src, { .thunk = false }) == "2 4 2 4\n");
+        CHECK(run_capture(src) == "2 4 2 4\n");
+    }
+    SUBCASE("a process that reaches a draw never joins a thunk group") {
+        // The draw is reached through a call, so the process is a coroutine
+        // even though its body is suspension-free; its draw-free siblings in
+        // both instances still fuse with each other.
+        constexpr std::string_view src = R"(
+            interface bus_if; logic clk = 0; endinterface
+            module leaf(bus_if b);
+                reg [7:0] r = 0, c = 0;
+                function automatic int rnd(); return $urandom; endfunction
+                always @(posedge b.clk) r <= rnd();
+                always @(posedge b.clk) c <= c + 8'd1;
+            endmodule
+            module top;
+                bus_if bus();
+                leaf u0(bus);
+                leaf u1(bus);
+                initial begin
+                    #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1;
+                    #1 $display("%0d %0d", u0.c, u1.c);
+                end
+            endmodule
+        )";
+        const std::string ir = emit(src);
+        CHECK(count_substr(ir, ".f4(ptr %state") == 0);
+        CHECK(count_substr(ir, ".f2.thunk(ptr %wake") == 1);
+        CHECK(run_capture(src) == "2 2\n");
+    }
+}
+
+// A group spanning instances runs as one function per member, each handed its
+// own instance's record: what a member writes of its own instance (a signal
+// with waiters, an NBA target, the dump index) must land in THAT instance, and
+// what it writes of another instance's (an interface it is connected to) must
+// still reach that one. Fused and unfused agree on every line.
+TEST_CASE("members of a group spanning instances address their own instance") {
+    constexpr std::string_view src = R"(
+        interface bus_if; logic clk = 0; endinterface
+        interface sig_if; logic [7:0] v = 0; endinterface
+        module leaf(bus_if b, sig_if s, input int id);
+            reg [7:0] q = 0, n = 0;
+            always @(posedge b.clk) begin
+                q = q + 8'd1 + id[7:0];       // blocking: wakes this instance's waiter
+                n <= n + 8'd1;                // NBA staged in this instance
+                s.v = s.v + id[7:0];          // another instance's signal
+            end
+            always @(q) $display("leaf%0d q=%0d", id, q);
+        endmodule
+        module top;
+            bus_if bus();
+            sig_if s0(), s1();
+            leaf u0(bus, s0, 1);
+            leaf u1(bus, s1, 10);
+            initial begin
+                #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1;
+                #1 $display("n %0d %0d v %0d %0d", u0.n, u1.n, s0.v, s1.v);
+            end
+        endmodule
+    )";
+    const std::string expected = "leaf1 q=2\nleaf10 q=11\nleaf1 q=4\nleaf10 q=22\nn 2 2 v 2 20\n";
+    CHECK(count_substr(emit(src), ".f2.thunk(ptr %wake") == 1);
+    CHECK(run_capture(src) == expected);
+    CHECK(run_capture(src, { .fuse = false }) == expected);
+    CHECK(run_capture(src, { .thunk = false }) == expected);
+}
+
+// Every group spanning instances dispatches: whatever its size (there is no
+// member cap) and whether or not emission is split into per-definition modules.
+// Twenty instances of one block sharing a clock make one twenty-member group,
+// run as twenty rows of one function behind one dispatcher; the schedule is
+// untouched, so fused, unfused and unsplit runs print the same lines.
+TEST_CASE("a group spanning instances dispatches whatever its size and layout") {
+    constexpr std::string_view src = R"(
+        interface bus_if; logic clk = 0; endinterface
+        module leaf(bus_if b, input int id);
+            always @(posedge b.clk) $display("%0d", id);
+        endmodule
+        module top;
+            bus_if bus();
+            for (genvar i = 0; i < 20; i++) begin : g
+                leaf u(bus, i);
+            end
+            initial begin #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1; end
+        endmodule
+    )";
+    const std::string out = run_capture(src);
+    CHECK(std::count(out.begin(), out.end(), '\n') == 40);
+    CHECK(run_capture(src, { .fuse = false }) == out);
+    CHECK(run_capture(src, { .split = false }) == out);
+    for (const bool split : { true, false }) {
+        const std::string ir = emit(src, { .split = split });
+        CHECK(count_substr(ir, ".f20.thunk(ptr %wake") == 1);
+        // The twenty instances run one row function of their unit, each with its
+        // own record.
+        CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == 1);
+    }
+}
+
+// SimulationConfig::verify_shared_code lowers each group again for every
+// instance that shares it, into scratch modules, and must leave nothing behind:
+// the emitted modules and the run are the same with it on and off. The design
+// has what the lowering registers or names besides code: nonblocking blocks, an
+// array and a struct (types made at each use), a string constant, a function
+// copy and a name per instance (which keep their groups per instance).
+TEST_CASE("verifying shared code changes nothing in the emitted modules or the run") {
+    constexpr std::string_view src = R"(
+        typedef struct { logic [3:0] lo; logic [3:0] hi; } pair_t;
+        module child #(parameter int K = 1)(input logic clk, input logic [7:0] d, output logic [7:0] q);
+            logic [7:0] x = 0;
+            logic [7:0] mem [4];
+            pair_t p;
+            string s = "";
+            function automatic logic [7:0] twice(input logic [7:0] v); return v + v; endfunction
+            always @(posedge clk) begin
+                x <= x + K;
+                mem[x[1:0]] <= x;
+                p.lo <= d[3:0];
+                p.hi <= p.lo;
+                q <= mem[0] + {p.hi, p.lo} + d;
+                s = {s, "a"};
+            end
+            always @(posedge clk) $display("%m %0d %s", twice(x), s);
+        endmodule
+        module top;
+            logic clk = 0;
+            logic [7:0] d = 5;
+            wire [7:0] qa, qb, qc;
+            child #(1) a(clk, d, qa);
+            child #(1) b(clk, 8'd9, qb);
+            child #(2) c(clk, d, qc);
+            always #5 clk = ~clk;
+            initial begin #22 $display("%0d %0d %0d", qa, qb, qc); $finish; end
+        endmodule
+    )";
+    for (const bool thunk : { true, false }) {
+        CHECK(emit(src, { .thunk = thunk, .verify_shared_code = true }) ==
+              emit(src, { .thunk = thunk, .verify_shared_code = false }));
+        CHECK(run_capture(src, { .thunk = thunk, .verify_shared_code = true }) ==
+              run_capture(src, { .thunk = thunk, .verify_shared_code = false }));
+    }
+}
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
 // once shifted the accumulator by the full result width, which is poison in LLVM
 // (shift >= bitwidth). Replication wraps its operand in a single-element concat,
@@ -4331,7 +4567,7 @@ TEST_CASE("NBA of a z value round-trips a static-select block commit (z and neve
     // mask; no per-signal bucket globals form. zq carries z (full slot), nq is
     // proven never-z, and both round-trip their shadow commit.
     const std::string ir = emit(src);
-    CHECK(ir.find("clotho.nba.commit_blk") != std::string::npos);
+    CHECK(count_defs(ir, "@m.p", ".nba0(ptr %desc)") == 1);
     CHECK(ir.find("clotho.nba.w4") == std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
@@ -4358,12 +4594,15 @@ TEST_CASE("whole-scalar NBAs lower to the block-commit path by default") {
     // One straight-line block: a single enqueue registration and one commit
     // function; no per-signal w4 bucket worklists form.
     CHECK(ir.find("clotho.nba_block_enqueue") != std::string::npos);
-    CHECK(ir.find("clotho.nba.commit_blk0") != std::string::npos);
+    CHECK(count_defs(ir, "@m.p", ".nba0(ptr %desc)") == 1);
+    CHECK(count_defs(ir, "@m.p", ".nba1(ptr %desc)") == 0);
     CHECK(ir.find("clotho.nba.w4.full") == std::string::npos);
-    // Shadow accesses go through the owning instance's opaque base pointer,
-    // not state-relative constant offsets (memory-dependence mis-speculation
-    // defense; see shadow_ptr).
-    CHECK(ir.find("clotho.inst.m.shadow_base") != std::string::npos);
+    // Shadow accesses go through the base pointer the writer's record holds, not
+    // state-relative constant offsets (memory-dependence mis-speculation defense;
+    // see shadow_ptr), and the commit function names no instance's global.
+    const std::string commit = function_text(ir, "@m.p0.nba0(ptr %desc)");
+    CHECK(commit.find("%rec = load ptr") != std::string::npos);
+    CHECK(commit.find("@clotho.inst.") == std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
 
@@ -5143,8 +5382,8 @@ TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
     CHECK(run_capture(src) == "211 112 121\n");
     // All three lower into one fused unit: a thunk by default (suspension-free),
     // a coroutine under --no-thunk.
-    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
-    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(ptr %state") == 1);
+    CHECK(count_substr(emit(src), ".f3.entry(ptr %wake") == 1);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(ptr %ctx") == 1);
 }
 
 TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {
@@ -5165,10 +5404,10 @@ TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {
     )";
     // Exactly the two simple always blocks become thunks; the two non-elidable
     // always blocks and the initial stay coroutines.
-    CHECK(count_substr(emit(src), ".thunk(ptr noalias %state") == 2);
+    CHECK(count_substr(emit(src), ".entry(ptr %wake") == 2);
     // Under --no-thunk nothing elides, and there are strictly more coroutine
     // frames (the two simple procs are coroutines again).
-    CHECK(count_substr(emit(src, { .thunk = false }), ".thunk(") == 0);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".entry(") == 0);
     CHECK(count_substr(emit_raw(src), "call ptr @llvm.coro.begin")
           < count_substr(emit_raw(src, { .thunk = false }), "call ptr @llvm.coro.begin"));
     // Elision is behavior-preserving: the same design produces byte-identical
@@ -5221,37 +5460,33 @@ TEST_CASE("time-zero stores do not overflow the active queue via self-start re-w
     CHECK(out == "y=1\n");
 }
 
-// ---- The `ref` ABI shape: narrow by default, fat only where it is load-bearing.
+// ---- The `ref` ABI: one shape, whoever the callers are.
 
-// Matching the four-word form to the actual is a silent-corruption seam: a caller
-// and callee disagreeing about the arity write past each other's arguments, and no
-// test that only checks values would notice. So these assert the emitted shape
-// directly, in both directions, alongside the behaviour.
+// A callee's signature must not depend on any caller, or a unit's code would
+// change with the units that call it. A `ref` formal is its storage pointer and a
+// witness chain, null for a place that cannot move; these assert the emitted
+// shape directly, alongside the behaviour, because a caller and callee that
+// disagree about the arity write past each other's arguments and no test that
+// only checks values would notice.
 
-TEST_CASE("a ref to a place that cannot move is one pointer, with no epoch check") {
-    // A ref formal carries the relocation epoch only when some call site binds it
-    // inside a container's heap buffer (docs/design/data-model.md §3). A plain
-    // variable's storage never moves, so the fat form would be three dead words and
-    // a branch that can never be taken.
-    const std::string ir = emit_raw(R"(
+TEST_CASE("a ref to a place that cannot move passes no witness chain") {
+    // A plain variable's storage never moves, so there is nothing to witness: the
+    // chain is a null pointer and the callee's guard is one compare against it.
+    constexpr std::string_view src = R"(
         module m;
             int v;
             function automatic void f(ref int r); r = r + 1; endfunction
             initial begin v = 5; f(v); $display("%0d", v); end
         endmodule
-    )");
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 1);
-    CHECK(count_substr(ir, "rt_ref_stale") == 0);
-    CHECK(run_capture(R"(
-        module m;
-            int v;
-            function automatic void f(ref int r); r = r + 1; endfunction
-            initial begin v = 5; f(v); $display("%0d", v); end
-        endmodule
-    )") == "6\n");
+    )";
+    const std::string ir = emit_raw(src);
+    // state, rng, proc, home, the storage pointer and the chain.
+    CHECK(call_arity(ir, ".fn.f") == 6);
+    CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
+    CHECK(run_capture(src) == "6\n");
 }
 
-TEST_CASE("a ref to a whole container handle is one pointer") {
+TEST_CASE("a ref to a whole container handle passes no witness chain") {
     // The handle POD is design state: it never moves, only the buffer it points at
     // does. So a `ref` to the WHOLE queue needs no epoch even though a ref to one of
     // its elements does -- the two cases differ by which allocation is aliased.
@@ -5262,11 +5497,12 @@ TEST_CASE("a ref to a whole container handle is one pointer") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 1);
+    CHECK(call_arity(ir, ".fn.f") == 6);
+    CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
 }
 
-TEST_CASE("a ref to a container element keeps the epoch words") {
-    // The one shape that earns them: `slot` is an interior pointer into the heap
+TEST_CASE("a ref to a container element passes the epoch it was formed at") {
+    // The one shape that earns a chain: `slot` is an interior pointer into the heap
     // ring, and the epoch it is checked against lives in the handle -- a different
     // allocation, which is exactly why a stale pointer cannot reach its own witness.
     const std::string ir = emit_raw(R"(
@@ -5276,6 +5512,7 @@ TEST_CASE("a ref to a container element keeps the epoch words") {
             initial begin q.push_back(5); f(q[0]); $display("%0d", q[0]); end
         endmodule
     )");
+    CHECK(call_arity(ir, ".fn.f") == 6);
     CHECK(ir.find("i64 %ref.epoch.at.call") != std::string::npos);
     // The site record is the callee's, built at the guard, so it is not an operand
     // of the call; the container's name reaches the report through the epoch table.
@@ -5283,27 +5520,33 @@ TEST_CASE("a ref to a container element keeps the epoch words") {
     CHECK(ir.find("@clotho.ref.site") != std::string::npos);
 }
 
-TEST_CASE("one ref formal reached by both actual shapes stays fat at every call") {
-    // The fact is per FORMAL, not per call site: one heap-rooted actual anywhere
-    // makes the formal fat, and the variable call site then passes the no-epoch
-    // sentinel rather than a shorter argument list.
-    constexpr std::string_view src = R"(
+TEST_CASE("a ref formal's signature is the same whatever its callers bind it to") {
+    // The callee takes the same parameters whether every caller passes a variable,
+    // every caller a container element, or both. (It used to widen to the deepest
+    // caller's depth, so one unit's call changed another unit's signature.)
+    const auto sig = [](std::string_view call) {
+        const std::string src = std::string(R"(
+            module m;
+                int q[$]; int v;
+                function automatic void f(ref int r); r = r + 1; endfunction
+                initial begin q.push_back(5); v = 1; )") + std::string(call) + R"( $display("%0d %0d", v, q[0]); end
+            endmodule
+        )";
+        const std::vector<std::string> sigs = define_params(emit_raw(src), "fn.f");
+        REQUIRE(sigs.size() == 1);
+        return sigs[0];
+    };
+    const std::string by_var = sig("f(v);");
+    CHECK(by_var == "(ptr noalias %ctx, ptr %rng, ptr %proc, i8 %home, ptr %0, ptr %1)");
+    CHECK(sig("f(q[0]);") == by_var);
+    CHECK(sig("f(v); f(q[0]);") == by_var);
+    CHECK(run_capture(R"(
         module m;
             int q[$]; int v;
             function automatic void f(ref int r); r = r + 1; endfunction
-            initial begin
-                q.push_back(5); v = 1;
-                f(v); f(q[0]);
-                $display("%0d %0d", v, q[0]);
-            end
+            initial begin q.push_back(5); v = 1; f(v); f(q[0]); $display("%0d %0d", v, q[0]); end
         endmodule
-    )";
-    const std::string          ir  = emit_raw(src);
-    // The sentinel appears as a call OPERAND (the global's own definition line
-    // matches the bare name too, hence the surrounding argument text).
-    CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0)") == 1);
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 0);
-    CHECK(run_capture(src) == "2 6\n");
+    )") == "2 6\n");
 }
 
 TEST_CASE("twin instances calling their own tasks and functions keep their statics apart") {
@@ -5337,6 +5580,58 @@ TEST_CASE("twin instances calling their own tasks and functions keep their stati
             initial #20 $finish;
         endmodule
     )") == "top.a 1\ntop.a 2\ntop.a f 11\ntop.a f 12\ntop.b 10\ntop.b 20\ntop.b f 20\ntop.b f 30\n");
+}
+
+TEST_CASE("twin instances read their own name from a task and a function") {
+    // `%m` in a subroutine names that subroutine of the instance it runs for (LRM
+    // 21.2.1.6) whichever instance's code runs, also through a string built of it;
+    // the twins' calls are one function each (cli_test: --stat=unit-code).
+    CHECK(run_capture(R"(
+        module m (input int D);
+            function string who();
+                return $sformatf("<%m>");
+            endfunction
+            task automatic say(input int v);
+                $display("%m says %0d", v);
+            endtask
+            initial begin
+                #D;
+                say(D);
+                $display("%s", who());
+            end
+        endmodule
+        module top;
+            m a (.D(1));
+            m b (.D(5));
+        endmodule
+    )") == "top.a.say says 1\n<top.a.who>\ntop.b.say says 5\n<top.b.who>\n");
+}
+
+TEST_CASE("a subroutine its parent calls by hierarchical name reads the name of its own instance") {
+    CHECK(run_capture(R"(
+        module m (input int D);
+            function string who();
+                return $sformatf("<%m>");
+            endfunction
+            task automatic say(input int v);
+                $display("%m says %0d", v);
+            endtask
+            initial begin
+                #D;
+                say(D);
+                $display("%s", who());
+            end
+        endmodule
+        module top;
+            m a (.D(1));
+            m b (.D(5));
+            initial begin
+                #10;
+                $display("%s %s", a.who(), b.who());
+                b.say(9);
+            end
+        endmodule
+    )") == "top.a.say says 1\n<top.a.who>\ntop.b.say says 5\n<top.b.who>\n<top.a.who> <top.b.who>\ntop.b.say says 9\n");
 }
 
 TEST_CASE("a subroutine its parent calls by hierarchical name keeps the statics of its own instance") {
@@ -5447,12 +5742,223 @@ TEST_CASE("an interface task's statics are per instance, however the instance wa
     )") == "122 1101\n108 108\n");
 }
 
+TEST_CASE("twin modules calling an interface task through their port keep each interface instance's state") {
+    // The task belongs to the interface instance the port names, and so do its
+    // statics (LRM 13.4.2): each parent drives its own bus, whichever instance's
+    // code runs.
+    CHECK(run_capture(R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+        endinterface
+        module drv #(parameter int D = 1, parameter int K = 1) (bus_if b);
+            initial begin
+                #D;
+                b.put(10 * K);
+                b.put(20 * K);
+                $display("%m last %0d", b.last);
+            end
+        endmodule
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            drv #(.D(1), .K(1)) d0 (b0);
+            drv #(.D(5), .K(2)) d1 (b1);
+            initial #20 $finish;
+        endmodule
+    )") == "top.d0 last 122\ntop.d1 last 142\n");
+}
+
+TEST_CASE("an interface task called through a virtual interface acts on the instance the handle names") {
+    // One body serves every handle; the instance it runs on comes from the handle,
+    // so twin interface instances keep their own variables.
+    CHECK(run_capture(R"(
+        interface bus_if;
+            int last;
+            int hits;
+            task automatic put(input int v);
+                last = v;
+                hits++;
+            endtask
+            function int twice();
+                return last * 2;
+            endfunction
+        endinterface
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            virtual bus_if vi0 = b0;
+            virtual bus_if vi1 = b1;
+            initial begin
+                vi0.put(10); vi0.put(20); vi1.put(300);
+                $display("%0d %0d %0d %0d %0d", b0.last, b0.hits, b1.last, b1.hits, vi1.twice());
+            end
+        endmodule
+    )") == "20 2 300 1 600\n");
+}
+
+TEST_CASE("a fork child of a task in a twin instance runs on its own instance") {
+    // Each child is a body of the instance that forked it: it adds to that
+    // instance's `total`, scaled by that instance's parameter.
+    CHECK(run_capture(R"(
+        module m #(parameter int D = 1, parameter int K = 1);
+            int total;
+            task automatic add(int v);
+                #1 total += v * K;
+            endtask
+            initial begin
+                #D;
+                fork
+                    add(1);
+                    add(2);
+                join_none
+                #5;
+                $display("%m total %0d", total);
+            end
+        endmodule
+        module top;
+            m #(.D(1), .K(1)) a ();
+            m #(.D(2), .K(10)) b ();
+            initial #20 $finish;
+        endmodule
+    )") == "top.a total 3\ntop.b total 30\n");
+}
+
+// The twins below are one specialization each (the same body, ports apart), so
+// their code is compiled once and each instance runs it with its own record.
+// Which instance a call lands in is data the record holds, never code.
+
+TEST_CASE("twin callers of one instance's subroutines each call into it") {
+    // Both drivers run one body and call `top.m` by name: its record is the
+    // callee's, whichever driver's code makes the call.
+    CHECK(run_capture(R"(
+        module mon;
+            int log_n;
+            int log_sum;
+            task automatic log(input int who, input int v);
+                log_n++;
+                log_sum += who * 100 + v;
+                #1;
+            endtask
+            function int total();
+                return log_sum;
+            endfunction
+        endmodule
+        module drv (input int id, input int v);
+            initial begin
+                #1; #(id * 10);
+                top.m.log(id, v);
+                top.m.log(id, v + 1);
+                $display("drv %0d sees %0d", id, top.m.total());
+            end
+        endmodule
+        module top;
+            mon m ();
+            drv d0 (.id(1), .v(10));
+            drv d1 (.id(2), .v(20));
+            initial #50 $display("n=%0d sum=%0d", m.log_n, m.log_sum);
+        endmodule
+    )") == "drv 1 sees 221\ndrv 2 sees 662\nn=4 sum=662\n");
+}
+
+TEST_CASE("twin modules calling their interface instance's subroutines share them") {
+    // The interface instances are twins and so are the modules that drive them:
+    // one `put` and one `get`, and one driver body, run against the record each
+    // instance passes. The static of `put` is its instance's.
+    CHECK(run_capture(R"(
+        interface bus_if;
+            int last;
+            task automatic put(input int v);
+                static int n = 100;
+                n++;
+                last = v + n;
+            endtask
+            function int get();
+                return last;
+            endfunction
+        endinterface
+        module drv (bus_if b, input int k);
+            initial begin
+                #1; #(k);
+                b.put(10 * k);
+                b.put(20 * k);
+                $display("drv %0d last %0d get %0d", k, b.last, b.get());
+            end
+        endmodule
+        module top;
+            bus_if b0 ();
+            bus_if b1 ();
+            drv d0 (b0, 1);
+            drv d1 (b1, 2);
+            initial #20 $display("%0d %0d", b0.last, b1.last);
+        endmodule
+    )") == "drv 1 last 122 get 122\ndrv 2 last 142 get 142\n122 142\n");
+}
+
+TEST_CASE("fork children of one task body run on the twin that forked them") {
+    // The children, the task that forks them and the process that calls it are
+    // one body for both instances: each child adds to its own instance's total,
+    // scaled by that instance's port.
+    CHECK(run_capture(R"(
+        module m (input int k);
+            int total;
+            int res;
+            task automatic add(int v);
+                #1 total += v * k;
+            endtask
+            task automatic run(output int r);
+                fork
+                    add(1);
+                    add(2);
+                    begin #5 add(3); end
+                join_none
+                #10;
+                r = total;
+            endtask
+            initial begin #1; #(k); run(res); end
+        endmodule
+        module top;
+            m a (.k(1));
+            m b (.k(10));
+            initial begin #30; $display("%0d %0d", a.res, b.res); end
+        endmodule
+    )") == "6 60\n");
+}
+
+TEST_CASE("a resolved net's fold, forced and released, is one function for twin instances") {
+    // The fold of a forceable net is a function of its instance that `release`
+    // reaches too. Twins share it: each folds its own drivers (the second pair
+    // conflicts, so its fold keeps x bits) and its own force value.
+    CHECK(run_capture(R"(
+        module m (input logic [3:0] a, input logic [3:0] b, input logic [3:0] f, input int id);
+            wire [3:0] w;
+            assign w = a;
+            assign w = b;
+            initial begin
+                #1; #(id);
+                $display("%0d %b", id, w);
+                force w = f;
+                #1 $display("%0d forced %b", id, w);
+                release w;
+                #1 $display("%0d released %b", id, w);
+            end
+        endmodule
+        module top;
+            m x (.a(4'd3), .b(4'bzzzz), .f(4'd9), .id(1));
+            m y (.a(4'd5), .b(4'd6), .f(4'd2), .id(10));
+            initial #30 $finish;
+        endmodule
+    )") == "1 0011\n1 forced 1001\n1 released 0011\n10 01xx\n10 forced 0010\n10 released 01xx\n");
+}
+
 TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     // Dispatch picks the body at run time, so the caller cannot know which override
-    // it reaches. If one sibling took the fat form and another the narrow one, an
-    // indirect call would write three arguments the callee never declared. The
-    // analysis unions the answer across the slot: here only D::g is passed a queue
-    // element, and that must widen B::g too.
+    // it reaches: every override of a slot takes the same parameter list, with no
+    // analysis to keep them so, whichever of them is passed a queue element.
     constexpr std::string_view src = R"(
         class B; virtual function void g(ref int r); r = r + 1; endfunction endclass
         class D extends B; virtual function void g(ref int r); r = r + 2; endfunction endclass
@@ -5468,36 +5974,17 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
             end
         endmodule
     )";
-    const std::string          ir  = emit_raw(src);
-    // Both bodies take the SAME parameter list: state, rng, the object handle (one
-    // i64: a 2-state scalar crosses as one word), then the three ref words.
+    const std::string ir = emit_raw(src);
     // Compared as lists rather than as whole symbol names -- LLVM's uniquing suffix
     // on the second `g` shifts as the module gains unrelated functions, and that is
     // not what this case is about.
     const std::vector<std::string> sigs = define_params(ir, "fn.g");
     REQUIRE(sigs.size() == 2);
     CHECK(sigs[0] == sigs[1]);
-    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1, ptr %2, i64 %3)");
+    // state, rng, proc, home, the object handle (one i64: a 2-state scalar crosses
+    // as one word), then the storage pointer and the witness chain.
+    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, ptr %proc, i8 %home, i64 %0, ptr %1, ptr %2)");
     CHECK(run_capture(src) == "2 7\n");
-
-    // And with no heap-rooted actual at either site, the whole slot narrows.
-    const std::string narrow = emit_raw(R"(
-        class B; virtual function void g(ref int r); r = r + 1; endfunction endclass
-        class D extends B; virtual function void g(ref int r); r = r + 2; endfunction endclass
-        module m;
-            int v;
-            initial begin
-                B b; D d;
-                v = 1; b = new; d = new;
-                b.g(v); d.g(v);
-                $display("%0d", v);
-            end
-        endmodule
-    )");
-    const std::vector<std::string> nsigs = define_params(narrow, "fn.g");
-    REQUIRE(nsigs.size() == 2);
-    CHECK(nsigs[0] == nsigs[1]);
-    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1)");
 }
 
 TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {
@@ -5679,4 +6166,58 @@ TEST_CASE("--emit llvm of a design with several definitions is one module") {
         CHECK(ids == 1);
         CHECK(text.find("\nsource_filename") == text.rfind("\nsource_filename"));
     }
+}
+
+TEST_CASE("twin instances stage nonblocking writes into the interface their port names") {
+    // One body for both drivers (cli_test: --stat=unit-code); each commits into the
+    // signal of its own interface instance, in order.
+    CHECK(run_capture(R"(
+        interface bus;
+          logic [7:0] d;
+        endinterface
+        module drv(bus b, input int k);
+          initial begin
+            #k;
+            b.d <= 8'd10 + k[7:0];
+            #1 b.d <= 8'd20 + k[7:0];
+          end
+        endmodule
+        module top;
+          bus b0();
+          bus b1();
+          drv u0(b0, 1);
+          drv u1(b1, 2);
+          initial #10 $display("%0d %0d", b0.d, b1.d);
+        endmodule
+    )") == "21 22\n");
+}
+
+TEST_CASE("twin instances stage nonblocking writes from their tasks and functions") {
+    // One lowering of the task and the function for both instances (cli_test:
+    // --stat=unit-code); each commits into the `n` of the instance whose call it is,
+    // across the task's delay as well.
+    CHECK(run_capture(R"(
+        module drv(input int k);
+          int n = 0;
+          task automatic put(input int v);
+            n <= v;
+            #1;
+            n <= n + v;
+          endtask
+          function void set(input int v);
+            n <= v * 2;
+          endfunction
+          initial begin
+            #k;
+            put(10 * k);
+            #3 $display("%m n=%0d", n);
+            set(k);
+            #1 $display("%m n=%0d", n);
+          end
+        endmodule
+        module top;
+          drv u0(1);
+          drv u1(5);
+        endmodule
+    )") == "top.u0 n=20\ntop.u1 n=100\ntop.u1 n=10\ntop.u0 n=2\n");
 }

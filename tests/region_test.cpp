@@ -293,3 +293,61 @@ endmodule
 )";
     check_regions(src, "1 02 03\n");
 }
+
+TEST_CASE("regions: twin instances each guard on their own masks") {
+    // Two instances of one block, each with a guarded group (s2 / s3 / s4 hang off
+    // s1, which its own stimulus drives). The trigger colours are the design's and
+    // differ from instance to instance, so each instance's guards must test the
+    // masks of THAT instance; a mask taken from the other twin would skip a member
+    // whose own input changed and print a stale value.
+    static const char* src = R"(
+module leaf(input [7:0] id);
+  reg  [7:0] a = 0;
+  wire [7:0] s1, s2, s3, s4;
+  assign s1 = a + 1;
+  assign s2 = s1 + 2;
+  assign s3 = s1 ^ s2;
+  assign s4 = s3 + 3;
+  initial begin
+    #1 a = 8'h0e + id;
+    #1 $display("leaf%0d %h %h %h %h", id, s1, s2, s3, s4);
+    #1 a = 8'h11 + id;
+    #1 $display("leaf%0d %h %h %h %h", id, s1, s2, s3, s4);
+  end
+endmodule
+module top;
+  leaf u0(8'd0);
+  leaf u1(8'd1);
+endmodule
+)";
+    check_regions(src, "leaf0 0f 11 1e 21\nleaf1 10 12 02 05\nleaf0 12 14 06 09\nleaf1 13 15 06 09\n");
+}
+
+TEST_CASE("regions: a write from another instance reaches a guarded group") {
+    // top writes the twins' `a` by hierarchical reference, so the wake of s1's
+    // process comes from code that is not the owner's: it reads the trigger bits
+    // of the bucket it scans from the owner's record, and the group it wakes must
+    // run exactly the members those bits name.
+    static const char* src = R"(
+module leaf;
+  reg  [7:0] a = 0;
+  wire [7:0] s1, s2, s3, s4;
+  assign s1 = a + 1;
+  assign s2 = s1 + 2;
+  assign s3 = s1 ^ s2;
+  assign s4 = s3 + 3;
+endmodule
+module top;
+  leaf u0();
+  leaf u1();
+  initial begin
+    #1 u0.a = 8'h0e;
+    #1 u1.a = 8'h11;
+    #1 $display("%h %h", u0.s4, u1.s4);
+    #1 u0.a = 8'h15; u1.a = 8'h0e;
+    #1 $display("%h %h", u0.s4, u1.s4);
+  end
+endmodule
+)";
+    check_regions(src, "21 09\n11 21\n");
+}

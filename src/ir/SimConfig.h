@@ -32,7 +32,7 @@ enum class SystemAccess : uint8_t {
 // and changes nothing about the emitted code.
 enum class Stat : uint32_t {
     // Twin-group dedup: how many groups collapsed onto a shared body, and the
-    // time the comparison took (see share_twin_groups).
+    // time the comparison took.
     Dedup = 1u << 0,
     // Dedup, plus the member sets behind each identity key.
     DedupSets = 1u << 1,
@@ -46,6 +46,9 @@ enum class Stat : uint32_t {
     // Frontend units: how many instances each specialization has, and which
     // specializations' instances do not yet lower to identical unit IR.
     Units = 1u << 5,
+    // Backend units: which fusion groups of multi-instance units still lower to
+    // different code per instance (report_unit_code).
+    UnitCode = 1u << 6,
 };
 
 [[nodiscard]] inline bool stat_on(uint32_t stats, Stat s) {
@@ -119,7 +122,7 @@ struct SimulationConfig {
     // (Analysis.h) proves never carry z. Semantics are identical either way.
     //
     // This and the feature gates below (`fuse`, `comb_fuse`, `thunk`, `dedup`,
-    // `outline`, `split`, `parallel_compile`) exist for differential testing:
+    // `split`, `parallel_compile`) exist for differential testing:
     // an as-if optimization must produce byte-identical output with the gate
     // off, which is what the tests A/B. They are deliberately NOT on the CLI —
     // an operator has no reason to reach for one.
@@ -163,27 +166,37 @@ struct SimulationConfig {
     // unguarded ones. Disable for bisection / differential testing.
     bool regions = true;
     // Share one compiled body across twin instances of a reused module
-    // definition: thunk groups whose lowered functions are identical modulo
-    // their instance-context symbol collapse to ONE shared body (ctx passed
-    // as a parameter) plus a two-instruction musttail stub per instance
-    // (see share_twin_groups in ir/llvm/Dedup.cpp). Sharing is gated on
-    // literal post-lowering IR identity, so semantics are byte-identical
+    // definition: thunk groups of one unit whose lowered functions print
+    // identically, symbols included, collapse onto ONE function (each instance
+    // passes its own record), see the code-once lowering in Backend::run. The
+    // gate is literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
-    // Under `split`: lower a cross-instance fused thunk group as per-member
-    // functions emitted into each member's own definition unit plus a root
-    // dispatcher calling them in rank order, so the member code is
-    // per-definition cacheable (the merged form lives in the always-
-    // recompiled root). Costs one call per member per activation. Disable
-    // for bisection; no effect with split off.
-    bool outline = true;
+    // Check the code a unit's groups share. A group is lowered once, from the
+    // first instance of its unit whose imports are alike, and every other
+    // instance runs that code with its own record; a lowering that bakes
+    // something of its instance is kept off that path by a list of the things
+    // known to (Backend::taint), which can miss one. With this on, each
+    // instance that shares a group also lowers it for itself, into a scratch
+    // module, and the two must be the same code up to what legitimately differs
+    // (the function's name, the numbering of constants and attribute groups); a
+    // difference fails the build with the unit, the group, both instances and
+    // the first line that differs. The emitted modules are unchanged. It costs
+    // compile time, so it is one of the checks too slow to ship: on with
+    // CLOTHO_EXTRA_ASSERTS (Debug and CI), off otherwise.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    bool verify_shared_code = true;
+#else
+    bool verify_shared_code = false;
+#endif
     // Emit one llvm::Module per elaborated definition (unit = the definition
-    // state-struct identity) holding its single-scope process groups, plus a
-    // root module with everything else (state globals, scheduler machinery,
-    // functions/tasks, cross-instance groups, main). Prep for per-definition
-    // object caching; the JIT links the set into one dylib, so semantics are
-    // identical either way. Disable for bisection / debugging (one module,
-    // exactly the pre-split emission).
+    // state-struct identity) holding its instances' process groups and the entry
+    // of a schedule group that runs just one of them, plus a root module with
+    // everything else (state globals, scheduler machinery, functions/tasks, the
+    // dispatchers of schedule groups that run the groups of several instances,
+    // main). Prep for per-definition object caching; the JIT links the set into
+    // one dylib, so semantics are identical either way. Disable for bisection /
+    // debugging (one module, the same functions).
     bool split = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a

@@ -303,6 +303,77 @@ TEST_CASE("flatten resolves package members through a static root") {
     CHECK(run_capture(*m) == "7 9\n");
 }
 
+TEST_CASE("flatten lists each instance's functions and the ones its declarations are bound to") {
+    Design      d;
+    Scratch     scratch(d);
+    InternPool& pool = scratch.module().pool;
+    const Ref   byte = byte_type(pool);
+
+    // leaf(input d): function g returns d.
+    d.units.push_back(Unit{ .kind = UnitKind::Module, .def_name = "leaf" });
+    const UnitId leaf_id{ 0 };
+    {
+        Unit&        leaf = d.units.back();
+        const Signal in   = local(leaf, "d", byte, SignalInfo::Direction::Input);
+        Builder      fb(scratch.module());
+        fb.unary(Inst::Tag::Ret, fb.unary(Inst::Tag::Load, fb.signal(in, kLoc), kLoc), kLoc);
+        leaf.functions.push_back({ .fn = Function{ .name = "g", .return_type = byte, .ir = fb.finish() }, .name = "g" });
+    }
+
+    // top: two leaves, each given a value through a port copy, and an initial
+    // that calls each one's g by hierarchical name.
+    d.units.push_back(Unit{ .kind = UnitKind::Module, .def_name = "top" });
+    {
+        Unit&        top = d.units.back();
+        const Signal a0  = local(top, "a0", byte);
+        const Signal a1  = local(top, "a1", byte);
+        const Signal x0  = local(top, "x0", byte);
+        const Signal x1  = local(top, "x1", byte);
+        const Signal d0  = extern_signal(top, "u0.d", byte, member({ .slots = { 0 } }, "d"));
+        const Signal d1  = extern_signal(top, "u1.d", byte, member({ .slots = { 1 } }, "d"));
+        top.imports.push_back(member({ .slots = { 0 } }, "g"));
+        top.functions.push_back({ .fn     = Function{ .name = "g", .return_type = byte },
+                                  .import = static_cast<uint32_t>(top.imports.size() - 1) });
+        top.imports.push_back(member({ .slots = { 1 } }, "g"));
+        top.functions.push_back({ .fn     = Function{ .name = "g", .return_type = byte },
+                                  .import = static_cast<uint32_t>(top.imports.size() - 1) });
+        top.children.push_back({ .unit = leaf_id, .name = "u0" });
+        top.children.push_back({ .unit = leaf_id, .name = "u1" });
+        top.processes.push_back(copy_process(scratch.module(), d0, a0));
+        top.processes.push_back(copy_process(scratch.module(), d1, a1));
+
+        Builder b(scratch.module());
+        store_const(b, pool, a0, 3);
+        store_const(b, pool, a1, 5);
+        delay(b, pool, 1);
+        b.binary(Inst::Tag::Store, b.signal(x0, kLoc), b.call(FunctionId{ 0 }, {}, kLoc), kLoc);
+        b.binary(Inst::Tag::Store, b.signal(x1, kLoc), b.call(FunctionId{ 1 }, {}, kLoc), kLoc);
+        const Signal shown[] = { x0, x1 };
+        display(b, "%0d %0d", shown);
+        top.processes.push_back(Process{ .activation = Activation::Initial, .ir = b.finish() });
+    }
+    d.roots.push_back({ .unit = UnitId{ 1 }, .name = "top", .prefix = "" });
+    d.name = d.top_name = "top";
+
+    scratch.give_back();
+    auto m = flatten(std::move(d));
+
+    // Each leaf instance defines its own g; top defines none and is bound to
+    // both, in the order of its declarations.
+    REQUIRE(m->tops().size() == 1);
+    const InstanceScope& top = m->tops()[0];
+    CHECK(m->function_count() == 2);
+    CHECK(top.fn_locals.empty());
+    CHECK(top.fn_externs == std::vector<FunctionId>{ FunctionId{ 0 }, FunctionId{ 1 } });
+    REQUIRE(top.children.size() == 2);
+    CHECK(top.children[0].fn_locals == std::vector<FunctionId>{ FunctionId{ 0 } });
+    CHECK(top.children[1].fn_locals == std::vector<FunctionId>{ FunctionId{ 1 } });
+    CHECK(top.children[0].fn_externs.empty());
+
+    // Both leaves run one function, each with its own record.
+    CHECK(run_capture(*m) == "3 5\n");
+}
+
 TEST_CASE("flatten resolves interface-port and upward references") {
     Design      d;
     Scratch     scratch(d);

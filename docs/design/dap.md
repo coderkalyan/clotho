@@ -94,8 +94,8 @@ path cannot become a URI) and `offset` (`:97`). The LSP's
 1-based where LSP is 0-based, which is a `+1` in one place.
 
 **The codegen knobs a debug mode needs already exist and already say so.**
-`fuse` (`SimConfig.h:119`), `comb_fuse` (`:125`), `thunk` (`:132`),
-`dedup` (`:140`), `outline` (`:147`) each carry a comment of the form
+`fuse` (`SimConfig.h:119`), `comb_fuse` (`:125`), `thunk` (`:132`) and
+`dedup` (`:140`) each carry a comment of the form
 *"Disable for bisection / debugging; semantics are identical either way."*
 They are deliberately not on the CLI. §4.2.
 
@@ -518,20 +518,23 @@ Consequences worth stating plainly:
 
 ### 4.2 The generated code is not the code the user wrote, unless we ask
 
-Five transforms are on by default and each breaks a debugger assumption:
+Four transforms are on by default and each breaks a debugger assumption:
 `fuse` (N processes → one coroutine), `comb_fuse` (dependent combinational
 processes merged), `thunk` (suspension-free process → a frameless function
-pointer), `dedup` (one body shared across twin instances), `outline`
-(fused group split across definition units). Above them, `inline` runs even at
+pointer), `dedup` (one function per unit group, run by every instance with its
+own record). A schedule group that spans instances calls one row per instance
+from a dispatcher, and only `fuse` and `comb_fuse` form groups to share, so
+turning them off covers it.
+Above them, `inline` runs even at
 tier 0 (`ir/llvm/LlvmBackend.cpp, optimize_module`), and `sroa`/`instcombine`/`dce` destroy frame
 locals.
 
 So: **`clotho dap` compiles the design in a debug mode.** `SimConfig` gains
-`bool debug = false`; setting it forces `fuse`, `comb_fuse`, `thunk`, `dedup`
-and `outline` off, and enables the debug emissions each phase adds. This is not
-a new idea being invented here — every one of those five fields already carries
+`bool debug = false`; setting it forces `fuse`, `comb_fuse`, `thunk` and `dedup`
+off, and enables the debug emissions each phase adds. This is not
+a new idea being invented here — every one of those four fields already carries
 the comment *"Disable for bisection / debugging; semantics are identical either
-way"* (`SimConfig.h:119,125,132,140,147`).
+way"* (`SimConfig.h:119,125,132,140`).
 
 Two rules make this honest:
 
@@ -752,7 +755,7 @@ Ordering claims worth arguing over:
    granularity.** §3.5 option 3. The alternative is lying about `instruction`,
    and a client that offers "step instruction" also offers `disassemble`.
 7. **~~`--debug` on the CLI~~ — APPROVED, unbuilt.** `SimConfig::debug` forces
-   `fuse`/`comb_fuse`/`thunk`/`dedup`/`outline` off, `clotho dap` always uses
+   `fuse`/`comb_fuse`/`thunk`/`dedup` off, `clotho dap` always uses
    it, and `clotho run --debug` exposes the same build so a debug-mode failure
    is reproducible and bisectable from a shell. A `run`/`build`-scoped option,
    so it needs a `check_scope` row (`main.cpp:265-276`). Lands with D2, which

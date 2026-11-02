@@ -249,7 +249,7 @@ properly instead of avoiding it.
 
 **P4 is a separate feature.** The mechanics are local — staging has two entry
 points (`lower_store_nb`:18401, `register_block_store`:18546), commit is per
-`BlockSig`, and `nba_meta` needs no renumbering — but the qualification proof
+`BlockSig`, and no table of block metadata needs renumbering (the commit functions are code of the writer's unit) — but the qualification proof
 is wide. A scalar NBA target may be observed through the shadow/commit path by
 static and dynamic wait queues, virtual-interface waiters, `<= @e` triggers,
 intra-assignment record pools, VCD, `$strobe`/`$monitor`, Preponed sampling
@@ -288,8 +288,9 @@ site, which takes a bite out of the 22.7% without touching the shadow.
   coroutine path, per-member frame temps are built in the ramp (the
   `member_strs` snapshots in `lower_group`) — guard the body, never the temp
   construction.
-- `share_twin_groups` (:8810) hashes group bodies for cross-instance dedup, so
-  guard code and masks must be per-definition constants, not per-instance.
+- Groups are lowered once per unit and run by every instance, so guard code
+  and masks must not be per-instance constants: they are fields of the
+  instance's record, filled at startup.
 - The tagged-thunk handle and the active ring are reused as-is: a region is a
   thunk, so the hybrid with coroutines, delays and dynamic sensitivity needs
   no new dispatch machinery.

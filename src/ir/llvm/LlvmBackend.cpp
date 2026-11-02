@@ -2,8 +2,13 @@
 
 #include "ir/llvm/Backend.h"
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/PassManager.h>
 
 #include "ir/Verify.h"
 #include "ir/llvm/RuntimeBitcode.h"
@@ -123,6 +128,102 @@ void clamp_unproven_align(llvm::Module& m) {
     }
 }
 
+// Tier-0 code generation (FastISel, the fast register allocator) folds an address
+// computation into the load or store that uses it only inside one basic block. An
+// address EarlyCSE computed once for several blocks is a value live across them:
+// the allocator spills it where it is made and reloads it in each block that uses
+// it, a store and a load a constant displacement on the base would have cost
+// nothing. A GEP with constant indices is free to compute where it is used, so
+// give each block that uses one its own copy and let the access fold it. The
+// base is then what each block reloads, once, however many fields it touches --
+// the whole difference between code addressed through an instance record
+// (everything one displacement off the record, which the entry of a group holds
+// in one argument) and code addressed through absolute symbols, which never
+// needed a register.
+struct RematAddressPass : llvm::PassInfoMixin<RematAddressPass> {
+    llvm::PreservedAnalyses run(llvm::Function& f, llvm::FunctionAnalysisManager& /*fam*/) {
+        llvm::SmallVector<llvm::GetElementPtrInst*, 32> geps;
+        for (llvm::BasicBlock& bb : f) {
+            for (llvm::Instruction& inst : bb) {
+                if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst); gep != nullptr && gep->hasAllConstantIndices()) {
+                    geps.push_back(gep);
+                }
+            }
+        }
+        bool changed = false;
+        for (llvm::GetElementPtrInst* gep : geps) {
+            // The uses outside the GEP's own block, a copy per block. A phi use is
+            // read on the edge, not in its block, and keeps the original.
+            llvm::SmallVector<llvm::Use*, 8> outside;
+            for (llvm::Use& use : gep->uses()) {
+                auto* user = llvm::cast<llvm::Instruction>(use.getUser());
+                if (user->getParent() != gep->getParent() && !llvm::isa<llvm::PHINode>(user)) {
+                    outside.push_back(&use);
+                }
+            }
+            llvm::SmallDenseMap<llvm::BasicBlock*, llvm::Instruction*, 4> copy;
+            for (llvm::Use* use : outside) {
+                llvm::BasicBlock* const bb = llvm::cast<llvm::Instruction>(use->getUser())->getParent();
+                llvm::Instruction*&     c  = copy[bb];
+                if (c == nullptr) {
+                    c = gep->clone();
+                    c->insertBefore(bb->getFirstInsertionPt());
+                }
+                use->set(c);
+                changed = true;
+            }
+            if (gep->use_empty()) {
+                gep->eraseFromParent();
+            }
+        }
+        return changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
+    }
+};
+
+// Tier-0 code generation lays blocks out in the order the function holds them,
+// which is the order the backend created them in: a block's successor is rarely
+// the next one, so a branch is a conditional jump and a jump, and a hot path is
+// a chain of them. Put the blocks in reverse postorder of a walk that follows a
+// terminator's last successor first, so the first successor of a branch (the
+// "then" of a `br i1` the backend builds, the body of a loop test) is the block
+// that follows it and a straight-line sequence of blocks falls through.
+struct BlockLayoutPass : llvm::PassInfoMixin<BlockLayoutPass> {
+    llvm::PreservedAnalyses run(llvm::Function& f, llvm::FunctionAnalysisManager& /*fam*/) {
+        if (f.size() < 3) {
+            return llvm::PreservedAnalyses::all();
+        }
+        llvm::SmallVector<llvm::BasicBlock*, 32>                         post;
+        llvm::SmallPtrSet<llvm::BasicBlock*, 32>                         seen;
+        llvm::SmallVector<std::pair<llvm::BasicBlock*, unsigned>, 32> stack;
+        stack.emplace_back(&f.getEntryBlock(), 0);
+        seen.insert(&f.getEntryBlock());
+        while (!stack.empty()) {
+            auto& [bb, next] = stack.back();
+            const llvm::Instruction* term = bb->getTerminator();
+            const unsigned           n    = term->getNumSuccessors();
+            if (next < n) {
+                // The last successor first, so the first is finished last and comes
+                // first in reverse postorder.
+                llvm::BasicBlock* succ = term->getSuccessor(n - 1 - next++);
+                if (seen.insert(succ).second) {
+                    stack.emplace_back(succ, 0);
+                }
+            } else {
+                post.push_back(bb);
+                stack.pop_back();
+            }
+        }
+        // Reverse postorder, entry first; blocks the walk did not reach (none but a
+        // dead block the optimizer left) keep their place after the others.
+        llvm::BasicBlock* prev = &f.getEntryBlock();
+        for (auto it = post.rbegin() + 1; it != post.rend(); ++it) {
+            (*it)->moveAfter(prev);
+            prev = *it;
+        }
+        return llvm::PreservedAnalyses::all();
+    }
+};
+
 } // namespace
 
 // Lower the coroutine intrinsics emitted for each process and clean up the
@@ -165,13 +266,18 @@ bool optimize_module(llvm::Module& m, bool o3) {
         // CoroCleanup) plus the loop/GVN/vectorizer stack tier 0 omits.
         mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     }
-    else if (auto err = pb.parsePassPipeline(mpm,
-                                        std::string("coro-early,"
-                                        "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
-                                        "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
-                                        "coro-cleanup") + (linked ? ",globaldce" : ""))) {
-        llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
-        return false;
+    else {
+        if (auto err = pb.parsePassPipeline(mpm,
+                                            std::string("coro-early,"
+                                            "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
+                                            "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
+                                            "coro-cleanup") + (linked ? ",globaldce" : ""))) {
+            llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
+            return false;
+        }
+        // Last, so nothing merges the copies again.
+        mpm.addPass(llvm::createModuleToFunctionPassAdaptor(RematAddressPass()));
+        mpm.addPass(llvm::createModuleToFunctionPassAdaptor(BlockLayoutPass()));
     }
     mpm.run(m, mam);
     return true;
@@ -194,7 +300,8 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
     // state and repairs none of them.
     assert_well_typed(m, resolve);
 
-    auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
+    // Not the design's name: a unit module can be named like the design.
+    auto root = std::make_unique<llvm::Module>("clotho.root", ctx);
 
     // Pin the modules to the target's triple and DataLayout before any IR is
     // built: the state/frame struct layouts, the NBA meta table's baked byte
@@ -255,6 +362,71 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
     return built;
 }
 
+// The built modules, each moved by a bitcode round trip into `shared` -- or, with
+// none, into a context of its own, kept in `owned` -- so a module reloaded alone
+// names its types as its own text says, where modules still sharing the building
+// context suffix a type name another module holds.
+static bool reload_modules(BuiltDesign& built, llvm::LLVMContext* shared,
+                           std::vector<std::unique_ptr<llvm::LLVMContext>>& owned,
+                           std::vector<std::unique_ptr<llvm::Module>>&      out) {
+    std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
+    std::vector<std::string>                names;
+    for (size_t i = 0; i < built.modules.size(); ++i) {
+        llvm::raw_svector_ostream bits(bitcode[i]);
+        llvm::WriteBitcodeToFile(*built.modules[i], bits);
+        names.push_back(built.modules[i]->getModuleIdentifier());
+    }
+    built.modules.clear();
+    for (size_t i = 0; i < bitcode.size(); ++i) {
+        const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
+        llvm::LLVMContext*          ctx = shared;
+        if (ctx == nullptr) {
+            ctx = owned.emplace_back(std::make_unique<llvm::LLVMContext>()).get();
+        }
+        auto parsed = llvm::parseBitcodeFile(buf, *ctx);
+        if (!parsed) {
+            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
+            return false;
+        }
+        out.push_back(std::move(*parsed));
+    }
+    return true;
+}
+
+SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve) {
+    assert_well_typed(m, resolve);
+    auto host = host_target();
+    if (!host) {
+        return { SharedCodeCheck::Outcome::Refused, "cannot detect host target" };
+    }
+    auto tm = host->createTargetMachine();
+    if (!tm) {
+        llvm::consumeError(tm.takeError());
+        return { SharedCodeCheck::Outcome::Refused, "cannot create the target machine" };
+    }
+    // Declared before the backend so they outlive it.
+    llvm::LLVMContext ctx;
+    llvm::Module      root("clotho.root", ctx);
+    root.setTargetTriple((*tm)->getTargetTriple());
+    root.setDataLayout((*tm)->createDataLayout());
+    SimulationConfig config;
+    config.verify_shared_code = true;
+    try {
+        Backend be(m, ctx, root, config, resolve);
+        be.run();
+    } catch (const BackendError& e) {
+        if (!e.message.starts_with("internal: the code shared by")) {
+            return { SharedCodeCheck::Outcome::Refused, e.message };
+        }
+        std::string where;
+        if (e.span.valid() && resolve) {
+            where = resolve(e.span).where + ": ";
+        }
+        return { SharedCodeCheck::Outcome::Mismatch, where + "error: " + e.message };
+    }
+    return {};
+}
+
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config,
                Timings* timings, const LocResolver& resolve) {
     const auto t_llvm = std::chrono::steady_clock::now();
@@ -284,36 +456,55 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     // gives the linked copies no name -- `%0 = type { %1, %1 }` for what was
     // `%alu.state` -- which is the readable part of this output. In a fresh
     // context the names are free.
-    std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
-    std::vector<std::string>                names;
-    for (size_t i = 0; i < built.modules.size(); ++i) {
-        llvm::raw_svector_ostream bits(bitcode[i]);
-        llvm::WriteBitcodeToFile(*built.modules[i], bits);
-        names.push_back(built.modules[i]->getModuleIdentifier());
+    llvm::LLVMContext                               linked_ctx;
+    std::vector<std::unique_ptr<llvm::LLVMContext>> no_owned;
+    std::vector<std::unique_ptr<llvm::Module>>      reloaded;
+    if (!reload_modules(built, &linked_ctx, no_owned, reloaded)) {
+        return false;
     }
-    built.modules.clear();
-    llvm::LLVMContext             linked_ctx;
-    std::unique_ptr<llvm::Module> root;
-    for (size_t i = 0; i < bitcode.size(); ++i) {
-        const llvm::MemoryBufferRef buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()), names[i]);
-        auto                        parsed = llvm::parseBitcodeFile(buf, linked_ctx);
-        if (!parsed) {
-            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
-            return false;
-        }
-        if (i == 0) {
-            root = std::move(*parsed);
-            continue;
-        }
+    std::unique_ptr<llvm::Module> root = std::move(reloaded.front());
+    for (size_t i = 1; i < reloaded.size(); ++i) {
         // Reports its own diagnostic through the context's handler.
         llvm::Linker linker(*root);
-        if (linker.linkInModule(std::move(*parsed))) {
+        if (linker.linkInModule(std::move(reloaded[i]))) {
             return false;
         }
     }
     root->print(os, nullptr);
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
+    }
+    return true;
+}
+
+bool emit_llvm_modules(const Module& m, std::vector<ModuleIr>& out, const SimulationConfig& config,
+                       const LocResolver& resolve) {
+    auto host = host_target();
+    if (!host) {
+        llvm::errs() << "llvm backend: cannot detect host target: " << llvm::toString(host.takeError())
+                     << "\n";
+        return false;
+    }
+    auto tm = host->createTargetMachine();
+    if (!tm) {
+        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
+        return false;
+    }
+    llvm::LLVMContext ctx;
+    auto              built = build_modules(m, ctx, **tm, config, resolve);
+    if (built.modules.empty()) {
+        return false;
+    }
+    std::vector<std::unique_ptr<llvm::LLVMContext>> owned;
+    std::vector<std::unique_ptr<llvm::Module>>      reloaded;
+    if (!reload_modules(built, nullptr, owned, reloaded)) {
+        return false;
+    }
+    for (const auto& mod : reloaded) {
+        ModuleIr& entry = out.emplace_back();
+        entry.name      = mod->getModuleIdentifier();
+        llvm::raw_string_ostream os(entry.ir);
+        mod->print(os, nullptr);
     }
     return true;
 }

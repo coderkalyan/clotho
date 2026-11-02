@@ -1,19 +1,20 @@
 # Modular compilation
 
-Status: steps 1 and 2a/2b/2c are on this branch (2d, lowering a specialization
-once, is not); step 3, the backend per unit (instance records, groups and
-functions lowered once per unit, one LLVM module per unit), is on the
-`modular-ir` branch and is described here as the design it implements, not as
-what this branch does. The frontend's output is a `Design` (src/ir/Design.h)
-with one unit per specialization wherever its instances lower identically, which
-`flatten` expands back into the flat module the backend consumes (`clotho run
---stat=units` reports what is still split: none on rocket-chip, nor on a design
-whose instances print `%m`, report through assertions and build covergroups).
-The frontend still lowers every instance, and everything below the IR is still
-whole-design; `module-split.md` describes the LLVM-level partition that exists
-today. An instance's own path is read through `inst_path`, which the flat
-backend resolves from the instance a body belongs to (a borrowed constant
-string); it costs a body nothing until a report fires.
+Status: steps 1, 2a/2b/2c and 3 are on this branch (2d, lowering a specialization
+once, is not): layout, records,
+groups, functions and tasks are lowered once per unit (3a-3c), each unit has
+its own LLVM module named by the unit with the instance glue in root, root's
+per-instance work is tables behind loops (3e), and the
+gate test passes. The frontend's output
+is a `Design` (src/ir/Design.h) with one unit per specialization wherever its
+instances lower identically, which `flatten` expands back into the flat module
+the backend consumes (`clotho run --stat=units` reports what is still split:
+none on rocket-chip, nor on a design whose instances print `%m`, report through
+assertions and build covergroups). The frontend still lowers every instance, and
+the whole-design analyses still decide the layout; `module-split.md` describes
+the LLVM-level partition. An instance's own path is read through `inst_path`,
+the address of a borrowed constant string held in the instance's record; it
+costs a body nothing until a report fires.
 
 Goal: compile an SV design as a composition of small units, so compilation can
 be incremental, cached and parallel. The aim is an architecture whose unit
@@ -31,9 +32,10 @@ Every stage up to and including LLVM IR construction is one whole-design pass:
   tables and appear verbatim in IR bodies.
 - `analyze()` runs whole-design fixpoints (may-z, undriven, pointer arguments)
   whose results decide state layout.
-- The backend builds every LLVM module in one serial pass, then splits the
-  output into a root module and one module per state struct type. Functions,
-  NBA commit functions, initializers and the seed loop stay in root.
+- The backend builds every LLVM module in one serial pass: the groups and the
+  functions and tasks of an instance, and the commit functions of the NBA
+  blocks they register, go into the module of its unit, and the code of no
+  instance (a package's, `$unit`'s), initializers and the seed loop stay in root.
 - Nothing is cached. `clotho build` links every module back into one.
 
 The partition is drawn after every whole-design decision, so no stage above
@@ -282,23 +284,86 @@ unit, which is also what the no-IR-rewriting rule asks
 ## Code generation
 
 - Unit code is instance-relative: it addresses storage as instance base plus
-  offset, never through per-instance symbols. The constant-anchor form measured
-  faster under FastISel on picorv32 (module-split.md), so the cost is measured
-  before anything is keyed on instance count.
-- No inlining across units. Comb fusion across instances composes through a
-  dispatcher calling each unit's member functions, which generalizes today's
-  outlining. A flattening, LTO-style `-O` mode can come later without changing
-  units.
-- Root holds link glue only: instance storage, binding tables, the scheduling
-  plan and global numbering as tables.
+  offset, never through per-instance symbols, singleton units included, so a
+  unit's code does not change when it gains a second instance. The
+  constant-anchor form measured faster under FastISel on picorv32
+  (module-split.md); recovering that belongs to a later whole-design `-O` tier.
+- No inlining across units. Processes fuse within a unit, and a unit's group is
+  one function taking the instance's record; the groups of several instances
+  that wait on the same events are the rows -- (unit function, instance
+  record) pairs -- of one schedule group, run by one dispatcher, with no
+  member-count caps. Merged cross-instance bodies can return in a flattening,
+  LTO-style `-O` mode without changing units. A group of one row is run by its
+  unit's entry directly: the scheduler's handle for it is the address of the
+  process's wake pair inside the instance's record, and the entry, which is
+  handed that address, finds the record a constant below it, so no code of root
+  is per instance (see "The instance record").
+- Function and task signatures are uniform: the process-control and home
+  parameters are always present and `ref` epoch handling never depends on
+  callers, so no other unit's code changes a unit's signatures.
+- Root holds link glue only: instance storage and records, binding tables, the
+  scheduling plan and global numbering as tables.
+
+### The instance record
+
+Every instance of a unit, a static unit's single instance included, has a
+record the unit's code receives as its first argument. It holds what differs
+between instances:
+
+- bases of the instance's state and NBA shadow, and one wake pair per process it
+  owns -- the wake word (the scheduled flag and the trigger bits it carries) and
+  the entry a thunk handle runs;
+- bases of its ids in design-wide spaces (VCD variables, NBA blocks and
+  buffers, triggers, RNG seeds), so code adds a unit-local ordinal;
+- its hierarchical name (`%m`, banners, covergroup scope), held as a borrowed
+  string handle: `inst_path` reads it at no cost and nothing owns the value, so
+  consumers read it in place (a display argument, a banner piece the runtime
+  joins when it reports, a concatenation part) and copy only where they need a
+  string of their own;
+- its deferred-assertion generation counters, one per process it owns: a group
+  bumps its counter at each activation and tags the reports it queues with it
+  (LRM 16.4.2), so the counter is a field of the instance, not a global of the
+  group;
+- the design-wide index of each process it owns (its control block, its random
+  stream's seed) and the index of its program instance (LRM 24.3, `$exit`);
+- the flat ids of the `disable` targets and covergroup types it declares, which a
+  unit's code names by position (a hierarchical `disable` of another instance's
+  block, or a covergroup of one, still names a symbol of that instance);
+- one binding per extern declaration: the address of an imported signal, the
+  record of the instance that owns it (only carried, into a deferred write's
+  record) and the address of the signal's **port** in that record, and the record
+  of an imported function's instance (landed); the record of an instance an
+  interface port or `inst_refs` entry names (not yet);
+- one **port** per signal that has anything for a writer: its wake buckets (base,
+  subscriber count and trigger bits of each static one; base, length cell and
+  capacity of each dynamic one), its ids in the design-wide id spaces, its
+  dump-var index, the address of each of its shadow fields and the heads of its
+  virtual-interface waiter lists. A port is a struct whose elements are a function
+  of the signal's facts alone, so code that writes a signal of another unit reads
+  the port through its binding and names no offset of the owner's record: what the
+  owner gains elsewhere (a process, an event, a covergroup, an assertion, another
+  signal) moves the port inside the record and changes no one else's code. The
+  ports of a state type are the same for every unit of it, which a virtual
+  interface relies on. What does still reach a parent's code is the set of
+  buckets a signal it writes has (a new waiter on an edge of a port): an inbound
+  fact, joined per unit until step 4;
+- the trigger masks of the guarded groups the instance runs;
+- the waiter queue of each `expect` its unit declares (LRM 16.17), as the address
+  of a root global `{ count, parked handles }`: the wait and the wake of the
+  statement are both unit code and read it here, so neither names a monitor's
+  design-wide number (and two instances of one unit do not share a queue).
+
+Today's per-definition `@clotho.inst.<hier>.ctx` (StateLayout.cpp) is the
+seed of it; the `abs_id` / `idval` relocations (gone: ids are record fields) and constant anchors in unit
+code go.
 
 ## Staging
 
 1. **IR containers and the flatten adapter.** `Design`, `Unit`, imports and
    child slots, plus `flatten(Design) -> Module`, which expands units into
    instances and reproduces the flat module the backend consumes today. The
-   adapter is per-instance only on the backend side, as the backend already is,
-   and it is deleted in step 3.
+   adapter is per-instance only on the backend side, as the backend already is;
+   in step 3 it stops copying bodies and keeps only the instance expansion.
 2. **Lowering per specialization**, in four sub-steps that each keep the suite
    and the perf corpus simulating identically:
    - **2a, partition (landed).** The Lowerer records which unit owns what
@@ -328,10 +393,282 @@ unit, which is also what the no-IR-rewriting rule asks
      have to agree on layout and on start values (`declare_interface_statics`).
    - **2d, lower once.** The Lowerer lowers each specialization's canonical
      body only; per-instance lowering and the comparison go.
-3. **Backend per unit** (not on this branch; it is on `modular-ir`). Code is a function of (unit, inbound facts, config);
-   functions, commit functions and initializers move into units; root becomes
-   link glue; the adapter goes. Gate: an edit to one definition changes only
-   that unit's object bytes and root's.
+3. **Backend per unit.** Code is a function of (unit, inbound facts, config);
+   root becomes link glue. Gate: an edit to one definition changes only that
+   unit's object bytes and root's, checked by compiling a design twice with one
+   definition edited and comparing per-module bitcode. Sub-steps, each keeping
+   the suite and corpus simulating identically and measured for speed:
+   - **3a, one layout per unit.** flatten records which unit instance every
+     flat signal, process and function came from (`Module::unit_instances`).
+     Slot facts (may-z and the other z-storage causes, NBA staging flags) are
+     joined over a unit's instances, so all of them share one state and shadow
+     type; power-on values stay per instance. A unit's storage the scope does
+     not list (driver slots, constant tables, assertion state) moves from the
+     root struct into the instance's.
+   - **3b, instance records.** Every unit instance gets a record; unit code
+     addresses its own storage, ids and name through it and other units'
+     storage and instances through its bindings. Landed so far: every
+     instance scope has a record, and a fusion group addresses its own
+     storage, shadow, sched flags, wait buckets, dump-var index and NBA block
+     ids through it (block ids at the record's field for the function's
+     def-local process ordinal). A signal outside the instance (another
+     instance's, a package's) is reached through a binding: two record fields
+     per extern declaration of the unit (`InstanceScope::externs`, in the unit's
+     order), the address of the signal's storage and the record of the instance
+     that owns it, filled at startup. A write through one wakes the owner's
+     readers from the owner's record (buckets, trigger bits, shadow, dump-var
+     index), exactly as an access through a virtual interface handle does, so
+     what it needs of the owner is data and not a symbol. Two declarations of
+     one instance can name one signal (an inout port and the contribution a
+     child drives through it); the first stands for both, so instances whose
+     declarations alias differently do not share code. The ids of its signals in
+     design-wide spaces (array, aggregate, container, string and intra NBA
+     buffers, `<= @e` triggers) are record fields at def-local ordinals, filled
+     at startup, and the sets they index are joined over a unit's instances;
+     the dump-var base was a field already. A signal of no instance keeps its
+     immediates. The name (`inst_path`) is a record field, the address of the
+     instance's borrowed path handle (a constant of root), so code of a unit
+     reads its instance's name and bakes none.
+   - **3c, code once per unit.** Each unit's processes and functions are
+     lowered once from the unit's IR, taking the record, into the unit's module.
+     Fusion runs within a unit; groups spanning instances become dispatch
+     table rows. `share_twin_groups` and outlining go. Landed: fusion groups
+     are formed per unit (`compute_fusion_groups`,
+     ir/llvm/Groups.cpp). A group is a list of def-local process ordinals,
+     the same in every instance and never mixing instances, decided on the
+     unit's processes and facts joined over its instances, never on an
+     instance's context. A thunk group is a function taking its instance's
+     record, a row; the rows of the groups that wait on the same (signal,
+     edge) set, in any instances, share one subscription as a schedule group,
+     whose entry (a dispatcher in root, or in the unit module for one row)
+     owns the flag, runs the rows and re-arms. Each group is lowered once, from
+     the first instance whose imports are alike (`code_key`: which bindings
+     alias, and the owner and position of what each names, except an event
+     port, which is only its declaration), and every other
+     instance gets a row of that function with its own record, plus NBA blocks
+     of its own signals; a coroutine ramp takes the record as its first argument
+     too. `merge_twin_bodies`, `share_twin_groups` and
+     `SimulationConfig::outline` are gone. A lowering that bakes something of the
+     instance it ran for (a symbol of its storage or wait buckets, a call of a
+     function that is its instance's own, a disable target or covergroup type of
+     another instance) taints itself and each
+     instance lowers its own; `--stat=unit-code` reports unit groups, functions
+     emitted and what stopped sharing. Comb fusion stays within one instance
+     (combchain regresses; accepted until fusion across instances is revisited).
+
+     A function or task of an instance takes that instance's record as its
+     first argument and addresses the instance through it, as a group does:
+     its own storage, shadow, ids, wake buckets and dump-var index from the
+     record, another instance's signals through bindings. One that belongs to
+     no instance (a package's, `$unit`'s, a virtual interface body) takes the
+     root state, which nothing reads, and addresses absolutely. A direct call
+     passes the callee's record: the caller's own when it is the same
+     instance, else the one its function binding holds (one record field per
+     extern function declaration of the unit, `InstanceScope::fn_externs`,
+     filled at startup like a signal binding), so a call into another instance
+     names a function and never a record. A virtual call cannot name it, so a
+     vtable entry of an instance's method is a root thunk of the same signature
+     that does, and a `$strobe` / reactive body, a fork child, an exported
+     subroutine and the `$monitor` body (`rt_monitor_set` takes it with the
+     ramp) carry theirs. A subroutine that stages a nonblocking write registers its
+     blocks like a group: the first block id is a record field at the subroutine's
+     ordinal in its unit, and the instances that share it register the same blocks
+     for their own signals (a signal of another instance through the binding that
+     names it).
+
+     The functions and tasks of a unit are lowered once too, into the unit's
+     module (`lower_subroutines`, ir/llvm/Families.cpp). The ones of the
+     instances of a unit that lower alike are a family: the first to be lowered
+     is its function, and the others are that function, each called with its
+     own instance's record. What decides a family is its key
+     (`subroutine_key`): the unit and the function's ordinal in it
+     (`InstanceScope::fn_locals`), the code key of the instance (above, and
+     which function bindings alias), what the design says of the function
+     rather than of its body (the home region its parks answer to, the random
+     stream it owns, the program a `$exit` in it ends), and the functions it
+     calls as declared, each with whether it may finish. Callers are lowered
+     after their callees (the order of the call graph's strongly connected
+     components), so a key names its callees as they were settled: instances
+     whose calls land in one function match, instances whose callee was lowered
+     apart do not. A cycle of subroutines (a strongly connected component of the
+     call graph) is one family: its key is its members' keys in the unit's order,
+     each naming the members it calls by their place in the cycle, and the cycle is
+     lowered once, all of it or none (a taint in any member keeps every member
+     per instance); a cycle with a member of another instance is not shared. A group's key
+     names the functions its processes call the same way (`group_key`), which
+     is what lets a group that calls a function of its instance, or of the
+     instance a binding names, share like any other; a call of a function that
+     stayed one instance's own taints the group. A function that is not
+     shared is lowered as it was, into its unit's module like every other, and
+     `--stat=unit-code` counts the subroutines of multi-instance units, the
+     functions emitted for them and what kept each per instance: a
+     disable target or covergroup of another instance, a call of such a
+     subroutine. The instance a process, a control block, a random
+     stream or a `$exit` names is a record field (process indices, the program
+     instance) read by the instance's own code, so none of them splits a family; a
+     `$exit`'s relation to the subroutine's own instance is in its key. Measured:
+     rocket-chip has no function or task in a multi-instance unit (0 of 0; its
+     1021 groups of multi-instance units are as many functions as before), so
+     the suite's twin designs are what covers shared subroutines; the perf
+     corpus runs the same instructions as before, picorv32 1.2% fewer, since
+     its testbench's tasks now sit in the module of the code that calls them
+     and LLVM inlines them there.
+
+     An event object is instance data reached through its variable: a declared
+     event powers on holding the handle of its own object (a slot of
+     `clotho.events`, numbered design-wide in signal order, handles being
+     design-wide), so code reads the slot from the variable's storage -- the
+     instance's own through its record, an event port's through its binding --
+     and indexes `clotho.events` with it, as it already did for an event that is
+     reassigned. A variable no store reaches (`event_mono_`) is the declared
+     object for the whole run, which is what lets waits link without reading the
+     handle a second time and unlink without recording the owner; the fact is
+     joined over a unit's instances, and over what each instance binds an event
+     port to, since the code is shared. The object's VCD index is a field of the
+     object and a trigger id of an event is its slot, so neither is code. The
+     dump of a reassigned event names its declared object by number, and so does
+     every other `$dumpvars` registration: `$dumpvars` in a body is a call of one
+     function of root (`vcd_register_fn`) that walks the design's scope tree, the
+     link glue that owns the design-wide numbering, so no unit's code names a
+     dumped signal of any instance. An event of no instance (a package's) is one
+     object for everyone and keeps its constant address.
+
+     The taint list is a claim that the lowering of one instance is the lowering
+     of all, and the frontend's equivalent (partition merging) compares, so the
+     backend is checked too: `SimulationConfig::verify_shared_code`, on with
+     `CLOTHO_EXTRA_ASSERTS` (Debug builds and CI; the suite's build passes it,
+     so the whole suite runs through it) and off otherwise,
+     lowers every group, function and task again for each instance that shares
+     it, into a scratch module (a subroutine into a declaration of its own),
+     and compares it with the shared code. What is compared is
+     the printed code with the function's name, the names and contents of
+     private constants, the names and bodies of struct types and the numbering
+     of attribute groups normalized (`CodeText`, ir/llvm/CodeText.h), and for a
+     group the NBA blocks and the record fills the sharing instance gets
+     against the ones its own lowering registers. A difference, or an own
+     lowering that taints, fails the build and names the unit, the group or
+     subroutine, both instances and the first line that differs; the emitted
+     modules are the same with the check on and off. A difference is a bake the
+     taint list missed: move the fact into the instance record, or taint the
+     lowering if it is genuinely per-instance (and, for a subroutine, a fact
+     of how the design uses it belongs in its key).
+     It found one miss: `$finish` emptied the active ring only when an earlier
+     body had already made it, so two instances lowered either side of that
+     body were different code (and a `$finish` in a function, lowered before
+     any body, left what it had woken running). `--stat=unit-code` reports how
+     many groups and subroutines were checked and what it cost.
+     The check only sees a unit with two instances in the design being compiled, so
+     it missed a queue named by monitor number until a test happened to instantiate
+     an `expect`'s module twice. Twin mode (docs/VERIFICATION.md, `set_twin_check` in
+     src/Lower.h) removes the dependence on the designs' own instance counts: with
+     the check built in, every design the suite lowers is lowered again with each
+     top instantiated twice and checked (`ir::check_shared_code`, no codegen). It
+     found a second miss: the dereference guard of a `ref` formal that a forwarded
+     string store (`s = {s, "x"}`) resolves in the body's prologue named the
+     instruction an earlier body left in `cur_inst_`, a different site in each
+     lowering of one body. Lowerings that would bake an instance's number now taint
+     instead of falling back to it (a design-wide id, a dump-var index, the
+     deferred-assertion counter of another instance), and a verifying lowering that
+     makes a global in root, which the lowering it checks did not, is a difference.
+   - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
+     capacity from the record, a subscription carries its trigger bits, the
+     ring mask is a root constant (`clotho.ring_mask`) a unit loads, NBA and
+     trigger ids are record base plus unit-local ordinal, and block commit
+     functions live in the writer's unit (see 3e). Facts other units impose (a
+     signal is waited on, forced, may carry z) stay joined per unit and part of
+     its codegen key until step 4. Landed so far: an owner's scan reads its
+     buckets' subscriber count and trigger bits from the record, and trigger
+     colours (design-global, first-fit) are data wherever unit code needs them,
+     never an immediate: a guarded group's member and group masks are record
+     fields filled at startup, a writer of another instance's signal reads that
+     instance's record, and a signal of no instance has a trigger global per
+     bucket. What a park or self-start stores into the scheduled flag is every
+     trigger bit whether or not the design guards a group, so no unit's code
+     depends on that.
+  - **3e, root as link glue (landed).** Landed: one LLVM module per
+    Design unit, named by the unit's key (`InstanceScope::unit_key`: the
+    definition name, plus a body hash when several units share it) and holding
+    only that unit's code under unit-key symbols; instance storage, records,
+    dispatchers, the shared queues and the wheel's trampolines are defined in
+    root whichever unit asked first; the entry of a one-row schedule group is
+    unit code handed the address of its process's wake pair (a field of the
+    instance's record) and finding the record at a constant offset from it; a
+    unit's declarations of root globals carry no size. Gate
+    (tests/modular_gate_test.cpp, `ir::emit_llvm_modules`, `clotho build --emit
+    llvm-units`): compiling a design of several modules with several instances
+    each, and a package, twice with one definition's body edited changes that
+    unit's module and no other unit's; every unit module names no instance.
+    NBA block commit functions are unit code too. The lowering of a group or a
+    subroutine emits, when it is done, one `void(desc)` function per block it
+    registered, in the module the body went into, named from the body's
+    function (`<unit>.p3.nba0`): it commits the shadows of the block's targets
+    into the live state of the writer's instance and services their wake
+    buckets and dump-var indices through the record exactly as a blocking store
+    does (`service_wait_queue`, `vcd_touch_signal`), a target of another
+    instance through the binding the writer reaches it by. `desc` is the
+    block's entry in root's `clotho.nba_blocks`, `{ commit function, the
+    writer's record, next pending block }` by block id, which also links the
+    pending chain: `clotho.nba_block_enqueue(i32)` pushes a descriptor and each
+    commit function tail-calls the next one's. The instances that share a
+    group's code share its commit functions, each block with a descriptor of
+    its own, and `verify_shared_code` compares the commit functions' code too.
+    The instance records are initializers of their globals
+    (`fill_instance_records`, ir/llvm/RootTables.cpp): every field of one is a
+    link-time constant (the addresses of the instance's storage, the ports' wake
+    buckets and ids, the bindings, the entry of each thunk group's wake pair), so
+    `clotho_main` holds no code per instance and a record costs data only.
+    The rest of root's per-instance work is tables behind one loop each
+    (ir/llvm/RootTables.cpp, Vcd.cpp). The groups that run once (PreInit,
+    Preponed, Observed, Re-NBA, Final) are rows `{ ramp, first argument }` of a
+    table walked by `clotho.run_once`. The seed is `clotho.seed`: a row per schedule
+    group `{ ramp, first argument, wake word, kind, subscriptions }` (kind: set the
+    wake word, which ring it is queued on, queued late, continuous home tag), the
+    handle array, the list of the slot each bucket subscription fills (row after
+    row), the always_comb rows queued last and the persistent event waiters
+    (node, object or the address of the variable's handle) in link order. The
+    tables are built in the order the straight-line code was emitted in, so ring
+    contents, bucket slots, event waiter order and region homes are unchanged. The
+    dump registration is a table of scope / upscope / `$var` / array rows behind
+    `clotho.vcd.register`. Measured on rocket-chip (558 instances, 266 units): root's
+    text 116.1 MB / 662k instructions (`sim_drain` 420k, `clotho_main` 242k) became
+    48.3 MB / 21.7k (`sim_drain` 18.2k, `clotho_main` 3.4k, `clotho.seed` 73); the
+    gate test checks that the size of root's functions does not depend on the
+    instance count. What is still code of root that grows with the design: the
+    dispatcher of a schedule group of several rows (a call per row), the whole-signal
+    commits of deferred writes through a runtime index (`emit_nba_commit`: array,
+    aggregate, handle, string, intra-assignment; 431 of them are the 18k
+    instructions of `sim_drain`), the power-on loops of memories and strings
+    (`init_state`), their teardown, and one `gc_roots_add` call per region with class
+    handles. Flatten still copies bodies per instance.
+
+    Inbound facts that still reach unit modules (step 4 replaces them with
+    summaries): the design-wide feature flags that gate or reshape unit code and
+    every record -- process control (`design_uses_process_`, `design_uses_disable_`,
+    so claimable parks, ring guards and the `n_proc` fields), the reactive region set
+    and its continuous ring (`design_uses_reactive_`, `_reactive_cont_`: wake tags),
+    the VCD dump (`design_uses_vcd_`: touches in every writer and a port field),
+    the process-home argument, `may_finish_`, nonblocking event triggers and
+    detached events, deferred assertions (`any_defer_`), guarded groups
+    (`any_guarded_`: mask fields), a program `initial` (`n_prog`) -- and the facts
+    other units impose on a signal (its set of waiters, may-z, forced, event
+    monomorphism, trigger colours). What still makes a unit module depend on outside
+    it: lowerings the taint list keeps per instance (they name `clotho.inst.<hier>.*`
+    globals) and the intern pool's type and class numbers (step 5).
+
+    What the entry costs at tier 0. A root trampoline per instance (`lea
+    ctx,%rdi; jmp entry`) and an entry that spilled the record's addresses and
+    reloaded them per block made a thunk activation of `thunk_comb` 26
+    instructions where the absolute-addressing thunk is 19 (+6.3% of the run,
+    callgrind: the whole difference was in the 256 per-process thunks). Handing
+    the entry the wake pair removes the trampoline, putting the state base at a
+    fixed offset off the pair takes the record's own address out of every
+    access (the record leads with the fields a body reads least), and
+    RematAddressPass (backend, last in the tier-0 pipeline) gives each basic
+    block its own copy of a constant-index GEP so FastISel folds it into the
+    access instead of spilling the address across blocks. What is left over the
+    absolute form is the entry's incoming pointer, spilled and reloaded once
+    (21 instructions, +1.8% on thunk_comb); a record-relative body cannot be
+    cheaper at tier 0.
 4. **Summaries and the link step** replace the whole-design `analyze()`.
 5. **Caches and parallelism.** Per-unit intern pools (cross-unit types match by
    structure, nominal types by unit and name), content keys, an object cache,
@@ -368,8 +705,8 @@ Each of these makes lowered IR depend on something outside the unit:
   scope; a declaration initializer reads it like any other body), hidden
   temporaries are numbered per name prefix, and assertion state is named by an
   instance-relative ordinal. `inst_path` is a borrowed string, a read-only
-  handle over constant bytes today (a record field later), so evaluating it
-  takes no temporary and no init or release, and a severity report or a
+  handle over constant bytes whose address is a field of the instance's record,
+  so evaluating it takes no temporary and no init or release, and a severity report or a
   covergroup name keeps it apart from the text around it (`SeverityInfo`:
   banner, path, tail; `CoverInfo::text`) for the runtime to join when the line
   is issued or the name is made, so a report that does not fire costs its body

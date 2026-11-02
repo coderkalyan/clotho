@@ -819,8 +819,8 @@ struct SignalSlot {
     // Nonblocking-assignment staging. Set only for signals that are NBA targets.
     // A target gets shadow `i(2W)` / `iW` fields mirroring its live slot in the
     // root's shadow struct; a target with any dynamic (runtime-indexed) select site
-    // also gets an iW dirty mask field. nba_id is a dense index into the meta table;
-    // the sh_* members are field indices into the shadow struct.
+    // also gets an iW dirty mask field. The sh_* members are field indices into the
+    // shadow struct.
     bool     nba           = false;
     bool     nba_partial   = false;
     // Any bit/part-select NBA site with a runtime index/offset (BitSelect /
@@ -863,10 +863,15 @@ struct SignalSlot {
     // that, each record holds the dense ids IT registered on, so the first trigger
     // to mature it can take it off the others (rt_intra_event_register_group).
     uint32_t intra_trigs   = 0;
-    uint32_t nba_id        = 0;
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
     uint32_t sh_mask_field = 0;
+    // The signal's fields of the block shadow are contiguous in its instance's
+    // shadow struct: `sh_count` of them from `sh_first` (a scalar's mm plane, then
+    // its z plane and its dirty mask as it has them; an aggregate target's leaves'
+    // planes in order). 0 for a signal that stages nothing there.
+    uint32_t sh_first = 0;
+    uint32_t sh_count = 0;
     // A string (or array-of-string) signal: the slot is an opaque rt_string
     // handle (`clotho.string`), has_z is false, and `nba` is never set (the
     // frontend rejects nonblocking assignment to strings).
@@ -924,16 +929,88 @@ struct SignalSlot {
     bool vif_rec = false;
 };
 
+// The design-wide id spaces a signal can have an id in, each dense over the
+// design: a runtime NBA buffer (arrays, aggregates, containers, strings), the
+// intra-assignment record pools, and the `<= @e` triggers of each edge. A
+// signal's ids sit in its instance's record, so the code that uses one names
+// no number.
+enum class IdFamily : uint32_t { Arr, Agg, Handle, Str, Intra, TrigPos, TrigNeg, TrigAny };
+inline constexpr uint32_t kIdFamilies = 8;
+inline constexpr uint32_t no_id       = ~0u;
+
+// A signal's port: everything the code that WRITES the signal needs of the
+// signal's instance, kept in a struct of the signal's own, whose elements are a
+// function of the signal's facts alone (which wake buckets it has, which ids,
+// whether it is dumped, how many shadow fields): the signal's wake buckets (the
+// base of each static and dynamic one, a static one's subscriber count and
+// trigger bits, a dynamic one's length cell and capacity), its ids in the
+// design-wide id spaces, its dump-var index, the address of each of its shadow
+// fields and of the heads of its virtual-interface waiter lists. The instance's
+// record holds one port per signal that has any
+// of these, and a binding of another unit's signal holds that port's address, so
+// code that writes a signal of another instance reads its port and names
+// nothing of the owner's record layout: what the owner's unit gains elsewhere
+// (a process, an event, a covergroup, another signal) moves the port inside the
+// record and no one else's code.
+inline constexpr uint32_t no_port_elem = ~0u;
+struct PortLayout {
+    static constexpr std::array<uint32_t, kIdFamilies> none_ids = { no_port_elem, no_port_elem, no_port_elem, no_port_elem,
+                                                                    no_port_elem, no_port_elem, no_port_elem, no_port_elem };
+    // The struct, or null when nothing of the signal is reached from outside.
+    llvm::StructType* ty = nullptr;
+    // Element of each id family's i32.
+    std::array<uint32_t, kIdFamilies> id = none_ids;
+    // Element of the absolute dump-var index (i32) of a dumped signal.
+    uint32_t vcd = no_port_elem;
+    // Element of the first of `n_shadow` shadow slot addresses (ptr), one per
+    // field of the signal's shadow group (SignalSlot::sh_first + k).
+    uint32_t shadow   = no_port_elem;
+    uint32_t n_shadow = 0;
+    // Per edge (Edge::Any, Positive, Negative): a static bucket's base (ptr),
+    // trigger bits (i64) and subscriber count (i32); a dynamic bucket's base and
+    // length cell (ptr) and capacity (i32). no_port_elem for a bucket it lacks.
+    struct Static {
+        uint32_t base = no_port_elem;
+        uint32_t trig = no_port_elem;
+        uint32_t cap  = no_port_elem;
+    };
+    struct Dynamic {
+        uint32_t base = no_port_elem;
+        uint32_t len  = no_port_elem;
+        uint32_t cap  = no_port_elem;
+    };
+    std::array<Static, 3>  sta;
+    std::array<Dynamic, 3> dyn;
+    // Per edge, the element holding the address of the waiter-list head that
+    // `@(edge vif.sig)` waiters through a virtual interface park on.
+    std::array<uint32_t, 3> vif = { no_port_elem, no_port_elem, no_port_elem };
+};
+
+// The fixed leading fields of an instance record (Anchor, "Instance context");
+// every field after them is addressed through its Anchor::ctx_*_base. The first
+// is the one a body reads least: a group's entry is handed the address of its
+// wake pair and reaches the record at a constant offset from it, so a field
+// at offset 0 would be a use of the record's own address, a value tier-0 code
+// generation computes once and spills where it folds every other access into
+// the pair-relative displacement.
+inline constexpr uint32_t kCtxFirstVcd = 0;
+inline constexpr uint32_t kCtxShadow   = 1;
+inline constexpr uint32_t kCtxState    = 2;
+inline constexpr uint32_t kCtxFixed    = 3;
+
+// Where the parked handles of an `expect` queue start (Backend::expect_queue_ty).
+inline constexpr uint64_t kExpectHandlesOffset = 8;
+
 // One instance-scope occurrence: the addressing anchor for every signal the
 // scope declares. Each scope owns its own state global
 // (@clotho.inst.<hier>.state, own signals only — children own theirs), so a
 // signal access is `scope global + def-local offset`: a real symbol plus a
 // def-content-derived addend, the relocation shape per-definition compilation
 // units and object caching need. A definition's code never embeds
-// whole-design layout. Unique-definition instances bake the symbol directly
-// (link-time constant, free at run time); a scope of a reused definition
-// loads a base pointer main stores at startup when the body is shareable
-// (one shared body cannot bake N instance symbols).
+// whole-design layout. An instance's own single-scope groups address through
+// its instance context, whatever the instance count of its unit, so a unit's
+// code does not depend on how many times it is instantiated
+// (docs/design/modular-compilation.md, "Code generation").
 struct Anchor {
     // The scope's own state global (@clotho.inst.<hier>.state), created by
     // emit_state_global.
@@ -942,18 +1019,11 @@ struct Anchor {
     llvm::StructType* ty = nullptr;
     // Hierarchical instance name (diagnostic / symbol naming).
     std::string name;
-    // True when the scope's definition state type is instantiated more than
-    // once: def-relative code addresses through the instance context.
-    bool indirect = false;
     // Lowest process index owned by this scope (~0 when it owns none).
     uint32_t first_proc = ~0u;
-    // This scope's own scheduled-flag array (@clotho.inst.<hier>.sched,
-    // [n_own x i32]) and its type; null when the scope owns no processes. An
-    // owned group's flag is `sched_gv + def-local dense ordinal` — a real
-    // symbol plus a def-content addend (relocatable), or ctx field 2 + the
-    // same ordinal in a shareable reused-definition body.
-    llvm::GlobalVariable* sched_gv = nullptr;
-    llvm::ArrayType*      sched_ty = nullptr;
+    // How many processes the scope owns; each has a wake pair in the record
+    // (ctx_sched_base), at its dense def-local ordinal.
+    uint32_t n_owned = 0;
     // This scope's NBA shadow: the per-def staging struct type (null when
     // the scope has no NBA shadow fields), its own global
     // (@clotho.inst.<hier>.shadow), and the opaque base-pointer global
@@ -970,27 +1040,149 @@ struct Anchor {
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
 
-    // Instance context (reused definitions): ONE per-instance global
-    // (@clotho.inst.<hier>.ctx) holding every base a def-relative body needs,
-    // laid out per definition so twin instances load identical field
-    // constants — the single symbol a shared body later swaps for a
-    // parameter. Filled by main at startup. Layout:
-    //   0             ptr  state base (the scope's storage)
+    // Instance context: ONE per-instance record (@clotho.inst.<hier>.ctx)
+    // holding every base a def-relative body needs, laid out per definition so
+    // twin instances load identical field constants. It is the record a thunk
+    // group's function takes as its first parameter. Filled by main at startup.
+    // Layout:
+    //   0             i32  first_vcd
     //   1             ptr  shadow sub-struct base (null when no NBA shadows)
-    //   2             ptr  the scope's sched-flag array base (Anchor::sched_gv)
-    //   3             i32  first_vcd
-    //   ctx_blk_base  i32  first NBA block id, one per def-local single-scope
-    //                      group ordinal (0 when the group registers none)
-    //   ctx_wait_base ptr  wait bucket bases (sta / dyn / dyn-len), def-local
-    //                      slot order from the bucket walk
-    // ctx_ty is shared across instances of one definition; the global is
+    //   2             ptr  state base (the scope's storage)
+    //   ctx_blk_base  i32  first NBA block id, one per process the instance
+    //                      owns, at its def-local process ordinal: a group's
+    //                      field is its front process's
+    //                      (0 when the function registers none)
+    //   ctx_sched_base [n x { i64, ptr }] one wake pair per owned process, at its
+    //                      def-local ordinal (a group's is its front process's):
+    //                      the wake word (the scheduled flag and the trigger
+    //                      bits) and the entry a thunk handle runs. A thunk
+    //                      group's handle is the address of its pair, so the
+    //                      entry is handed the pair and finds the record, and
+    //                      its own wake word, at constant offsets from it
+    //   ctx_port_base PortLayout::ty  one port per signal of the definition that
+    //                      has anything for a writer (see PortLayout), in the
+    //                      definition's signal order and the same for every unit
+    //                      of one state type (a virtual interface names a member by
+    //                      its representative's field): wake bucket bases, counts
+    //                      and trigger bits, ids, dump-var index, shadow addresses
+    //   ctx_mmask_base i64 one per owned process, at its def-local ordinal: the
+    //                      trigger bits of the process's own events, which its
+    //                      member guard tests (0 unless it is a member of a
+    //                      guarded group; absent when the design has none)
+    //   ctx_gmask_base i64 same indexing: for the front process of a guarded
+    //                      group, the union of its members' bits, which the
+    //                      group's fail-safe tests
+    //   ctx_bind_base ptr  three per binding (see n_bind): the address of an
+    //                      imported signal's storage, the record of the instance
+    //                      that owns it and the address of its port in that record
+    //                      (null for a signal of no instance, or with no port)
+    //   ctx_fbind_base ptr one per function binding (see n_fbind): the record
+    //                      of the instance that owns an imported function
+    //                      (null for a function of none)
+    // A writer in the instance's own code reads a bucket's base, count and
+    // trigger bits from its port, and a guarded group its masks, so none of them
+    // is baked into unit code: the buckets depend on who subscribes and the bits
+    // on the design-global colours (compute_trigger_masks), which are other
+    // units' business. A writer of another unit's signal reads the signal's port
+    // through its binding, never at an offset of the owner's record.
+    // ctx_ty is shared across instances of one unit; the global is
     // created lazily by the first def-relative use.
-    llvm::StructType*     ctx_ty        = nullptr;
-    llvm::GlobalVariable* ctx_gv        = nullptr;
-    uint32_t              ctx_blk_base  = 0;
-    uint32_t              ctx_wait_base = 0;
-    // Def-local single-scope group count (sizes the blk fields).
-    uint32_t n_groups = 0;
+    llvm::StructType*     ctx_ty         = nullptr;
+    llvm::GlobalVariable* ctx_gv         = nullptr;
+    uint32_t              ctx_blk_base   = 0;
+    uint32_t              ctx_sched_base = 0;
+    uint32_t              ctx_port_base  = 0;
+    uint32_t              ctx_mmask_base = 0;
+    uint32_t              ctx_gmask_base = 0;
+    // Def-local count of owned processes (sizes the blk fields), the length of
+    // each mask array (the same, or 0 when no group of the design is guarded) and
+    // the number of ports of the definition.
+    uint32_t n_blk  = 0;
+    uint32_t n_mask = 0;
+    uint32_t n_port = 0;
+    // Bindings: one per extern signal declaration of the unit that names an
+    // instance's storage (InstanceScope::externs), in the unit's order, three
+    // record fields each at ctx_bind_base + 3 * ordinal -- the address of the
+    // imported signal's storage, the record of the instance that owns it and the
+    // address of the signal's port in that record (null for a signal of no
+    // instance) -- so every instance of a unit has the same layout whatever its
+    // imports resolve to. `externs` is the flat signal each is bound to in THIS
+    // instance; bind_of is its inverse, which names a flat signal's binding while
+    // the code of this instance is lowered.
+    uint32_t ctx_bind_base = 0;
+    // Function bindings: one per extern function declaration of the unit
+    // (InstanceScope::fn_externs), in the unit's order, one record field each at
+    // ctx_fbind_base + ordinal: the record of the instance that owns the
+    // function, which a call passes as the callee's first argument, so a unit's
+    // code names the function and never the instance it runs on. `fn_externs`
+    // is the flat function each is bound to in THIS instance; fn_bind_of is its
+    // inverse (the first declaration of a function stands for all that name it),
+    // which names a function's binding while the code of this instance is
+    // lowered.
+    uint32_t                                         ctx_fbind_base = 0;
+    uint32_t                                         n_fbind        = 0;
+    std::vector<FunctionId>                          fn_externs;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> fn_bind_of;
+    // The functions the instance defines, in the unit's order (InstanceScope::
+    // fn_locals): a function's position is its ordinal in the unit.
+    std::vector<FunctionId> fn_locals;
+    // Which function bindings the lowered code of this instance reads (only
+    // those are filled).
+    std::vector<uint8_t> fbind_used;
+    // The instance's hierarchical name (`%m`): one ptr field at ctx_name_base, the
+    // address of the borrowed string handle of its path (Backend::inst_path_global),
+    // filled at startup, so code of the unit reads its instance's name and bakes
+    // none. It follows the bindings; later fields append after it.
+    uint32_t ctx_name_base = 0;
+    // Deferred-assertion generation counters (LRM 16.4.2): one i64 per owned
+    // process at ctx_defer_base + its def-local ordinal (that of the front process
+    // of a group), n_defer of them (n_blk when the design has a deferred
+    // assertion, else 0). The counter is the field itself: a group bumps it at
+    // each activation and tags its queued reports with it, so no counter is named
+    // by unit code.
+    uint32_t ctx_defer_base = 0;
+    uint32_t n_defer        = 0;
+    // Process identity: one i32 per owned process at ctx_proc_base + its def-local
+    // ordinal, the process's design-wide index (n_proc of them: n_blk when the
+    // design has control blocks or a per-process random stream, else 0). Code
+    // that needs a thread's control block or seeds its random stream reads the
+    // index here, so it names no process of the instance it was lowered for.
+    uint32_t ctx_proc_base = 0;
+    uint32_t n_proc        = 0;
+    // The program instance (LRM 24.3) of the instance's program `initial`s: one i32
+    // at ctx_prog_base, its index among the design's program instances, when the
+    // design has a program `initial` (n_prog 1, else 0).
+    uint32_t ctx_prog_base = 0;
+    uint32_t n_prog        = 0;
+    // The `disable` targets and covergroup types the instance declares (the unit's
+    // own, in its order: InstanceScope::disable_locals / cover_locals) and their
+    // flat ids, one i32 field each at ctx_dis_base / ctx_cov_base + ordinal, so code
+    // of the unit names a target or type by position and the id is data.
+    std::vector<uint32_t> disable_locals;
+    std::vector<uint32_t> cover_locals;
+    uint32_t              ctx_dis_base = 0;
+    uint32_t              ctx_cov_base = 0;
+    // The first NBA block id of each subroutine the instance defines, one i32 at
+    // ctx_subblk_base + the subroutine's ordinal in its unit (fn_locals), like a
+    // group's at its process ordinal (ctx_blk_base).
+    uint32_t              ctx_subblk_base = 0;
+    // The `expect`s the instance's unit declares (the flat monitors of its range
+    // whose kind is Expect, in the unit's order) and the address of each one's
+    // waiter queue, one ptr field at ctx_expect_base + ordinal, so the wait and
+    // the wake of an `expect`, both code of the unit, name no monitor of the design.
+    std::vector<uint32_t> expect_locals;
+    uint32_t              ctx_expect_base = 0;
+    uint32_t n_bind        = 0;
+    std::vector<Signal> externs;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
+    // Which bindings the lowered code of this instance reads (only those are
+    // filled).
+    std::vector<uint8_t> bind_used;
+    // The Design unit the scope expands (InstanceScope::unit).
+    uint32_t unit = InstanceScope::no_unit;
+    // InstanceScope::unit_key: the name of the unit's module and of its code's
+    // symbols. Empty for a scope built without a unit.
+    std::string unit_key;
 };
 
 // One function-frame local: its slot type and width / domain. A 2-state local is
@@ -1029,23 +1221,30 @@ struct FrameSlot {
     bool is_ref = false;
 };
 
-// A `ref` formal's fat pointer, as bound from the callee's parameters
-// (docs/design/data-model.md §3). `slot` aliases the actual's storage — a plane
-// slot, a managed handle, or an aggregate image. `epochs` addresses the relocation
-// epoch of each container the actual was nested inside, OUTERMOST FIRST, paired
-// with that epoch's value at the call in `expects`; an unused level (a call site
-// bound shallower than the formal's declared depth) passes the
-// `clotho.ref.noepoch` zero word, which never compares stale. Every dereference
-// re-checks the pairs in order and reports through `site`; the order is what makes
-// a nested witness safe to read, since level n's epoch lives in level n-1's buffer.
+// What a call passes for a `ref` actual (docs/design/data-model.md §3). `slot`
+// aliases the actual's storage — a plane slot, a managed handle, or an aggregate
+// image. `epochs` addresses the relocation epoch of each container the actual was
+// nested inside, OUTERMOST FIRST, paired with that epoch's value at the call in
+// `expects`; a place that cannot move has none.
+struct RefActual {
+    llvm::Value*              slot = nullptr;
+    std::vector<llvm::Value*> epochs;
+    std::vector<llvm::Value*> expects;
+};
+
+// A `ref` formal as bound from the callee's parameters. `slot` is the aliased
+// storage; `chain` is null for a place that cannot move, else the array of
+// (&epoch, expected epoch) pairs the caller built, outermost first and ended by a
+// null epoch. Every dereference re-checks the pairs in order and reports through
+// a site of its own; the order is what makes a nested witness safe to read, since
+// level n's epoch lives in level n-1's buffer.
 //
 // `formal` is the callee's own name for the binding, used to build the
 // per-dereference site record a staleness report prints (§3.3).
 struct RefBinding {
-    llvm::Value*              slot = nullptr;
-    std::vector<llvm::Value*> epochs;
-    std::vector<llvm::Value*> expects;
-    std::string               formal;
+    llvm::Value* slot  = nullptr;
+    llvm::Value* chain = nullptr;
+    std::string  formal;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level and
@@ -1097,13 +1296,8 @@ struct ModuleEnv {
     // Writable images of an aggregate type that an out-of-range aggregate `ref` / `out`
     // actual is bound to, keyed by the type Ref (agg_sink_global).
     ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> agg_sinks;
-    // The shared zero word a `ref` through a stable place aims its epoch at
-    // (no_epoch_global).
-    llvm::GlobalVariable* no_epoch = nullptr;
-    // The borrowed string handle of each instance's path, keyed by the instance's
-    // anchor index (inst_path_handle). Per module like the other internal constants:
-    // every unit module that reads an instance's path holds its own.
-    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> inst_paths;
+    // (the borrowed string handle of an instance's path is a global of root, one per
+    // anchor: Backend::inst_path_global; the record holds its address.)
 };
 
 // Builds the shared state struct and lowers every process. One instance per
@@ -1133,7 +1327,18 @@ public:
 
     uint64_t member_mask(uint32_t g, size_t i) const;
 
+    // Constant pointer to a field of process k's wake pair: 0 the wake word
+    // (what sched_flag_ptr returns), 1 the entry its thunk handle runs.
+    llvm::Constant* sched_wake_ptr(uint32_t k, uint32_t member);
+
     llvm::Constant* sched_flag_ptr(uint32_t k);
+
+    // The `{ i64 wake word, ptr entry }` pair of one process.
+    llvm::StructType* wake_ty();
+
+    // Byte offset of the wake pair of owned process `ord` inside its instance's
+    // record: what a group's entry subtracts from the pair it is handed.
+    uint64_t wake_offset(const Anchor& a, uint32_t ord);
 
 private:
     // -- Cross-unit symbol references --
@@ -1141,21 +1346,57 @@ private:
     llvm::Function* sym(llvm::Function* f);
     llvm::GlobalVariable* sym(llvm::GlobalVariable* g);
 
-    bool unit_emission() const;
-
-    llvm::Value* abs_id_const(const std::string& key, uint32_t value, uint32_t addend);
-
-    bool abs_id_eligible(const SignalSlot& s) const;
+    // A design-numbering id the code being lowered uses (a runtime buffer index
+    // or a trigger id), as an IR value: the field of the record of the instance
+    // that owns `sig` -- the own instance's, or the one a binding or an installed
+    // context names -- and an immediate where no record describes the signal
+    // (code outside a group, a signal of no instance).
+    llvm::Value* id_value(Signal sig, IdFamily family, uint32_t id);
 
     llvm::Value* arr_id_value(Signal sig);
 
     llvm::Value* agg_id_value(Signal sig);
 
+    llvm::Value* handle_id_value(Signal sig);
+
+    llvm::Value* str_id_value(Signal sig);
+
     llvm::Value* intra_id_value(Signal sig);
 
     llvm::Value* trigger_id_value(Signal sig, uint32_t edge);
 
+    // Join which id families each signal has over the signals at one position of
+    // a state type, and record each id's value for the fill (build_ports,
+    // build_instance_ctx_layout).
+    void assign_id_fields();
+
     ModuleEnv& unit_env(const Anchor& a);
+
+    // Makes root the active module for its scope: what is created for every unit
+    // to share (a singleton global, a trampoline) is defined in root whichever
+    // unit's code asked for it first, and its body refers to symbols as root's.
+    class InRoot {
+    public:
+        explicit InRoot(Backend& b)
+          : b_(b)
+          , saved_(b.env_) {
+            b.env_ = b.root_env_.get();
+        }
+        ~InRoot() {
+            b_.env_ = saved_;
+        }
+        InRoot(const InRoot&)            = delete;
+        InRoot& operator=(const InRoot&) = delete;
+
+    private:
+        Backend&   b_;
+        ModuleEnv* saved_;
+    };
+
+    // What names the code of the instance of `a` in its unit's module: the
+    // unit's key, or the instance's own name for a scope built without a unit,
+    // which is a unit of its own.
+    std::string unit_symbol(const Anchor& a) const;
 
     // -- LLVM type helpers --
 
@@ -1516,6 +1757,10 @@ private:
 
     void scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier);
 
+    void collect_unit_twins();
+
+    void join_twin_slots();
+
     void compute_vif_reachable();
 
     void collect_vif_nba();
@@ -1556,6 +1801,50 @@ private:
 
     llvm::Value* storage_ptr(const SignalSlot& s);
 
+    // The binding (an index into the own anchor's externs) through which the
+    // code being lowered reaches `s`, or no_bind when it addresses `s` directly:
+    // a signal of the own instance, one an installed instance context supplies,
+    // and every access outside a group of an instance. Marks the binding used.
+    static constexpr uint32_t no_bind = ~0u;
+    uint32_t                  binding_of(const SignalSlot& s);
+
+    // One field of the own instance's record, whatever instance context is
+    // installed for another instance's signals.
+    llvm::Value* own_field(uint32_t field, llvm::Type* ty);
+
+    // The constant address of a signal's storage, as a binding is filled with.
+    llvm::Constant* storage_address(const SignalSlot& s);
+
+    // The constant address of `s`'s port in its owner's record, as a binding is
+    // filled with. `s` must have a port and an owner instance.
+    llvm::Constant* port_address(const SignalSlot& s);
+
+    // The record of the instance that owns `s` when the code reaches it through a
+    // binding, else null (the signal is addressed directly, or belongs to no
+    // instance). Nothing but the record a deferred write saves (record_ptr)
+    // reads it: a writer finds what it needs of `s` in its port.
+    llvm::Value* bound_record(const SignalSlot& s);
+
+    // The address of `s`'s port when the code reaches it through a binding, else
+    // null.
+    llvm::Value* bound_port(const SignalSlot& s);
+
+    // `s`'s port layout, or null when nothing of it is reached from outside.
+    const PortLayout* port_of(const SignalSlot& s) const;
+
+    // Whether the body being lowered reaches `s`'s port: through the own record,
+    // an installed instance context, or a binding.
+    bool port_reachable(const SignalSlot& s);
+
+    // The address of element `elem` of `s`'s port, wherever the body reaches it
+    // (the own record, an installed instance context, a binding, or -- outside
+    // any instance's code -- the owner's record global).
+    llvm::Value* port_elem_ptr(const SignalSlot& s, uint32_t elem);
+
+    // Lay out each definition's ports (see PortLayout) and give every signal its
+    // port and the record field that holds it.
+    void build_ports();
+
     llvm::Value* vif_head_ptr(Signal sig, uint32_t edge);
 
     bool def_relative_for(const SignalSlot& owner) const;
@@ -1569,6 +1858,15 @@ private:
     llvm::GlobalVariable* ensure_ctx(Anchor& a);
 
     llvm::Value* ctx_field(Anchor& a, uint32_t field, llvm::Type* ty);
+
+    // The address of a field of the instance record ctx_field reads.
+    llvm::Value* ctx_field_ptr(Anchor& a, uint32_t field);
+
+    // The record of the instance a store to `s` lands in (see record_ptr).
+    llvm::Value* record_ptr(const SignalSlot& s, llvm::Value* vif_ctx);
+
+    // The anchor of the instance scope that owns process `p`, or no_anchor.
+    uint32_t process_anchor(const Process& p) const;
 
     // Install a runtime instance context for the duration of one access (see
     // LValue::vif_ctx). Every def-relative base -- storage, NBA shadow, wait
@@ -1626,9 +1924,9 @@ private:
     llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool four_state,
                                        bool has_z);
 
-    RefBinding ref_actual_arg(const Guarded& raw, Ref type);
+    RefActual ref_actual_arg(const Guarded& raw, Ref type);
 
-    void push_ref_epochs(std::vector<llvm::Value*>& argv, const RefBinding& rb, uint32_t depth);
+    llvm::Value* ref_witness_chain(const RefActual& ra);
 
     llvm::Value* ref_actual_ptr(const Guarded& lv, Ref type);
 
@@ -1672,9 +1970,44 @@ private:
 
     llvm::Function* declare_task(FunctionId id);
 
-    uint32_t ref_epoch_depth(const Function& f, size_t k) const;
+    // -- The record of a subroutine's instance --
+    //
+    // A function or task of an instance takes that instance's record as its first
+    // argument and addresses the instance through it, as a group does: its own
+    // storage, ids, wake buckets and the rest from the record, other instances'
+    // signals through bindings. One of no instance (a package's, `$unit`'s, a
+    // virtual interface body) takes the root state, which nothing reads, and
+    // addresses absolutely.
 
-    bool ref_needs_epoch(const Function& f, size_t k) const;
+    // The anchor of the instance `f` belongs to, or no_anchor.
+    uint32_t subroutine_anchor(const Function& f) const;
+
+    // The first argument of a direct call of `fid`: the record of the instance it
+    // belongs to -- the caller's own when it is the same instance, the one its
+    // function binding holds (Anchor::fn_externs) when the caller names it by an
+    // extern declaration -- else the root state. A caller that names the record
+    // of another instance by its symbol cannot be shared (taint).
+    llvm::Value* callee_record(FunctionId fid);
+
+    // What a virtual dispatch passes: the callee is chosen at run time, so its
+    // record cannot be, and a vtable entry of an instance's method is a thunk
+    // that supplies it (vtable_entry). The root state, like any callee that
+    // belongs to no instance reads.
+    llvm::Value* dispatch_record();
+
+    // The pointer a vtable or an interface-method table holds for `fid`: the
+    // function itself, or for one of an instance a root thunk of the same
+    // signature that calls it with the instance's record.
+    llvm::Function* vtable_entry(FunctionId fid);
+
+    // The thunks of every vtable entry that needs one, made before any body so
+    // the records they name exist when main fills them.
+    void make_vtable_entries();
+
+    // The records of the instances that export a subroutine to C, created before
+    // main fills them: the export thunks come after it.
+    void reserve_export_records();
+
 
     uint32_t formal_param_count(const Function& f, size_t k) const;
 
@@ -1748,6 +2081,7 @@ private:
     llvm::Function* inertial_cb_trampoline();
 
     llvm::Function* enqueue_trampoline();
+    void build_enqueue_trampoline();
 
     void emit_suspend(const char* label);
 
@@ -1755,10 +2089,23 @@ private:
 
     void emit_delay_timer(llvm::Value* ticks);
 
-    void emit_entry(llvm::ArrayType* arr_ty, llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle,
-                    llvm::Value* flag_ptr);
+    void emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr);
 
-    void emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* handle, llvm::Value* flag_ptr);
+    // One persistent subscription as the seed's tables hold it (plan_static_subscribe):
+    // a bucket's slot, or an event's node and the object it links onto.
+    struct StaticSub {
+        // A bucket: the address of the slot of the (signal, edge)'s static bucket that
+        // takes the group's { handle, flag } entry. An event: the node of the
+        // persistent pool that links onto the object's list.
+        llvm::Constant* slot = nullptr;
+        // An event only: the address of the object, or, when the variable's own
+        // handle decides it (`by_handle`), the address of that handle.
+        llvm::Constant* obj       = nullptr;
+        bool            is_event  = false;
+        bool            by_handle = false;
+    };
+
+    StaticSub plan_static_subscribe(Signal sig, uint32_t edge);
 
     void emit_dynamic_register(Signal sig, uint32_t edge);
 
@@ -1766,12 +2113,29 @@ private:
 
     void lower_wait(ExtraIndex info);
 
-    void emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
+    // -- Root from tables (RootTables.cpp) --
+    //
+    // What differs per instance or per group is data root's loops walk, so the code
+    // of root is the same size for any design: the instance records are initializers
+    // of their globals, and the creation, start and subscription of every group, the
+    // run-once regions and the dump registration are tables behind one loop each.
+
+    // The power-on value of every instance record (and the other link-time constants
+    // of root's globals), as the initializers of the globals themselves.
+    void fill_instance_records(const std::vector<llvm::Function*>& procs);
+
+    // Run the groups of one activation once each, in order, from a table: a call of
+    // `clotho.run_once` and no code of its own per group. Nothing is emitted when the
+    // design has none.
+    void emit_run_once(Activation which, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
+
+    llvm::Function* run_once_fn();
+
+    // The seed (emit_active_run): create every group's handle, start the ones that
+    // start now and subscribe the sensitive ones, from tables behind `clotho.seed`.
+    void emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
     bool has_preponed() const;
-
-    void emit_preponed_run(llvm::Value* state, llvm::Value* wheel,
-                           const std::vector<llvm::Function*>& procs);
 
     bool has_observed() const;
 
@@ -1781,13 +2145,7 @@ private:
 
     bool has_reactive_continuous() const;
 
-    void emit_observed_run(llvm::Value* state, llvm::Value* wheel,
-                           const std::vector<llvm::Function*>& procs);
-
     bool has_renba() const;
-
-    void emit_renba_run(llvm::Value* state, llvm::Value* wheel,
-                        const std::vector<llvm::Function*>& procs);
 
     bool is_reactive_fn(FunctionId id) const;
 
@@ -1814,11 +2172,35 @@ private:
 
     uint32_t program_exit_owner_of(FunctionId id) const;
 
+    // What a subroutine's key says of the program its `$exit` ends: none or
+    // ambiguous as they are, the instance the subroutine belongs to as one value,
+    // any other instance as itself.
+    uint32_t program_exit_relation(FunctionId id, uint32_t anchor) const;
+
+    // The anchor whose records hold program instance `inst` (that of its processes).
+    uint32_t program_inst_anchor(uint32_t inst) const;
+
+    // Program instance `inst` as an IR value: the own record's field when the body
+    // being lowered is that instance's, else the constant (which taints).
+    llvm::Value* program_inst_value(uint32_t inst);
+
+    // The design-wide index of process `k` as an IR value, read from the record of
+    // the instance that owns it when that is the instance being lowered, else a
+    // constant (which taints).
+    llvm::Value* proc_index_value(uint32_t k);
+
+    // The flat id of `disable` target `t` / covergroup type `t` as an IR value: read
+    // from the own record when the instance being lowered declares it, a constant
+    // for one of no instance (a package's: the same in every instance), and a
+    // constant that taints for another instance's.
+    llvm::Value* disable_target_value(uint32_t t);
+    llvm::Value* cover_type_value(uint32_t t);
+
     void lower_program_exit(Index i);
 
     uint32_t program_inst_of(uint32_t proc_index) const;
 
-    llvm::Value* program_inst_live_ptr(uint32_t inst);
+    llvm::Value* program_inst_live_ptr(llvm::Value* inst);
 
     void emit_program_end(uint32_t proc_index);
 
@@ -1897,6 +2279,10 @@ private:
     // the node must come off that object, not off whatever `a` names on resume.
     static constexpr uint32_t kNodeOwner  = 4;
 
+    // The slot of the object an event variable names, and the object of a
+    // monomorphic one (see Events.cpp).
+    llvm::Value* event_slot_value(Signal sig);
+
     llvm::Value* event_obj(Signal sig);
 
     llvm::Value* event_obj_of(llvm::Value* handle);
@@ -1941,21 +2327,87 @@ private:
 
     void report_dedup_stat();
 
-    static std::string normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst = nullptr);
+    static std::string normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst = nullptr,
+                                       bool number_inst_symbols = true);
 
     void report_dedup_shapes(const std::vector<llvm::Function*>& group_fns);
 
-    // -- Module-instance body sharing (dedup V1) --
+    void report_unit_code(const std::vector<llvm::Function*>& group_fns);
 
-    static llvm::GlobalVariable* only_inst_global(llvm::Function* fn);
+    // -- Code once --
 
-    static bool constant_uses(const llvm::Constant* c, const llvm::GlobalVariable* gv);
+    // The code of a unit's group is lowered once, from the first instance whose
+    // imports are alike, and every instance runs it with its own record; the
+    // functions and tasks of a unit are lowered once too (below). Lowering that
+    // bakes something of the instance it is lowered for (a symbol of its
+    // storage, a function copy only it calls, its name, a covergroup index)
+    // cannot be shared: it taints the lowering, and the instances lower their
+    // own. `taint` is a no-op outside a shared lowering.
+    void taint(const char* why);
 
-    llvm::Function* clone_with_ctx_param(llvm::Function* rep, llvm::GlobalVariable* ctx_gv);
+    // What decides the code of the groups and subroutines of the instance of
+    // `anchor`: the owner and position of every signal its bindings name, and
+    // which of them alias. Instances with equal keys lower alike.
+    std::vector<uint64_t> code_key(uint32_t anchor) const;
 
-    void rewrite_to_stub(llvm::Function* fn, llvm::Function* shared, llvm::GlobalVariable* ctx_gv);
+    // What decides whether group `g` of the instance of `anchor` lowers like the
+    // same group of another instance: its code key, and the functions the group
+    // names, as declared. A function is the one declaration to every instance
+    // of its family and another to an instance outside it, so instances whose
+    // calls land in different functions lower differently.
+    std::vector<uint64_t> group_key(uint32_t g, uint32_t anchor) const;
 
-    void share_twin_groups(const std::vector<llvm::Function*>& group_fns);
+    // -- Subroutines once --
+    //
+    // The functions and tasks of one unit's instances that lower alike are a
+    // family: the code is lowered once, for the first of them, into the unit's
+    // module, and every instance's subroutine is that function, called with the
+    // record of the instance it belongs to. What decides a family is
+    // `subroutine_key`; a subroutine whose key matches no earlier one starts a
+    // family, and one whose lowering bakes something of its instance (a taint)
+    // stays its own. A caller's key names the functions it calls as they were
+    // settled, so subroutines are lowered callees first (`plan_subroutines`: the
+    // order of the call graph's strongly connected components); a cycle of
+    // subroutines is never shared.
+
+    // Every function `ir` names directly: its call, task enable and fork edges,
+    // and the bodies it hands to the Postponed, Reactive and monitor machinery.
+    static void direct_callees(const Ir& ir, std::vector<FunctionId>& out);
+
+    // Where each function belongs (subroutine_home_), how many instances each
+    // unit has, and the order the functions are lowered in.
+    void plan_subroutines();
+
+    // The module a function is emitted into: its unit's, else root.
+    ModuleEnv* subroutine_env(FunctionId id);
+
+    // The symbol of a function or task (`kind` is ".fn." or ".task."): its
+    // instance's name and its own, made unique across every module.
+    std::string subroutine_symbol(const Function& f, std::string_view kind);
+
+    // The prefix of the symbols of root's own code (what belongs to no unit, and
+    // the link glue): a unit named like the design cannot collide with it.
+    static constexpr std::string_view kRootSymbol = "clotho.root";
+
+    // What leads the symbol (and frame type name) of subroutine `f`: its unit's
+    // key, or root's prefix for one built without a unit.
+    std::string subroutine_base(const Function& f);
+
+    // What decides the code of subroutine `f`: its unit and ordinal, the code
+    // key of its instance, what the design says of it (home region, random
+    // stream, program exit) and the functions it calls as declared, with
+    // whether each may finish.
+    // `scc` is the cycle `f` is in, when the key is that of a member of one: the
+    // members it calls are named by their place in it.
+    std::vector<uint64_t> subroutine_key(uint32_t f, const std::vector<uint32_t>& scc = {}) const;
+
+    // Lower the members of one cycle of the call graph (see Families.cpp).
+    void lower_cycle(std::vector<uint32_t> members);
+
+    // Lower every function and task, callees first, once per family.
+    void lower_subroutines();
+
+    void lower_subroutine(FunctionId id);
 
     static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out);
 
@@ -1966,6 +2418,14 @@ private:
     void report_comb_fuse_stat() const;
 
     void compute_fusion_groups();
+
+    void build_sched_groups(const std::vector<uint32_t>& pos);
+
+    std::vector<llvm::Function*> emit_sched_entries(const std::vector<llvm::Function*>& group_fns);
+
+    llvm::Function* emit_unit_entry(llvm::Function* row, uint32_t g0);
+
+    void emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask);
 
     void compute_trigger_masks();
 
@@ -1978,9 +2438,23 @@ private:
     void block_register(Signal sig, const llvm::APInt& mask, bool dynamic);
 
     llvm::Constant* block_not_queued();
-    void emit_block_commit_tail(uint32_t id);
 
-    void emit_block_commit_fn(uint32_t id);
+    // The descriptor of an NBA block -- the entry of root's table by block id, and
+    // the one argument of its commit function: { the commit function, the record of
+    // the instance that writes the block (null when it belongs to none), the next
+    // pending block }. A fixed link ABI: a unit's commit function names nothing else
+    // of root.
+    llvm::StructType* nba_desc_ty();
+
+    void emit_block_commit_tail(llvm::Value* desc);
+
+    // The commit function of each block a lowering from block id `first` on
+    // registered, emitted into the module that lowering went into (its unit's, or
+    // root's for a body of no instance) and named from `owner`, the function it
+    // lowered.
+    void emit_block_commits(uint32_t first, llvm::Function* owner);
+
+    void emit_block_commit_fn(uint32_t id, const std::string& name);
 
     void emit_block_commit_body(uint32_t id);
 
@@ -2108,15 +2582,24 @@ private:
 
     void emit_release_moment(Signal sig, const EdgeFacts& f);
 
-    llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig);
+    // The pieces of a (signal, edge) wake bucket a writer addresses: the static
+    // subscribers' base, the dynamic waiters' base and their length cell.
+    enum class WaitPart : uint8_t { Static, Dynamic, DynamicLen };
+
+    // Where a bucket piece is for the body being lowered: read from the signal's
+    // port where the body reaches it, the bucket's own global otherwise.
+    llvm::Value* wait_base(WaitPart part, Signal sig, uint32_t edge);
 
     void service_static_queue(Signal sig, uint32_t edge);
+
+    llvm::Value* static_trig_bits(Signal sig, uint32_t edge);
 
     void service_dynamic_queue(Signal sig, uint32_t edge);
 
     llvm::StructType* event_timer_ty();
 
     llvm::Function* event_delay_thunk();
+    void build_event_delay_thunk();
 
     void emit_event_pend_guarded(llvm::Value* handle);
 
@@ -2134,8 +2617,6 @@ private:
                          llvm::Value* flag, bool record_owner = true);
 
     void emit_event_unlink(llvm::Value* node, llvm::Value* obj = nullptr);
-
-    llvm::Value* next_static_event_node();
 
     Plane lower_event_triggered(llvm::Value* obj);
 
@@ -2227,7 +2708,12 @@ private:
     void emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, llvm::Value* tail,
                               llvm::Value* ring);
 
-    void emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, uint32_t cap, uint32_t which);
+    void emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, llvm::Value* cap, uint32_t which);
+
+    // The mask of the scheduler's rings (their capacity - 1) as a value: a constant in
+    // root, which owns the rings and is the design's, and a load of root's
+    // `clotho.ring_mask` in a unit, whose code must not hold the design's process count.
+    llvm::Value* ring_mask(llvm::IRBuilder<>& b);
 
     bool ring_guard_wanted();
 
@@ -2356,14 +2842,9 @@ private:
         b.SetInsertPoint(cont);
     }
 
-    llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty);
-
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded = false, uint64_t trig = 0);
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig);
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
-
-    void emit_nba_service(Signal sig, llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
-                          uint32_t width, bool four_state, llvm::Value* old_z, llvm::Value* new_z);
 
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
@@ -2393,6 +2874,10 @@ private:
 
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
+    // The first argument of the ramp of schedule group `sched`: the record of the
+    // instance its code belongs to, or the root state for a group of no instance.
+    llvm::Constant* ramp_arg(uint32_t sched);
+
     // -- Coroutine intrinsics / frame allocator --
 
     llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {});
@@ -2418,6 +2903,7 @@ private:
     llvm::FunctionCallee monitor_set_fn();
     llvm::FunctionCallee monitor_enable_fn();
     llvm::FunctionCallee monitor_active_ramp_fn();
+    llvm::FunctionCallee monitor_active_record_fn();
 
     llvm::FunctionCallee timeformat_init_fn();
     llvm::FunctionCallee timeformat_set_fn();
@@ -2448,8 +2934,8 @@ private:
     void emit_encoding_check(Plane v, bool four, Index at);
 
     llvm::StructType* ref_site_ty();
-    llvm::FunctionCallee ref_stale_fn();
-    llvm::FunctionCallee ref_epoch_regress_fn();
+    llvm::StructType* ref_witness_ty();
+    llvm::FunctionCallee ref_check_fn();
     llvm::StructType* ref_name_ty();
 
     llvm::StructType* tagged_site_ty();
@@ -2882,6 +3368,9 @@ private:
     void lower_string_constant(Index i, Ref ref);
 
     llvm::Value* inst_path_handle(uint32_t scope);
+    // The global of root holding the borrowed string handle of the path of the
+    // instance anchored at `anchor`, created on first use.
+    llvm::GlobalVariable* inst_path_global(uint32_t anchor);
 
     uint32_t body_scope() const;
 
@@ -3368,7 +3857,19 @@ private:
 
     void lower_reactive_pend(Index i);
 
-    std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*> expect_queue(uint32_t monitor);
+    // The waiter queue of one `expect`, by flat monitor: a root global
+    // `{ i32 count, parked handles }` (expect_queue_ty).
+    llvm::GlobalVariable* expect_queue(uint32_t monitor);
+
+    // The address of the queue the `expect` of `monitor` names: a field of the
+    // own instance's record in a unit's code, the global for a monitor of no
+    // instance.
+    llvm::Value* expect_queue_ptr(uint32_t monitor);
+
+    // The type of an `expect` queue, `{ i32, [cap x ptr] }`, and the slot of the
+    // parked handle `idx` of the queue at `queue`.
+    llvm::StructType* expect_queue_ty();
+    llvm::Value*      expect_handle_slot(llvm::Value* queue, llvm::Value* idx);
 
     void lower_expect_wait(Index i);
 
@@ -3441,7 +3942,6 @@ private:
 
     void emit_null_handle_check(llvm::Value* handle, Index at, NullKind kind = NullKind::Class);
 
-    llvm::Constant* no_epoch_global();
 
     llvm::Constant* ref_site_global(const SourceText& at, std::string_view formal);
 
@@ -3604,13 +4104,20 @@ private:
 
     void lower_dump_vars();
 
-    void emit_vcd_scope(std::string_view name);
+    // The dump registration is a table (Vcd.cpp, VcdRows) that one loop of root walks:
+    // a scope, an upscope, a scalar $var or an unpacked array's $vars per row.
+    struct VcdRows;
 
-    void emit_vcd_scope_tree(const InstanceScope& sc);
+    void vcd_plan_scope(VcdRows& rows, std::string_view name);
+
+    void vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc);
 
     const char* vcd_unrepresentable(Ref type) const;
 
-    void emit_vcd_var(Signal sig);
+    void vcd_plan_var(VcdRows& rows, Signal sig);
+
+    // The function of root that registers every dumped signal (lower_dump_vars).
+    llvm::Function* vcd_register_fn();
 
     void lower_dump_control(Inst::Tag tag);
 
@@ -3625,7 +4132,7 @@ private:
     void lower_virtual_call_inst(Index i);
 
     void lower_call_common(Index i, const Function& f, llvm::FunctionType* fnty,
-                           llvm::Value* callee, ExtraSlice arg_slice);
+                           llvm::Value* callee, llvm::Value* record, ExtraSlice arg_slice);
 
     static uint32_t dpi_nchunks(uint32_t w);
 
@@ -4069,7 +4576,7 @@ private:
 
     llvm::Value* proc_pcb_slot(uint32_t proc_index);
 
-    llvm::Value* program_root_pcb(uint32_t inst);
+    llvm::Value* program_root_pcb(llvm::Value* inst);
 
     void emit_proc_state(uint32_t from, uint32_t to);
 
@@ -4189,10 +4696,62 @@ private:
     // initializer. A fork child's block comes from the runtime pool instead.
     llvm::GlobalVariable*   proc_pcb_gv_      = nullptr;
     llvm::ArrayType*        proc_pcb_arr_ty_  = nullptr;
-    ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
-    // Root-defined integer-id value globals (abs_id_const): name -> global.
-    ankerl::unordered_dense::map<std::string, llvm::GlobalVariable*> idval_gvs_;
+    std::map<std::pair<uint32_t, llvm::StructType*>, ModuleEnv*> unit_env_of_;
+    // Per flat signal and id family: whether the signal has an id there (joined
+    // over the signals at one position of a state type, so the layout of a port is
+    // the same wherever it is addressed), and its value for the fill.
+    std::vector<std::array<bool, kIdFamilies>>     id_has_;
+    std::vector<std::array<uint32_t, kIdFamilies>> id_val_;
+    // Ports (see PortLayout), built by build_ports: the distinct layouts, and per
+    // flat signal the index of its layout (no_port when nothing of it is reached
+    // from outside) and the record field that holds its port.
+    static constexpr uint32_t no_port = ~0u;
+    std::vector<PortLayout>   port_layouts_;
+    std::vector<uint32_t>     port_idx_;
+    std::vector<uint32_t>     port_field_;
+    // Each state type's port field types, in the order of its record's port fields.
+    ankerl::unordered_dense::map<llvm::StructType*, std::vector<llvm::Type*>> ty_ports_;
     llvm::IRBuilder<>       b_;
+    // Set while a group or a subroutine is lowered for sharing (taint); why it
+    // cannot be.
+    bool                                                 share_active_ = false;
+    const char*                                          taint_why_    = nullptr;
+    // The borrowed path handle of each instance (inst_path_global), by anchor.
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> inst_path_gvs_;
+    // Thunk groups lowered per instance after all, by what stopped sharing them.
+    std::map<std::string, uint64_t>                      unshared_;
+    // Subroutines of multi-instance units lowered per instance after all, by what
+    // stopped sharing them.
+    std::map<std::string, uint64_t>                      unshared_subroutines_;
+    // Declarations of the functions that are one instance's own in a unit of
+    // several (their family has no other member), which a shared group cannot
+    // name.
+    ankerl::unordered_dense::set<const llvm::Function*> instance_fns_;
+
+    // Where a function belongs: the instance whose function it is, and its
+    // ordinal among its unit's functions. no_anchor for one of no unit.
+    struct SubroutineHome {
+        uint32_t anchor  = SignalSlot::no_anchor;
+        uint32_t ordinal = 0;
+    };
+    // By FunctionId (plan_subroutines).
+    std::vector<SubroutineHome> subroutine_home_;
+    // How many instances each Design unit has (by InstanceScope::unit).
+    ankerl::unordered_dense::map<uint32_t, uint32_t> unit_instances_;
+    // The functions, callees before callers, and the size of the call cycle each
+    // is in (1 when none).
+    std::vector<uint32_t> subroutine_order_;
+    std::vector<uint32_t> subroutine_cycle_;
+    // The symbols given to functions so far, with how many of each (a symbol is
+    // unique across every module: they all link into one).
+    ankerl::unordered_dense::map<std::string, uint32_t> subroutine_symbols_;
+    // (instance, instance whose code it runs) for every group and subroutine an
+    // instance runs that another lowered: the instance reads the bindings that
+    // code reads.
+    std::vector<std::pair<uint32_t, uint32_t>> shared_instances_;
+    // The root thunk of each vtable entry that belongs to an instance, by FunctionId
+    // (vtable_entry).
+    ankerl::unordered_dense::map<uint32_t, llvm::Function*> vtable_thunks_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;
@@ -4233,6 +4792,11 @@ private:
     // Instances of one definition share the type; a same-named definition with
     // different fields (different parameterization) gets its own entry.
     std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
+    // One entry per signal of a unit that has several instances: the flat
+    // signal each instance holds for it (InstanceScope::unit / locals). Every
+    // instance of a unit shares one layout, so slot facts are joined over
+    // these sets (docs/design/modular-compilation.md, invariant 4).
+    std::vector<std::vector<Signal>> unit_twins_;
     std::vector<SignalSlot> slots_;
     // Instance-scope anchors, one per scope occurrence (see Anchor); filled by
     // scope_type, symbols created by emit_state_global.
@@ -4242,16 +4806,14 @@ private:
     // Twin sets (process indices) recorded by report_dedup_stat under
     // `--stat=dedup-sets`, compared post-lowering by report_dedup_shapes.
     std::vector<std::vector<uint32_t>> shape_sets_;
-    // Per fusion group: owning scope anchor (single-scope reused-def groups
-    // only, else no_anchor) and def-local group ordinal. Built by
-    // build_instance_ctx_layout; the shareable-group identity.
-    std::vector<uint32_t> group_anchor_of_;
-    std::vector<uint32_t> group_def_ordinal_;
-    // Owning scope anchor of ANY single-scope group (unique or reused def),
-    // no_anchor for cross-instance / unscoped groups, and the group's dense
-    // def-local ordinal among them: the split-emission unit assignment (see
-    // unit_env / the lower_group loop in run()) and the blk absolute-id key.
+    // Per fusion group (compute_fusion_groups): the scope anchor of its
+    // instance (no_anchor for a group of no instance), the unit it was formed
+    // in (an index private to that pass) and its position among that unit's
+    // groups. The anchor assigns the group to its unit's module (see unit_env /
+    // the lower_group loop in run()); (unit, ordinal) is the unit-code
+    // statistic's key, and the same in every instance of the unit.
     std::vector<uint32_t> group_unit_anchor_;
+    std::vector<uint32_t> group_unit_;
     std::vector<uint32_t> group_unit_ordinal_;
     // Def-local signal table per anchor (slot.path's last element), kept from
     // build_wait_queues for the ctx layout and block-signal translation.
@@ -4275,12 +4837,13 @@ private:
     // one, when the owning instance is the one whose body is being emitted.
     llvm::Value* ctx_override_        = nullptr;
     uint32_t     ctx_override_anchor_ = SignalSlot::no_anchor;
+    // The root function that registers the design's dump variables, built on first use.
+    llvm::Function* vcd_register_fn_ = nullptr;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
     // not a touched scalar (an unnamed temporary, a string, or an unpacked array —
-    // array elements are always-scanned, not instrumented). nba_vcd_gv_ is a
-    // parallel [n_nba x i32] of those indices, read in the NBA commit loop.
+    // array elements are always-scanned, not instrumented).
     bool                  design_uses_vcd_ = false;
     // Any StrobePend instruction anywhere in the design? Gates the per-instant
     // Postponed-region drain loop (emit_active_run), so a design with no
@@ -4297,9 +4860,9 @@ private:
     // force-wake, the post-suspend poll, and the ring-overflow guard's second
     // reason to exist.
     bool design_uses_disable_  = false;
-    // Any `process` class op (LRM 9.7). Gates the control-block machinery: the ABI
-    // argument carrying the calling thread's block, the pooled block a fork child
-    // takes, the status stores at every park, and the completion hook.
+    // Any `process` class op (LRM 9.7). Gates the control-block machinery: the
+    // value the ABI's `proc` argument carries (null otherwise), the pooled block a
+    // fork child takes, the status stores at every park, and the completion hook.
     bool design_uses_process_  = false;
     // Any ReactivePend, or any process that runs in Observed. Gates the entire
     // reactive region set: both queues, the drain blocks, and the Observed run.
@@ -4327,10 +4890,9 @@ private:
     // thread's instead (LRM 24.3.1).
     std::vector<bool> reactive_home_fns_;
     std::vector<bool> shared_home_fns_;
-    // Whether ANY body is shared, i.e. whether the `home` ramp parameter exists.
-    // Design-wide for the same reason `proc` is (home_param_index): one vtable slot,
-    // one FunctionType. False for every design with no shared body, which then emits
-    // exactly the signatures it did before this existed.
+    // Whether ANY body is shared, i.e. whether some body reads the `home` ramp
+    // parameter instead of folding its lexical home. The parameter itself is in
+    // every signature (home_param_index); this only says whether a body reads it.
     bool design_uses_home_arg_ = false;
     // Whether the body currently lowering is a program block's `initial`. Drives
     // the LRM 24.3 implicit finish; false for everything else, so no other design
@@ -4360,6 +4922,9 @@ private:
     // instances reach it, or a program instance and a design process both do. Only
     // `$exit` cares, and it refuses rather than guess (LRM 24.7 answers by thread).
     static constexpr uint32_t kAmbiguousProgramInst = ~1u;
+    // In a subroutine's key (program_exit_relation): the program instance of the
+    // subroutine's own instance, which its code reads from the record.
+    static constexpr uint32_t kOwnProgramInst = ~2u;
     // Per instance, the process indices of its `initial` procedures, in process
     // order. Its size is the number of program instances, and each entry's size is
     // that instance's live-`initial` count at time zero.
@@ -4386,9 +4951,19 @@ private:
     // Current group's deferred-assertion generation-counter group id (-1 = none);
     // set per group in lower_group. Per-group generation globals, created lazily.
     int32_t                            cur_defer_group_ = -1;
+    // Per-group generation globals of a group that belongs to no instance, created
+    // lazily; an instance's groups keep theirs in its record (Anchor::ctx_defer_base).
     std::vector<llvm::GlobalVariable*> defer_gen_gv_;
+    // Whether any process of the design holds a deferred assertion (sizes the records).
+    bool any_defer_ = false;
+    // Who declares each flat `disable` target and covergroup type: the anchor and
+    // the ordinal among its unit's own (no_anchor for none).
+    std::vector<std::pair<uint32_t, uint32_t>> disable_owner_;
+    std::vector<std::pair<uint32_t, uint32_t>> cover_owner_;
+    // Who declares each flat `expect` monitor, and its ordinal among its unit's
+    // own `expect`s (no_anchor for a monitor no instance declares).
+    std::vector<std::pair<uint32_t, uint32_t>> expect_owner_;
     std::vector<int32_t>  vcd_index_;
-    llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
@@ -4396,8 +4971,6 @@ private:
     // against it. Set by lower_inst, read only by emit_ref_epoch_check.
     Index cur_inst_ = Index{ 0 };
     std::vector<llvm::Function*> fn_decls_;
-    // &Function -> FunctionId, for the ABI helpers that only receive a reference.
-    ankerl::unordered_dense::map<const Function*, uint32_t> fn_ids_;
     // Set while lowering a function or task body (null during a process). `frame_`
     // is the current call's frame; `frame_slots_` / `frame_ty_` its layout.
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
@@ -4572,21 +5145,25 @@ private:
     // the thread into the Reactive region for good (LRM 16.17 + 24.3.1). Such a
     // body goes through home_ptr_ at every park instead of folding a constant.
     bool                body_home_is_runtime_ = false;
-    // Deferred def-relative sched addressing chosen by lower_group (see
-    // materialize_sched_ptr); no_anchor when the absolute constant is used.
-    // sched_group_ is the fusion-group index currently lowering (feeds the
-    // def-local blk-field ordinal in block_register).
-    uint32_t sched_anchor_  = SignalSlot::no_anchor;
-    uint32_t sched_ordinal_ = 0;
-    uint32_t sched_group_   = 0;
-    // Outlined cross-instance member currently lowering: its owning anchor
-    // (~0 = none / not outlining) and def-local process ordinal, the
-    // member-scoped idval key for its NBA blocks (see lower_group).
-    uint32_t outline_anchor_ = ~0u;
-    uint32_t outline_ord_    = 0;
-    // First NBA block id of the group currently lowering (-1 until a block
+    // The instance whose record the function being lowered reads its own
+    // instance's storage, shadow, dump-var index, wait-bucket bases and NBA
+    // block ids through (def_relative_for): the single-scope group lowering,
+    // or the instance of the member of a group spanning instances. no_anchor
+    // addresses everything absolutely (functions, tasks, commit code, startup).
+    // own_ctx_ is the record itself when the body takes it as a parameter (a
+    // member); null reads the instance's record global. own_ordinal_ is the
+    // def-local ordinal of the function's (front) process: its flag's index
+    // among the record's flags (materialize_group_ctx) and its block-id field
+    // in the record (block_register).
+    uint32_t     own_anchor_  = SignalSlot::no_anchor;
+    llvm::Value* own_ctx_     = nullptr;
+    uint32_t     own_ordinal_ = 0;
+    // First NBA block id of the function currently lowering (-1 until a block
     // opens); block_register keys its ctx-relative ids off it.
     int64_t group_first_block_ = -1;
+    // The ordinal in its unit of the subroutine being lowered, whose first NBA block
+    // id is the record field at Anchor::ctx_subblk_base + it.
+    uint32_t cur_sub_ordinal_ = 0;
     // (anchor, ctx field, first block id) triples main stores at startup.
     std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> ctx_blk_fills_;
     // The shared timer callback (pushes a woken handle onto the active queue) and
@@ -4621,17 +5198,22 @@ private:
     llvm::GlobalVariable*               reactive_cont_head_gv_ = nullptr;
     llvm::GlobalVariable*               reactive_cont_tail_gv_ = nullptr;
     llvm::GlobalVariable*               pend_record_gv_     = nullptr;
-    // Per-`expect` waiter queues (LRM 16.17), keyed by monitor index and created
-    // on demand by expect_queue: {array of parked handles, count}. Same shape as
-    // the inactive batch -- push at the top, drain the whole thing -- because an
-    // expect's cohort is drained in one go and never partially.
+    // Per-`expect` waiter queues (LRM 16.17), keyed by flat monitor index and
+    // created on demand by expect_queue: `{ i32 count, [cap x ptr] parked handles }`,
+    // one root global each. Same shape as the inactive batch -- push at the top,
+    // drain the whole thing -- because an expect's cohort is drained in one go and
+    // never partially. A unit's code never names one: the instance's record holds
+    // the address of each queue of its own (Anchor::ctx_expect_base), the handles
+    // start 8 bytes in (expect_handles_offset), and `cap` is no number the code
+    // holds.
     //
     // Sized like the rings, and the same bound justifies it exactly: a process can
     // be parked on at most one `expect` at a time, so one slot per process is
     // enough for every waiter one monitor can hold.
-    ankerl::unordered_dense::map<uint32_t, std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*>> expect_queue_;
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> expect_queue_;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
+    llvm::GlobalVariable*               ring_mask_gv_      = nullptr; // active_mask_ as a constant global
     // Memoized design_forks(); only a forking design pays the ring-overflow check.
     std::optional<bool>                 design_forks_;
     // Process indices in static-subscription order (compute_subscription_order).
@@ -4645,11 +5227,11 @@ private:
     // Sizes of the groups the comb-fusion pass formed (measurement only, for
     // the `--stat=comb-fuse` probe).
     std::vector<uint32_t>               comb_group_sizes_;
-    // Fusion groups (compute_fusion_groups): each group lowers to one
-    // coroutine. groups_[g] lists member process indices in scheduled-rank
-    // order; group_of_ maps a process to its group; group_events_[g] is the
-    // (signal, edge) set the group subscribes (canonical deduped for fused
-    // groups, the member's raw list for singletons).
+    // Fusion groups (compute_fusion_groups): each is ONE function lowered from a
+    // unit's code, never mixing instances. groups_[g] lists the member process
+    // indices in the unit's order; group_of_ maps a process to its group;
+    // group_events_[g] is the (signal, edge) set the group waits on (canonical
+    // deduped for fused groups, the member's raw list for singletons).
     std::vector<std::vector<uint32_t>>  groups_;
     std::vector<uint32_t>               group_of_;
     std::vector<std::vector<WaitEvent>> group_events_;
@@ -4657,9 +5239,27 @@ private:
     // group is suspension-free), not a coroutine. Drives lower_group's emission
     // and the seed/drain dispatch, kept as one table so all three agree.
     std::vector<bool>                   thunk_group_;
+    // Per-group: formed by comb fusion (members of different sensitivities
+    // ordered for each other). Such a group is always a schedule group of its
+    // own, never one of several rows (build_sched_groups).
+    std::vector<bool>                   group_comb_;
+    // Schedule groups (build_sched_groups): what the seed loop creates one handle
+    // for and subscribes once. A coroutine group is its own; the thunk groups
+    // that wait on the same events are the rows of one, which runs them in rank
+    // order behind one scheduled flag (emit_sched_entries). `front` is the
+    // first process of its first row: the one whose flag it owns.
+    struct SchedGroup {
+        std::vector<uint32_t>  rows;
+        std::vector<WaitEvent> events;
+        uint32_t               front = 0;
+        bool                   thunk = false;
+    };
+    std::vector<SchedGroup>             sched_;
+    std::vector<uint32_t>               sched_of_;
     // Per-(signal, edge) trigger colour: the wake word bit a wake of that pair
-    // sets, or 0 for "no guarded group waits on it". Design-global so the mask
-    // is a constant at the scan site (compute_trigger_masks).
+    // sets, or 0 for "no guarded group waits on it". Design-global, so it is
+    // data wherever unit code needs it (the owner's record, a bucket's trigger
+    // global, the NBA meta table), never an immediate (compute_trigger_masks).
     std::vector<std::array<uint8_t, 3>> trig_colour_;
     // Per-group: guard each member on its own sensitivity, the per-member masks
     // in member order, and the union of those masks. Empty / false / 0 for a
@@ -4668,9 +5268,8 @@ private:
     std::vector<bool>                   group_guarded_;
     std::vector<std::vector<uint64_t>>  group_member_mask_;
     std::vector<uint64_t>               group_trig_mask_;
-    // Any group guarded at all. Gates whether an unclassified wake has to set
-    // every trigger bit, so a design with no guarded group emits the wake sites
-    // it always did.
+    // Any group guarded at all. Sizes the record's mask arrays and, with no
+    // guarded group, spares the main-side fills.
     bool                                any_guarded_     = false;
     uint32_t                            trig_collisions_ = 0;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
@@ -4688,14 +5287,11 @@ private:
     // is padded past them to the definition maximum (see build_wait_queues).
     std::vector<std::array<uint32_t, 3>> wait_sta_true_;
     std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
-    // Def-local wait-table slots per (signal, edge): ctx field ordinal (past
-    // ctx_wait_base) in the owning instance's context, or ~0 when the signal's
-    // owner is not a reused definition (body-side code then uses the absolute
-    // queue global).
-    static constexpr uint32_t no_wait_slot = ~0u;
-    std::vector<std::array<uint32_t, 3>> wait_slot_sta_;
-    std::vector<std::array<uint32_t, 3>> wait_slot_dyn_;
-    std::vector<std::array<uint32_t, 3>> wait_slot_len_;
+    // A signal of no instance has no record to hold its buckets' trigger bits:
+    // each static bucket gets a global of its own, filled at startup.
+    std::vector<std::array<llvm::GlobalVariable*, 3>> wait_sta_trig_gv_;
+    // Whether a bucket exists is `wait_*_gv_[signal][edge] != nullptr`; where a
+    // writer finds its pieces is the signal's port (PortLayout).
 
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
@@ -4749,14 +5345,17 @@ private:
     // Root scheduled-flag array (clotho.proc_sched) for unowned processes.
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;
+    // `clotho.run_once(table, count, wheel)` (run_once_fn), and the table of each
+    // activation emit_run_once has built, with its row count: the Preponed table is
+    // walked from two sites and built once.
+    llvm::Function* run_once_fn_ = nullptr;
+    std::map<Activation, std::pair<llvm::GlobalVariable*, uint32_t>> run_tables_;
 
     // Nonblocking-assignment update state, built in build_nba_state(). A StoreNb
     // stages its RHS into the target's shadow and registers its block; the NBA region
-    // commits the shadows into live state and services wait queues via nba_meta.
+    // commits the shadows into live state and services wait queues through the
+    // block's commit function.
     uint32_t                n_nba_  = 0; // distinct NBA-target signals
-    llvm::GlobalVariable*   nba_meta_gv_    = nullptr; // [n_nba x NbaMeta] constants
-    llvm::ArrayType*        nba_meta_arr_ty_ = nullptr;
-    llvm::StructType*       nba_meta_ty_    = nullptr;
     // Unpacked-array signals that are nonblocking-assignment targets. Their
     // per-element writes go through the runtime deferred queue (rt_nba_arr_*)
     // rather than the per-signal shadow; after a commit, each is woken if any
@@ -4811,11 +5410,13 @@ private:
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant
-    // via nba_block_enqueue_fn_ onto the threaded chain (block_next / block_head). The
-    // NBA region calls the chain head; each block's monomorphized commit function
-    // (block_commits_[id].fn) copies that block's shadows -> live, services their
-    // waiters, then musttail-calls the next pending block. Segments are keyed on
-    // cur_seg_epoch_ so back-to-back fused members coalesce into one block.
+    // via nba_block_enqueue_fn_ onto the threaded chain of descriptors (root's
+    // clotho.nba_blocks, by block id; nba_desc_ty). The NBA region calls the chain head's
+    // commit function; each block's commit function, in the writer's unit, copies that
+    // block's shadows -> live in the writer's instance (the record its descriptor
+    // holds), services their waiters, then musttail-calls the next pending block.
+    // Segments are keyed on cur_seg_epoch_ so back-to-back fused members coalesce into
+    // one block.
     // One NBA target the block writes, with the commit mask: `dynamic` means the mask
     // is a runtime dirty field (sh_mask_field); otherwise `mask` is the compile-time
     // union of the block's static writes to the signal (all-ones for a whole target).
@@ -4825,10 +5426,117 @@ private:
         bool        dynamic = false;
     };
     struct BlockCommit {
-        std::vector<BlockSig> sigs;         // targets, in first-store order
-        llvm::Function*       fn = nullptr; // monomorphized commit, void(state)
+        std::vector<BlockSig> sigs;                           // targets, in first-store order
+        llvm::Function*       fn     = nullptr;               // commit, void(descriptor)
+        uint32_t              anchor = SignalSlot::no_anchor; // the writer's instance
     };
     std::vector<BlockCommit>                    block_commits_;
+
+    // A group lowered once for sharing (Backend::run): the function the first
+    // instance of its unit whose imports are alike lowered for it, and what that
+    // lowering registered, which every other instance repeats for its own
+    // signals (shared_blocks, and the fills of the record's block fields).
+    struct SharedGroup {
+        uint32_t        g;                  // the group, of the instance that lowered it
+        llvm::Function* fn;
+        uint32_t        block_lo, block_hi; // the NBA blocks it registered
+        size_t          fill_lo, fill_hi;   // its record fills of their first ids
+        std::string     text;               // canonical_text(fn), set by the first check
+    };
+
+    // The NBA blocks an instance registers when it runs the code `rep` lowered:
+    // the same blocks, of its own signals.
+    std::vector<BlockCommit> shared_blocks(const SharedGroup& rep, uint32_t anchor) const;
+
+    // The record fills of the first ids of those blocks, for an instance whose
+    // blocks start at id `base`.
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> shared_fills(const SharedGroup& rep, uint32_t anchor,
+                                                                       uint32_t base) const;
+
+    // `SimulationConfig::verify_shared_code`: lower group `g` for its own
+    // instance, as it would have been without sharing, and check it is the code
+    // `rep` shares with it, including the blocks and record fills it registers.
+    // Throws a BackendError naming the difference. Leaves the backend as it
+    // found it.
+    void verify_shared_group(uint32_t g, SharedGroup& rep);
+
+    // The last global and function root's module held when a verifying lowering began
+    // (both lists only grow at the end), and the names of what follows them after: the
+    // check lowers into scratch modules, so a global or function it makes in root (a
+    // queue, a table made on first use) is a side effect only the check has, and root
+    // would differ with the check on and off. Empty when there is none.
+    struct RootMark {
+        const llvm::GlobalVariable* last_global;
+        const llvm::Function*       last_function;
+    };
+    RootMark    root_mark() const;
+    std::string root_added_since(const RootMark& mark) const;
+
+    // What lowering group `g` for its own instance gives: the function, in a
+    // scratch module, why it could not have been shared, and what it registered
+    // (`lower_for_own_instance` takes that back out of the backend).
+    struct OwnLowering {
+        llvm::Function*                                       fn    = nullptr;
+        const char*                                           taint = nullptr;
+        std::string                                           root_added;
+        std::vector<BlockCommit>                              blocks;
+        std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fills;
+    };
+    OwnLowering lower_for_own_instance(uint32_t g);
+
+    // How `own`, the lowering of group `g`, differs from what the instance runs
+    // when it shares `rep`; empty when it does not.
+    std::string shared_code_differs(uint32_t g, SharedGroup& rep, const OwnLowering& own);
+
+    // A subroutine lowered for sharing (lower_subroutines): the first of its
+    // family, whose function the rest of the family are.
+    struct SharedSubroutine {
+        uint32_t        f;     // the function, of the instance that lowered it
+        llvm::Function* fn;
+        const char*     taint; // why it cannot be shared, or null when it can
+        std::string     text;  // CodeText of fn, set by the first check
+        // The NBA blocks it registered and the record fills of their first ids (the
+        // function of every other instance repeats them for its own signals).
+        uint32_t block_lo = 0, block_hi = 0;
+        size_t   fill_lo = 0, fill_hi = 0;
+    };
+
+    // shared_blocks / shared_fills for the blocks lowered in anchor `rep_anchor`, ids
+    // `block_lo`..`block_hi` and fills `fill_lo`..`fill_hi`.
+    std::vector<BlockCommit> shared_blocks_of(uint32_t rep_anchor, uint32_t block_lo, uint32_t block_hi,
+                                              uint32_t anchor) const;
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> shared_fills_of(uint32_t block_lo, size_t fill_lo,
+                                                                          size_t fill_hi, uint32_t anchor,
+                                                                          uint32_t base) const;
+    // What an instance that runs the function `rep` lowered registers for its own
+    // signals: its blocks and the record fills of their first ids.
+    void adopt_shared_blocks(const SharedSubroutine& rep, uint32_t anchor);
+    // The block/fill range a lowering from `block_lo` / `fill_lo` on registered.
+    void note_blocks(SharedSubroutine& s, uint32_t block_lo, size_t fill_lo) const;
+    std::map<std::vector<uint64_t>, SharedSubroutine> subroutine_families_;
+    // Cycles of subroutines shared as one family: the key of the cycle (its members'
+    // keys in the unit's order) to its members, in that order.
+    std::map<std::vector<uint64_t>, std::vector<SharedSubroutine>> cycle_families_;
+
+    // `SimulationConfig::verify_shared_code`: lower subroutine `f` for its own
+    // instance, as it would have been without sharing, into a scratch module,
+    // and check it is the code `rep` shares with it. Throws a BackendError
+    // naming the difference. Leaves the backend as it found it.
+    void verify_shared_subroutine(uint32_t f, SharedSubroutine& rep);
+
+    // The scratch modules the verification lowers into, kept until run() ends:
+    // lowering caches instructions of the functions it builds (event_wait_node,
+    // gc_mutator_cur), which a deleted function would leave dangling. While a
+    // group is lowered into one, `sym` does not promote what it names to
+    // external linkage, so the real modules are untouched.
+    std::vector<std::unique_ptr<llvm::Module>> verify_modules_;
+    std::vector<std::unique_ptr<ModuleEnv>>    verify_envs_;
+    bool                                       verifying_       = false;
+    uint64_t                                   verified_groups_ = 0;
+    std::chrono::nanoseconds                   verify_time_{};
+    uint64_t                                   verified_subroutines_ = 0;
+    std::chrono::nanoseconds                   verify_subroutine_time_{};
+
     // Source-IR straight-line segment counter, bumped at every structured-region
     // boundary (lower_region entry/exit) and in-region suspend (Delay / Wait /
     // TaskCall). NBAs sharing an epoch are unconditionally co-executed with no
@@ -4839,16 +5547,13 @@ private:
     int64_t                 cur_block_epoch_ = -1;  // epoch cur_block_id_ was opened at (-1: none)
     uint32_t                cur_block_id_    = 0;
     llvm::Function*         nba_block_enqueue_fn_ = nullptr;    // void(i32 id), body emitted post-lowering
-    llvm::GlobalVariable*   block_commit_fns_gv_  = nullptr;    // [n_block x ptr] commit fn table
-    llvm::ArrayType*        block_commit_fns_ty_  = nullptr;
-    // Threaded-dispatch state. An intrusive chain of pending blocks: block_next[id]
-    // holds the next pending block's commit-fn pointer, `null` = chain end, sentinel
-    // 1 (block_not_queued) = not enqueued (also the dedup marker). block_head points
-    // at the first pending block's commit fn. Each commit fn musttail-calls its
-    // successor; the NBA region just calls the head.
-    llvm::GlobalVariable*   block_next_gv_        = nullptr;    // [n_block x ptr] intrusive links
-    llvm::ArrayType*        block_next_ty_        = nullptr;
-    llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's commit fn
+    // Root's table of block descriptors by block id (nba_desc_ty). Threaded-dispatch
+    // state: the intrusive chain of pending blocks runs through the descriptors' `next`
+    // fields, `null` = chain end, sentinel 1 (block_not_queued) = not enqueued (also the
+    // dedup marker). block_head points at the first pending block's descriptor.
+    llvm::GlobalVariable*   nba_blocks_gv_        = nullptr;    // [n_block x descriptor]
+    llvm::ArrayType*        nba_blocks_ty_        = nullptr;
+    llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's descriptor
 
     std::vector<Plane>                 values_;
     std::vector<std::optional<Guarded>> lvals_;

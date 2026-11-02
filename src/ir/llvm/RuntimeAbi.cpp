@@ -53,10 +53,11 @@ llvm::FunctionCallee Backend::monitor_emit_fn() {
     return rt_fn("rt_monitor_emit", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
 }
 
-// rt_monitor_set(ptr ramp) — register the monitor body's ramp function pointer
-// as the single active monitor (enabled, output-primed reset).
+// rt_monitor_set(ptr ramp, ptr record) — register the monitor body's ramp function
+// pointer and the record of the instance it belongs to as the single active
+// monitor (enabled, output-primed reset).
 llvm::FunctionCallee Backend::monitor_set_fn() {
-    return rt_fn("rt_monitor_set", b_.getVoidTy(), { raw_ptr_ty() });
+    return rt_fn("rt_monitor_set", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // rt_monitor_enable(i32 on) — $monitoron / $monitoroff.
@@ -68,6 +69,12 @@ llvm::FunctionCallee Backend::monitor_enable_fn() {
 // active and enabled, else null (drives the Postponed-region per-instant run).
 llvm::FunctionCallee Backend::monitor_active_ramp_fn() {
     return rt_fn("rt_monitor_active_ramp", raw_ptr_ty(), {});
+}
+
+// ptr rt_monitor_active_record(void) — the record the registered body takes as its
+// first argument.
+llvm::FunctionCallee Backend::monitor_active_record_fn() {
+    return rt_fn("rt_monitor_active_record", raw_ptr_ty(), {});
 }
 
 // -- $timeformat / %t --
@@ -237,32 +244,21 @@ llvm::StructType* Backend::ref_site_ty() {
       ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
 }
 
-// void rt_ref_stale(ptr site, i64 expect, i64 actual, i64 now) — reports the
-// dangling ref; fatal by default, a once-per-site warning under
-// --loose-stale-ref, so it CAN return (see Runtime.h).
-//
-// Declared as touching only memory the design cannot reach (it writes a
-// diagnostic and a per-site suppression set, both runtime-private). Without
-// that, GVN has to assume the call on the FAILING path clobbers the epoch, and
-// refuses to CSE the epoch load of a second dereference in the same block — so
-// N accesses through one ref formal paid N loads and N compares instead of one.
-llvm::FunctionCallee Backend::ref_stale_fn() {
-    auto callee =
-      rt_fn("rt_ref_stale", b_.getVoidTy(),
-            { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
-    if (auto* fn = llvm::dyn_cast<llvm::Function>(callee.getCallee())) {
-        fn->setMemoryEffects(llvm::MemoryEffects::inaccessibleMemOnly());
-        fn->setDoesNotThrow();
-    }
-    return callee;
+// The rt_ref_witness record (Runtime.h): { ptr epoch, i64 expect }, one entry of
+// the chain a `ref` actual that can move passes, ended by one whose epoch is
+// null.
+llvm::StructType* Backend::ref_witness_ty() {
+    return llvm::StructType::get(ctx_, { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
-// void rt_ref_epoch_regress(ptr site, ptr epoch, i64 expect, i64 actual, i64 now)
-// — an epoch that went backwards is a Clotho bug; aborts unconditionally.
-llvm::FunctionCallee Backend::ref_epoch_regress_fn() {
-    return rt_fn(
-      "rt_ref_epoch_regress", b_.getVoidTy(),
-      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+// void rt_ref_check(ptr site, ptr chain, ptr wheel) — walks a ref's witness chain
+// outermost first and reports the first level whose container was restructured:
+// fatal by default, a once-per-site warning under --loose-stale-ref, so it CAN
+// return (see Runtime.h). An epoch that went backwards is a Clotho bug and
+// aborts unconditionally. Only the cold path reaches it: the guard the backend
+// plants in the callee does the common check inline.
+llvm::FunctionCallee Backend::ref_check_fn() {
+    return rt_fn("rt_ref_check", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // { ptr epoch, ptr name } -- must match rt_container_name in Runtime.h.

@@ -204,6 +204,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_monitor_set", &rt_monitor_set);
     expose("rt_monitor_enable", &rt_monitor_enable);
     expose("rt_monitor_active_ramp", &rt_monitor_active_ramp);
+    expose("rt_monitor_active_record", &rt_monitor_active_record);
     expose("rt_monitor_emit", &rt_monitor_emit);
     expose("rt_fopen_mcd", &rt_fopen_mcd);
     expose("rt_fopen_fd", &rt_fopen_fd);
@@ -250,8 +251,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_null_handle", &rt_null_handle);
     expose("rt_encoding_violation", &rt_encoding_violation);
     expose("rt_tagged_access", &rt_tagged_access);
-    expose("rt_ref_stale", &rt_ref_stale);
-    expose("rt_ref_epoch_regress", &rt_ref_epoch_regress);
+    expose("rt_ref_check", &rt_ref_check);
     expose("rt_ref_names", &rt_ref_names);
     expose("rt_tagged_format_p", &rt_tagged_format_p);
     expose("rt_alloc_checked", &rt_alloc_checked);

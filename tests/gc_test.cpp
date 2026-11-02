@@ -615,8 +615,8 @@ TEST_CASE("gc: an object reachable only through a deep handle chain survives") {
 }
 
 // A `ref` formal bound to a class property is a raw INTERIOR pointer into the
-// object body, carrying clotho.ref.noepoch -- a compile-time-zero epoch that can
-// never signal invalidation (F6, ir/llvm/StateLayout.cpp, ref_actual_arg). The task nulls
+// object body that passes no witness chain -- a class body never moves, so
+// nothing signals invalidation (F6, ir/llvm/StateLayout.cpp, ref_actual_arg). The task nulls
 // the only precise root before suspending, so across the #20 the object is
 // designated by nothing but that interior pointer, and keeping it alive is
 // exactly rt_gc_find_object's interior resolution (Gc.h:244-250): a validator

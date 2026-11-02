@@ -1133,7 +1133,7 @@ bool Lowerer::is_program_signal(const ValueSymbol& raw) {
 //   assertion is evaluated.
 //
 // Clotho's loop does not close that way. In emit_active_run: `wheel.check` runs
-// emit_observed_run and then re-settles to the active drain (`check`) when the
+// the Observed groups (emit_run_once) and then re-settles to the active drain (`check`) when the
 // ACTIVE ring is non-empty; the reactive drain's `reactive.done` re-settle
 // branches to `check` on the same test and otherwise falls through to
 // `reactive.settled` -> Postponed -> the wheel. Observed <-> Active is a closed

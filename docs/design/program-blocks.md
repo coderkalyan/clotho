@@ -193,8 +193,9 @@ already pin against Active-region cascades.
 Gaps A and B are the same missing thing. Clotho has exactly two flavours of
 Reactive-region body today, and neither is a continuous process:
 
-- `Activation::Reactive` — a program `initial`: seeded onto the reactive ring
-  (`src/ir/llvm/Scheduler.cpp, emit_active_run`), **never subscribed**, one-shot.
+- `Activation::Reactive` — a program `initial`: a row of `clotho.seed`'s table
+  (`src/ir/llvm/RootTables.cpp`) whose ring is the reactive one, **never subscribed**,
+  one-shot.
 - reactive *pend* thunks — an assertion action block, pushed by
   `Inst::Tag::ReactivePend`.
 
@@ -215,13 +216,13 @@ both; A3 inherits the corrections.
 
 1. **A static subscription is NOT tagged by `parked_handle`.** Only an
    *intra-body* wait is (`emit_dynamic_register`). A process with a static
-   sensitivity list is subscribed once, from the seed loop, with the bare ramp
+   sensitivity list is subscribed once, by `clotho.seed`, with the bare ramp
    handle, and its always-loop park never re-records it (`emit_wait_suspend`
    only suspends) — so the subscription record is the *only* place a
    continuously-active process can state its home. Left untagged, every wake of
    a program's continuous assign pushes it onto the **active** ring, i.e. the
-   whole feature silently does nothing. The seed loop now tags it
-   (`tag_reactive_home`).
+   whole feature silently does nothing. The seed now tags it: the row's tag bit
+   makes the subscription loop OR `kReactiveContTag` into the recorded handle.
 2. **A reactive-home group must not be thunk-eligible.** `kReactiveHomeTag` is
    bit 1 and the thunk tag is bit 0, and the scheduler's reactive test is "bit 1
    set AND bit 0 clear" precisely because the two are documented as mutually
@@ -250,8 +251,8 @@ would fork all of them. Concretely:
 |---|---|
 | `ir::Process` (`src/ir/Module.h:210`) | add `bool reactive_home = false` |
 | `add_continuous_process` (`src/lower/Nets.cpp`) | set it from `in_program_` |
-| seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) | `self_start` push → `emit_reactive_cont_push` when reactive-home, so the time-zero settle happens in slot 0's Reactive, ahead of every program thread (§3.1) |
-| subscribe loop (`:12013`) | unchanged predicate, but the recorded handle must be tagged — see correction 1 above |
+| seed rows (`emit_seed`, `src/ir/llvm/RootTables.cpp`) | a reactive-home group's `self_start` row names the reactive continuous ring (`emit_reactive_cont_push`), so the time-zero settle happens in slot 0's Reactive, ahead of every program thread (§3.1) |
+| subscription rows (`clotho.seed.slots`) | unchanged predicate, but the recorded handle must be tagged: the row's tag bit makes `clotho.seed` OR the continuous home tag into it — see correction 1 above |
 | `reactive_home()` (`:11399`) | include the current process's flag |
 | `compute_fusion_groups` | make the group key home-homogeneous — never fuse a reactive-home process with an Active one |
 | `has_program()` (`:6901`) | must also report a reactive-home process, so `design_uses_reactive_` is set for a program that has only an `assign` |
@@ -261,7 +262,7 @@ would fork all of them. Concretely:
 | `lower_continuous_assign` | a program driver of a **resolved** net was refused here, because its slots are written in Reactive while an Active-home resolver folds them, one region later than 24.3.2. **Retired by A5**, which makes such a net's resolver reactive-home; the same question ports raise, reachable without ports via a hierarchical `assign` |
 
 Cost to a design with no program: one `bool` in `Process` (fits existing
-padding), one already-taken branch in the seed loop. No new region, no new
+padding), one tag bit in a seed row. No new region, no new
 runtime entry point, no IR opcode.
 
 ### 3.1 Order inside the Reactive region: continuous before procedural
@@ -286,7 +287,7 @@ choice is made in the order of events inside the region, which 4.7 leaves free
 |---|---|
 | `clotho.reactive_cont` + head/tail | second ring, shape and capacity of `clotho.reactive`; exists only when a reactive-home process does (`design_uses_reactive_cont_`) |
 | `kReactiveContTag` | bit 2 on the home tag. Put on the static subscription of a reactive-home group, the one place a continuous process records its home; `emit_wake_push` reads it and picks the ring |
-| seed loop | a reactive-home `self_start` push goes to the continuous ring (`deferred_comb` too) |
+| seed rows | a reactive-home `self_start` row names the continuous ring, a late (always_comb) row of such a group too |
 | `reactive.check` | strict priority: while the continuous ring is non-empty the next pop is from it |
 | `lower_finish`, `emit_program_end`, ring reset | empty / reset it with the others |
 
@@ -541,13 +542,12 @@ Available machinery:
   `docs/design/disable.md`). `$exit` and 24.3's implicit kill are that operation
   with a program instance as the root set.
 
-The obstacle this section expected — **module dedup** — turns out not to exist,
-and the paragraph that claimed it did was wrong. Two instances of one program
-definition do *not* share a lowered body: the only body sharing in the backend is
-`share_twin_groups`, which takes **thunk groups only** (`thunk_group_[g]`), and
-thunk eligibility is `is_simple_always`, which requires `Activation::Always`
-(`src/ir/Analysis.cpp:1628`). An `Activation::Reactive` process is therefore
-always a coroutine of its own, one per instance — the same property
+The obstacle this section expected — **module dedup** — does not exist for
+program instances. The backend lowers each unit group once and every instance
+runs it with its own record, but a program `initial` names its program instance
+by a constant, so lowering one taints the group (`belongs to a program
+instance`) and every instance lowers its own copy: an `Activation::Reactive`
+process is a coroutine of its own, one per instance — the same property
 `lower_group`'s deferred-assertion note already relies on for its per-group
 generation counter. So the program-instance index is a **compile-time constant
 folded into each body**, and no instance-context plumbing is needed.
@@ -707,12 +707,13 @@ union is taken from the ordinary roots too, over-approximation is safe — a slo
 both kinds of code dispatch on marks all its overrides *shared*, and a shared body
 asks its caller rather than folding anything.
 
-The home reaches the callee as a **conditional trailing-of-the-prologue `i8`
-parameter**, `home`, sitting immediately after the gated `proc` pointer in both
-`declare_function` and `declare_task` (`home_param_index`). Gated design-wide on
-`design_uses_home_arg_` (= "some body is shared"), for the same reason `proc` is:
-one vtable slot, one `FunctionType`, no per-callee bit may vary it. A design with
-no shared body emits exactly the signatures it did before.
+The home reaches the callee as a **trailing-of-the-prologue `i8` parameter**,
+`home`, sitting immediately after the `proc` pointer in both `declare_function` and
+`declare_task` (`home_param_index`). It is in every signature, whether or not the
+design has a shared body (`design_uses_home_arg_`, = "some body is shared", only
+says whether any body reads it): one vtable slot, one `FunctionType`, and a unit's
+code that cannot change with what other units call it or are called by
+(modular-compilation.md, "Code generation").
 
 Not in the task record. That record's single pointer slot is the caller's *parked
 handle* and is deliberately null until the async path — `lower_task_call_inst`
@@ -887,7 +888,7 @@ All three are in `emit_active_run` (`src/ir/llvm/Scheduler.cpp`):
 
 | Block | What it does | Where it can go |
 |---|---|---|
-| `wheel.check` | runs `emit_observed_run`, then the Observed/Postponed flushes | `check` (the active drain) when the active ring is non-empty, else `observed.settled` and on into the reactive drain |
+| `wheel.check` | runs the Observed table through `clotho.run_once`, then the Observed/Postponed flushes | `check` (the active drain) when the active ring is non-empty, else `observed.settled` and on into the reactive drain |
 | `observed.settled` | the fall-through when Observed woke nothing | straight on to the Observed/Postponed flushes and the reactive drain |
 | `reactive.done` | the reactive drain's re-settle, after Re-Inactive and Re-NBA | `check` when the active ring is non-empty, else `reactive.settled` → Postponed → the wheel |
 

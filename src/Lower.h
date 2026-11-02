@@ -9,6 +9,9 @@
 // crashing; see PRINCIPLES.md on never silently accepting a construct Clotho does
 // not implement.
 
+#include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -147,6 +150,32 @@ LowerResult lower_buffer(std::string_view path,
                          std::string_view text,
                          Timings*         timings      = nullptr,
                          ir::SystemAccess allow_system = ir::SystemAccess::Off);
+
+// Twin mode (docs/VERIFICATION.md, "Shared code"). The backend shares one lowering
+// of a unit's code between its instances, and checks it against each instance's
+// own only for units a design instantiates twice, so a bake the taint list misses
+// goes unseen by every design that has one instance of the unit. With a twin check
+// installed, every design that lowers (the entry points above but `lower_buffer`)
+// is lowered a second time with each of its top-level modules instantiated twice
+// by a synthetic wrapper module, and the check is handed that second lowering. The
+// check throws when the instances do not run the same code; the exception
+// propagates out of the lowering entry point, so the test (or run) that compiled the
+// design fails. A design whose twin form cannot be built is skipped, and counted
+// by why.
+enum class TwinVerdict : uint8_t {
+    Checked, // the backend lowered the twin design and its shared code matched
+    Refused, // the backend refuses the twin design (the refusal is the design's own)
+};
+using TwinCheck = std::function<TwinVerdict(const LowerResult& twin)>;
+
+// Install `check` for every lowering that follows, or none with an empty one.
+void set_twin_check(TwinCheck check);
+
+struct TwinStats {
+    uint64_t                        twinned = 0; // designs whose twin form the check ran on
+    std::map<std::string, uint64_t> skipped;     // designs not checked, by reason
+};
+const TwinStats& twin_stats();
 
 // Decode a source extent for whoever needs one: the IR dump's headers, and the
 // snippet a runtime diagnostic bakes into its report. Everything comes from the

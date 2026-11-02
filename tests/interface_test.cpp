@@ -1084,6 +1084,55 @@ TEST_CASE("virtual interface: a plain write after the trigger commits after a ti
         )");
         CHECK(out == "b0=33 b1=22\n");
     }
+    // Nothing here names an instance hierarchically, so b0 and b1 are twins of one unit
+    // with ids of their own for the member. The write through a handle must still find the
+    // record the statement through the same handle armed.
+    SUBCASE("event control, twins of one unit") {
+        const std::string out = run_capture(R"(
+            interface ibus; logic [7:0] d; endinterface
+            module top;
+                ibus b0(); ibus b1();
+                virtual ibus v0, v1;
+                event e;
+                initial begin
+                    v0 = b0;
+                    v1 = b1;
+                    v0.d = 8'h00;
+                    v1.d = 8'h00;
+                    v1.d <= @e 8'h11;
+                    #1;
+                    -> e;
+                    v1.d <= 8'h22;
+                    v0.d <= 8'h33;
+                    #1 $display("b0=%h b1=%h", v0.d, v1.d);
+                    $finish;
+                end
+            endmodule
+        )");
+        CHECK(out == "b0=33 b1=22\n");
+    }
+    SUBCASE("delay, twins of one unit") {
+        const std::string out = run_capture(R"(
+            interface ibus; logic [7:0] d; endinterface
+            module top;
+                ibus b0(); ibus b1();
+                virtual ibus v0, v1;
+                initial begin
+                    v0 = b0;
+                    v1 = b1;
+                    v0.d = 8'h00;
+                    v1.d = 8'h00;
+                    v1.d <= #1 8'h11;
+                    #1;
+                    v1.d <= 8'h22;
+                    v0.d <= 8'h33;
+                    #1 $display("b0=%h b1=%h", v0.d, v1.d);
+                    $finish;
+                end
+            endmodule
+        )");
+        CHECK(out == "b0=33 b1=22\n");
+    }
 }
 
 // A record released while its own member commits -- here by the wake of the first of two
@@ -1254,4 +1303,69 @@ TEST_CASE("ports: instances of one definition reach what their own parents bind"
         endmodule
     )");
     CHECK(out == "s0=13 s1=43 b0=12/1 b1=42/1\nw0=5 w1=7\nn0=2 n1=1\n");
+}
+
+// A port copy of a block writes its child's port and reads the child's output,
+// so the signals it reaches are another instance's, whose readers it must wake.
+// Two instances of one block reach two different children, and each write must
+// wake the reader in the child that block's own instance holds.
+TEST_CASE("bindings: twin instances write the ports of their own children and wake their readers") {
+    const std::string out = run_capture(R"(
+        module child(input logic [7:0] d, output logic [7:0] q);
+            assign q = d + 8'd1;
+        endmodule
+        module twin(input logic [7:0] x, output logic [7:0] y);
+            logic [7:0] m;
+            child c(.d(x), .q(m));
+            assign y = m + 8'd100;
+        endmodule
+        module top;
+            logic [7:0] x0 = 0, x1 = 0;
+            wire [7:0] y0, y1;
+            twin t0(.x(x0), .y(y0));
+            twin t1(.x(x1), .y(y1));
+            initial begin
+                #1 $display("%0d %0d", y0, y1);
+                x0 = 8'd5;
+                #1 $display("%0d %0d", y0, y1);
+                x1 = 8'd20;
+                #1 $display("%0d %0d", y0, y1);
+                x0 = 8'd6; x1 = 8'd21;
+                #1 $display("%0d %0d", y0, y1);
+            end
+        endmodule
+    )");
+    CHECK(out == "101 101\n106 101\n106 121\n107 122\n");
+}
+
+// Hierarchical references from the twins of one block reach different targets:
+// each writes the variable of its own child, whose continuous assignment must
+// wake, and both add to one package variable, which belongs to no instance.
+TEST_CASE("bindings: twin instances reach their own children and a package variable by name") {
+    const std::string out = run_capture(R"(
+        package p;
+            logic [15:0] total = 0;
+        endpackage
+        module leaf;
+            logic [7:0] v = 0;
+            wire [7:0] dbl = v * 2;
+        endmodule
+        module holder(input logic [7:0] step);
+            leaf l();
+            initial begin
+                #1 l.v = step;
+                #2 l.v = l.v + step;
+                #1 p::total = p::total + 16'(l.dbl);
+            end
+        endmodule
+        module top;
+            holder h0(.step(8'd1));
+            holder h1(.step(8'd10));
+            initial begin
+                #2 $display("%0d %0d", h0.l.dbl, h1.l.dbl);
+                #3 $display("%0d %0d %0d", h0.l.dbl, h1.l.dbl, p::total);
+            end
+        endmodule
+    )");
+    CHECK(out == "2 20\n4 40 44\n");
 }

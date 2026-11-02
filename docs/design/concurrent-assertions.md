@@ -230,11 +230,11 @@ JIT'd function `sim_drain`, built by `emit_active_run`
 
 | LRM region | clotho | Where |
 |---|---|---|
-| Preponed | `Activation::Preponed`, run once per time step | `emit_preponed_run` |
+| Preponed | `Activation::Preponed`, run once per time step | the Preponed table of `clotho.run_once` |
 | Active | ring FIFO `@clotho.active`, drained | `active.check` |
 | Inactive | batch promote into the empty Active ring | `inactive.check` |
 | NBA | block-commit chain | `nba.check` |
-| Observed | `Activation::Observed`, runs process bodies | `emit_observed_run` |
+| Observed | `Activation::Observed`, runs process bodies | the Observed table of `clotho.run_once` |
 | Reactive | ring FIFO `@clotho.reactive`, drained | `reactive.check` |
 | Re-Inactive | batch promote into the empty Reactive ring | `re_inactive.check` |
 | Re-NBA | commit staged updates, re-drain Reactive | `re_nba.check` |
@@ -269,8 +269,9 @@ exactly the Preponed position. It is strictly more work for the same result.
 
 **Observed becomes a real region that runs bodies.** Monitor evaluation is a
 process that must execute there, not a flush. This was the one genuinely new
-capability, and it is now `ir::Activation::Observed`, run by `emit_observed_run`
-at the settled point.
+capability, and it is now `ir::Activation::Observed`, run at the settled point by
+`clotho.run_once` over the Observed table (`emit_run_once`,
+`src/ir/llvm/RootTables.cpp`).
 
 **Reactive, Re-Inactive and Re-NBA are new**, and structurally they are a second
 copy of the Active/Inactive/NBA triad that `emit_active_run` already builds. This
@@ -331,7 +332,7 @@ That was sound *because of* §4 — the monitor reads only sampled shadows, so i
 verdict could not depend on where in the instant it ran — and it would have become
 observable only once reactive code could perturb a monitor's inputs.
 
-**Now:** the monitor is `ir::Activation::Observed`, run by `emit_observed_run` at
+**Now:** the monitor is `ir::Activation::Observed`, run by `clotho.run_once` at
 the settled point. It is *not* subscribed to its clock and no event wakes it: it
 runs once per settled point and detects its own clocking event by comparing the
 sampled clock against a one-slot history. That is deliberate, not a shortcut. A

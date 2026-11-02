@@ -92,8 +92,9 @@ flowchart TD
    live signal here in Observed, which is where 14.4 puts it.
 4. **Drives in Re-NBA.** `cb.sig <= expr` evaluates the RHS immediately into
    per-clockvar pending state and does not block (LRM 14.16); a new region
-   process, `ir::Activation::ReNba` run by `emit_renba_run`, applies the pending
-   drives of any block whose event fired this slot.
+   process, `ir::Activation::ReNba`, applies the pending drives of any block whose
+   event fired this slot. Its groups are the rows of the ReNba table that
+   `clotho.run_once` walks at the Re-NBA point of the drain.
 
 Why those two regions are the only workable choice, and the two latches that make
 it exact: an Observed store is an ordinary design write and the drain re-settles
@@ -105,9 +106,10 @@ value change anyway.
 
 ## 3. What this cost the rest of the simulator
 
-- One new `ir::Activation` (`ReNba`), one new backend runner (`emit_renba_run`),
-  and `has_renba()` folded into `design_uses_reactive_` so a design without a
-  clocking block pays nothing. `reject_unsupported_observed` became
+- One new `ir::Activation` (`ReNba`), run through the existing `clotho.run_once`
+  table walker (`emit_run_once`, `src/ir/llvm/RootTables.cpp`) rather than a runner
+  of its own, and `has_renba()` folded into `design_uses_reactive_` so a design
+  without a clocking block pays nothing. `reject_unsupported_observed` became
   `reject_resume_once`, shared by both resume-once regions.
 - `finalize_sva_sampling` became `finalize_preponed`: the same single Preponed
   process now also clears each block's per-step "my event fired" latch.

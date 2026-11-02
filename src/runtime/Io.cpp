@@ -216,8 +216,9 @@ extern "C" void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt
     write_raw(desc, out);
 }
 
-extern "C" void rt_monitor_set(void* ramp) {
+extern "C" void rt_monitor_set(void* ramp, void* record) {
     g_monitor.ramp    = ramp;
+    g_monitor.record  = record;
     g_monitor.enabled = true;
     g_monitor.has     = true;
     g_monitor.primed  = false; // print at the first settled instant
@@ -237,6 +238,10 @@ extern "C" void rt_monitor_enable(int32_t on) {
 
 extern "C" void* rt_monitor_active_ramp() {
     return (g_monitor.has && g_monitor.enabled) ? g_monitor.ramp : nullptr;
+}
+
+extern "C" void* rt_monitor_active_record() {
+    return g_monitor.record;
 }
 
 extern "C" void rt_monitor_emit(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {

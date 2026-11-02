@@ -190,11 +190,14 @@ the same shape as the existing generation counter.
 - **No process identity, no process table, and no handle array.** A process is
   the raw `ptr` from `llvm.coro.begin`; `src/runtime/*` has no process struct.
   `@clotho.proc_handle` does not exist anywhere in the tree — the only
-  occurrence of that name is this document. Handles live as SSA values inside
-  the seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) and are then dropped; the
-  only durable copies anywhere are wait-bucket entries (`{handle, flag_ptr}`),
-  field 2 of a frame-resident `awaiter`, and the `parent` field of a task or
-  fork record — all three region-tagged through `parked_handle`.
+  occurrence of that name is this document. `clotho.seed` (`src/ir/llvm/RootTables.cpp`,
+  `emit_seed`) makes each group's handle in a loop over the `clotho.seed.rows` table and
+  keeps it in `clotho.seed.handles`, a private array indexed by seed row, not by process;
+  only the seed's own later loops (the late queueing, the subscriptions) read it back, and
+  nothing does once the seed returns. The only durable copies anywhere else are
+  wait-bucket entries (`{handle, flag_ptr}`), field 2 of a frame-resident `awaiter`, and
+  the `parent` field of a task or fork record — all three region-tagged through
+  `parked_handle`.
   `fnmap_` gives the static `FunctionId` for a task target and says nothing
   about which calls are live.
 
@@ -239,7 +242,7 @@ close.
    The two are different shapes, and V2 wants the second: `defer.gen` is a flat
    per-group `i64` global with no anchor, whereas the per-instance anchored
    array is `build_sched_flags` (`:793-829`) — dense def-local ordinals,
-   per-anchor `clotho.inst.<hier>.sched` arrays, a root array for unowned
+   the wake pairs in each instance's record (`Anchor::ctx_sched_base`), a root array for unowned
    (package / `$unit`) processes, and a constant-GEP accessor `sched_flag_ptr`
    (`:832-838`) valid in any block. A `build_disable_epochs` /
    `disable_epoch_ptr` pair is a near-literal transcription of that with `i32`
@@ -308,7 +311,7 @@ A thunk-elided group links nothing: it has no handle, and having no suspend it c
 be inside the target while any other process runs — so the list stays empty and the
 `disable` is the no-op the LRM already prescribes. A group holding either half of the
 remote form is nevertheless forced to a real coroutine (`is_simple_always`), because
-the disabler's baked target id is per-instance and only a thunk group is ever shared
+the disabler's baked target id is per-instance, so a group that names one taints its lowering and every instance lowers its own (groups are otherwise lowered once per unit)
 across instances.
 
 ### Aborting: force-wake exactly once, then a structured exit — LANDED
@@ -404,9 +407,9 @@ Consequences worth stating plainly:
   freed (bullet 2), so the only real hazard is the stale *wake*, which the claim on
   the record settles. The record is heap-allocated per arm in a disable-using
   design, so it also stops pointing into the frame at all. `coro.destroy` remains
-  not an alternative: it IS used in-tree (`emit_finals_run`, `emit_preponed_run`,
-  `emit_observed_run`, and the active drain) but only ever on a handle that has run
-  to completion or is gated on `coro.done`. A real `WheelImpl::cancel`
+  not an alternative: it IS used in-tree (`clotho.run_once`, which runs the Final,
+  Preponed, Observed, PreInit and Re-NBA groups, and the active drain) but only ever on a
+  handle that has run to completion or is gated on `coro.done`. A real `WheelImpl::cancel`
   (doubly-linked slots plus lazy heap invalidation) would let the per-arm heap
   record go away; it is an optimisation now, not a prerequisite.
 - **Detached event timers were already heap-allocated.** A `->> #d e` timer is not

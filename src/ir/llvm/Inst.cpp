@@ -270,6 +270,10 @@ void Backend::build_str_temps() {
         if (ir_->tag(i) == Inst::Tag::Concat && k + 2 < ir_->inst_count() &&
             forwarded_string_store(static_cast<Index>(k + 2))) {
             const Inst::Payload& lp = ir_->payload(static_cast<Index>(k + 1));
+            // Resolving a ref formal guards the dereference, and the guard names the
+            // access it guards: the Local at k + 1, not whatever instruction an earlier
+            // body left in cur_inst_ (a different site in each lowering of one body).
+            cur_inst_ = static_cast<Index>(k + 1);
             const LValue lv = ir_->tag(static_cast<Index>(k + 1)) == Inst::Tag::Signal
                                 ? signal_lvalue(lp.signal)
                                 : local_lvalue(lp.local.index);
@@ -1055,8 +1059,9 @@ void Backend::lower_inst(Index i) {
         // the NBA update region (see emit_nba_region), which commits shadow ->
         // live and services wait queues only after every active process has run.
         case Inst::Tag::StoreNb: {
-            const Guarded& lv = lvalue_of(p.binary.l);
-            CtxOverride   ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
+            const Guarded&             lv = lvalue_of(p.binary.l);
+            std::optional<CtxOverride> ov;
+            ov.emplace(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
             emit_bounds_reports(lv, /*is_write=*/true);
             if (lv.is_string) {
                 // A whole-string NBA stages an owned deep copy in its own record
@@ -1104,8 +1109,14 @@ void Backend::lower_inst(Index i) {
                     lower_store_nb(v, rhs);
                 }
                 // A signal that also takes timed NBAs keeps this write behind the deferred
-                // updates that were already released (emit_intra_nba_ordered).
+                // updates that were already released (emit_intra_nba_ordered). The copy and
+                // its probe name the record list the timed arms stage under, and the arms
+                // install no instance context: a write through a handle names the member's
+                // list (the representative's), whichever instance the handle named, and the
+                // record carries the instance. The instance's own record would hold another
+                // twin's id, or none at all in a unit of its own.
                 if (v.is_signal && is_intra_target(v.sig)) {
+                    ov.reset();
                     emit_intra_nba_ordered(v, rhs);
                 }
             });
@@ -2079,11 +2090,11 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::CoverCtl:
             lower_cover_ctl(i);
             return;
-        case Inst::Tag::MonitorSet:
-            b_.CreateCall(monitor_set_fn(),
-                          { sym(fn_decls_[static_cast<uint32_t>(
-                              ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra).func)]) });
+        case Inst::Tag::MonitorSet: {
+            const FunctionId body = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra).func;
+            b_.CreateCall(monitor_set_fn(), { sym(fn_decls_[static_cast<uint32_t>(body)]), callee_record(body) });
             return;
+        }
         case Inst::Tag::MonitorEmit: {
             const auto& p = ir_->payload(i).op_extra;
             emit_display_to(ir_->extra_data<DisplayInfo>(p.extra),
@@ -2455,22 +2466,14 @@ uint32_t Backend::body_scope() const {
     return cur_fn_ != nullptr ? cur_fn_->scope : cur_proc_scope_;
 }
 
-// The path of the instance `scope` names, as the BORROWED string handle an InstPath
-// evaluates to: a read-only rt_string in its heap form whose buffer is the path's own
-// constant bytes. It needs no temp, no init and no release, so a body that reads it
-// only on a rare path (a report) pays nothing for it on the others. The flat module
-// knows each instance's hierarchical name (the anchor of its scope, which is how its
-// state global is named), so for now the handle is a constant of the module that
-// reads it. Compiling units directly will have the instance's record hold the same
-// handle in a field and read it from there, which is why the instruction exists at
-// all -- and why nothing may write through the handle.
-llvm::Value* Backend::inst_path_handle(uint32_t scope) {
-    if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
-        anchor_of_scope_[scope] == SignalSlot::no_anchor) {
-        throw BackendError{ "internal: inst_path in a body that belongs to no instance" };
-    }
-    const uint32_t         anchor = anchor_of_scope_[scope];
-    llvm::GlobalVariable*& slot   = env_->inst_paths[anchor];
+// The path of the instance anchored at `anchor`, as the BORROWED string handle an
+// InstPath evaluates to: a read-only rt_string in its heap form whose buffer is the
+// path's own constant bytes. It needs no temp, no init and no release, so a body
+// that reads it only on a rare path (a report) pays nothing for it on the others,
+// and nothing may write through it. A global of root, one per instance, whose
+// address the instance's record holds (Anchor::ctx_name_base).
+llvm::GlobalVariable* Backend::inst_path_global(uint32_t anchor) {
+    llvm::GlobalVariable*& slot = inst_path_gvs_[anchor];
     if (slot != nullptr) {
         return slot;
     }
@@ -2484,19 +2487,41 @@ llvm::Value* Backend::inst_path_handle(uint32_t scope) {
     auto*              pad_ty = llvm::ArrayType::get(i8, sizeof(rt_string) - sizeof(rt_string_heap) - 1);
     auto*              ty     = llvm::StructType::get(ctx_, { raw_ptr_ty(), i64, i64, pad_ty, i8 }, /*isPacked=*/true);
     const std::string& path   = anchors_[anchor].name;
+    llvm::Module&      root   = root_env_->llmod;
 
     // The bytes keep their NUL terminator: a handle's data is also a valid C string.
     llvm::Constant* text  = llvm::ConstantDataArray::getString(ctx_, path, /*AddNull=*/true);
-    auto*           bytes = new llvm::GlobalVariable(env_->llmod, text->getType(), /*isConstant=*/true,
+    auto*           bytes = new llvm::GlobalVariable(root, text->getType(), /*isConstant=*/true,
                                                      llvm::GlobalValue::PrivateLinkage, text, "inst.path.str");
     bytes->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     llvm::Constant* init = llvm::ConstantStruct::get(
       ty, { bytes, b_.getInt64(path.size()), b_.getInt64(path.size()), llvm::ConstantAggregateZero::get(pad_ty),
             b_.getInt8(rt_string_heap_flag) });
-    slot = new llvm::GlobalVariable(env_->llmod, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init,
+    slot = new llvm::GlobalVariable(root, ty, /*isConstant=*/true, llvm::GlobalValue::InternalLinkage, init,
                                     "inst.path");
     slot->setAlignment(llvm::Align(alignof(rt_string)));
     return slot;
+}
+
+// What an InstPath in the body being lowered evaluates to: the borrowed path handle
+// of the instance `scope` names. A body of that instance reads the address from its
+// record, so the unit's code is the same for every instance and holds no name; code
+// that has no record of it (root glue, a body of another instance) names the root
+// global, which is per instance and so keeps a shared lowering from being shared.
+llvm::Value* Backend::inst_path_handle(uint32_t scope) {
+    if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
+        anchor_of_scope_[scope] == SignalSlot::no_anchor) {
+        throw BackendError{ "internal: inst_path in a body that belongs to no instance" };
+    }
+    const uint32_t anchor = anchor_of_scope_[scope];
+    if (own_ctx_ != nullptr && anchor == own_anchor_) {
+        Anchor& a = anchors_[anchor];
+        return ctx_field(a, a.ctx_name_base, llvm::PointerType::getUnqual(ctx_));
+    }
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        taint("reads the name of an instance it has no record of");
+    }
+    return sym(inst_path_global(anchor));
 }
 
 // String concatenation: gather the part handles into a stack array and hand
@@ -2559,33 +2584,36 @@ llvm::ConstantInt* Backend::const_from_bytes(std::span<const uint8_t> bytes, uin
     return llvm::ConstantInt::get(ctx_, apint_from_bytes(bytes, width));
 }
 
-// Whole-storage lvalue for a module signal (state struct).
+// Whole-storage lvalue for a module signal (state struct). A signal the own
+// instance reaches through a binding has its storage in the binding and every
+// other base of an access (wake buckets, shadow, dump-var index, ids) in its
+// port, which the binding names (port_elem_ptr); only a virtual interface member
+// carries an instance context, the record of the instance its handle names.
 LValue Backend::signal_lvalue(Signal sig) {
     const SignalSlot& s = slot_of(sig);
+    LValue            lv{};
     if (s.is_agg) {
         // The aggregate root; a following MemberSelect / ElemSelect chain
         // extends agg_path and (at a scalar/string leaf) fills the leaf
         // metadata. A bare aggregate lvalue is never loaded/stored directly.
-        LValue lv{};
         lv.base      = storage_ptr(s);
         lv.root_ty   = s.storage_ty;
         lv.is_agg    = true;
         lv.is_signal = true;
         lv.sig       = sig;
-        return lv;
+    } else {
+        lv.base        = storage_ptr(s);
+        lv.slot_ty     = s.slot_ty;
+        lv.four_state  = s.four_state;
+        lv.has_z       = s.has_z;
+        lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
+        lv.store_width = s.width;
+        lv.bit_off     = b_.getInt64(0);
+        lv.width       = s.width;
+        lv.is_signal   = true;
+        lv.sig         = sig;
+        lv.is_string   = s.is_string;
     }
-    LValue lv;
-    lv.base        = storage_ptr(s);
-    lv.slot_ty     = s.slot_ty;
-    lv.four_state  = s.four_state;
-    lv.has_z       = s.has_z;
-    lv.array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr;
-    lv.store_width = s.width;
-    lv.bit_off     = b_.getInt64(0);
-    lv.width       = s.width;
-    lv.is_signal   = true;
-    lv.sig         = sig;
-    lv.is_string   = s.is_string;
     return lv;
 }
 

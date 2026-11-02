@@ -6,6 +6,7 @@
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -449,6 +450,51 @@ TEST_CASE("ref of a string aliases the actual") {
         endmodule
     )";
     CHECK(run_capture(src) == "hello world\n");
+}
+
+TEST_CASE("ref of a string: the instances of one module each alias their own actual") {
+    // Two instances run one lowering of the function and of the task. The guard of a
+    // `ref` formal that a forwarded string store resolves in the prologue names the
+    // access it guards, so the instances' code is the same (it named an instruction
+    // left over from lowering another body: found by twin mode, and caught by
+    // verify_shared_code once a design instantiates the module twice). Each shape is
+    // a module of its own, because what the guard named depended on what was lowered
+    // before it. Oracle: LRM 13.5.2 (a ref formal is the actual itself), checked
+    // against the output of main's binary.
+    constexpr std::string_view src = R"(
+        module mf;
+            function automatic void f(ref string s);
+                s = {s, " world"};
+            endfunction
+            string t;
+            initial begin
+                t = "hello";
+                f(t);
+                $display("%s", t);
+            end
+        endmodule
+        module mt;
+            string s;
+            task automatic app(ref string a);
+                a = {a, "!"};
+            endtask
+            initial begin
+                s = "hi";
+                app(s);
+                $display("%s", s);
+            end
+        endmodule
+        module top;
+            mf a();
+            mf b();
+            mt c();
+            mt d();
+        endmodule
+    )";
+    // A child process, which resolves source locations as the CLI does: the guard's
+    // site record carries the line it names, and `run_capture` has no resolver, so
+    // every site there reads "<unknown>" and two lowerings cannot differ.
+    CHECK(test::run_design_subprocess(src) == "hello world\nhello world\nhi!\nhi!\n");
 }
 
 TEST_CASE("ref of a queue aliases the actual, mutations included") {

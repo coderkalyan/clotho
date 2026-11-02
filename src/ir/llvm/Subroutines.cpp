@@ -4,71 +4,70 @@
 
 namespace clotho::ir::backend {
 
-// Lower one fusion group (usually a singleton) to one coroutine. Members of
-// a fused group share one frame, one sched flag (the first member's slot),
-// and one wait suspend; their bodies run back-to-back per wake, in
-// scheduled-rank order (see compute_fusion_groups for the legality
-// argument). The per-member value tables are swapped in around each
-// member's body.
+// Lower one fusion group (usually a singleton). A coroutine group lowers to one
+// coroutine: the members of a fused one share one frame, one sched flag (the
+// first member's slot) and one wait suspend, and run back-to-back per wake. A
+// thunk group lowers to one plain function, a ROW of a schedule group
+// (emit_sched_entries), that runs its members back-to-back for the instance
+// whose record it is handed. Either way the members run in the order
+// compute_fusion_groups gave them (see there for the legality argument), and
+// the per-member value tables are swapped in around each member's body.
 llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const auto     all        = mod_.processes();
     const uint32_t proc_index = members.front();
     const Process& proc       = all[proc_index];
     ir_                       = &proc.ir;
+    cur_inst_                 = Index{ 0 }; // not the site an earlier body left: code names it (loc_text)
     frame_slots_.clear(); // a process has no frame; deinit sees only temps
+    // The NBA blocks this lowering registers get their commit functions when it is
+    // done (emit_block_commits), in the module the body went into.
+    const auto first_block = static_cast<uint32_t>(block_commits_.size());
 
-    // This group's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
-    // constant GEP so it is valid in any block of the function. Dedup prep:
-    // a group fully inside one reused-definition instance instead loads the
-    // instance's sched base and indexes the def-local ordinal — the same
-    // slot, materialized at function entry (materialize_sched_ptr); a
-    // unique-definition or cross-instance group keeps the folded constant.
-    sched_anchor_      = SignalSlot::no_anchor;
-    sched_group_       = group_of_[proc_index];
-    const uint32_t gaid = group_anchor_of_[sched_group_];
-    if (gaid != SignalSlot::no_anchor) {
-        sched_anchor_  = gaid;
-        sched_ordinal_ = proc_sched_ord_[proc_index];
+    // A group of an instance addresses everything of that instance through its
+    // record. A coroutine group's flag is its own wake word in the instance's
+    // record (ctx_sched_base plus the def-local ordinal, materialize_group_ctx)
+    // -- while a thunk row touches no flag but the wake word it is handed. An
+    // unscoped group has no record and keeps the folded constant.
+    const uint32_t g_ = group_of_[proc_index];
+    own_anchor_       = group_unit_anchor_[g_];
+    own_ctx_          = nullptr;
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        own_ordinal_ = proc_sched_ord_[proc_index];
     }
-    sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
+    sched_ptr_ = own_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
 
     // Deferred immediate assertion (LRM 16.4): a group carrying one gets a
     // per-process generation counter, bumped at each activation, that tags
     // its queued reports so a superseded activation's reports are dropped at
-    // maturation (the flush of LRM 16.4.2). Such a group is a forced coroutine
-    // (is_simple_always is false for a deferred Severity) and coroutines are
-    // never shared across instances (only thunk groups dedup), so every
-    // instance of a reused definition is its own group with its own gen
-    // global keyed by the per-instance group id — per-instance correct with
-    // no extra machinery. The counter is a plain per-group global.
+    // maturation (the flush of LRM 16.4.2). The counter of a group of an
+    // instance is a field of the instance's record (defer_gen_ptr_for), so the
+    // group is the same code in every instance of its unit.
     cur_defer_group_ = -1;
     if (std::any_of(members.begin(), members.end(),
                     [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
-        cur_defer_group_ = static_cast<int32_t>(sched_group_);
+        cur_defer_group_ = static_cast<int32_t>(g_);
     }
 
-    // Same-eligibility NBA prep: the group's block registrations pass
-    // (instance block base + group-local ordinal) instead of the absolute
-    // block id — identical value (a group's blocks are id-contiguous by
-    // construction: block_register only runs while its group lowers), in the
-    // def-relative form a shared body needs. Main stores the base into the
-    // instance ctx after lowering, once the ids are known (ctx_blk_fills_).
+    // Same-eligibility NBA prep: the function's block registrations pass
+    // (instance block base + function-local ordinal) instead of the absolute
+    // block id — identical value (a function's blocks are id-contiguous by
+    // construction: block_register only runs while it lowers), in the
+    // def-relative form shared code needs. Main stores the base into the
+    // instance record after lowering, once the ids are known (ctx_blk_fills_).
     group_first_block_ = -1;
 
-    // Name a process by its owner: a definition-unit group (split mode) is
-    // @clotho.inst.<hier>.p<def-local ordinal> — instance-qualified (twin
-    // instances land in one module, so a bare def-local name would
-    // collide) with a def-local index, keeping the unit module's bytes
-    // independent of whole-design process numbering (cache-stability
-    // prep). Everything else keeps @<module>.p<flat index>; source-offset
-    // naming would collide across instances of one module (processes
-    // share the AST location); proc.loc still carries the source mapping.
-    // A fused group is named by its first member plus its size.
-    const uint32_t ua   = group_unit_anchor_[group_of_[proc_index]];
-    std::string    name = config_.split && ua != SignalSlot::no_anchor
-                            ? "clotho.inst." + anchors_[ua].name + ".p" +
-                                std::to_string(proc_sched_ord_[proc_index])
-                            : mod_.name + ".p" + std::to_string(proc_index);
+    // Name a process by its owner: a group of an instance is
+    // <unit key>.p<def-local ordinal>, so its symbol is a function of its unit
+    // alone -- no instance name, no design-wide process number -- and the unit's
+    // module does not change when instances come or go. A group of no instance
+    // keeps @<module>.p<flat index>; source-offset naming would collide across
+    // instances of one module (processes share the AST location); proc.loc still
+    // carries the source mapping. A fused group is named by its first member
+    // plus its size.
+    const uint32_t ua   = group_unit_anchor_[g_];
+    std::string    name = ua != SignalSlot::no_anchor
+                            ? unit_symbol(anchors_[ua]) + ".p" + std::to_string(proc_sched_ord_[proc_index])
+                            : std::string(kRootSymbol) + ".p" + std::to_string(proc_index);
     if (members.size() > 1) {
         name += ".f" + std::to_string(members.size());
     }
@@ -76,6 +75,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // Per-member table setup, run before lowering anything of that member.
     const auto select_member = [&](uint32_t m) {
         ir_             = &all[m].ir;
+        cur_inst_       = Index{ 0 };
         cur_proc_scope_ = all[m].scope;
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
@@ -91,33 +91,32 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         lower_region(ir_->root());
         runs_once_ = false;
     };
-    // Open the guarded region of a group: returns true when its members are
-    // guarded, having ensured the wake word carries at least one of the
-    // group's bits.
-    //
-    // That store is the fail-safe. If the word carries none of this group's
-    // bits, some wake path pushed the group without naming a trigger, so set
-    // them all and let every member run -- which makes a missed bit a lost
-    // optimization rather than a lost execution, in a wake path this wide.
-    // It also means each member's guard is a plain test with no fallback of
-    // its own.
+    // A trigger mask the code being lowered tests the wake word against. An
+    // instance's own code (own_anchor_ set) loads it from its record, where
+    // main stored it at startup with the design-global colours, so no colour
+    // reaches unit code; code that addresses absolutely (the dispatcher of a
+    // group spanning instances, an unscoped group) bakes it, which is root
+    // glue. `field` is the record's array (ctx_mmask_base / ctx_gmask_base)
+    // and `m` the process whose def-local ordinal indexes it.
+    const auto mask_value = [&](uint64_t baked, uint32_t Anchor::*field, uint32_t m) -> llvm::Value* {
+        if (own_anchor_ == SignalSlot::no_anchor) {
+            return b_.getInt64(baked);
+        }
+        Anchor& a = anchors_[own_anchor_];
+        return ctx_field(a, a.*field + proc_sched_ord_[m], b_.getInt64Ty());
+    };
+    // Open the guarded region of a coroutine group: returns true when its
+    // members are guarded, having ensured the wake word carries at least one of
+    // the group's bits (emit_trigger_failsafe). A thunk row's fail-safe is its
+    // entry's.
     auto open_group = [&](uint32_t g) -> bool {
         if (!group_guarded_[g]) {
             return false;
         }
-        auto* mask = b_.getInt64(group_trig_mask_[g]);
-        auto* w    = b_.CreateLoad(sched_word_ty(), sched_ptr_);
-        auto* none = b_.CreateICmpEQ(b_.CreateAnd(w, mask), b_.getInt64(0));
-        auto* set  = llvm::BasicBlock::Create(ctx_, "trig.all", fn_);
-        auto* go   = llvm::BasicBlock::Create(ctx_, "trig.go", fn_);
-        b_.CreateCondBr(none, set, go);
-        b_.SetInsertPoint(set);
-        b_.CreateStore(b_.CreateOr(w, mask), sched_ptr_);
-        b_.CreateBr(go);
-        b_.SetInsertPoint(go);
+        emit_trigger_failsafe(sched_ptr_, mask_value(group_trig_mask_[g], &Anchor::ctx_gmask_base, members.front()));
         return true;
     };
-    // Open one member's guard: run it only if one of ITS OWN events has
+    // Open member `i`'s guard: run it only if one of ITS OWN events has
     // fired. Returns the join block to branch to once the body is emitted
     // (null when the group is unguarded).
     //
@@ -131,15 +130,18 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // (comb-fusion.md's "the downstream member runs later in the same
     // activation with final values" -- with guards, that sentence is
     // load-bearing, not an aside).
-    auto open_guard = [&](bool guarded, uint64_t mask, uint64_t group_mask) -> llvm::BasicBlock* {
+    auto open_guard = [&](bool guarded, uint32_t g, size_t i) -> llvm::BasicBlock* {
         // A member sensitive to everything the group is sensitive to runs on
         // every activation, so its guard can only ever be true: emit none.
-        if (!guarded || mask == group_mask) {
+        // Only decidable while the masks are baked; a mask read from a record
+        // may be anything.
+        if (!guarded || (own_anchor_ == SignalSlot::no_anchor && member_mask(g, i) == group_trig_mask_[g])) {
             return nullptr;
         }
         auto* run  = llvm::BasicBlock::Create(ctx_, "mem.run", fn_);
         auto* join = llvm::BasicBlock::Create(ctx_, "mem.skip", fn_);
-        auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), b_.getInt64(mask));
+        auto* mask = mask_value(member_mask(g, i), &Anchor::ctx_mmask_base, members[i]);
+        auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), mask);
         b_.CreateCondBr(b_.CreateICmpNE(bits, b_.getInt64(0)), run, join);
         b_.SetInsertPoint(run);
         return join;
@@ -154,29 +156,20 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
 
     // Coroutine elision: a suspension-free always-with-sensitivity group (see
     // is_simple_always) carries no state across activations, so instead of a
-    // coroutine it lowers to a plain thunk — void @<name>.thunk(state, wheel)
-    // — run once per activation. The seed subscribes a tagged pointer to it
-    // and the drain calls it directly (no frame, no suspend switch, no
-    // CoroSplit). The sched-flag timeline matches the coroutine always-loop:
-    // the flag is held set across the body and cleared at the end, so
-    // same-instant re-triggers behave identically.
-    // Cross-instance fused thunk group under split emission: lower each
-    // member as its own plain function emitted into the member's OWN
-    // definition unit, plus a root-emitted dispatcher (named like the
-    // merged thunk, so seed/subscription/drain contracts are untouched)
-    // calling them in scheduled-rank order. The members become
-    // per-definition cacheable — the merged form parked the whole group's
-    // code in the always-recompiled root. Single-scope groups keep the
-    // merged body inside their unit (no call overhead). Only the population
-    // that cannot otherwise leave root pays the per-member call, not every comb
-    // group (docs/design/module-split.md, Partition).
-    // Member cap: a cross-module member call cannot be inlined, so the
-    // per-activation dispatch cost scales with member count — a 256-member
-    // comb group measured 3.7x sim outlined (combchain), while the real
-    // cross-instance populations on cores (2-7 member clocked groups) are
-    // wall-neutral. Groups past the cap keep the merged root body.
-    constexpr size_t outline_max_members = 16;
-    const uint32_t g_ = group_of_[proc_index];
+    // coroutine it lowers to a plain function run once per activation. The
+    // scheduler holds the ENTRY of its schedule group (emit_sched_entries), a
+    // tagged pointer the drain calls directly (no frame, no suspend switch, no
+    // CoroSplit), and the entry owns the sched-flag timeline: the flag is held
+    // set across every row and cleared at the end, so same-instant re-triggers
+    // behave as they do for a coroutine always-loop.
+    //
+    // The function is a ROW, `void(ptr ctx, ptr wheel [, ptr flag])`: it takes
+    // the record of the instance it runs for (@clotho.inst.<hier>.ctx) and
+    // addresses everything of that instance through it and, when its members are
+    // guarded, the wake word whose trigger bits those guards test. It is code of
+    // its unit, so one function serves every instance whose code is the same;
+    // signals of other instances it reaches stay absolute.
+
     // A thunk group is not a thread: no frame, no handle, no control block, and
     // proc_arg's own contract already says such a body passes null. Reset here,
     // ahead of both thunk paths, because they return before the coroutine path's
@@ -189,125 +182,76 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // forks widens the population it is latent in, so fix it rather than reason
     // about it again.
     pcb_ = nullptr;
-    // Nor is a thunk group a PreInit or Preponed capture, whose stores generate
-    // no event: that is a property of the process being lowered, so it must not
-    // be inherited from the one lowered before this group (a declaration
-    // initializer of an earlier top), or every member store of the group wakes
-    // nobody. The outlined member functions below read it without ever setting it.
-    silent_stores_ = false;
-    if (config_.split && config_.outline && thunk_group_[g_] &&
-        members.size() > 1 && members.size() <= outline_max_members &&
-        group_unit_anchor_[g_] == SignalSlot::no_anchor &&
-        std::any_of(members.begin(), members.end(),
-                    [&](uint32_t m) { return proc_sched_anchor_[m] != ~0u; })) {
-        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
-
-        std::vector<llvm::Function*> member_fns;
-        member_fns.reserve(members.size());
-        for (const uint32_t m : members) {
-            const uint32_t aid = proc_sched_anchor_[m];
-            env_ = aid != ~0u ? &unit_env(anchors_[aid]) : root_env_.get();
-            const std::string mname =
-              aid != ~0u ? "clotho.inst." + anchors_[aid].name + ".p" +
-                             std::to_string(proc_sched_ord_[m])
-                         : mod_.name + ".p" + std::to_string(m);
-            fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, mname, env_->llmod);
-            state_ = fn_->getArg(0);
-            state_->setName("state");
-            wheel_ = fn_->getArg(1);
-            wheel_->setName("wheel");
-            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-            rng_slot_ = sym(rng_global_);
-            // Member bodies never touch the sched flag (the dispatcher
-            // owns the timeline) and address absolutely (no ctx), but
-            // their NBA block ids need a member-scoped def-stable idval
-            // key: block_register keys on outline_anchor_/outline_ord_
-            // while these are set, with block ids member-contiguous
-            // (group_first_block_ reset per member).
-            outline_anchor_    = aid;
-            outline_ord_       = proc_sched_ord_[m];
-            group_first_block_ = -1;
-            select_member(m);
-            str_vals_.assign(ir_->inst_count(), nullptr);
-            build_str_temps();
-            build_dynarr_temps();
-            build_agg_elem_temps();
-            lower_member_body(m);
-            deinit_body_strings();
-            b_.CreateRetVoid();
-            member_fns.push_back(fn_);
-        }
-        outline_anchor_    = ~0u;
-        group_first_block_ = -1;
-
-        env_ = root_env_.get();
-        fn_  = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
-        state_ = fn_->getArg(0);
-        state_->setName("state");
-        wheel_ = fn_->getArg(1);
-        wheel_->setName("wheel");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
-        rng_slot_ = sym(rng_global_);
-        const bool guarded = open_group(g_);
-        for (size_t i = 0; i < member_fns.size(); ++i) {
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
-            b_.CreateCall(fnty, sym(member_fns[i]), { state_, wheel_ });
-            close_guard(join);
-        }
-        b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
-        b_.CreateRetVoid();
-        return fn_;
-    }
-
-    if (thunk_group_[group_of_[proc_index]]) {
-        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
-        fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
-        state_ = fn_->getArg(0);
-        state_->setName("state");
-        wheel_ = fn_->getArg(1);
-        wheel_->setName("wheel");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-        awaiter_          = nullptr;
-        record_           = nullptr;
-        fork_record_      = nullptr;
-        fork_live_        = nullptr;
-        disable_node_     = nullptr;
+    // What a thunk body starts from: no thread, no wait or fork state, not a
+    // task, stores that generate events. The last is a property of the process
+    // being lowered (a PreInit or Preponed capture has silent stores), so a
+    // thunk group must not inherit it from the process lowered before it: every
+    // member store would wake nobody.
+    const auto reset_thunk_state = [&] {
+        awaiter_       = nullptr;
+        record_        = nullptr;
+        fork_record_   = nullptr;
+        fork_live_     = nullptr;
+        disable_node_  = nullptr;
         fork_disable_nodes_.clear();
-        spawn_sched_ = nullptr;
+        spawn_sched_   = nullptr;
         block_nodes_.clear();
         event_wait_nodes_.clear();
-    sync_nodes_.clear();
-        cur_is_task_      = false;
-        hdl_              = nullptr;
-        auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
-        b_.SetInsertPoint(entry_bb);
-        // A thunk group cannot reach a draw (compute_fusion_groups excludes one
-        // that can), so this pointer only ever travels as a callee's ABI
-        // argument and is never dereferenced.
-        rng_slot_ = sym(rng_global_);
-        materialize_group_ctx();
+        sync_nodes_.clear();
+        cur_is_task_   = false;
+        silent_stores_ = false;
+        hdl_           = nullptr;
+    };
+    if (thunk_group_[g_]) {
+        auto*                    ptr_ty    = llvm::PointerType::getUnqual(ctx_);
+        const bool               takes_flag = group_guarded_[g_];
+        std::vector<llvm::Type*> params{ ptr_ty, ptr_ty };
+        if (takes_flag) {
+            params.push_back(ptr_ty);
+        }
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), params, false);
+        // Internal: its callers are the entry of its schedule group, in this
+        // module when the group has no other row (where the inliner may fold the
+        // body in), or a dispatcher in root, which promotes it through sym().
+        fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
+        fn_->getArg(0)->setName("ctx");
+        wheel_ = fn_->getArg(1);
+        wheel_->setName("wheel");
+        if (takes_flag) {
+            fn_->getArg(2)->setName("flag");
+        }
+        if (own_anchor_ != SignalSlot::no_anchor) {
+            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+        }
+        reset_thunk_state();
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+        // The `state` callees still take is the root's. A thunk group cannot
+        // reach a draw (compute_fusion_groups excludes one that can), so the RNG
+        // pointer only ever travels as a callee's ABI argument and is never
+        // dereferenced.
+        state_     = sym(state_global_);
+        rng_slot_  = sym(rng_global_);
+        own_ctx_   = own_anchor_ != SignalSlot::no_anchor ? fn_->getArg(0) : nullptr;
+        sched_ptr_ = takes_flag ? fn_->getArg(2) : nullptr;
         // Run each member body per activation, freeing its string temporaries
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
         // process, so deinit_body_strings frees exactly this member's temps.
-        const bool guarded = open_group(group_of_[proc_index]);
         for (size_t i = 0; i < members.size(); ++i) {
             select_member(members[i]);
             str_vals_.assign(ir_->inst_count(), nullptr);
             build_str_temps();
             build_dynarr_temps();
             build_agg_elem_temps();
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
+            llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
         }
-        b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
         b_.CreateRetVoid();
+        own_ctx_   = nullptr;
+        sched_ptr_ = nullptr;
+        emit_block_commits(first_block, fn_);
         return fn_;
     }
 
@@ -323,13 +267,26 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     fn_          = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, env_->llmod);
     // Mark it pre-split so the CoroSplit pass picks it up.
     fn_->setPresplitCoroutine();
-    state_ = fn_->getArg(0);
-    state_->setName("state");
+    // The ramp of a group of an instance takes the record of the instance it
+    // runs for (ramp_arg), like a thunk row, so one ramp serves every instance of
+    // its unit; any other group takes the root state pointer.
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        own_ctx_ = fn_->getArg(0);
+        own_ctx_->setName("ctx");
+        state_ = sym(state_global_);
+    } else {
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+    }
     wheel_ = fn_->getArg(1);
     wheel_->setName("wheel");
-    // The state pointer is the sole module memory the process touches; noalias
-    // lets the allocator rematerialize signal loads instead of spilling them.
-    fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+    // The state pointer is the sole module memory a root process touches; noalias
+    // lets the allocator rematerialize signal loads instead of spilling them. An
+    // instance's ramp reaches its wake word through the record, which wakers
+    // write through pointers of their own, so its record cannot claim it.
+    if (own_anchor_ == SignalSlot::no_anchor) {
+        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+    }
     awaiter_          = nullptr;
     record_           = nullptr;
     fork_record_      = nullptr;
@@ -441,6 +398,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         member_agg_elem.push_back(agg_elem_ret_);
     }
     ir_ = &proc.ir;
+    cur_inst_ = Index{ 0 };
 
     // Shared epilogue, built up front so #delay suspends and the final suspend
     // can all branch to it. cleanup frees the frame (coro.free -> rt_free); ret
@@ -512,7 +470,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // module-wide state along, which by that proof nothing dereferences.
     if (rng_procs_[proc_index]) {
         rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
-        b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.getInt64(proc_index) });
+        b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.CreateZExt(proc_index_value(proc_index), b_.getInt64Ty()) });
     } else {
         rng_slot_ = sym(rng_global_);
     }
@@ -558,13 +516,13 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.CreateBr(loop_bb);
         b_.SetInsertPoint(loop_bb);
         emit_defer_gen_bump(); // activation start = deferred-assertion flush point
-        const bool guarded = open_group(group_of_[proc_index]);
+        const bool guarded = open_group(g_);
         for (size_t i = 0; i < members.size(); ++i) {
             select_member(members[i]);
             str_vals_     = member_strs[i];
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
+            llvm::BasicBlock* join = open_guard(guarded, g_, i);
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
@@ -621,6 +579,8 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // lowering, the event_wait_node hazard: proc_abort_exit reads this one.
     program_end_bb_   = nullptr;
     cur_program_inst_ = kNoProgramInst;
+    own_ctx_ = nullptr;
+    emit_block_commits(first_block, fn_);
     return fn_;
 }
 
@@ -781,12 +741,11 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     params.push_back(ptr); // rng
     // The calling THREAD's process control block (LRM 9.7), so
     // `process::self()` inside a subroutine names the caller rather than the
-    // callee -- a task or function is not a thread. Present only in a design
-    // that names `process`, and uniform across the design for the same reason
-    // `rng` is unconditional: one FunctionType per vtable slot.
-    if (design_uses_process_) {
-        params.push_back(ptr); // proc
-    }
+    // callee -- a task or function is not a thread. Always present, null where
+    // the design has no control blocks: a signature that depended on whether
+    // some other unit names `process` would make a unit's code change with
+    // its callers' (docs/design/modular-compilation.md, "Code generation").
+    params.push_back(ptr); // proc
     // The calling THREAD's scheduling home region (LRM 24.3.1): "a section of
     // sequential code anywhere in the design or testbench inherits the
     // scheduling region of the thread that calls it". A FUNCTION cannot suspend
@@ -794,24 +753,20 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     // spawn a `fork ... join_none` child, and that child is a thread whose park
     // sites need the answer. Sits beside `proc` because it is the same kind of
     // thing: the second of the two facts a callee inherits from its caller's
-    // thread rather than from its own declaration. Gated design-wide, on the
-    // same uniformity argument as `proc` (see home_param_index).
-    if (design_uses_home_arg_) {
-        params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
-    }
+    // thread rather than from its own declaration. Always present, for the
+    // reason `proc` is.
+    params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         const Ref     pt  = f.param_types[k];
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
         if (dir == ArgDir::Ref) {
-            // The actual's storage pointer, plus -- only when some call site
-            // binds this formal to a place inside a container's heap buffer --
-            // the relocation epoch of that container, its value at the call, and
-            // the site record for the staleness report (§3.0).
-            params.push_back(ptr);                 // &actual storage
-            for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
-                params.push_back(ptr);             // &epoch, outermost first
-                params.push_back(b_.getInt64Ty()); // expected epoch
-            }
+            // The actual's storage pointer and its witness chain: null for a
+            // place that cannot move, else the caller's array of (&epoch,
+            // expected epoch) pairs, one per container level, ended by a null
+            // epoch (§3.0). One shape for every caller, so the callee's
+            // signature never depends on how any of them binds the formal.
+            params.push_back(ptr); // &actual storage
+            params.push_back(ptr); // witness chain, or null
             continue;
         }
         // A dynamic array or queue is one handle pointer regardless of
@@ -853,14 +808,14 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     }
     auto* fnty = llvm::FunctionType::get(rty, params, false);
     auto* fn   = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
-                                        mod_.name + ".fn." + f.name, env_->llmod);
+                                        subroutine_symbol(f, ".fn."), env_->llmod);
     fn->addParamAttr(0, llvm::Attribute::NoAlias);
     return fn;
 }
 
 // A task is a switched-resume coroutine. Its signature is:
-//   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel,
-//                          [ptr proc,] [i8 home,] <per formal>, ptr record)
+//   ptr @<instance>.task.<name>(ptr noalias record, ptr rng, ptr wheel, ptr proc,
+//                          i8 home, <per formal>, ptr record)
 // where each 2-state input formal contributes one iW and each 4-state one an
 // (i(2W) mm, iW z) pair, each output / inout formal one pointer to its caller
 // temp's slot (two, mm and z, when 4-state), and an unpacked aggregate formal
@@ -875,27 +830,20 @@ llvm::Function* Backend::declare_task(FunctionId id) {
     params.push_back(ptr); // state
     params.push_back(ptr); // rng
     params.push_back(ptr); // wheel
-    if (design_uses_process_) {
-        params.push_back(ptr); // proc — the calling thread's control block
-    }
+    params.push_back(ptr); // proc — the calling thread's control block
     // The calling thread's home region, LRM 24.3.1's "inherits the scheduling
     // region of the thread that calls it". This is the load-bearing one: a task
     // reached from both a program `initial` and an ordinary process is lowered
     // ONCE, so its park sites cannot fold a home, and the only authority on
     // which region the running thread belongs to is the caller. See
-    // build_shared_home_fns for who actually reads it, and home_param_index for
-    // why it is gated design-wide rather than per callee.
-    if (design_uses_home_arg_) {
-        params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
-    }
+    // build_shared_home_fns for who actually reads it. Present in every
+    // signature, like `proc`, whether or not the design has a body that reads it.
+    params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         if (f.arg_dirs[k] == ArgDir::Ref) {
-            // The same shape declare_function builds, narrow or fat.
-            params.push_back(ptr);                 // &actual storage
-            for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
-                params.push_back(ptr);             // &epoch, outermost first
-                params.push_back(b_.getInt64Ty()); // expected epoch
-            }
+            // The same shape declare_function builds.
+            params.push_back(ptr); // &actual storage
+            params.push_back(ptr); // witness chain, or null
         } else if (is_handle_type(f.param_types[k])) {
             params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
         } else if (is_agg_abi(f.param_types[k])) {
@@ -927,39 +875,113 @@ llvm::Function* Backend::declare_task(FunctionId id) {
     params.push_back(ptr); // record { ptr parent }
     auto* fnty = llvm::FunctionType::get(ptr, params, false);
     auto* fn   = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage,
-                                        mod_.name + ".task." + f.name, env_->llmod);
+                                        subroutine_symbol(f, ".task."), env_->llmod);
     fn->setPresplitCoroutine();
     fn->addParamAttr(0, llvm::Attribute::NoAlias);
     return fn;
 }
 
+uint32_t Backend::subroutine_anchor(const Function& f) const {
+    return f.scope != Process::no_scope && f.scope < anchor_of_scope_.size() ? anchor_of_scope_[f.scope]
+                                                                              : SignalSlot::no_anchor;
+}
+
+llvm::Value* Backend::callee_record(FunctionId fid) {
+    const uint32_t callee = subroutine_anchor(mod_.function(fid));
+    if (callee == SignalSlot::no_anchor) {
+        return sym(state_global_);
+    }
+    if (callee == own_anchor_ && own_ctx_ != nullptr) {
+        return own_ctx_;
+    }
+    // An instance's code reaches another instance's function through the binding
+    // its extern declaration of the function holds (filled at startup), so the
+    // code names no record of a neighbour.
+    if (own_anchor_ != SignalSlot::no_anchor && own_ctx_ != nullptr) {
+        Anchor&    a  = anchors_[own_anchor_];
+        const auto it = a.fn_bind_of.find(static_cast<uint32_t>(fid));
+        if (it != a.fn_bind_of.end()) {
+            a.fbind_used.resize(a.fn_externs.size(), 0);
+            a.fbind_used[it->second] = 1;
+            return own_field(a.ctx_fbind_base + it->second, llvm::PointerType::getUnqual(ctx_));
+        }
+    }
+    return ensure_ctx(anchors_[callee]);
+}
+
+llvm::Value* Backend::dispatch_record() {
+    return sym(state_global_);
+}
+
+llvm::Function* Backend::vtable_entry(FunctionId fid) {
+    if (subroutine_anchor(mod_.function(fid)) == SignalSlot::no_anchor) {
+        return sym(fn_decls_[static_cast<uint32_t>(fid)]);
+    }
+    return sym(vtable_thunks_.at(static_cast<uint32_t>(fid)));
+}
+
+// A virtual call cannot name the record of the instance its callee belongs to --
+// the callee is chosen at run time, from a vtable that can mix methods of a
+// package class and of a class an instance declares -- so a method of an instance
+// is entered through a thunk of the same signature that supplies it. The thunk is
+// root glue: the record it names is the only per-instance thing in it, and a
+// class an instance declares has that one instance, whose function the thunk
+// calls in its unit's module.
+void Backend::make_vtable_entries() {
+    ModuleEnv* const real_env = env_;
+    env_                      = root_env_.get();
+    const auto make           = [&](FunctionId fid) {
+        const Function& f      = mod_.function(fid);
+        const uint32_t  anchor = subroutine_anchor(f);
+        if (anchor == SignalSlot::no_anchor || f.is_dpi || vtable_thunks_.contains(static_cast<uint32_t>(fid))) {
+            return;
+        }
+        llvm::Function* callee = fn_decls_[static_cast<uint32_t>(fid)];
+        auto*           thunk  = llvm::Function::Create(callee->getFunctionType(), llvm::Function::InternalLinkage,
+                                                        callee->getName() + ".vt", env_->llmod);
+        llvm::IRBuilder<> tb(llvm::BasicBlock::Create(ctx_, "entry", thunk));
+        std::vector<llvm::Value*> args;
+        for (llvm::Argument& arg : thunk->args()) {
+            args.push_back(&arg);
+        }
+        args[0]    = ensure_ctx(anchors_[anchor]);
+        auto* call = tb.CreateCall(callee->getFunctionType(), sym(callee), args);
+        if (callee->getReturnType()->isVoidTy()) {
+            tb.CreateRetVoid();
+        } else {
+            tb.CreateRet(call);
+        }
+        vtable_thunks_.emplace(static_cast<uint32_t>(fid), thunk);
+    };
+    for (const ClassDesc& cd : mod_.class_descs()) {
+        for (const FunctionId fid : cd.slots) {
+            make(fid);
+        }
+        for (const FunctionId fid : cd.iface_slots) {
+            make(fid);
+        }
+    }
+    env_ = real_env;
+}
+
+void Backend::reserve_export_records() {
+    for (const DpiExport& e : mod_.dpi_exports) {
+        if (const uint32_t anchor = subroutine_anchor(mod_.function(e.func)); anchor != SignalSlot::no_anchor) {
+            ensure_ctx(anchors_[anchor]);
+        }
+    }
+}
+
 // How many LLVM parameters formal k occupies:
-//   4 — a `ref` fat pointer { &storage, &epoch, expect, site }
+//   2 — a `ref`: the aliased storage pointer and the witness chain
 //   1 — an aggregate storage pointer, a container handle pointer, a string
 //       handle (each one pointer in every direction), or a 2-state scalar (one
 //       iW, or the one pointer to its slot for an out / inout)
 //   2 — a 4-state scalar: the (must|may, z) plane pair, or the (&mm, &z)
 //       out / inout pointer pair
-// How many relocation-epoch witness PAIRS ref formal k of `f` carries: one per
-// container level some call site nests its actual inside, 0 for a ref to a
-// variable, a fixed-array element, a struct member, a class property or a whole
-// container HANDLE — storage that cannot move, so the callee emits no check
-// (docs/design/data-model.md §3.0).
-uint32_t Backend::ref_epoch_depth(const Function& f, size_t k) const {
-    const auto it = fn_ids_.find(&f);
-    // A function the map has not seen cannot be reasoned about; keep the guard,
-    // and keep it at the one level every heap place has at minimum.
-    return it == fn_ids_.end() ? 1u : facts_.ref_epoch_depth(it->second, k);
-}
-
-bool Backend::ref_needs_epoch(const Function& f, size_t k) const {
-    return ref_epoch_depth(f, k) != 0;
-}
-
 uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-        // slot, plus (ptr epoch, i64 expect) per level.
-        return 1u + 2u * ref_epoch_depth(f, k);
+        return 2;
     }
     // An aggregate is one storage pointer, in every direction (function or task).
     if (is_agg_abi(f.param_types[k])) {
@@ -979,27 +1001,22 @@ uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     return abi_four_state(f.param_types[k]) ? 2 : 1;
 }
 
-// LLVM arg index of the gated `home` parameter (declare_function /
-// declare_task): right after the gated `proc`, which is right after the fixed
-// head -- `state, rng` for a function, `state, rng, wheel` for a task.
-//
-// Gated DESIGN-WIDE rather than per callee, exactly as `proc` is and for the
-// same reason: a virtual call reaches its callee through one vtable slot, so
-// every body that can occupy that slot must share one FunctionType, and no
-// per-callee bit can vary it. The design-wide bit costs one i8 register on
-// calls that ignore it, and only in a design that has a shared body at all.
+// LLVM arg index of the `home` parameter (declare_function / declare_task),
+// right after `proc`, which is right after the fixed head -- `state, rng` for a
+// function, `state, rng, wheel` for a task. Both are in every signature, so no
+// body's position of a formal depends on what the rest of the design does: a
+// virtual call reaches its callee through one vtable slot, and a unit's code is
+// the same whoever calls it.
 uint32_t Backend::home_param_index(bool is_task) const {
-    return (is_task ? 3u : 2u) + (design_uses_process_ ? 1u : 0u);
+    return is_task ? 4u : 3u;
 }
 
 // LLVM arg index of each formal's first parameter for `f`'s signature shape:
-// functions start after `state, rng`, tasks after `state, rng, wheel`. The
-// record slot follows all formals.
+// functions start after `state, rng, proc, home`, tasks after `state, rng,
+// wheel, proc, home`. The record slot follows all formals.
 std::vector<uint32_t> Backend::param_indices(const Function& f) const {
     std::vector<uint32_t> idx(f.param_types.size());
-    // ... plus the gated `proc` and `home` parameters, which sit right after
-    // them, in that order.
-    uint32_t cur = home_param_index(f.is_task) + (design_uses_home_arg_ ? 1u : 0u);
+    uint32_t              cur = home_param_index(f.is_task) + 1;
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         idx[k] = cur;
         cur += formal_param_count(f, k);
@@ -1011,7 +1028,7 @@ std::vector<uint32_t> Backend::param_indices(const Function& f) const {
 uint32_t Backend::task_record_param(const Function& f) const {
     const auto idx = param_indices(f);
     if (idx.empty()) {
-        return home_param_index(/*is_task=*/true) + (design_uses_home_arg_ ? 1u : 0u);
+        return home_param_index(/*is_task=*/true) + 1;
     }
     return idx.back() + formal_param_count(f, f.param_types.size() - 1);
 }
@@ -1080,7 +1097,7 @@ void Backend::build_frame_layout(const Function& f) {
                                             frame_slots_[i].four_state);
         fields[i]               = frame_slots_[i].slot_ty;
     }
-    frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
+    frame_ty_ = llvm::StructType::create(ctx_, fields, subroutine_base(f) + ".fn." + f.name + ".frame");
 }
 
 // Power up the frame: 4-state locals come up X (must 0, may 1), 2-state 0; z
@@ -1204,7 +1221,6 @@ void Backend::deinit_body_strings() {
 // shared instruction lowering — Arg reads a parameter, Local addresses the
 // frame, Ret is a real return, Call invokes another function.
 void Backend::lower_function(FunctionId id) {
-    sched_anchor_ = SignalSlot::no_anchor; // functions are not a shareable group
     const Function& f = mod_.function(id);
     // A subroutine reached through a virtual interface handle addresses its
     // interface's signals through the instance formal 0 names, for the whole
@@ -1216,8 +1232,16 @@ void Backend::lower_function(FunctionId id) {
         // its body is native C, so there is nothing to lower.
         return;
     }
+    // A function of an instance addresses it through the record it is passed, like
+    // a group (own_ctx_, set at the entry below); one of no instance addresses
+    // absolutely.
+    own_anchor_ = subroutine_anchor(f);
+    own_ctx_    = nullptr;
     ir_ = &f.ir;
+    cur_inst_ = Index{ 0 };
     cur_fn_           = &f;
+    cur_sub_ordinal_  = subroutine_home_[static_cast<uint32_t>(id)].ordinal;
+    group_first_block_ = -1;
     // The body's LEXICAL home region (LRM 24.3.1): Reactive when reactive code
     // -- a program block, an assertion action block -- is what reaches it. Only
     // meaningful for a body one KIND of caller reaches; see reactive_home.
@@ -1244,19 +1268,26 @@ void Backend::lower_function(FunctionId id) {
 
     auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
     b_.SetInsertPoint(entry);
-    state_ = fn_->getArg(0);
-    state_->setName("state");
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        own_ctx_ = fn_->getArg(0);
+        own_ctx_->setName("ctx");
+        state_ = sym(state_global_);
+    } else {
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+    }
     // A function body runs inside the caller's thread, so its $urandom draws
     // come from the caller's state (LRM 18.13). Unlike a task's, this pointer
     // cannot outlive the call: a function is atomic.
     rng_slot_ = fn_->getArg(1);
     rng_slot_->setName("rng");
     // A function is not a thread either: `process::self()` inside one names the
-    // caller, so the block travels as a parameter (LRM 9.7).
+    // caller, so the block travels as a parameter (LRM 9.7). The parameter is
+    // in every signature; a design with no control blocks never reads it.
     pcb_ = nullptr;
+    fn_->getArg(2)->setName("proc");
     if (design_uses_process_) {
         pcb_ = fn_->getArg(2);
-        pcb_->setName("proc");
     }
     // Nor does it have a home region of its own: a function cannot suspend, so
     // it only carries the calling thread's home onward -- to a `fork ...
@@ -1264,9 +1295,9 @@ void Backend::lower_function(FunctionId id) {
     // Straight from the parameter, with no frame slot: there is no suspend for
     // the value to have to survive.
     home_arg_ = nullptr;
+    fn_->getArg(home_param_index(/*is_task=*/false))->setName("home");
     if (design_uses_home_arg_) {
         home_arg_ = fn_->getArg(home_param_index(/*is_task=*/false));
-        home_arg_->setName("home");
     }
     // A function takes no wheel parameter, but the clock is a global, so event
     // ops and any other time read resolve here exactly as they do in a task.
@@ -1308,6 +1339,8 @@ void Backend::lower_function(FunctionId id) {
     home_ptr_ = nullptr;
     home_arg_             = nullptr;
     frame_  = nullptr;
+    own_anchor_ = SignalSlot::no_anchor;
+    own_ctx_    = nullptr;
 }
 
 // Copy each aggregate input / inout formal's caller storage (passed by pointer)
@@ -1358,7 +1391,9 @@ void Backend::lower_task(FunctionId id) {
     const Function& f = mod_.function(id);
     const BodyCtx   body_ctx(*this, f);
     ir_               = &f.ir;
+    cur_inst_         = Index{ 0 };
     cur_fn_           = &f;
+    cur_sub_ordinal_  = subroutine_home_[static_cast<uint32_t>(id)].ordinal;
     // Same two answers a function's prologue records, and here they are the ones
     // that matter: a task suspends, so its park sites are where the home region
     // is actually spent. LRM 24.5's `module ... task T; #5; endtask` called from
@@ -1380,8 +1415,18 @@ void Backend::lower_task(FunctionId id) {
     str_vals_.assign(n, nullptr);
 
     auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-    state_       = fn_->getArg(0);
-    state_->setName("state");
+    own_anchor_  = subroutine_anchor(f);
+    own_ctx_     = nullptr;
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        // The record of the instance the task belongs to; the root state it
+        // replaces is read by nothing here.
+        own_ctx_ = fn_->getArg(0);
+        own_ctx_->setName("ctx");
+        state_ = sym(state_global_);
+    } else {
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+    }
     wheel_ = fn_->getArg(2);
     wheel_->setName("wheel");
     awaiter_ = nullptr;
@@ -1451,7 +1496,6 @@ void Backend::lower_task(FunctionId id) {
     // intra-body @event waits, exactly like a process's proc_sched slot.
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
-    sched_anchor_      = SignalSlot::no_anchor;
     group_first_block_ = -1;
     // And, for a task some `disable` names, this activation's list node — same
     // placement and for the same reason: a `disable` reads it while we are parked.
@@ -1478,9 +1522,9 @@ void Backend::lower_task(FunctionId id) {
     // A plain task activation is NOT a thread: it runs in its caller's, so it
     // carries the caller's block through unchanged (LRM 13.3).
     pcb_ = nullptr;
+    fn_->getArg(3)->setName("proc");
     if (design_uses_process_) {
         llvm::Value* caller = fn_->getArg(3);
-        caller->setName("proc");
         pcb_ = f.is_fork_child ? b_.CreateCall(proc_alloc_fn(), { caller }) : caller;
         // A fork child owns its state (it was reseeded above), so it publishes its
         // own; a plain task activation publishes nothing -- the thread's block
@@ -1497,9 +1541,9 @@ void Backend::lower_task(FunctionId id) {
     // of task enables. A fork child inherits the same way: it is spawned with
     // the spawning thread's current home (lower_fork), not with a lexical one.
     home_arg_ = nullptr;
+    fn_->getArg(home_param_index(/*is_task=*/true))->setName("home");
     if (design_uses_home_arg_) {
         home_arg_ = fn_->getArg(home_param_index(/*is_task=*/true));
-        home_arg_->setName("home");
     }
     acts_node_ = nullptr;
     fork_live_ = nullptr;
@@ -1723,23 +1767,22 @@ void Backend::lower_task(FunctionId id) {
     cur_is_task_      = false;
     frame_            = nullptr;
     task_epilogue_bb_ = nullptr;
+    own_anchor_       = SignalSlot::no_anchor;
+    own_ctx_          = nullptr;
 }
 
-// Record each ref formal's fat pointer into ref_ptr_ (Local k == formal k), so
-// local_lvalue aliases the actual's storage live and can check the actual's
-// container epoch on every access. Called in the callee prologue of both
-// functions and tasks. A ref formal takes no copy-in / copy-out.
+// Record each ref formal's pointer and witness chain into ref_ptr_ (Local k ==
+// formal k), so local_lvalue aliases the actual's storage live and can check the
+// actual's container epochs on every access. Called in the callee prologue of
+// both functions and tasks. A ref formal takes no copy-in / copy-out.
 void Backend::bind_ref_formals(const Function& f) {
     for (uint32_t k = 0; k < f.param_types.size(); ++k) {
         if (f.arg_dirs.empty() || f.arg_dirs[k] != ArgDir::Ref) {
             continue;
         }
-        const uint32_t p = param_llvm_index_[k];
-        ref_ptr_[k].slot = fn_->getArg(p);
-        for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
-            ref_ptr_[k].epochs.push_back(fn_->getArg(p + 1 + 2 * lvl));
-            ref_ptr_[k].expects.push_back(fn_->getArg(p + 2 + 2 * lvl));
-        }
+        const uint32_t p  = param_llvm_index_[k];
+        ref_ptr_[k].slot  = fn_->getArg(p);
+        ref_ptr_[k].chain = fn_->getArg(p + 1);
         // `formal` names the binding in a staleness report. It is a property of
         // the CALLEE, so it is held here rather than shipped per call.
         ref_ptr_[k].formal = f.name + " argument " + std::to_string(k + 1);
@@ -1941,7 +1984,7 @@ void Backend::lower_call_inst(Index i) {
         return;
     }
     llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
-    lower_call_common(i, f, cf->getFunctionType(), cf, ci.args);
+    lower_call_common(i, f, cf->getFunctionType(), cf, callee_record(ci.func), ci.args);
     emit_finish_check(callee_may_finish(ci.func));
 }
 
@@ -1982,7 +2025,7 @@ void Backend::lower_virtual_call_inst(Index i) {
     const Function& f    = mod_.function(vci.func); // signature shared by all overrides
     llvm::FunctionType* fnty =
         fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
-    lower_call_common(i, f, fnty, load_vtable_callee(vci, i), vci.args);
+    lower_call_common(i, f, fnty, load_vtable_callee(vci, i), dispatch_record(), vci.args);
     emit_finish_check(virtual_call_may_finish());
 }
 
@@ -1995,6 +2038,7 @@ void Backend::lower_call_common(Index               i,
                                 const Function&     f,
                                 llvm::FunctionType* fnty,
                                 llvm::Value*        callee,
+                                llvm::Value*        record,
                                 ExtraSlice          arg_slice) {
     // Every arm of the marshaling loop indexes the signature by the actual's
     // position, so an actual list that is not exactly as long as `param_types`
@@ -2008,21 +2052,17 @@ void Backend::lower_call_common(Index               i,
                                         f.param_types.size()) };
     }
     std::vector<llvm::Value*> argv;
-    argv.push_back(state_);
+    argv.push_back(record);
     // A function body runs in the caller's thread, so $urandom inside one
     // continues the caller's stream (LRM 18.13, 18.14.1).
     argv.push_back(rng_slot_);
     // A function runs in its caller's thread, so `process::self()` inside one
     // names the caller (LRM 9.7).
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // ... and its scheduling region, for the same reason (LRM 24.3.1). A
     // function cannot suspend, so this only matters for a `fork ... join_none`
     // child it spawns.
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(callee_home());
     // A ref actual that is a signal with waiters: the callee writes it live, so
     // its wait queue must be serviced with the call's net old -> new transition.
     // Snapshot each before the (atomic, zero-time) function call; service after.
@@ -2035,8 +2075,9 @@ void Backend::lower_call_common(Index               i,
     for (Index a : ir_->region(arg_slice)) {
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
         if (dir == ArgDir::Ref) {
-            // The fat ref: aliased storage, the actual's container epoch, that
-            // epoch now, and the site the callee reports a stale ref through.
+            // The ref: aliased storage, and the chain of the actual's container
+            // epochs as they are now (null when it cannot move), which the
+            // callee reports a stale ref through.
             // Every storage class goes through here — a plane slot, a managed
             // handle, an aggregate image — so `ref` has one shape.
             const Guarded&   lv = lvalue_of(a);
@@ -2061,9 +2102,9 @@ void Backend::lower_call_common(Index               i,
             if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
                 ref_containers.push_back(root);
             }
-            const RefBinding rb = ref_actual_arg(lv, f.param_types[k]);
+            const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
-            push_ref_epochs(argv, rb, ref_epoch_depth(f, k));
+            argv.push_back(ref_witness_chain(rb));
             if (!is_handle_type(f.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
@@ -2244,21 +2285,17 @@ void Backend::lower_task_call_inst(Index i) {
                                         tf.name, args.size(), tf.param_types.size()) };
     }
     std::vector<llvm::Value*>    argv;
-    argv.push_back(state_);
+    argv.push_back(virt ? dispatch_record() : callee_record(fid));
     argv.push_back(rng_slot_);
     argv.push_back(wheel_);
     // A task runs in its caller's thread too, so it carries the caller's block.
-    if (design_uses_process_) {
-        argv.push_back(proc_arg());
-    }
+    argv.push_back(proc_arg());
     // ... and its home region, which is the whole of LRM 24.5: "when a task
     // within a design module is called from a program, it shall use the reactive
     // region set for its scheduling activities". callee_home() is this thread's
     // answer at this call, so a task calling a task passes on what it inherited
     // rather than what its own declaration would say.
-    if (design_uses_home_arg_) {
-        argv.push_back(callee_home());
-    }
+    argv.push_back(callee_home());
     // Snapshot each ref-actual signal with waiters before the call; the wait
     // queue is serviced at the continuation with the net old -> new transition.
     // NOTE: a task that writes the same ref signal across a #delay (multiple time
@@ -2274,8 +2311,8 @@ void Backend::lower_task_call_inst(Index i) {
     std::vector<llvm::Value*> ref_containers;
     for (uint32_t k = 0; k < args.size(); ++k) {
         if (tf.arg_dirs[k] == ArgDir::Ref) {
-            // The fat ref, as at a function call: aliased storage, the actual's
-            // container epoch, that epoch now, and the report site. A task is
+            // The ref, as at a function call: aliased storage and the chain of
+            // the actual's container epochs as they are now. A task is
             // where the epoch earns its keep — it can suspend, and the container
             // can be restructured by another process while the ref stays live.
             const Guarded&   lv = lvalue_of(args[k]);
@@ -2317,9 +2354,9 @@ void Backend::lower_task_call_inst(Index i) {
             if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
                 ref_containers.push_back(root);
             }
-            const RefBinding rb = ref_actual_arg(lv, tf.param_types[k]);
+            const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
-            push_ref_epochs(argv, rb, ref_epoch_depth(tf, k));
+            argv.push_back(ref_witness_chain(rb));
             if (!is_handle_type(tf.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||

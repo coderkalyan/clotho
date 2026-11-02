@@ -106,40 +106,51 @@ void Backend::emit_delay_timer(llvm::Value* ticks) {
 
 // Store a { handle, flag_ptr } entry at a chosen slot of a queue array. The
 // edge is no longer stored per entry — it is encoded by which sub-queue the
-// entry lives in.
-void Backend::emit_entry(llvm::ArrayType* arr_ty,
-                         llvm::Value*     q,
-                         llvm::Value*     slot_idx,
-                         llvm::Value*     handle,
-                         llvm::Value*     flag_ptr) {
+// entry lives in. The slot is addressed by element, so a writer of another
+// unit's bucket names no capacity.
+void Backend::emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr) {
     llvm::StructType* elem = wait_elem_ty();
-    llvm::Value*      slot = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), slot_idx });
+    llvm::Value*      slot = b_.CreateInBoundsGEP(elem, q, slot_idx);
     b_.CreateStore(handle, b_.CreateStructGEP(elem, slot, 0));
     b_.CreateStore(flag_ptr, b_.CreateStructGEP(elem, slot, 1));
 }
 
-// Persistent (always-block) subscription: write a process's entry into the
-// signal's static queue at a compile-time slot. Slots are handed out in
-// process / wait-event order, matching the capacities build_wait_queues
-// computed, so each array fills exactly once and is never compacted. Issued
-// from the seed loop (emit_active_run) with the process's ramp handle and
-// scheduled-flag pointer — by plain stores, never by resuming the coroutine,
-// so it does not inhibit coro-elide of other processes. All subscriptions land
-// before any servicing, so the fixed-trip scans never read an empty slot.
-void Backend::emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* handle, llvm::Value* flag_ptr) {
+// Persistent (always-block) subscription, planned: where a process's entry goes. The
+// seed's tables hold it (emit_seed), and one loop of root makes the stores. A static
+// bucket takes the entry at a compile-time slot; slots are handed out in process /
+// wait-event order, matching the capacities build_wait_queues computed, so each array
+// fills exactly once and is never compacted. The store is a plain one of the
+// process's ramp handle and scheduled-flag pointer, never a resume of the coroutine,
+// so it does not inhibit coro-elide of other processes. All subscriptions land before
+// any servicing, so the fixed-trip scans never read an empty slot.
+//
+// An event has no buckets: a node of the contiguous persistent array links onto the
+// event object's waiter list. Edge is meaningless for an event (a trigger is not a
+// transition), so it is ignored here -- every event subscription is recorded once, on
+// the one list. The object is a constant only for an event of no instance that no
+// store reaches; any other is the one its variable's own handle names when the links
+// are made, which a declaration initializer (`event e2 = e1`) may have changed.
+Backend::StaticSub Backend::plan_static_subscribe(Signal sig, uint32_t edge) {
     const auto i = static_cast<uint32_t>(sig);
+    StaticSub  sub;
     if (mod_.signal(sig).is_event) {
-        // An event has no buckets: link a node from the contiguous persistent
-        // array onto the event object's waiter list. Edge is meaningless for an
-        // event (a trigger is not a transition), so it is ignored here -- every
-        // event subscription is recorded once, on the one list.
-        // A persistent subscription is never unlinked, so it needs no owner.
-        emit_event_link(event_obj_for(sig), next_static_event_node(), handle, flag_ptr,
-                        /*record_owner=*/false);
-        return;
+        sub.is_event = true;
+        sub.slot     = llvm::ConstantExpr::getInBoundsGetElementPtr(
+          event_nodes_arr_ty_, event_nodes_gv_,
+          llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(event_node_next_++) });
+        if (event_is_mono(sig) && slots_[i].anchor == SignalSlot::no_anchor) {
+            sub.obj = llvm::ConstantExpr::getInBoundsGetElementPtr(
+              events_arr_ty_, events_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(event_slot_[i]) });
+        } else {
+            sub.obj       = storage_address(slots_[i]);
+            sub.by_handle = true;
+        }
+        return sub;
     }
     const uint32_t slot = sta_next_[i][edge]++;
-    emit_entry(wait_sta_ty_[i][edge], sym(wait_sta_gv_[i][edge]), b_.getInt32(slot), handle, flag_ptr);
+    sub.slot            = llvm::ConstantExpr::getInBoundsGetElementPtr(
+      wait_elem_ty(), sym(wait_sta_gv_[i][edge]), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(slot) });
+    return sub;
 }
 
 // One-shot (intra-body @(sig)) registration: append this coroutine to the
@@ -167,14 +178,21 @@ void Backend::emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* hand
 // still needs a growable bucket, and in a design without a fork it is
 // unguarded. Sizing it to a constant would only move the cliff.
 void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
-    const auto   i       = static_cast<uint32_t>(sig);
-    llvm::Value* len_ptr = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
-    llvm::Value* q       = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
-    auto*        i32     = b_.getInt32Ty();
-    llvm::Value* len     = b_.CreateLoad(i32, len_ptr);
-    emit_len_full_check(b_, len, static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()),
-                        kRingWaitDynamic);
-    emit_entry(wait_dyn_ty_[i][edge], q, len, parked_handle(b_, hdl_), sched_ptr_);
+    const auto        i       = static_cast<uint32_t>(sig);
+    const SignalSlot& s       = slots_[i];
+    llvm::Value*      len_ptr = wait_base(WaitPart::DynamicLen, sig, edge);
+    llvm::Value*      q       = wait_base(WaitPart::Dynamic, sig, edge);
+    auto*             i32     = b_.getInt32Ty();
+    llvm::Value*      len     = b_.CreateLoad(i32, len_ptr);
+    // The bucket's capacity is every waiter of the signal's, the owner's own
+    // among them, so a signal of another unit's code reads it from the signal's
+    // port instead of baking it.
+    llvm::Value* cap =
+      port_reachable(s) && binding_of(s) != no_bind
+        ? static_cast<llvm::Value*>(b_.CreateLoad(i32, port_elem_ptr(s, port_of(s)->dyn[edge].cap)))
+        : b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()));
+    emit_len_full_check(b_, len, cap, kRingWaitDynamic);
+    emit_entry(q, len, parked_handle(b_, hdl_), sched_ptr_);
     b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_ptr);
 }
 
@@ -276,11 +294,13 @@ Backend::WaitCounts Backend::wait_counts() const {
     WaitCounts c{ std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }),
                   std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }) };
     // Static capacities count what the seed loop will actually subscribe:
-    // one entry per group (signal, edge) — a fused group subscribes its
-    // canonical set once, not once per member. The scan reads every slot
-    // up to the capacity, so over-allocation would read a null flag ptr.
-    for (const std::vector<WaitEvent>& evs : group_events_) {
-        for (const WaitEvent& w : evs) {
+    // one entry per schedule group (signal, edge) — a fused group subscribes
+    // its canonical set once, not once per member, and the groups of several
+    // instances that share a wake set subscribe once between them. The scan
+    // reads every slot up to the capacity, so over-allocation would read a
+    // null flag ptr.
+    for (const SchedGroup& sg : sched_) {
+        for (const WaitEvent& w : sg.events) {
             c.sta[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)]++;
         }
     }
@@ -454,19 +474,30 @@ llvm::StructType* Backend::event_node_ty() {
     return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, ptr });
 }
 
-// The object of a statically-declared event, as a folded constant GEP into
-// clotho.events. Slot 0 is the reserved null object, so a real event's slot is
-// always >= 1.
-//
-// A compile-time slot is only sound because a module definition that declares
-// an event is never body-shared by module dedup: the event signal registers as
-// an instance-specific hint (`extra-sig`), so each instance keeps its own
-// signal, its own slot, and its own object. The previous per-event named
-// globals relied on exactly the same property.
+// The slot of the object an event variable names, as an IR value. A declared
+// event powers on holding the handle of its own object (Aggregates.cpp), so the
+// handle read from the variable's storage -- the instance's own, or the one a
+// binding names (an event port) -- is the slot, and it stays the declared one
+// where the variable is monomorphic. Shared code thereby names no slot and no
+// event of the instance it was lowered for. Only an event of no instance (a
+// package's), one object for everyone, folds to a constant while monomorphic.
+llvm::Value* Backend::event_slot_value(Signal sig) {
+    const auto i = static_cast<uint32_t>(sig);
+    if (slots_[i].anchor == SignalSlot::no_anchor && event_is_mono(sig)) {
+        return b_.getInt32(event_slot_[i]);
+    }
+    return b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+}
+
+// The object of a declared event: clotho.events at its slot. A variable that is
+// assigned names another object later, so what is wanted of it (the dump watches
+// the declared one) is the object it powered on with, by number. Only the
+// whole-design dump registration asks, and that is code of root (vcd_register_fn),
+// which owns the design-wide numbering; no unit's code names a declared slot.
 llvm::Value* Backend::event_obj(Signal sig) {
-    const auto slot = event_slot_[static_cast<uint32_t>(sig)];
-    return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_),
-                                { b_.getInt32(0), b_.getInt32(slot) });
+    llvm::Value* slot = event_is_mono(sig) ? event_slot_value(sig)
+                                           : static_cast<llvm::Value*>(b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]));
+    return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_), { b_.getInt32(0), slot });
 }
 
 // The object a runtime event HANDLE names. The handle is { u32 slot, u32 gen }
@@ -591,6 +622,59 @@ void Backend::analyze_event_monomorphism() {
     for (uint32_t i = 0; i < mod_.function_count(); ++i) {
         visit(mod_.function(static_cast<FunctionId>(i)).ir);
     }
+    // The code of a unit is shared by its instances, so a variable it names is
+    // one object for the run only if it is in every instance: the declaration at
+    // one def-local position, and what each instance binds one import to, are
+    // monomorphic only when all of them are. Signals that must agree are joined,
+    // and a class is monomorphic when none of its members is stored to.
+    std::vector<uint32_t> up(event_slot_.size());
+    for (uint32_t s = 0; s < up.size(); ++s) {
+        up[s] = s;
+    }
+    const auto find = [&](uint32_t s) {
+        while (up[s] != s) {
+            up[s] = up[up[s]];
+            s     = up[s];
+        }
+        return s;
+    };
+    const auto join = [&](uint32_t a, uint32_t b) { up[find(a)] = find(b); };
+    std::map<std::tuple<llvm::StructType*, uint32_t, uint32_t>, uint32_t> owned;   // (type, unit, position)
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t>                      imported; // (unit, extern)
+    for (uint32_t s = 0; s < event_slot_.size(); ++s) {
+        if (event_slot_[s] == 0 || slots_[s].anchor == SignalSlot::no_anchor) {
+            continue;
+        }
+        const Anchor& a = anchors_[slots_[s].anchor];
+        const auto [it, fresh] = owned.try_emplace({ a.ty, a.unit, slots_[s].path.back() }, s);
+        if (!fresh) {
+            join(s, it->second);
+        }
+    }
+    for (const Anchor& a : anchors_) {
+        if (a.unit == InstanceScope::no_unit) {
+            continue;
+        }
+        for (uint32_t k = 0; k < a.externs.size(); ++k) {
+            const auto s = static_cast<uint32_t>(a.externs[k]);
+            if (event_slot_[s] == 0) {
+                continue;
+            }
+            const auto [it, fresh] = imported.try_emplace({ a.unit, k }, s);
+            if (!fresh) {
+                join(s, it->second);
+            }
+        }
+    }
+    std::vector<bool> stored(event_slot_.size(), false);
+    for (uint32_t s = 0; s < event_slot_.size(); ++s) {
+        if (!event_mono_[s]) {
+            stored[find(s)] = true;
+        }
+    }
+    for (uint32_t s = 0; s < event_slot_.size(); ++s) {
+        event_mono_[s] = !stored[find(s)];
+    }
 }
 
 // True when `sig` is an event whose object is fixed at compile time.
@@ -697,6 +781,7 @@ void Backend::build_wait_queues() {
     wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
     wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
     sta_next_.assign(sigs.size(), { 0, 0, 0 });
+    wait_sta_trig_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
 
     // Event objects. Slots were numbered by assign_event_slots (it has to run
     // before emit_state_global, because a declared event's power-on value IS its
@@ -773,6 +858,14 @@ void Backend::build_wait_queues() {
                 wait_sta_gv_[i][e]  = new llvm::GlobalVariable(
                   env_->llmod, arr, false, llvm::GlobalValue::InternalLinkage,
                   llvm::ConstantAggregateZero::get(arr), base + "sta." + edge_suffix(e));
+                if (slots_[i].anchor == SignalSlot::no_anchor) {
+                    // No record describes this bucket (a package variable's): its
+                    // trigger bits live in a global of their own, which writers in
+                    // any unit read (static_trig_bits).
+                    wait_sta_trig_gv_[i][e] = new llvm::GlobalVariable(
+                      env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+                      llvm::ConstantInt::get(b_.getInt64Ty(), 0), base + "sta." + edge_suffix(e) + ".trig");
+                }
             }
             if (c.dyn[i][e] > 0) {
                 auto* arr          = llvm::ArrayType::get(elem, c.dyn[i][e]);
@@ -783,44 +876,6 @@ void Backend::build_wait_queues() {
                 wait_dyn_len_gv_[i][e] = new llvm::GlobalVariable(
                   env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                   llvm::ConstantInt::get(i32, 0), base + "dyn." + edge_suffix(e) + ".len");
-            }
-        }
-    }
-
-    // Def-local wait-bucket slots (module-dedup prep): for a reused
-    // definition, body-side queue access goes through a def-local slot in
-    // the instance context (ctx_wait_base + slot) instead of a per-instance
-    // queue global. Slot numbering follows the def-local signal walk and
-    // the (padded, so def-uniform) bucket existence — identical across
-    // twin instances by construction. main fills the pointers at startup.
-    wait_slot_sta_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-    for (uint32_t a = 0; a < anchors_.size(); ++a) {
-        // A virtual interface reaches an instance chosen at run time, so its
-        // buckets have to be addressable through the context record even when
-        // the definition is instantiated once and its own body bakes symbols.
-        const bool vif_anchor =
-          std::ranges::any_of(by_anchor[a], [&](Signal sj) {
-              return sj != Signal{ ~0u } && vif_sig_[static_cast<uint32_t>(sj)];
-          });
-        if (!anchors_[a].indirect && !vif_anchor) {
-            continue;
-        }
-        uint32_t next = 0;
-        for (const Signal sj : by_anchor[a]) {
-            if (sj == Signal{ ~0u }) {
-                continue;
-            }
-            const auto si = static_cast<uint32_t>(sj);
-            for (uint32_t e = 0; e < 3; ++e) {
-                if (wait_sta_gv_[si][e] != nullptr) {
-                    wait_slot_sta_[si][e] = next++;
-                }
-                if (wait_dyn_gv_[si][e] != nullptr) {
-                    wait_slot_dyn_[si][e] = next++;
-                    wait_slot_len_[si][e] = next++;
-                }
             }
         }
     }
@@ -956,6 +1011,10 @@ Backend::ServiceSnapshot Backend::service_snapshot(const Guarded& g) {
 
 void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
     g.when_valid(b_, [&](const LValue& lv) {
+        // Wake buckets, trigger bits and the dump-var index of a written signal are
+        // the owner's: its record, when the write reached it through a binding or a
+        // virtual interface handle.
+        CtxOverride ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
         if (old.str != nullptr) {
             str_chg_after(lv, old.str);
         } else if (old.container) {
@@ -1359,30 +1418,77 @@ void Backend::emit_trigger_fire(llvm::Value* trig_id) {
     b_.SetInsertPoint(done);
 }
 
-// Static sub-queue scan (one edge bucket): a fixed-trip loop over the
-// persistent subscriptions for this (signal, edge). The bucket's edge already
-// matched the transition (the caller guarded the whole scan), so there is no
-// per-entry edge check. Emitted via the generic runtime scan with a constant
-// non-null base and constant cap: simplifycfg (lower_coroutines) folds the
-// dead null guard and the constant trip count still lets the optimizer
-// unroll. Membership never changes — no compaction, no length.
-// Body-side base pointer of a wait bucket: loaded from the owning
-// instance's wait-pointer table when its definition is reused (def-local
-// slot constant — twin bodies stay identical), the absolute queue global
-// otherwise. Commit functions / the seed loop keep the globals directly.
-llvm::Value* Backend::wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig) {
-    if (slot == no_wait_slot || !def_relative_for(slots_[sig])) {
-        return sym(llvm::cast<llvm::GlobalVariable>(gv));
+// Body-side base pointer of a wait bucket piece: loaded from the signal's port
+// where the body reaches it (the own instance's record, or the port address a
+// binding holds for a signal of another instance), the bucket's own global
+// otherwise. Root's code (commit functions, the seed loop) keeps the globals
+// directly.
+llvm::Value* Backend::wait_base(WaitPart part, Signal sig, uint32_t edge) {
+    const auto        i = static_cast<uint32_t>(sig);
+    const SignalSlot& s = slots_[i];
+    if (port_reachable(s)) {
+        const PortLayout& pl   = *port_of(s);
+        const uint32_t    elem = part == WaitPart::Static    ? pl.sta[edge].base
+                                 : part == WaitPart::Dynamic ? pl.dyn[edge].base
+                                                             : pl.dyn[edge].len;
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
     }
-    Anchor& a = anchors_[slots_[sig].anchor];
-    return ctx_field(a, a.ctx_wait_base + slot, llvm::PointerType::getUnqual(ctx_));
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names a wait bucket of one instance");
+    }
+    llvm::GlobalVariable* gv = part == WaitPart::Static    ? wait_sta_gv_[i][edge]
+                               : part == WaitPart::Dynamic ? wait_dyn_gv_[i][edge]
+                                                           : wait_dyn_len_gv_[i][edge];
+    return sym(gv);
 }
 
+// The trigger bits a wake of (sig, edge) ORs into a subscriber's wake word, as
+// data: they are design-global colours (compute_trigger_masks), so no unit's
+// code may hold them as an immediate. The owner's code finds them in its own
+// record's port, a writer of another instance's signal in the port its binding
+// names, any other writer (root's) in the owner's record global (a design
+// symbol, like the bucket it scans), and a signal of no instance has a global of
+// its own per bucket.
+llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
+    const auto        i = static_cast<uint32_t>(sig);
+    const SignalSlot& s = slots_[i];
+    if (s.anchor != SignalSlot::no_anchor && wait_sta_gv_[i][edge] != nullptr) {
+        return b_.CreateLoad(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
+    }
+    if (wait_sta_trig_gv_[i][edge] != nullptr) {
+        return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
+    }
+    // The colours of a signal of some instance are that instance's own.
+    if (s.anchor != SignalSlot::no_anchor) {
+        taint("names the trigger bits of a signal of one instance");
+    }
+    return b_.getInt64(trig_bits(sig, edge));
+}
+
+// Static sub-queue scan (one edge bucket): a loop over the persistent
+// subscriptions for this (signal, edge). The bucket's edge already matched the
+// transition (the caller guarded the whole scan), so there is no per-entry
+// edge check. Emitted via the generic runtime scan with a non-null base:
+// simplifycfg (lower_coroutines) folds a dead null guard, and a constant cap
+// still lets the optimizer unroll. Membership never changes — no compaction,
+// no length.
+//
+// A body that reaches the signal's port (the owner's own code, or a writer of
+// another instance's signal through its binding) reads the bucket's subscriber
+// count from it, the exact count of that instance, so the scan needs no padding;
+// any other writer bakes the per-definition maximum (null-checked when twins
+// differ). The trigger bits are data for every writer (static_trig_bits).
 void Backend::service_static_queue(Signal sig, uint32_t edge) {
-    const auto i = static_cast<uint32_t>(sig);
-    emit_static_scan_rt(wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i),
-                        b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
-                        trig_bits(sig, edge));
+    const auto        i    = static_cast<uint32_t>(sig);
+    const SignalSlot& s    = slots_[i];
+    llvm::Value*      base = wait_base(WaitPart::Static, sig, edge);
+    if (port_reachable(s)) {
+        emit_static_scan_rt(base, b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
+                            static_trig_bits(sig, edge));
+        return;
+    }
+    emit_static_scan_rt(base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
+                        static_trig_bits(sig, edge));
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -1391,9 +1497,7 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
 // resets to 0); the firing process deregisters its stale entries from any
 // OTHER buckets itself on resume (eager removal in lower_wait).
 void Backend::service_dynamic_queue(Signal sig, uint32_t edge) {
-    const auto i = static_cast<uint32_t>(sig);
-    emit_dynamic_scan_rt(wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i),
-                         wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i));
+    emit_dynamic_scan_rt(wait_base(WaitPart::Dynamic, sig, edge), wait_base(WaitPart::DynamicLen, sig, edge));
 }
 
 // The detached timer node a `->> #d e` schedules: an rt_timer ({next,
@@ -1417,14 +1521,18 @@ llvm::StructType* Backend::event_timer_ty() {
 // firing the event here would wake the waiter in the Active region; pending it
 // leaves the wake to the NBA drain, exactly as for `->> e`.
 //
-// Defined in whichever module first needs it and reached from every other one
-// through sym(), like enqueue_trampoline: returning the bare definition to a
-// second module is a cross-module global reference, which LLVM rejects
-// (docs/design/module-split.md).
+// Defined in root and reached from every unit through sym(), like
+// enqueue_trampoline: returning the bare definition to a second module is a
+// cross-module global reference, which LLVM rejects.
 llvm::Function* Backend::event_delay_thunk() {
-    if (event_delay_thunk_ != nullptr) {
-        return sym(event_delay_thunk_);
+    if (event_delay_thunk_ == nullptr) {
+        InRoot in_root(*this);
+        build_event_delay_thunk();
     }
+    return sym(event_delay_thunk_);
+}
+
+void Backend::build_event_delay_thunk() {
     auto*             ptr  = raw_ptr_ty();
     auto*             fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
     llvm::IRBuilder<> save(ctx_);
@@ -1442,7 +1550,6 @@ llvm::Function* Backend::event_delay_thunk() {
     if (saved_bb != nullptr) {
         b_.SetInsertPoint(saved_bb, saved_pt);
     }
-    return sym(event_delay_thunk_);
 }
 
 // Link an event object onto the NBA pending chain (LRM 15.5.1), unless it is
@@ -1737,15 +1844,6 @@ void Backend::emit_event_unlink(llvm::Value* node, llvm::Value* obj) {
     b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodePrev));
 }
 
-// A persistent (`always @(e)`) waiter's node: the next slot of the contiguous
-// clotho.event_nodes array. Handed out in the same subscription order the
-// static bucket slots used to be, so the count build_wait_queues reserved is
-// filled exactly once.
-llvm::Value* Backend::next_static_event_node() {
-    return b_.CreateInBoundsGEP(event_nodes_arr_ty_, sym(event_nodes_gv_),
-                                { b_.getInt32(0), b_.getInt32(event_node_next_++) });
-}
-
 // Lower `e.triggered` (LRM 15.5.3) to a definite 2-state 1-bit: 1 iff the last
 // trigger tick equals the current tick (true across all delta cycles of the
 // step, false once time advances — no per-step reset needed).
@@ -1763,10 +1861,8 @@ Plane Backend::lower_event_triggered(llvm::Value* obj) {
 // `mine` is the PARKED form of this handle -- what emit_dynamic_register
 // wrote -- so the comparison matches for reactive code too.
 void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
-    const auto        i      = static_cast<uint32_t>(sig);
-    llvm::Value*      q      = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
-    auto*             arr_ty = wait_dyn_ty_[i][edge];
-    llvm::Value*      len_gv = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
+    llvm::Value*      q      = wait_base(WaitPart::Dynamic, sig, edge);
+    llvm::Value*      len_gv = wait_base(WaitPart::DynamicLen, sig, edge);
     llvm::StructType* elem   = wait_elem_ty();
     auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
     auto*             i32    = b_.getInt32Ty();
@@ -1789,14 +1885,14 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
     b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* src  = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
+    llvm::Value* src  = b_.CreateInBoundsGEP(elem, q, idx);
     llvm::Value* h    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
     llvm::Value* f    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
     llvm::Value* mine = b_.CreateICmpEQ(h, parked_handle(b_, hdl_));
     b_.CreateCondBr(mine, cont, keep); // ours -> drop; else -> keep
 
     b_.SetInsertPoint(keep);
-    llvm::Value* dst = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), w });
+    llvm::Value* dst = b_.CreateInBoundsGEP(elem, q, w);
     b_.CreateStore(h, b_.CreateStructGEP(elem, dst, 0));
     b_.CreateStore(f, b_.CreateStructGEP(elem, dst, 1));
     llvm::Value* w_keep = b_.CreateAdd(w, b_.getInt32(1));
@@ -1815,20 +1911,11 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
     b_.CreateStore(w, len_gv);
 }
 
-// -- NBA update region --
-//
-// After the active queue drains, the NBA region commits every staged update:
-// Load edge element `e` of meta array field `field`. Meta layout (per nba-id):
-// 0 sta_base[3], 1 sta_cap[3], 2 dyn_base[3], 3 dyn_len[3] — the wait-queue
-// pointers emit_nba_service scans per edge.
-llvm::Value* Backend::meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty) {
-    return b_.CreateLoad(
-      ty, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-}
+// -- Wait-queue scans --
 
 // Generic static-queue scan (base + capacity values), null base => no
-// waiters. Serves both callers: service_static_queue passes a constant
-// global and cap; the NBA commit loop passes values read from meta. Each
+// waiters. Serves service_static_queue, which passes the bucket's base and
+// capacity (a constant global, or fields of the owner's record). Each
 // entry wakes its process only if its scheduled flag is 0, then sets the
 // flag — collapsing a multi-signal sensitivity (the same process
 // subscribed under several signals) into a single wake.
@@ -1837,59 +1924,63 @@ llvm::Value* Backend::meta_at(llvm::Value* meta, unsigned field, uint32_t e, llv
 // pointer instead of dereferencing it. Exact buckets keep the check-free
 // scan.
 // `trig`: trigger bits this (signal, edge) contributes to the wake word
-// (compute_trigger_masks), or 0 when no guarded group waits on it. Note the
-// already-queued path: it must still OR the bits in, or a group woken by two
-// of its events in one instant loses the second one's bit and skips the
-// members that were waiting for it. With `trig` 0 that path is empty and the
-// emission is exactly the unguarded scan.
-void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, uint64_t trig) {
+// (compute_trigger_masks): a constant, or a value read from the owner's
+// instance record. Note the already-queued path: it must still OR the bits
+// in, or a group woken by two of its events in one instant loses the second
+// one's bit and skips the members that were waiting for it. With a constant 0
+// that path is empty and the emission is exactly the unguarded scan.
+void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* word = sched_word_ty();
     auto* elem = wait_elem_ty();
     auto* fn   = b_.GetInsertBlock()->getParent();
-    auto* head = llvm::BasicBlock::Create(ctx_, "nsta.head", fn);
     auto* body = llvm::BasicBlock::Create(ctx_, "nsta.body", fn);
     auto* wake = llvm::BasicBlock::Create(ctx_, "nsta.wake", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "nsta.cont", fn);
     auto* done = llvm::BasicBlock::Create(ctx_, "nsta.done", fn);
     auto* entry = b_.GetInsertBlock();
-    b_.CreateCondBr(b_.CreateICmpNE(base, llvm::ConstantPointerNull::get(ptr)), head, done);
-
-    b_.SetInsertPoint(head);
-    auto* idx = b_.CreatePHI(i32, 2);
-    idx->addIncoming(b_.getInt32(0), entry);
-    b_.CreateCondBr(b_.CreateICmpULT(idx, cap), body, done);
+    // A bucket nobody subscribed to has no entries, whatever its base is. A loop
+    // that tests at its bottom and carries one pointer and one count is what
+    // tier-0 code generation (which keeps every value that outlives a block in
+    // memory) makes the least of: this is the shape of every wake a store makes.
+    b_.CreateCondBr(b_.CreateICmpNE(cap, b_.getInt32(0)), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
-    llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
-    llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
+    auto* cur  = b_.CreatePHI(ptr, 2);
+    auto* left = b_.CreatePHI(i32, 2);
+    cur->addIncoming(base, entry);
+    left->addIncoming(cap, entry);
+    llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, cur, 0));
+    llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, cur, 1));
     if (padded) {
         auto* live = llvm::BasicBlock::Create(ctx_, "nsta.live", fn);
         b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
         b_.SetInsertPoint(live);
     }
-    llvm::Value* old   = b_.CreateLoad(word, fptr);
+    llvm::Value* old    = b_.CreateLoad(word, fptr);
     auto*        queued = b_.CreateICmpNE(old, b_.getInt64(0));
-    if (trig != 0) {
-        auto* arm = llvm::BasicBlock::Create(ctx_, "nsta.arm", fn);
-        b_.CreateCondBr(queued, arm, wake);
-        b_.SetInsertPoint(arm);
-        b_.CreateStore(b_.CreateOr(old, b_.getInt64(trig)), fptr);
-        b_.CreateBr(cont);
-    } else {
+    auto*        none   = llvm::dyn_cast<llvm::ConstantInt>(trig);
+    if (none != nullptr && none->isZero()) {
         b_.CreateCondBr(queued, cont, wake);
+        b_.SetInsertPoint(wake);
+        emit_wake_push(b_, h);
+        b_.CreateStore(b_.getInt64(1), fptr);
+    } else {
+        // The word becomes the entry's bits OR-ed in if it was already queued, else
+        // queued with them: one store, so only the push is a block of its own.
+        b_.CreateStore(b_.CreateSelect(queued, b_.CreateOr(old, trig), b_.CreateOr(trig, b_.getInt64(1))), fptr);
+        b_.CreateCondBr(queued, cont, wake);
+        b_.SetInsertPoint(wake);
+        emit_wake_push(b_, h);
     }
-
-    b_.SetInsertPoint(wake);
-    emit_wake_push(b_, h);
-    b_.CreateStore(b_.getInt64(1 | trig), fptr);
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(cont);
-    idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), cont);
-    b_.CreateBr(head);
+    cur->addIncoming(b_.CreateInBoundsGEP(elem, cur, b_.getInt32(1)), cont);
+    llvm::Value* next = b_.CreateSub(left, b_.getInt32(1));
+    left->addIncoming(next, cont);
+    b_.CreateCondBr(b_.CreateICmpNE(next, b_.getInt32(0)), body, done);
 
     b_.SetInsertPoint(done);
 }
