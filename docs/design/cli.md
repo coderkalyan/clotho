@@ -82,7 +82,7 @@ see "One parser".
 
 | option | commands | effect |
 |---|---|---|
-| `--emit <target>` | build | `exe` (default: an executable, docs/design/executables.md), `obj` (a relocatable object for this machine: the definition units linked back into one module, position-independent, defining `clotho_main` and `clotho_design`), `llvm` (post-coroutine-pipeline LLVM IR), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
+| `--emit <target>` | build | `exe` (default: an executable, docs/design/executables.md), `obj` (a relocatable object for this machine, position-independent, defining `clotho_main` and `clotho_design`: on Linux the objects of the design's modules, generated in parallel and joined by a relocatable link; on macOS and Windows the modules linked back into one and generated on one thread, as those platforms' lld cannot link relocatably), `llvm` (post-coroutine-pipeline LLVM IR, the modules linked into one), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
 | `--target <lang>` | synth (Debug builds only) | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
 | `--hierarchy <mode>` | synth (Debug builds only) | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
 | `--sidecar <path>` | synth (Debug builds only) | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |
@@ -93,7 +93,7 @@ see "One parser".
 | `--cpu <name>` | build | the processor an `exe` or `obj` is compiled for: by default a baseline every machine of the kind has (`x86-64-v2`, `apple-m1` on Apple Silicon, `generic` Armv8-A on other AArch64), `native` for the machine building it, or any processor name LLVM knows for the target (an unknown one is a usage error). Refused for text targets |
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
-| `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`, `units`. `parallel` reports only under `run`; `units` reports how many instances each specialization has and which specializations' instances still do not lower to identical unit IR |
+| `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`, `units`. `parallel` reports the timings of the per-module compile pool, so only where one runs: `run`, and `build` of an executable or an object; `units` reports how many instances each specialization has and which specializations' instances still do not lower to identical unit IR |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `divzero` (a 2-state divide or modulo by zero: the design still gets 0, the x of LRM 11.4.3 made 0 by LRM 6.3.1, and the report says where it happened), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
 | `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled in -- the emitted coverage model names its own -- so an executable writes its report to the file `build` was given |
 | `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so an executable keeps the setting `build` was given |
@@ -305,7 +305,8 @@ the command line does.
 | `--emit=llvm` | `build --emit=llvm-raw` | it is the raw pre-pipeline dump; the name now says so |
 | `--emit=ir` | `build --emit=ir` | plus `-o` is finally honoured (it was silently ignored) |
 | `--emit=check` | folded into `build` | `build` already elaborates, lowers, analyses and reports the same diagnostics before writing; a diagnostics-only entry point is back as `lint`, where lint severity policy belongs (synthesis-and-lsp-scoping.md §3.4) |
-| `--no-z-elision`, `--no-fuse`, `--no-comb-fuse`, `--no-thunk`, `--no-dedup`, `--no-split`, `--no-parallel-compile` | removed | they gate as-if optimizations, so the only consumer is the differential test that proves output is byte-identical with the gate off. Those tests set the `SimulationConfig` fields directly; an operator has no reason to reach for one. **Any doc mentioning `--no-<x>` means the `SimulationConfig::<x>` field**, except `--no-outline`. |
+| `--no-z-elision`, `--no-fuse`, `--no-comb-fuse`, `--no-thunk`, `--no-dedup`, `--no-split` | removed | they gate as-if optimizations, so the only consumer is the differential test that proves output is byte-identical with the gate off. Those tests set the `SimulationConfig` fields directly; an operator has no reason to reach for one. **Any doc mentioning `--no-<x>` means the `SimulationConfig::<x>` field**, except `--no-outline` and `--no-parallel-compile`. |
+| `--no-parallel-compile` | removed with its field | nothing set `SimulationConfig::parallel_compile`, and `-j 1` compiles the modules one at a time. `run` and `build` share one per-module pipeline (module-split.md), so a gate on it would have to exist twice |
 | `--no-outline` | removed with its field | it chose between per-member functions plus a dispatcher and one merged body for a fused group spanning instances. Every such group now takes the dispatch form (one row per instance, all running the unit's function), with or without `--no-split` (module-split.md, Partition), so there is no second form to gate and no `SimulationConfig::outline` |
 | `--domain-spec` | removed with the feature | domain-spec.md |
 | `CLOTHO_DEDUP_STAT` (+`=2`), `CLOTHO_COMB_FUSE_STAT`, `CLOTHO_FINISH_STAT`, `CLOTHO_PARALLEL_STAT`, `CLOTHO_DOM_DEBUG` | `--stat=<list>` | five undiscoverable env vars, read by `getenv` deep in the backend, became one documented option and a `Stat` bitmask in `SimulationConfig` |
@@ -390,9 +391,9 @@ compiled with.
 
 ## Out of scope
 
-- A per-definition object cache (module-split.md): `--emit=obj` writes one
-  object for the whole design; caching needs a cache-key design, not a CLI
-  change.
+- A per-definition object cache (module-split.md): `build` generates one object per
+  module, in parallel, and removes them with its scratch directory; keeping them
+  between builds needs a cache-key design, not a CLI change.
 - `--x=` / `--x-init=` (x-semantics.md S3): semantics work; the convention above
   fixes only their spelling.
 - A `--vcd <file>` override: `$dumpfile` covers it, and the runtime default

@@ -10,8 +10,8 @@ files. That is the point of it: a CI job builds once and runs the result, or
 copies it to any machine like the one it was built on.
 
 ```
-design.sv --(front end, backend)--> design.o --(lld, in-process)--> executable
-                                                ^
+design.sv --(front end, backend)--> one object per module --(lld, in-process)--> executable
+                                                                  ^
                      embedded in clotho: executable runtime, compiler-rt,
                      the C library's startup objects and static parts
 ```
@@ -67,10 +67,14 @@ compiler-rt's builtins.
 
 ## Linking
 
-lld runs inside clotho (`lld::lldMain`, src/link/Link.cpp) with the link line a
-compiler driver would build, written out per platform. The files it needs are
-embedded in clotho when clotho is built (`#embed`, generated LinkKit.cpp) and
-extracted to a temporary directory for the link:
+The backend writes one object per LLVM module (module-split.md): each is
+optimized and generated on its own thread of the compile pool `run` uses, sized
+by `-j`, through the same per-module pipeline, into the scratch directory. lld
+runs inside clotho (`lld::lldMain`, src/link/Link.cpp) with the link line a
+compiler driver would build, written out per platform, and the objects as inputs
+in module order, root first. The files it needs are embedded in clotho when
+clotho is built (`#embed`, generated LinkKit.cpp) and extracted to a temporary
+directory for the link:
 
 | Platform | Embedded | Taken from the machine at link time |
 |---|---|---|

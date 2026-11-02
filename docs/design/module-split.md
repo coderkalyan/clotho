@@ -47,10 +47,12 @@ One shared `LLVMContext` for all modules during construction (`Backend`/
 `ModuleEnv`/`sym()` are unchanged from V1 — ALL emission still happens into
 one context, so every type memo stays shared and no per-module type
 re-derivation was needed there). Parallel codegen (landed) does NOT touch
-that: instead, `Jit.cpp` migrates each already-built module into its own
+that: instead, `for_each_optimized_module` (ir/llvm/LlvmBackend.cpp), which
+`run` and `build` share, migrates each already-built module into its own
 fresh `LLVMContext` via a bitcode round-trip (`WriteBitcodeToFile` /
-`parseBitcodeFile`) after construction, then runs `optimize_module` + ORC
-codegen per module across a thread pool. This sidesteps the "DataLayout-derived
+`parseBitcodeFile`) after construction, then runs `optimize_module` and the
+verifier per module across a thread pool (`-j`) and hands the module to the
+caller's consumer, on that thread. This sidesteps the "DataLayout-derived
 offset recomputation" concern entirely — bitcode reconstructs types
 structurally (same field order/types), not by pointer, so GEP offsets
 (already plain field-index vectors, context-free) are unaffected; nothing in
@@ -71,13 +73,30 @@ trivially — loads through an extern global are more opaque, not less.
 
 ## ORC side
 
-`addIRModule` per unit into the main JITDylib; `lookup("clotho_main")` pulls root and
-its extern refs materialize each def module. Eager, sequential, same
-semantics. Laziness is deliberately not built: the seed loop references every
-group at startup, so the whole design is always reachable. ObjectCache keys on
-(unit content key, SimConfig flags, clotho version, triple); a definition edit
-changes other units' ctx *values* (root-filled), not their code, by
-construction of the anchors work.
+`addIRModule` per unit into the main JITDylib (`run`'s consumer);
+`lookup("clotho_main")` pulls root and its extern refs materialize each def
+module, concurrently on the dispatcher's pool. Eager, same semantics. Laziness is
+deliberately not built: the seed loop references every group at startup, so the
+whole design is always reachable. ObjectCache keys on (unit content key, SimConfig
+flags, clotho version, triple); a definition edit changes other units' ctx
+*values* (root-filled), not their code, by construction of the anchors work.
+
+## Build side
+
+`build`'s consumer generates the module's object on the worker thread
+(`emit_objects`, ir/llvm/LlvmBackend.cpp): a TargetMachine per task, built the
+way a C compiler's would be (position-independent code, the platform's default
+code model, `config.o3` for the machine optimization level; a JIT target machine
+would default to the large code model, whose absolute addresses are text
+relocations a macOS link refuses), and writes `design.<i>.o` into the scratch
+directory, root first. An executable is one link of the list (src/link/Link.cpp).
+`--emit obj` on Linux joins the list with `ld.lld -r` in process
+(`link_relocatable`), which keeps it one file with the parallel code
+generation. lld's Mach-O driver accepts `-r` and then links an executable anyway
+("not yet implemented") and its MinGW driver rejects it, so on macOS and Windows
+`--emit obj` still links the optimized modules into one and generates its code
+on one thread (`emit_object`). `--emit llvm` is that one linked module as text
+and is not parallel.
 
 ## Cache stability
 
@@ -110,11 +129,14 @@ ids, per-scope state globals) is in git history.
 - Module count explosion on unique-def designs (hazard3-class): merge
   singleton defs below a group-count threshold into root if per-module fixed
   cost shows up.
-- Root's unbounded size is now also a *compile-parallelism* ceiling, not just
-  an object-cache-granularity one: measured on rocket-chip (255 modules), root
-  alone is 30 MB of bitcode (16x the next-largest module) and its own
-  single-threaded optimize+codegen time is the entire parallel section's
-  wall-clock floor, capping the win at ~1.5x on 12 cores despite 260
-  independent modules. Raising this ceiling needs root itself split further
-  (more of `M_root`'s machinery moved into the units the way the rows of
-  schedule groups already are), not more parallel-compile machinery.
+- Root's size was a *compile-parallelism* ceiling as well as an
+  object-cache-granularity one: with every instance's code in root, rocket-chip's
+  root alone was 30 MB of bitcode (16x the next-largest module) and its
+  single-threaded optimize+codegen time was the whole parallel section's
+  wall-clock floor, ~1.5x on 12 cores despite 260 independent modules. With root
+  as tables (modular-compilation.md, 3e), `build --stat=parallel` on rocket-chip
+  (267 modules, 12 threads) shows root at 14 MB of bitcode and 2.2 s of
+  optimize+codegen against 3.9 s for the longest module and 61 s for all of them:
+  the section takes 6.1 s of a 9.4 s compile. What is serial now is what comes
+  before it: building every module in one context (about 1.8 s) and writing them
+  to bitcode (1.4 s).
