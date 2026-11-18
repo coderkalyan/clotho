@@ -88,7 +88,7 @@ macOS version clotho was built for.
 
 ## Processor
 
-`--cpu` picks the processor for `exe` and `obj`. The default is a baseline every
+`--cpu` picks the processor for `exe`. The default is a baseline every
 machine of the kind has (`x86-64-v2`, `apple-m1`, `generic` Armv8-A), so an
 executable built on a new machine runs on an older CI runner; `native` is this
 machine exactly. The JIT keeps compiling for the host it runs on. Objects use

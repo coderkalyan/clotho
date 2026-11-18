@@ -147,33 +147,18 @@ struct SharedCodeCheck {
 };
 SharedCodeCheck check_shared_code(const Module& m, const LocResolver& resolve = {});
 
-// Compile the design for `target`'s triple, CPU and features and write it to
-// `os` as one relocatable object file, holding the code of every module. The
-// object defines `clotho_main`, the entry rt_run takes, and `clotho_design`, the
-// rt_design an executable's main reads; every runtime symbol it references is
-// left undefined, for a link against the runtime. The modules are optimized in
-// parallel (for_each_optimized_module), then linked back into the root module,
-// so the object holds exactly the code `run` would compile, and generated as one
-// on the calling thread. That is the one object where lld cannot join emit_objects'
-// files relocatably (macOS, Windows); Linux joins them instead. Code generation
-// uses `config.o3` as run_jit does, the platform's default code model and
-// position-independent code, so the object links into a PIE. Returns false with
-// the reason on llvm::errs().
-bool emit_object(const Module&                             m,
-                 llvm::raw_ostream&                        os,
-                 const llvm::orc::JITTargetMachineBuilder& target,
-                 const SimulationConfig&                   config  = {},
-                 Timings*                                  timings = nullptr,
-                 const LocResolver&                        resolve = {});
-
-// Compile the design as emit_object does, but write each module as an object file
-// of its own into the existing directory `dir`, generated in parallel on
-// `config.compile_jobs` threads (for_each_optimized_module, so the same pool and
-// pipeline `run` uses). `objects` is set to the files' paths, root first: the
-// order a link takes them in. Between them they define `clotho_main` and
-// `clotho_design`; a symbol one module takes from another is undefined in the
-// one and defined in the other, to be resolved by a link of them all. Returns false
-// with the reason on llvm::errs().
+// Compile the design for `target`'s triple, CPU and features and write each
+// module as a relocatable object file of its own into the existing directory
+// `dir`, generated in parallel on `config.compile_jobs` threads
+// (for_each_optimized_module, so the same pool and pipeline `run` uses). Code
+// generation uses `config.o3` as run_jit does, the platform's default code model
+// and position-independent code, so the objects link into a PIE. `objects` is set
+// to the files' paths, root first: the order a link takes them in. Between them
+// they define `clotho_main`, the entry rt_run takes, and `clotho_design`, the
+// rt_design an executable's main reads; every other definition is a `clotho.*`
+// name. A symbol one module takes from another is undefined in the one and
+// defined in the other, and runtime symbols are undefined, to be resolved by the
+// executable's link. Returns false with the reason on llvm::errs().
 bool emit_objects(const Module&                             m,
                   const std::string&                        dir,
                   std::vector<std::string>&                 objects,

@@ -552,14 +552,14 @@ TEST_CASE("cli: build refuses the options its output cannot carry") {
         CHECK(contains(r.err, "an executable cannot be written to stdout"));
     }
     SUBCASE("only an executable links DPI libraries in") {
-        const Result r = s.run(std::format("build --emit obj --dpi-lib x.o -o - \"{}\"", design.string()));
+        const Result r = s.run(std::format("build --emit llvm --dpi-lib x.o -o - \"{}\"", design.string()));
         CHECK(r.code == 2);
         CHECK(contains(r.err, "--dpi-lib applies to an executable"));
     }
     SUBCASE("only machine code has a processor") {
         const Result r = s.run(std::format("build --emit llvm --cpu native -o - \"{}\"", design.string()));
         CHECK(r.code == 2);
-        CHECK(contains(r.err, "--cpu applies to an executable or object"));
+        CHECK(contains(r.err, "--cpu applies to an executable"));
     }
     SUBCASE("a processor LLVM does not know") {
         const Result r = s.run(std::format("build --cpu not-a-cpu -o x \"{}\"", design.string()));
@@ -1245,10 +1245,9 @@ TEST_CASE("cli: build writes an executable named after the top module by default
     CHECK(clotho::test::detail::read_file(s.path("sim.txt")) == "W=4 S=dflt\n");
 }
 
-// The modules of a design are compiled to one object each, and `--emit=obj` still
-// writes one file: the same bytes to a file as to a pipe, and whatever the number
-// of threads the modules were compiled on.
-TEST_CASE("cli: build --emit=obj writes one object, to a file or to stdout") {
+// The modules of a design are compiled to one object each, on as many threads as
+// -j allows; the executable linked from them must not depend on that number.
+TEST_CASE("cli: build writes the same executable whatever the number of compile threads") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", R"(
         module child(input logic clk, output logic [7:0] q);
@@ -1261,34 +1260,27 @@ TEST_CASE("cli: build --emit=obj writes one object, to a file or to stdout") {
             initial begin #1 clk = 1; #1 $display("%0d", q); end
         endmodule
     )");
-    const fs::path file    = s.path("design.o");
-    const Result   to_file = s.run(std::format("build --emit=obj -o \"{}\" \"{}\"", file.string(), design.string()));
-    const Result   to_pipe = s.run(std::format("build --emit=obj -o - \"{}\"", design.string()));
-    CHECK(to_file.code == 0);
-    CHECK(to_file.out.empty());
-    CHECK(to_pipe.code == 0);
-    const std::string object = clotho::test::detail::read_file(file);
-    REQUIRE(object.size() > 20);
-    CHECK(to_pipe.out == object);
+    std::string first;
     for (const std::string_view jobs : { "1", "3" }) {
         CAPTURE(jobs);
-        const Result r = s.run(std::format("build --emit=obj -j {} -o - \"{}\"", jobs, design.string()));
-        CHECK(r.code == 0);
-        CHECK(r.out == object);
+        const fs::path exe = s.path(std::format("sim{}", jobs));
+        const Result   r   = s.run(std::format("build -j {} -o \"{}\" \"{}\"", jobs, exe.string(), design.string()));
+        REQUIRE(r.code == 0);
+        const std::string bytes = clotho::test::detail::read_file(exe);
+        REQUIRE(bytes.size() > 20);
+        if (first.empty()) {
+            first = bytes;
+        } else {
+            CHECK(bytes == first);
+        }
     }
-#if defined(__linux__)
-    // ELF, relocatable (ET_REL), not an executable or a library.
-    CHECK(object.starts_with("\x7f"
-                             "ELF"));
-    CHECK(static_cast<unsigned char>(object[16]) == 1);
-#endif
 }
 
-TEST_CASE("cli: build will not write text or an object to a terminal by default") {
+TEST_CASE("cli: build will not write text to a terminal by default") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);
     SUBCASE("without -o it is a usage error that says how to get the output") {
-        for (const std::string_view emit : { "obj", "llvm", "llvm-raw", "ir" }) {
+        for (const std::string_view emit : { "llvm", "llvm-raw", "ir" }) {
             CAPTURE(emit);
             const Result r = s.run_on_terminal(std::format("build --emit={} \"{}\"", emit, design.string()));
             CHECK(r.code == 2);

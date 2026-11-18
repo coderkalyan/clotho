@@ -136,19 +136,18 @@ void find_system_libs_on_disk(SystemLibs& libs) {
     }
 }
 
-#if defined(__x86_64__)
-constexpr const char* kEmulation = "elf_x86_64";
-#elif defined(__aarch64__)
-constexpr const char* kEmulation = "aarch64linux";
-#else
-#error "clotho links executables for x86-64 and AArch64 Linux only"
-#endif
-
 bool link_host(std::span<const std::string> objects,
                std::span<const std::string> dpi_libs,
                bool                         exports_dpi,
                const std::string&           output,
                const std::string&           scratch) {
+#if defined(__x86_64__)
+    constexpr const char* emulation = "elf_x86_64";
+#elif defined(__aarch64__)
+    constexpr const char* emulation = "aarch64linux";
+#else
+#error "clotho links executables for x86-64 and AArch64 Linux only"
+#endif
     SystemLibs libs;
     dl_iterate_phdr(collect_system_libs, &libs);
     find_system_libs_on_disk(libs);
@@ -161,7 +160,7 @@ bool link_host(std::span<const std::string> objects,
     std::vector<std::string> args = {
         "ld.lld",
         "-m",
-        kEmulation,
+        emulation,
         "--hash-style=gnu",
         "--build-id",
         "--eh-frame-hdr",
@@ -406,13 +405,5 @@ bool link_executable(std::span<const std::string> objects,
                      const std::string&           scratch) {
     return extract_kit(scratch) && link_host(objects, dpi_libs, exports_dpi, output, scratch);
 }
-
-#if defined(__linux__)
-bool link_relocatable(std::span<const std::string> objects, const std::string& output) {
-    std::vector<std::string> args = { "ld.lld", "-m", kEmulation, "-r", "-o", output };
-    args.insert(args.end(), objects.begin(), objects.end());
-    return run_lld(args, { lld::Gnu, &lld::elf::link });
-}
-#endif
 
 } // namespace clotho::link

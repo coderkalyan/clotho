@@ -233,9 +233,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Cross-compiling an executable** — `build` writes one only for the machine it runs
   on; another target needs its executable runtime and C library startup files.
-- [ ] **Per-module objects for `build --emit obj` on macOS and Windows (performance)** — lld's
-  Mach-O driver has no relocatable link and its MinGW driver rejects `-r`, so the modules are
-  linked into one and generated on one thread there.
 
 ### Compilation
 
