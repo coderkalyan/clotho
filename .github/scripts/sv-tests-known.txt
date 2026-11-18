@@ -6,7 +6,7 @@
 # One entry per line: <category> <test name> <reason, to end of line>
 #
 #   race       self-check: the outcome depends on an order the LRM leaves open
-#              (4.7). Listed apart, for manual review.
+#              (4.7). Each was reviewed and accepted: a design must not rely on it.
 #   oracle     self-check: the design's own expectation contradicts the LRM, and
 #              Clotho follows the LRM. NN is a docs/LRM_NOTES.md note.
 #   known-ran  ran: clotho exits 0 but sv-tests marks the test failed.
