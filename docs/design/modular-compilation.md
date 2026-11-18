@@ -36,7 +36,10 @@ Every stage up to and including LLVM IR construction is one whole-design pass:
   functions and tasks of an instance, and the commit functions of the NBA
   blocks they register, go into the module of its unit, and the code of no
   instance (a package's, `$unit`'s), initializers and the seed loop stay in root.
-- Nothing is cached. `clotho build` links every module back into one.
+  Optimizing and generating the code of each module is parallel, in `run` and
+  in `build` alike (module-split.md): `build` writes one object per module and
+  lld links them.
+- Nothing is cached.
 
 The partition is drawn after every whole-design decision, so no stage above
 LLVM can be incremental, and the LLVM units are not a function of their own
@@ -672,8 +675,8 @@ code go.
 4. **Summaries and the link step** replace the whole-design `analyze()`.
 5. **Caches and parallelism.** Per-unit intern pools (cross-unit types match by
    structure, nominal types by unit and name), content keys, an object cache,
-   an IR unit cache, parallel lowering and codegen, and per-unit objects handed
-   straight to lld by `clotho build`.
+   an IR unit cache, parallel lowering. Landed: parallel codegen, and per-unit
+   objects handed straight to lld by `clotho build`.
 
 ## Known leaks step 2 removes
 

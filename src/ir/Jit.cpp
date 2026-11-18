@@ -1,15 +1,10 @@
 #include "Jit.h"
 
 #include <cstring>
-#include <future>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
-#include <llvm/ADT/SmallVector.h>
-#include <llvm/Bitcode/BitcodeReader.h>
-#include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
@@ -26,11 +21,9 @@
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <llvm/IR/Verifier.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/ThreadPool.h>
 #include <llvm/Support/Threading.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -83,19 +76,16 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     }
 
     // Each run owns its context: the design modules are built into it, then
-    // (parallel_compile off, or a single module) moved into ThreadSafeModules
-    // sharing one ThreadSafeContext the JIT takes over — same as before. With
-    // parallel_compile on and >1 module, each unit is instead migrated into
-    // its own fresh LLVMContext below (a bitcode round-trip) so unrelated
-    // modules can be optimized and codegen'd concurrently: LLVMContext is not
-    // thread-safe, and ORC's ThreadSafeContext lock serializes any modules
-    // that still share one (docs/design/module-split.md).
+    // for_each_optimized_module moves each into a context of its own (a bitcode
+    // round-trip) so unrelated modules can be optimized and codegen'd
+    // concurrently: LLVMContext is not thread-safe, and ORC's ThreadSafeContext
+    // lock serializes any modules that still share one (docs/design/module-split.md).
     auto ctx = std::make_unique<llvm::LLVMContext>();
     // The JIT needs runnable code: coroutine lowering is mandatory regardless
     // of what the caller's config says (lower_coro=false is an emit_llvm
     // inspection mode). Deferred (build_modules_unoptimized, not
-    // build_modules) so optimize_module can run per module below, after
-    // context migration when parallel.
+    // build_modules) so optimize_module can run per module after that context
+    // migration.
     SimulationConfig jit_config = config;
     jit_config.lower_coro       = true;
     const bool stat             = stat_on(config.stats, Stat::Parallel);
@@ -107,12 +97,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         fprintf(stderr, "PARALLEL_STAT build_modules_unoptimized: %.1f ms\n", ms_since(t_llvm));
     }
 
-    // Parallel compile needs its own context per module to mean anything;
-    // a single-module build (e.g. --no-split) falls through to the plain
-    // sequential path unconditionally.
-    const bool     parallel = config.parallel_compile && built.modules.size() > 1;
-    const unsigned n_jobs =
-      parallel ? llvm::hardware_concurrency(config.compile_jobs).compute_thread_count() : 1;
+    const unsigned n_jobs = llvm::hardware_concurrency(config.compile_jobs).compute_thread_count();
 
     // Machine-code generation matches the IR tier: -O0/FastISel for tier 0
     // (the backend pipeline already did the cheap cleanup; codegen quality is
@@ -138,24 +123,18 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         llvm::errs() << "jit: " << llvm::toString(mem_mgr.takeError()) << "\n";
         return -1;
     }
-    // Parallel compile needs ORC to materialize the unit modules concurrently: each
-    // is migrated to its own LLVMContext below (bitcode round-trip), so
-    // ConcurrentIRCompiler (a fresh TargetMachine per compile call) can dispatch
-    // per-module codegen onto the thread pool when lookup("clotho_main")
-    // transitively pulls in every unit.
-    std::unique_ptr<llvm::orc::TaskDispatcher> dispatcher;
-    if (parallel) {
-        dispatcher = std::make_unique<llvm::orc::DynamicThreadPoolTaskDispatcher>(n_jobs);
-    } else {
-        dispatcher = std::make_unique<llvm::orc::InPlaceTaskDispatcher>();
-    }
-    auto epc = llvm::orc::SelfExecutorProcessControl::Create(nullptr, std::move(dispatcher), std::move(*mem_mgr));
+    // ORC materializes the unit modules concurrently: each is migrated to its own
+    // LLVMContext below (bitcode round-trip), so ConcurrentIRCompiler (a fresh
+    // TargetMachine per compile call) can dispatch per-module codegen onto the
+    // thread pool when lookup("clotho_main") transitively pulls in every unit.
+    auto epc = llvm::orc::SelfExecutorProcessControl::Create(
+      nullptr, std::make_unique<llvm::orc::DynamicThreadPoolTaskDispatcher>(n_jobs), std::move(*mem_mgr));
     if (!epc) {
         llvm::errs() << "jit: " << llvm::toString(epc.takeError()) << "\n";
         return -1;
     }
     builder.setExecutorProcessControl(std::move(*epc));
-    builder.setSupportConcurrentCompilation(parallel);
+    builder.setSupportConcurrentCompilation(true);
 
     // Register the perf jitdump listener on the object-linking layer. The
     // default LLJIT layer is RTDyldObjectLinkingLayer; supply our own so we can
@@ -632,119 +611,14 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     }
     jd.addGenerator(std::move(*builtins));
 
-    if (parallel) {
-        // Serialize every module to bitcode while they still share `ctx` — a
-        // read-only traversal, no writes into the context's uniquing tables,
-        // so this stays single-threaded rather than risk concurrent reads of
-        // one LLVMContext. Then drop the shared modules/context: each buffer
-        // below is independently reparsed into its own fresh LLVMContext, so
-        // optimize_module + verify + addIRModule for different units run
-        // concurrently instead of serializing on one shared context's lock.
-        const auto t_serialize = std::chrono::steady_clock::now();
-        std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
-        for (size_t i = 0; i < built.modules.size(); ++i) {
-            llvm::raw_svector_ostream os(bitcode[i]);
-            llvm::WriteBitcodeToFile(*built.modules[i], os);
-        }
-        built.modules.clear();
-        ctx.reset();
-        if (stat) {
-            fprintf(stderr, "PARALLEL_STAT serialize: %.1f ms\n", ms_since(t_serialize));
-        }
-
-        const auto          t_parallel = std::chrono::steady_clock::now();
-        std::vector<double> stat_ms(stat ? bitcode.size() : 0);
-
-        llvm::DefaultThreadPool pool(llvm::hardware_concurrency(config.compile_jobs));
-        std::mutex              err_mu;
-        std::string             first_err;
-        std::vector<std::shared_future<void>> tasks;
-        tasks.reserve(bitcode.size());
-        for (size_t i = 0; i < bitcode.size(); ++i) {
-            tasks.push_back(pool.async([&, i] {
-                const auto              t0      = std::chrono::steady_clock::now();
-                auto                   mod_ctx = std::make_unique<llvm::LLVMContext>();
-                llvm::MemoryBufferRef  buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()),
-                                          "clotho.unit");
-                auto                   parsed = llvm::parseBitcodeFile(buf, *mod_ctx);
-                const auto             fail   = [&](std::string msg) {
-                    std::lock_guard<std::mutex> lock(err_mu);
-                    if (first_err.empty()) {
-                        first_err = std::move(msg);
-                    }
-                };
-                if (!parsed) {
-                    fail("jit: parallel module reload failed: " + llvm::toString(parsed.takeError()));
-                    return;
-                }
-                if (!optimize_module(**parsed, config.o3)) {
-                    fail("jit: parallel module optimize failed");
-                    return;
-                }
-                if (llvm::verifyModule(**parsed, &llvm::errs())) {
-                    fail("jit: parallel module failed verification after optimize");
-                    return;
-                }
-                llvm::orc::ThreadSafeContext mod_tsc(std::move(mod_ctx));
-                if (auto err = (*jit)->addIRModule(
-                      llvm::orc::ThreadSafeModule(std::move(*parsed), std::move(mod_tsc)))) {
-                    fail("jit: " + llvm::toString(std::move(err)));
-                }
-                if (stat) {
-                    stat_ms[i] = ms_since(t0);
-                }
-            }));
-        }
-        for (auto& t : tasks) {
-            t.wait();
-        }
-        if (stat) {
-            fprintf(stderr, "PARALLEL_STAT parallel section wall: %.1f ms\n", ms_since(t_parallel));
-        }
-        if (stat) {
-            double sum = 0.0, max_ms = 0.0;
-            size_t max_i = 0;
-            for (size_t i = 0; i < stat_ms.size(); ++i) {
-                sum += stat_ms[i];
-                if (stat_ms[i] > max_ms) {
-                    max_ms = stat_ms[i];
-                    max_i  = i;
-                }
-            }
-            // max_ms is the longest single module's optimize+verify+addIRModule
-            // time — a hard wall-time floor no thread count can beat. sum/max_ms
-            // is the speedup ceiling (vs a hypothetical fully-serial run of just
-            // this phase); compare against the measured speedup to see how much
-            // headroom load imbalance (a few big modules dominating) is costing.
-            fprintf(stderr,
-                    "PARALLEL_STAT modules=%zu jobs=%u sum_ms=%.1f max_ms=%.1f (module %zu) "
-                    "ceiling=%.2fx\n",
-                    stat_ms.size(), n_jobs, sum, max_ms, max_i, sum / std::max(max_ms, 1e-6));
-            for (size_t i = 0; i < stat_ms.size(); ++i) {
-                fprintf(stderr, "  module %zu: %.1f ms (bitcode %zu B)\n", i, stat_ms[i],
-                        bitcode[i].size());
-            }
-        }
-        if (!first_err.empty()) {
-            llvm::errs() << first_err << "\n";
-            return -1;
-        }
-    } else {
-        llvm::orc::ThreadSafeContext tsc(std::move(ctx));
-        for (auto& mod : built.modules) {
-            if (!optimize_module(*mod, config.o3)) {
-                llvm::errs() << "jit: module optimize failed\n";
-                return -1;
-            }
-            if (llvm::verifyModule(*mod, &llvm::errs())) {
-                llvm::errs() << "jit: module failed verification after optimize\n";
-                return -1;
-            }
-            if (auto err = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(mod), tsc))) {
-                llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
-                return -1;
-            }
-        }
+    // Every module is optimized on the pool and handed to ORC, which compiles them
+    // when `clotho_main` is looked up below.
+    if (auto err = for_each_optimized_module(built, std::move(ctx), config, [&](size_t, OwnedModule&& unit) {
+            llvm::orc::ThreadSafeContext tsc(std::move(unit.ctx));
+            return (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(unit.module), std::move(tsc)));
+        })) {
+        llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
+        return -1;
     }
 
     // Looking up `clotho_main` materializes the root module through the compile

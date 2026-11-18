@@ -13,8 +13,11 @@
 #include <vector>
 
 #include <llvm/ADT/STLExtras.h>
+#include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Object/ObjectFile.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
@@ -5987,36 +5990,31 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     CHECK(run_capture(src) == "2 7\n");
 }
 
-TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {
-    // Two definitions, so the per-definition units are linked back into the root.
-    const LowerResult result = lower_text(R"(
-        module child(input logic clk, output logic [7:0] q);
-            always_ff @(posedge clk) q <= q + 1;
-        endmodule
-        module top;
-            logic clk = 0;
-            logic [7:0] q;
-            child c(.clk(clk), .q(q));
-            initial begin #1 clk = 1; #1 $display("%0d", q); end
-        endmodule
-    )");
-    REQUIRE(result.ok);
-    auto target = ir::host_target();
-    REQUIRE(static_cast<bool>(target));
-    llvm::SmallVector<char, 0> bytes;
-    llvm::raw_svector_ostream  os(bytes);
-    REQUIRE(ir::emit_object(*result.module, os, *target));
+namespace {
 
-    auto object = llvm::object::ObjectFile::createObjectFile(
-      llvm::MemoryBufferRef(llvm::StringRef(bytes.data(), bytes.size()), "design.o"));
+// Two definitions, so the design is more than one module.
+constexpr const char* kObjectDesign = R"(
+    module child(input logic clk, output logic [7:0] q);
+        always_ff @(posedge clk) q <= q + 1;
+    endmodule
+    module top;
+        logic clk = 0;
+        logic [7:0] q;
+        child c(.clk(clk), .q(q));
+        initial begin #1 clk = 1; #1 $display("%0d", q); end
+    endmodule
+)";
+
+// The objects link into a program the user writes, so a definition spelled as a
+// C identifier could collide with one of theirs or their C library's. These are
+// the global definitions of `bytes`, an object file, that are spelled as one.
+std::vector<std::string> c_identifier_definitions(std::string_view bytes) {
+    auto object = llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(bytes, "design.o"));
     REQUIRE(static_cast<bool>(object));
     const llvm::Triple host(llvm::sys::getProcessTriple());
     CHECK((*object)->isRelocatableObject());
     CHECK((*object)->getArch() == host.getArch());
 
-    // The object links into a program the user writes, so a definition spelled
-    // as a C identifier could collide with one of theirs or their C library's.
-    // Only the entry and its rt_design may be; every other definition is `clotho.*`.
     std::vector<std::string> c_names;
     for (const llvm::object::SymbolRef& sym : (*object)->symbols()) {
         auto flags = sym.getFlags();
@@ -6038,9 +6036,61 @@ TEST_CASE("an emitted object defines clotho_main and clotho_design and no other 
             c_names.push_back(c_name.str());
         }
     }
+    return c_names;
+}
+
+} // namespace
+
+TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {
+    const LowerResult result = lower_text(kObjectDesign);
+    REQUIRE(result.ok);
+    auto target = ir::host_target();
+    REQUIRE(static_cast<bool>(target));
+    llvm::SmallVector<char, 0> bytes;
+    llvm::raw_svector_ostream  os(bytes);
+    REQUIRE(ir::emit_object(*result.module, os, *target));
+
+    // Only the entry and its rt_design may be; every other definition is `clotho.*`.
+    std::vector<std::string> c_names = c_identifier_definitions(std::string_view(bytes.data(), bytes.size()));
     std::ranges::sort(c_names);
     CHECK(c_names == std::vector<std::string>{ "clotho_design", "clotho_main" });
 }
+
+TEST_CASE("emitted per-module objects together define clotho_main and clotho_design and no other name a C program "
+          "could use") {
+    const LowerResult result = lower_text(kObjectDesign);
+    REQUIRE(result.ok);
+    auto target = ir::host_target();
+    REQUIRE(static_cast<bool>(target));
+
+    llvm::SmallString<128> dir;
+    REQUIRE_FALSE(llvm::sys::fs::createUniqueDirectory("clotho-objects-test", dir));
+    const struct Remove {
+        const llvm::SmallString<128>& dir;
+        ~Remove() {
+            llvm::sys::fs::remove_directories(dir);
+        }
+    } remove{ dir };
+
+    std::vector<std::string> paths;
+    REQUIRE(ir::emit_objects(*result.module, std::string(dir), paths, *target));
+    // The root and a module for each definition.
+    CHECK(paths.size() > 1);
+
+    // A name two of them defined would be a link error, which the sorted list shows
+    // as a repeat.
+    std::vector<std::string> c_names;
+    for (const std::string& path : paths) {
+        auto buffer = llvm::MemoryBuffer::getFile(path);
+        REQUIRE(static_cast<bool>(buffer));
+        for (std::string& name : c_identifier_definitions((*buffer)->getBuffer())) {
+            c_names.push_back(std::move(name));
+        }
+    }
+    std::ranges::sort(c_names);
+    CHECK(c_names == std::vector<std::string>{ "clotho_design", "clotho_main" });
+}
+
 // A delay that would land past the end of time (2**64 - 1 ticks) is not wrapped
 // into the past: at time 5 the wheel used to compute 5 + (2**64 - 1) = 4 and fire
 // the event there (here it was hashed into a slot and fired at 1028, the next time

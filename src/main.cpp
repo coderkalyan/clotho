@@ -26,6 +26,7 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/SubtargetFeature.h>
@@ -1030,6 +1031,29 @@ bool write_text(std::string_view out, const std::string& text) {
 }
 #endif
 
+// A fresh temporary directory for the objects of a build and the files embedded
+// for its link, removed with this object. `path` is empty, with the reason on
+// stderr, if there is none.
+struct ScratchDir {
+    std::string path;
+
+    ScratchDir() {
+        llvm::SmallString<128> dir;
+        if (const std::error_code ec = llvm::sys::fs::createUniqueDirectory("clotho-build", dir)) {
+            std::println(stderr, "clotho: cannot create a temporary directory: {}", ec.message());
+            return;
+        }
+        path = std::string(dir);
+    }
+    ScratchDir(const ScratchDir&)            = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+    ~ScratchDir() {
+        if (!path.empty()) {
+            llvm::sys::fs::remove_directories(path);
+        }
+    }
+};
+
 // `build`: write the requested artifact. `-o -` means stdout. `target` is the
 // build_target for an object or executable, null for anything else.
 bool write_artifact(const clotho::LowerResult&                result,
@@ -1058,37 +1082,53 @@ bool write_artifact(const clotho::LowerResult&                result,
         return true;
     }
     if (emit == Emit::Exe) {
-        // The object and the embedded link files go in a directory of their own,
-        // removed once the executable is written.
-        llvm::SmallString<128> scratch;
-        if (const std::error_code ec = llvm::sys::fs::createUniqueDirectory("clotho-build", scratch)) {
-            std::println(stderr, "clotho: cannot create a temporary directory: {}", ec.message());
+        // One object per module, generated in parallel, and the embedded link
+        // files, in a directory of their own removed once the executable is
+        // written.
+        const ScratchDir scratch;
+        if (scratch.path.empty()) {
             return false;
         }
-        const std::string dir(scratch);
-        const struct Remove {
-            const std::string& dir;
-            ~Remove() {
-                llvm::sys::fs::remove_directories(dir);
-            }
-        } remove{ dir };
-        llvm::SmallString<128> object(scratch);
-        llvm::sys::path::append(object, "design.o");
-        {
-            std::error_code      ec;
-            llvm::raw_fd_ostream os(object, ec);
-            if (ec) {
-                std::println(stderr, "clotho: cannot open '{}': {}", std::string_view(object), ec.message());
-                return false;
-            }
-            if (!clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve)) {
-                return false;
-            }
+        std::vector<std::string> objects;
+        if (!clotho::ir::emit_objects(*result.module, scratch.path, objects, *target, config, timings, resolve)) {
+            return false;
         }
         return clotho::link::link_executable(
-          std::string(object), config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), dir);
+          objects, config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), scratch.path);
     }
     if (emit == Emit::Obj) {
+#if defined(__linux__)
+        // The same per-module objects, joined into the one the user asked for.
+        const ScratchDir scratch;
+        if (scratch.path.empty()) {
+            return false;
+        }
+        std::vector<std::string> objects;
+        if (!clotho::ir::emit_objects(*result.module, scratch.path, objects, *target, config, timings, resolve)) {
+            return false;
+        }
+        if (!to_stdout) {
+            return clotho::link::link_relocatable(objects, std::string(out));
+        }
+        // lld writes a file, and a pipe is not one it can seek in.
+        llvm::SmallString<128> joined(scratch.path);
+        llvm::sys::path::append(joined, "design.o");
+        if (!clotho::link::link_relocatable(objects, std::string(joined))) {
+            return false;
+        }
+        auto buffer = llvm::MemoryBuffer::getFile(joined);
+        if (!buffer) {
+            std::println(stderr, "clotho: cannot read '{}': {}", std::string_view(joined), buffer.getError().message());
+            return false;
+        }
+        llvm::outs().write((*buffer)->getBufferStart(), (*buffer)->getBufferSize());
+        return true;
+#else
+        // TODO: one object per module, as above. lld's Mach-O driver has no
+        // relocatable link (`-r` is "not yet implemented", and then links an
+        // executable) and its MinGW driver rejects `-r`, so here the modules are
+        // optimized in parallel but linked into one and generated on one thread
+        // (docs/TODO.md, "Per-unit code generation").
         if (to_stdout) {
             return clotho::ir::emit_object(*result.module, llvm::outs(), *target, config, timings, resolve);
         }
@@ -1099,6 +1139,7 @@ bool write_artifact(const clotho::LowerResult&                result,
             return false;
         }
         return clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve);
+#endif
     }
     if (emit == Emit::LlvmUnits) {
         if (to_stdout) {

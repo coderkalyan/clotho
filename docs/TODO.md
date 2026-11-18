@@ -233,14 +233,18 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Cross-compiling an executable** — `build` writes one only for the machine it runs
   on; another target needs its executable runtime and C library startup files.
+- [ ] **Per-module objects for `build --emit obj` on macOS and Windows (performance)** — lld's
+  Mach-O driver has no relocatable link and its MinGW driver rejects `-r`, so the modules are
+  linked into one and generated on one thread there.
 
 ### Compilation
 
 - [ ] **Per-specialization lowering (performance)** — every elaborated instance is lowered
   separately into one flat module instead of once per specialization into a unit
   (docs/design/modular-compilation.md).
-- [ ] **Per-unit code generation (performance)** — unit code depends on the whole design,
-  and `build` links every module into one and generates its code on one thread.
+- [ ] **Per-unit code generation (performance)** — the modules are still built in one serial
+  pass in one LLVM context before the compile pool starts; unit code depends on whole-design
+  type and class numbers (docs/design/modular-compilation.md, step 5).
 - [ ] **Compilation caching across runs (performance)** — syntax trees, lowered units and
   objects are rebuilt each run; needs content-addressed caches.
 - [ ] **Process fusion across instances (performance)** — groups fuse only within one
