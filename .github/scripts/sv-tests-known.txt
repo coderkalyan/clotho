@@ -52,6 +52,7 @@ oracle regress-vlg_task_omemw3_iv 13.3: an output argument is copied out at the 
 oracle regress-sv_svconstants_iv LRM_NOTES 45 (6.20.2, 5.7.1): an untyped parameter set to '1 is at least 32 bits of ones in Clotho and slang, one bit in iverilog and Verilator
 oracle regress-sv_program3_iv LRM_NOTES 35 (24.3): the LRM does not say whether work woken by the last program initial runs before the implicit $finish; Clotho stops at once
 oracle regress-vlg_pr2792897_iv 21.2.1.2: no width rule for a real argument under %d; Clotho and Verilator pad to the 64-bit width, iverilog prints it minimal
+oracle regress-vlg_fread_iv LRM_NOTES 34 (21.3.4.4): the EOL check expects a 9-bit element with one byte left to keep its old x bits, as iverilog does; the clause takes fread data as 2-value, and Clotho zero-fills the unread bits
 
 # --- known-ran --------------------------------------------------------------
 known-ran basic-tagged-union the test's :assert: expression has unbalanced quotes (''{valid:10}'), so sv-tests' Python eval of it raises SyntaxError and no tool can pass; broken upstream
