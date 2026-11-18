@@ -829,3 +829,80 @@ TEST_CASE("overlapping drivers of an output port's net are a port coercion") {
         CHECK(r.diagnostic_text().find(msg) != std::string::npos);
     }
 }
+
+// A hierarchical call into another top-level module runs that module's own body, so
+// the statics of the callee are the callee instance's (LRM 13.4.2): one copy, not one
+// per top that reaches it, and none in the caller's unit, where two callees' statics
+// of one name used to collide ("unit 'top' has more than one member 'f.result'").
+// Calls from the callee's own code and from other tops share them.
+TEST_CASE("xhier: a call into another top-level module shares the callee's statics") {
+    CHECK(run_capture(R"(
+        module a;
+            function int f; int result; result = 1; return result; endfunction
+        endmodule
+        module b;
+            function int f; int result; result = 2; return result; endfunction
+        endmodule
+        module top;
+            initial $display("%0d %0d", a.f(), b.f());
+        endmodule
+    )") == "1 2\n");
+    CHECK(run_capture(R"(
+        module a;
+            function int f; int n; n = n + 1; return n; endfunction
+            initial #1 $display("a %0d", f());
+        endmodule
+        module top;
+            initial begin $display("top %0d", a.f()); #2 $display("top %0d", a.f()); end
+        endmodule
+    )") == "top 1\n"
+           "a 2\n"
+           "top 3\n");
+}
+
+// The callee may be a task, sit in a child instance or a generate block of the other
+// top, read that top's own variables, or be automatic; the caller may come before it.
+TEST_CASE("xhier: a call into another top-level module reaches its tasks, children, generate blocks and variables") {
+    CHECK(run_capture(R"(
+        module top;
+            int v;
+            initial begin
+                $display("top %0d %0d", a.u.f(), a.g.h());
+                a.u.t(v); $display("t %0d", v);
+                #2 $display("top %0d %0d %0d %0d", a.u.f(), a.g.h(), a.bump(), a.fresh());
+            end
+        endmodule
+        module a;
+            int x = 5;
+            leaf u();
+            generate if (1) begin : g
+                function int h(); static int k = 100; k++; return k; endfunction
+            end endgenerate
+            function int bump(); x++; return x; endfunction
+            function automatic int fresh(); int r; r = r + 1; return r; endfunction
+            initial #1 $display("a %0d", u.f());
+        endmodule
+        module leaf;
+            function int f(); static int n = 0; n++; return n; endfunction
+            task t(output int v); static int m = 10; m++; v = m; endtask
+        endmodule
+    )") == "top 1 101\n"
+           "t 11\n"
+           "a 2\n"
+           "top 3 102 6 1\n");
+}
+
+// Code outside every top calling into one (a `$unit` function's `top.f()`) is not
+// shared with the top that declares it, and is refused instead of getting a copy of
+// the callee's statics of its own.
+TEST_CASE("xhier: a call into a top-level module from `$unit` code is refused") {
+    const LowerResult r = lower_text(R"(
+        function int g(); return top.f(); endfunction
+        module top;
+            function int f(); static int n = 0; n++; return n; endfunction
+            initial $display("%0d", g());
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("from outside that module is not supported") != std::string::npos);
+}

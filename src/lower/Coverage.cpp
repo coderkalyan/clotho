@@ -571,6 +571,9 @@ std::string Lowerer::cover_group_name(const slang::ast::CovergroupType& cgt) {
 ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&                       cgt,
                                            uint32_t                                                type_idx,
                                            const std::vector<const slang::ast::CoverpointSymbol*>& points) {
+    // The declaring scope, not whichever one this Lowerer reached the type from: a
+    // package's covergroup body names no instance, a module's names its own.
+    const Restore<const Scope*> decl_scope(scope_, cgt.getParentScope());
     const ir::FunctionId id   = module_.reserve_function(module_.pool.void_type);
     own_function(id, cgt, ".sample");
     const ir::Ref        word = make_int_type(64, false);

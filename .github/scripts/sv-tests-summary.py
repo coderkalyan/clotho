@@ -42,7 +42,7 @@ KNOWN_LIST = Path(__file__).with_name("sv-tests-known.txt")
 # Known category -> the outcome it explains.
 KNOWN_OUTCOME = {"race": "self-check", "oracle": "self-check", "known-ran": "ran"}
 KNOWN_TITLE = {
-    "race": "race (LRM 4.7: order unspecified; for manual review)",
+    "race": "race (LRM 4.7: order unspecified; reviewed, no design may rely on it)",
     "oracle": "oracle (the test's expectation contradicts the LRM)",
     "known-ran": "known-ran (exit 0, test expects failure or its check cannot pass)",
 }

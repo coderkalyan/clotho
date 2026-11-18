@@ -315,7 +315,11 @@ Code: `src/runtime/Format.cpp` (`render_arg`). Tests: `tests/display_test.cpp` (
 
 The clause does not say what the unread bytes of a partly read element hold.
 Clotho packs the bytes it read into the high end of the element and zero-fills
-the rest; the return value counts the bytes read.
+the rest; the return value counts the bytes read. Zero-fill follows the clause's
+"The data loaded from the file are taken as 2-value data ... It is not possible
+to read a value of x or z using $fread": an element `$fread` writes holds only 0
+and 1. iverilog 13 keeps the unread bits' old value, so a 9-bit `9'bx` with one
+byte left reads `1xxxxxxxx` there and `100000000` here.
 
 Code: `src/runtime/Io.cpp` (`rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$fread into a memory with elements wider than 64 bits").
 

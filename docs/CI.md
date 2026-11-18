@@ -43,8 +43,8 @@ logs are uploaded as the `sv-tests-report` artifact.
 
 `.github/scripts/sv-tests-known.txt` lists the self-check and ran tests that are
 understood and not Clotho defects to fix now, one `<category> <test> <reason>`
-line each: `race` (outcome rests on an order LRM 4.7 leaves open; kept apart for
-manual review), `oracle` (the test's expectation contradicts the LRM) and
+line each: `race` (outcome rests on an order LRM 4.7 leaves open; each reviewed,
+and no design may rely on it), `oracle` (the test's expectation contradicts the LRM) and
 `known-ran`. The summary prints each category in its own section and leaves
 those tests out of the self-check and ran counts, so a non-zero count there is
 new. An entry whose test now passes, fails another way or has left the report is

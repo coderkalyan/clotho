@@ -801,6 +801,10 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     wait_prop_scan.out = &waited_props;
     root.visit(wait_prop_scan);
     UnitOwners unit_owners;
+    ForeignCalls foreign_calls;
+    if (root.topInstances.size() > 1) {
+        collect_foreign_calls(root, foreign_calls);
+    }
     try {
         Lowerer globals(*module, *result.sources, tick_fs, allow_system);
         globals.set_events_merge(events_merge);
@@ -809,6 +813,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_vif_defs(&vif_defs);
         globals.set_waited_props(&waited_props);
         globals.set_unit_owners(&unit_owners);
+        globals.set_foreign_calls(&foreign_calls);
         globals.lower_globals(comp, root);
 
         for (const InstanceSymbol* top : root.topInstances) {
@@ -823,6 +828,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
             lw.set_unit_owners(&unit_owners);
+            lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions resolve in the scope that owns them: this top's

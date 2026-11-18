@@ -1500,7 +1500,7 @@ ir::Signal Lowerer::register_signal(ir::SignalInfo info) {
     } else {
         // Package / $unit state, and the statics reached through it: the
         // static unit of the scope being lowered (partition).
-        own_signal(sig, owner_in(scope_).owner);
+        own_signal(sig, owner_in(scope_));
     }
 
     return sig;
@@ -1629,7 +1629,7 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
 
     const ir::Signal sig = module_.add_signal(std::move(info));
     sigmap_[&vs]         = sig;
-    own_signal(sig, owner_in(vs.getParentScope()).owner);
+    own_signal(sig, owner_in(vs.getParentScope()));
 
     if (seeded) {
         // The handles this value needs only exist at run time, so the table is
@@ -1648,6 +1648,28 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
     return sig;
 }
 
+// The name of a static declared in a subroutine, up to its own name: where the
+// declaring instance puts it, then the subroutine. A method's static is named by
+// its class first (the class's path, which tells one specialization from another),
+// since two classes of one unit can each have a method of one name, and a static of
+// one name in it. `scope` is the scope declaring the static, or the subroutine
+// itself.
+std::string Lowerer::subroutine_static_prefix(const std::optional<Home>& home, const Scope* scope) const {
+    for (const Scope* s = scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        if (s->asSymbol().kind != SymbolKind::Subroutine) {
+            continue;
+        }
+        const Scope* owner = s->asSymbol().getParentScope();
+        if (owner != nullptr && owner->asSymbol().kind == SymbolKind::ClassType) {
+            return (home ? home->instance_prefix : prefix_) + unit_path(owner->asSymbol(), unit_frame(owner)) +
+                   "::" + fn_ctx_->name_prefix;
+        }
+        break;
+    }
+
+    return (home ? home->prefix : prefix_) + fn_ctx_->name_prefix;
+}
+
 // A static-lifetime function local: it persists across calls (LRM 13.4.2), so
 // it gets persistent module-signal storage, initialized once at time zero —
 // not the per-call frame. Named with the function qualifier to avoid clashes.
@@ -1661,7 +1683,7 @@ ir::Signal Lowerer::declare_static_local(const ValueSymbol& vs) {
     }
     const std::optional<Home> home = home_of(vs.getParentScope());
     ir::SignalInfo            info;
-    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(vs.name);
+    info.name            = subroutine_static_prefix(home, vs.getParentScope()) + std::string(vs.name);
     info.loc             = to_source_loc(vs.location);
     info.type            = lower_type(vs.getType());
     info.is_event        = vs.getType().isEvent(); // see declare_local
@@ -1704,21 +1726,20 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
         sigmap_.emplace(&prop, sig);
         return sig;
     }
-    // The class's own rendering, which carries a specialization's arguments
-    // (bind_class_type): each specialization has its own statics (LRM 8.25), and
-    // their signals need distinct names to be imported by name. A class a module
-    // declares keeps its statics in that instance, whoever reaches them first.
+    // The class's own path, which carries a specialization's arguments and the
+    // classes it is nested in (unit_path): each specialization has its own
+    // statics (LRM 8.25), and a name is all another unit imports one by. A class a
+    // module declares keeps its statics in that instance, whoever reaches them
+    // first.
     std::string cls;
     if (const slang::ast::Scope* sc = prop.getParentScope()) {
         const slang::ast::Symbol& owner = sc->asSymbol();
-        cls = (owner.kind == SymbolKind::ClassType ? owner.as<slang::ast::ClassType>().toString()
-                                                   : std::string(owner.name)) +
-              "::";
+        cls = (owner.kind == SymbolKind::ClassType ? unit_path(owner, unit_frame(sc)) : std::string(owner.name)) + "::";
     }
     const std::optional<Home> home = home_of(prop.getParentScope());
     const ir::Ref             pty  = lower_type(prop.getType());
     ir::SignalInfo            info;
-    info.name            = (home ? home->prefix : prefix_) + cls + std::string(prop.name);
+    info.name            = (home ? home->instance_prefix : prefix_) + cls + std::string(prop.name);
     info.loc             = to_source_loc(prop.location);
     info.type            = pty;
     info.is_event        = prop.getType().isEvent(); // see declare_local

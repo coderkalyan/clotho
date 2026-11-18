@@ -1486,6 +1486,9 @@ void Lowerer::emit_rand_hook(const slang::ast::ClassType& clt,
 // middle: the hook calls, the mask intersection and the recursion are
 // constraint-independent.
 void Lowerer::build_randomize_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
+    // The declaring scope, not whichever one this Lowerer reached the class from: a
+    // package class's body names no instance, a module class's names its own.
+    const Restore<const Scope*> decl_scope(scope_, clt.getParentScope());
     const ir::SourceLoc l   = to_source_loc(clt.location);
     const ir::Ref       u64 = make_int_type(64, false);
     const ir::Ref       i32 = make_int_type(32, false);
@@ -1689,6 +1692,9 @@ ir::Index Lowerer::emit_rand_enum(const slang::ast::EnumType& et,
 // (LRM 18.13.3) and both `rand_mode` forms (LRM 18.8). One slot with an opcode
 // rather than four slots: these are rare calls, and the vtable is per class.
 void Lowerer::build_randops_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
+    // The declaring scope, not whichever one this Lowerer reached the class from: a
+    // package class's body names no instance, a module class's names its own.
+    const Restore<const Scope*> decl_scope(scope_, clt.getParentScope());
     const ir::SourceLoc l   = to_source_loc(clt.location);
     const ir::Ref       u64 = make_int_type(64, false);
     ir::Builder         b(module_);

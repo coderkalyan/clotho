@@ -832,33 +832,6 @@ void Lowerer::build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
     arg_elem_cts.push_back(*ec);
 }
 
-// The root (top-level) instance whose hierarchy ultimately contains `scope`, or
-// null when it sits in no elaborated instance. A module's members hang off an
-// InstanceBodySymbol whose own parent scope is the *declaration* site, so
-// climbing a level steps across the body/InstanceSymbol pair through
-// parentInstance — the same walk control_depth uses.
-const InstanceSymbol* Lowerer::owning_top(const Scope* scope) {
-    const InstanceSymbol* top = nullptr;
-    while (scope != nullptr) {
-        const Symbol& sym = scope->asSymbol();
-        if (sym.kind != SymbolKind::InstanceBody) {
-            scope = sym.getParentScope();
-            continue;
-        }
-        const InstanceSymbol* parent = sym.as<InstanceBodySymbol>().parentInstance;
-        if (parent == nullptr) {
-            return nullptr; // a body slang elaborated without an instance
-        }
-        top   = parent;
-        scope = parent->getParentScope();
-    }
-    return top;
-}
-
-const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
-    return owning_top(sub.getParentScope());
-}
-
 void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
                                   const InstanceSymbol*          top,
                                   bool                           collect_globals) {
@@ -1027,6 +1000,9 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
         return globals_->function_id(sub);
     }
 
+    if (const auto foreign = foreign_->fns.find(&sub); foreign != foreign_->fns.end()) {
+        return foreign_function_id(sub, foreign->second);
+    }
     const auto cached = fnmap_.find(&sub);
     if (cached != fnmap_.end()) {
         return cached->second;
@@ -1037,6 +1013,16 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
         own_function(id, sub);
         build_dpi_import(sub, id);
         return id;
+    }
+    // A subroutine of another top that nothing here was told to share would be
+    // lowered a second time under this top, with a second copy of its statics
+    // (LRM 13.4.2): the call comes from where collect_foreign_calls does not look
+    // (a package, a class, a design with one top).
+    // TODO: share these too (`$unit` code calling `top.f()`, a method of another
+    // top's class).
+    if (const InstanceSymbol* owner = owning_top(sub); owner != nullptr && owner != top_inst_) {
+        fail("a call of '" + std::string(sub.name) + "' in top-level module '" + std::string(owner->name) +
+             "' from outside that module is not supported here");
     }
     // No per-formal type guard here: every storage class now passes in every
     // direction. `ref` aliases the actual's live storage through a fat pointer
@@ -1085,6 +1071,38 @@ void Lowerer::build_reserved_body(const SubroutineSymbol& sub, ir::FunctionId id
         build_task(sub, id);
     } else {
         build_function(sub, id);
+    }
+}
+
+// A subroutine other tops call (ForeignCalls) has one id for every Lowerer. A caller
+// lowered before the top that declares it reserves the id and that top fills it; the
+// declaring top builds it the first time it needs it, under its own scope, so the
+// statics are its instance's whoever calls first.
+ir::FunctionId Lowerer::foreign_function_id(const SubroutineSymbol& sub, ForeignCalls::Fn& fn) {
+    const bool owner = owning_top(sub) == top_inst_;
+    if (!fn.reserved) {
+        if (!owner && sub.getReturnType().getCanonicalType().isClass()) {
+            // TODO: the reserved type is this Lowerer's class Ref, the body's is the owner's.
+            fail("a call of '" + std::string(sub.name) +
+                 "' in a later top-level module, which returns a class handle, is not supported");
+        }
+        fn.id       = module_.reserve_function(subroutine_return_type(sub));
+        fn.reserved = true;
+    }
+    fnmap_[&sub] = fn.id;
+    if (owner && !fn.built) {
+        fn.built = true;
+        own_function(fn.id, sub);
+        build_reserved_body(sub, fn.id);
+    }
+    return fn.id;
+}
+
+void Lowerer::build_foreign_subroutines(const InstanceSymbol& top) {
+    for (const SubroutineSymbol* sub : foreign_->order) {
+        if (owning_top(*sub) == &top && !foreign_->fns.at(sub).built) {
+            (void)function_id(*sub);
+        }
     }
 }
 
@@ -1599,7 +1617,7 @@ ir::Signal Lowerer::declare_static_return(const SubroutineSymbol& sub) {
     }
     const std::optional<Home> home = home_of(sub.getParentScope());
     ir::SignalInfo            info;
-    info.name            = (home ? home->prefix : prefix_) + fn_ctx_->name_prefix + std::string(rv.name);
+    info.name            = subroutine_static_prefix(home, &sub) + std::string(rv.name);
     info.type            = lower_type(rv.getType());
     info.dir             = ir::SignalInfo::Direction::Internal;
     const ir::Signal sig = register_declared_signal(home, std::move(info));

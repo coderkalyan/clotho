@@ -467,6 +467,22 @@ bool has_user_call(const slang::ast::Expression& e);
 // every instance and package), or null for a package or `$unit` scope. See Scans.cpp.
 const slang::ast::Scope* enclosing_instance_scope(const slang::ast::Scope* s);
 
+// The scope whose unit holds what `scope` declares: its instance body, or else the
+// package or `$unit` that declares it. Null for a scope in neither.
+const slang::ast::Scope* unit_frame(const slang::ast::Scope* scope);
+
+// `sym`'s path as its unit names it, which is what an import names it by: the
+// scopes from `frame` (the scope `unit_frame` gives; its own segment is dropped)
+// down to `sym`, or from the root when `frame` is null, as slang writes a
+// hierarchical path. It differs from slang's in one respect: a class's segment
+// is its name and the arguments of a specialization (LRM 8.25), each argument
+// written as the type or value it is, qualified like the path, so that two
+// specializations of one class never share a path and one specialization has the
+// same path wherever it is reached. slang writes an argument that is a typedef
+// declared in a generic class without the class's own arguments, and a class
+// argument without its scope. See Scans.cpp.
+std::string unit_path(const slang::ast::Symbol& sym, const slang::ast::Scope* frame);
+
 // Whether the implicit return variable of a STATIC function (LRM 13.4.1, 13.4.2)
 // has to be persistent storage. It keeps its value from call to call, but that is
 // only observable if some call can see the value an earlier one left: the body
@@ -871,20 +887,42 @@ struct IfaceIds {
     ankerl::unordered_dense::map<std::string_view, uint32_t>             slots;
 };
 
+// The root instance whose hierarchy contains `scope` (a subroutine's, or the scope
+// of a declaration), null when it sits in none: a package's or `$unit`'s.
+const InstanceSymbol* owning_top(const slang::ast::Scope* scope);
+const InstanceSymbol* owning_top(const slang::ast::SubroutineSymbol& sub);
+
+// The tasks and functions one top-level module's instances declare and something
+// outside that top calls by hierarchical name (LRM 23.7): `same.check_time()` in
+// `top`. One body serves every caller, and the top that declares it lowers it, so
+// its statics belong to that instance (LRM 13.4.2) whichever top reaches it first.
+// A caller lowered before that top reserves the function and the owner fills it.
+// Filled by collect_foreign_calls before any top is lowered and shared by every
+// Lowerer, like UnitOwners.
+struct ForeignCalls {
+    struct Fn {
+        ir::FunctionId id{};
+        bool           reserved = false;
+        bool           built    = false;
+    };
+    ankerl::unordered_dense::map<const slang::ast::SubroutineSymbol*, Fn> fns;
+    // The keys of `fns` in the order the design names them, so the owner builds
+    // them in the same order every run.
+    std::vector<const slang::ast::SubroutineSymbol*> order;
+};
+
+// Every foreign call of a design with several tops. A design with one top has none
+// a hierarchical name could make: it is the only top there is.
+void collect_foreign_calls(const slang::ast::RootSymbol& root, ForeignCalls& out);
+
 // Which unit declares what, for partition (ir/Partition.h). Shared by every
 // Lowerer of one design, like ClassIds: the globals Lowerer registers the static
 // units, each top's Collect pass registers its instance bodies, and every
 // Lowerer attributes the functions and unscoped signals it creates.
 struct UnitOwners {
     ir::Attribution attribution;
-    // An instance body, package or compilation unit, and the hierarchical-path
-    // prefix its members' import names drop ("top.u." for an instance; nothing
-    // for a package, whose members keep their `pkg::` qualification).
-    struct Entry {
-        ir::Owner   owner;
-        std::string strip;
-    };
-    ankerl::unordered_dense::map<const slang::ast::Scope*, Entry> scopes;
+    // The unit an instance body, package or compilation unit declares.
+    ankerl::unordered_dense::map<const slang::ast::Scope*, ir::Owner> scopes;
     // Import names already given, keyed "<owner kind>:<owner index>:<name>",
     // with how many times (own_function).
     ankerl::unordered_dense::map<std::string, uint32_t> names;
@@ -1091,6 +1129,11 @@ public:
     // Point this Lowerer at the design-wide unit ownership record (UnitOwners).
     void set_unit_owners(UnitOwners* owners) {
         owners_ = owners;
+    }
+
+    // Point this Lowerer at the design's foreign calls (ForeignCalls).
+    void set_foreign_calls(ForeignCalls* calls) {
+        foreign_ = calls;
     }
 
     // The record, for lower_design to hand to partition.
@@ -1878,8 +1921,9 @@ private:
     // parent) must not put them under the caller.
     struct Home {
         ir::InstanceScope* node = nullptr;
-        // The flat name prefix of the declaring scope: its instance's, then the
-        // generate blocks between.
+        // The flat name prefix of the declaring scope's instance.
+        std::string instance_prefix;
+        // The same, then the generate blocks between the instance and the scope.
         std::string prefix;
     };
 
@@ -4994,6 +5038,8 @@ private:
 
     uint32_t fn_local(const ValueSymbol& vs);
 
+    std::string subroutine_static_prefix(const std::optional<Home>& home, const Scope* scope) const;
+
     ir::Signal declare_static_local(const ValueSymbol& vs);
 
     ir::Signal declare_static_return(const SubroutineSymbol& sub);
@@ -5026,10 +5072,6 @@ private:
                                   std::vector<ir::ArgDir>&            arg_dirs,
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
-
-    static const InstanceSymbol* owning_top(const Scope* scope);
-
-    static const InstanceSymbol* owning_top(const SubroutineSymbol& sub);
 
     // Collect `export "DPI-C"` directives (LRM 35.5 / 35.8): for each, force-lower
     // the SV subroutine and record a DpiExport so the backend emits its C-callable
@@ -5067,17 +5109,22 @@ private:
 
     ir::FunctionId vif_function_id(const SubroutineSymbol& ph_sub);
 
-    // Register the unit an instance body, package or compilation unit declares,
-    // with the path prefix its members' import names drop (UnitOwners).
-    void own_scope(const slang::ast::Scope& scope, ir::Owner owner, std::string strip);
+    // Register the unit an instance body, package or compilation unit declares
+    // (UnitOwners).
+    void own_scope(const slang::ast::Scope& scope, ir::Owner owner);
     // Record the specialization `inst` elaborates (UnitOwners::Spec), from
     // Collect, once its scope is numbered and before it joins its parent.
     void note_specialization(const slang::ast::InstanceSymbol& inst, uint32_t scope);
     // The unit a symbol declared in `scope` belongs to: the nearest enclosing
     // registered scope's, else the glue unit's.
-    const UnitOwners::Entry& owner_in(const slang::ast::Scope* scope) const;
-    // `decl`'s hierarchical path relative to the unit declaring it: the name
-    // another unit imports it by.
+    const ir::Owner& owner_in(const slang::ast::Scope* scope) const;
+    // The instance body of the unit a symbol declared in `scope` belongs to, when
+    // that unit is an instance's: the frame its members' names are relative to
+    // (unit_path). Null for a package's or `$unit`'s unit and the glue unit, whose
+    // members are named from the root.
+    const slang::ast::Scope* owner_frame(const slang::ast::Scope* scope) const;
+    // `decl`'s path relative to the unit declaring it (unit_path): the name another
+    // unit imports it by.
     std::string import_name(const slang::ast::Symbol& decl) const;
     // Attribute function `id` to the unit declaring `decl`, importable as
     // `decl`'s path relative to that unit followed by `suffix`.
@@ -5088,8 +5135,8 @@ private:
     // `decl`, importable as `decl`'s path relative to that unit.
     void own_cover_type(uint32_t idx, const slang::ast::Symbol& decl);
     // `name` as an import name no other of its table (`table` tags it: "" for
-    // functions) names in the unit `e` owns: the nth repeat takes `#n`.
-    std::string unique_import_name(const UnitOwners::Entry& e, std::string name, std::string_view table);
+    // functions) names in the unit `owner` is: the nth repeat takes `#n`.
+    std::string unique_import_name(ir::Owner owner, std::string name, std::string_view table);
     // Attribute an unscoped signal to a unit (UnitOwners).
     void own_signal(ir::Signal sig, ir::Owner owner);
 
@@ -5098,6 +5145,12 @@ private:
     void add_process(ir::Process p);
 
     ir::FunctionId function_id(const SubroutineSymbol& sub);
+
+    // `function_id` for a subroutine another top calls: the id every Lowerer shares.
+    ir::FunctionId foreign_function_id(const SubroutineSymbol& sub, ForeignCalls::Fn& fn);
+
+    // Build what other tops call that this top declares and nothing here called.
+    void build_foreign_subroutines(const InstanceSymbol& top);
 
     // The return type `sub`'s function is reserved with: void for a task and a void
     // function, else its lowered return type.
@@ -5931,6 +5984,9 @@ private:
     // lower_compilation shares one across every Lowerer.
     UnitOwners  own_owners_;
     UnitOwners* owners_ = &own_owners_;
+    // The subroutines other tops call (ForeignCalls); none for a standalone Lowerer.
+    ForeignCalls  own_foreign_;
+    ForeignCalls* foreign_ = &own_foreign_;
     // The unit a scope-less process this Lowerer creates belongs to: its top's,
     // once Collect has numbered the top scope; the glue unit's for the globals
     // Lowerer.
