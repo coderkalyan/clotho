@@ -25,7 +25,7 @@ The option sets nest the same way.
 
 `build` writes, by default, an executable that simulates the design without
 clotho, a compiler or a linker on the machine (docs/design/executables.md); with
-`--emit` it writes the generated code instead -- a native object file, LLVM IR, or
+`--emit` it writes the generated code instead -- LLVM IR, or
 Clotho's own IR. The executable takes plusargs and `--stop-time` when it runs,
 like `run`; everything else about the run is fixed by the options `build` was
 given.
@@ -82,7 +82,7 @@ see "One parser".
 
 | option | commands | effect |
 |---|---|---|
-| `--emit <target>` | build | `exe` (default: an executable, docs/design/executables.md), `obj` (a relocatable object for this machine, position-independent, defining `clotho_main` and `clotho_design`: on Linux the objects of the design's modules, generated in parallel and joined by a relocatable link; on macOS and Windows the modules linked back into one and generated on one thread, as those platforms' lld cannot link relocatably), `llvm` (post-coroutine-pipeline LLVM IR, the modules linked into one), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
+| `--emit <target>` | build | `exe` (default: an executable, docs/design/executables.md), `llvm` (post-coroutine-pipeline LLVM IR, the modules linked into one), `llvm-units` (each module's LLVM IR, one file each, in the directory `-o` names), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
 | `--target <lang>` | synth (Debug builds only) | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
 | `--hierarchy <mode>` | synth (Debug builds only) | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
 | `--sidecar <path>` | synth (Debug builds only) | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |
@@ -90,7 +90,7 @@ see "One parser".
 | `--full-case` | synth (Debug builds only) | Believe `full_case` / `unique`; reported wherever the claim is what removed a latch |
 | `--parallel-case` | synth (Debug builds only) | Believe `parallel_case` / `unique0` |
 | `-o, --output <file>` | build, synth | output path for every target; `-` is stdout. Without `-o`, `build` writes an executable to the current directory, named after the design's first top-level module (`.exe` added on Windows), and any other target to stdout, refusing when that is a terminal (see "The artifact and the terminal"). An executable cannot go to stdout |
-| `--cpu <name>` | build | the processor an `exe` or `obj` is compiled for: by default a baseline every machine of the kind has (`x86-64-v2`, `apple-m1` on Apple Silicon, `generic` Armv8-A on other AArch64), `native` for the machine building it, or any processor name LLVM knows for the target (an unknown one is a usage error). Refused for text targets |
+| `--cpu <name>` | build | the processor an `exe` is compiled for: by default a baseline every machine of the kind has (`x86-64-v2`, `apple-m1` on Apple Silicon, `generic` Armv8-A on other AArch64), `native` for the machine building it, or any processor name LLVM knows for the target (an unknown one is a usage error). Refused for text targets |
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`, `units`. `parallel` reports the timings of the per-module compile pool, so only where one runs: `run`, and `build` of an executable or an object; `units` reports how many instances each specialization has and which specializations' instances still do not lower to identical unit IR |
@@ -309,6 +309,7 @@ the command line does.
 | `--no-parallel-compile` | removed with its field | nothing set `SimulationConfig::parallel_compile`, and `-j 1` compiles the modules one at a time. `run` and `build` share one per-module pipeline (module-split.md), so a gate on it would have to exist twice |
 | `--no-outline` | removed with its field | it chose between per-member functions plus a dispatcher and one merged body for a fused group spanning instances. Every such group now takes the dispatch form (one row per instance, all running the unit's function), with or without `--no-split` (module-split.md, Partition), so there is no second form to gate and no `SimulationConfig::outline` |
 | `--domain-spec` | removed with the feature | domain-spec.md |
+| `build --emit obj` | removed | a relocatable object for linking the design into another program. Embedding is not a supported use for now, and an executable already runs a design without clotho; the per-module objects an executable is linked from stay internal (`emit_objects`). Its one-file form also needed a relocatable link lld has only for ELF |
 | `CLOTHO_DEDUP_STAT` (+`=2`), `CLOTHO_COMB_FUSE_STAT`, `CLOTHO_FINISH_STAT`, `CLOTHO_PARALLEL_STAT`, `CLOTHO_DOM_DEBUG` | `--stat=<list>` | five undiscoverable env vars, read by `getenv` deep in the backend, became one documented option and a `Stat` bitmask in `SimulationConfig` |
 | `SimulationConfig::optimize` | `lower_coro` | it gates the coroutine pipeline, not optimization; `o3` is the optimization field and the pair read as a contradiction |
 | header comment + hand-written usage string | one registration in `register_options` | both copies had drifted (neither listed `--no-split`/`--no-outline`; the header also missed `--dpi-lib` and `--emit=check`). `--help` is generated from the same registry that parses, so an option cannot exist undocumented |

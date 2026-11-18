@@ -572,7 +572,7 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     if (built.modules.empty()) {
         return false;
     }
-    // One linked module, as emit_object writes: the unit modules are separate
+    // One linked module: the unit modules are separate
     // llvm::Modules, and printing each in turn gives a file llvm-as rejects at the
     // second `; ModuleID`.
     //
@@ -663,8 +663,7 @@ object_machine(const llvm::orc::JITTargetMachineBuilder& target, bool o3) {
     return tm;
 }
 
-// The object code of `module`, in memory first: an object writer may seek back to
-// patch headers, which a pipe on stdout cannot do.
+// The object code of `module`, generated into memory and written out by the caller.
 static llvm::Expected<llvm::SmallVector<char, 0>> generate_object(llvm::Module& module, llvm::TargetMachine& tm) {
     llvm::SmallVector<char, 0> object;
     llvm::raw_svector_ostream  object_os(object);
@@ -675,69 +674,6 @@ static llvm::Expected<llvm::SmallVector<char, 0>> generate_object(llvm::Module& 
     }
     pm.run(module);
     return object;
-}
-
-bool emit_object(const Module&                             m,
-                 llvm::raw_ostream&                        os,
-                 const llvm::orc::JITTargetMachineBuilder& target,
-                 const SimulationConfig&                   config,
-                 Timings*                                  timings,
-                 const LocResolver&                        resolve) {
-    assert(config.lower_coro && "an object needs the coroutines lowered");
-    const auto t_llvm = std::chrono::steady_clock::now();
-    auto       tm     = object_machine(target, config.o3);
-    if (!tm) {
-        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
-        return false;
-    }
-    auto ctx   = std::make_unique<llvm::LLVMContext>();
-    auto built = build_modules_unoptimized(m, *ctx, **tm, config, resolve);
-    if (built.modules.empty()) {
-        return false;
-    }
-
-    // The modules are optimized apart and in parallel, then linked into one, which
-    // the Linker can only do inside one context: each goes back through bitcode.
-    std::vector<llvm::SmallVector<char, 0>> optimized(built.modules.size());
-    if (auto err = for_each_optimized_module(built, std::move(ctx), config, [&](size_t i, OwnedModule&& unit) -> llvm::Error {
-            llvm::raw_svector_ostream bits(optimized[i]);
-            llvm::WriteBitcodeToFile(*unit.module, bits);
-            return llvm::Error::success();
-        })) {
-        llvm::errs() << "llvm backend: " << llvm::toString(std::move(err)) << "\n";
-        return false;
-    }
-    llvm::LLVMContext             linked_ctx;
-    std::unique_ptr<llvm::Module> root;
-    for (size_t i = 0; i < optimized.size(); ++i) {
-        const llvm::MemoryBufferRef buf(llvm::StringRef(optimized[i].data(), optimized[i].size()), "clotho.unit");
-        auto                        parsed = llvm::parseBitcodeFile(buf, linked_ctx);
-        if (!parsed) {
-            llvm::errs() << "llvm backend: module reload failed: " << llvm::toString(parsed.takeError()) << "\n";
-            return false;
-        }
-        llvm::SmallVector<char, 0>().swap(optimized[i]);
-        if (i == 0) {
-            root = std::move(*parsed);
-            continue;
-        }
-        llvm::Linker linker(*root);
-        // Reports its own diagnostic through the context's handler.
-        if (linker.linkInModule(std::move(*parsed))) {
-            return false;
-        }
-    }
-
-    auto object = generate_object(*root, **tm);
-    if (!object) {
-        llvm::errs() << "llvm backend: " << llvm::toString(object.takeError()) << "\n";
-        return false;
-    }
-    os.write(object->data(), object->size());
-    if (timings != nullptr) {
-        timings->llvm_ms += ms_since(t_llvm);
-    }
-    return true;
 }
 
 bool emit_objects(const Module&                             m,

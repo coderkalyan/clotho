@@ -26,7 +26,6 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/FileSystem.h>
-#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/SubtargetFeature.h>
@@ -361,7 +360,6 @@ private:
 // What `build` writes.
 enum class Emit : uint8_t {
     Exe,     // an executable for this machine (the default)
-    Obj,     // a native object file for this machine
     Ir,      // Clotho process IR
     Llvm,    // LLVM IR after the coroutine-lowering pipeline
     LlvmUnits, // one file of LLVM IR per module (post-pipeline), into the directory of -o
@@ -428,15 +426,14 @@ void register_options(Registry& r, Options& o) {
           "--emit",
           o.emit,
           "What to write: exe (an executable that runs the simulation without clotho, the default), "
-          "obj (an object file that defines clotho_main, for linking against Clotho's runtime "
-          "library), llvm (LLVM IR for the design), llvm-units (the LLVM IR of each unit's module and "
-          "of the link glue, one file each, in the directory -o names), ir (Clotho's own intermediate "
-          "form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
+          "llvm (LLVM IR for the design), llvm-units (the LLVM IR of each unit's module and of the "
+          "link glue, one file each, in the directory -o names), ir (Clotho's own intermediate form), "
+          "llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
           "<target>");
     r.add(bit(Command::Build),
           "--cpu",
           o.cpu,
-          "The processor an executable or object is compiled for: a baseline every machine of this "
+          "The processor an executable is compiled for: a baseline every machine of this "
           "kind has (x86-64-v2 on x86-64, Apple M1 on Apple Silicon, generic Armv8-A on other "
           "AArch64) by default, `native` for exactly this one, or an LLVM processor name",
           "<name>");
@@ -661,7 +658,7 @@ bool stdout_is_terminal() {
 
 // `build` writes anything but an executable to stdout unless given `-o`, and a
 // terminal is where that is almost always a forgotten `-o`: the generated code
-// is pages of text, or binary, nobody reads there. So the default is refused on
+// is pages of text nobody reads there. So the default is refused on
 // a terminal; an explicit `-o -` still asks for it by name, and a pipe or a file
 // is not a terminal.
 bool refuses_terminal_artifact(Command command, Emit emit, bool out_given, bool stdout_terminal) {
@@ -1096,51 +1093,6 @@ bool write_artifact(const clotho::LowerResult&                result,
         return clotho::link::link_executable(
           objects, config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), scratch.path);
     }
-    if (emit == Emit::Obj) {
-#if defined(__linux__)
-        // The same per-module objects, joined into the one the user asked for.
-        const ScratchDir scratch;
-        if (scratch.path.empty()) {
-            return false;
-        }
-        std::vector<std::string> objects;
-        if (!clotho::ir::emit_objects(*result.module, scratch.path, objects, *target, config, timings, resolve)) {
-            return false;
-        }
-        if (!to_stdout) {
-            return clotho::link::link_relocatable(objects, std::string(out));
-        }
-        // lld writes a file, and a pipe is not one it can seek in.
-        llvm::SmallString<128> joined(scratch.path);
-        llvm::sys::path::append(joined, "design.o");
-        if (!clotho::link::link_relocatable(objects, std::string(joined))) {
-            return false;
-        }
-        auto buffer = llvm::MemoryBuffer::getFile(joined);
-        if (!buffer) {
-            std::println(stderr, "clotho: cannot read '{}': {}", std::string_view(joined), buffer.getError().message());
-            return false;
-        }
-        llvm::outs().write((*buffer)->getBufferStart(), (*buffer)->getBufferSize());
-        return true;
-#else
-        // TODO: one object per module, as above. lld's Mach-O driver has no
-        // relocatable link (`-r` is "not yet implemented", and then links an
-        // executable) and its MinGW driver rejects `-r`, so here the modules are
-        // optimized in parallel but linked into one and generated on one thread
-        // (docs/TODO.md, "Per-unit code generation").
-        if (to_stdout) {
-            return clotho::ir::emit_object(*result.module, llvm::outs(), *target, config, timings, resolve);
-        }
-        std::error_code      ec;
-        llvm::raw_fd_ostream os(out, ec);
-        if (ec) {
-            std::println(stderr, "clotho: cannot open '{}': {}", out, ec.message());
-            return false;
-        }
-        return clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve);
-#endif
-    }
     if (emit == Emit::LlvmUnits) {
         if (to_stdout) {
             std::println(stderr, "clotho: --emit llvm-units writes a directory; pass -o <dir>");
@@ -1311,8 +1263,6 @@ int main(int argc, char** argv) {
         const std::string& target = *options.emit;
         if (target == "exe") {
             emit = Emit::Exe;
-        } else if (target == "obj") {
-            emit = Emit::Obj;
         } else if (target == "llvm") {
             emit = Emit::Llvm;
         } else if (target == "llvm-units") {
@@ -1323,7 +1273,7 @@ int main(int argc, char** argv) {
             emit = Emit::Ir;
         } else {
             return usage_error(
-              std::format("unknown --emit target '{}'; expected exe, obj, llvm, llvm-units, ir or llvm-raw", target));
+              std::format("unknown --emit target '{}'; expected exe, llvm, llvm-units, ir or llvm-raw", target));
         }
     }
     if (refuses_terminal_artifact(command, emit, options.out.has_value(), stdout_is_terminal())) {
@@ -1338,7 +1288,7 @@ int main(int argc, char** argv) {
         return usage_error("--dpi-lib applies to an executable (--emit exe), which links the libraries in");
     }
     std::optional<llvm::orc::JITTargetMachineBuilder> target;
-    if (command == Command::Build && (emit == Emit::Exe || emit == Emit::Obj)) {
+    if (command == Command::Build && emit == Emit::Exe) {
         std::string error;
         bool        usage = false;
         target            = build_target(options.cpu, error, usage);
@@ -1350,7 +1300,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     } else if (options.cpu.has_value()) {
-        return usage_error("--cpu applies to an executable or object (--emit exe or obj)");
+        return usage_error("--cpu applies to an executable (--emit exe)");
     }
 
     SimulationConfig config;

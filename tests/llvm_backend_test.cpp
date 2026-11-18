@@ -6041,21 +6041,6 @@ std::vector<std::string> c_identifier_definitions(std::string_view bytes) {
 
 } // namespace
 
-TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {
-    const LowerResult result = lower_text(kObjectDesign);
-    REQUIRE(result.ok);
-    auto target = ir::host_target();
-    REQUIRE(static_cast<bool>(target));
-    llvm::SmallVector<char, 0> bytes;
-    llvm::raw_svector_ostream  os(bytes);
-    REQUIRE(ir::emit_object(*result.module, os, *target));
-
-    // Only the entry and its rt_design may be; every other definition is `clotho.*`.
-    std::vector<std::string> c_names = c_identifier_definitions(std::string_view(bytes.data(), bytes.size()));
-    std::ranges::sort(c_names);
-    CHECK(c_names == std::vector<std::string>{ "clotho_design", "clotho_main" });
-}
-
 TEST_CASE("emitted per-module objects together define clotho_main and clotho_design and no other name a C program "
           "could use") {
     const LowerResult result = lower_text(kObjectDesign);
@@ -6187,7 +6172,8 @@ TEST_CASE("--stop-time stops before a timer at the last instant") {
 // `build --emit llvm` writes one file, so it must be one module: each distinct
 // module definition gets its own llvm::Module, and printing them back to back
 // gave a file llvm-as rejects at the second `; ModuleID` ("expected top-level
-// entity"). emit_object already links them; the text path now does too. Oracle:
+// entity"). An executable's link joins the modules' objects; the text path links
+// the modules into one. Oracle:
 // none; `; ModuleID` opens exactly one module in textual IR.
 TEST_CASE("--emit llvm of a design with several definitions is one module") {
     for (const bool lower_coro : { true, false }) {

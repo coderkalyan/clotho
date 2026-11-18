@@ -90,13 +90,7 @@ code model, `config.o3` for the machine optimization level; a JIT target machine
 would default to the large code model, whose absolute addresses are text
 relocations a macOS link refuses), and writes `design.<i>.o` into the scratch
 directory, root first. An executable is one link of the list (src/link/Link.cpp).
-`--emit obj` on Linux joins the list with `ld.lld -r` in process
-(`link_relocatable`), which keeps it one file with the parallel code
-generation. lld's Mach-O driver accepts `-r` and then links an executable anyway
-("not yet implemented") and its MinGW driver rejects it, so on macOS and Windows
-`--emit obj` still links the optimized modules into one and generates its code
-on one thread (`emit_object`). `--emit llvm` is that one linked module as text
-and is not parallel.
+`--emit llvm` links the modules into one as text and is not parallel.
 
 ## Cache stability
 
