@@ -88,8 +88,20 @@ them in step.
   objects, events, covergroup instances) follows one discipline: a collected
   object, with a finalizer for any native resource it owns. **Not yet:** events
   are never freed.
-- The collector's design (heap organization, roots, generations, barriers,
-  triggers, safepoints) is open for discussion.
+- Collection is generational: an object is old once a collection has marked it.
+  That bit is the only generation state; it is kept beside the heap, not in the
+  object, and a full collection clears it first. **Not yet:** marks are an epoch
+  parity in each object's header, with a separate old bit.
+- Objects do not move, but only what the collector scans may rely on that: an
+  object's address is held in object fields, design state, frames and the stack
+  and nowhere else, and identity and ordering never use it, so that moving can be
+  added. **Not yet:** an associative array keyed by a class handle orders by
+  address.
+- Suspended frames and the native stack are scanned conservatively until frames
+  have explicit stack maps; object fields and design state are scanned precisely.
+- Still open for discussion: heap organization, barriers, triggers, safepoints
+  and threads, and whether buffers stay outside the collected heap once any
+  process may run on any thread.
 
 ## Containers and classes
 
