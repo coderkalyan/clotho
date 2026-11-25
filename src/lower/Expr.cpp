@@ -1140,8 +1140,8 @@ ir::Index Lowerer::lower_range_select(const RangeSelectExpression& rs,
             // emit_indexed_slice_copy for a write). Reaching here means some
             // other consumer asked for it as a plain lvalue.
             fail("indexed part-select slice of an unpacked array is only supported as a "
-                 "whole-slice copy source or target, an equality operand, or a "
-                 "subroutine argument");
+                 "whole-slice copy source or target, an equality operand, a "
+                 "subroutine argument, or a %p argument");
         }
         if (is_aggregate(*rs.value().type)) {
             // TODO: slice of an array whose element is an unpacked struct /

@@ -1986,7 +1986,10 @@ void Lowerer::expand_p_arg(const Expression& arg, std::string& frag, std::vector
         expand_p_scalar(lower_expr(arg, b), sty, frag, args, b, l);
         return;
     }
-    expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
+    // An indexed slice of an unpacked array has no storage-anchored sub-array to
+    // walk (its first position is a runtime value), so lower_array_operand copies
+    // it into a temp first; every other operand is its own lvalue.
+    expand_p_lvalue(lower_array_operand(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
 }
 
 // The Scope side of a union type, whose members carry the names and payload
