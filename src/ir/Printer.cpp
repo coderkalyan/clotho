@@ -1026,7 +1026,7 @@ private:
             case Inst::Tag::AggEq: {
                 const AggEqInfo info = ir_.extra_data<AggEqInfo>(p.op_extra.extra);
                 ref(p.op_extra.op);
-                os_ << " == ";
+                os_ << (info.mode == AggEqMode::Case ? " === " : " == ");
                 ref(info.rhs);
                 os_ << ")\n";
                 break;

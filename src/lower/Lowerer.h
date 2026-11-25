@@ -1625,13 +1625,15 @@ private:
 
     ir::Index lower_packed_pattern(const Expression& expr, ir::Builder& b);
 
-    ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b, ir::SourceLoc l);
+    ir::Index lower_agg_eq_operand(const Expression& e, ir::Builder& b);
 
-    void guard_agg_eq_members(ir::Ref type);
+    ir::Index lower_struct_eq(const Expression& lhs,
+                              const Expression& rhs,
+                              ir::AggEqMode     mode,
+                              ir::Builder&      b,
+                              ir::SourceLoc     l);
 
-    bool case_eq_matches_logical(ir::Ref type) const;
-
-    bool assoc_value_may_carry_xz(ir::Ref type) const;
+    void guard_agg_eq_members(ir::Ref type, ir::AggEqMode mode);
 
     static const Expression& unwrap_conversion(const Expression& e);
 

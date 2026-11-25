@@ -698,78 +698,30 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
     // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5, Table 11-1): a
     // whole struct / fixed unpacked array / queue / dynamic array / associative
     // array value cannot be loaded, so every equality-family operator reduces to
-    // a per-leaf (or, for an associative array, whole-map canonical byte)
-    // comparison instead. slang wraps each operand in a bitstream Conversion,
-    // so the aggregate type is on the unwrapped operand.
+    // one AggEq node, `==` or `===` by its mode, which the backend expands by
+    // recursion over the type (docs/design/aggregate-equality.md). slang wraps
+    // each operand in a bitstream Conversion, so the aggregate type is on the
+    // unwrapped operand.
     if (bin.op == B::Equality || bin.op == B::Inequality || bin.op == B::CaseEquality ||
         bin.op == B::CaseInequality) {
-        const Expression& ule = unwrap_conversion(bin.left());
-        if (is_assoc(ule)) {
-            // LRM 11.4.5 / 7.9 (P4a): two associative arrays are equal iff
-            // they hold the same set of (key, value) pairs -- no per-leaf
-            // walk here (a map has no positional "leaves" to Land-reduce
-            // over the way a struct/array/queue does); the backend compares
-            // each side's P3 canonical serialization byte for byte instead.
-            const Expression& re = unwrap_conversion(bin.right());
-            if (!is_struct_lvalue_shape(ule) || !is_struct_lvalue_shape(re)) {
-                fail("associative array equality is only supported between "
-                     "array variables");
-            }
-            const ir::Ref  sty     = lower_type(*ule.type);
-            const bool     is_case = bin.op == B::CaseEquality || bin.op == B::CaseInequality;
-            if (!is_case) {
-                const ir::Type t = std::get<ir::Type>(module_.pool.get(sty));
-                if (assoc_value_may_carry_xz(t.element)) {
-                    // TODO: X-propagating logical equality for a
-                    // 4-state-capable value element (LRM 11.4.5) -- the
-                    // canonical byte serialization is bit-exact, which is
-                    // what case equality (===) wants, but logical equality
-                    // needs an unknown VALUE pair to propagate to an
-                    // ambiguous (x) result, and a flat byte compare cannot
-                    // give that.
-                    fail("logical equality of an associative array with a "
-                         "4-state-capable value element is not supported "
-                         "(LRM 11.4.5); use === instead");
-                }
-            }
-            const ir::SourceLoc l        = loc(bin);
-            const ir::Index     left_lv  = lower_lvalue(ule, b);
-            const ir::Index     right_lv = lower_lvalue(re, b);
-            const ir::Index     acc      = b.agg_eq(left_lv, right_lv, sty, l);
-            return (bin.op == B::Equality || bin.op == B::CaseEquality)
-                   ? acc
-                   : b.unary(ir::Inst::Tag::Lnot, acc, l);
-        }
-        const bool agg_operand =
-          is_unpacked_struct(*ule.type) ||
-          ule.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() !=
-            nullptr ||
+        const Expression&  ule     = unwrap_conversion(bin.left());
+        const bool         is_case = bin.op == B::CaseEquality || bin.op == B::CaseInequality;
+        const ir::AggEqMode mode   = is_case ? ir::AggEqMode::Case : ir::AggEqMode::Logical;
+        const bool          agg_operand =
+          is_assoc(ule) || is_unpacked_struct(*ule.type) ||
+          ule.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr ||
           is_queue(ule) || is_dyn_array(ule);
         if (agg_operand) {
-            const bool is_case = bin.op == B::CaseEquality || bin.op == B::CaseInequality;
-            if (is_case && !case_eq_matches_logical(lower_type(*ule.type))) {
-                // Case equality compares x/z bits directly instead of
-                // X-propagating them like logical equality does (11.4.5,
-                // "just as ... the procedural case statement", 12.5); the
-                // AggEq / runtime container comparator below implements
-                // only the X-propagating rule. Reusing it is exact when no
-                // leaf can ever carry x/z (case_eq_matches_logical); a leaf
-                // that could carry x/z has no dedicated case-equality
-                // comparator yet.
-                // TODO: a bit-for-bit (x/z-inclusive) case-equality member
-                // walk for a struct / queue / dynamic array with a 4-state
-                // or real leaf (LRM 11.4.5, 12.5).
-                fail("case equality of an aggregate or container with a "
-                     "4-state or real leaf is not supported (LRM 11.4.5)");
+            const ir::SourceLoc l = loc(bin);
+            ir::Index           acc;
+            if (is_assoc(ule)) {
+                const Expression& re  = unwrap_conversion(bin.right());
+                const ir::Ref     sty = lower_type(*ule.type);
+                guard_agg_eq_members(sty, mode);
+                acc = b.agg_eq(lower_lvalue(ule, b), lower_lvalue(re, b), sty, mode, l);
+            } else {
+                acc = lower_struct_eq(ule, unwrap_conversion(bin.right()), mode, b, l);
             }
-            // A whole queue / dynamic-array compare (LRM 11.2.2) reduces to
-            // a per-element walk with the same X-propagation (Land-reduced
-            // Eq leaves) a struct / fixed-array compare uses; the AggEq
-            // expansion dispatches the handle leaf to the runtime element
-            // compare. Proven leaf-safe above, that walk is exact for a
-            // case (in)equality operand too, not merely an approximation.
-            const ir::SourceLoc l   = loc(bin);
-            const ir::Index     acc = lower_struct_eq(ule, unwrap_conversion(bin.right()), b, l);
             return (bin.op == B::Equality || bin.op == B::CaseEquality)
                    ? acc
                    : b.unary(ir::Inst::Tag::Lnot, acc, l);

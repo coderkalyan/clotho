@@ -1051,4 +1051,81 @@ void Backend::lower_assoc_traverse(Index i, Inst::Tag tag) {
     set_value(i, two_val(cast(status, 32, false)));
 }
 
+// `a == b` / `a === b` over two associative arrays (docs/design/aggregate-equality.md):
+// sizes, then a lock-step walk of both maps in sorted-key order. Keys compare exactly
+// (a differing key set is a definite 0); each value pair compares with the
+// recursive lower_agg_eq in `mode`. Accumulators live in allocas, as in
+// emit_container_eq_loop.
+Plane Backend::emit_assoc_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, AggEqMode mode) {
+    const Type&    t  = std::get<Type>(mod_.pool.get(type));
+    const Ref      et = t.element;
+    llvm::Value*   ha = lv_handle_ptr(lhs, HandleUse::Read);
+    llvm::Value*   hb = lv_handle_ptr(rhs, HandleUse::Read);
+    llvm::Value*   size_eq = b_.CreateICmpEQ(b_.CreateCall(assoc_num_fn(), { ha }), b_.CreateCall(assoc_num_fn(), { hb }));
+
+    auto* i1   = b_.getInt1Ty();
+    auto* must = entry_alloca(i1, "aeq.must");
+    auto* may  = entry_alloca(i1, "aeq.may");
+    b_.CreateStore(size_eq, must);
+    b_.CreateStore(size_eq, may);
+    auto* kpa  = entry_alloca(raw_ptr_ty(), "aeq.kpa");
+    auto* kla  = entry_alloca(b_.getInt32Ty(), "aeq.kla");
+    auto* kpb  = entry_alloca(raw_ptr_ty(), "aeq.kpb");
+    auto* klb  = entry_alloca(b_.getInt32Ty(), "aeq.klb");
+    auto* have = entry_alloca(i1, "aeq.have");
+
+    auto* fn    = b_.GetInsertBlock()->getParent();
+    auto* start = llvm::BasicBlock::Create(ctx_, "aeq.start", fn);
+    auto* head  = llvm::BasicBlock::Create(ctx_, "aeq.head", fn);
+    auto* body  = llvm::BasicBlock::Create(ctx_, "aeq.body", fn);
+    auto* vals  = llvm::BasicBlock::Create(ctx_, "aeq.vals", fn);
+    auto* done  = llvm::BasicBlock::Create(ctx_, "aeq.done", fn);
+    // Different sizes are already a definite 0, so the walk is skipped.
+    b_.CreateCondBr(size_eq, start, done);
+
+    b_.SetInsertPoint(start);
+    llvm::Value* got_a = b_.CreateCall(assoc_end_fn(/*last=*/false), { ha, kpa, kla });
+    llvm::Value* got_b = b_.CreateCall(assoc_end_fn(/*last=*/false), { hb, kpb, klb });
+    b_.CreateStore(b_.CreateAnd(b_.CreateTrunc(got_a, i1), b_.CreateTrunc(got_b, i1)), have);
+    b_.CreateBr(head);
+
+    b_.SetInsertPoint(head);
+    b_.CreateCondBr(b_.CreateLoad(i1, have), body, done);
+
+    b_.SetInsertPoint(body);
+    llvm::Value* pa = b_.CreateLoad(raw_ptr_ty(), kpa);
+    llvm::Value* la = b_.CreateLoad(b_.getInt32Ty(), kla);
+    llvm::Value* pb = b_.CreateLoad(raw_ptr_ty(), kpb);
+    llvm::Value* lb = b_.CreateLoad(b_.getInt32Ty(), klb);
+    llvm::Value* same_key = b_.CreateICmpNE(b_.CreateCall(key_span_eq_fn(), { pa, la, pb, lb }), b_.getInt8(0));
+    // A key present in one map only is a definite 0; the walk stops there.
+    auto* clear = llvm::BasicBlock::Create(ctx_, "aeq.clear", fn);
+    b_.CreateCondBr(same_key, vals, clear);
+    b_.SetInsertPoint(clear);
+    b_.CreateStore(b_.getInt1(false), must);
+    b_.CreateStore(b_.getInt1(false), may);
+    b_.CreateBr(done);
+
+    b_.SetInsertPoint(vals);
+    const DynElem ve = dynarr_elem(type);
+    const auto elem_lv = [&](llvm::Value* h, llvm::Value* kp, llvm::Value* kl) {
+        llvm::Value* slot = b_.CreateCall(assoc_get_ptr_fn(), { h, kp, kl });
+        LValue       lv   = tmp_elem_lvalue(slot, ve, b_.getInt64(0));
+        lv.is_string      = ve.is_string;
+        return Guarded(lv);
+    };
+    const Plane e_eq = lower_agg_eq(elem_lv(ha, pa, la), elem_lv(hb, pb, lb), et, mode);
+    const Plane acc  = lower_logical(Inst::Tag::Land, bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may)), true,
+                                     e_eq, agg_eq_four(et, mode));
+    b_.CreateStore(b_.CreateTrunc(must_of(acc, true), i1), must);
+    b_.CreateStore(b_.CreateTrunc(may_of(acc, true), i1), may);
+    llvm::Value* na = b_.CreateCall(assoc_step_fn(/*prev=*/false), { ha, pa, la, kpa, kla });
+    llvm::Value* nb = b_.CreateCall(assoc_step_fn(/*prev=*/false), { hb, pb, lb, kpb, klb });
+    b_.CreateStore(b_.CreateAnd(b_.CreateTrunc(na, i1), b_.CreateTrunc(nb, i1)), have);
+    b_.CreateBr(head);
+
+    b_.SetInsertPoint(done);
+    return bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may));
+}
+
 } // namespace clotho::ir::backend

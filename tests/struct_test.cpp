@@ -1166,22 +1166,26 @@ TEST_CASE("unpacked struct case-equality with a class-handle member") {
     )") == "ceq=1\nceq=0 cne=1\n");
 }
 
-// A 4-state leaf CAN carry x/z, where case and logical equality genuinely
-// disagree (case compares the bits directly, 12.5; logical X-propagates,
-// 11.4.5): reusing the == walk would be wrong, so this stays a located
-// refusal rather than a silent wrong answer.
-TEST_CASE("struct case-equality with a 4-state leaf is refused, not "
-          "silently approximated (LRM 11.4.5)") {
-    const LowerResult r = lower_text(R"(
+// A 4-state leaf can carry x/z, where case and logical equality differ: case
+// compares the bits as values (LRM 11.4.5, 12.5) and answers a known bit, logical
+// propagates x. Oracle: LRM 11.4.5, derived by hand.
+TEST_CASE("struct case-equality with a 4-state leaf compares x/z exactly (LRM 11.4.5)") {
+    CHECK(run_capture(R"(
         module m;
-            typedef struct { logic [7:0] a; } s_t;
+            typedef struct { logic [3:0] a; int i; } s_t;
             s_t x, y;
-            initial $display("%b", x === y);
+            initial begin
+                x.a = 4'b01x0; x.i = 1; y.a = 4'b01x0; y.i = 1;
+                $display("%b %b %b", x === y, x !== y, x == y);
+                y.a = 4'b01z0;
+                $display("%b %b %b", x === y, x !== y, x == y);
+                y.a = 4'b0110;
+                $display("%b %b", x === y, x == y);
+                y.a = 4'b01x0; y.i = 2;
+                $display("%b %b", x === y, x == y);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("case equality of an aggregate or container "
-                                    "with a 4-state or real leaf is not supported") != std::string::npos);
+    )") == "1 0 x\n0 1 x\n0 x\n0 0\n");
 }
 
 TEST_CASE("unpacked struct equality with a string member") {
@@ -2675,23 +2679,26 @@ TEST_CASE("conditional operator over an unpacked struct") {
             endmodule
         )") == "1 11\n");
     }
-    SUBCASE("an ambiguous condition over an associative member is refused") {
-        // The 11.4.5 compare has no ordered element walk for an associative
-        // member, so the ambiguous path refuses rather than guessing.
-        const LowerResult r = lower_text(R"(
+    SUBCASE("an ambiguous condition over an associative member compares the maps") {
+        // Oracle: LRM 11.4.11 + Table 7-1. The arms differ, so the whole struct is
+        // its default: a == 0 and an empty map. Equal arms return the arm.
+        CHECK(run_capture(R"(
             module m;
                 typedef struct { int m[string]; int a; } st;
                 initial begin
                     st x, y, v;
                     logic c;
                     c = 1'bx;
+                    x.a = 1; x.m["k"] = 11;
+                    y.a = 1; y.m["k"] = 22;
                     v = c ? x : y;
+                    $display("%0d %0d", v.a, v.m.num());
+                    y.m["k"] = 11;
+                    v = c ? x : y;
+                    $display("%0d %0d", v.a, v.m["k"]);
                 end
             endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("equality of an aggregate with an associative-array member is not supported") !=
-              std::string::npos);
+        )") == "0 0\n1 11\n");
     }
     SUBCASE("a conditional over a whole queue is refused") {
         const LowerResult r = lower_text(R"(
@@ -2830,4 +2837,113 @@ TEST_CASE("conditional operator over a fixed unpacked array") {
             endmodule
         )") == "'{1, 2, 3}\n");
     }
+}
+
+// Aggregate equality is one recursion over the type, so nested combinations need no
+// case of their own (docs/design/aggregate-equality.md). Oracle for every line: the
+// LRM 11.4.5 rules (definite mismatch 0, else any x gives x, else 1; case equality
+// compares x/z as values), different sizes or key sets a definite 0, derived by hand.
+TEST_CASE("aggregate equality composes: struct with an associative member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int k; int m[int]; } s_t;
+            s_t a, b;
+            initial begin
+                a.k = 1; b.k = 1; a.m[1] = 2; b.m[1] = 2;
+                $display("%b %b %b", a == b, a === b, a != b);
+                b.m[1] = 3;
+                $display("%b %b", a == b, a === b);
+                b.m[1] = 2; b.m[5] = 0;
+                $display("%b %b", a == b, a === b);
+                a.m[5] = 0; b.k = 2;
+                $display("%b %b", a == b, a === b);
+            end
+        endmodule
+    )") == "1 1 0\n0 0\n0 0\n0 0\n");
+}
+
+TEST_CASE("aggregate equality composes: associative array of structs with 4-state fields") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [3:0] f; } s_t;
+            s_t a[int], b[int];
+            initial begin
+                a[1].f = 4'b0000; b[1].f = 4'bx;
+                $display("%b", a === b);
+                a[1].f = 4'bx;
+                $display("%b", a === b);
+                b[1].f = 4'bz;
+                $display("%b %b", a === b, a !== b);
+            end
+        endmodule
+    )") == "0\n1\n0 1\n");
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [3:0] f; } s_t;
+            s_t a[int], b[int];
+            initial $display("%b", a == b);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("4-state-capable value element") != std::string::npos);
+}
+
+TEST_CASE("aggregate equality composes: queue of associative arrays, array of queues") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef int am_t[int];
+            am_t p[$], q[$];
+            am_t e1, e2;
+            int fa[0:1][$], fb[0:1][$];
+            initial begin
+                e1[1] = 5; e2[1] = 5;
+                p.push_back(e1); q.push_back(e2);
+                $display("%b %b", p == q, p === q);
+                e2[1] = 6; q[0] = e2;
+                $display("%b", p == q);
+                fa[0] = '{1, 2}; fb[0] = '{1, 2};
+                $display("%b %b", fa == fb, fa === fb);
+                fb[1].push_back(7);
+                $display("%b", fa == fb);
+            end
+        endmodule
+    )") == "1 1\n0\n1 1\n0\n");
+}
+
+TEST_CASE("aggregate equality: case equality of a container with 4-state elements") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [3:0] a[$], b[$];
+            initial begin
+                a = '{4'b01x0, 4'b1}; b = '{4'b01x0, 4'b1};
+                $display("%b %b", a == b, a === b);
+                b[0] = 4'b01z0;
+                $display("%b %b", a == b, a === b);
+                b[0] = 4'b0000; a[0] = 4'b0000;
+                $display("%b %b", a == b, a === b);
+                b.push_back(1);
+                $display("%b %b", a == b, a === b);
+            end
+        endmodule
+    )") == "x 1\nx 0\n1 1\n0 0\n");
+}
+
+// Operand shapes: any expression of aggregate type is an operand.
+TEST_CASE("aggregate equality operands: function result, cast pattern, conditional") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [3:0] b; } s_t;
+            function automatic s_t mk(int x); s_t r; r.a = x; r.b = 4'h3; return r; endfunction
+            s_t s, t;
+            bit c;
+            initial begin
+                s.a = 1; s.b = 4'h3; t.a = 9; t.b = 4'h3; c = 1;
+                $display("%b %b", s == mk(1), s === mk(2));
+                $display("%b %b", s == s_t'{1, 4'h3}, s === s_t'{1, 4'h3});
+                $display("%b %b", (c ? s : t) == s, (c ? t : s) === s);
+                s.b = 4'bx;
+                $display("%b %b", s == mk(1), s === mk(1));
+            end
+        endmodule
+    )") == "1 0\n1 1\n1 0\nx 0\n");
 }

@@ -642,8 +642,8 @@ void Lowerer::emit_agg_cond_ambiguous(ir::Index                    lhs,
     // differ becomes its Table 7-1 default WHOLE -- not a member-by-member
     // merge, which is the array rule and only the array rule. (Verilator
     // returns the false arm here instead; see docs/TODO.md.)
-    guard_agg_eq_members(type);
-    const ir::Index eq = b.agg_eq(ta, tb, type, l);
+    guard_agg_eq_members(type, ir::AggEqMode::Logical);
+    const ir::Index eq = b.agg_eq(ta, tb, type, ir::AggEqMode::Logical, l);
 
     b.open_region();
     emit_agg_copy(lhs, ta, type, tag, b, l);
@@ -724,8 +724,8 @@ void Lowerer::emit_agg_cond_elementwise(ir::Index               lhs,
 // (or real, or string) operands is already definite and needs no narrowing.
 ir::Index Lowerer::agg_cond_elem_match(ir::Index a, ir::Index other, ir::Ref ety, ir::Builder& b, ir::SourceLoc l) {
     if (is_agg_abi_ref(ety)) {
-        guard_agg_eq_members(ety);
-        const ir::Index eq = b.agg_eq(a, other, ety, l);
+        guard_agg_eq_members(ety, ir::AggEqMode::Logical);
+        const ir::Index eq = b.agg_eq(a, other, ety, ir::AggEqMode::Logical, l);
 
         return b.binary(ir::Inst::Tag::CaseEq, eq, bit_like(eq, 1, b, l), l);
     }
@@ -1279,133 +1279,61 @@ ir::Index Lowerer::lower_packed_pattern(const Expression& expr, ir::Builder& b) 
     return b.concat(parts, l);
 }
 
-// 1-bit 4-state equality of two whole unpacked aggregates (struct or fixed
-// unpacked array): one AggEq node the backend expands per leaf, AND-reducing
-// the per-leaf `==` results with Land (the reduction carries LRM 11.4.5
-// X-propagation). Both operands must be aggregate lvalues (a '{...} pattern
-// compare is a follow-up); a heap-owning leaf (string is handled; queue /
-// dynamic array is guarded) is rejected.
-ir::Index Lowerer::lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b, ir::SourceLoc l) {
-    const Expression& le = unwrap_conversion(lhs);
-    const Expression& re = unwrap_conversion(rhs);
-    // An aggregate lvalue: a variable / member / element, or a fixed
-    // unpacked-array slice — a constant-bounds one is an ArrSlice lvalue, an
-    // indexed one materializes into a temp (lower_array_operand). A `?:`
-    // (LRM 11.4.11) is accepted too: lower_lvalue stages it into a canonical
-    // aggregate temp, so `(c ? x : y) == z` compares anchored storage exactly
-    // as a variable operand does.
-    const auto agg_eq_operand = [](const Expression& e) {
-        return is_struct_lvalue_shape(e) || e.kind == ExpressionKind::ConditionalOp ||
-               (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
-    };
-    if (!agg_eq_operand(le) || !agg_eq_operand(re)) {
-        fail("unpacked aggregate equality is only supported between aggregate variables");
+// An operand of an aggregate equality as an lvalue of its own type. A variable,
+// member, element, call result, `?:` or fixed-array slice already is one
+// (lower_array_operand / lower_lvalue); a queue rvalue materializes through
+// materialize_queue_rvalue; anything else (a `T'{...}` cast pattern) is built into
+// a temp. The one helper every aggregate equality and ambiguous `?:` goes through
+// (docs/design/aggregate-equality.md).
+ir::Index Lowerer::lower_agg_eq_operand(const Expression& e, ir::Builder& b) {
+    if (is_queue(e)) {
+        return materialize_queue_rvalue(e, b);
     }
+    if (is_struct_lvalue_shape(e) || e.kind == ExpressionKind::ConditionalOp || e.kind == ExpressionKind::Call ||
+        (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e))) {
+        return lower_array_operand(e, b);
+    }
+    const ir::SourceLoc l   = loc(e);
+    const ir::Ref       ty  = lower_type(*e.type);
+    const ir::Index     tmp = is_dyn_array(e) ? make_arg_temp(ty, b, l) : make_canonical_agg_temp(ty, b, l);
+    emit_agg_store(tmp, ty, e, ir::Inst::Tag::Store, b, l);
+    return tmp;
+}
+
+// Equality of two whole unpacked aggregates or containers: one AggEq node the
+// backend expands by recursion over the type, `==` or `===` by `mode`.
+ir::Index Lowerer::lower_struct_eq(const Expression& lhs,
+                                   const Expression& rhs,
+                                   ir::AggEqMode     mode,
+                                   ir::Builder&      b,
+                                   ir::SourceLoc     l) {
     const ir::Ref sty = lower_type(*lhs.type);
-    guard_agg_eq_members(sty);
-    const ir::Index lhs_agg = lower_array_operand(le, b);
-    const ir::Index rhs_agg = lower_array_operand(re, b);
-    return b.agg_eq(lhs_agg, rhs_agg, sty, l);
+    guard_agg_eq_members(sty, mode);
+    const ir::Index lhs_agg = lower_agg_eq_operand(unwrap_conversion(lhs), b);
+    const ir::Index rhs_agg = lower_agg_eq_operand(unwrap_conversion(rhs), b);
+    return b.agg_eq(lhs_agg, rhs_agg, sty, mode, l);
 }
 
-// Reject comparable-aggregate leaf shapes the backend AggEq expansion does
-// not cover. An unpacked-array member is walked element-wise (supported);
-// only a queue / dynamic-array leaf still needs the length+element compare.
-// A REAL leaf works: the backend's leaf compare picks FEq for one (it used to
-// hand a real plane to the integer compare and crash).
-void Lowerer::guard_agg_eq_members(ir::Ref type) {
+// The one refusal of aggregate equality, at any nesting: logical `==` over an
+// associative array whose value has a 4-state leaf. The comparison is exact where
+// `===` wants it; the X-propagating answer across a key-set mismatch is not settled.
+// TODO: docs/design/aggregate-equality.md, "Associative arrays".
+void Lowerer::guard_agg_eq_members(ir::Ref type, ir::AggEqMode mode) {
     const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-    if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
-        // A queue / dynamic-array leaf compares element-wise. An aggregate, a
-        // nested container or an element wider than one word walks in the backend
-        // (emit_container_eq_loop, which recurses through this same compare, so
-        // only the element's own shape has to be checked here); anything narrower
-        // is a scalar / real / string the flat runtime comparator reads directly.
-        if (is_agg_abi_ref(t.element) || value_cat(t.element) == ValueCat::handle ||
-            module_.pool.layout(t.element).width > 64) {
-            guard_agg_eq_members(t.element);
-        }
-        return;
+    if (t.kind == ir::Type::Kind::Assoc && mode == ir::AggEqMode::Logical &&
+        ir::types::has_four_state_leaf(module_.pool, t.element)) {
+        fail("logical equality of an associative array with a 4-state-capable value element is not "
+             "supported (LRM 11.4.5); use === instead");
     }
-    if (value_cat(type) == ValueCat::handle) {
-        // TODO: equality of an aggregate with an associative-array / class
-        // member (no ordered element walk yet).
-        fail("equality of an aggregate with an associative-array member is not supported");
-    }
-    if (t.kind == ir::Type::Kind::UnpackedArray) {
-        guard_agg_eq_members(t.element);
+    if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray ||
+        t.kind == ir::Type::Kind::UnpackedArray || t.kind == ir::Type::Kind::Assoc) {
+        guard_agg_eq_members(t.element, mode);
     }
     if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
         for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
-            guard_agg_eq_members(f.type);
+            guard_agg_eq_members(f.type, mode);
         }
     }
-}
-
-// Whether case equality (===/!==) on `type` is provably identical to
-// logical equality (==/!=): true when no leaf can ever carry x/z, the one
-// condition under which LRM 11.4.5's two rules (case: x/z compare
-// directly, like a procedural case statement, 12.5; logical: x/z
-// propagate to an unknown result) can disagree. A string leaf carries no
-// x/z at all (LRM 6.16.9); a class handle or chandle is a definite
-// pointer or null, never x/z. A 4-state integral leaf is not provably
-// safe, and neither is a real/shortreal leaf (=== is outright illegal on
-// one, Table 11-1) or an associative-array leaf (no case-compare
-// implementation) -- the caller refuses case equality for any of those
-// rather than silently reusing the X-propagating AggEq / container-
-// compare result.
-bool Lowerer::case_eq_matches_logical(ir::Ref type) const {
-    const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-    if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-        for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
-            if (!case_eq_matches_logical(f.type)) {
-                return false;
-            }
-        }
-        return true;
-    }
-    if (t.kind == ir::Type::Kind::UnpackedArray || t.kind == ir::Type::Kind::Queue ||
-        t.kind == ir::Type::Kind::DynArray) {
-        return case_eq_matches_logical(t.element);
-    }
-    if (t.kind == ir::Type::Kind::String) {
-        return true;
-    }
-    if (module_.pool.is_float(type) || value_cat(type) == ValueCat::handle) {
-        return false;
-    }
-    return module_.pool.layout(type).domain != ir::Domain::Four;
-}
-
-// Whether a value of `type` could ever carry an x/z bit, recursing through
-// every leaf kind the P3 assoc-key canonical serializer
-// (emit_variable_agg_key_bytes, ir/llvm/AssocArrays.cpp) knows how to encode --
-// struct / fixed array / queue / dynamic array / associative array nesting,
-// down to a plain leaf. False for a leaf with no x/z state at all (string,
-// class handle, chandle, event, virtual interface, real/shortreal, a
-// 2-state integral); true for a genuinely 4-state-capable integral leaf.
-// Used only to gate whole-associative-array logical equality (P4a): a flat
-// byte compare on the canonical serialization is exact for a definite
-// value, but cannot give the X-propagating answer LRM 11.4.5 wants when a
-// value pair is unknown.
-bool Lowerer::assoc_value_may_carry_xz(ir::Ref type) const {
-    const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-    if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-        for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
-            if (assoc_value_may_carry_xz(f.type)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (t.kind == ir::Type::Kind::UnpackedArray || t.kind == ir::Type::Kind::Queue ||
-        t.kind == ir::Type::Kind::DynArray || t.kind == ir::Type::Kind::Assoc) {
-        return assoc_value_may_carry_xz(t.element);
-    }
-    if (t.kind == ir::Type::Kind::String || module_.pool.is_float(type)) {
-        return false;
-    }
-    return module_.pool.layout(type).domain == ir::Domain::Four;
 }
 
 // Scale a %t argument from its module's time unit to design ticks: the runtime

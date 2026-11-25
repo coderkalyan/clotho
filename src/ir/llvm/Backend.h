@@ -4435,11 +4435,13 @@ private:
 
     LValue tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx);
 
-    Plane emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e);
+    Plane emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e, AggEqMode mode);
 
-    bool agg_eq_four(Ref type);
+    Plane emit_assoc_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, AggEqMode mode);
 
-    Plane lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type);
+    bool agg_eq_four(Ref type, AggEqMode mode);
+
+    Plane lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type, AggEqMode mode);
 
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 

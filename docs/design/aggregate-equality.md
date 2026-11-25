@@ -41,14 +41,13 @@ into a temp; every equality, and the ambiguous `?:` of LRM 11.4.11, goes through
 
 ## Associative arrays
 
-Open, to be decided by the maintainer; the code keeps its present behaviour until then:
+Equal iff the same set of (key, value) pairs: sizes, then a lock-step walk in
+sorted-key order, keys compared exactly, values by the recursive `eq` in the requested
+mode. A different key set is a definite 0, like a queue size mismatch. The rule is the
+same for a whole array, a member, an element and any nesting.
 
-- Which clause defines associative-array equality. The code cites "11.4.5 / 7.9" and
-  reads it as: equal iff the same set of (key, value) pairs.
-- X-propagation across a key-set mismatch. Present reading: a different key set is a
-  definite 0 (like a queue size mismatch, `docs/LRM_NOTES.md` note 13), keys compared
-  exactly (a key containing x/z is invalid, 7.8.4).
-
-Until settled, an associative array is compared by canonical serialization (exact), so
-`===` works and logical `==` over a 4-state-capable value is refused, and an
-associative-array member of an aggregate is refused.
+Open, pending the maintainer: which LRM clause defines associative-array equality (the
+code cites "11.4.5 / 7.9"), and whether a key-set mismatch propagates x in logical
+mode. Until then logical `==` over an associative array whose value has a 4-state leaf
+is refused, at one site (`guard_agg_eq_members`); `===` and every other combination
+work. The decision only changes the logical-mode x rule of the walk.

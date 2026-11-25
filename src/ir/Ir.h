@@ -359,13 +359,24 @@ struct PowInfo {
     uint32_t exp_signed;
 };
 
-// Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
-// aggregate lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
+// Which equality an `agg_eq` computes (LRM 11.4.5). The two differ only at a leaf
+// that can hold x or z (docs/design/aggregate-equality.md).
+enum class AggEqMode : uint32_t {
+    // `==` / `!=`: an x or z bit makes a leaf compare ambiguous, which folds to x.
+    Logical,
+    // `===` / `!==`: x and z bits compare as values; the result is always known.
+    Case,
+};
+
+// Extra payload for `agg_eq`: whole-value equality of two unpacked aggregate or
+// container lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
 struct AggEqInfo {
     // Right-hand aggregate lvalue.
     Index rhs;
-    // The aggregate type (gives the member layout to compare).
+    // The compared type: an unpacked struct, a fixed unpacked array, a queue, a
+    // dynamic array or an associative array.
     Ref type;
+    AggEqMode mode;
 };
 
 // Extra payload for `member_select`: a member of an unpacked struct (the base is
@@ -1533,11 +1544,10 @@ struct Inst {
         // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
         // frontend emits it only for a string-free aggregate.
         AggCopy,
-        // 1-bit 4-state equality of two whole unpacked aggregates (payload:
-        // op_extra -> AggEqInfo; op is the left lvalue). The backend expands
-        // the member walk, AND-reducing per-leaf `==` results so LRM 11.4.5
-        // X-propagation is carried exactly (docs/LRM_NOTES.md, note 13); `!=` is a Lnot
-        // of this.
+        // 1-bit equality of two whole unpacked aggregates or containers (payload:
+        // op_extra -> AggEqInfo; op is the left lvalue), `==` or `===` by
+        // AggEqInfo::mode. The backend expands it by recursion over the type
+        // (docs/design/aggregate-equality.md); `!=` / `!==` are a Lnot of this.
         AggEq,
 
         // -- Dynamic-array operations on a handle lvalue (LRM 7.5) --
