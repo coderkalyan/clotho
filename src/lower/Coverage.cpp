@@ -25,6 +25,19 @@ int64_t Lowerer::cover_const(const Expression& e, const char* what) {
     return *n;
 }
 
+// Fold one covergroup option expression to a string, in the covergroup's own scope.
+// LRM 19.7 evaluates an instance option "at the time that the covergroup is
+// instantiated", so a string the design computes at run time would have to be
+// evaluated by the covergroup's constructor, which is the mechanism covergroup formals
+// would use too (refused below). Everything that reaches here must fold.
+std::string Lowerer::cover_const_string(const Expression& e, const char* what) {
+    const slang::ConstantValue cv = fold_const(e, Fold::Required);
+    if (!cv.isString()) {
+        fail(std::string("a non-constant ") + what + " is not supported");
+    }
+    return cv.str();
+}
+
 // The value space of a coverpoint type.
 Lowerer::CoverSpace Lowerer::cover_space_of(const slang::ast::Type& t) {
     const slang::ast::Type& ct = t.getCanonicalType();
@@ -354,8 +367,8 @@ void Lowerer::cover_apply_option(const slang::ast::CoverageOptionSetter& set, Co
         // option.weight, so a type option never changes an instance's coverage
         // or a type's. A covergroup's type_option.weight weights the group in the
         // design-wide $get_coverage; a coverpoint's weights it only in the merged
-        // form. `goal` and `comment` are report metadata, and Clotho reports no
-        // goal or comment at either level, so they change nothing either.
+        // form. `goal` is report metadata Clotho does not report, so it changes
+        // nothing either; `comment` is carried to the report.
         if (name == "weight") {
             opts.type_weight = as_u32("coverage option 'type_option.weight'");
             return;
@@ -364,10 +377,13 @@ void Lowerer::cover_apply_option(const slang::ast::CoverageOptionSetter& set, Co
             as_u32("coverage option 'type_option.goal'");
             return;
         }
-        // TODO: the remaining type options of LRM Table 19-3. `comment` is report
-        // metadata the model has no field for; `strobe`, `merge_instances`,
-        // `distribute_first` and `real_interval` each change a semantic this
-        // phase does not implement.
+        if (name == "comment") {
+            opts.type_comment = cover_const_string(rhs, "coverage option 'type_option.comment'");
+            return;
+        }
+        // TODO: the remaining type options of LRM Table 19-3. `strobe`,
+        // `merge_instances`, `distribute_first` and `real_interval` each change a
+        // semantic this phase does not implement.
         fail("coverage option 'type_option." + std::string(name) + "' is not supported");
     }
     if (name == "weight") {
@@ -390,10 +406,33 @@ void Lowerer::cover_apply_option(const slang::ast::CoverageOptionSetter& set, Co
         opts.per_instance = as_u32("coverage option 'per_instance'") != 0;
         return;
     }
-    // TODO: the remaining options of LRM Table 19-1 / 19-3. `name` and
-    // `comment` are report metadata the model has no field for;
-    // `detect_overlap` is a bin-pair warning; `cross_*` belong with cross
-    // coverage; `strobe`, `merge_instances`, `distribute_first` and
+    if (name == "name") {
+        // Table 19-1: the instance's name, as set_inst_name would give it. Only the
+        // covergroup level has it (Table 19-2); slang rejects it on a coverpoint.
+        opts.name = cover_const_string(rhs, "coverage option 'name'");
+        return;
+    }
+    if (name == "comment") {
+        opts.comment = cover_const_string(rhs, "coverage option 'comment'");
+        return;
+    }
+    if (name == "detect_overlap") {
+        opts.detect_overlap = as_u32("coverage option 'detect_overlap'") != 0;
+        return;
+    }
+    if (name == "get_inst_coverage") {
+        // Table 19-1: "Only applies when the merge_instances type option is set". It
+        // then enables per-instance tracking, and when false get_inst_coverage "shall
+        // equal the value returned by get_coverage". merge_instances is refused below,
+        // so type coverage is always the weighted average of the instances, every
+        // instance's own counters are always kept, and get_inst_coverage always
+        // answers for its instance: the option changes nothing here, and is
+        // validated and dropped. It is the consumer merge_instances will need.
+        as_u32("coverage option 'get_inst_coverage'");
+        return;
+    }
+    // TODO: the remaining options of LRM Table 19-1 / 19-3. `cross_*` belong with
+    // cross coverage; `strobe`, `merge_instances`, `distribute_first` and
     // `real_interval` each change a semantic this phase does not implement.
     fail("coverage option '" + std::string(name) + "' is not supported");
 }
@@ -439,6 +478,9 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
     ct.type_weight  = gopts.type_weight;
     ct.goal         = gopts.goal;
     ct.per_instance = gopts.per_instance;
+    ct.inst_name    = gopts.name;
+    ct.inst_comment = gopts.comment;
+    ct.type_comment = gopts.type_comment;
 
     std::vector<const slang::ast::CoverpointSymbol*> points;
     for (const Symbol& m : body.members()) {
@@ -477,7 +519,7 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
     // reach this covergroup, but the body build reads cover_decls_ for the
     // index, and an exception from it must not leave a half-built entry that a
     // later `new` of the same type would reuse.
-    cover_decls_.emplace(&cgt, CoverDecl{ .type_idx = idx, .sample = ir::FunctionId{} });
+    cover_decls_.emplace(&cgt, CoverDecl{ .type_idx = idx, .sample = ir::FunctionId{}, .points = points });
     const ir::FunctionId sid  = build_cover_sample(cgt, idx, points);
     cover_decls_[&cgt].sample = sid;
     cover_event_process(cgt, idx, sid);
@@ -500,31 +542,41 @@ ir::CoverPoint Lowerer::cover_point_model(const slang::ast::CoverpointSymbol& cp
     }
     const CoverSpace space = cover_space_of(cp.getType());
     out.is_signed          = space.is_signed;
-    // A coverpoint's options default to the covergroup's for at_least and
-    // auto_bin_max (LRM Table 19-2's "default for coverpoints"), but NOT for
-    // weight and goal, which Table 19-2 says do not act as defaults.
+    // A coverpoint's options default to the covergroup's for at_least, auto_bin_max
+    // and detect_overlap (LRM Table 19-2's "default for coverpoints"), but NOT for
+    // weight, goal and comment, which Table 19-2 says do not act as defaults.
     CoverOpts opts;
-    opts.at_least     = gopts.at_least;
-    opts.auto_bin_max = gopts.auto_bin_max;
+    opts.at_least       = gopts.at_least;
+    opts.auto_bin_max   = gopts.auto_bin_max;
+    opts.detect_overlap = gopts.detect_overlap;
     for (const slang::ast::CoverageOptionSetter& set : cp.options) {
         cover_apply_option(set, opts);
     }
-    out.weight   = opts.weight;
-    out.goal     = opts.goal;
-    out.at_least = opts.at_least;
+    out.weight       = opts.weight;
+    out.goal         = opts.goal;
+    out.at_least     = opts.at_least;
+    out.inst_comment = opts.comment;
+    out.type_comment = opts.type_comment;
 
     // LRM 19.5.3: automatic bins happen when the coverpoint defines no bins
     // EXCEPT ignore / illegal ones, so those are expanded either way.
     bool any_real_bin = false;
+    // The declaration each expanded bin came from, parallel to out.bins, for the
+    // overlap warning's location.
+    std::vector<const slang::ast::CoverageBinSymbol*> bin_src;
     for (const Symbol& m : cp.members()) {
         if (m.kind != SymbolKind::CoverageBin) {
             continue;
         }
         const auto& bin = m.as<slang::ast::CoverageBinSymbol>();
         cover_expand_bin(bin, space, opts, out);
+        bin_src.resize(out.bins.size(), &bin);
         if (bin.binsKind == slang::ast::CoverageBinSymbol::Bins && !bin.isDefault) {
             any_real_bin = true;
         }
+    }
+    if (opts.detect_overlap) {
+        cover_report_overlaps(bin_src, space, out);
     }
     if (!any_real_bin) {
         // LRM 19.5: with no explicit data type, "the inferred data type for the
@@ -548,6 +600,110 @@ ir::CoverPoint Lowerer::cover_point_model(const slang::ast::CoverpointSymbol& cp
         fail("a coverpoint of more than " + std::to_string(kCoverMaxBins) + " bins is not supported");
     }
     return out;
+}
+
+// LRM 19.7, Table 19-1: with option.detect_overlap "a warning is issued if there is
+// an overlap between the range list (or transition list) of two bins of a
+// coverpoint". Bin ranges are final here (cast, clamped and `$` resolved, 19.5.7),
+// so the check is static: every pair of bins whose range lists share a value is
+// reported once, naming both bins and the first run of values they share, at the
+// later bin's declaration. Transition lists arrive with transition bins, which are
+// refused, so only range lists are checked.
+//
+// Only bins declared with `bins` take part. The clause says "two bins" and does not
+// say whether ignore_bins and illegal_bins are among them. 19.5.5 and 19.5.6 give
+// them their own rule for the values they share with other bins (the value is
+// removed from those, or flagged illegal), so sharing one is what they are written
+// to do and a warning for it would fire on every design that uses them.
+//
+// One bin's own ranges may overlap each other (`bins a = {[0:5], [3:8]}`): that is
+// one bin's value set, not two bins sharing a value, so each bin's ranges are merged
+// first. The sweep then walks the merged ranges in value order, at O(n log n + pairs)
+// where a pass over every pair of bins would be quadratic in a `bins b[]` array.
+void Lowerer::cover_report_overlaps(const std::vector<const slang::ast::CoverageBinSymbol*>& sources,
+                                    const CoverSpace&                                      space,
+                                    const ir::CoverPoint&                                  model) {
+    struct Span {
+        uint64_t lo;
+        uint64_t hi;
+        uint32_t bin;
+    };
+    // Ordering and successor in the coverpoint's own value space, as the runtime's
+    // range compare reads it.
+    const auto before = [&](uint64_t a, uint64_t b) {
+        return space.is_signed ? static_cast<int64_t>(a) < static_cast<int64_t>(b) : a < b;
+    };
+    const auto successor = [&](uint64_t v) {
+        return space.is_signed ? static_cast<uint64_t>(static_cast<int64_t>(v) + 1) : v + 1;
+    };
+
+    std::vector<Span> spans;
+    for (uint32_t k = 0; k < model.bins.size(); ++k) {
+        const ir::CoverBin& bin = model.bins[k];
+        if (bin.kind != ir::CoverBinKind::Normal || bin.ranges.empty()) {
+            continue;
+        }
+        std::vector<ir::CoverRange> own = bin.ranges;
+        std::ranges::sort(own, [&](const ir::CoverRange& x, const ir::CoverRange& y) { return before(x.lo, y.lo); });
+        Span cur{ own[0].lo, own[0].hi, k };
+        for (size_t r = 1; r < own.size(); ++r) {
+            // Overlapping or touching ranges are one run of values.
+            if (!before(cur.hi, own[r].lo) || (cur.hi != space.max && successor(cur.hi) == own[r].lo)) {
+                if (before(cur.hi, own[r].hi)) {
+                    cur.hi = own[r].hi;
+                }
+                continue;
+            }
+            spans.push_back(cur);
+            cur = Span{ own[r].lo, own[r].hi, k };
+        }
+        spans.push_back(cur);
+    }
+    std::ranges::sort(spans, [&](const Span& x, const Span& y) {
+        if (before(x.lo, y.lo)) {
+            return true;
+        }
+        return !before(y.lo, x.lo) && x.bin < y.bin;
+    });
+
+    // A coverpoint whose bins all overlap would name every pair of them. The limit is
+    // slang's own default for how many diagnostics of one kind it prints before it
+    // stops, and a final note says the listing was cut.
+    constexpr size_t kMaxListed = 20;
+    const std::string cp_name   = model.name;
+
+    std::vector<Span>                      active;
+    ankerl::unordered_dense::set<uint64_t> seen;
+    size_t                                 listed = 0;
+    for (const Span& s : spans) {
+        std::erase_if(active, [&](const Span& a) { return before(a.hi, s.lo); });
+        for (const Span& a : active) {
+            // `a` starts no later than `s`, so the shared run starts at s.lo.
+            const uint32_t early = std::min(a.bin, s.bin);
+            const uint32_t late  = std::max(a.bin, s.bin);
+            if (!seen.insert((uint64_t{ early } << 32) | late).second) {
+                continue;
+            }
+            const uint64_t hi = before(a.hi, s.hi) ? a.hi : s.hi;
+            const std::string values = s.lo == hi ? "value " + cover_val_str(s.lo, space)
+                                                  : "values " + cover_val_str(s.lo, space) + ":" + cover_val_str(hi, space);
+            if (listed == kMaxListed) {
+                report_once(Severity::Warning,
+                            "coverage-bin-overlap",
+                            "more bins of coverpoint '" + cp_name + "' overlap; the first " +
+                              std::to_string(kMaxListed) + " are listed",
+                            span_of(*sources[late]));
+                return;
+            }
+            ++listed;
+            report_once(Severity::Warning,
+                        "coverage-bin-overlap",
+                        "bins '" + model.bins[early].name + "' and '" + model.bins[late].name + "' of coverpoint '" +
+                          cp_name + "' overlap at " + values + " (option.detect_overlap, LRM 19.7)",
+                        span_of(*sources[late]));
+        }
+        active.push_back(s);
+    }
 }
 
 // The enumeration a coverage expression names, with the implicit conversions
@@ -839,9 +995,11 @@ bool Lowerer::is_cover_method(const slang::ast::SubroutineSymbol& sub) {
     return k == SymbolKind::CovergroupBody || k == SymbolKind::Coverpoint || k == SymbolKind::CoverCross;
 }
 
-// A covergroup / coverpoint built-in method call (LRM 19.8). `recv` is the
-// covergroup handle expression; a coverpoint-level call arrives with the
-// coverpoint named as the member, which the caller resolved.
+// A covergroup / coverpoint built-in method call (LRM 19.8). The covergroup is
+// named by where the built-in is declared, so the forms that have no receiver
+// (`cg::get_coverage()`, `cg::cp::get_coverage()`) lower like the ones that do; a
+// coverpoint-level call through a handle arrives with the coverpoint named as the
+// member of the receiver (`h.cp`), which the handle is read off.
 ir::Index Lowerer::lower_cover_method(const slang::ast::CallExpression&   call,
                                       const slang::ast::SubroutineSymbol& sub,
                                       ir::Builder&                        b) {
@@ -850,22 +1008,35 @@ ir::Index Lowerer::lower_cover_method(const slang::ast::CallExpression&   call,
     if (owner->asSymbol().kind == SymbolKind::CoverCross) {
         fail("cross coverage (LRM 19.6) is not supported");
     }
-    // The receiver is the covergroup variable; slang models a coverpoint method
-    // as a member of the coverpoint scope reached through it.
-    const Expression* recv = cover_receiver(call);
-    if (recv == nullptr) {
+    const bool                        on_point = owner->asSymbol().kind == SymbolKind::Coverpoint;
+    const slang::ast::CovergroupType& cgt      = cover_type_owning(*owner);
+    const uint32_t                    idx      = cover_type_of(cgt);
+    uint32_t                          point    = 0;
+    if (on_point) {
+        const auto* sym    = &owner->asSymbol().as<slang::ast::CoverpointSymbol>();
+        const auto& points = cover_decls_.at(&cgt).points;
+        const auto  it     = std::ranges::find(points, sym);
+        if (it == points.end()) {
+            fail("internal: coverpoint '" + std::string(sym->name) + "' is not in its covergroup's model");
+        }
+        point = static_cast<uint32_t>(it - points.begin());
+    }
+
+    const Expression* recv   = cover_receiver(call);
+    const Expression* handle = recv;
+    if (on_point && recv != nullptr) {
+        if (recv->kind != ExpressionKind::MemberAccess) {
+            fail("internal: a coverpoint-level coverage method has no covergroup handle");
+        }
+        handle = &recv->as<slang::ast::MemberAccessExpression>().value();
+    }
+    const bool type_level = sub.name == "get_coverage";
+    if (handle == nullptr && !type_level) {
+        // Only get_coverage is static (LRM 19.8); slang rejects the others through a type.
         fail("a covergroup method needs a covergroup handle receiver");
     }
-    const slang::ast::Type& rt = recv->type->getCanonicalType();
-    if (!rt.isCovergroup()) {
-        // A coverpoint-level call (`cv.x.get_inst_coverage()`); the handle is
-        // one hop further out.
-        fail("a coverpoint-level coverage method is not supported");
-    }
-    const auto&     cgt  = rt.as<slang::ast::CovergroupType>();
-    const uint32_t  idx  = cover_type_of(cgt);
     const ir::Ref   real = module_.pool.real_type;
-    const ir::Index h    = lower_expr(*recv, b);
+    const ir::Index h    = handle != nullptr ? lower_expr(*handle, b) : ir::Index{};
     const auto      args = call.arguments();
     if (sub.name == "sample") {
         if (!args.empty()) {
@@ -875,7 +1046,16 @@ ir::Index Lowerer::lower_cover_method(const slang::ast::CallExpression&   call,
         return ir::Index{};
     }
     if (sub.name == "start" || sub.name == "stop") {
-        b.cover_ctl(ir::CoverOp::Start, { { h, int_const(sub.name == "start" ? 1 : 0, 32, b, l) } }, idx, 0, l);
+        // Table 19-5 gives start() and stop() to a coverpoint as well as to a covergroup, and
+        // says no more than "Starts / Stops collecting coverage information". Read as two
+        // independent switches: a coverpoint counts only while its own and its covergroup's
+        // are both on, so neither undoes the other.
+        const ir::Index on = int_const(sub.name == "start" ? 1 : 0, 32, b, l);
+        if (on_point) {
+            b.cover_ctl(ir::CoverOp::StartPoint, { { h, on } }, idx, point, l);
+        } else {
+            b.cover_ctl(ir::CoverOp::Start, { { h, on } }, idx, 0, l);
+        }
         return ir::Index{};
     }
     if (sub.name == "set_inst_name") {
@@ -885,9 +1065,20 @@ ir::Index Lowerer::lower_cover_method(const slang::ast::CallExpression&   call,
         b.cover_ctl(ir::CoverOp::SetName, { { h, lower_expr(*args[0], b) } }, idx, 0, l);
         return ir::Index{};
     }
-    const bool type_level = sub.name == "get_coverage";
     if (sub.name != "get_inst_coverage" && !type_level) {
         fail("unsupported coverage method '" + std::string(sub.name) + "'");
+    }
+    // The coverage number and its two bin counts: this instance's for get_inst_coverage,
+    // every instance's for get_coverage, of the whole covergroup or of one coverpoint.
+    const ir::CoverOp coverage_op = on_point ? (type_level ? ir::CoverOp::TypePointCoverage : ir::CoverOp::PointCoverage)
+                                             : (type_level ? ir::CoverOp::TypeCoverage : ir::CoverOp::InstCoverage);
+    const ir::CoverOp covered_op  = on_point ? (type_level ? ir::CoverOp::TypePointCovered : ir::CoverOp::PointCovered)
+                                             : (type_level ? ir::CoverOp::TypeCovered : ir::CoverOp::InstCovered);
+    const ir::CoverOp total_op    = on_point ? (type_level ? ir::CoverOp::TypePointTotal : ir::CoverOp::PointTotal)
+                                             : (type_level ? ir::CoverOp::TypeTotal : ir::CoverOp::InstTotal);
+    std::vector<ir::Index> qargs;
+    if (!type_level) {
+        qargs.push_back(h);
     }
     // The optional (ref int covered, ref int total) pair (LRM 19.8): stored
     // through the ordinary assignment path from two more queries, rather than
@@ -901,33 +1092,40 @@ ir::Index Lowerer::lower_cover_method(const slang::ast::CallExpression&   call,
     const bool has_outs =
       args.size() == 2 && args[0]->getSymbolReference() != nullptr && args[1]->getSymbolReference() != nullptr;
     if (has_outs) {
-        const ir::CoverOp      cov = type_level ? ir::CoverOp::TypeCovered : ir::CoverOp::InstCovered;
-        const ir::CoverOp      tot = type_level ? ir::CoverOp::TypeTotal : ir::CoverOp::InstTotal;
-        std::vector<ir::Index> qargs;
-        if (!type_level) {
-            qargs.push_back(h);
-        }
         const ir::Index covered_lv = lower_lvalue(*args[0], b, /*is_write=*/true);
-        const ir::Index covered    = b.cover_query(cov, qargs, make_int_type(32, false), idx, 0, l);
+        const ir::Index covered    = b.cover_query(covered_op, qargs, make_int_type(32, false), idx, point, l);
         b.binary(ir::Inst::Tag::Store, covered_lv, covered, l);
         const ir::Index total_lv = lower_lvalue(*args[1], b, /*is_write=*/true);
-        const ir::Index total    = b.cover_query(tot, qargs, make_int_type(32, false), idx, 0, l);
+        const ir::Index total    = b.cover_query(total_op, qargs, make_int_type(32, false), idx, point, l);
         b.binary(ir::Inst::Tag::Store, total_lv, total, l);
     }
-    std::vector<ir::Index> qargs;
-    if (!type_level) {
-        qargs.push_back(h);
-    }
-    return b.cover_query(
-      type_level ? ir::CoverOp::TypeCoverage : ir::CoverOp::InstCoverage, qargs, real, idx, 0, l);
+    return b.cover_query(coverage_op, qargs, real, idx, point, l);
 }
 
-// The covergroup handle a built-in coverage method was called on.
+// The covergroup handle a built-in coverage method was called on: the covergroup
+// itself, or for a coverpoint method the access `h.cp` that names the coverpoint.
+// Null for the static forms called through a type name.
 const Expression* Lowerer::cover_receiver(const slang::ast::CallExpression& call) {
     if (const Expression* t = call.thisClass(); t != nullptr) {
         return t;
     }
     return nullptr;
+}
+
+// The covergroup type a built-in coverage method belongs to, read off the scope it
+// is declared in: the covergroup's body, or a coverpoint or cross of it. slang adds
+// the body to the type's own scope as a member.
+const slang::ast::CovergroupType& Lowerer::cover_type_owning(const slang::ast::Scope& owner) {
+    const slang::ast::Scope* body = &owner;
+    if (owner.asSymbol().kind == SymbolKind::Coverpoint || owner.asSymbol().kind == SymbolKind::CoverCross) {
+        body = owner.asSymbol().getParentScope();
+    }
+    const slang::ast::Scope* type =
+      body != nullptr && body->asSymbol().kind == SymbolKind::CovergroupBody ? body->asSymbol().getParentScope() : nullptr;
+    if (type == nullptr || type->asSymbol().kind != SymbolKind::CovergroupType) {
+        fail("internal: a coverage method is declared outside a covergroup");
+    }
+    return type->asSymbol().as<slang::ast::CovergroupType>();
 }
 
 } // namespace clotho::lower

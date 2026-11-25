@@ -880,6 +880,10 @@ struct CoverPoint {
     bool     is_auto    = false;
     uint32_t auto_total = 0;
     bool     is_signed  = false;
+    // option.comment and type_option.comment (LRM 19.7, 19.7.1), shown in the
+    // coverage report: empty when unset.
+    std::string inst_comment;
+    std::string type_comment;
 
     bool operator==(const CoverPoint&) const = default;
 };
@@ -898,6 +902,12 @@ struct CoverType {
     uint32_t                type_weight  = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
+    // option.name (LRM 19.7, Table 19-1): the name each instance starts with, unset
+    // when the group leaves it to the tool.
+    std::optional<std::string> inst_name;
+    // option.comment and type_option.comment of the covergroup, shown in the report.
+    std::string inst_comment;
+    std::string type_comment;
 
     bool operator==(const CoverType&) const = default;
 };

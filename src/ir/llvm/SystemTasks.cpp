@@ -31,6 +31,15 @@ llvm::Constant* Backend::cover_array(llvm::StructType*                   row_ty,
                                     nm);
 }
 
+// A model string, or a null pointer for an empty one: the runtime reads a null
+// comment as none, and an unset option.name as the generated name.
+llvm::Constant* Backend::cover_string(const std::string& s) {
+    if (s.empty()) {
+        return llvm::Constant::getNullValue(raw_ptr_ty());
+    }
+    return b_.CreateGlobalString(s);
+}
+
 llvm::Constant* Backend::cover_config_global() {
     if (auto* g = env_->llmod.getNamedGlobal("clotho.cover.config")) {
         return g;
@@ -72,17 +81,25 @@ llvm::Constant* Backend::cover_config_global() {
                                                          b_.getInt32(cp.at_least),
                                                          b_.getInt32(cp.is_auto ? 1u : 0u),
                                                          b_.getInt32(cp.auto_total),
-                                                         b_.getInt32(cp.is_signed ? 1u : 0u) }));
+                                                         b_.getInt32(cp.is_signed ? 1u : 0u),
+                                                         cover_string(cp.inst_comment),
+                                                         cover_string(cp.type_comment) }));
         }
-        types.push_back(llvm::ConstantStruct::get(cover_type_ty(),
-                                                  { b_.CreateGlobalString(ct.name),
-                                                    b_.CreateGlobalString(ct.banner),
-                                                    b_.getInt32(static_cast<uint32_t>(ct.points.size())),
-                                                    cover_array(cover_point_ty(), points, tn + ".points"),
-                                                    b_.getInt32(ct.weight),
-                                                    b_.getInt32(ct.type_weight),
-                                                    b_.getInt32(ct.goal),
-                                                    b_.getInt32(ct.per_instance ? 1u : 0u) }));
+        types.push_back(llvm::ConstantStruct::get(
+          cover_type_ty(),
+          { b_.CreateGlobalString(ct.name),
+            b_.CreateGlobalString(ct.banner),
+            b_.getInt32(static_cast<uint32_t>(ct.points.size())),
+            cover_array(cover_point_ty(), points, tn + ".points"),
+            b_.getInt32(ct.weight),
+            b_.getInt32(ct.type_weight),
+            b_.getInt32(ct.goal),
+            b_.getInt32(ct.per_instance ? 1u : 0u),
+            // An empty option.name is a name, so only an unset one is null.
+            ct.inst_name.has_value() ? static_cast<llvm::Constant*>(b_.CreateGlobalString(*ct.inst_name))
+                                     : llvm::Constant::getNullValue(raw_ptr_ty()),
+            cover_string(ct.inst_comment),
+            cover_string(ct.type_comment) }));
     }
     llvm::Constant* path = config_.coverage_report.empty()
                              ? llvm::Constant::getNullValue(raw_ptr_ty())
@@ -693,6 +710,19 @@ void Backend::lower_cover_query(Index i) {
         case CoverOp::TypeTotal:
             ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { cover_type_value(info.type_idx) }));
             return;
+        case CoverOp::TypePointCoverage:
+            set_value(i,
+                      real_plane(b_.CreateCall(cover_type_point_query_fn("rt_cover_type_point_coverage", dbl),
+                                               { cover_type_value(info.type_idx), b_.getInt32(info.point) })));
+            return;
+        case CoverOp::TypePointCovered:
+            ival(b_.CreateCall(cover_type_point_query_fn("rt_cover_type_point_covered", i32),
+                               { cover_type_value(info.type_idx), b_.getInt32(info.point) }));
+            return;
+        case CoverOp::TypePointTotal:
+            ival(b_.CreateCall(cover_type_point_query_fn("rt_cover_type_point_total", i32),
+                               { cover_type_value(info.type_idx), b_.getInt32(info.point) }));
+            return;
         case CoverOp::DesignCoverage:
             set_value(i, real_plane(b_.CreateCall(cover_design_coverage_fn(), {})));
             return;
@@ -727,6 +757,13 @@ void Backend::lower_cover_ctl(Index i) {
             }
             b_.CreateCall(cover_start_fn(),
                           { h, cast(must_of(args[1]), 32, false) });
+            return;
+        case CoverOp::StartPoint:
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_ctl start_point takes an enable" };
+            }
+            b_.CreateCall(cover_start_point_fn(),
+                          { h, b_.getInt32(info.point), cast(must_of(args[1]), 32, false) });
             return;
         case CoverOp::SetName: {
             if (args.size() != 2) {

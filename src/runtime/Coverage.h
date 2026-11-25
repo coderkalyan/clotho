@@ -80,6 +80,10 @@ typedef struct rt_cover_point {
     uint32_t auto_total;
     // Coverpoint value signedness, for the range compares.
     uint32_t is_signed;
+    // option.comment and type_option.comment (LRM 19.7, 19.7.1): report metadata,
+    // null when empty.
+    const char* inst_comment;
+    const char* type_comment;
 } rt_cover_point;
 
 typedef struct rt_cover_type {
@@ -96,6 +100,12 @@ typedef struct rt_cover_type {
     uint32_t type_weight;
     uint32_t goal;
     uint32_t per_instance;
+    // option.name: the name every instance starts with (LRM 19.7, Table 19-1), or
+    // null when the group leaves it unset and each instance gets a generated one.
+    const char* inst_name;
+    // option.comment and type_option.comment, null when empty.
+    const char* inst_comment;
+    const char* type_comment;
 } rt_cover_type;
 
 // Emitted once per design as `clotho.cover.config` and handed to rt_cover_init.
@@ -165,6 +175,12 @@ void rt_cover_hit(uint64_t h, uint32_t point, uint64_t value, uint64_t xmask);
 // `start()` / `stop()` (LRM 19.8). While stopped, rt_cover_hit counts nothing.
 void rt_cover_start(uint64_t h, int32_t on);
 
+// `start()` / `stop()` called on one coverpoint of an instance (LRM 19.8, Table
+// 19-5): that coverpoint counts nothing while stopped, whatever the covergroup's
+// own switch says. The two are independent, and a coverpoint collects only while
+// both are on.
+void rt_cover_start_point(uint64_t h, uint32_t point, int32_t on);
+
 // `set_inst_name(string)` (LRM 19.8). Copies the bytes.
 void rt_cover_set_inst_name(uint64_t h, const char* name, uint64_t len);
 
@@ -190,6 +206,13 @@ int32_t rt_cover_type_total(uint32_t type_idx);
 double  rt_cover_point_coverage(uint64_t h, uint32_t point);
 int32_t rt_cover_point_covered(uint64_t h, uint32_t point);
 int32_t rt_cover_point_total(uint64_t h, uint32_t point);
+
+// get_coverage() of a coverpoint: that coverpoint over every instance of the type,
+// the weighted average of its coverage in each (LRM 19.11.3), and the sums of the
+// two bin counts (19.8).
+double  rt_cover_type_point_coverage(uint32_t type_idx, uint32_t point);
+int32_t rt_cover_type_point_covered(uint32_t type_idx, uint32_t point);
+int32_t rt_cover_type_point_total(uint32_t type_idx, uint32_t point);
 
 // $get_coverage() (LRM 19.9): the overall coverage of every covergroup type,
 // 100.0 when the design has no covergroup instances or every weight is zero.

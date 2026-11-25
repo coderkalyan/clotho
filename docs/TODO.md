@@ -687,11 +687,8 @@ Milestones, in order; lower ones unblock higher ones:
   `default sequence` and overlapping matches.
 - [~] **Coverage options and accounting** — open pieces:
   - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
-    `max(at_least)` across instances.
-  - [ ] **`option.get_inst_coverage`** — refused as a coverage option.
-  - [ ] **`option.name`, `option.comment` and `type_option.comment`** — refused; the model has
-    no field for them.
-  - [ ] **`option.detect_overlap`** — no overlap warnings.
+    `max(at_least)` across instances; `option.get_inst_coverage` then decides what
+    `get_inst_coverage()` returns.
 - [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
   floats.
 - [ ] **`covergroup extends`** (19.4.1) — slang hides an inherited coverpoint behind a
@@ -713,8 +710,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Covergroup coverage event** (19.3) — open forms:
   - [ ] **Covergroup declared in a class** (19.4) — its event needs a per-object subscription.
   - [ ] **Event list as the coverage event** — `covergroup cg @(a or b);`.
-- [ ] **Coverpoint-level coverage methods and `cg::get_coverage()`** (19.8) —
-  `cg.cp.get_inst_coverage()` and the type-name form are refused.
 
 ### Foreign interface
 
@@ -746,8 +741,6 @@ Milestones, in order; lower ones unblock higher ones:
     names** (`vif.i.d`) — the context record does not carry its children's.
   - [ ] **`edge` / `iff` qualifier on an event control over an expression of members** —
     refused.
-  - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
-    — refused.
   - [ ] **Composite expression of members outside a lone procedural event control** —
     e.g. one operand of an event list, `@(vif.a & vif.b or c)`.
   - [ ] **Parameter or other member with no signal storage** — `vif.P`, or a clockvar the

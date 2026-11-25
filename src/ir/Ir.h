@@ -673,11 +673,15 @@ enum class CoverOp : uint32_t {
     TypeCoverage, // cg_type::get_coverage() -> real, over every instance
     TypeCovered,
     TypeTotal,
+    TypePointCoverage, // cg_type::cp::get_coverage() -> real, that coverpoint over every instance
+    TypePointCovered,
+    TypePointTotal,
     DesignCoverage, // $get_coverage() (LRM 19.9)
     // CoverCtl.
-    Hit,     // one coverpoint's sampled value: match bins and count
-    Start,   // h.start() / h.stop()
-    SetName, // h.set_inst_name(s)
+    Hit,        // one coverpoint's sampled value: match bins and count
+    Start,      // h.start() / h.stop()
+    StartPoint, // h.cp.start() / h.cp.stop()
+    SetName,    // h.set_inst_name(s)
 };
 
 // Extra payload for the two coverage tags.
@@ -685,7 +689,7 @@ struct CoverInfo {
     // SSA operands, in order: the covergroup handle (absent for the type-level and
     // design-level queries, which name a type index or nothing), then the op's
     // value arguments -- for Hit the sampled value and its unknown-bit mask, for
-    // Start the 1-bit enable, for SetName the string. New takes no handle: its
+    // Start and StartPoint the 1-bit enable, for SetName the string. New takes no handle: its
     // operands are the enclosing object a class-embedded group captures (0
     // otherwise) and, when the group is built inside an instance, that instance's
     // path (an InstPath value, borrowed), which the report names the new instance
@@ -700,7 +704,7 @@ struct CoverInfo {
     // for New and the type-level queries; the instance ops read the type off the
     // instance record instead.
     uint32_t type_idx = 0;
-    // Which coverpoint of that type, for Hit and the coverpoint-level queries.
+    // Which coverpoint of that type, for Hit, StartPoint and the coverpoint-level queries.
     uint32_t point = 0;
     CoverOp  op    = CoverOp::New;
     // New only: the packed bytes of the instance's name prefix after its path -- the
@@ -723,6 +727,9 @@ constexpr bool cover_op_names_type(CoverOp op) {
         case CoverOp::TypeCoverage:
         case CoverOp::TypeCovered:
         case CoverOp::TypeTotal:
+        case CoverOp::TypePointCoverage:
+        case CoverOp::TypePointCovered:
+        case CoverOp::TypePointTotal:
             return true;
         case CoverOp::Ctx:
         case CoverOp::Next:
@@ -735,6 +742,7 @@ constexpr bool cover_op_names_type(CoverOp op) {
         case CoverOp::DesignCoverage:
         case CoverOp::Hit:
         case CoverOp::Start:
+        case CoverOp::StartPoint:
         case CoverOp::SetName:
             return false;
     }

@@ -5564,19 +5564,28 @@ private:
         // The generated sample body: `void(u64 handle)`, which evaluates every
         // coverpoint expression and hands each value to the coverage runtime.
         ir::FunctionId sample{};
+        // The coverpoints in model order: the position a coverpoint-level method
+        // (`h.cp.get_inst_coverage()`, `cg::cp::get_coverage()`) names its coverpoint by.
+        std::vector<const slang::ast::CoverpointSymbol*> points;
     };
 
     // A covergroup's own instance / type options, as far as this phase resolves
     // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
     // type set. `weight` is option.weight; `type_weight` is a covergroup's
     // type_option.weight, which only weights the group in $get_coverage (19.11.3).
+    // `name` is the covergroup's option.name, and `comment` / `type_comment` are the
+    // option.comment / type_option.comment of whichever level the setters belong to.
     struct CoverOpts {
-        uint32_t weight       = 1;
-        uint32_t type_weight  = 1;
-        uint32_t goal         = 100;
-        uint32_t at_least     = 1;
-        uint32_t auto_bin_max = 64; // LRM Table 19-1's default
-        bool     per_instance = false;
+        uint32_t                   weight       = 1;
+        uint32_t                   type_weight  = 1;
+        uint32_t                   goal         = 100;
+        uint32_t                   at_least     = 1;
+        uint32_t                   auto_bin_max = 64; // LRM Table 19-1's default
+        bool                       per_instance = false;
+        bool                       detect_overlap = false;
+        std::optional<std::string> name;
+        std::string                comment;
+        std::string                type_comment;
     };
 
     // The value space a coverpoint's bins live in: what `$` means, and how many
@@ -5592,6 +5601,8 @@ private:
     };
 
     int64_t cover_const(const Expression& e, const char* what);
+
+    std::string cover_const_string(const Expression& e, const char* what);
 
     CoverSpace cover_space_of(const slang::ast::Type& t);
 
@@ -5623,6 +5634,10 @@ private:
 
     ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts);
 
+    void cover_report_overlaps(const std::vector<const slang::ast::CoverageBinSymbol*>& sources,
+                               const CoverSpace&                                      space,
+                               const ir::CoverPoint&                                  model);
+
     static const slang::ast::Type* cover_enum_type(const Expression& e);
 
     std::string cover_group_name(const slang::ast::CovergroupType& cgt);
@@ -5642,6 +5657,8 @@ private:
                                  ir::Builder&                        b);
 
     static const Expression* cover_receiver(const slang::ast::CallExpression& call);
+
+    const slang::ast::CovergroupType& cover_type_owning(const slang::ast::Scope& owner);
 
     // Cap on the bins one coverpoint may hold. The LRM sets no limit; enumerating
     // `bins b[] = {[0:$]}` on a 32-bit coverpoint would otherwise try to name four
@@ -6053,6 +6070,13 @@ private:
     static constexpr uint64_t kRandOpModeAll   = 1;
     static constexpr uint64_t kRandOpModeOne   = 2;
     static constexpr uint64_t kRandOpModeQuery = 3;
+    // The randstate pair (LRM 18.13.4, 18.13.5). The state is four 64-bit words and the
+    // call returns one i64, so it crosses a word at a time: HasState says whether the
+    // class owns an object RNG at all, StateGet + k returns word k of it, and StateSet + k
+    // stores `arg` into word k.
+    static constexpr uint64_t kRandOpHasState = 4;
+    static constexpr uint64_t kRandOpStateGet = 8;
+    static constexpr uint64_t kRandOpStateSet = 12;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ClassRand> class_rand_;
     // A rand property -> its rand ordinal. Design-wide like class_prop_index_ and
     // stable for the same reason: prefix layout gives an inherited property the same
@@ -6065,13 +6089,6 @@ private:
     // the point its holder is being laid out.
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> randomize_fn_;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> randops_fn_;
-    // The randstate pair (LRM 18.13.4, 18.13.5). The state is four 64-bit words and the
-    // call returns one i64, so it crosses a word at a time: HasState says whether the
-    // class owns an object RNG at all, StateGet + k returns word k of it, and StateSet + k
-    // stores `arg` into word k.
-    static constexpr uint64_t kRandOpHasState = 4;
-    static constexpr uint64_t kRandOpStateGet = 8;
-    static constexpr uint64_t kRandOpStateSet = 12;
     std::vector<std::pair<const slang::ast::ClassType*, ir::Ref>>              rand_pending_;
     // Depth of the lower_class_type recursion; the outermost frame drains the list.
     uint32_t class_depth_ = 0;
