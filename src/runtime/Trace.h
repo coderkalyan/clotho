@@ -108,13 +108,65 @@ enum {
     RT_TRACE_RUN_ONCE = 2,
 };
 
+// The region of a time slot a scheduler block is in (rt_trace_region, rt_trace_nba_pass).
+enum {
+    RT_TRACE_REG_ACTIVE = 0,
+    RT_TRACE_REG_INACTIVE = 1,
+    RT_TRACE_REG_NBA = 2,
+    RT_TRACE_REG_OBSERVED = 3,
+    RT_TRACE_REG_REACTIVE = 4,
+    RT_TRACE_REG_RE_INACTIVE = 5,
+    RT_TRACE_REG_RE_NBA = 6,
+    RT_TRACE_REG_POSTPONED = 7,
+    // The top of a slot once the wheel has fired its timers: the Preponed samples and the
+    // commit of continuous assignments' delayed updates (S26), before the Active drain.
+    RT_TRACE_REG_PREPONED = 8,
+    // rt_sim_run starts the final blocks.
+    RT_TRACE_REG_FINAL = 9,
+};
+
+// The staging path that created a nonblocking update (S23), in the low byte of
+// rt_trace_nba_site::flags, and the flags above it. A timed update's path is how it is released
+// (rt_trace_nba_release).
+enum {
+    // A block's shadow (lower_store_nb, S22).
+    RT_TRACE_NBA_BLOCK = 0,
+    // The record of an unpacked-array element or of a member written through a virtual
+    // interface (emit_array_nba).
+    RT_TRACE_NBA_ARRAY = 1,
+    // The record of an aggregate leaf (emit_agg_nba).
+    RT_TRACE_NBA_AGG = 2,
+    // A `<= #0` record, created when its statement executes.
+    RT_TRACE_NBA_ZERO = 3,
+    // A `<= #d` record, created when its timer fires.
+    RT_TRACE_NBA_TIMER = 4,
+    // A `<= @e` record, created when its event occurs.
+    RT_TRACE_NBA_EVENT = 5,
+    RT_TRACE_NBA_PATHS = 6,
+    // The target can be forced or procedurally assigned (StoreNbGated): its commit may drop
+    // the update, which is R14's to judge, so its bytes are not compared.
+    RT_TRACE_NBA_GATED = 0x100,
+    // The update's bytes are not known to the trace: a runtime-offset select of a very wide
+    // vector stages through rt_wide_ins. Its target's bytes are not compared.
+    RT_TRACE_NBA_OPAQUE = 0x200,
+};
+
+// How an event object is triggered (rt_trace_trigger).
+enum {
+    // `-> e`, at once.
+    RT_TRACE_TRIGGER_NOW = 0,
+    // Every form of `->>`: the update event of a nonblocking trigger, which belongs to an NBA
+    // pass.
+    RT_TRACE_TRIGGER_NB = 1,
+};
+
 // One park site, or the origin of an activation: a constant the backend emits per
 // site. Two lowerings of one site may emit two records, which are one control when
 // the kind and the location agree.
 typedef struct rt_trace_control {
     // "<file>:<line>:<col>" of the construct, "<unknown>" without a resolver.
     const char* where;
-    uint32_t    kind; // RT_TRACE_CTL_*, or RT_TRACE_ORG_*
+    uint32_t    kind; // RT_TRACE_CTL_* or RT_TRACE_ORG_*
 } rt_trace_control;
 
 // One entry of a list: the address of a signal's storage in its own instance and the
@@ -126,6 +178,22 @@ typedef struct rt_trace_entry {
     uint64_t    edge;
 } rt_trace_entry;
 
+// What a nonblocking statement says of its updates, constant per statement. The update's
+// planes are the target's own, as the code stores them: a vector's `must | may << W` word
+// (just the value for a 2-state target) of `bits0` bits and, when the target has one, its
+// z word of `bits1` bits (zero: none).
+typedef struct rt_trace_nba_site {
+    // "<file>:<line>:<col>" of the statement, "<unknown>" without a resolver.
+    const char* where;
+    // The target's declared name, or null where the code is shared by instances that bind
+    // it differently.
+    const char* name;
+    // The staging path (RT_TRACE_NBA_*) and RT_TRACE_NBA_GATED / RT_TRACE_NBA_OPAQUE.
+    uint32_t flags;
+    uint32_t bits0;
+    uint32_t bits1;
+} rt_trace_nba_site;
+
 // What a run reported, for the suite's summary line.
 typedef struct rt_trace_counts {
     uint64_t runs;
@@ -134,6 +202,12 @@ typedef struct rt_trace_counts {
     uint64_t parks;
     uint64_t wakes;
     uint64_t dispatches;
+    // Nonblocking updates created, by staging path (RT_TRACE_NBA_*).
+    uint64_t creates[RT_TRACE_NBA_PATHS];
+    uint64_t nba_passes;
+    uint64_t pends;
+    uint64_t triggers;
+    uint64_t finishes;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -179,6 +253,40 @@ void rt_trace_resume(void* a, const rt_trace_control* c);
 // `a` reached its final suspend.
 void rt_trace_end(void* a);
 
+// The scheduler enters `region` (RT_TRACE_REG_*): the Active drain's entries, the Inactive,
+// Observed, Reactive, Re-Inactive and Postponed regions, and the top of a slot. The NBA and
+// Re-NBA regions are the passes of rt_trace_nba_pass.
+void rt_trace_region(uint32_t region);
+
+// A nonblocking update is created when its statement executes: a plain NBA, and a `<= #0`.
+// `dst0` and `dst1` are the addresses of the target's planes (`dst1` null: no z word);
+// `val0`, `mask0`, `val1` and `mask1` are the update's bits and the bits it writes, in the
+// planes' own layout and positioned at the target's bit offset, as word buffers of the
+// planes' width rounded up to 64-bit words (`mask` null: every bit).
+void rt_trace_nba_create(const rt_trace_nba_site* site, void* dst0, void* dst1, const void* val0,
+                         const void* mask0, const void* val1, const void* mask1);
+
+// A timed update is armed: `rec` is the record that will release it, `<= #d` for a timer and
+// `<= @e` for an event, and the planes are those of rt_trace_nba_create. The update is
+// created when the record is released (rt_trace_nba_release).
+void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* site, void* dst0, void* dst1,
+                        const void* val0, const void* mask0, const void* val1, const void* mask1);
+
+// A timer or an occurrence of an event releases `rec`: `path` is RT_TRACE_NBA_TIMER or
+// RT_TRACE_NBA_EVENT, and `moment` the scheduler's number for the occurrences that released
+// records together (zero for a timer: a wheel tick is one moment).
+void rt_trace_nba_release(const void* rec, uint32_t path, uint32_t moment);
+
+// The NBA or Re-NBA commit begins (`begin` nonzero) or ends; `region` is RT_TRACE_REG_NBA or
+// RT_TRACE_REG_RE_NBA.
+void rt_trace_nba_pass(uint32_t begin, uint32_t region);
+
+// A `->>` links event object `obj` onto the nonblocking pend chain.
+void rt_trace_pend(const void* obj);
+
+// Event object `obj` triggers: RT_TRACE_TRIGGER_NOW or RT_TRACE_TRIGGER_NB.
+void rt_trace_trigger(const void* obj, uint32_t kind);
+
 // -- Events of the scheduler (runtime/Scheduler.cpp) --
 
 // A run starts: forget every activation and the last run's violation.
@@ -186,6 +294,13 @@ void rt_trace_begin(void);
 
 // Time advances to `now`.
 void rt_trace_slot(uint64_t now);
+
+// The slot has settled and time is about to move on, or the run to end: every region is
+// empty.
+void rt_trace_slot_end(void);
+
+// A `$finish` was taken.
+void rt_trace_finish(void);
 
 // Whether a violation has ended the run: rt_wheel_advance reads it as it reads the
 // stop time.
