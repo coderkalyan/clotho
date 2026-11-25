@@ -507,8 +507,7 @@ TEST_CASE("deferred #0 assertion: the report names the instance and the label") 
     CHECK_EQ(count_occ(c.err, "ERROR: "), 2u);
 }
 
-// Phase 1 guards: a deferred action that is not a severity report, or a deferred
-// assertion inside a function, is rejected loudly.
+// Phase 1 guards: a deferred action that is not a severity report is rejected loudly.
 TEST_CASE("deferred assertion: unsupported action / context rejected") {
     // $display action (stdout, not a severity task) — Phase 2.
     CHECK(contains(reject("module m; initial begin\n"
@@ -520,16 +519,17 @@ TEST_CASE("deferred assertion: unsupported action / context rejected") {
                           "  a1: assert #0 (0) else $fatal(1);\n"
                           "end endmodule"),
                    "deferred assertion action"));
-    // Deferred assertion inside a function — Phase 2 (generation threading).
-    CHECK(contains(reject("module m;\n"
-                          "  function int f(int v);\n"
-                          "    p: assert #0 (v > 0);\n"
-                          "    return v;\n"
-                          "  endfunction\n"
-                          "  int y;\n"
-                          "  initial y = f(3);\n"
-                          "endmodule"),
-                   "deferred assertion inside a function"));
+    // A deferred assertion inside a function is accepted: see "deferred assertion: inside a
+    // function, a task and a fork child".
+    CHECK(run_capture("module m;\n"
+                      "  function int f(int v);\n"
+                      "    p: assert #0 (v > 0);\n"
+                      "    return v;\n"
+                      "  endfunction\n"
+                      "  int y;\n"
+                      "  initial y = f(3);\n"
+                      "endmodule")
+            .err.empty());
 }
 
 // LRM 16.4.4: disabling "a specific deferred assertion" cancels its pending reports. A label is
@@ -931,4 +931,80 @@ TEST_CASE("a failing wait_order's default report names its scope and the time") 
                                    "  initial wait_order (a, b);\n"
                                    "endmodule\n");
     CHECK(c.err == "ERROR: source:4: top at 1 s: wait_order: events triggered out of order\n");
+}
+
+// A deferred assertion in a function, a task or a fork child queues its report under the report
+// generation of the thread that runs it (LRM 16.4.2): the calling process's for a function or task,
+// the child's own for a fork child. Expected output is derived from the clause; no oracle.
+TEST_CASE("deferred assertion: inside a function, a task and a fork child") {
+    SUBCASE("a function called by a process matures its report") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0;
+              function automatic void f(); assert #0 (x) else $error("fn"); endfunction
+              initial begin f(); #1 $display("done"); end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "fn"), 1u);
+    }
+    SUBCASE("the calling process's resume from an event control flushes it") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              function automatic void f(); assert #0 (x) else $error("fn"); endfunction
+              initial begin f(); @(e); $display("resumed"); end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "fn"), 0u);
+        CHECK(c.out == "resumed\n");
+    }
+    SUBCASE("a task, with a wait of its own after the assertion") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              task automatic tk(); assert #0 (x) else $error("tk"); @(e); endtask
+              initial begin tk(); $display("done"); end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "tk"), 0u);
+    }
+    SUBCASE("a fork child matures its own report") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0;
+              initial begin
+                fork begin assert #0 (x) else $error("child"); end join_none
+                #1;
+              end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "child"), 1u);
+    }
+    SUBCASE("a fork child resumed twice in one time step reports once") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              initial fork
+                forever begin @(e); assert #0 (x) else $error("child at %0t", $time); end
+              join_none
+              initial begin #1 -> e; #0 -> e; end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "child at 1"), 1u);
+    }
+    SUBCASE("the parent's resume does not flush the child's report") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              initial begin
+                fork begin assert #0 (x) else $error("child"); end join_none
+                @(e);
+              end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "child"), 1u);
+    }
 }

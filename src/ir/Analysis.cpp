@@ -978,12 +978,13 @@ struct Structural {
                     }
                     break;
                 case Inst::Tag::Severity:
-                    // Deferred assertions are processes-only: the frontend rejects
-                    // one inside a called function or task, so a process scan
-                    // already covers every case the backend must handle.
-                    if (for_process && ir.extra_data<SeverityInfo>(p.extra).defer != 0) {
-                        uses.defer = true;
-                        saw_defer  = true;
+                    // A deferred assertion in a function or task queues its report under the
+                    // generation of the thread that called it, like a unique/priority report
+                    // (`case_viol`); one in a process also owns that process's counter.
+                    if (ir.extra_data<SeverityInfo>(p.extra).defer != 0) {
+                        uses.defer      = true;
+                        facts.case_viol = true;
+                        saw_defer       = saw_defer || for_process;
                     }
                     break;
                 case Inst::Tag::DumpFile:

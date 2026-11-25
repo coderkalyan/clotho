@@ -512,11 +512,22 @@ void Backend::lower_severity(Index i) {
     // deferred Severity lowers, since is_simple_always forces the group to a
     // coroutine and lower_group set cur_defer_group_. defer == 2 selects the
     // Postponed (final) maturation, defer == 1 the Observed (`#0`).
-    llvm::Value* gen = defer_gen_ptr();
+    // In a subroutine the report belongs to the thread that called it: its published generation
+    // (a task keeps what it read at entry in its frame; a fork child's is its own cell), which is
+    // null at run time when that thread has no counter.
+    llvm::Value* gen = cur_fn_ == nullptr ? defer_gen_ptr()
+                       : gen_gv_ == nullptr ? nullptr
+                       : gen_slot_ != nullptr ? static_cast<llvm::Value*>(b_.CreateLoad(raw_ptr_ty(), gen_slot_))
+                                              : load_gen();
     auto*        i64 = b_.getInt64Ty();
-    llvm::Value* gen_val =
-      gen != nullptr ? b_.CreateLoad(i64, gen)
-                     : static_cast<llvm::Value*>(b_.getInt64(0));
+    llvm::Value* gen_val = static_cast<llvm::Value*>(b_.getInt64(0));
+    if (gen != nullptr && cur_fn_ == nullptr) {
+        gen_val = b_.CreateLoad(i64, gen);
+    } else if (gen != nullptr) {
+        auto* zero = new llvm::GlobalVariable(env_->llmod, i64, true, llvm::GlobalValue::PrivateLinkage,
+                                              b_.getInt64(0), "clotho.gen.zero");
+        gen_val = b_.CreateLoad(i64, b_.CreateSelect(b_.CreateIsNull(gen), zero, gen));
+    }
     llvm::Value* gen_arg =
       gen != nullptr ? gen
                      : static_cast<llvm::Value*>(null);

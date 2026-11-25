@@ -121,7 +121,7 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     // Whether its own body queues deferred assertion reports, which makes each event control and
     // wait statement in it a flush point (LRM 16.4.2); see flush_deferred_on_resume.
     proc_defers_  = holds_deferred_assertion(sym.getBody());
-    proc_flushes_ = holds_flushable_reports(sym.getBody());
+    proc_flushes_ = holds_flushable_reports(sym.getBody()) || body_may_report(sym.getBody());
 
     // A module-item concurrent assertion is not a process of its own. slang
     // wraps it in ProceduralBlockSymbol(Always, isFromAssertion) purely to

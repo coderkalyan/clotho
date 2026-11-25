@@ -74,16 +74,11 @@ void Lowerer::emit_deferred_action(const Statement*      action,
 // region). The expression is evaluated here (Active region, as for a simple
 // immediate assertion); only the action is deferred. The backend's per-process
 // generation flush gives the glitch suppression (LRM 16.4.2). Phase 1 restricts
-// the action to a severity report and requires the assertion to sit directly in
-// a process body (a deferred assertion inside a function/task needs the caller
-// process's generation threaded through the call ABI).
+// the action to a severity report.
 void Lowerer::lower_deferred_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
     using AK = slang::ast::AssertionKind;
-    if (fn_ctx_ != nullptr) {
-        // TODO: thread the calling process's deferred-assertion generation
-        // through the function/task ABI (LRM 16.4.1 short-circuit example).
-        fail("deferred assertion inside a function / task is not supported — Phase 1");
-    }
+    // In a function, task or fork child the report is queued under the generation of the thread
+    // that runs it (the backend publishes it, lower_severity), so there is nothing to refuse.
     const bool is_cover = a.assertionKind == AK::CoverProperty;
     if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume && !is_cover) {
         fail("only deferred assert / assume / cover are supported");
@@ -917,6 +912,76 @@ bool Lowerer::design_has_reports(slang::ast::Compilation& comp) {
 // is a thread of its own and flushes its own.
 bool Lowerer::task_flushes_reports() {
     return fn_ctx_ != nullptr && fn_ctx_->is_task && design_has_reports(scope_->getCompilation());
+}
+
+namespace {
+
+// Finds the statements that queue a deferred or unique/priority report, and the user subroutines
+// a body calls. `virtual_reports` answers a virtual call, whose override is not known here.
+struct ReportScan : ASTVisitor<ReportScan, VisitFlags::AllGood> {
+    std::vector<const SubroutineSymbol*>* calls          = nullptr;
+    bool                                  virtual_reports = false;
+    bool                                  found           = false;
+    std::function<bool(const SubroutineSymbol&)> callee_reports;
+
+    void handle(const ImmediateAssertionStatement& s) {
+        found = found || s.isDeferred;
+        visitDefault(s);
+    }
+    void handle(const slang::ast::ConditionalStatement& s) {
+        found = found || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const slang::ast::CaseStatement& s) {
+        found = found || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const slang::ast::PatternCaseStatement& s) {
+        found = found || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const CallExpression& c) {
+        if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
+            const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
+            if (callee != nullptr) {
+                found = found || (callee->isVirtual() && virtual_reports);
+                if (calls != nullptr) {
+                    calls->push_back(callee);
+                }
+                if (callee_reports) {
+                    found = found || callee_reports(*callee);
+                }
+            }
+        }
+        visitDefault(c);
+    }
+};
+
+} // namespace
+
+// Whether calling `sub` can reach a deferred assertion or a unique/priority statement, through
+// the calls it makes (a virtual call counts when the design has one anywhere). A process that
+// calls one has pending reports its own event controls flush (LRM 16.4.2).
+bool Lowerer::subroutine_reports(const SubroutineSymbol& sub) {
+    const bool virt = design_has_reports(sub.getParentScope()->getCompilation());
+    return reaches_property(
+      sub, sub_reports_, [virt](const SubroutineSymbol& s, std::vector<const SubroutineSymbol*>& callees) {
+          ReportScan scan;
+          scan.calls           = &callees;
+          scan.virtual_reports = virt;
+          s.getBody().visit(scan);
+
+          return scan.found;
+      });
+}
+
+bool Lowerer::body_may_report(const Statement& body) {
+    ReportScan scan;
+    scan.virtual_reports = design_has_reports(scope_->getCompilation());
+    scan.callee_reports  = [this](const SubroutineSymbol& s) { return subroutine_reports(s); };
+    body.visit(scan);
+
+    return scan.found;
 }
 
 void Lowerer::record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,

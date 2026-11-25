@@ -516,7 +516,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Subroutine-call action block** — a user task or void function as the action is
     refused.
   - [ ] **`$display` / `$write` / `$fatal` action** — refused.
-  - [ ] **Deferred assertion inside a function or task** — refused.
   - [ ] **`disable` of one deferred assertion** (16.4.4) — `disable a1;` naming an assertion's
     label is refused: a pending report carries no identity of its assertion to cancel by.
   - [ ] **Flush at a resume the process cannot see** (16.4.2) — a process holding a deferred

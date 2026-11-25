@@ -2558,6 +2558,10 @@ private:
 
     bool task_flushes_reports();
 
+    bool subroutine_reports(const SubroutineSymbol& sub);
+
+    bool body_may_report(const Statement& body);
+
     bool design_virtual_parks(slang::ast::Compilation& comp);
 
     bool task_parks_unseen(const SubroutineSymbol& callee, bool direct);
@@ -5798,6 +5802,9 @@ private:
     // Whether the design has a deferred assertion or a unique/priority statement
     // anywhere (design_has_reports); computed on first use.
     std::optional<bool> design_has_reports_;
+    // Memoized "calling this can reach a deferred assertion or unique/priority statement", see
+    // subroutine_reports.
+    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_reports_;
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
