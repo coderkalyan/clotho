@@ -1247,6 +1247,9 @@ TEST_CASE("cli: build writes an executable named after the top module by default
 
 // The modules of a design are compiled to one object each, on as many threads as
 // -j allows; the executable linked from them must not depend on that number.
+// Both builds write a file of the same name, in different directories: lld's
+// Mach-O writer hashes the output file name into LC_UUID (and arm64's ad-hoc
+// code signature names it), so differently named outputs differ on macOS.
 TEST_CASE("cli: build writes the same executable whatever the number of compile threads") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", R"(
@@ -1263,7 +1266,8 @@ TEST_CASE("cli: build writes the same executable whatever the number of compile 
     std::string first;
     for (const std::string_view jobs : { "1", "3" }) {
         CAPTURE(jobs);
-        const fs::path exe = s.path(std::format("sim{}", jobs));
+        const fs::path exe = s.path(std::format("j{}", jobs)) / "sim";
+        fs::create_directories(exe.parent_path());
         const Result   r   = s.run(std::format("build -j {} -o \"{}\" \"{}\"", jobs, exe.string(), design.string()));
         REQUIRE(r.code == 0);
         const std::string bytes = clotho::test::detail::read_file(exe);
