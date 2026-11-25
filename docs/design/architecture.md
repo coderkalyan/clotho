@@ -99,13 +99,24 @@ them in step.
   address.
 - Suspended frames and the native stack are scanned conservatively until frames
   have explicit stack maps; object fields and design state are scanned precisely.
+- A young collection costs what happened since the last collection (allocation,
+  logged writes, frames that ran), never the size of the design. **Not yet:**
+  each one reads every state root, walks every state-resident container and scans
+  every registered frame, and with a small live set every collection is full.
+- An object is finalized only if it owns a buffer outside the heap when it dies.
+  **Not yet:** every dead object with a string or container property runs a
+  finalizer.
+- A handle stored through a `ref` argument is recorded by a barrier in the
+  callee, which finds the owning object from the address. **Not yet:** the call
+  site records the owner, and every collection re-records whatever frames
+  reference.
 - Any process may run on any worker thread, but two run at the same time only
   when what they may access does not overlap with a write, and a run is
   reproducible. So values and containers need no protection against concurrent
   access, and their buffers stay with their one owner. **Not yet:** one thread
   runs every process.
-- Still open for discussion: heap organization, barriers, triggers, safepoints
-  and per-worker collector state.
+- Still open for discussion: heap organization, triggers and heap sizing,
+  safepoints and per-worker collector state.
 
 ## Containers and classes
 
