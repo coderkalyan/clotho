@@ -651,6 +651,9 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // Every instance is collected: a target named from outside its instance is
     // now known, and no instance has been emitted yet.
     join_disable_targets();
+    // Every instance is collected: give each forced or assigned variable, and each
+    // twin of it, its state, before Classify or Emit appends to any instance.
+    join_pca_targets();
     // Between the passes: Collect has just enumerated every assertion and
     // said whether the design calls an LRM 20.12 control task, and the
     // scope tree it built is now frozen, so the control state can be
@@ -901,20 +904,19 @@ void Lowerer::lower_members(const Scope&       scope,
                 break;
             case SymbolKind::ProceduralBlock:
                 // Collect: enumerate the concurrent assertions / control tasks the
-                // block holds (LRM 20.12, see scan_assert_control), and label the
-                // named blocks a `disable` targets (LRM 9.6.2, see
-                // scan_disable_targets).
+                // block holds (LRM 20.12, see scan_assert_control), label the named
+                // blocks a `disable` targets (LRM 9.6.2, see scan_disable_targets),
+                // and note the variables a `force` / `assign` targets (LRM 10.6),
+                // which join_pca_targets gives their state once every instance is
+                // collected: a `force u.v` ahead of `sub u();` names a signal
+                // Collect has not registered yet.
                 //
-                // Classify: register a hidden force_site signal per `force` target so
-                // writers gate in Emit (LRM 10.6.2). Not in Collect, which meets a
-                // block before the instances declared after it: a `force u.v` ahead of
-                // `sub u();` named a signal Collect had not registered yet, so the
-                // force was lost and refused. Every signal of the top exists by
-                // Classify, and every force site is known before the first Emit
-                // decides whether a writer of its target is gated.
+                // Classify: register a net `force` site, which needs the net
+                // resolution facts Collect finalizes (finalize_sim_nets).
                 if (pass == Pass::Collect) {
                     scan_assert_control(m.as<ProceduralBlockSymbol>());
                     scan_disable_targets(m.as<ProceduralBlockSymbol>());
+                    record_pca_var_sites(m.as<ProceduralBlockSymbol>().getBody());
                 } else if (pass == Pass::Classify) {
                     scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
                 } else if (emit) {

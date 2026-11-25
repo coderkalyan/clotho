@@ -180,6 +180,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
 - [ ] **`force` inside a task or function** (10.6.2) — a net force there, and a variable force
   that no procedural block also holds, is refused: the scan reads procedural blocks only.
+- [ ] **`force` / `assign` of an interface member when more than one top instantiates the
+  interface** (10.6, 25.9) — refused: the state every instance of the type needs is given
+  per top, after an earlier top's instances are already lowered.
 
 ### Real numbers
 

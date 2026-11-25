@@ -1200,6 +1200,25 @@ TEST_CASE("force: a force inside a task or function that no procedural block reg
     }
 }
 
+// A forced interface member gets its state in every instance of the interface's type,
+// which a handle may name; an instance under another top is lowered by another pass, so
+// the design is refused, whichever top is lowered first (docs/TODO.md). No oracle: the
+// LRM allows it.
+TEST_CASE("force: a member of an interface more than one top instantiates is rejected") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+        endinterface
+        module top1;
+            bus b();
+            initial force b.q = 8'hAA;
+        endmodule
+        module top2;
+            bus b();
+        endmodule)";
+    CHECK(lower_error(src).find("which more than one top instantiates") != std::string::npos);
+}
+
 // The boundary of that refusal: a variable that a procedural block also forces is forceable, so
 // the force inside the task is exact. LRM 10.6.2: the force holds 0 until the release, which
 // reestablishes the continuous assignment (a=1).

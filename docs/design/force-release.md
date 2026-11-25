@@ -55,19 +55,43 @@ conditional / impure-RHS force). We adopt that insight but not the structure:
 ### Forceable set
 
 A pre-pass collects every signal that is a whole-signal `force`/`assign` target. Only
-these carry override state and gated writers. Everything else lowers unchanged. The
-pre-pass is `scan_force_targets` over every procedural block of the top, in the
-Classify walk: Collect has registered every signal by then, so a target named by
-hierarchy resolves whatever the order of the forcing block and the instance, and every
-site is known before Emit decides which writers to gate. It reads procedural blocks
-only, so a `force` inside a task or function is refused on a net, and on a variable
-that no block forces (docs/TODO.md).
+these carry override state and gated writers. Everything else lowers unchanged. For a
+variable, the Collect walk notes the target of every `force`/`assign` in a procedural
+block (`record_pca_var_sites`), and `join_pca_targets` gives the targets their state
+once every instance of the top is collected, before Classify or Emit appends to any
+instance, so a target named by hierarchy resolves whatever the order of the forcing
+block and the instance. A net site is registered in the Classify walk
+(`scan_force_targets`), which needs the net facts Collect finalizes. Both read
+procedural blocks only, so a `force` inside a task or function is refused on a net,
+and on a variable that no block forces (docs/TODO.md).
 
-### Per-forceable-signal state (hidden signals)
+### Per-forceable-variable state (hidden signals)
 
 - `force_site` (2-state i32, 0 = none) — id of the currently-active force site.
 - `assign_site` (2-state i32, 0 = none) — id of the currently-active `assign` site;
   allocated only for variables that are an `assign` target.
+
+The state lives with the variable, not with the force: in the variable's own instance,
+named after it (`<var>$force_site`), and in every instance of the variable's
+specialization, forced or not. For an interface it is also every instance of the same
+type (`hasSameType`), which a virtual interface handle can name. This is what makes the
+state reachable wherever a write of the variable is:
+
+- The instances of a specialization share their code, so the gate in that code reads
+  each instance's own state, 0 in an instance nothing forces. Forcing `u1.q` leaves
+  `u1` and `u2` alike.
+- A write through a handle (`vif.q = e`, `vif.q <= e`, a task of the interface called
+  through one) cannot know which instance it writes until it runs. The state of the
+  member's representative sits at the same def-local position in every instance, so
+  `IfaceSignal(handle, representative's force_site)` reads the state of the instance
+  the handle names, the same way `IfaceSignal(handle, q)` writes its `q`.
+
+The states are appended in flat-signal order of the targets, to every instance of the
+group at once, so each instance takes them in the same order. The state table
+(`PcaTargets`) is design-wide, because a write through a handle may be lowered on the
+globals Lowerer (a package class method). An interface instantiated under more than one
+top cannot have a forced member: the second top's join would have to add state to the
+first top's instances, which are already lowered, so it is refused (docs/TODO.md).
 
 Site ids disambiguate re-force / re-assign (LRM last-wins): each textual force/assign
 site targeting a signal gets a unique per-signal id; a stale site's re-eval process

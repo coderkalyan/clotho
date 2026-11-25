@@ -990,6 +990,41 @@ struct VifDefs {
     std::vector<const slang::ast::InstanceBodySymbol*> wanted;
 };
 
+// The state of one variable a `force` or procedural `assign` can own (LRM 10.6).
+// `site` is a hidden 2-state i32 (0 = not forced, else the id of the active
+// textual force site) and `assign_site` the same for the `assign` layer. Ordinary
+// writes are gated on both; a `force` sets its site and writes unconditionally,
+// plus arms a re-eval process that re-applies its RHS while its site stays active
+// (last-force-wins); `release` clears the site and the value holds.
+//
+// The state lives beside the variable, in its own instance, and every instance of
+// the variable's specialization carries it (join_pca_targets): code shared between
+// the instances then gates alike, and a virtual interface handle reaches the state
+// of whichever instance it names at the same def-local position as the member.
+struct ForceInfo {
+    ir::Signal site{ 0 };     // force_site, always allocated
+    uint32_t   next_site = 0; // ids handed to textual force sites, 1-based
+    // Second override layer: the procedural continuous `assign` statement (LRM
+    // 10.6.1), priority below force and above ordinary procedural writes.
+    // Present only when the member is an `assign` target in some instance.
+    bool       has_assign = false;
+    ir::Signal assign_site{ 0 };
+    uint32_t   next_assign = 0;
+};
+
+// Design-wide force / assign state of variables, keyed by flat signal, shared by
+// every Lowerer: a write through a virtual interface handle may lower on the
+// globals Lowerer (a package class method), which never saw the forcing top.
+struct PcaTargets {
+    ankerl::unordered_dense::map<uint32_t, ForceInfo> vars;
+    // Interface bodies with a forced member, by the top whose join gave them state:
+    // an instance of the same type under another top has no state.
+    std::vector<std::pair<const slang::ast::InstanceBodySymbol*, const slang::ast::InstanceSymbol*>> iface_bodies;
+    // Members written through a handle before any of their instances had state, so
+    // the write was lowered ungated.
+    ankerl::unordered_dense::set<uint32_t> vif_ungated;
+};
+
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
@@ -1145,6 +1180,11 @@ public:
     // must outlive every call made through this Lowerer.
     void set_vif_defs(VifDefs* defs) {
         vif_defs_ = defs;
+    }
+
+    // Point this Lowerer at the design's force / assign state (PcaTargets).
+    void set_pca_targets(PcaTargets* pca) {
+        pca_ = pca;
     }
 
     // Diagnostics for members this Lowerer recovered past, and whether it did so
@@ -2026,27 +2066,18 @@ private:
 
     // -- Procedural continuous assignment: force / release (LRM 10.6.2) --
     //
-    // Whole-scalar variables (integral or real) and nets. Each forceable signal
-    // carries a hidden 2-state i32 `force_site` signal (0 = not forced, else the
-    // compile-time id of the active textual force site). Ordinary procedural /
-    // continuous writes to the variable are gated `if (force_site === 0)`; a
-    // `force` sets the site and writes unconditionally, plus arms a continuous
-    // re-eval process that re-applies its RHS whenever the RHS changes (LRM's
-    // continuous relationship); `release` clears the site and the value holds. Per
-    // textual force site ids give last-force-wins: a superseded site's re-eval
-    // process sees `force_site !== its id` and stops writing. Nets, bit/part/
-    // element-selects, aggregates, and `assign`/`deassign` are guarded loud below.
-    struct ForceInfo {
-        ir::Signal site{ 0 };     // force_site, always allocated
-        uint32_t   next_site = 0; // ids handed to textual force sites, 1-based
-        // Second override layer: the procedural continuous `assign` statement (LRM
-        // 10.6.1), priority below force and above ordinary procedural writes.
-        // Present only when the variable is an `assign` target somewhere.
-        bool       has_assign = false;
-        ir::Signal assign_site{ 0 };
-        uint32_t   next_assign = 0;
+    // Whole-scalar variables (integral or real) and nets. Variables carry their
+    // state in a design-wide table (PcaTargets, ForceInfo); nets carry theirs below.
+    // Nets, bit/part/element-selects and aggregates are guarded loud below.
+    PcaTargets  own_pca_;
+    PcaTargets* pca_ = &own_pca_;
+    // The variable targets the Collect walk met, as written: canonicalized and
+    // given their state by join_pca_targets once every instance is collected.
+    struct PcaVarSite {
+        const ValueSymbol* sym;
+        bool               is_force;
     };
-    ankerl::unordered_dense::map<uint32_t, ForceInfo> forceable_;
+    std::vector<PcaVarSite> pca_var_sites_;
 
     // One `force` of a net (LRM 10.6.2), whole or a constant bit/part-select. A net
     // has no procedural writers to gate; instead each force site contributes a
@@ -2096,13 +2127,16 @@ private:
 
     void scan_force_targets(const Statement& body);
 
-    ir::Signal new_pca_state(const char* tag, const ValueSymbol& sym);
+    void record_pca_var_sites(const Statement& body);
+
+    void join_pca_targets();
+
+    ir::Signal new_pca_state(const char* tag, ir::Signal target, ir::InstanceScope* node);
 
     void register_pca_site(const ProceduralAssignStatement& s);
 
     void register_net_force_site(const ProceduralAssignStatement& s, const Expression& lhs, const ValueSymbol& root);
 
-    void register_pca_target(const Expression& lhs, bool is_force);
 
     std::vector<ir::WaitEvent> with_force_wake(std::vector<ir::WaitEvent> ev, const Expression& lhs);
 

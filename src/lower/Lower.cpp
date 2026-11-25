@@ -802,6 +802,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     root.visit(wait_prop_scan);
     UnitOwners unit_owners;
     ForeignCalls foreign_calls;
+    PcaTargets   pca_targets;
     if (root.topInstances.size() > 1) {
         collect_foreign_calls(root, foreign_calls);
     }
@@ -811,6 +812,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_class_ids(&class_ids);
         globals.set_iface_ids(&iface_ids);
         globals.set_vif_defs(&vif_defs);
+        globals.set_pca_targets(&pca_targets);
         globals.set_waited_props(&waited_props);
         globals.set_unit_owners(&unit_owners);
         globals.set_foreign_calls(&foreign_calls);
@@ -825,6 +827,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_class_ids(&class_ids);
             lw.set_iface_ids(&iface_ids);
             lw.set_vif_defs(&vif_defs);
+            lw.set_pca_targets(&pca_targets);
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
             lw.set_unit_owners(&unit_owners);
