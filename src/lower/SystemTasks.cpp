@@ -2133,9 +2133,8 @@ std::optional<std::string_view> Lowerer::handle_p_name(const slang::ast::Type& c
 // The `%p` text of a handle value `v`: `null` when the handle word is zero, else
 // `name`. A select over two string constants, so nothing dereferences the handle
 // and there is no branch to build. Zero is `null` for all five reference types --
-// a class handle and a chandle by Table 7-1's default, an event because slot 0 is
-// the reserved null object, a virtual interface because the handle is the address
-// of an instance's context record.
+// a class handle, an event and a chandle by Table 7-1's default, a virtual
+// interface because the handle is the address of an instance's context record.
 ir::Index Lowerer::handle_p_render(ir::Index v, std::string_view name, ir::Builder& b, ir::SourceLoc l) {
     const ir::Ref   u64       = make_int_type(64, false);
     const ir::Index null      = b.constant(module_.pool.put_int(u64, 0), l);

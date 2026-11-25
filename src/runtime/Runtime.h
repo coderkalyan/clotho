@@ -1778,31 +1778,28 @@ void  rt_free(void* p);
 
 // -- Named event objects (LRM 15.5) --
 //
-// An event variable holds a 64-bit handle `{ u32 slot, u32 gen }` naming an event
-// OBJECT. LRM Table 6-7 gives an event's default initial value as "New event", so
+// An event variable holds a handle: the address of an event OBJECT, or 0 for
+// `null`. LRM Table 6-7 gives an event's default initial value as "New event", so
 // EVERY event-typed storage location is bound to a fresh object when that storage
 // comes into existence -- a declared variable, an unpacked-array element, a struct
 // member, a class property, an automatic local, a container element.
 //
-// The objects a scalar declared event needs are laid out by the backend in one
-// static array, so the common case folds to a constant address. Everything else is
-// allocated here, from a CHUNKED pool: chunks never move, so an object pointer
-// stays valid across growth even while a process is parked on its waiter list.
-// The backend registers its static block as the pool's first chunk at startup, so
-// one slot space covers both tiers and rt_event_ptr resolves any handle.
-//
-// Objects are never freed. LRM 15.5.5.2 reclaims a synchronization object once no
-// variable references it, which is garbage collection; Clotho has none, and class
-// object bodies leak by the same direction (docs/design/classes.md §7).
+// An object is a collected object (Gc.h), which is LRM 15.5.5.2's reclamation: it
+// lives while a variable, a parked waiter, or one of the runtime's own records
+// (a pending `->> e`, a `->> #d e` timer, a `->> @(x) e` subscription, the dump)
+// names it. Design state, class bodies, containers and frames name it the way
+// they name a class object; the runtime's records are roots of their own.
 
 // Mirror of the backend's `%clotho.event`. Field order and types must match it
 // exactly, like rt_null_site -- the two change together.
 typedef struct rt_event {
-    uint64_t last_trig; // tick of the last fire; UINT64_MAX == never triggered
-    void*    waiters;   // intrusive waiter-list head
-    uint8_t  pending;   // a `->> e` awaiting the NBA region
-    int32_t  vcd;       // dump-var index, or -1
-    void*    next_pend; // next object on the NBA pending chain
+    const void* vptr;      // names the collector's trace map, as a class object's does
+    uint64_t    last_trig; // tick of the last fire; UINT64_MAX == never triggered
+    void*       waiters;   // intrusive waiter-list head
+    void*       next_pend; // next object on the NBA pending chain
+    int32_t     vcd;       // dump-var index, or -1
+    uint32_t    trig;      // dense id as a `<= @e` / `->> @(e)` control; 0 until it is one
+    uint8_t     pending;   // a `->> e` awaiting the NBA region
 } rt_event;
 
 // -- Run start (the process-global reset seam) --
@@ -1822,30 +1819,41 @@ typedef struct rt_event {
 // runtime: reset at the START of a run, never at shutdown, so a finished run
 // leaves a readable oracle behind for the harness that just ran it.
 //
-// The parameters are the event pool's first chunk -- the backend's static object
-// block, re-registered on every run because it is a JIT global that dies with the
-// previous LLJIT. `count` includes the reserved null object at slot 0. The seam
-// also owns the process control-block pool and the detached-subscription table;
+// `event_pend_head` is the address of the design's NBA pending-chain head
+// (clotho.event_pend_head), a JIT global, so it is passed anew on every run; the
+// collector reads the chain through it. The seam also owns the process
+// control-block pool, the detached-subscription table and the `->> #d e` timers;
 // rt_run_init's own definition lists what it resets and what it deliberately does
 // not.
-void rt_run_init(void* event_static_block, uint32_t event_static_count);
+void rt_run_init(void* event_pend_head);
 
 // Detached one-shot event subscriptions (`->> @(x) e`, LRM 15.5.1), keyed by the
-// trigger id of the control: a dense (signal, edge) id, or RT_TRIG_EVENT | slot
-// when the control names an event (see rt_intra_event_register). Growable: a
-// `->> @(x) e` in a loop makes one registration per pass, which no static wait
-// bucket can bound. `count` is the `repeat (n)` countdown; the trigger decrements
-// and only a record reaching zero fires. rt_event_detach_fire moves the matured
-// handles to a ready list the caller reads back with rt_event_detach_ready.
+// trigger id of the control: a dense (signal, edge) id, or RT_TRIG_EVENT | the id
+// of the object when the control names an event (see rt_intra_event_register).
+// Growable: a `->> @(x) e` in a loop makes one registration per pass, which no
+// static wait bucket can bound. `count` is the `repeat (n)` countdown; the trigger
+// decrements and only a record reaching zero fires. rt_event_detach_fire moves the
+// matured handles to a ready list the caller reads back with rt_event_detach_ready.
+// A record keeps the event it will trigger alive.
 void     rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count);
 uint32_t rt_event_detach_fire(uint32_t trig_id);
 uint64_t rt_event_detach_ready(uint32_t i);
 
-// Allocate a fresh event object; returns its handle `{ slot, gen }`.
+// Allocate a fresh event object; returns its handle. Like any allocation of a
+// collected object it may collect first, so the caller's other handles must be
+// where the collector looks.
 uint64_t rt_event_new(void);
 
-// The object a handle's slot names, in either tier.
-void* rt_event_ptr(uint32_t slot);
+// The same for an element of a container: never collects, because element
+// construction runs inside container operations whose buffers the collector
+// cannot see until the operation is complete.
+uint64_t rt_event_new_elem(void);
+
+// The detached timer of a `->> #d e`: a wheel node that keeps the event `handle`
+// names alive until it expires. rt_event_timer_take, called by the expiry thunk,
+// returns the handle and frees the node.
+void*    rt_event_timer_new(uint64_t handle);
+uint64_t rt_event_timer_take(void* timer);
 
 // -- Process control blocks (the `process` class, LRM 9.7) --
 //
@@ -2233,16 +2241,18 @@ void rt_inertial_cb(rt_timer* timer, void* ctx);
 //
 // A trigger id names one of two things. Without RT_TRIG_EVENT it is the backend's
 // dense (signal, edge) id, fired from both signal wake paths (a blocking store and
-// an NBA commit). With RT_TRIG_EVENT, the low bits are the slot of a named event
-// OBJECT, fired wherever that object is triggered (`-> e`, and the NBA-region
-// service of `->> e`): an event wakes through its object, not through a value
-// change, and the record waits on the object its variable named when the
-// statement executed (LRM 15.5.5.1). Object slots are never reused, so the key
-// cannot go stale.
+// an NBA commit). With RT_TRIG_EVENT, the low bits are the id of a named event
+// OBJECT (rt_event::trig), fired wherever that object is triggered (`-> e`, and
+// the NBA-region service of `->> e`): an event wakes through its object, not
+// through a value change, and the record waits on the object its variable named
+// when the statement executed (LRM 15.5.5.1). An id is never reused within a run,
+// so the key cannot go stale.
 enum { RT_TRIG_EVENT = 0x80000000u };
 
-// The trigger id of the event object at `obj`: RT_TRIG_EVENT | its slot.
-uint32_t rt_event_trig_id(const void* obj);
+// The trigger id of the event object at `obj`: RT_TRIG_EVENT | its id, which the
+// first call assigns. A fire reads rt_event::trig directly and skips an object
+// that was never a control.
+uint32_t rt_event_trig_id(void* obj);
 
 // Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
 void rt_intra_event_register(uint32_t trig_id, void* rec);

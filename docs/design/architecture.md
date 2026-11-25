@@ -86,8 +86,8 @@ them in step.
   owner that frees them, and the collector traces through them.
 - Every built-in handle kind (fork capture boxes, semaphores, mailboxes, process
   objects, events, covergroup instances) follows one discipline: a collected
-  object, with a finalizer for any native resource it owns. **Not yet:** events
-  are never freed, and covergroup instances live until the run ends.
+  object, with a finalizer for any native resource it owns. **Not yet:**
+  covergroup instances live until the run ends.
 - A covergroup instance's results outlive it: its finalizer folds them into the
   type's record, and an instance with its own sampling event stays reachable
   while that event can fire (tentative until read against clause 19).
@@ -98,8 +98,10 @@ them in step.
 - Objects do not move, but only what the collector scans may rely on that: an
   object's address is held in object fields, design state, frames and the stack
   and nowhere else, and identity and ordering never use it, so that moving can be
-  added. **Not yet:** an associative array keyed by a class handle orders by
-  address.
+  added. **Not yet:** an associative array keyed by a class or event handle
+  orders by address, and the runtime's own records of an event (a `->> #d` timer,
+  a `->> @(x)` subscription, a dump variable) hold its address where the
+  collector reads it but could not update it.
 - Suspended frames and the native stack are scanned conservatively until frames
   have explicit stack maps; object fields and design state are scanned precisely.
 - A young collection costs what happened since the last collection (allocation,

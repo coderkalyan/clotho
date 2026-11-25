@@ -26,7 +26,9 @@ void rt_elem_init(const rt_elem_ops* o, void* p) {
         // LRM Table 6-7: an event's default value is a NEW event, so every element
         // slot gets its own object. This is the one kind whose power-on image is
         // not a constant, which is why init cannot be a blind copy of `proto`.
-        auto h = rt_event_new();
+        // The element form of the allocation, because `p` is usually in a buffer
+        // its container does not name yet.
+        auto h = rt_event_new_elem();
         std::memcpy(p, &h, sizeof h);
         return;
     }
@@ -47,8 +49,8 @@ void rt_elem_deinit(const rt_elem_ops* o, void* p) {
         case rt_elem_pod:
             return;
         case rt_elem_event:
-            // Nothing to release: event objects are never freed (LRM 15.5.5.2's
-            // reclamation is GC, which Clotho does not have).
+            // Nothing to release: the collector reclaims an event object once no
+            // handle names it (LRM 15.5.5.2).
             return;
         case rt_elem_string:
             rt_string_deinit(static_cast<rt_string*>(p));

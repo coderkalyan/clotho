@@ -646,11 +646,29 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     v.mm_bytes   = v.narrow ? (width + 7) / 8 : (2 * width + 7) / 8;
     v.z_bytes    = z != nullptr ? (width + 7) / 8 : 0;
     if (v.is_event) {
-        // `mm` is the event's 64-bit last-trigger tick, not a value slot: diff all
-        // eight bytes, and seed the shadow with the same never-triggered sentinel
-        // the design state holds, so a trigger at tick 0 still reads as a change.
-        // `seen` starts true for the same reason -- there is no power-on value to
-        // dump, only occurrences.
+        // `mm` arrives as the address of the event VARIABLE, and the dump watches the
+        // object that variable names now: its 64-bit last-trigger tick, not a value
+        // slot. Diff all eight bytes, and seed the shadow with the never-triggered
+        // sentinel an object starts with, so a trigger at tick 0 still reads as a
+        // change. `seen` starts true for the same reason -- there is no power-on
+        // value to dump, only occurrences.
+        //
+        // The object learns its dump index here, so a trigger reached through any
+        // handle marks this variable dirty, and it is kept for the run because `mm`
+        // now points into it. Of two dumped variables naming one object, only the
+        // first registered pulses.
+        static const uint64_t never = ~uint64_t{ 0 };
+        rt_event*             e     = nullptr;
+        std::memcpy(&e, mm, sizeof(e));
+        if (e == nullptr) {
+            v.mm = reinterpret_cast<const uint8_t*>(&never);
+        } else {
+            if (e->vcd < 0) {
+                e->vcd = static_cast<int32_t>(g_vcd.vars.size());
+            }
+            event_keep(e);
+            v.mm = reinterpret_cast<const uint8_t*>(&e->last_trig);
+        }
         v.mm_bytes = sizeof(uint64_t);
         v.z_bytes  = 0;
         v.seen     = true;

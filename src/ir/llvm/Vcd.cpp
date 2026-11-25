@@ -493,15 +493,13 @@ void Backend::vcd_plan_var(VcdRows& rows, Signal sig) {
         return llvm::ConstantExpr::getInBoundsGetElementPtr(ty, base, v);
     };
     if (info.is_event) {
-        // A named event (LRM 15.5) has no value -- its 1-bit placeholder slot
-        // is never written -- so what the dump carries is occurrences. The
-        // runtime watches the event's last-trigger tick (clotho.event_trig,
-        // stamped by emit_event_fire for every trigger form) and emits `1<id>`
-        // at each instant that stamp moves. The object is the declared one, by
-        // number: a variable no store reaches holds it for the whole run, and the
-        // dump of a reassigned one names it all the same.
-        llvm::Constant* obj = gep(events_arr_ty_, sym(events_gv_), { 0, event_slot_[static_cast<uint32_t>(sig)] });
-        rows.add(VcdRows::Var, leaf, 1, 16, gep(event_obj_ty(), obj, { 0, kEventTrig }));
+        // A named event (LRM 15.5) has no value, so what the dump carries is
+        // occurrences. The row hands the runtime the VARIABLE: at registration it
+        // reads the handle and from then on watches that object's last-trigger
+        // tick (stamped by emit_event_fire for every trigger form), emitting
+        // `1<id>` at each instant the stamp moves. A variable reassigned after
+        // `$dumpvars` keeps dumping the object it named then.
+        rows.add(VcdRows::Var, leaf, 1, 16, gep(slot_of(sig).slot_ty, storage_address(slot_of(sig)), { 0, 0 }));
         return;
     }
     const SignalSlot& s = slot_of(sig);

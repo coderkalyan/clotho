@@ -16,7 +16,6 @@ void Backend::run() {
     // undriven / ptr-arg bits while laying out signal slots.
     facts_ = analyze(mod_);
     build_state_types();
-    assign_event_slots(); // before emit_state_global: an event's power-on value IS its handle
     emit_state_global();  // before any body: storage_ptr resolves through the anchors
     build_rng_global();  // before any body: every call site passes an RNG pointer
     build_wheel_global(); // before any body: a function reads the clock from it
@@ -324,13 +323,13 @@ llvm::Value* Backend::intra_id_value(Signal sig) {
 }
 
 // Trigger id of (signal, edge), as an IR value. A dense `<= @e` id for a value
-// signal. For a declared event it is RT_TRIG_EVENT | the slot of the object the
-// variable names NOW (LRM 15.5.5.1: a control captures the object when it
-// executes), which is what emit_event_fire counts down.
+// signal. For a declared event it is the id of the object the variable names NOW
+// (LRM 15.5.5.1: a control captures the object when it executes), which the
+// runtime assigns on this first use and emit_event_fire counts down. Only the
+// statements that register on a trigger ask for an event's.
 llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
-    if (event_slot_[static_cast<uint32_t>(sig)] != 0) {
-        llvm::Value* slot = event_slot_value(sig);
-        return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
+    if (mod_.signal(sig).is_event) {
+        return b_.CreateCall(event_trig_id_fn(), { event_obj_for(sig) });
     }
     return id_value(sig, static_cast<IdFamily>(static_cast<uint32_t>(IdFamily::TrigPos) + edge),
                     static_cast<uint32_t>(trigger_id(sig, edge)));

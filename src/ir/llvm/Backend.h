@@ -2106,17 +2106,16 @@ private:
     void emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr);
 
     // One persistent subscription as the seed's tables hold it (plan_static_subscribe):
-    // a bucket's slot, or an event's node and the object it links onto.
+    // a bucket's slot, or an event's node and the variable whose object it links onto.
     struct StaticSub {
         // A bucket: the address of the slot of the (signal, edge)'s static bucket that
         // takes the group's { handle, flag } entry. An event: the node of the
         // persistent pool that links onto the object's list.
         llvm::Constant* slot = nullptr;
-        // An event only: the address of the object, or, when the variable's own
-        // handle decides it (`by_handle`), the address of that handle.
-        llvm::Constant* obj       = nullptr;
-        bool            is_event  = false;
-        bool            by_handle = false;
+        // An event only: the address of the variable's handle, which names the
+        // object when the links are made.
+        llvm::Constant* handle   = nullptr;
+        bool            is_event = false;
     };
 
     StaticSub plan_static_subscribe(Signal sig, uint32_t edge);
@@ -2232,6 +2231,13 @@ private:
 
     void emit_gc_root_tables();
 
+    // Emit `body(row)` once for each of `rows`, as one loop over a private
+    // constant table of them, `row` being the address of the entry. What root
+    // sets up for each instance goes through here, so that root's code is the
+    // same size however many instances the design has.
+    void emit_rows(const std::vector<llvm::Constant*>& rows, llvm::Type* row_ty, const char* name,
+                   llvm::function_ref<void(llvm::Value* row)> body);
+
     void signal_handle_offsets(const SignalSlot& s, uint64_t base, std::vector<uint32_t>& out);
 
     void signal_gc_containers(const SignalSlot& s, uint64_t base, std::vector<GcContainer>& out);
@@ -2273,15 +2279,19 @@ private:
 
     llvm::StructType* event_node_ty();
 
-    static constexpr uint32_t kEventTrig    = 0;
-    static constexpr uint32_t kEventWaiters = 1;
-    static constexpr uint32_t kEventPending = 2;
+    // Field indices of event_obj_ty, the mirror of rt_event. Field 0 is the
+    // collector's descriptor word.
+    static constexpr uint32_t kEventTrig    = 1;
+    static constexpr uint32_t kEventWaiters = 2;
+    // Next object on the NBA pending chain, or null when this one is not on it.
+    static constexpr uint32_t kEventNextPend = 3;
     // The event's runtime dump-var index, or -1 when it is not dumped. Carried in
     // the object because a fire reached through a handle does not know which
     // declared event it landed on, and the VCD dirty set is index-based.
-    static constexpr uint32_t kEventVcd     = 3;
-    // Next object on the NBA pending chain, or null when this one is not on it.
-    static constexpr uint32_t kEventNextPend = 4;
+    static constexpr uint32_t kEventVcd     = 4;
+    // The object's id as a `<= @e` / `->> @(e)` control, or 0 (rt_event_trig_id).
+    static constexpr uint32_t kEventTrigId  = 5;
+    static constexpr uint32_t kEventPending = 6;
 
     static constexpr uint32_t kNodeNext   = 0;
     static constexpr uint32_t kNodePrev   = 1;
@@ -2293,24 +2303,18 @@ private:
     // the node must come off that object, not off whatever `a` names on resume.
     static constexpr uint32_t kNodeOwner  = 4;
 
-    // The slot of the object an event variable names, and the object of a
-    // monomorphic one (see Events.cpp).
-    llvm::Value* event_slot_value(Signal sig);
-
-    llvm::Value* event_obj(Signal sig);
-
+    // The object a handle names (the null object for a null handle), the same for
+    // a handle known not to be null, and the object a declared event names now
+    // (see Events.cpp).
     llvm::Value* event_obj_of(llvm::Value* handle);
+
+    llvm::Value* event_obj_live(llvm::Value* handle);
 
     llvm::Value* load_event_handle(Signal sig);
 
     llvm::Value* event_field(llvm::Value* obj, uint32_t field);
 
     static const char* edge_suffix(uint32_t edge);
-    void assign_event_slots();
-
-    void analyze_event_monomorphism();
-
-    bool event_is_mono(Signal sig) const;
 
     llvm::Value* event_obj_for(Signal sig);
 
@@ -2614,8 +2618,6 @@ private:
 
     void service_dynamic_queue(Signal sig, uint32_t edge);
 
-    llvm::StructType* event_timer_ty();
-
     llvm::Function* event_delay_thunk();
     void build_event_delay_thunk();
 
@@ -2625,7 +2627,7 @@ private:
 
     void emit_event_pend_drain(llvm::Value* wheel);
 
-    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel, llvm::Value* trig_id = nullptr);
+    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel);
 
     void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel);
 
@@ -2634,7 +2636,7 @@ private:
     void emit_event_link(llvm::Value* obj, llvm::Value* node, llvm::Value* handle,
                          llvm::Value* flag, bool record_owner = true);
 
-    void emit_event_unlink(llvm::Value* node, llvm::Value* obj = nullptr);
+    void emit_event_unlink(llvm::Value* node);
 
     Plane lower_event_triggered(llvm::Value* obj);
 
@@ -3103,7 +3105,9 @@ private:
     llvm::FunctionCallee event_detach_fire_fn();
     llvm::FunctionCallee event_detach_ready_fn();
     llvm::FunctionCallee event_new_fn();
-    llvm::FunctionCallee event_ptr_fn();
+    llvm::FunctionCallee event_new_elem_fn();
+    llvm::FunctionCallee event_timer_new_fn();
+    llvm::FunctionCallee event_timer_take_fn();
     llvm::FunctionCallee event_trig_id_fn();
     llvm::FunctionCallee run_init_fn();
 
@@ -5327,18 +5331,10 @@ private:
     // Next free static slot per (signal, edge), handed out during lowering
     // (parallels the capacities computed in build_wait_queues).
     std::vector<std::array<uint32_t, 3>>               sta_next_;
-    // The design-wide event object array (clotho.events) and its LLVM type. One
-    // slot per declared named event, plus the reserved null object at slot 0.
-    // Built in build_wait_queues; addressed by event_slot_ through event_obj().
-    llvm::GlobalVariable*                              events_gv_ = nullptr;
-    llvm::ArrayType*                                   events_arr_ty_ = nullptr;
-    // Slot of each signal's event object, or 0 for a non-event signal.
-    std::vector<uint32_t>                              event_slot_;
-    // Per signal: true when an event variable is never assigned, so it names one
-    // object for the whole run and every reference folds to a constant address.
-    std::vector<bool>                                  event_mono_;
-    // Number of event object slots, including the reserved null object at 0.
-    uint32_t                                           event_slot_count_ = 1;
+    // The object a null event handle resolves to (clotho.event_null), so that a
+    // wait on or a `.triggered` of a null handle needs no branch. Built in
+    // build_wait_queues.
+    llvm::GlobalVariable*                              event_null_gv_ = nullptr;
     // Contiguous nodes for persistent (`always @(e)`) event waiters
     // (clotho.event_nodes), one per static subscription, plus the next free index.
     // Null when the design has no persistent event waiter.

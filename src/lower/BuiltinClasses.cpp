@@ -141,13 +141,6 @@ ir::Ref Lowerer::lower_mailbox_class(const slang::ast::ClassType& clt) {
     }
     const ir::Ref elem = lower_type(mt);
     guard_container_element(mt.getCanonicalType(), elem, "mailbox message");
-    if (mt.getCanonicalType().isEvent()) {
-        // TODO: `mailbox #(event)`. rt_queue_push_back constructs the element
-        // before copying it, and an event element's construction MINTS a new
-        // object (LRM Table 6-7), which the copy then overwrites -- one leaked
-        // sync object per `put`, since event objects are never freed.
-        fail("a mailbox of events is not supported");
-    }
     ir::Type qt;
     qt.kind        = ir::Type::Kind::Queue;
     qt.element     = elem;

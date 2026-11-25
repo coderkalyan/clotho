@@ -199,10 +199,10 @@ Layout InternPool::compute_layout(Ref type) const {
             // property table `fields_id`), reached by dereferencing the handle.
             return { Domain::Two, 64, plane_bytes(64) };
         case Type::Kind::Event:
-            // A named event variable holds a handle: { u32 slot, u32 gen } naming an
-            // entry in the backend's event object array, stored as one 2-state
-            // 64-bit value. Identical storage / assign / compare to a class handle,
-            // which is what makes every container and ABI path work unchanged.
+            // A named event variable holds a handle: the address of its event
+            // object, stored as one 2-state 64-bit value. Identical storage /
+            // assign / compare to a class handle, which is what makes every
+            // container and ABI path work unchanged.
             return { Domain::Two, 64, plane_bytes(64) };
         case Type::Kind::VirtualIface:
             // A virtual interface variable holds a handle to one interface

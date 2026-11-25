@@ -2027,18 +2027,17 @@ struct Inst {
         Wait,
         // Bind a NEW event object and yield its handle (payload: none). LRM Table
         // 6-7 makes "New event" the default value of an event variable, so this is
-        // emitted wherever event storage comes into existence and no constant handle
-        // can be baked in: an automatic-lifetime local. Static storage gets its
-        // handle from the state initializer, and aggregate / container element leaves
-        // are constructed by their own init walks.
+        // emitted where event storage comes into existence in a body: an
+        // automatic-lifetime local. Static storage is bound when the design
+        // starts, and aggregate / container element leaves are constructed by
+        // their own init walks.
         EventNew,
         // Blocking trigger of a named event `-> e` (payload: unary -> the event
-        // HANDLE value, a 64-bit { slot, gen }). Resolves the handle to its event
-        // object, records the trigger time (for `.triggered`) and wakes every
-        // waiter on the object's list in the current instant (LRM 15.5.2). An event
-        // has no value, so there is no edge computation. A null handle resolves to
-        // the reserved null object, whose waiter list is always empty -- the no-op
-        // LRM 15.5.5 requires of `-> null`.
+        // HANDLE value, the 64-bit address of its object). Records the trigger
+        // time in the object (for `.triggered`) and wakes every waiter on its list
+        // in the current instant (LRM 15.5.2). An event has no value, so there is
+        // no edge computation. A null handle triggers nothing -- the no-op LRM
+        // 15.5.5 requires of `-> null`.
         EventTrigger,
         // The `e.triggered` event property (payload: unary -> the event handle),
         // -> a definite 1-bit value: 1 iff the event was triggered in the current

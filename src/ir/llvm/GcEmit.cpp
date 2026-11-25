@@ -125,10 +125,10 @@ void Backend::agg_key_handle_offsets(Ref type, uint32_t base, std::vector<uint32
         }
         return;
     }
-    if (t.kind == Type::Kind::Class) {
+    if (types::is_object_handle(mod_.pool, type)) {
         // 64-bit unsigned (InternPool.cpp:177-182), so emit_key_bytes writes exactly
         // 8 big-endian bytes here with no sign flip for the collector to undo.
-        assert(agg_key_bytes(type) == 8 && "a class handle normalizes to 8 key bytes");
+        assert(agg_key_bytes(type) == 8 && "a handle normalizes to 8 key bytes");
         out.push_back(base);
     }
 }
@@ -447,7 +447,7 @@ std::vector<uint32_t> Backend::class_handle_offsets(Ref class_ref) {
 // are still its own. An `event`-only class is precisely why the gate is per
 // property and not per leaf: collect_elem_leaves would emit an event leaf, but
 // has_heap_leaf is false for an event (TypeModel.h:179-203), so neither table
-// gets an entry.
+// gets an entry. The event's handle word is traced through `handles` instead.
 std::vector<llvm::Constant*> Backend::class_elem_leaves(Ref class_ref) {
     const Type& t = std::get<Type>(mod_.pool.get(class_ref));
     assert(t.kind == Type::Kind::Class && "a trace map describes a class body");
@@ -727,6 +727,37 @@ void Backend::emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base, 
 // scanned range (rt_gc_range_add) rather than described by offsets: it is a flat
 // staging struct of masks and planes beside the handle, and a stale word in it is
 // retention at worst, which the validation of every candidate bounds.
+//
+// Each of the three is registered by one loop over a table of its regions
+// (emit_rows), not by a call per region: a region is an instance's state, and
+// root's code must not grow with the number of instances.
+void Backend::emit_rows(const std::vector<llvm::Constant*>& rows, llvm::Type* row_ty, const char* name,
+                        llvm::function_ref<void(llvm::Value* row)> body) {
+    if (rows.empty()) {
+        return;
+    }
+    auto* i32    = b_.getInt32Ty();
+    auto* arr_ty = llvm::ArrayType::get(row_ty, rows.size());
+    auto* table  = new llvm::GlobalVariable(env_->llmod, arr_ty, /*isConstant=*/true,
+                                            llvm::GlobalValue::PrivateLinkage,
+                                            llvm::ConstantArray::get(arr_ty, rows), name);
+    auto* fn     = b_.GetInsertBlock()->getParent();
+    auto* head   = llvm::BasicBlock::Create(ctx_, "rows.head", fn);
+    auto* each   = llvm::BasicBlock::Create(ctx_, "rows.body", fn);
+    auto* done   = llvm::BasicBlock::Create(ctx_, "rows.done", fn);
+    auto* entry  = b_.GetInsertBlock();
+    b_.CreateBr(head);
+    b_.SetInsertPoint(head);
+    auto* idx = b_.CreatePHI(i32, 2);
+    idx->addIncoming(b_.getInt32(0), entry);
+    b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(static_cast<uint32_t>(rows.size()))), each, done);
+    b_.SetInsertPoint(each);
+    body(b_.CreateInBoundsGEP(arr_ty, table, { b_.getInt32(0), idx }));
+    idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+    b_.CreateBr(head);
+    b_.SetInsertPoint(done);
+}
+
 void Backend::emit_gc_root_tables() {
     const llvm::DataLayout& dl = env_->llmod.getDataLayout();
     // Anchor index -> offsets, with the root state buffer in the last bucket:
@@ -747,26 +778,34 @@ void Backend::emit_gc_root_tables() {
         signal_handle_offsets(s, static_cast<uint64_t>(off), by_region[region]);
         signal_gc_containers(s, static_cast<uint64_t>(off), cont_by_region[region]);
     }
-    uint32_t emitted = 0;
+    auto*                        ptr     = raw_ptr_ty();
+    uint32_t                     emitted = 0;
+    std::vector<llvm::Constant*> root_rows;
     for (size_t r = 0; r < by_region.size(); ++r) {
         if (by_region[r].empty()) {
             continue; // a region with no class handle needs no table
         }
         llvm::Constant* base =
           r == root_region ? sym(state_global_) : sym(anchors_[r].state_gv);
-        b_.CreateCall(gc_roots_add_fn(), { gc_roots_global(base, by_region[r], emitted++) });
+        root_rows.push_back(gc_roots_global(base, by_region[r], emitted++));
     }
     assert(emitted <= by_region.size() && "one table per region at most");
-    uint32_t cont_emitted = 0;
+    emit_rows(root_rows, ptr, "clotho.gcroots.regions", [&](llvm::Value* row) {
+        b_.CreateCall(gc_roots_add_fn(), { b_.CreateLoad(ptr, row) });
+    });
+    uint32_t                     cont_emitted = 0;
+    std::vector<llvm::Constant*> cont_rows;
     for (size_t r = 0; r < cont_by_region.size(); ++r) {
         if (cont_by_region[r].empty()) {
             continue; // a region with no handle-bearing container needs no table
         }
         llvm::Constant* base =
           r == root_region ? sym(state_global_) : sym(anchors_[r].state_gv);
-        b_.CreateCall(gc_containers_add_fn(),
-                      { gc_containers_global(base, cont_by_region[r], cont_emitted++) });
+        cont_rows.push_back(gc_containers_global(base, cont_by_region[r], cont_emitted++));
     }
+    emit_rows(cont_rows, ptr, "clotho.gccontainers.regions", [&](llvm::Value* row) {
+        b_.CreateCall(gc_containers_add_fn(), { b_.CreateLoad(ptr, row) });
+    });
     // NBA shadows that can stage a handle, one range per region that has any.
     std::vector<bool> shadow_roots(anchors_.size() + 1, false);
     for (const SignalSlot& s : slots_) {
@@ -774,14 +813,21 @@ void Backend::emit_gc_root_tables() {
             shadow_roots[s.anchor == SignalSlot::no_anchor ? root_region : s.anchor] = true;
         }
     }
+    auto* const                  range_ty = llvm::StructType::get(ctx_, { ptr, b_.getInt64Ty() });
+    std::vector<llvm::Constant*> shadow_rows;
     for (size_t r = 0; r < shadow_roots.size(); ++r) {
         llvm::GlobalVariable* shadow = r == root_region ? shadow_global_ : anchors_[r].shadow_gv;
         if (!shadow_roots[r] || shadow == nullptr) {
             continue; // no handle staged here, or only through deferred records, which are roots
         }
-        b_.CreateCall(gc_range_add_fn(),
-                      { sym(shadow), b_.getInt64(dl.getTypeAllocSize(shadow->getValueType())) });
+        shadow_rows.push_back(llvm::ConstantStruct::get(
+          range_ty, { sym(shadow), b_.getInt64(dl.getTypeAllocSize(shadow->getValueType())) }));
     }
+    emit_rows(shadow_rows, range_ty, "clotho.gcshadows.regions", [&](llvm::Value* row) {
+        b_.CreateCall(gc_range_add_fn(),
+                      { b_.CreateLoad(ptr, b_.CreateStructGEP(range_ty, row, 0)),
+                        b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(range_ty, row, 1)) });
+    });
     emit_gc_nba_queues();
     assert(cont_emitted <= cont_by_region.size() && "one container table per region at most");
 }
@@ -826,8 +872,8 @@ void Backend::emit_gc_nba_queues() {
     }
 }
 
-// The byte offsets of every class-handle word inside one signal's storage,
-// appended relative to `base` (that storage's offset in its region).
+// The byte offsets of every class- or event-handle word inside one signal's
+// storage, appended relative to `base` (that storage's offset in its region).
 void Backend::signal_handle_offsets(const SignalSlot& s, uint64_t base, std::vector<uint32_t>& out) {
     if (s.is_agg) {
         // An aggregate slot's storage_ty IS the recursive agg_storage_ty mirror,
@@ -849,10 +895,10 @@ void Backend::signal_handle_offsets(const SignalSlot& s, uint64_t base, std::vec
         assert(depth < kArrayDepthMax && "unpacked array nesting did not bottom out");
         leaf = std::get<Type>(mod_.pool.get(leaf)).element;
     }
-    if (std::get<Type>(mod_.pool.get(leaf)).kind != Type::Kind::Class) {
+    if (!types::is_object_handle(mod_.pool, leaf)) {
         return;
     }
-    assert(s.slot_ty != nullptr && "a class-handle slot has a leaf slot type");
+    assert(s.slot_ty != nullptr && "a handle slot has a leaf slot type");
     const uint64_t stride = env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty);
     const uint32_t n      = s.is_array ? s.elem_count : 1u;
     for (uint32_t k = 0; k < n; ++k) {

@@ -94,6 +94,17 @@ inline bool is_container(const InternPool& pool, Ref ref) {
     }
 }
 
+// A handle to a COLLECTED object: a class handle or a named-event handle. The
+// word is the object's address, null being 0, so everything that makes a
+// reference visible to the collector -- trace maps, root tables, element
+// descriptors, key decoding, frame registration, the write barrier -- asks this
+// one question. A chandle and a virtual interface are 64-bit words too, and are
+// not: the collector allocated neither.
+inline bool is_object_handle(const InternPool& pool, Ref ref) {
+    const Type::Kind kind = type_of(pool, ref).kind;
+    return kind == Type::Kind::Class || kind == Type::Kind::Event;
+}
+
 // -- Recursive structure --
 
 // Element count of one unpacked-array dimension.

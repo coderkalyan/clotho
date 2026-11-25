@@ -96,7 +96,8 @@ std::vector<const llvm::GlobalVariable*> leaf_types(const ElemOpsView& v, bool (
     return out;
 }
 
-// Leaves a destroy has work for: everything that owns heap. An event is never freed.
+// Leaves a destroy has work for: everything that owns heap. An event's object is
+// the collector's to free.
 bool owns_heap(uint32_t kind) {
     return kind != rt_elem_pod && kind != rt_elem_event;
 }
@@ -275,7 +276,10 @@ void Backend::emit_leaf_dispatch(const std::vector<const llvm::GlobalVariable*>&
 void Backend::emit_elem_init(const llvm::Constant* ops, llvm::Value* p) {
     const ElemOpsView v = view_of(ops);
     if (v.kind == rt_elem_event) {
-        b_.CreateStore(b_.CreateCall(event_new_fn()), p);
+        // The element form, which never collects: `p` is a slot of a container
+        // operation in progress, and what that operation has built so far is in
+        // a buffer no collection would find.
+        b_.CreateStore(b_.CreateCall(event_new_elem_fn()), p);
         return;
     }
     b_.CreateMemCpy(p, llvm::MaybeAlign(), v.proto, llvm::MaybeAlign(), v.stride);
@@ -407,8 +411,8 @@ void Backend::emit_elem_deinit(const llvm::Constant* ops, llvm::Value* p) {
         case rt_elem_pod:
             return;
         case rt_elem_event:
-            // Event objects are never freed (LRM 15.5.5.2's reclamation is the
-            // collector's, not the element's).
+            // Nothing to release: the collector reclaims an event object once no
+            // handle names it (LRM 15.5.5.2).
             return;
         case rt_elem_string:
             b_.CreateCall(str_deinit_fn(), { p });

@@ -324,6 +324,13 @@ rt_gc_mutator* rt_gc_mutator_current(void);
 void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
                   const struct rt_alloc_site* site);
 
+// rt_gc_alloc for a runtime caller that holds handles where no collection would
+// find them (a container buffer being built): it never collects, at the price
+// that the nursery budget and --gc-heap-max are only enforced by the next
+// ordinary allocation or safepoint. An object that does not fit under the
+// ceiling without a collection ends the run.
+void* rt_gc_alloc_held(uint64_t size, const rt_gc_map* map);
+
 // The out-of-line half of the inlined fast path: the current hole is exhausted,
 // so refill (next hole, then a recycled or fresh block, then a new chunk) and
 // allocate. Refreshing `cursor` / `limit` / `block_base` / `start_bitmap` /

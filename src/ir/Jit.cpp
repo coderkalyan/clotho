@@ -353,8 +353,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_cover_design_coverage", &rt_cover_design_coverage);
     expose("rt_run_init", &rt_run_init);
     expose("rt_event_new", &rt_event_new);
-    expose("rt_event_ptr", &rt_event_ptr);
+    expose("rt_event_new_elem", &rt_event_new_elem);
     expose("rt_event_trig_id", &rt_event_trig_id);
+    expose("rt_event_timer_new", &rt_event_timer_new);
+    expose("rt_event_timer_take", &rt_event_timer_take);
     expose("rt_proc_alloc", &rt_proc_alloc);
     expose("rt_proc_mark_kill", &rt_proc_mark_kill);
     expose("rt_proc_complete", &rt_proc_complete);

@@ -767,14 +767,14 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     b_.CreateCall(gc_init_fn(), { gc_config_global() });
     // Every process-global runtime pool back to power-on, before anything can
     // allocate out of one. Unconditional: build_wait_queues runs for every
-    // design and always creates clotho.events with at least the reserved null
-    // slot, and the static block has to be re-registered as the pool's chunk 0
-    // on every run because it is a JIT global that died with the previous
-    // LLJIT — init_state below already binds aggregate event leaves through it.
-    // The same seam owns the process control-block pool and the detached
-    // `->> @(x) e` subscription table, which otherwise carry a finished
-    // design's pointers and trigger ids into this one (Runtime.h:1472).
-    b_.CreateCall(run_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
+    // design and always creates the pending-chain head, whose address the
+    // runtime needs anew on every run because it is a JIT global that died with
+    // the previous LLJIT, and init_state below already allocates event objects,
+    // which need the descriptor this call builds. The same seam owns the process
+    // control-block pool and the detached `->> @(x) e` subscription table, which
+    // otherwise carry a finished design's pointers and trigger ids into this one
+    // (Runtime.h:1472).
+    b_.CreateCall(run_init_fn(), { sym(event_pend_head_gv_) });
     // The coverage model (LRM 19), before any `new` can register an instance
     // against it. Only for a design that has a covergroup: rt_cover_init would
     // otherwise be a declaration nothing needs, and the runtime treats an

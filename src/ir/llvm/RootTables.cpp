@@ -571,13 +571,13 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         }
         late_gv = table(i32, v, "clotho.seed.late");
     }
-    auto* const           event_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i32, i32 });
+    auto* const           event_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i32 });
     llvm::GlobalVariable* events_gv = nullptr;
     if (!event_subs.empty()) {
         std::vector<llvm::Constant*> v;
         for (const EventSub& e : event_subs) {
-            v.push_back(llvm::ConstantStruct::get(
-              event_ty, { e.sub.slot, e.sub.obj, b_.getInt32(e.row), b_.getInt32(e.sub.by_handle ? 1u : 0u) }));
+            v.push_back(
+              llvm::ConstantStruct::get(event_ty, { e.sub.slot, e.sub.handle, b_.getInt32(e.row) }));
         }
         events_gv = table(event_ty, v, "clotho.seed.events");
     }
@@ -742,33 +742,20 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         b_.SetInsertPoint(done);
     }
 
-    // The persistent event waiters: a node of the contiguous pool, linked onto its
-    // object's list. The object is a constant, or the one the variable's own handle names
-    // now -- after the declaration initializers ran, which can have re-pointed it.
+    // The persistent event waiters: a node of the contiguous pool, linked onto the list
+    // of the object the variable's own handle names now -- after the declaration
+    // initializers ran, which can have re-pointed it.
     if (events_gv != nullptr) {
         count_loop(static_cast<uint32_t>(event_subs.size()), "evsub", [&](llvm::Value* t) {
             llvm::Value* e = b_.CreateInBoundsGEP(event_ty, events_gv, t);
             const auto   field = [&](uint32_t f, llvm::Type* ty) { return b_.CreateLoad(ty, b_.CreateStructGEP(event_ty, e, f)); };
             llvm::Value* node = field(0, ptr_ty);
-            llvm::Value* obj  = field(1, ptr_ty);
+            llvm::Value* obj  = event_obj_of(b_.CreateLoad(i64, field(1, ptr_ty)));
             llvm::Value* row  = field(2, i32);
-            llvm::Value* by   = field(3, i32);
-            auto* const  from_handle = block("evsub.handle");
-            auto* const  have        = block("evsub.obj");
-            auto* const  entry       = b_.GetInsertBlock();
-            b_.CreateCondBr(b_.CreateICmpNE(by, b_.getInt32(0)), from_handle, have);
-            b_.SetInsertPoint(from_handle);
-            llvm::Value* named = event_obj_of(b_.CreateLoad(i64, obj));
-            auto* const  named_bb = b_.GetInsertBlock();
-            b_.CreateBr(have);
-            b_.SetInsertPoint(have);
-            auto* const o = b_.CreatePHI(ptr_ty, 2);
-            o->addIncoming(obj, entry);
-            o->addIncoming(named, named_bb);
             llvm::Value* kind = b_.CreateLoad(i32, row_field(row, 3));
             llvm::Value* wake = b_.CreateLoad(ptr_ty, row_field(row, 2));
             // A persistent subscription is never unlinked, so it needs no owner.
-            emit_event_link(o, node, sub_handle(row, kind), wake, /*record_owner=*/false);
+            emit_event_link(obj, node, sub_handle(row, kind), wake, /*record_owner=*/false);
         });
     }
     b_.CreateRetVoid();

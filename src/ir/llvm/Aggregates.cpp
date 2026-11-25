@@ -544,31 +544,13 @@ llvm::Constant* Backend::const_data_init(const SignalSlot& s, Ref const_data) {
 // is its own baked image (nothing ever writes it, so the static initializer
 // IS the value). Other arrays and string arrays are zeroinitialized (filled
 // at runtime by `init_state`); a scalar string is the empty inline handle, which
-// is all zero; a scalar plane is X
-// (4-state) or 0 (2-state) with the z word set for an undriven-net may-z seed.
+// is all zero; a declared event is null until `init_state` binds its object; a
+// scalar plane is X (4-state) or 0 (2-state) with the z word set for an
+// undriven-net may-z seed.
 llvm::Constant* Backend::slot_const(const SignalSlot& s) {
     const Ref const_data = mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data;
     if (const_data != Ref::Invalid) {
         return const_data_init(s, const_data);
-    }
-    const auto sidx = static_cast<uint32_t>(&s - slots_.data());
-    if (!event_slot_.empty() && event_slot_[sidx] != 0) {
-        // A declared event powers on holding the handle of its OWN object:
-        // `{ u32 slot, u32 gen }` with gen 0, the generation a statically-bound
-        // object keeps forever. Baked into the state initializer rather than
-        // stored at startup, so binding an event costs nothing at run time --
-        // and `-> e` in a PreInit process already sees a valid handle.
-        //
-        // A null handle is all-zero, i.e. slot 0, which is why real slots start
-        // at 1: an uninitialized or explicitly nulled event resolves to the
-        // reserved null object and its trigger is the no-op LRM 15.5.5 asks for.
-        // An event is a 2-state handle word (its layout is Domain::Two), so its slot
-        // is the native `{ i64 }`, and a handle is definite, so one word carries it.
-        assert(!s.four_state && !s.has_z);
-        const uint64_t               h = event_slot_[sidx];
-        std::vector<llvm::Constant*> fields;
-        fields.push_back(llvm::ConstantInt::get(int_ty(s.width), h));
-        return llvm::ConstantStruct::get(s.slot_ty, fields);
     }
     if (s.is_array || s.is_agg) {
         // Zeroinitialized, which is every string leaf's empty value; the runtime

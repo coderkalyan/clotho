@@ -4280,3 +4280,373 @@ TEST_CASE("gc: $strobe and $monitor arguments evaluated across emergency collect
     const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
     CHECK(ss.emergency_collections > 0u);
 }
+
+// -- Event objects (LRM 15.5.5.2) ----------------------------------------------
+//
+// An event object is collected like a class object, and the cases above already
+// cover what the two have in common: design state, class bodies, containers and
+// frames name an event through the same tables. What is particular to an event is
+// that the RUNTIME names it too, in records no table describes -- the node of a
+// parked waiter, the NBA pending chain, a `->> #d e` timer, a `->> @(x) e`
+// subscription -- and each of those later STORES into the object: an unlink, a
+// pend, a trigger stamp. So these cases drop every handle a design can hold, let
+// the collector run, and then make that store happen.
+//
+// The device is §2's filler, sized for the purpose: `Junk` is exactly as large as
+// an event object, every one `fill` allocates is kept in `held`, and `check` reads
+// all of them back. An event freed too early gives its bytes to one of them, and
+// the store that follows lands in a field `check` compares. A line is only handed
+// back when everything in it is dead, and a line holds two of these objects, so
+// each case allocates the event between two calls of `drop`, whose object nothing
+// keeps.
+//
+// The filler's values are chosen field by field, because the code under test READS
+// the object before it writes it, and a filler that reads as a pending event or as
+// a list would make that code skip its store or walk a pattern as a pointer.
+// `a` lies over the trigger tick, which every trigger stamps. `c`, `d` and `e` lie
+// over the pending-chain link, the dump index, the trigger id and the pending
+// flag, and are zero: an event at the end of the chain, not dumped, no control,
+// not pending. `b` lies over the waiter-list head, so it is zero for a case that
+// triggers (an empty list) and the pattern for a case that unlinks a waiter
+// (which stores the head).
+enum class EventStore { Trigger, Unlink };
+
+static std::string event_design(EventStore store, std::string_view body) {
+    std::string src = R"(
+        module m;
+            class Junk; longint a, b, c, d, e; endclass
+            Junk held[$];
+            int  bad;
+            function automatic Junk junk();
+                Junk j;
+                j   = new;
+                j.a = 64'h5A5A5A5A5A5A5A5A;
+                j.b = @B@;
+                return j;
+            endfunction
+            function automatic void fill(input int n);
+                for (int i = 0; i < n; i++) held.push_back(junk());
+            endfunction
+            function automatic void drop();
+                Junk j;
+                j = junk();
+            endfunction
+            function automatic void check();
+                foreach (held[i]) begin
+                    if (held[i].a != 64'h5A5A5A5A5A5A5A5A || held[i].b != @B@ ||
+                        held[i].c != 0 || held[i].d != 0 || held[i].e != 0) begin
+                        bad++;
+                    end
+                end
+            endfunction
+    )";
+    const std::string_view head = store == EventStore::Unlink ? "64'h5A5A5A5A5A5A5A5A" : "64'h0";
+    for (size_t at = src.find("@B@"); at != std::string::npos; at = src.find("@B@")) {
+        src.replace(at, 3, head);
+    }
+    src += body;
+    src += "\n        endmodule\n";
+    return src;
+}
+
+// Reclamation itself. Each call binds a new object to its automatic `event`, and
+// nothing names it once the call returns, so the live count the last collection
+// measured stays far below the number allocated.
+TEST_CASE("gc: an event object no handle names is reclaimed") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int once(input int i);
+                event e;
+                -> e;
+                return e.triggered ? i : -1;
+            endfunction
+            initial begin
+                longint s;
+                s = 0;
+                for (int i = 0; i < 4000; i++) begin
+                    #1;
+                    s += once(i);
+                end
+                $display("%0d", s);
+            end
+        endmodule
+    )";
+    const std::string expected = "7998000\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 0u);
+    CHECK(st.objects_allocated >= 4000u);
+    CHECK(st.objects_live < 64u);
+    CHECK(run_capture(src, gc_cfg(cadence_stress)) == expected);
+}
+
+// A process suspended on `@(e)` must keep `e` alive: the block's local and the node
+// it parked are both words of its frame, and nothing else names the object. The
+// `disable` then unlinks that node, which is a store into the object's list head.
+TEST_CASE("gc: an event named only by a parked waiter's frame survives until the waiter leaves") {
+    const std::string src = event_design(EventStore::Unlink, R"(
+            initial begin : waiter
+                drop();
+                begin
+                    automatic event e;
+                    drop();
+                    @(e);
+                end
+            end
+            initial begin
+                repeat (4) begin
+                    #1;
+                    fill(600);
+                end
+                disable waiter;
+                #1;
+                check();
+                $display("bad=%0d held=%0d", bad, held.size());
+            end
+    )");
+    const std::string expected = "bad=0 held=2400\n";
+    check_both_cadences(src, expected);
+    // Negative space, as for a class object in a frame: nothing precise names the
+    // event, so a run with no conservative pin never reached it.
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0u);
+    CHECK(st.conservative_pins > 0u);
+}
+
+// The same for a DECLARED event whose variable is assigned away while the waiter
+// is parked. No live value of the body is the handle: the node's record of the
+// object it is linked onto is the only reference, and the frame has to be one
+// the collector scans for it.
+TEST_CASE("gc: a declared event its variable no longer names survives while a waiter is parked on it") {
+    const std::string src = event_design(EventStore::Unlink, R"(
+            event a;
+            initial begin : waiter
+                @(a);
+            end
+            initial begin
+                drop();
+                #1;
+                a = null;
+                repeat (4) begin
+                    #1;
+                    fill(600);
+                end
+                disable waiter;
+                #1;
+                check();
+                $display("bad=%0d held=%0d", bad, held.size());
+            end
+    )");
+    const std::string expected = "bad=0 held=2400\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0u);
+    CHECK(st.conservative_pins > 0u);
+}
+
+// `->> e` leaves the object on the NBA pending chain, and the process that pended
+// it has ended, so the chain is all that names it. The collections run inside
+// `fill`, in another process and in the same time step (`#0`), before the NBA
+// region stamps and clears it. Another process, because the one that pended it
+// would still have the handle in a register.
+TEST_CASE("gc: an event awaiting its nonblocking trigger survives a collection before the NBA region") {
+    const std::string src = event_design(EventStore::Trigger, R"(
+            task automatic pend();
+                event e;
+                ->> e;
+            endtask
+            initial begin
+                #1;
+                drop();
+                pend();
+                drop();
+            end
+            initial begin
+                #1;
+                #0;
+                fill(4000);
+                #1;
+                check();
+                $display("bad=%0d held=%0d", bad, held.size());
+            end
+    )");
+    const std::string expected = "bad=0 held=4000\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.emergency_collections > 0u);
+    const rt_gc_stats ss = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+}
+
+// `->> #d e`: from the statement until the delay expires only the timer names the
+// object, and the expiry pends and then triggers it.
+TEST_CASE("gc: an event named only by its delayed nonblocking trigger survives until it fires") {
+    const std::string src = event_design(EventStore::Trigger, R"(
+            task automatic arm();
+                event e;
+                ->> #3 e;
+            endtask
+            initial begin
+                drop();
+                arm();
+                drop();
+                repeat (2) begin
+                    #1;
+                    fill(1000);
+                end
+                #5;
+                check();
+                $display("bad=%0d held=%0d", bad, held.size());
+            end
+    )");
+    const std::string expected = "bad=0 held=2000\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 0u);
+}
+
+// `->> @(posedge clk) e`: the subscription record names the object until the edge
+// comes, which pends it for that instant's NBA region.
+TEST_CASE("gc: an event named only by a detached subscription survives until its edge") {
+    const std::string src = event_design(EventStore::Trigger, R"(
+            bit clk;
+            task automatic subscribe();
+                event e;
+                ->> @(posedge clk) e;
+            endtask
+            initial begin
+                drop();
+                subscribe();
+                drop();
+                repeat (2) begin
+                    #1;
+                    fill(1000);
+                end
+                clk = 1;
+                #1;
+                check();
+                $display("bad=%0d held=%0d", bad, held.size());
+            end
+    )");
+    const std::string expected = "bad=0 held=2000\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 0u);
+}
+
+// The write barrier, for an event stored into a class property: `h` is old by the
+// time it takes the only reference to a young object, and the run is young-only,
+// so nothing but the remembered set reaches that object afterwards. The store is
+// inside a function for §7's reason: a handle in the calling process's frame would
+// be pinned and keep the object without any barrier.
+TEST_CASE("gc: a young event stored into an old object survives young collections") {
+    const std::string src = event_design(EventStore::Trigger, R"(
+            class Holder; int n; event e; endclass
+            Holder h;
+            function automatic void attach(input Holder o);
+                event f;
+                o.e = f;
+            endfunction
+            initial begin
+                h = new;
+                repeat (3) begin
+                    #1;
+                    fill(600);
+                end
+                drop();
+                attach(h);
+                drop();
+                repeat (3) begin
+                    #1;
+                    fill(600);
+                end
+                -> h.e;
+                check();
+                $display("bad=%0d held=%0d triggered=%0d", bad, held.size(), h.e.triggered);
+            end
+    )");
+    const std::string expected = "bad=0 held=3600 triggered=1\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats yg =
+      run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.collections > 1u);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
+    CHECK(yg.remembered > 0u);
+}
+
+// Events as container elements and as an associative-array key: each is the only
+// reference to its object, held in a buffer the collector reaches through the
+// container's element descriptor.
+TEST_CASE("gc: events held only as container elements and as an associative key survive") {
+    const std::string src = event_design(EventStore::Trigger, R"(
+            event q[$];
+            event d[];
+            int   keyed[event];
+            function automatic event fresh();
+                event f;
+                return f;
+            endfunction
+            initial begin
+                event k;
+                int   n;
+                drop();
+                for (int i = 0; i < 8; i++) q.push_back(fresh());
+                d = new[8];
+                keyed[fresh()] = 7;
+                drop();
+                repeat (3) begin
+                    #1;
+                    fill(600);
+                end
+                n = 0;
+                foreach (q[i]) begin
+                    -> q[i];
+                    n += q[i].triggered;
+                end
+                foreach (d[i]) begin
+                    -> d[i];
+                    n += d[i].triggered;
+                end
+                if (keyed.first(k)) begin
+                    -> k;
+                    n += k.triggered + keyed[k];
+                end
+                check();
+                $display("bad=%0d held=%0d n=%0d", bad, held.size(), n);
+            end
+    )");
+    const std::string expected = "bad=0 held=1800 n=24\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0u);
+}
+
+// An object has to be findable from the moment it exists, which is before its body
+// is initialized: binding an event property allocates, an allocation can collect,
+// and the object's only reference at that point is a register of the code that is
+// constructing it. Here every `new` collects (stress) while the previous `Big` is
+// garbage, and a `Big` fills a line, so an object the collection cannot recognize
+// has its line handed to the event that is being allocated for it.
+TEST_CASE("gc: an object survives the collection that binding its event property runs") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Big; longint pad[13]; event e; endclass
+            Big h;
+            int bad;
+            initial begin
+                for (int i = 0; i < 200; i++) begin
+                    h = new;
+                    foreach (h.pad[k]) h.pad[k] = 64'h5A5A5A5A5A5A5A5A;
+                    -> h.e;
+                    if (!h.e.triggered) bad++;
+                    foreach (h.pad[k]) if (h.pad[k] != 64'h5A5A5A5A5A5A5A5A) bad++;
+                end
+                $display("bad=%0d", bad);
+            end
+        endmodule
+    )";
+    const std::string expected = "bad=0\n";
+    const rt_gc_stats ss       = run_stats(src, expected, cadence_stress);
+    CHECK(ss.emergency_collections > 0u);
+    CHECK(run_capture(src, gc_cfg(cadence_ordinary)) == expected);
+}
