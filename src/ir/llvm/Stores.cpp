@@ -773,12 +773,16 @@ void Backend::emit_block_commit_body(uint32_t id) {
             }
         }
         // The wake a blocking store to this signal makes (edge facts, the buckets of
-        // its instance's record, `<= @e` triggers), then its dump-var touch.
-        service_wait_queue(bs.sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT);
+        // its instance's record, `<= @e` triggers), then its dump-var touch, which
+        // the Any bucket's scan may carry (service_wait_queue).
+        const int32_t fold = design_uses_vcd_ && !slot_of(bs.sig).is_array ? vcd_index_[static_cast<uint32_t>(bs.sig)]
+                                                                            : -1;
         // Mark a dumped scalar target dirty in the VCD set. Commit is
         // unconditional, so a no-change commit over-touches; the flush diff
         // suppresses it.
-        vcd_touch_signal(bs.sig);
+        if (!service_wait_queue(bs.sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT, fold)) {
+            vcd_touch_signal(bs.sig);
+        }
         if (after_hold != nullptr) {
             b_.CreateBr(after_hold);
             b_.SetInsertPoint(after_hold);

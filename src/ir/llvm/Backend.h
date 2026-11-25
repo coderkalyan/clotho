@@ -2831,8 +2831,13 @@ private:
     EdgeFacts emit_edge_bits(llvm::Value* old_m, llvm::Value* new_m, llvm::Value* old_may,
                              llvm::Value* new_may, bool need_pos, bool need_neg);
 
-    void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm,
-                            llvm::Value* old_z, llvm::Value* new_z, uint32_t path = RT_TRACE_CHG_STORE);
+    // Service `sig`'s waiters after a store; `path` is the write's kind for the
+    // trace checker. With `fold_vcd` (the signal's dump-var base) the store's
+    // dump-var touch is offered to the Any bucket's shared scan, which makes it
+    // only when the value changed (static_scan_port_fn); true when the scan took
+    // it, so the caller must not touch again.
+    bool service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm, llvm::Value* old_z,
+                            llvm::Value* new_z, uint32_t path = RT_TRACE_CHG_STORE, int32_t fold_vcd = -1);
 
     // Fire the buckets a transition's facts select.
     void service_wake_buckets(Signal sig, const EdgeFacts& f);
@@ -3107,7 +3112,18 @@ private:
         b.SetInsertPoint(cont);
     }
 
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig, const TraceCause& why);
+    // The static wake scan, emitted once per LLVM module and shape and called from
+    // every store that wakes a static bucket (service_static_queue), so a store
+    // site holds one call rather than the loop. `edge` only shapes the function
+    // when the trace checker is on, whose report names the bucket's edge; the
+    // traced form also takes the storage the writer reaches.
+    llvm::Function* static_scan_fn(bool padded, bool trig_zero, uint32_t edge);
+    // The same for a bucket reached through the signal's port: one argument, the
+    // address of the port's {base, trig, cap} triple, read in the function. With
+    // `vcd` it also takes the store's dump-var index and touches it after the scan.
+    llvm::Function* static_scan_port_fn(bool vcd, uint32_t edge);
+    void            emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig,
+                                        const TraceCause& why);
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
@@ -5300,6 +5316,17 @@ private:
     std::vector<std::string>                            dpi_scope_names_;
     ankerl::unordered_dense::map<std::string, uint32_t> dpi_scope_index_;
     std::vector<int32_t>  vcd_index_;
+    // The shared scans (static_scan_fn, static_scan_port_fn) per LLVM module and shape.
+    std::map<std::tuple<llvm::Module*, bool, bool, uint32_t>, llvm::Function*> static_scan_fns_;
+    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*>       static_scan_port_fns_;
+    // The dump-var touch of the store being serviced, while service_wait_queue
+    // offers it to the Any bucket's scan; `taken` once a scan carries it.
+    struct VcdFold {
+        Signal  sig;
+        int32_t base  = -1;
+        bool    taken = false;
+    };
+    std::optional<VcdFold> vcd_fold_;
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
