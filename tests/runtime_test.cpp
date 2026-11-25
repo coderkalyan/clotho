@@ -763,3 +763,60 @@ TEST_CASE("svdpi open array: descending bounds normalize the element index") {
 // The element pack/unpack marshal (any width, 2-state / 4-state, x/z, z-elided
 // slots) is emitted inline as LLVM IR at the DPI call site, so it is exercised
 // end-to-end against verilator in dpi_test.cpp rather than unit-tested here.
+
+// -- What the link gives the runtime ------------------------------------------
+//
+// The C library's memory and string functions are the ones this binary runs and the
+// ones it hands to generated code (ir/Jit.cpp exposes &std::memset and the rest). An
+// archive that defines the same names takes them over for the whole program, with no
+// link error: a definition in a linked object beats one in a shared library even when
+// it is weak. libsva's bundled compiler-rt did exactly that, and every `new` zeroed
+// its object with a byte loop.
+//
+// Checked where the C library is a shared object, which is where a second definition
+// wins quietly. An address-sanitized build is left out: the sanitizer's interceptors
+// carry these names on purpose.
+#if defined(__SANITIZE_ADDRESS__)
+#define CLOTHO_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CLOTHO_TEST_ASAN 1
+#endif
+#endif
+
+#if defined(__linux__) && defined(__GLIBC__) && !defined(CLOTHO_TEST_ASAN)
+#include <dlfcn.h>
+
+namespace {
+
+void in_this_binary() {}
+
+// The base of the object `address` is in, or null.
+const void* object_of(const void* address) {
+    Dl_info info{};
+    return dladdr(address, &info) != 0 ? info.dli_fbase : nullptr;
+}
+
+} // namespace
+
+TEST_CASE("link: the C library's memory and string functions are not replaced") {
+    const void* const here = object_of(reinterpret_cast<const void*>(&in_this_binary));
+    REQUIRE(here != nullptr);
+    // Through volatile pointers, so each address is the one a call would reach rather
+    // than something the compiler knows about the name.
+    void* (*volatile set)(void*, int, std::size_t)                 = &std::memset;
+    void* (*volatile copy)(void*, const void*, std::size_t)        = &std::memcpy;
+    void* (*volatile move)(void*, const void*, std::size_t)        = &std::memmove;
+    int (*volatile compare)(const void*, const void*, std::size_t) = &std::memcmp;
+    std::size_t (*volatile length)(const char*)                    = &std::strlen;
+    const void* const found[] = {
+        object_of(reinterpret_cast<const void*>(set)),  object_of(reinterpret_cast<const void*>(copy)),
+        object_of(reinterpret_cast<const void*>(move)), object_of(reinterpret_cast<const void*>(compare)),
+        object_of(reinterpret_cast<const void*>(length)),
+    };
+    for (const void* const object : found) {
+        CHECK(object != nullptr);
+        CHECK(object != here);
+    }
+}
+#endif
