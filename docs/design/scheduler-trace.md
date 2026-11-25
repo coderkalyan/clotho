@@ -3,7 +3,11 @@
 Status: phase 1 landed (2026-11-25): `spawn`, `park`, `wake`, `dispatch`, `resume`, `end`
 and `slot`, the control table, and the R5 checks (wake, dispatch, resume, end), in
 `src/runtime/TraceCheck.cpp`; `region`, `nba`, `pend`, `trigger`, `finish` and `change` events
-and their rules are phases 2-4. Step 3 of the plan in
+and their rules are phases 2-4. Measured at landing (Debug, extra asserts, `ctest -j2`, one
+run each at load ~11): 268 s with the checker, 290 s with `CLOTHO_NO_TRACE_CHECK=1`, no
+violation in 114 test files; a Release build without extra asserts has no `rt_trace` symbol.
+Reintroducing B51 locally is reported as R5.1 at t=3; `p.kill()` of an always parked at its
+static control (S1 x R23) is not reported, because the force wake is a legal wake. Step 3 of the plan in
 `scheduler-rules.md` §1. R, S and B ids are that document's §3, §2 and §4, and its caveat
 applies: no rule is checked against the LRM text, and clauses are cited only as the code
 and `docs/LRM_NOTES.md` cite them.

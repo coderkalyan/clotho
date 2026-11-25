@@ -1195,7 +1195,12 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
         // process would flush on exit but a host that keeps running would not.
         std::fflush(nullptr);
     }
-    g_run_status = halt == Halt::Interrupt ? kInterruptedStatus : (traced ? kTraceViolationStatus : (g_fatal_seen ? 1 : 0));
+    g_run_status = halt == Halt::Interrupt ? kInterruptedStatus : (g_fatal_seen ? 1 : 0);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (traced && halt != Halt::Interrupt) {
+        g_run_status = kTraceViolationStatus;
+    }
+#endif
     g_diag_wheel = nullptr;
     sim_teardown();
 }
