@@ -27,10 +27,8 @@ two-activation, `#0`, fork-child and action-block cases.
 
 Still refused, and now only ever for one reason: a target whose body can park
 where the abort cannot claim the park — a TIME-CONSUMING task call (one that forks
-included) or an `expect` — and `disable fork` / `wait fork`, which need the enumerable
-live-descendant set fork owes and which no `disable` work can supply. The 9.7
-`process` class is a separate feature behind the same std-package guard as
-`semaphore` and `mailbox`.
+included) or an `expect`. `disable fork` and `wait fork` landed with the 9.7 `process`
+class (V3, below; `docs/design/process-class.md`).
 
 **What V2 cost, against what this document long assumed.** The epilogue is why the
 task target was cheap: LRM 9.6.2 says a disabled task's caller resumes at the
@@ -380,9 +378,10 @@ it was parked in, so the entry would otherwise wake it later at an unrelated
 suspend point.
 
 The parks V2a does NOT support are refused in the frontend by walking the target
-block's body (`hard_park`): a `#0` or a runtime-valued delay (the inactive batch has
-no per-entry claim), a task call or a fork (the process is parked behind another
-activation's completion, which would resume it a second time), and an `expect`.
+block's body (`hard_park`): a time-consuming task call or a fork in a callee (the
+process is parked behind another activation's completion, which would resume it a
+second time), and an `expect`. A `#0` or a runtime-valued delay was refused here until
+the batch park marked itself scheduled (V2b).
 
 Consequences worth stating plainly:
 

@@ -559,7 +559,7 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
         // A fork inside a named block parks its parent at the join, but its children are
         // activations of the block too (build_fork_child) and end with it, so the join
         // is released by them: not a park the abort cannot claim.
-        if (hard_park(*body, /*forked_children_are_occupants=*/true)) {
+        if (hard_park(*body)) {
             disable_hard_.insert(sym);
         }
     }
@@ -594,7 +594,7 @@ void Lowerer::register_disable_target(const Symbol* t, bool remote) {
         // (build_fork_child) and end with it, releasing the join.
         const auto& sub = t->as<SubroutineSymbol>();
         disable_remote_.insert(t);
-        if (hard_park(sub.getBody(), /*forked_children_are_occupants=*/true)) {
+        if (hard_park(sub.getBody())) {
             disable_hard_.insert(t);
         }
         return;
@@ -723,21 +723,15 @@ bool Lowerer::design_virtual_parks(slang::ast::Compilation& comp) {
 // buckets on resume, and a `#0`'s batch entry is the one wake it will get. The
 // rest are not, each for its own reason -- a TIME-CONSUMING task call parks the
 // process behind ANOTHER activation's completion, which would resume it a second
-// time, and so does a fork that is not the body's own (a callee's); an `expect`
-// parks on a reactive verdict. A fork in the body itself parks it only behind
-// children that are activations of the target, so it is hard only when
-// `forked_children_are_occupants` is false. Refused rather than silently
-// double-woken.
-bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupants) {
+// time, and so does a fork in a callee; an `expect` parks on a reactive verdict. A
+// fork in the body itself is not a park of this kind: it parks the process only
+// behind children that are activations of the target, which release the join.
+// Refused rather than silently double-woken.
+bool Lowerer::hard_park(const Statement& body) {
     struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
         Lowerer* self         = nullptr;
         bool     found        = false;
-        bool     fork_is_hard = true;
 
-        void handle(const BlockStatement& s) {
-            found = found || (fork_is_hard && s.blockKind != StatementBlockKind::Sequential);
-            visitDefault(s);
-        }
         void handle(const slang::ast::ConcurrentAssertionStatement& s) {
             // Only `expect` parks the executing process; the other concurrent
             // forms are their own monitor process.
@@ -764,8 +758,7 @@ bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupant
         }
     };
     Park p;
-    p.self         = this;
-    p.fork_is_hard = !forked_children_are_occupants;
+    p.self = this;
     body.visit(p);
 
     return p.found;

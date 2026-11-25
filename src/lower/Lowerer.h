@@ -2499,7 +2499,7 @@ private:
 
     void join_disable_targets();
 
-    bool hard_park(const Statement& body, bool forked_children_are_occupants = false);
+    bool hard_park(const Statement& body);
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
@@ -5724,10 +5724,10 @@ private:
     // Whether any user virtual task of the design can park (design_virtual_parks); computed on
     // first use.
     std::optional<bool> design_virtual_parks_;
-    // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
-    // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
-    // hard_park. The remote form refuses one, the lexical form does not care -- it
-    // never leaves a park behind.
+    // Named blocks and tasks whose body can park in a way the abort cannot claim (a
+    // time-consuming task call, a fork in a callee, an `expect`); see hard_park. The
+    // remote form refuses one, the lexical form does not care -- it never leaves a
+    // park behind.
     ankerl::unordered_dense::set<const Symbol*> disable_hard_;
     // Memoized "calling this can suspend the caller", see subroutine_parks.
     ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_parks_;
