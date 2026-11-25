@@ -1,0 +1,18 @@
+# Test cases whose designs run differently under a backend gate (CLOTHO_CONFIG_MATRIX=1,
+# docs/VERIFICATION.md, "Detectors") and are understood. Read by tests/ConfigMatrix.h: a
+# listed test case is not failed for a difference, and a run in which a listed test case
+# passes without any of its designs differing fails, so an entry is deleted when its cause
+# is gone.
+#
+# One entry per line: <category> "<doctest test case name>" <reason, to end of line>
+# This is the format of .github/scripts/sv-tests-known.txt, but for the quotes a test case
+# name needs because it has spaces. A test case with several designs is listed once.
+#
+#   race   The design's output depends on an order the LRM leaves open (4.7), and a gate
+#          (fuse, comb_fuse, thunk, regions, ...) legitimately picks another. Names the
+#          processes that race and the variant that differs. A design must not rely on it.
+#   bug    A real Clotho bug: the gate changes what the design observes although the LRM
+#          fixes the output. One line says what differs; the bug is not fixed yet.
+#
+# The wording of LRM clauses cited here is not yet checked against the LRM text.
+

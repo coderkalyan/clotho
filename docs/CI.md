@@ -27,6 +27,11 @@ push runs them; the other platforms test the shipped configuration.
 linux-x64-sanitize adds `CLOTHO_SANITIZE` (ASan and UBSan) on top of the
 extra asserts.
 
+The config matrix (`CLOTHO_CONFIG_MATRIX=1`, docs/VERIFICATION.md) is not run in
+CI: it runs every design the suite lowers once per backend gate in a process of its
+own, which multiplies the suite's time. Run it locally before changing a gate or the
+scheduler's wake paths.
+
 ## sv-tests
 
 Nightly, and on `workflow_dispatch` with `sv_tests` set, the `sv-tests` job runs
