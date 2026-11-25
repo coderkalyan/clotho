@@ -277,20 +277,30 @@ TEST_CASE("string and null parameters fold") {
     CHECK(run_capture(src) == "abc 3 1 1\n");
 }
 
-// What still has no constant-table form: an associative array whose key type is
-// a wildcard (no declared type to intern the key against, and the runtime keys
-// on the byte span), and a container whose element is itself an aggregate (one
-// entry op carries one value, not an lvalue to build into).
-TEST_CASE("constant tables with no representable form are rejected") {
-    constexpr std::string_view wildcard = R"(
+// Oracle: LRM 7.8.1 as recorded at lower_assoc_key — a wildcard [*] key names
+// its entry by numeric value alone, so keys written at different widths that
+// denote one value find one entry, and a missing key reads the default.
+TEST_CASE("wildcard-index constant table is keyed by value") {
+    constexpr std::string_view src = R"(
         module t;
-            localparam int A[*] = '{1:10};
-            int k;
-            initial begin k = 1; $display("%0d", A[k]); end
+            localparam int A[*] = '{4'd3:10, 8'd5:20, default:-1};
+            int          k;
+            logic [15:0] w;
+            initial begin
+                k = 3;     $write("%0d ", A[k]);
+                w = 16'd5; $write("%0d ", A[w]);
+                k = 5;     $write("%0d ", A[k]);
+                k = 7;     $write("%0d ", A[k]);
+                $display("%0d", A.num());
+            end
         endmodule
     )";
-    CHECK(reject(wildcard).find("wildcard index") != std::string::npos);
+    CHECK(run_capture(src) == "10 20 20 -1 2\n");
+}
 
+// What still has no constant-table form: a container whose element is itself
+// an aggregate (one entry op carries one value, not an lvalue to build into).
+TEST_CASE("constant tables with no representable form are rejected") {
     constexpr std::string_view agg_value = R"(
         typedef struct { int a; } s_t;
         module t;

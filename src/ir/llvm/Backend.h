@@ -1449,9 +1449,9 @@ private:
 
     uint64_t dynarr_stride(const DynElem& e);
 
-    // The %p / == runtime descriptor of a queue / dynamic-array container: the
+    // The %p runtime descriptor of a queue / dynamic-array container: the
     // element format facts (kind 0 int / 1 real / 2 string, plane layout) plus
-    // the container flavor. Shared by rt_container_format_p and rt_container_eq.
+    // the container flavor. Used by rt_container_format_p.
     struct ContainerFmt {
         int32_t  is_queue  = 0;
         int32_t  kind      = 0;
@@ -4053,8 +4053,7 @@ private:
     bool design_uses_vcd() const;
 
     // Any StrobePend instruction anywhere in the design (a process body, or a
-    // task body it calls — $strobe is legal in either, never in a plain
-    // function)? Scans functions too.
+    // task or function it calls)? Scans functions too.
 
     // Any Observed-region report source in the design? Gates the per-instant
     // Observed-region flush (see emit_active_run). Currently a unique/priority
@@ -4435,11 +4434,13 @@ private:
 
     LValue tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx);
 
-    Plane emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e);
+    Plane emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e, AggEqMode mode);
 
-    bool agg_eq_four(Ref type);
+    Plane emit_assoc_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, AggEqMode mode);
 
-    Plane lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type);
+    bool agg_eq_four(Ref type, AggEqMode mode);
+
+    Plane lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type, AggEqMode mode);
 
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool four);
 

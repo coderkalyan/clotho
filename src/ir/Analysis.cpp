@@ -159,8 +159,9 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::StoreNbDelay:
         case Inst::Tag::StoreInertialDelay:
         case Inst::Tag::StoreNbEvent:
-        // $strobe's pending record is likewise anchored on the coroutine, and a
-        // reactive pend ramps its action block through that same record ABI.
+        // $strobe's pended body is ramped from the process's own thread state
+        // (proc_arg, callee_home), and a reactive pend ramps its action block the
+        // same way.
         case Inst::Tag::StrobePend:
         case Inst::Tag::ReactivePend:
         // An `expect` is a suspension point (ExpectWait) and its wake pushes onto

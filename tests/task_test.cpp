@@ -709,6 +709,237 @@ TEST_CASE("disable of an enclosing block inside a task leaves that block") {
     )") == "t done at 5\n");
 }
 
+// LRM 9.6.2 ends "all activities enabled within the named block" (docs/design/disable.md), and
+// the children a task forks are activity enabled within it, so they are activations of the
+// task's target and end with it.
+// A task whose body forked was refused ("the abort cannot claim that park") because the join
+// parks it behind its children; they now end with it and release the join. Each case parks the
+// task, or leaves a child running, where the `disable` lands. Oracle: iverilog 13.
+TEST_CASE("disable of a task ends the children it forked, whatever the join kind") {
+    SUBCASE("parked at a join") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        #10 $display("child a at %0t", $time);
+                        #20 $display("child b at %0t", $time);
+                    join
+                    $display("never after join");
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                    #30 $display("end at %0t", $time);
+                end
+                initial #5 disable t;
+            endmodule
+        )") == "t returned at 5\nend at 35\n");
+    }
+    SUBCASE("past a join_any, with a sibling still running") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        #10 $display("child a at %0t", $time);
+                        #20 $display("child b at %0t", $time);
+                    join_any
+                    $display("join_any done at %0t", $time);
+                    #100 $display("never after delay");
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                    #30 $display("end at %0t", $time);
+                end
+                initial #15 disable t;
+            endmodule
+        )") == "child a at 10\njoin_any done at 10\nt returned at 15\nend at 45\n");
+    }
+    SUBCASE("past a join_none, with the task still running") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        #10 $display("child a at %0t", $time);
+                    join_none
+                    $display("forked at %0t", $time);
+                    #20 $display("never after delay");
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                    #30 $display("end at %0t", $time);
+                end
+                initial #5 disable t;
+            endmodule
+        )") == "forked at 0\nt returned at 5\nend at 35\n");
+    }
+    // The child outlives the activation that forked it and is still activity enabled within
+    // the task, as a join_none child of a named block is.
+    SUBCASE("a join_none child after the task has returned") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        #10 $display("child a at %0t", $time);
+                    join_none
+                    $display("forked at %0t", $time);
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                    #30 $display("end at %0t", $time);
+                end
+                initial #5 disable t;
+            endmodule
+        )") == "forked at 0\nt returned at 0\nend at 30\n");
+    }
+    SUBCASE("a grandchild of a nested fork") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        begin
+                            fork
+                                #10 $display("grandchild at %0t", $time);
+                            join
+                            $display("never after inner join");
+                        end
+                    join
+                    $display("never after join");
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                    #30 $display("end at %0t", $time);
+                end
+                initial #5 disable t;
+            endmodule
+        )") == "t returned at 5\nend at 35\n");
+    }
+    SUBCASE("parked at wait fork") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        #10 $display("child at %0t", $time);
+                    join_none
+                    wait fork;
+                    $display("never after wait fork");
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                    #30 $display("end at %0t", $time);
+                end
+                initial #5 disable t;
+            endmodule
+        )") == "t returned at 5\nend at 35\n");
+    }
+    SUBCASE("a child parked on a #0 before its delay") {
+        CHECK(run_capture(R"(
+            module m;
+                task t;
+                    fork
+                        begin #0; #10 $display("child at %0t", $time); end
+                    join
+                    $display("never after join");
+                endtask
+                initial begin
+                    t;
+                    $display("t returned at %0t", $time);
+                end
+                initial #5 disable t;
+            endmodule
+        )") == "t returned at 5\n");
+    }
+}
+
+// A forked child naming its own task is LRM 9.6.2 example 4 from inside the fork: the child
+// is an activation of the task, the running one the force-wake skips, so it has to end itself
+// as the task body does. Left running, it would print "never after disable". Oracle: iverilog 13.
+TEST_CASE("a child forked by a task disabling that task ends itself, its siblings and the task") {
+    CHECK(run_capture(R"(
+        module m;
+            task t;
+                fork
+                    begin
+                        #5 disable t;
+                        $display("never after disable");
+                    end
+                    #10 $display("sibling never at %0t", $time);
+                join
+                $display("never after join");
+            endtask
+            initial begin
+                t;
+                $display("t returned at %0t", $time);
+                #30 $display("end at %0t", $time);
+            end
+        endmodule
+    )") == "t returned at 5\nend at 35\n");
+}
+
+// Two activations of an automatic task, each parked at the join of its own fork: one `disable`
+// ends both, children included (LRM 9.6.2, "all activations"). The callers resume in the same
+// instant, so they are told apart by time. Oracle: iverilog 13.
+TEST_CASE("disable of a task ends the forked children of every activation") {
+    CHECK(run_capture(R"(
+        module m;
+            task automatic t(input integer id);
+                fork
+                    #10 $display("child of %0d at %0t", id, $time);
+                join
+                $display("never %0d", id);
+            endtask
+            initial begin
+                t(1);
+                #1 $display("caller 1 back, now %0t", $time);
+            end
+            initial begin
+                #1 t(2);
+                #2 $display("caller 2 back, now %0t", $time);
+            end
+            initial #5 disable t;
+        endmodule
+    )") == "caller 1 back, now 6\ncaller 2 back, now 7\n");
+}
+
+// A task target is per instance, and so is the child's link onto it: disabling u1.t leaves
+// u2's activation and its child alone. Oracle: iverilog 13.
+TEST_CASE("disable of one instance's forking task leaves the other instance's") {
+    CHECK(run_capture(R"(
+        module sub;
+            task t;
+                fork
+                    #10 $display("%m child at %0t", $time);
+                join
+                $display("%m join done at %0t", $time);
+            endtask
+            initial t;
+        endmodule
+        module top;
+            sub u1();
+            sub u2();
+            initial #5 disable u1.t;
+        endmodule
+    )") == "top.u2.t child at 10\ntop.u2.t join done at 10\n");
+}
+
+// Still refused: the children of a fork in a CALLEE are not activations of the task, and the
+// caller parks behind that callee's activation.
+TEST_CASE("disable of a task that calls a forking task is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            task inner; fork #5; join endtask
+            task outer; inner(); endtask
+            initial outer;
+            initial #1 disable outer;
+        endmodule
+    )";
+    CHECK(reject(src).find("cannot claim that park") != std::string::npos);
+}
+
 // A nonblocking assignment to a module signal from inside a task stages into the
 // signal's shadow and commits in the caller instant's NBA region: the old value is
 // still visible immediately after the call, the new value one delta later (LRM

@@ -25,12 +25,10 @@ LRM 16.4.4's outermost-scope flush lands with them, lexically and remotely, as a
 1, 2, 3 (both readings), 4 and 5, plus the stale-timer, always-re-arm, two-instance,
 two-activation, `#0`, fork-child and action-block cases.
 
-Still refused, and now only ever for one reason plus fork: a target whose body can
-park where the abort cannot claim the park — a TIME-CONSUMING task call, a fork, or
-an `expect` — and `disable fork` / `wait fork`, which need the enumerable
-live-descendant set fork owes and which no `disable` work can supply. The 9.7
-`process` class is a separate feature behind the same std-package guard as
-`semaphore` and `mailbox`.
+Still refused, and now only ever for one reason: a target whose body can park
+where the abort cannot claim the park — a TIME-CONSUMING task call (one that forks
+included) or an `expect`. `disable fork` and `wait fork` landed with the 9.7 `process`
+class (V3, below; `docs/design/process-class.md`).
 
 **What V2 cost, against what this document long assumed.** The epilogue is why the
 task target was cheap: LRM 9.6.2 says a disabled task's caller resumes at the
@@ -380,9 +378,10 @@ it was parked in, so the entry would otherwise wake it later at an unrelated
 suspend point.
 
 The parks V2a does NOT support are refused in the frontend by walking the target
-block's body (`hard_park`): a `#0` or a runtime-valued delay (the inactive batch has
-no per-entry claim), a task call or a fork (the process is parked behind another
-activation's completion, which would resume it a second time), and an `expect`.
+block's body (`hard_park`): a time-consuming task call or a fork in a callee (the
+process is parked behind another activation's completion, which would resume it a
+second time), and an `expect`. A `#0` or a runtime-valued delay was refused here until
+the batch park marked itself scheduled (V2b).
 
 Consequences worth stating plainly:
 
@@ -882,6 +881,12 @@ Landed with V2b, in `tests/task_test.cpp` and `tests/loop_test.cpp`:
 - **A remote 16.4.4 flush**, with the un-disabled counterpart proving the report
   would otherwise have matured.
 - **An assertion action block as the disabler.**
+- **A task that forks**, in `tests/task_test.cpp`: the activation parked at a `join`,
+  past a `join_any` with a sibling running, past a `join_none` and still running, at
+  a `wait fork`, with a nested fork's grandchild, and with a child parked behind a
+  `#0`; a `join_none` child outliving the activation that forked it; a child
+  disabling the enclosing task; two activations; and two instances. Each is
+  oracle-matched against iverilog 13.
 
 Owed by whoever takes the rest:
 
@@ -917,6 +922,20 @@ child's own `disable` of one of these blocks marks the others and ends itself
 (`DisableAbort`). A fork whose children are all in one target no longer counts as a park
 the abort cannot claim (`hard_park`), since they release the join.
 
+A task is the same: a `fork` directly in the body of a task some `disable` names makes
+every child an activation of the task's target. `build_task` records the target id in
+`FnCtx::disable_target`, and `build_fork_child` copies it into the child's own context
+(so a fork nested in a child inherits it) and puts it first in the child's
+`fork_targets`, ahead of the blocks. The backend needs nothing new: the child's ramp
+links it onto the task's list like any other target, so one `disable` of the task
+marks the activation parked at the `join` / `join_any` / `wait fork`, every child still
+running, and the `join_none` children that outlive the activation that forked them, and
+it does so for every activation of the task. Oracle: iverilog 13, which ends the
+children with the task in each of those shapes. A child's `disable` of the enclosing
+task is a self-disable like the task body's own, so `lower_disable` tests
+`FnCtx::disable_target` rather than `FnCtx::sym`, which is null in a child.
+
 Still refused, with a TODO: a target with forked children that parks behind a
-time-consuming call or an `expect`, and a block whose body calls a subroutine that forks
-(those children are built outside the block).
+time-consuming call or an `expect`, and a block or task whose body calls a subroutine
+that forks (those children are built outside it, and the call is a park the abort
+cannot claim).

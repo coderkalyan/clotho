@@ -1986,7 +1986,10 @@ void Lowerer::expand_p_arg(const Expression& arg, std::string& frag, std::vector
         expand_p_scalar(lower_expr(arg, b), sty, frag, args, b, l);
         return;
     }
-    expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
+    // An indexed slice of an unpacked array has no storage-anchored sub-array to
+    // walk (its first position is a runtime value), so lower_array_operand copies
+    // it into a temp first; every other operand is its own lvalue.
+    expand_p_lvalue(lower_array_operand(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
 }
 
 // The Scope side of a union type, whose members carry the names and payload
@@ -2572,7 +2575,8 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                            std::vector<ir::FmtArg>&           args,
                            ir::Builder&                       b,
                            char                               default_conv,
-                           std::string_view                   lead_text) {
+                           std::string_view                   lead_text,
+                           bool                               monitor) {
     // Conversions (lowercase) of specifiers seen but not yet matched to a value
     // arg, in order (FIFO). Needed so a `%t` argument can be scaled to ticks and a
     // string object checked against %s. A conversion that brings its own argument
@@ -2608,6 +2612,13 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
         if (lit->kind == ExpressionKind::StringLiteral && next >= pending.size()) {
             append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending, b);
         } else {
+            // A monitor ignores a change of the time functions alone (LRM 21.2.2),
+            // and only a bare call is one: `$time + 1` is an ordinary expression.
+            bool is_time = false;
+            if (monitor && lit->kind == ExpressionKind::Call && lit->as<CallExpression>().isSystemCall()) {
+                const std::string_view callee = lit->as<CallExpression>().getSubroutineName();
+                is_time                       = callee == "$time" || callee == "$stime" || callee == "$realtime";
+            }
             const bool str  = is_string_expr(*arg);
             const bool fl   = arg->type->isFloating();
             char       conv = str ? 's' : (fl ? 'g' : default_conv);
@@ -2630,7 +2641,11 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                 // token. The leaf args are pushed here, in the same order the
                 // spliced specs appear, so positional matching stays correct.
                 std::string frag;
+                const size_t first = args.size();
                 expand_p_arg(*arg, frag, args, b);
+                for (size_t k = first; k < args.size(); ++k) {
+                    args[k].is_time = is_time;
+                }
                 const auto [pos, len] = find_p_spec(fmt);
                 if (pos != std::string::npos) {
                     fmt.replace(pos, len, frag);
@@ -2689,7 +2704,7 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                 v        = scale_to_ticks(*arg, v, b);
                 v_signed = fl || arg->type->isSigned();
             }
-            args.push_back({ v, v_signed });
+            args.push_back({ v, v_signed, is_time });
         }
     }
     bind();
@@ -2772,15 +2787,6 @@ void Lowerer::lower_display(const CallExpression& call, bool newline, ir::Builde
 // occurred for that simulation time, just before simulation time is
 // advanced"). The call site just pends that task.
 void Lowerer::lower_strobe(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
-    if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-        // The deferred body is ramped through the caller's task-call record
-        // slot, and record_slot() anchors on coro_begin_ -- a plain function
-        // is not a coroutine and has neither. (The clock itself is reachable
-        // here: the wheel is a global, so $time in a function works.)
-        // TODO: a record slot for a non-coroutine body would lift this.
-        fail("$strobe inside a function is not supported (no record slot to ramp "
-             "the deferred body)");
-    }
     const ir::FunctionId fid =
       build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/false);
     b.strobe_pend(fid, loc(call));
@@ -2788,14 +2794,11 @@ void Lowerer::lower_strobe(const CallExpression& call, ir::Builder& b, char defa
 
 // Lower $monitor / $monitorb/o/h and $fmonitor (LRM 21.2.2): register a single
 // persistent monitor. Unlike $strobe (fire-once), the monitor body re-runs at
-// the Postponed region of EVERY subsequent time step and prints only when its
-// rendered output changed (runtime change-detection, rt_monitor_emit). A new
+// the Postponed region of EVERY subsequent time step and prints only when an
+// argument value changed, a bare $time / $stime / $realtime argument excepted
+// (runtime change-detection, rt_monitor_emit). A new
 // $monitor replaces the previous; $monitoron/$monitoroff enable/disable.
 void Lowerer::lower_monitor(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
-    if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-        fail("$monitor inside a function is not supported (no record slot to ramp "
-             "the deferred body)");
-    }
     const ir::FunctionId fid =
       build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/true);
     b.monitor_set(fid, loc(call));

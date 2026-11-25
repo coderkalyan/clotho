@@ -244,16 +244,56 @@ extern "C" void* rt_monitor_active_record() {
     return g_monitor.record;
 }
 
+namespace {
+
+// rt_arg flags bit 3: a bare $time / $stime / $realtime call.
+constexpr uint32_t kArgTime = 8;
+
+// The bytes that identify the values of every argument except the time calls, in
+// argument order: what $monitor compares from one time step to the next. A value
+// is its planes (a real its bit pattern, a string its characters), so two values
+// that print alike but differ, such as a %c of a vector whose high bits changed,
+// differ here too.
+std::string monitor_key_image(uint32_t argc, const rt_arg* argv) {
+    std::string key;
+    for (uint32_t k = 0; k < argc; ++k) {
+        const rt_arg& a = argv[k];
+        if ((a.flags & kArgTime) != 0) {
+            continue;
+        }
+        if ((a.flags & 2u) != 0) {
+            const auto*    s   = reinterpret_cast<const rt_string*>(a.val);
+            const uint64_t len = str_len(s);
+            key.append(reinterpret_cast<const char*>(&len), sizeof len);
+            key.append(str_data(s), len);
+        } else if ((a.flags & 4u) != 0) {
+            key.append(reinterpret_cast<const char*>(a.val), sizeof(uint64_t));
+        } else {
+            const size_t bytes = size_t{ plane_words(a.width) } * sizeof(uint64_t);
+            key.append(reinterpret_cast<const char*>(a.val), bytes);
+            key.append(reinterpret_cast<const char*>(a.xz), bytes);
+            key.append(reinterpret_cast<const char*>(a.z), bytes);
+        }
+    }
+    return key;
+}
+
+} // namespace
+
+// $monitor's print (LRM 21.2.2): a monitor prints when an argument other than
+// $time, $stime or $realtime changes value, and once when it is armed or
+// re-enabled (`primed`). Change is a change of value, not of rendered text.
 extern "C" void rt_monitor_emit(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {
     io_ensure_init();
-    std::string out;
-    render(out, fmt, argc, argv);
-    if (g_monitor.primed && out == g_monitor.last) {
-        return; // no argument changed this time step
+    std::string key = monitor_key_image(argc, argv);
+    if (g_monitor.primed && key == g_monitor.last) {
+        return;
     }
     g_monitor.primed = true;
-    g_monitor.last   = std::move(out);
-    write_raw(desc, g_monitor.last);
+    g_monitor.last   = std::move(key);
+    std::string out;
+    render(out, fmt, argc, argv);
+    write_raw(desc, out);
 }
 
 extern "C" void rt_strobe_pend(void* handle) {

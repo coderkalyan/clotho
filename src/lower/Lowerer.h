@@ -1625,13 +1625,15 @@ private:
 
     ir::Index lower_packed_pattern(const Expression& expr, ir::Builder& b);
 
-    ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b, ir::SourceLoc l);
+    ir::Index lower_agg_eq_operand(const Expression& e, ir::Builder& b);
 
-    void guard_agg_eq_members(ir::Ref type);
+    ir::Index lower_struct_eq(const Expression& lhs,
+                              const Expression& rhs,
+                              ir::AggEqMode     mode,
+                              ir::Builder&      b,
+                              ir::SourceLoc     l);
 
-    bool case_eq_matches_logical(ir::Ref type) const;
-
-    bool assoc_value_may_carry_xz(ir::Ref type) const;
+    void guard_agg_eq_members(ir::Ref type, ir::AggEqMode mode);
 
     static const Expression& unwrap_conversion(const Expression& e);
 
@@ -2499,7 +2501,7 @@ private:
 
     void join_disable_targets();
 
-    bool hard_park(const Statement& body, bool forked_children_are_occupants = false);
+    bool hard_park(const Statement& body);
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
@@ -3991,7 +3993,8 @@ private:
                       std::vector<ir::FmtArg>&           args,
                       ir::Builder&                       b,
                       char                               default_conv = 'd',
-                      std::string_view                   lead_text    = {});
+                      std::string_view                   lead_text    = {},
+                      bool                               monitor      = false);
 
     static char display_radix(std::string_view name, std::string_view base);
 
@@ -4683,32 +4686,62 @@ private:
 
     static ir::Inst::Tag pattern_cmp(CaseStatementCondition cond);
 
+    // One `&&&` step of a cond_predicate (LRM 12.4 / 12.6): `acc &&& next`.
+    // Conjuncts are evaluated left to right and stop at the first false one,
+    // the short-circuit `&&` has (lower_short_circuit): `next` is lowered only
+    // in a SelectLazy branch taken unless `acc` is a definite 0, so a guard such
+    // as `h != null &&& h.x` never dereferences a null `h`. An x/z `acc` does
+    // not decide the result, so `next` still runs and the 3-valued Land merges
+    // the two. A pattern conjunct binds its variables by slot stores, so a
+    // binding made inside the branch runs only when its conjunct is reached and
+    // is still visible to later conjuncts and to the guarded body.
+    template<typename LowerNext>
+    ir::Index lower_cond_and(ir::Index acc, LowerNext&& lower_next, ir::Builder& b, ir::SourceLoc l) {
+        using T = ir::Inst::Tag;
+        // Every conjunct predicate is 1 bit; case-equality against 0 is a
+        // definite bit even for an x/z `acc`, so the backend branches on it.
+        const ir::Index zero = b.constant(module_.pool.put_int(make_int_type(1, b.type_of(acc).four_state), 0), l);
+        const ir::Index pred = b.unary(T::Lnot, b.binary(T::CaseEq, acc, zero, l), l);
+
+        b.open_region();
+        const ir::Index      combined    = b.binary(T::Land, acc, lower_next(), l);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        // The skipped branch's 0 has the domain of the combined value.
+        const ir::Index dom = b.constant(module_.pool.put_int(make_int_type(1, b.type_of(combined).four_state), 0), l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        return b.select_lazy(pred, then_region, combined, else_region, dom, l);
+    }
+
     // AND-reduce the predicates of a cond_predicate's conditions (LRM 12.4 /
-    // 12.6): each condition is either a plain boolean expression or an
-    // `expr matches pattern`. Pattern variables bound by an earlier condition are
-    // visible to later conditions (the `&&&` filter form) and the guarded body,
-    // so bindings are emitted left to right into the current region.
+    // 12.6), short-circuiting at the first false one (lower_cond_and): each
+    // condition is either a plain boolean expression or an `expr matches
+    // pattern`. Pattern variables bound by an earlier condition are visible to
+    // later conditions (the `&&&` filter form) and the guarded body.
     // Templated over the Condition type: ConditionalStatement::Condition and
     // ConditionalExpression::Condition are distinct nested structs with the same
     // { expr, pattern } shape (the `if` and `?:` forms), so one body serves both.
     template<typename Cond>
     ir::Index lower_conditions(std::span<const Cond> conds, ir::Builder& b, ir::SourceLoc l) {
-        ir::Index acc  = ir::Index{};
-        bool      have = false;
-        for (const auto& cond : conds) {
-            ir::Index p;
+        const auto lower_one = [&](const Cond& cond) {
             if (cond.pattern != nullptr) {
-                p = lower_pattern(*cond.pattern,
-                                  lower_expr(*cond.expr, b),
-                                  cond.expr->type->getCanonicalType(),
-                                  ir::Inst::Tag::CaseEq,
-                                  b,
-                                  l);
-            } else {
-                p = lower_predicate(*cond.expr, b);
+                return lower_pattern(*cond.pattern,
+                                     lower_expr(*cond.expr, b),
+                                     cond.expr->type->getCanonicalType(),
+                                     ir::Inst::Tag::CaseEq,
+                                     b,
+                                     l);
             }
-            acc  = have ? b.binary(ir::Inst::Tag::Land, acc, p, l) : p;
-            have = true;
+            return lower_predicate(*cond.expr, b);
+        };
+        if (conds.empty()) {
+            fail("internal: empty cond_predicate"); // slang guarantees at least one condition.
+        }
+        ir::Index acc = lower_one(conds.front());
+        for (const auto& cond : conds.subspan(1)) {
+            acc = lower_cond_and(acc, [&] { return lower_one(cond); }, b, l);
         }
         return acc;
     }
@@ -4823,10 +4856,14 @@ private:
         // controls and $time are allowed.
         bool is_task = false;
         // The subroutine this body belongs to, or null for a synthetic body (a fork
-        // child, an action block, a print thunk). Read by lower_disable to spot LRM
-        // 9.6.2 example 4: a task naming ITSELF as the disable target, and by
-        // hier_name for the classes a method's %m passes through.
+        // child, an action block, a print thunk). Read by hier_name for the classes a
+        // method's %m passes through.
         const SubroutineSymbol* sym = nullptr;
+        // The `disable` target id of the task this body is, or is a fork child of,
+        // when some `disable` names that task. A fork child is an activation of the
+        // task's target (LRM 9.6.2), and lower_disable tests it to spot LRM 9.6.2
+        // example 4: a task, or a child it forked, naming the task as the target.
+        uint32_t disable_target = ir::kNoDisableTarget;
         // Class method context (valid iff has_this): `this` is spliced as frame
         // Local 0, `this_class` is its Kind::Class handle type. A bare property
         // reference inside the body roots at this handle (value_lvalue -> this_handle).
@@ -5689,10 +5726,10 @@ private:
     // Whether any user virtual task of the design can park (design_virtual_parks); computed on
     // first use.
     std::optional<bool> design_virtual_parks_;
-    // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
-    // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
-    // hard_park. The remote form refuses one, the lexical form does not care -- it
-    // never leaves a park behind.
+    // Named blocks and tasks whose body can park in a way the abort cannot claim (a
+    // time-consuming task call, a fork in a callee, an `expect`); see hard_park. The
+    // remote form refuses one, the lexical form does not care -- it never leaves a
+    // park behind.
     ankerl::unordered_dense::set<const Symbol*> disable_hard_;
     // Memoized "calling this can suspend the caller", see subroutine_parks.
     ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_parks_;

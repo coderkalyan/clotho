@@ -1462,10 +1462,10 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::AggEq: {
             const auto  info = ir_->extra_data<AggEqInfo>(p.op_extra.extra);
-            const Plane eq   = lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type);
+            const Plane eq   = lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type, info.mode);
             // A leaf the runtime compares answers in a 4-state bit even where no leaf
             // can be x or z, so the instruction's own type decides what is kept.
-            set_value(i, agg_eq_four(info.type) && !type_of(i).four_state ? two_val(must_of(eq, true)) : eq);
+            set_value(i, agg_eq_four(info.type, info.mode) && !type_of(i).four_state ? two_val(must_of(eq, true)) : eq);
             return;
         }
 
