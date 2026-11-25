@@ -161,12 +161,21 @@ private:
             const Unit& u = d_.unit(fi.unit);
             fi.signals.assign(u.signals.size(), kUnresolvedSignal);
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
-                if (u.signals[h].import != kLocal) {
+                if (u.signals[h].import != kLocal || u.signals[h].alias != kLocal) {
                     continue;
                 }
                 SignalInfo info = u.signals[h].info;
                 info.name       = fi.prefix + info.name;
                 fi.signals[h]   = m_.add_signal(std::move(info));
+            }
+            // An alias targets a local signal that is not itself an alias, so
+            // one hop reaches storage.
+            for (uint32_t h = 0; h < u.signals.size(); ++h) {
+                if (u.signals[h].import == kLocal && u.signals[h].alias != kLocal) {
+                    const uint32_t target = u.signals[h].alias;
+                    assert(u.signals[target].import == kLocal && u.signals[target].alias == kLocal);
+                    fi.signals[h] = fi.signals[target];
+                }
             }
             fi.functions.assign(u.functions.size(), kUnresolvedFunction);
             for (uint32_t h = 0; h < u.functions.size(); ++h) {
@@ -639,6 +648,16 @@ private:
                 if (imp != kLocal) {
                     s.externs.push_back(u.imports[imp].kind == Import::Kind::Representative ? InstanceScope::no_extern
                                                                                             : fi.signals[h]);
+                    continue;
+                }
+                if (u.signals[h].alias != kLocal) {
+                    if (u.signals[h].scoped) {
+                        InstanceScope::Alias a{ .info = u.signals[h].info,
+                                                .target = fi.signals[h],
+                                                .pos    = static_cast<uint32_t>(s.signals.size()) };
+                        a.info.name = fi.prefix + a.info.name;
+                        s.aliases.push_back(std::move(a));
+                    }
                     continue;
                 }
                 s.locals.push_back(fi.signals[h]);

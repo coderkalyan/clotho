@@ -199,6 +199,11 @@ flags (four-state, net, narrow, real). `rt_vcd_array` registers a whole unpacked
 array as one `$var` per element from a base pointer and a stride, so the emitted
 design does not grow with the array.
 
+A declared signal with no storage of its own (an alias of a removed copy,
+`InstanceScope::aliases`, modular-compilation.md "Copy aliasing") is
+registered by `rt_vcd_alias`: one more `$var` line on its target's identifier
+code (LRM 21.7.2.3 b), with no var-table entry and no touch.
+
 No blob, no offset math in the runtime, no state base: the runtime stores the
 pointers it was handed, and they stay valid for the run. `SignalInfo::name`
 holds the full hierarchical path; the leaf is the tail after the scope prefix.

@@ -19,14 +19,33 @@ struct Analyzed {
     std::vector<bool> may_z;
 
     // May-z of the signal whose (possibly hierarchical) name is `name` or ends
-    // with ".name". Fails the test if no such signal exists.
+    // with ".name". A copy alias (InstanceScope::aliases) answers for the
+    // storage it names. Fails the test if no such signal exists.
     bool z(std::string_view name) const {
+        const auto matches = [&](const std::string& n) {
+            return n == name || (n.size() > name.size() && n.compare(n.size() - name.size(), name.size(), name) == 0 &&
+                                 n[n.size() - name.size() - 1] == '.');
+        };
         const auto signals = lowered.module->signals();
         for (size_t i = 0; i < signals.size(); ++i) {
-            const std::string& n = signals[i].name;
-            if (n == name || (n.size() > name.size() && n.compare(n.size() - name.size(), name.size(), name) == 0 &&
-                              n[n.size() - name.size() - 1] == '.')) {
+            if (matches(signals[i].name)) {
                 return may_z[i];
+            }
+        }
+        std::vector<const ir::InstanceScope*> scopes;
+        for (const ir::InstanceScope& top : lowered.module->tops()) {
+            scopes.push_back(&top);
+        }
+        while (!scopes.empty()) {
+            const ir::InstanceScope* sc = scopes.back();
+            scopes.pop_back();
+            for (const ir::InstanceScope::Alias& a : sc->aliases) {
+                if (matches(a.info.name)) {
+                    return may_z[static_cast<uint32_t>(a.target)];
+                }
+            }
+            for (const ir::InstanceScope& c : sc->children) {
+                scopes.push_back(&c);
             }
         }
         FAIL("no signal named ", name);

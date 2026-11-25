@@ -444,7 +444,8 @@ uint32_t signal_width(const ir::Module& m, std::string_view name) {
 }
 
 // Two-level hierarchy: an inverter child wired into a top via one input and one
-// output port.
+// output port. The top inverts again rather than copying, so `w` is no copy
+// alias (docs/design/modular-compilation.md) and stays a signal of its own.
 constexpr std::string_view kHier = R"(
     module inv(input a, output y);
         assign y = ~a;
@@ -452,7 +453,7 @@ constexpr std::string_view kHier = R"(
     module top(input g, output o);
         wire w;
         inv u_inv(.a(g), .y(w));
-        assign o = w;
+        assign o = ~w;
     endmodule
 )";
 
@@ -466,7 +467,7 @@ TEST_CASE("instantiation flattens the child under a hierarchical prefix") {
     CHECK(m.name == "top");
     // Top signals are unprefixed; the child's are under "u_inv.".
     CHECK(signal_names(m) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
-    // top assign (o=w) + child assign (y=~a) + 2 port-copy processes (.a in, .y out).
+    // top assign (o=~w) + child assign (y=~a) + 2 port-copy processes (.a in, .y out).
     CHECK(m.processes().size() == 4);
 }
 
@@ -496,7 +497,7 @@ TEST_CASE("lower_files compiles a design split across two files into one design"
         module top(input g, output o);
             wire w;
             inv u_inv(.a(g), .y(w));
-            assign o = w;
+            assign o = ~w;
         endmodule
     )");
 

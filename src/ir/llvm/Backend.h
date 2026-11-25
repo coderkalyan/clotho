@@ -3021,6 +3021,7 @@ private:
     llvm::FunctionCallee vcd_upscope_fn();
     llvm::FunctionCallee vcd_var_fn();
     llvm::FunctionCallee vcd_array_fn();
+    llvm::FunctionCallee vcd_alias_fn();
     llvm::FunctionCallee vcd_start_fn();
     llvm::FunctionCallee vcd_limit_fn();
     llvm::FunctionCallee vcd_touch_fn();
@@ -4169,6 +4170,7 @@ private:
     void vcd_plan_scope(VcdRows& rows, std::string_view name);
 
     void vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc);
+    void vcd_plan_alias(VcdRows& rows, const InstanceScope::Alias& a);
 
     const char* vcd_unrepresentable(Ref type) const;
 

@@ -150,6 +150,11 @@ struct UnitSignal {
     // VCD dump and the scope tree show. False for storage the compiler adds to
     // a unit without declaring it there, such as a constant table.
     bool scoped = true;
+    // kLocal, or the local signal whose storage this local signal names: it was
+    // a pure continuous copy of that signal or the source of one, and
+    // alias_copies removed the copy. It has no storage of its own; flatten
+    // binds every reference to it, imports by name included, to the target's.
+    uint32_t alias = kLocal;
 
     bool operator==(const UnitSignal&) const = default;
 };
@@ -290,6 +295,14 @@ public:
 // Every field of `f` but its body, which a caller rebases separately: a
 // Function is move-only because its body is.
 Function signature_of(const Function& f);
+
+// Remove every continuous assignment that copies one whole signal of a unit
+// into another of the same type, where one of the two can become a name for
+// the other's storage, and record that alias (UnitSignal::alias). Unit-local:
+// a unit's result depends on its own bodies, plus the names other units write
+// through imports, which only ever block an alias. See
+// docs/design/modular-compilation.md, "Copy aliasing".
+void alias_copies(Design& design);
 
 // Expand `design` into the flat Module: every unit copied once per instance,
 // with each extern declaration resolved to the definition its import names. The

@@ -148,6 +148,17 @@ struct InstanceScope {
     // no_unit.
     uint32_t monitor_base  = 0;
     uint32_t monitor_count = 0;
+    // Declared signals with no storage of their own, each a second name for the
+    // signal `target` and equal to it at every instant (alias_copies in
+    // Design.h). No body names one, so only consumers of declared names (the
+    // VCD dump) read this. `pos` is how many entries of `signals` the alias was
+    // declared after, so a consumer can list both in declaration order.
+    struct Alias {
+        SignalInfo info;
+        Signal     target{ 0 };
+        uint32_t   pos = 0;
+    };
+    std::vector<Alias> aliases;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the

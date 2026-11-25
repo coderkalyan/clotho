@@ -958,6 +958,12 @@ void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t 
 // Finish the header ($enddefinitions) and arm the initial full dump.
 void rt_vcd_start(void);
 
+// Declare one more reference name `name` for the variable of dump-var index
+// `target` (registered before or after this call): a $var line on that
+// variable's identifier code, which LRM 21.7.2.3 allows. `width` / `flags` as
+// rt_vcd_var; nothing is added to the scan table. Called before rt_vcd_start.
+void rt_vcd_alias(const char* name, uint32_t name_len, uint32_t width, uint32_t flags, uint32_t target);
+
 // Mark variable `idx` changed this instant (activity-driven dirty set). Called
 // from the design at each write to a dumped scalar signal (blocking store and NBA
 // commit); the next rt_vcd_flush visits only the marked variables. A no-op when

@@ -299,10 +299,11 @@ void Backend::lower_dump_vars() {
 //
 //   { kind, name length, name, width, flags, value plane, z plane, count, stride, left, right }
 //
-// and the fields a kind does not use are zero. The leaf names are interned: the same
-// `clk` or `valid` of a thousand instances is one string.
+// and the fields a kind does not use are zero. An Alias row's `count` is the dump-var
+// index of the variable it names. The leaf names are interned: the same `clk` or
+// `valid` of a thousand instances is one string.
 struct Backend::VcdRows {
-    enum Kind : uint32_t { Scope, Upscope, Var, Array };
+    enum Kind : uint32_t { Scope, Upscope, Var, Array, Alias };
 
     explicit VcdRows(llvm::Module& m)
       : mod(m)
@@ -393,7 +394,7 @@ llvm::Function* Backend::vcd_register_fn() {
     tb.SetInsertPoint(body);
     llvm::Value* const row   = tb.CreateInBoundsGEP(rows.ty, table, i);
     const auto         field = [&](uint32_t f, llvm::Type* t) { return tb.CreateLoad(t, tb.CreateStructGEP(rows.ty, row, f)); };
-    auto* const        sw    = tb.CreateSwitch(field(0, i32), latch, 4);
+    auto* const        sw    = tb.CreateSwitch(field(0, i32), latch, 5);
     const auto         arm   = [&](VcdRows::Kind kind, const char* name) {
         auto* const bb = block(name);
         sw->addCase(tb.getInt32(kind), bb);
@@ -412,6 +413,9 @@ llvm::Function* Backend::vcd_register_fn() {
     tb.CreateCall(vcd_array_fn(), { field(2, ptr), field(1, i32), field(7, i32), field(3, i32), field(4, i32), field(5, ptr),
                                     field(6, ptr), field(8, i32), field(9, b_.getInt64Ty()), field(10, b_.getInt64Ty()) });
     tb.CreateBr(latch);
+    arm(VcdRows::Alias, "vcd.alias");
+    tb.CreateCall(vcd_alias_fn(), { field(2, ptr), field(1, i32), field(3, i32), field(4, i32), field(7, i32) });
+    tb.CreateBr(latch);
     tb.SetInsertPoint(latch);
     i->addIncoming(tb.CreateAdd(i, tb.getInt32(1)), latch);
     tb.CreateBr(head);
@@ -429,13 +433,42 @@ void Backend::vcd_plan_scope(VcdRows& rows, std::string_view name) {
 
 void Backend::vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc) {
     vcd_plan_scope(rows, sc.name);
-    for (const Signal sig : sc.signals) {
-        vcd_plan_var(rows, sig);
+    // Aliases interleave with the signals in declaration order.
+    size_t next_alias = 0;
+    for (uint32_t k = 0; k <= sc.signals.size(); ++k) {
+        for (; next_alias < sc.aliases.size() && sc.aliases[next_alias].pos == k; ++next_alias) {
+            vcd_plan_alias(rows, sc.aliases[next_alias]);
+        }
+        if (k < sc.signals.size()) {
+            vcd_plan_var(rows, sc.signals[k]);
+        }
     }
     for (const InstanceScope& child : sc.children) {
         vcd_plan_scope_tree(rows, child);
     }
     rows.add(VcdRows::Upscope, {});
+}
+
+// A declared signal with no storage of its own (InstanceScope::aliases) dumps
+// as a second $var on its target's identifier code, which LRM 21.7.2.3 allows
+// ("More than one reference name can be mapped to the same identifier code"),
+// so it costs no dump-var index and no touch. Its target is a packed signal of
+// the same type (alias_copies), so the target's width and planes describe it;
+// the var type is its own.
+void Backend::vcd_plan_alias(VcdRows& rows, const InstanceScope::Alias& a) {
+    const int32_t index = vcd_index_[static_cast<uint32_t>(a.target)];
+    if (a.info.name.empty() || index < 0) {
+        return;
+    }
+    std::string_view leaf = a.info.name;
+    if (const auto pos = leaf.rfind('.'); pos != std::string_view::npos) {
+        leaf = leaf.substr(pos + 1);
+    }
+    const SignalSlot& s = slot_of(a.target);
+    assert(!s.is_array && !mod_.signal(a.target).is_event);
+    const uint32_t flags = (s.four_state ? 1u : 0u) | (a.info.is_net ? 2u : 0u) | (!s.four_state ? 4u : 0u)
+                         | (s.is_real ? 8u : 0u);
+    rows.add(VcdRows::Alias, leaf, s.width, flags, nullptr, nullptr, static_cast<uint32_t>(index));
 }
 
 // Why a signal's type has no $var form, or nullptr when it has one. Mirrors

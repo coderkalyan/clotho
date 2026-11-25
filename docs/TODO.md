@@ -249,6 +249,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Process fusion across instances (performance)** — groups fuse only within one
   instance, and comb-fused groups never share a subscription across instances, so a comb
   chain through many instances runs one wake per instance (docs/design/comb-fusion.md).
+- [ ] **Port copies as aliases (performance)** (23.3.3.7) — an input or output port is
+  still a process copying between two instances' signals; only copies within one unit
+  alias (docs/design/modular-compilation.md, "Copy aliasing").
 
 ### File and string I/O
 

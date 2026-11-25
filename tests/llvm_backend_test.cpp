@@ -330,7 +330,7 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
         module leaf(input logic a, output logic [7:0] q);
             logic [7:0] cnt;
             always @(posedge a) cnt <= cnt + 8'd1;
-            assign q = cnt;
+            assign q = ~cnt;
         endmodule
         module top;
             logic clk;

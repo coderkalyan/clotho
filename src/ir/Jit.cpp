@@ -274,6 +274,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_upscope", &rt_vcd_upscope);
     expose("rt_vcd_var", &rt_vcd_var);
     expose("rt_vcd_array", &rt_vcd_array);
+    expose("rt_vcd_alias", &rt_vcd_alias);
     expose("rt_vcd_start", &rt_vcd_start);
     expose("rt_vcd_touch", &rt_vcd_touch);
     expose("rt_vcd_touch_range", &rt_vcd_touch_range);

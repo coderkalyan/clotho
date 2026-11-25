@@ -920,6 +920,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         if (ir::stat_on(stats, ir::Stat::Units)) {
             std::fputs(ir::describe_sharing(*design, unit_specs).c_str(), stderr);
         }
+        ir::alias_copies(*design);
         module = ir::flatten(std::move(*design));
     }
     // The dump has to represent every declared signal, and the answer needs the

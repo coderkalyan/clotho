@@ -715,6 +715,27 @@ extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, 
     vcd_register(std::string_view(name, name_len), width, flags, mm, z);
 }
 
+// The $var line of vcd_register without the variable: the identifier code is the
+// one `target` gets (or got) from vcd_register, a function of its index alone.
+extern "C" void rt_vcd_alias(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
+                             uint32_t target) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    const char* vtype = (flags & RT_VCD_FLAG_REAL) != 0  ? "real"
+                        : (flags & RT_VCD_FLAG_NET) != 0 ? "wire"
+                                                         : "reg";
+    vcd_puts("$var ");
+    vcd_puts(vtype);
+    vcd_put(' ');
+    vcd_put_dec((flags & RT_VCD_FLAG_REAL) != 0 ? 64 : width);
+    vcd_put(' ');
+    vcd_puts(vcd_idcode(target));
+    vcd_put(' ');
+    vcd_puts(std::string_view(name, name_len));
+    vcd_puts(" $end\n");
+}
+
 extern "C" void rt_vcd_touch(uint32_t idx) {
     // idx >= epoch.size() covers a not-dumped NBA target passed as (uint32_t)-1.
     // Setting the flag is idempotent, so no dedup / list bookkeeping is needed.

@@ -1413,6 +1413,9 @@ void print_unit(const Design& d, UnitId id, std::ostream& os) {
         } else if (!s.scoped) {
             os << " unscoped";
         }
+        if (s.alias != kLocal) {
+            os << " alias s" << s.alias;
+        }
         os << "\n";
     }
     for (size_t i = 0; i < u.disable_targets.size(); ++i) {
