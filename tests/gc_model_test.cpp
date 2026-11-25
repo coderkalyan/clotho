@@ -105,12 +105,12 @@ struct Shape {
     }
 };
 
-// From one grain to larger than a block. The last two do not fit in a block and get
-// a mapping of their own; the two before them are found from an interior address
-// in more than one step back.
+// From one grain to larger than a block. The last three do not fit in a block and
+// get a mapping of their own; the two before them are found from an interior address
+// in more than one step back. The model allocates all but the last.
 Shape g_shapes[] = {
-    { 0, 0, false },   { 1, 1, false },   { 2, 0, true },    { 4, 3, false },   { 3, 40, true },
-    { 1, 300, false }, { 2, 1500, true }, { 2, 5000, false }, { 1, 6000, true },
+    { 0, 0, false },   { 1, 1, false },   { 2, 0, true },     { 4, 3, false },   { 3, 40, true },
+    { 1, 300, false }, { 2, 1500, true }, { 2, 5000, false }, { 1, 6000, true }, { 0, 7000, false },
 };
 constexpr uint32_t kShapes = sizeof g_shapes / sizeof g_shapes[0];
 
@@ -449,12 +449,13 @@ struct Heap {
     rt_gc_roots           table{};
     void*                 pend_head = nullptr;
 
-    explicit Heap(uint32_t slots) : words(slots, 0), offsets(slots) {
+    explicit Heap(uint32_t slots, uint64_t heap_bytes_max = 0) : words(slots, 0), offsets(slots) {
         for (Shape& s : g_shapes) {
             s.build();
         }
         rt_gc_config cfg{};
         cfg.nursery_bytes   = RT_GC_BLOCK_BYTES;
+        cfg.heap_bytes_max  = heap_bytes_max;
         cfg.map_vptr_offset = rt_gc_map_vptr_offset();
         cfg.request_offset  = static_cast<int32_t>(rt_gc_mutator_request_offset());
         cfg.mutator_bytes   = static_cast<int32_t>(rt_gc_mutator_bytes());
@@ -478,6 +479,7 @@ struct Heap {
         REQUIRE(!s.finalizable);
         void* const h = rt_gc_alloc(rt_gc_mutator_current(), s.map.size, &s.map, nullptr);
         REQUIRE(h != nullptr);
+        REQUIRE(load(h, kStampOffset) == 0);  // a fresh body is zero, whatever was here before
         store(h, 0, reinterpret_cast<uint64_t>(s.vptr));
         store(h, kStampOffset, stamp);
         words[slot] = reinterpret_cast<uint64_t>(h);
@@ -574,18 +576,89 @@ TEST_CASE("gc heap: an object larger than a block has a mapping of its own") {
     heap.collect(RT_GC_KIND_FULL);
     CHECK(rt_gc_find_object(h) == h);
     CHECK(load(h, kStampOffset) == 11);
-    // Old and unreachable: a young collection leaves it, a full one frees it and
-    // its mapping goes back.
+    // Old and unreachable: a young collection leaves it, a full one frees it and,
+    // nothing of its size having been allocated since the last collection, its
+    // mapping goes back.
     heap.words[0] = 0;
     CHECK(heap.collect(RT_GC_KIND_YOUNG).heap_bytes == held.heap_bytes);
     CHECK(rt_gc_find_object(h) == h);
     CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes == empty.heap_bytes);
     CHECK(rt_gc_find_object(h) == nullptr);
-    // Young and unreachable: a young collection is enough.
+    // Young and unreachable: a young collection is enough to free the object.
     uint8_t* const y = static_cast<uint8_t*>(heap.make(1, kLarge, 12));
     heap.words[1]    = 0;
-    CHECK(heap.collect(RT_GC_KIND_YOUNG).heap_bytes == empty.heap_bytes);
+    heap.collect(RT_GC_KIND_YOUNG);
     CHECK(rt_gc_find_object(y) == nullptr);
+    CHECK(rt_gc_find_object(y + size - 1) == nullptr);
+}
+
+TEST_CASE("gc heap: a dead large object's mapping is kept for the next of its size") {
+    constexpr uint32_t kLarge = 7;
+    constexpr uint32_t kFirst = 16;
+    constexpr uint32_t kNext  = 4;
+    Heap               heap(kFirst);
+    const rt_gc_stats  empty = Heap::stats();
+    std::vector<void*> first(kFirst);
+    for (uint32_t k = 0; k < kFirst; ++k) {
+        first[k] = heap.make(k, kLarge, 1 + k);
+    }
+    const rt_gc_stats held    = Heap::stats();
+    const uint64_t    mapping = (held.heap_bytes - empty.heap_bytes) / kFirst;
+    REQUIRE(mapping > g_shapes[kLarge].map.size);
+    // A young collection frees the objects and keeps their mappings.
+    std::fill(heap.words.begin(), heap.words.end(), 0);
+    const rt_gc_stats freed = heap.collect(RT_GC_KIND_YOUNG);
+    CHECK(freed.objects_live == 0);
+    CHECK(freed.heap_bytes == held.heap_bytes);
+    for (uint32_t k = 0; k < kFirst; ++k) {
+        REQUIRE(rt_gc_find_object(first[k]) == nullptr);
+    }
+    // The next objects of that size are put where dead ones were, and map nothing.
+    std::sort(first.begin(), first.end());
+    std::vector<void*> next(kNext);
+    for (uint32_t k = 0; k < kNext; ++k) {
+        next[k] = heap.make(k, kLarge, 100 + k);
+        CHECK(std::binary_search(first.begin(), first.end(), next[k]));
+        CHECK(rt_gc_find_object(next[k]) == next[k]);
+    }
+    CHECK(Heap::stats().heap_bytes == held.heap_bytes);
+    // A full collection keeps as many as were allocated since the last collection,
+    // which is what the next cycle will want, and returns the rest.
+    std::fill(heap.words.begin(), heap.words.end(), 0);
+    CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes == empty.heap_bytes + kNext * mapping);
+    // After a cycle that allocated none, that is none.
+    CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes == empty.heap_bytes);
+    for (uint32_t k = 0; k < kNext; ++k) {
+        CHECK(rt_gc_find_object(next[k]) == nullptr);
+    }
+}
+
+TEST_CASE("gc heap: a kept mapping is given up before the ceiling refuses an object") {
+    constexpr uint32_t kSmall  = 0;
+    constexpr uint32_t kLarge  = 7;
+    constexpr uint32_t kLarger = 9;
+    // What the heap holds once it has a chunk, measured rather than assumed.
+    uint64_t base = 0;
+    {
+        Heap probe(1);
+        probe.make(0, kSmall, 1);
+        base = Heap::stats().heap_bytes;
+    }
+    REQUIRE(base >= RT_GC_CHUNK_BYTES);
+    // A ceiling with room for either large object beside that chunk, and not for both.
+    const uint64_t larger = RT_GC_LARGE_PAYLOAD + g_shapes[kLarger].map.size;
+    REQUIRE(g_shapes[kLarger].map.size > g_shapes[kLarge].map.size);
+    Heap heap(3, base + larger);
+    heap.make(0, kSmall, 1);
+    heap.make(1, kLarge, 2);
+    heap.words[1] = 0;
+    // The dead object's mapping is kept, and still counts against the ceiling.
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).heap_bytes > base);
+    // An object of another size cannot use it and does not fit beside it. Nothing here
+    // can collect, so the heap makes room by giving the kept mapping back.
+    void* const big = heap.make(2, kLarger, 3);
+    CHECK(rt_gc_find_object(big) == big);
+    CHECK(Heap::stats().heap_bytes == base + larger);
 }
 
 TEST_CASE("gc heap: empty chunks go back to the system after a full collection") {

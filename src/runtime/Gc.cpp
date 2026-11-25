@@ -442,6 +442,17 @@ struct GcState {
     // swap with the last one.
     std::vector<ChunkRecord*> chunks;  // chunks of blocks
     std::vector<ChunkRecord*> large;   // large objects, one mapping each
+    // The mappings of dead large objects, kept for the next object of the same size,
+    // and how many objects of that size were allocated since the last collection,
+    // which is how many a full collection leaves (settle_spare_large). By object
+    // size. A kept mapping is in neither `table` nor `large` and holds no object.
+    struct LargeSize {
+        std::vector<ChunkRecord*> spare;
+        uint64_t                  taken = 0;
+    };
+    ankerl::unordered_dense::map<uint64_t, LargeSize> large_sizes;
+    // The bytes of every large object's mapping, in use or kept.
+    uint64_t large_mapped = 0;
     // Blocks an allocation can take: wholly free, and with some free granules, the
     // latter by the length of their longest free run -- partial_blocks[k] holds the
     // blocks whose longest run is 2^k to 2^(k+1)-1 granules, so every block in a list
@@ -869,10 +880,41 @@ void table_remove(ChunkRecord* c, uint64_t bytes) {
     }
 }
 
+// Give a large object's mapping, in use or kept, back to the system.
+void unmap_large(ChunkRecord* c) {
+    const uint64_t bytes = RT_GC_LARGE_PAYLOAD + c->large_bytes;
+    assert(g.large_mapped >= bytes && "a large mapping was counted when it was made");
+    g.large_mapped -= bytes;
+    clotho::rt::os_unmap(c, static_cast<size_t>(bytes));
+}
+
+// Give back every mapping kept for reuse. Returns the bytes that went.
+uint64_t release_spare_large() {
+    const uint64_t before = g.large_mapped;
+    for (auto& entry : g.large_sizes) {
+        for (ChunkRecord* c : entry.second.spare) {
+            unmap_large(c);
+        }
+        entry.second.spare.clear();
+    }
+    return before - g.large_mapped;
+}
+
+// A fresh chunk-aligned mapping of `bytes`, or null. Memory the heap is keeping for no
+// object is not a reason to report that the system has none, so the kept mappings go
+// back before that is the answer.
+void* map_region(uint64_t bytes) {
+    void* raw = clotho::rt::os_map_aligned(static_cast<size_t>(bytes), static_cast<size_t>(kChunkBytes));
+    if (raw == nullptr && release_spare_large() != 0) {
+        raw = clotho::rt::os_map_aligned(static_cast<size_t>(bytes), static_cast<size_t>(kChunkBytes));
+    }
+    return raw;
+}
+
 // One chunk from the OS, or false. Aligned to its own size, which is what lets an
 // address find its chunk and its metadata by arithmetic.
 bool grow_heap() {
-    void* raw = clotho::rt::os_map_aligned(static_cast<size_t>(kChunkBytes), static_cast<size_t>(kChunkBytes));
+    void* raw = map_region(kChunkBytes);
     if (raw == nullptr) {
         return false;
     }
@@ -1146,6 +1188,13 @@ bool heap_may_grow(uint64_t bytes) {
     return heap_bytes() + bytes <= ceiling;
 }
 
+// The same, having given back the mappings the heap keeps for no object if that is
+// what it takes: they count against the ceiling, and must not be what refuses a
+// design an object.
+bool make_room(uint64_t bytes) {
+    return heap_may_grow(bytes) || (release_spare_large() != 0 && heap_may_grow(bytes));
+}
+
 // How far past its budget the design has allocated since the last collection: the bytes
 // charge_budget() was handed, plus how far the buffers its strings and containers own
 // have grown (GcBuffers.h).
@@ -1232,12 +1281,16 @@ uint8_t* refill_and_bump(rt_gc_mutator* mut, uint64_t size, const rt_alloc_site*
     // which is the one place the ceiling is enforced. A collection can free blocks, and the
     // design may have been holding garbage; if even that leaves no room, the design needs
     // more than it was given and the run ends here, at this statement.
-    if (!heap_may_grow(kChunkBytes)) {
+    if (!make_room(kChunkBytes)) {
         collect_for_room();
         if (refill_hole(mut, size) || acquire_block(mut, size)) {
             return bump(mut, size);
         }
-        ceiling_fatal(size, site);
+        // No block came free, but the collection may have made room for a chunk: what
+        // it freed was large objects.
+        if (!make_room(kChunkBytes)) {
+            ceiling_fatal(size, site);
+        }
     }
     if (grow_heap() && acquire_block(mut, size)) {
         return bump(mut, size);
@@ -1278,6 +1331,21 @@ void set_object_meta(uint8_t* start, uint64_t size, bool finalizable) {
     }
 }
 
+// A kept mapping for an object of `size` bytes, or null: where a dead object of that
+// size was. Taking one maps nothing, which is what makes allocating large objects at
+// a steady rate cost what the objects cost and not a system call and a page fault per
+// page for each.
+ChunkRecord* take_spare_large(uint64_t size) {
+    const auto it = g.large_sizes.find(size);
+    if (it == g.large_sizes.end() || it->second.spare.empty()) {
+        return nullptr;
+    }
+    ChunkRecord* const c = it->second.spare.back();
+    it->second.spare.pop_back();
+    assert(c->large_bytes == size && "a kept mapping is listed under its object's size");
+    return c;
+}
+
 // A mapping of its own, laid out as a chunk is: the record, the metadata, the object
 // at RT_GC_LARGE_PAYLOAD. Only the object's first granule has a metadata byte anyone
 // reads, and it is where the arithmetic of Gc.h puts it, so marking, the barrier and
@@ -1290,29 +1358,37 @@ uint8_t* alloc_large(rt_gc_mutator* mut, uint64_t size, const rt_alloc_site* sit
     assert(size > kLargeObjectBytes);
     assert(size % RT_GC_ALIGN == 0);
     const uint64_t bytes = RT_GC_LARGE_PAYLOAD + size;
-    if (!heap_may_grow(bytes)) {
+    ChunkRecord*   c     = take_spare_large(size);
+    if (c == nullptr && !make_room(bytes)) {
         collect_for_room();
-        if (!heap_may_grow(bytes)) {
+        // The collection may have left a mapping of this size, or room for a new one.
+        c = take_spare_large(size);
+        if (c == nullptr && !make_room(bytes)) {
             ceiling_fatal(size, site);
         }
     }
-    void* raw = clotho::rt::os_map_aligned(static_cast<size_t>(bytes), static_cast<size_t>(kChunkBytes));
-    if (raw == nullptr) {
-        oom_fatal(size, site);
+    if (c == nullptr) {
+        void* raw = map_region(bytes);
+        if (raw == nullptr) {
+            oom_fatal(size, site);
+        }
+        assert((reinterpret_cast<uintptr_t>(raw) & kChunkMask) == 0 && "aligned allocation honoured");
+        // A fresh mapping reads as zero, so the record starts empty.
+        c              = static_cast<ChunkRecord*>(raw);
+        c->large_bytes = size;
+        g.large_mapped += bytes;
     }
-    assert((reinterpret_cast<uintptr_t>(raw) & kChunkMask) == 0 && "aligned allocation honoured");
-    // A fresh mapping reads as zero, so the record starts empty. Of the metadata, a
-    // large object uses the byte of its first granule, which alloc_object assigns.
-    auto* const c  = static_cast<ChunkRecord*>(raw);
-    c->large_bytes = size;
-    c->slot        = static_cast<uint32_t>(g.large.size());
+    // Of the metadata, a large object uses the byte of its first granule, which
+    // alloc_object assigns; a kept mapping's was zeroed when its object died.
+    g.large_sizes[size].taken += 1;
+    c->slot = static_cast<uint32_t>(g.large.size());
     g.large.push_back(c);
     g.young_large.push_back(c);
     table_add(c, bytes);
     g.stats.bytes_allocated += size;
     g.stats.objects_allocated += 1;
     charge_budget(mut, size);
-    return static_cast<uint8_t*>(raw) + RT_GC_LARGE_PAYLOAD;
+    return reinterpret_cast<uint8_t*>(c) + RT_GC_LARGE_PAYLOAD;
 }
 
 // THE allocation body. rt_gc_alloc() and rt_gc_alloc_slow() are this function behind
@@ -2493,21 +2569,26 @@ void list_block(BlockRef b) {
     }
 }
 
-// Free a dead large object: its finalizer, then its mapping, which goes back to the
-// system here. The last entry of g.large takes its slot.
-uint64_t release_large(ChunkRecord* c) {
+// Free a dead large object: its finalizer, then its place in the table and in g.large,
+// whose last entry takes its slot, so that no address resolves to it. Its mapping is
+// kept for the next object of its size.
+uint64_t retire_large(ChunkRecord* c) {
     uint8_t* const handle = reinterpret_cast<uint8_t*>(c) + RT_GC_LARGE_PAYLOAD;
+    uint8_t* const meta   = meta_at(handle);
     uint64_t       ran    = 0;
-    if ((*meta_at(handle) & RT_GC_META_FINALIZE) != 0) {
+    if ((*meta & RT_GC_META_FINALIZE) != 0) {
         finalize_object(handle);
         ran = 1;
     }
+    *meta = 0;
     table_remove(c, RT_GC_LARGE_PAYLOAD + c->large_bytes);
     assert(c->slot < g.large.size() && g.large[c->slot] == c && "a large object is in its slot");
     g.large[c->slot]       = g.large.back();
     g.large[c->slot]->slot = c->slot;
     g.large.pop_back();
-    clotho::rt::os_unmap(c, static_cast<size_t>(RT_GC_LARGE_PAYLOAD + c->large_bytes));
+    const auto it = g.large_sizes.find(c->large_bytes);
+    assert(it != g.large_sizes.end() && "a large object's size was entered when it was allocated");
+    it->second.spare.push_back(c);
     return ran;
 }
 
@@ -2520,6 +2601,22 @@ bool keep_large(ChunkRecord* c, bool spare_marked) {
     }
     *m = static_cast<uint8_t>(*m & ~kMetaWasOld);
     return true;
+}
+
+// What a collection leaves of the kept mappings. A young one leaves them all, as it
+// leaves every chunk. A full one keeps, of each size, as many as objects of that size
+// were allocated since the last collection -- what the next cycle will want again --
+// and gives the rest back, so a design that has stopped allocating large objects
+// holds none. Either way the count starts again.
+void settle_spare_large(bool full) {
+    for (auto& entry : g.large_sizes) {
+        GcState::LargeSize& kept = entry.second;
+        while (full && kept.spare.size() > kept.taken) {
+            unmap_large(kept.spare.back());
+            kept.spare.pop_back();
+        }
+        kept.taken = 0;
+    }
 }
 
 // How many free blocks a full collection leaves the heap: as many as were allocated
@@ -2560,7 +2657,7 @@ uint64_t sweep_young() {
     }
     for (ChunkRecord* c : g.young_large) {
         if (!keep_large(c, true)) {
-            ran += release_large(c);
+            ran += retire_large(c);
         }
     }
     return ran;
@@ -2616,11 +2713,11 @@ uint64_t sweep_all(bool spare_marked) {
             }
         }
     }
-    // Backwards for the same reason: release_large fills the slot from the end.
+    // Backwards for the same reason: retire_large fills the slot from the end.
     for (size_t n = g.large.size(); n > 0; --n) {
         ChunkRecord* const c = g.large[n - 1];
         if (!keep_large(c, spare_marked)) {
-            ran += release_large(c);
+            ran += retire_large(c);
         }
     }
     return ran;
@@ -2635,6 +2732,7 @@ void sweep() {
     assert(g_mutator.cursor == nullptr && "rt_gc_collect retires the run before marking");
     assert(g.worklist.empty() && "a sweep runs outside the mark loop");
     g.stats.finalized += g.kind == RT_GC_KIND_FULL ? sweep_all(true) : sweep_young();
+    settle_spare_large(g.kind == RT_GC_KIND_FULL);
     g.young.clear();
     g.young_large.clear();
     assert(g_mutator.cursor == nullptr && "a finalizer allocated");
@@ -2666,9 +2764,12 @@ void release_heap() {
     // inside drop_hole() reads that block's metadata to count what it handed out.
     drop_hole(&g_mutator);
     for (ChunkRecord* c : g.large) {
-        clotho::rt::os_unmap(c, static_cast<size_t>(RT_GC_LARGE_PAYLOAD + c->large_bytes));
+        unmap_large(c);
     }
     g.large.clear();
+    release_spare_large();
+    g.large_sizes.clear();
+    assert(g.large_mapped == 0 && "every large mapping went back");
     for (ChunkRecord* c : g.chunks) {
         clotho::rt::os_unmap(c, static_cast<size_t>(kChunkBytes));
     }
@@ -2757,16 +2858,13 @@ void rearm_after_collection() {
 
 // -- Collection policy (§7) ---------------------------------------------------
 
-// Committed heap bytes: whole chunks plus the mappings of large objects. Large objects
-// belong in it because a young collection does not reclaim an old one either, so a
-// design whose garbage is all large objects would otherwise never take a full collection.
+// Committed heap bytes: whole chunks plus the mappings of large objects, those kept
+// for reuse included. Large objects belong in it because a young collection does not
+// reclaim an old one either, so a design whose garbage is all large objects would
+// otherwise never take a full collection.
 uint64_t heap_bytes() {
     const uint64_t chunks = g.chunks.size() * kChunkBytes;
-    uint64_t       bytes  = chunks;
-    for (const ChunkRecord* c : g.large) {
-        assert(c->large_bytes > kLargeObjectBytes && "a small object in the large list");
-        bytes += RT_GC_LARGE_PAYLOAD + c->large_bytes;
-    }
+    const uint64_t bytes  = chunks + g.large_mapped;
     assert(bytes >= chunks && "the heap total wrapped");
     return bytes;
 }
@@ -3104,6 +3202,7 @@ void verify_block(BlockRef b, VerifyTally* t) {
 }
 
 void verify_large(VerifyTally* t) {
+    uint64_t mapped = 0;
     for (size_t i = 0; i < g.large.size(); ++i) {
         ChunkRecord* const c = g.large[i];
         assert(c->slot == i && "a large object is listed in its slot");
@@ -3112,7 +3211,19 @@ void verify_large(VerifyTally* t) {
         assert(record_at(reinterpret_cast<uintptr_t>(h) + c->large_bytes - 1) == c &&
                "the table does not cover a large object's last byte");
         verify_object(h, 0, t);
+        mapped += RT_GC_LARGE_PAYLOAD + c->large_bytes;
     }
+    // A kept mapping holds no object and no address resolves into it.
+    for (const auto& entry : g.large_sizes) {
+        for (const ChunkRecord* c : entry.second.spare) {
+            const uint8_t* const h = reinterpret_cast<const uint8_t*>(c) + RT_GC_LARGE_PAYLOAD;
+            assert(c->large_bytes == entry.first && "a kept mapping is listed under its object's size");
+            assert(record_at(reinterpret_cast<uintptr_t>(h)) == nullptr && "a kept mapping is in the table");
+            assert(*meta_at(h) == 0 && "a kept mapping holds an object");
+            mapped += RT_GC_LARGE_PAYLOAD + c->large_bytes;
+        }
+    }
+    assert(mapped == g.large_mapped && "the bytes of large mappings disagree with the count");
 }
 
 // §13 from the ROOT side, and the invariant no heap walk in this file can state: a

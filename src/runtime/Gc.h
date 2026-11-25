@@ -489,8 +489,8 @@ typedef struct rt_gc_stats {
     // collection had forgotten the numbers of those it did not reach.
     uint64_t identities;
     // Bytes the heap holds from the system right now: its chunks and the mappings of
-    // large objects. It falls when a full collection returns empty chunks and when
-    // a large object dies.
+    // large objects, those of dead ones kept for reuse included. It falls when a
+    // full collection returns empty chunks or kept mappings.
     uint64_t heap_bytes;
 } rt_gc_stats;
 

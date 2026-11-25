@@ -5418,3 +5418,53 @@ TEST_CASE("gc: an object keeps its identity number across collections") {
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
 }
+
+// An object too large for a block has a mapping of its own (Gc.h). Generated code
+// allocates one through the runtime rather than inline, a dead one's mapping is kept
+// for the next object of its size, and its finalizer runs when the object dies, not
+// when the mapping goes. So: a kept object's first and last words survive a churn of
+// objects of the same class and of another large size, an object put where a dead
+// one was starts zeroed, and each churned object's string is freed. That a mapping
+// is reused is checked at the C interface (gc_model_test.cpp); a run cannot see it.
+TEST_CASE("gc: objects larger than a block survive while held and start zeroed") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Big;   int v; int pad[10000]; string tag; endclass
+            class Other; int v; int pad[13000]; endclass
+            Big   kept, sink;
+            Other other;
+            task automatic churn();
+                repeat (6) begin
+                    for (int i = 0; i < 40; i++) begin
+                        sink           = new;
+                        sink.v         = 32'h5A5A5A5A;
+                        sink.pad[9999] = 32'h5A5A5A5A;
+                        sink.tag       = "junk";
+                        other          = new;
+                        other.pad[0]   = 32'h5A5A5A5A;
+                    end
+                    #1;
+                end
+            endtask
+            initial begin
+                int bad;
+                bad            = 0;
+                kept           = new;
+                kept.v         = 42;
+                kept.pad[9999] = 43;
+                kept.tag       = "kept";
+                churn();
+                if (kept.v != 42 || kept.pad[9999] != 43 || kept.tag != "kept") bad++;
+                if (kept.pad[0] != 0 || kept.pad[5000] != 0) bad++;
+                sink  = new;
+                if (sink.v != 0 || sink.pad[9999] != 0 || sink.tag != "") bad++;
+                $display("big %0d", bad);
+            end
+        endmodule
+    )";
+    const std::string expected = "big 0\n";
+    check_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 10u);
+    CHECK(st.owned_bytes == 0u);
+}
