@@ -115,8 +115,40 @@ them in step.
   reproducible. So values and containers need no protection against concurrent
   access, and their buffers stay with their one owner. **Not yet:** one thread
   runs every process.
-- Still open for discussion: heap organization, triggers and heap sizing,
-  safepoints and per-worker collector state.
+- An object's metadata is found from its address in constant time: chunks are
+  aligned and carry their own metadata, and a table of chunks says whether an
+  address is in the heap. **Not yet:** a binary search over chunks, then a
+  backward scan of a bitmap.
+- Free space is reclaimed at the 16-byte granule, with one metadata byte per
+  granule. **Not yet:** at the 128-byte line.
+- An object has no collector header: its flags are in its granule's byte, and
+  objects are 16-byte aligned. **Not yet:** an 8-byte word before each object,
+  which leaves it at 8 mod 16.
+- An object too large for a block has its own mapping, found through the same
+  table and returned to the system when it dies. **Not yet:** a sorted list.
+- After a full collection, empty chunks beyond a reserve go back to the system.
+  **Not yet:** the heap never shrinks during a run.
+- A young collection runs after a fixed amount of allocation (8 MiB, counting
+  the buffers objects own).
+- A full collection runs when the old generation has grown by a fixed factor
+  since the last one. The factor is a constant of the build: a collector tuning
+  value becomes a user setting only once a measurement shows it must. **Not
+  yet:** the test compares the committed heap, which includes the young budget.
+- A collection runs at the next boundary between process slices once the budget
+  is spent, and inside an allocation only past an overshoot or at the heap's
+  ceiling. **Not yet:** the boundary is the end of a time step.
+- The heap may be given a ceiling. Reaching it collects everything and, if that
+  is not enough, ends the run with a located fatal that lists live bytes by
+  class. **Not yet:** the fatal has no such list.
+- Allocation blocks and the buffer of logged objects belong to a worker.
+  Suspended frames come from an allocator the collector can walk, each with a
+  flag set when it resumes. **Not yet:** one global allocation state, and frames
+  that register themselves in a list.
+- The metadata is laid out so that stopped workers can mark in parallel; the
+  marker itself stays single-threaded until a workload needs more.
+- Finalizers run in the collection that finds their object dead.
+- Still open for discussion: how the collector is verified, weak references and
+  the lifetime of covergroup instances.
 
 ## Containers and classes
 
