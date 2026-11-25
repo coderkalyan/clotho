@@ -31,6 +31,8 @@ typedef struct rt_arg {
     //        double bit pattern (shortreal is widened to double by the codegen)
     //        and xz / z are null; it renders via the %e / %f / %g family (LRM
     //        21.2, Table 21-2).
+    // Bit 3: the argument is a bare $time / $stime / $realtime call, which
+    //        rt_monitor_emit leaves out of its change detection.
     uint32_t flags;
     // Value plane (definitely-1 bits), or an rt_string* / double-bits word per
     // the flags above.
@@ -78,8 +80,9 @@ void* rt_strobe_pop(void);
 // as its first argument (replacing any prior registration). Each settled instant
 // the Postponed-region drain queries rt_monitor_active_ramp and, if non-null, ramps
 // + resumes that body with rt_monitor_active_record, which renders its arguments
-// and calls rt_monitor_emit — which prints only when the rendered output changed
-// since the last emit. $monitoron/$monitoroff map to rt_monitor_enable.
+// and calls rt_monitor_emit — which prints only when the value of an argument
+// changed since the last emit, ignoring the $time / $stime / $realtime arguments
+// (rt_arg flags bit 3). $monitoron/$monitoroff map to rt_monitor_enable.
 void  rt_monitor_set(void* ramp, void* record);
 void  rt_monitor_enable(int32_t on);
 void* rt_monitor_active_ramp(void);

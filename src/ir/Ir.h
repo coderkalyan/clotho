@@ -871,6 +871,10 @@ struct SwitchInfo {
 struct FmtArg {
     Index value;
     bool  is_signed = false;
+    // The argument is a bare $time / $stime / $realtime call. $monitor does not
+    // print when only such an argument changed (LRM 21.2.2), so a monitor_emit
+    // leaves it out of its change detection. Set only for a monitor body.
+    bool  is_time = false;
 };
 
 // Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
@@ -889,7 +893,8 @@ struct DisplayInfo {
     uint32_t newline;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
-    // One word per operand of `args`: 1 when it prints as a signed number.
+    // One word per operand of `args`: bit 0 is set when it prints as a signed
+    // number, bit 1 when it is a FmtArg::is_time operand.
     ExtraSlice signs;
 };
 
@@ -2171,8 +2176,8 @@ struct Inst {
         MonitorSet,
         // The change-detecting print inside a monitor body (payload: op_extra — op
         // is the destination descriptor, extra a DisplayInfo). Renders the format +
-        // args and emits to the descriptor only if the output changed since the
-        // last emit (rt_monitor_emit).
+        // args and emits to the descriptor only if the value of an argument other
+        // than a FmtArg::is_time one changed since the last emit (rt_monitor_emit).
         MonitorEmit,
         // $monitoron / $monitoroff (payload: none): enable / disable the monitor.
         MonitorOn,

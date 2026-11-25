@@ -47,7 +47,8 @@ llvm::FunctionCallee Backend::strobe_pop_fn() {
 // -- $monitor (LRM 21.2.2) --
 
 // rt_monitor_emit(i32 desc, ptr fmt, i32 argc, ptr argv) — like rt_fwrite but
-// prints only when the rendered output differs from the last (LRM 21.2.2).
+// prints only when an argument value other than a $time one changed since the
+// last emit (LRM 21.2.2).
 llvm::FunctionCallee Backend::monitor_emit_fn() {
     auto* i32 = b_.getInt32Ty();
     return rt_fn("rt_monitor_emit", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });

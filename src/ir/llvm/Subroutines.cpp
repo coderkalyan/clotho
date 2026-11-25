@@ -2505,11 +2505,13 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
         const Plane   p    = value_of(args[k]);
         const ValueType t    = type_of(args[k]);
         llvm::Value*  elt  = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+        // FmtArg::is_time (signs bit 1) becomes rt_arg flags bit 3.
+        const uint32_t time_flag = (signs[k] & 2u) << 2;
         if (t.is_string) {
             // A string-object argument (%s): flag bit 1, val = the rt_string
             // handle pointer itself; the width / plane fields are unused.
             store_field(sty, elt, 0, b_.getInt32(0));
-            store_field(sty, elt, 1, b_.getInt32(2));
+            store_field(sty, elt, 1, b_.getInt32(2u | time_flag));
             store_field(sty, elt, 2, str_of(args[k]));
             store_field(sty, elt, 3, null);
             store_field(sty, elt, 4, null);
@@ -2524,7 +2526,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
                 fv = b_.CreateFPExt(fv, b_.getDoubleTy());
             }
             store_field(sty, elt, 0, b_.getInt32(64));
-            store_field(sty, elt, 1, b_.getInt32(0b101u));
+            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag));
             store_field(sty, elt, 2, put(b_.CreateBitCast(fv, i64), 1));
             store_field(sty, elt, 3, null);
             store_field(sty, elt, 4, null);
@@ -2538,7 +2540,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
         llvm::Value* must = must_of(p, t.four_state);
         llvm::Value* xz   = b_.CreateXor(must, may_of(p, t.four_state));
         store_field(sty, elt, 0, b_.getInt32(t.width));
-        store_field(sty, elt, 1, b_.getInt32(signs[k] != 0 ? 1u : 0u));
+        store_field(sty, elt, 1, b_.getInt32((signs[k] & 1u) | time_flag));
         store_field(sty, elt, 2, put(must, words[k]));
         store_field(sty, elt, 3, put(xz, words[k]));
         store_field(sty, elt, 4, put(z_of(p, t.four_state), words[k]));

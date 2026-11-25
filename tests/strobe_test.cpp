@@ -275,6 +275,107 @@ TEST_CASE("$monitor on/off and replacement") {
     )") == "mon1 a=0\nmon1 a=1\nmon1 a=2\nmon1 a=3\nmon2 b=0\nmon2 b=7\n");
 }
 
+// $monitor does not print when only $time, $stime or $realtime changed: the
+// time argument rides along when something else prints. Oracle: Icarus Verilog
+// 13 prints the same three lines.
+TEST_CASE("$monitor ignores a changing $time argument") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $monitor("t=%0t a=%0d", $time, a);
+            #1 a = 1;
+            #1; #1;
+            #1 a = 2;
+            #1 $finish;
+          end
+        endmodule
+    )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\n");
+}
+
+// The three time functions are all excluded, in any position. Oracle: Icarus
+// Verilog 13.
+TEST_CASE("$monitor ignores $stime and $realtime arguments") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $monitor("stime=%0d rt=%0t a=%0d", $stime, $realtime, a);
+            #1 a = 1; #2; #1 a = 2;
+            #1 $finish;
+          end
+        endmodule
+    )") == "stime=0 rt=0 a=0\nstime=1 rt=1 a=1\nstime=4 rt=4 a=2\n");
+}
+
+// With no argument but time, the monitor prints once, when it is armed. Oracle:
+// Icarus Verilog 13.
+TEST_CASE("$monitor of only $time prints once") {
+    CHECK(run_capture(R"(
+        module m;
+          initial begin
+            $monitor("only time %0t", $time);
+            #1; #1;
+            #1 $finish;
+          end
+        endmodule
+    )") == "only time 0\n");
+}
+
+// Change is a change of value, not of rendered text: %c prints the low byte, so
+// a change of the upper byte renders the same line again. Oracle: Icarus
+// Verilog 13 prints the line four times.
+TEST_CASE("$monitor prints again when a value changes but renders alike") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [15:0] v = 16'h0141;
+          initial begin
+            $monitor("c=%c", v);
+            #1 v = 16'h0241;
+            #1 v = 16'h0242;
+            #1 v = 16'h0342;
+            #1 $finish;
+          end
+        endmodule
+    )") == "c=A\nc=A\nc=B\nc=B\n");
+}
+
+// $monitoron reprints the current values immediately, also while the monitor is
+// already on, and the reprint carries the current time. Oracle: Icarus Verilog 13.
+TEST_CASE("$monitoron reprints with a $time argument") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $monitor("t=%0t a=%0d", $time, a);
+            #1 a = 1;
+            #1 $monitoroff;
+            #1 a = 2;
+            #1 $monitoron;
+            #1; #1 $monitoron;
+            #1 a = 3;
+            #1 $finish;
+          end
+        endmodule
+    )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\nt=6 a=2\nt=7 a=3\n");
+}
+
+// $fmonitor takes the same change detection as $monitor. Oracle: Icarus Verilog 13.
+TEST_CASE("$fmonitor ignores a changing $time argument") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $fmonitor(1, "t=%0t a=%0d", $time, a);
+            #1 a = 1;
+            #2;
+            #1 a = 2;
+            #1 $finish;
+          end
+        endmodule
+    )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\n");
+}
+
 // $monitor pends its body the same way $strobe does, so it needs the same record
 // slot a plain function has not got; guard loud (like $strobe).
 TEST_CASE("$monitor in a function is rejected") {

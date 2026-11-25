@@ -1970,8 +1970,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // $monitor (LRM 21.2.2): at every settled instant, if a monitor is
     // registered and enabled, ramp its body here (in the Postponed region) and
     // resume it. The body renders its argument list and prints only when the
-    // output changed since the last emit (rt_monitor_emit), giving the "print
-    // once per time step on any argument change" semantics. The body never
+    // argument values changed since the last emit (rt_monitor_emit; $time and its
+    // kin excepted), giving the "print once per time step on any argument
+    // change" semantics. The body never
     // suspends (timing controls in the arg list are rejected), so one resume
     // runs it to completion. Ramping is indirect: rt_monitor_active_ramp yields
     // the registered body's ramp function pointer (or null), which we call with

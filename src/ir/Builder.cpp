@@ -907,7 +907,7 @@ ExtraSlice Builder::add_fmt_args(std::span<const FmtArg> args, ExtraSlice& signs
     flags.reserve(args.size());
     for (const FmtArg& a : args) {
         values.push_back(a.value);
-        flags.push_back(a.is_signed ? 1u : 0u);
+        flags.push_back((a.is_signed ? 1u : 0u) | (a.is_time ? 2u : 0u));
     }
     signs = add_u32_slice(flags);
 

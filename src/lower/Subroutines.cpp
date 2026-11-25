@@ -1541,7 +1541,7 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
         }
         std::string            fmt;
         std::vector<ir::FmtArg> fargs;
-        build_format(args, fmt, fargs, b, default_conv);
+        build_format(args, fmt, fargs, b, default_conv, {}, monitor);
         if (monitor) {
             b.monitor_emit(desc, fmt, fargs, l);
         } else if (fd_arg) {

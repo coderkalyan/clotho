@@ -526,7 +526,7 @@ public:
     // time step in the Postponed region. A statement.
     Index monitor_set(FunctionId func, SourceLoc loc);
     // The change-detecting print inside a monitor body: render `fmt`+`args` and
-    // emit to `fd` only if the rendered output changed since the last emit.
+    // emit to `fd` only if an argument value other than a time one changed since the last emit.
     Index monitor_emit(Index fd, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // $monitoron (on=true) / $monitoroff (on=false): enable / disable the monitor.
     Index monitor_enable(bool on, SourceLoc loc);

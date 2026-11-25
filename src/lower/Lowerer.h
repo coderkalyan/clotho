@@ -3991,7 +3991,8 @@ private:
                       std::vector<ir::FmtArg>&           args,
                       ir::Builder&                       b,
                       char                               default_conv = 'd',
-                      std::string_view                   lead_text    = {});
+                      std::string_view                   lead_text    = {},
+                      bool                               monitor      = false);
 
     static char display_radix(std::string_view name, std::string_view base);
 
