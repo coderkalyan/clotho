@@ -288,7 +288,9 @@ uint64_t design_min_precision_fs(const InstanceSymbol& inst);
 
 bool scope_declares_subroutine(const Scope& scope);
 
-uint64_t global_scope_tick_fs(const Scope& scope, bool& any_explicit);
+uint64_t global_scope_tick_fs(const Scope& scope, const slang::TimeScale& ts);
+
+std::optional<slang::TimeScale> effective_time_scale(const Scope& scope, bool timed);
 
 int32_t fs_to_unit_exponent(uint64_t fs);
 
@@ -1555,7 +1557,7 @@ private:
 
     static bool aggregate_has_field_defaults(const slang::ast::Type& t);
 
-    void emit_var_field_defaults(const VariableSymbol& vs, ir::Index lv, ir::Builder& b, ir::SourceLoc l);
+    void emit_field_defaults(ir::Index lv, const slang::ast::Type& sv_type, ir::Builder& b, ir::SourceLoc l);
 
     void emit_string_literal_array_store(ir::Index        lhs,
                                          ir::Ref          type,
@@ -2550,11 +2552,17 @@ private:
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
-    bool subroutine_waits_on_event(const SubroutineSymbol& sub);
-
     void flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l);
 
     bool design_virtual_forks(slang::ast::Compilation& comp);
+
+    bool design_has_reports(slang::ast::Compilation& comp);
+
+    bool task_flushes_reports();
+
+    bool subroutine_reports(const SubroutineSymbol& sub);
+
+    bool body_may_report(const Statement& body);
 
     bool design_virtual_parks(slang::ast::Compilation& comp);
 
@@ -2640,7 +2648,8 @@ private:
 
     void require_finish_inlinable(const Statement& action);
 
-    ir::FunctionId build_action_body(const Statement& body, std::string_view name);
+    ir::FunctionId build_action_body(const Statement& body, std::string_view name,
+                                     std::optional<uint32_t> expect_monitor = std::nullopt);
 
     ir::FunctionId build_default_fail_body(const ir::AssertionMonitor& mon);
 
@@ -2704,6 +2713,9 @@ private:
         ir::Signal passing{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
+        // Attempt tally, for the same: the clocking edges an evaluation of the
+        // property started on (not disabled, not $assertoff).
+        ir::Signal attempts{ 0 };
         // -- `expect` only (LRM 16.17), both absent for every other directive. --
         //
         // The pending REQUEST: a process executing the statement sets it, and the
@@ -3066,6 +3078,7 @@ private:
                           ir::Index           seeding,
                           ir::Index           active,
                           ir::Index           verdict,
+                          ir::Index           wake,
                           ir::Builder&        b,
                           ir::SourceLoc       l);
 
@@ -3076,7 +3089,29 @@ private:
 
     void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st, const AssertionActions& act);
 
+    void emit_cover_attempt(const MonitorState& st, ir::Index active, ir::Index edge, ir::Builder& b, ir::SourceLoc l);
+
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b);
+
+    // -- Cover statistics (docs/design/functional-coverage.md, "Cover statements") --
+    //
+    // A `cover` site keeps its counts in hidden signals of its instance and files them at
+    // the end of the run as an ir::Severity::Cover record (a Final process), which is
+    // what the `--coverage` report lists. `fmt` names the site to the runtime: the
+    // record's operation, its kind, an ordinal per instance, and its source location.
+    ir::Signal  new_cover_counter(ir::SourceLoc l);
+    void        bump_cover_counter(ir::Signal counter, ir::Builder& b, ir::SourceLoc l);
+    std::string cover_site_fmt(char op, std::string_view kind, const std::string& banner, uint32_t ordinal) const;
+    void        emit_cover_record(const std::string&         banner,
+                                  const std::string&         fmt,
+                                  std::span<const ir::Signal> counters,
+                                  ir::SourceLoc              l,
+                                  uint32_t                   defer,
+                                  ir::Builder&               b);
+    void        add_cover_report(const std::string&         banner,
+                                 const std::string&         fmt,
+                                 std::span<const ir::Signal> counters,
+                                 ir::SourceSpan             span);
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b);
 
@@ -5080,7 +5115,8 @@ private:
           , blocks_(l.named_blocks_, {})
           , root_(l.proc_root_block_, nullptr)
           , depth_(l.loop_depth_, 0)
-          , defers_(l.proc_defers_, false) {}
+          , defers_(l.proc_defers_, false)
+          , flushes_(l.proc_flushes_, false) {}
 
     private:
         Restore<FnCtx*>                 ctx_;
@@ -5088,6 +5124,7 @@ private:
         Restore<const Symbol*>          root_;
         Restore<uint32_t>               depth_;
         Restore<bool>                   defers_;
+        Restore<bool>                   flushes_;
     };
 
     // The PreInit segment of the instance that declares a static, while the
@@ -5155,36 +5192,58 @@ private:
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
 
+    // The scope a DPI subroutine declared in `scope` belongs to (LRM 35.5.3, H.9.2:
+    // the subroutine's fully qualified name minus its own), spelled as
+    // ir::Function::dpi_scope spells it: free of the instance that holds it.
+    static std::string dpi_scope_text(const Scope& scope);
+
+    // One `export "DPI-C"` directive found in a scope: the subroutine it names and the
+    // c_identifier it exports it as.
+    struct DpiExportDecl {
+        const SubroutineSymbol* sub;
+        std::string             cid;
+    };
+
+    // The export directives of `scope`, resolved to the subroutines they name. slang
+    // resolves them too (Compilation::getDPIExports) but keeps one per c_identifier,
+    // and only for the scopes it elaborates, which leaves out every instance whose
+    // body duplicates an earlier one: a c_identifier exported from several scopes
+    // (LRM 35.4) would arrive as its first scope alone. The directive is not a member
+    // of the scope, so it is read from the syntax slang built the scope from.
+    static void scan_dpi_exports(const Scope& scope, std::vector<DpiExportDecl>& out);
+
+    // The directives of every scope this Lowerer walked, noted by lower_members as it
+    // meets each scope and consumed by collect_dpi_exports.
+    std::vector<DpiExportDecl> dpi_export_decls_;
+
     // Collect `export "DPI-C"` directives (LRM 35.5 / 35.8): for each, force-lower
     // the SV subroutine and record a DpiExport so the backend emits its C-callable
-    // thunk. slang resolves the export -> subroutine binding and the c_identifier
-    // (Compilation::getDPIExports). Scope: functions AND tasks; input/output/inout
+    // thunk. Scope: functions AND tasks; input/output/inout
     // scalar / chandle / real / packed-vector args; input string args;
     // scalar/chandle/real/void return. LRM 35.8 puts a task under exactly 35.7's
     // argument rules, so every guard below applies to one unchanged. Deferred
     // (loud-fail): string return (returned-char* lifetime), output/inout string,
     // open-array/unpacked args. Public: called by lower_compilation.
     //
-    // getDPIExports is compilation-wide, but every top has its own Lowerer that only
-    // knows its own symbols, and instance binding is baked into the lowered body (the
-    // backend addresses each signal absolutely off that instance's own state global).
-    // So an export must be collected by the Lowerer of the top containing it: `top`
-    // admits this top's module-scope exports, and `collect_globals` — true on exactly
-    // one call — admits the $unit/package exports, which have no instance multiplicity
+    // Every top has its own Lowerer that only knows its own symbols, and instance
+    // binding is baked into the lowered body (the backend addresses each signal
+    // absolutely off that instance's own state global). So an export must be
+    // collected by the Lowerer of the top containing it: the directives of the scopes
+    // this Lowerer walked are its own, and `collect_globals` — true on exactly one
+    // call — adds the $unit/package exports, which have no instance multiplicity
     // (LRM 6.8) and lower once through the shared globals Lowerer function_id
-    // delegates to. `top` is nullable: a design with no elaborated top module at all
-    // (e.g. an interface-only file bound into a package, LRM 23.4 -- a real shape,
-    // not a degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
+    // delegates to. A design with no elaborated top module at all (e.g. an
+    // interface-only file bound into a package, LRM 23.4 -- a real shape, not a
+    // degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
     // single top-less interface) still has $unit/package exports to collect, and the
-    // caller passes null with collect_globals=true exactly once for it, since there is
-    // no "first top" to piggyback the one-time collection on. A null top can never
-    // equal a module-scope export's real owning instance, so the module-scope branch
-    // below just skips every such export via the same `continue` an ordinary
-    // wrong-top mismatch already takes -- correctly, since a design with no top module
-    // has no module-scope subroutine any export could belong to either.
+    // caller collects them once through the globals Lowerer, since there is no
+    // "first top" to piggyback the one-time collection on.
+    //
+    // One c_identifier may be exported from several scopes (LRM 35.4): each scope's
+    // directive becomes a DpiExport of its own and the backend makes one thunk that
+    // dispatches on the current scope (docs/design/dpi-c.md, "Scopes").
 public:
-    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol* top,
-                             bool collect_globals);
+    void collect_dpi_exports(const slang::ast::Compilation& comp, bool collect_globals);
 
 private:
     void apply_time_scale(const Scope& scope);
@@ -5613,6 +5672,10 @@ private:
         // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
         bool    is_agg = false;
         ir::Ref agg_ty = ir::Ref::Invalid;
+        // A queue output / inout formal whose actual is a BOUNDED queue, passed via a
+        // temp so the copy-back is a whole-queue assignment that truncates to the actual's
+        // bound (the callee only knows its formal's own, usually unbounded, type).
+        bool is_bounded_queue = false;
     };
 
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
@@ -5786,9 +5849,17 @@ private:
     // reports it queued (LRM 16.4.2), and lower_event_wait / lower_wait_stmt say so.
     // Set per procedural block; false inside a subroutine body (FnScope).
     bool proc_defers_ = false;
-    // Memoized "calling this can wait on an event control or a wait statement", see
-    // subroutine_waits_on_event.
-    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_event_waits_;
+    // Whether its own body holds a deferred assertion or a unique/priority statement,
+    // whose pending reports an event control or wait statement in it flushes (LRM
+    // 16.4.2). Unlike proc_defers_ it never refuses anything. Set per procedural block;
+    // false inside a subroutine body (FnScope).
+    bool proc_flushes_ = false;
+    // Whether the design has a deferred assertion or a unique/priority statement
+    // anywhere (design_has_reports); computed on first use.
+    std::optional<bool> design_has_reports_;
+    // Memoized "calling this can reach a deferred assertion or unique/priority statement", see
+    // subroutine_reports.
+    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_reports_;
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;

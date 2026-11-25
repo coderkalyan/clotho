@@ -583,14 +583,24 @@ own a3 / a4 example relies on a delay not flushing). `wait fork` and `wait_order
 `wait_statement`s in the grammar but the clause does not say they are meant, so a
 process holding a deferred assertion is refused them.
 
-A task cannot reach its caller's counter, so a process holding a deferred assertion is
-refused a call to a task that can wait on an event control or a wait statement
-(`subroutine_waits_on_event`, transitive; a virtual task called anywhere along the way
-counts, directly or through another task or method, since the body read is the declared
-method's and any override may be the one that waits). A task that only delays is
-unaffected. Closing this takes
-the generation threaded through the task ABI, the same gap as a deferred assertion
-inside a task.
+A task does not hold its caller's counter, so the running thread's report generation is
+published through one global (`clotho.gen`, `Backend::gen_global`), made only in a design
+that has a unique/priority report or a deferred assertion. A process group stores its own
+counter there at each activation and after each park (`emit_suspend`); a task reads it in
+its ramp, while the caller is still the running thread, keeps it in its frame, republishes
+it after each of its own parks and bumps it where an event control or `wait` in it
+resumes (`DeferFlush`, which the frontend emits in a task only in such a design,
+`task_flushes_reports`). A function just reads it: it cannot park. Which bodies take part
+is a closure over the call graph (`DesignFacts::fn_gen`, `ProcessFacts::gen_counter`),
+with a virtual call counting as a call of every virtual method. A fork child is a thread of
+its own and publishes a counter cell of its own from a runtime pool when it can reach a
+report (`rt_gen_cell_alloc`, released in its cleanup, its pending reports then maturing),
+else null; a body the runtime ramps itself (`$strobe`, `$monitor`, an action block)
+publishes null, since nothing can flush it. A unique/priority report carries the
+published pointer and its value (`rt_observed_case_violation`) and is dropped at the
+Observed flush if the counter has moved on. Processes that hold a counter do not fuse
+(`compute_fusion_groups`): a fused group would share one counter between members that
+activate separately.
 
 ## Hazards
 

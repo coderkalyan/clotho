@@ -778,9 +778,24 @@ void Lowerer::emit_const_seed(ir::Index                   lhs,
             // container or an aggregate would need a temp built per entry.
             fail("a constant queue of aggregate or container elements is not supported");
         }
-        b.queue_delete(lhs, lhs, /*has_idx=*/false, ty, l);
+        // A literal longer than a bounded queue holds is built whole in an unbounded temp and
+        // assigned once, so it reports one overflow with its full count (LRM_NOTES 6) rather
+        // than one per element past the bound.
+        const bool overflows = t.left != 0 && cv.queue()->size() > static_cast<size_t>(t.left) + 1;
+        ir::Ref    build_ty  = ty;
+        ir::Index  build     = lhs;
+        if (overflows) {
+            ir::Type unbounded = t;
+            unbounded.left     = 0;
+            build_ty           = module_.pool.put(ir::Item{ unbounded });
+            build              = make_arg_temp(build_ty, b, l);
+        }
+        b.queue_delete(build, build, /*has_idx=*/false, build_ty, l);
         for (const slang::ConstantValue& e : *cv.queue()) {
-            b.queue_push(lhs, b.constant(lower_constant(e, et), l), /*front=*/false, ty, l);
+            b.queue_push(build, b.constant(lower_constant(e, et), l), /*front=*/false, build_ty, l);
+        }
+        if (overflows) {
+            b.queue_copy(lhs, build, ty, l);
         }
         return;
     }
@@ -1726,6 +1741,19 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
             const ir::Index val = coerce(lower_expr(*init, pb), *init->type, pty, pb, il);
             pb.binary(ir::Inst::Tag::Store, dst, val, il);
         }
+        home_init.commit();
+    } else if (aggregate_has_field_defaults(prop.getType())) {
+        // No initializer of its own: the field-level defaults its struct type
+        // declares (LRM 7.2.1), once, as for a module-level variable.
+        HomePreInit home_init(*this, home);
+        if (!preinit_) {
+            preinit_.emplace(module_);
+        }
+        const ir::SourceLoc                    pl = to_source_loc(prop.location);
+        const Restore<FnCtx*>                  no_frame(fn_ctx_, nullptr);
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
+        emit_field_defaults(preinit_->signal(sig, pl), prop.getType(), *preinit_, pl);
         home_init.commit();
     }
     return sig;

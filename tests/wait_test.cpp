@@ -1281,3 +1281,38 @@ TEST_CASE("wait on a captured event's triggered fails loudly") {
     CHECK(lower_error(src).find("fork-captured automatic 'e' of type event is not supported") !=
           std::string::npos);
 }
+
+// A write through a `ref` to a container ELEMENT wakes the waiters of the container's signal at the
+// write (LRM 9.4.2, 13.5.2): the element lvalue derived from the formal keeps the formal's wake thunk.
+// Oracle: derived from the clauses (iverilog has no `ref` ports).
+TEST_CASE("a write through a ref to a container element wakes its waiter at the write") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$] = '{0, 0};
+            int d[] = new[2];
+            string sq[$] = '{"a", "b"};
+            int nq[$][$] = '{'{0}, '{0}};
+            task automatic wq(ref int r[$]);     #1 r[1] = 5;  #1 r[1] = 0; endtask
+            task automatic wd(ref int r[]);      #1 r[1] = 5;  endtask
+            task automatic ws(ref string r[$]);  #1 r[1] = "z"; endtask
+            task automatic wn(ref int r[$][$]);  #1 r[1].push_back(3); endtask
+            initial begin wait (q[1] == 5); $display("q %0t", $time); wait (q[1] == 0); $display("q0 %0t", $time); end
+            initial begin wait (d[1] == 5); $display("d %0t", $time); end
+            initial begin wait (sq[1] == "z"); $display("s %0t", $time); end
+            initial begin wait (nq[1].size() == 2); $display("n %0t", $time); end
+            initial begin
+                wq(q);
+                wd(d);
+                ws(sq);
+                wn(nq);
+                #2 $finish;
+            end
+        endmodule
+    )";
+    const std::string out = run_capture_finish(src);
+    CHECK(out.find("q 1\n") != std::string::npos);
+    CHECK(out.find("q0 2\n") != std::string::npos);
+    CHECK(out.find("d 3\n") != std::string::npos);
+    CHECK(out.find("s 4\n") != std::string::npos);
+    CHECK(out.find("n 5\n") != std::string::npos);
+}

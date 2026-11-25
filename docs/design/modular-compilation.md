@@ -332,6 +332,10 @@ between instances:
 - the flat ids of the `disable` targets and covergroup types it declares, which a
   unit's code names by position (a hierarchical `disable` of another instance's
   block, or a covergroup of one, still names a symbol of that instance);
+- the DPI scope index of each `context` import it declares (LRM 35.5.3), which a call of
+  the import sets as the current scope for its duration: a unit's code reads it by the
+  import's position, so it names no scope and the unit's instances still share it
+  (docs/design/dpi-c.md, "Scopes");
 - one binding per extern declaration: the address of an imported signal, the
   record of the instance that owns it (only carried, into a deferred write's
   record) and the address of the signal's **port** in that record, and the record

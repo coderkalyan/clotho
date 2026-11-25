@@ -56,6 +56,7 @@
 #include "ir/Typing.h"
 #include "runtime/Gc.h"
 #include "runtime/Runtime.h"
+#include "runtime/Trace.h"
 
 // LLVM backend rationale.
 //
@@ -394,6 +395,11 @@ struct LValueInfo {
     // and its out-of-range sink. Only set for a container ELEMENT; a handle leaf
     // inside an aggregate leaves it invalid.
     Ref handle_type{};
+    // A queue reached through a `ref` formal: the max index of the queue the ACTUAL is
+    // (i64, 0 unbounded), passed beside the reference, since the formal's own type says
+    // nothing of it (slang does not make the bound part of a queue's type). Null for any
+    // other queue, whose bound is its type's.
+    llvm::Value* queue_bound = nullptr;
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
     // GEP index vector from `base` to the current sub-object (a leaf slot once a
@@ -541,6 +547,12 @@ struct LValueInfo {
     // down the mm-snapshot path with a null base.
     bool   mut_sig_valid = false;
     Signal mut_sig{ 0 };
+    // A write through a `ref` formal wakes the waiters of the actual at the write, by calling the
+    // wake thunk the call passed (null at run time when the actual has none):
+    // `void(ptr ctx, old mm, [old z,] new mm, [new z])`. Set only on the lvalue of a scalar ref
+    // formal, in a design where some ref actual has waiters (design_ref_wake_).
+    llvm::Value* ref_wake_fn  = nullptr;
+    llvm::Value* ref_wake_ctx = nullptr;
 
     // Whether a range mask decides which of the selected bits are in range.
     bool masked() const {
@@ -1183,6 +1195,14 @@ struct Anchor {
     // the wake of an `expect`, both code of the unit, name no monitor of the design.
     std::vector<uint32_t> expect_locals;
     uint32_t              ctx_expect_base = 0;
+    // The `context` DPI imports the instance's unit declares (its functions that are
+    // DPI imports with the context property, in the unit's order) and, one i32 field
+    // each at ctx_dpi_base + ordinal, the DPI scope each runs in: the index main
+    // registers the scope under, which a call of the import makes current (LRM
+    // 35.5.3). Data of the record, so the code of a unit that calls one names no scope
+    // and is the same for every instance.
+    std::vector<FunctionId> dpi_ctx_locals;
+    uint32_t                ctx_dpi_base = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -1255,7 +1275,12 @@ struct RefActual {
 struct RefBinding {
     llvm::Value* slot  = nullptr;
     llvm::Value* chain = nullptr;
+    // A queue formal's actual's bound, passed as a third word; null for any other.
+    llvm::Value* bound = nullptr;
     std::string  formal;
+    // The wake thunk and context the call passed (design_ref_wake_ only).
+    llvm::Value* wake_fn  = nullptr;
+    llvm::Value* wake_ctx = nullptr;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level and
@@ -1634,7 +1659,8 @@ private:
 
     bool is_handle_type(Ref type) const;
     llvm::StructType* handle_slot_ty(Ref type);
-    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type);
+    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type,
+                            const SourceText& at = SourceText{ .where = "<unknown>" }, std::string_view name = {});
     void emit_handle_delete(llvm::Value* handle, Ref type);
     llvm::Value* handle_sink_global(Ref elem_type);
 
@@ -1836,8 +1862,8 @@ private:
     static constexpr uint32_t no_bind = ~0u;
     uint32_t                  binding_of(const SignalSlot& s);
 
-    // One field of the own instance's record, whatever instance context is
-    // installed for another instance's signals.
+    // One fixed field (see fixed_field_load) of the own instance's record,
+    // whatever instance context is installed for another instance's signals.
     llvm::Value* own_field(uint32_t field, llvm::Type* ty);
 
     // The constant address of a signal's storage, as a binding is filled with.
@@ -1885,6 +1911,15 @@ private:
 
     llvm::GlobalVariable* ensure_ctx(Anchor& a);
 
+    // A load of an instance-record field that fill_instance_records gives its
+    // value at compile time, as the initializer of the record's global: every
+    // field but the wake words and the defer counters. No code stores to one, so
+    // at tier 0 the load is `!invariant.load` and stays available across the
+    // stores between two reads of it.
+    llvm::LoadInst* fixed_field_load(llvm::Type* ty, llvm::Value* ptr);
+
+    // A fixed field (see fixed_field_load) of the record the body being emitted
+    // reaches for `a`. Never a wake word or a defer counter.
     llvm::Value* ctx_field(Anchor& a, uint32_t field, llvm::Type* ty);
 
     // The address of a field of the instance record ctx_field reads.
@@ -1955,6 +1990,14 @@ private:
     RefActual ref_actual_arg(const Guarded& raw, Ref type);
 
     llvm::Value* ref_witness_chain(const RefActual& ra);
+
+    // The bound word a queue `ref` formal is passed: the actual's own (a ref formal passed
+    // on keeps the one it was given), else its declared type's.
+    llvm::Value* ref_queue_bound(const Guarded& actual, Index actual_ix);
+
+    // The max index a queue operation on `lv` enforces: the bound a `ref` formal was passed
+    // if `lv` is one, else `type_bound`, its declared type's.
+    llvm::Value* queue_bound_of(const LValueInfo& lv, uint64_t type_bound);
 
     llvm::Value* ref_actual_ptr(const Guarded& lv, Ref type);
 
@@ -2111,7 +2154,95 @@ private:
     llvm::Function* enqueue_trampoline();
     void build_enqueue_trampoline();
 
-    void emit_suspend(const char* label);
+    // -- The scheduler trace (docs/design/scheduler-trace.md) --
+    //
+    // Each emit_trace_* helper plants one call into the runtime's checker (runtime/Trace.h) in a
+    // build with CLOTHO_EXTRA_ASSERTS when the config asks for the check, and emits nothing
+    // otherwise, so the code a shipped build generates is unchanged. A park site cannot compile
+    // without saying what it parks for (TracePark), nor a wake site without its cause
+    // (TraceCause).
+
+    // What a park waits for. `kind` is RT_TRACE_CTL_*.
+    struct TracePark {
+        uint32_t                  kind  = 0;
+        // An event control: its list, from the IR facts and not from the buckets.
+        std::span<const WaitEdge> edges = {};
+        // A delay control: the ticks, an i64 (0: the `#0` region).
+        llvm::Value*              delay = nullptr;
+        // Where the construct is, when it is not the instruction being lowered.
+        const SourceText*         where = nullptr;
+    };
+
+    // What pushed an activation: RT_TRACE_*, and what it names -- the signal a store wrote and
+    // the change it made (RT_TRACE_POS ...) for a bucket's scan, the object for an event's.
+    struct TraceCause {
+        uint32_t              kind = 0;
+        std::optional<Signal> sig  = std::nullopt;
+        uint32_t              fact = 0;
+        llvm::Value*          obj  = nullptr;
+    };
+
+    bool trace_on() const;
+
+    // Where the instruction being lowered is, for a control or an origin.
+    std::string trace_here();
+
+    // `where` as the control of a park names it.
+    std::string trace_where(const TracePark& park);
+
+    // Where process `proc` is, for the control of its static subscription: its span, resolved.
+    SourceText trace_process_text(const Process& proc);
+
+    // A NUL-terminated string constant of module `m`, once per text.
+    llvm::Constant* trace_string(llvm::Module& m, const std::string& text);
+
+    // The constant record of a park site or an origin (rt_trace_control), in the module `m`.
+    llvm::Constant* trace_control(llvm::Module& m, uint32_t kind, const std::string& where);
+
+    // A signal's name as a constant string for a report, or a null pointer where the code that
+    // names it is shared by instances that bind it differently.
+    llvm::Constant* trace_signal_name(Signal sig);
+
+    // The entry of a list for one wait edge: the storage or object it names, and its name and
+    // edge.
+    struct TraceEntry {
+        llvm::Value* x;
+        llvm::Value* name;
+        uint32_t     edge;
+    };
+    TraceEntry trace_entry(const WaitEdge& e);
+
+    // A new activation: `a` is the handle its ramp returned, `parent` the creator's (null: none).
+    void emit_trace_spawn(llvm::IRBuilder<>& b, llvm::Value* a, uint32_t origin, const std::string& where,
+                          llvm::Value* parent);
+
+    // The park of the body being lowered. Returns its control, which the resume names; null when
+    // nothing is emitted.
+    llvm::Constant* emit_trace_park(const TracePark& park);
+
+    void emit_trace_wake(llvm::IRBuilder<>& b, llvm::Value* a, const TraceCause& why);
+
+    // Whether the dispatch of `a` may go on (an i1), or null when nothing is emitted.
+    llvm::Value* emit_trace_dispatch(llvm::IRBuilder<>& b, llvm::Value* a, uint32_t how);
+
+    void emit_trace_resume(llvm::Value* a, llvm::Constant* control);
+
+    void emit_trace_end(llvm::Value* a);
+
+    // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
+    void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
+
+    // The seed's reports of one row: the spawn of its handle `h`, its static list (`n` entries at
+    // `list`, from the IR's wait events) and, when `parked_now` (an i1), its park at the static
+    // control `ctl`, which is where a group that is not queued now waits.
+    void emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list, llvm::Value* n,
+                             llvm::Value* parked_now);
+
+    // One event the seed links a persistent waiter onto joins the static list of the group `h`.
+    void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
+
+    // Every park of a coroutine goes through here, and says what it parks for.
+    void emit_suspend(const char* label, const TracePark& park);
 
     void lower_delay(Index amount);
 
@@ -2136,13 +2267,13 @@ private:
 
     void emit_dynamic_register(Signal sig, uint32_t edge);
 
-    void emit_wait_suspend();
+    void emit_wait_suspend(const TracePark& park);
 
     void lower_wait(ExtraIndex info);
 
     // The events of an intra-body wait, from a Wait op (lower_wait) or, for a process that
     // waits at its head (waits_at_head), from its leading list.
-    void lower_wait_edges(std::span<const WaitEdge> events);
+    void lower_wait_edges(std::span<const WaitEdge> events, const SourceText* where = nullptr);
 
     // The one place a body arms its process's wake word before a park (TagInfo::arms_wake).
     void emit_arm_wake_word();
@@ -2179,6 +2310,10 @@ private:
     void emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
     bool has_preponed() const;
+
+    // Whether the design files a `cover` site's counts (ir::Severity::Cover), which is what
+    // makes a `--coverage` report worth publishing a model for with no covergroup.
+    bool has_cover_sites() const;
 
     bool has_observed() const;
 
@@ -2588,7 +2723,20 @@ private:
         // The words of a wide-select store's target it can touch, in place of `mm` /
         // `z`, which stay null (wide_window_snapshot).
         std::optional<WideWindow> wide;
+        // A write through a `ref` formal: the thunk and context to call after the write; `mm` /
+        // `z` hold the old words.
+        llvm::Value* ref_fn  = nullptr;
+        llvm::Value* ref_ctx = nullptr;
     };
+
+    // Append the wake thunk and context for ref actual `lv` to `argv` (design_ref_wake_ only).
+    // True when the callee wakes at each write, so the call must not service at its return.
+    bool push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref formal_type);
+
+    llvm::Function* emit_ref_wake_thunk(const LValueInfo& lv);
+
+    void emit_ref_wake_call(llvm::Value* fn, llvm::Value* ctx, llvm::Value* changed, llvm::Value* pos,
+                            llvm::Value* neg);
 
     ServiceSnapshot service_snapshot(const Guarded& lv);
 
@@ -2661,7 +2809,7 @@ private:
 
     void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel);
 
-    void emit_event_wake_list(llvm::Value* obj);
+    void emit_event_wake_list(llvm::Value* obj, const TraceCause& why);
 
     void emit_event_link(llvm::Value* obj, llvm::Value* node, llvm::Value* handle,
                          llvm::Value* flag, bool record_owner = true);
@@ -2848,7 +2996,7 @@ private:
 
     static bool ir_has_delay(const Ir& ir);
 
-    void emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked);
+    void emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked, const TraceCause& why);
 
     void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle);
 
@@ -2892,9 +3040,9 @@ private:
         b.SetInsertPoint(cont);
     }
 
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig);
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig, const TraceCause& why);
 
-    void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
+    void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
@@ -2960,6 +3108,8 @@ private:
 
     llvm::FunctionCallee finish_coop_fn();
     llvm::FunctionCallee observed_case_violation_fn();
+    llvm::FunctionCallee gen_cell_alloc_fn();
+    llvm::FunctionCallee gen_cell_free_fn();
     llvm::FunctionCallee observed_flush_fn();
     llvm::FunctionCallee severity_fn();
     llvm::FunctionCallee defer_report_fn();
@@ -3158,6 +3308,10 @@ private:
     llvm::FunctionCallee ring_overflow_fn();
     llvm::FunctionCallee dpi_export_task_suspended_fn();
     llvm::FunctionCallee dpi_export_task_no_task_frame_fn();
+    llvm::FunctionCallee dpi_export_no_scope_fn();
+    llvm::FunctionCallee svdpi_scope_enter_fn();
+    llvm::FunctionCallee svdpi_scope_leave_fn();
+    llvm::FunctionCallee svdpi_scope_index_fn();
     llvm::FunctionCallee wheel_now_fn();
     llvm::FunctionCallee wheel_schedule_rel_fn();
     llvm::FunctionCallee wheel_advance_fn();
@@ -3966,6 +4120,11 @@ private:
 
     std::string bounds_name(const LValueInfo& lv) const;
 
+    // The name a bounded-queue overflow report gives the queue `lv` addresses: its
+    // signal's, or empty for a queue with none to give (a frame local), and always empty
+    // for an unbounded queue, which never reports.
+    std::string queue_site_name(const LValueInfo& lv, uint64_t bound) const;
+
     void add_elem_bounds_check(LValueInfo& target, Index at, const LValueInfo& named, Index idx_expr,
                                llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent,
                                int32_t left = 0, int32_t right = 0);
@@ -4013,7 +4172,7 @@ private:
 
     llvm::Constant* tagged_site_global(const SourceText& at, const TaggedCheckInfo& info);
 
-    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what);
+    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what, std::string_view name = {});
 
     void lower_severity(Index i);
 
@@ -4131,6 +4290,22 @@ private:
     void emit_defer_gen_bump();
 
     void emit_defer_gen_bump_at(llvm::Value* gen);
+
+    // The report generation of the running thread (LRM 16.4.2), published for the
+    // bodies it calls: a process group publishes its own counter at each activation
+    // and resume, a task reads it at entry and republishes it after each resume, a
+    // function just reads it. Null where nothing can flush. Created only by a design
+    // with a unique/priority report, so any other design emits none of it.
+    llvm::Value* gen_global();
+
+    llvm::Value* load_gen();
+
+    void store_gen(llvm::Value* gen);
+
+    // The generation this body republishes after a resume, or null when it has none.
+    llvm::Value* body_gen();
+
+    bool fn_needs_gen(FunctionId id) const;
 
     // Any $monitor / $fmonitor registration in the design? Gates the per-instant
     // Postponed-region monitor run (see emit_active_run).
@@ -4263,6 +4438,16 @@ private:
 
     bool design_uses_dpi() const;
 
+    // The DPI scopes (LRM 35.5.3) in the order main registers them with the runtime,
+    // each scope's index being what a context import makes current and what an export
+    // that several scopes share dispatches on. build_dpi_scopes numbers them from the
+    // design's tops, exports and context imports; `declaring` is the function that
+    // sits in the scope (an export's, an import's) and `text` its dpi_scope.
+    void         build_dpi_scopes();
+    std::string  dpi_scope_name(const Function& declaring, const std::string& text) const;
+    uint32_t     dpi_scope_of(const Function& declaring, const std::string& text) const;
+    llvm::Value* dpi_scope_value(FunctionId callee);
+
     void emit_dpi_exports();
 
     llvm::Type* dpi_export_c_param_ty(DpiCType ct, ArgDir dir);
@@ -4283,7 +4468,9 @@ private:
     void emit_dpi_export_copyout(const std::vector<ExpOut>&       outs,
                                  const std::vector<llvm::Value*>& str_temps);
 
-    void emit_dpi_export(const DpiExport& ex);
+    // One C-callable thunk for a c_identifier, over the exports of it (one per scope that
+    // exports it, in the order the design declares them).
+    void emit_dpi_export(const std::vector<const DpiExport*>& targets);
 
     llvm::Value* dpi_arg_to_c(DpiCType t, Plane p, bool four);
 
@@ -5015,6 +5202,17 @@ private:
     // Per-group generation globals of a group that belongs to no instance, created
     // lazily; an instance's groups keep theirs in its record (Anchor::ctx_defer_base).
     std::vector<llvm::GlobalVariable*> defer_gen_gv_;
+    // The ptr global holding the running thread's report generation (gen_global).
+    llvm::GlobalVariable* gen_gv_ = nullptr;
+    // While lowering a task or function that needs the generation: the frame slot
+    // holding the pointer read at entry (a fork child's own cell), else null.
+    llvm::Value* gen_slot_ = nullptr;
+    // Whether some `ref` actual is a signal with waiters: every ref formal then takes a wake thunk
+    // and context after its witness chain, so a write wakes at the write, not at the call's return.
+    bool design_ref_wake_ = false;
+    std::map<const llvm::Function*, uint32_t> ref_wake_seq_;
+    // Per function: a body the runtime ramps on its own, which publishes no generation.
+    std::vector<uint8_t> gen_root_;
     // Whether any process of the design holds a deferred assertion (sizes the records).
     bool any_defer_ = false;
     // Who declares each flat `disable` target and covergroup type: the anchor and
@@ -5024,6 +5222,14 @@ private:
     // Who declares each flat `expect` monitor, and its ordinal among its unit's
     // own `expect`s (no_anchor for a monitor no instance declares).
     std::vector<std::pair<uint32_t, uint32_t>> expect_owner_;
+    // Who declares each flat context DPI import, and its ordinal among its unit's own
+    // (Anchor::dpi_ctx_locals); no_anchor for an import no instance declares.
+    std::vector<std::pair<uint32_t, uint32_t>> dpi_ctx_owner_;
+    // The names of the DPI scopes in registration order (build_dpi_scopes) and their
+    // index by name, behind "i:" for an instance's scope and "g:" for a package's or
+    // `$unit`'s so that a package and an instance of one name stay two scopes.
+    std::vector<std::string>                            dpi_scope_names_;
+    ankerl::unordered_dense::map<std::string, uint32_t> dpi_scope_index_;
     std::vector<int32_t>  vcd_index_;
 
     // Function declarations, indexed by FunctionId; filled before any body is
@@ -5056,6 +5262,12 @@ private:
     // Renders a SourceLoc for a sanitizer report baked into the emitted code.
     // Empty for a caller with no SourceContext (the tests); see loc_text.
     const LocResolver&      resolve_;
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The constants the trace emits, once per module: a control by (kind, location), a string by
+    // its text.
+    std::map<std::tuple<const llvm::Module*, uint32_t, std::string>, llvm::Constant*> trace_controls_;
+    std::map<std::pair<const llvm::Module*, std::string>, llvm::Constant*>            trace_strings_;
+#endif
     llvm::Value*           frame_ = nullptr;
     std::vector<FrameSlot> frame_slots_;
     // Per-ref-formal fat pointer, indexed by Local index; all-null for a non-ref

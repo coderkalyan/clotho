@@ -566,7 +566,7 @@ endmodule
     // A cover has no failure verdict (LRM 16.12.6): it tallies matches, and with
     // no action block it schedules nothing into the Reactive region at all.
     CHECK(find_signal(cm, "sva.0.cov") != nullptr);
-    CHECK(state_width(cm, "sva.0.cov") == 32);
+    CHECK(state_width(cm, "sva.0.cov") == 64);
     CHECK_FALSE(has_tag(monitor_process(cm), ir::Inst::Tag::ReactivePend));
 
     LowerResult       as;
@@ -6302,4 +6302,35 @@ TEST_CASE("%m in a concurrent assertion's action block names its scope and label
     CHECK(action_scope("clbl: assert property (@(posedge clk) x) else $display(\"%m\");", false) == "top.clbl\n");
     CHECK(action_scope("assert property (x) else $display(\"%m\");", true) == "top.pblk\n");
     CHECK(action_scope("plbl: assert property (x) else $display(\"%m\");", true) == "top.pblk.plbl\n");
+}
+
+// LRM 16.17 [unverified wording]: the action block is part of the expect statement, so the statement
+// after the `expect` runs only once the action block has finished, including when it suspended. No
+// available simulator implements `expect`, so the expected output is derived from the clause. The
+// verdict is at t=15 (see "an expect blocks its process until the property resolves").
+TEST_CASE("the statement after an expect waits for an action block that suspends") {
+    CHECK(expect_run(R"(
+    expect (@(posedge clk) ##1 d) begin #3 $display("[%0t] EXP pass done", $time); end
+    else $display("[%0t] EXP fail", $time);
+    $display("[%0t] EXP after", $time);
+)") == "[5] ACT edge cyc=0 d=0\n"
+       "[5] ACT nba  cyc=1\n"
+       "[15] ACT edge cyc=1 d=1\n"
+       "[15] ACT nba  cyc=2\n"
+       "[18] EXP pass done\n"
+       "[18] EXP after\n");
+}
+
+TEST_CASE("the statement after a failing expect waits for a fail action that suspends") {
+    CHECK(expect_run(R"(
+    expect (@(posedge clk) ##1 d) $display("[%0t] EXP pass", $time);
+    else begin #3 $display("[%0t] EXP fail done", $time); end
+    $display("[%0t] EXP after", $time);
+)",
+                     /*raise=*/false) == "[5] ACT edge cyc=0 d=0\n"
+                                         "[5] ACT nba  cyc=1\n"
+                                         "[15] ACT edge cyc=1 d=0\n"
+                                         "[15] ACT nba  cyc=2\n"
+                                         "[18] EXP fail done\n"
+                                         "[18] EXP after\n");
 }

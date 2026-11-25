@@ -46,13 +46,20 @@ every position invalid, so the read is all default and the write does nothing.
 
 Code: `src/lower/Expr.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slice`). Tests: `tests/assign_pattern_test.cpp` ("an out-of-range indexed slice reads the element default per position", "an x/z indexed slice base is an invalid index (LRM 7.4.5)").
 
-## 6. Overflowing a bounded queue (7.10.4)
+## 6. Overflowing a bounded queue (7.10.5)
 
-7.10.4 does not say which end an overflowing push gives up. Clotho always keeps
-the first `bound + 1` elements, so `push_front` drops the old tail, `push_back`
-onto a full queue has no effect, and `insert` follows the same rule.
+7.10.5 does not say which end an overflowing write gives up [unverified wording; the
+LRM PDF was not at hand for the section number]. Clotho always keeps the first
+`bound + 1` elements, on every write: whole assignment (from a queue, a dynamic or
+fixed array, a slice, a concatenation or pattern, a function result, a task output
+copied back, a nonblocking assignment, an input formal's copy-in, an element of a
+container of bounded queues), `push_back`, `push_front` and `insert`. So `push_front`
+drops the old tail, `push_back` onto a full queue has no effect, and `insert` follows
+the same rule. Every overflowing operation prints one run-time warning on stderr, never
+suppressed, naming the queue (when it is a design variable) and giving the element count
+it could not hold; Icarus Verilog also warns on each.
 
-Code: `src/runtime/Containers.cpp` (`q_apply_bound_ops`). Tests: `tests/queue_test.cpp` ("queue bounded push drops excess", "queue slice/concat into a bounded queue drops the tail").
+Code: `src/runtime/Queue.cpp` (`q_apply_bound_ops`, `rt_queue_drop_tail`), `src/runtime/Containers.cpp` (`rt_queue_assign`, `rt_queue_assign_dynarr`), `src/runtime/Reports.cpp` (`rt_queue_overflow_report`). Tests: `tests/queue_test.cpp` ("queue bounded push drops excess", "queue slice/concat into a bounded queue drops the tail", "a bounded queue keeps its first N+1 elements on every write path").
 
 ## 7. Unknown elements in `min` and `max` (7.12.1)
 
@@ -153,12 +160,17 @@ Code: `src/lower/Statements.cpp` (`lower_predicate`), `src/lower/Expr.cpp` (`low
 
 12.4.2 and 12.5.3 defer a violation report to the Observed region, and 12.4.2.1
 clears a pending report when its process reaches a flush point first. Clotho
-queues the report and issues it in the Observed region. Deviation: it does not
-clear pending reports at flush points, so a statement that violates on several
-settle passes of one time step reports once per pass. Not gated; the gap is
-listed in `docs/TODO.md`.
+queues the report and issues it in the Observed region, and drops it if its thread
+reached a flush point of 16.4.2 meanwhile: an activation start, or a resume from an
+event control or `wait`, including one inside a task or function-called task the
+thread entered (the generation travels with the call, docs/design/disable.md). So a
+zero-delay glitch of the condition reports nothing, as a deferred assertion's does.
+A fork child is a thread of its own and flushes its own reports. Not gated. The
+resumes from `wait fork` and `wait_order` are not flush points, as note 54 says for
+deferred assertions, but a process that holds only unique/priority reports is not
+refused them: its reports there are kept.
 
-Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`), `src/runtime/Reports.cpp` (`rt_observed_case_violation`, `rt_observed_flush`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant"). Design: `docs/design/x-semantics.md` (Free wins needing no new semantics).
+Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`, `gen_global`), `src/runtime/Reports.cpp` (`rt_observed_case_violation`, `rt_observed_flush`, `rt_gen_cell_alloc`), `src/lower/Statements.cpp` (`DeferredAssertionScan`), `src/lower/Timing.cpp` (`flush_deferred_on_resume`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant", "unique / priority report: ..."). Design: `docs/design/disable.md` (16.4.2's other flush point). Oracle: LRM-derived; iverilog ignores `unique` and cannot parse `unique if`.
 
 ## 19. `case` with a real selector (12.5)
 
@@ -181,10 +193,14 @@ Code: `src/ir/llvm/Subroutines.cpp` (`emit_copyin`), `src/ir/llvm/Containers.cpp
 ## 21. Immediate `cover` (16.3)
 
 An immediate `cover` runs its pass action when its expression is true and does
-nothing when it is false. Deviation: Clotho keeps no hit count and prints no
-coverage report for it. Not gated.
+nothing when it is false. The LRM gives it no statistics format, so Clotho counts the
+hits (the expression found true) of each site, per instance, and lists them in the
+`--coverage` report; a deferred `cover #0` / `cover final` counts at maturation, so a
+hit a later activation of its process supersedes is not one. `cover property` and
+`cover sequence` list attempts and matches. The report layout is Clotho's. Without
+`--coverage` nothing is printed.
 
-Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"). Design: `docs/design/functional-coverage.md` (The precedent that is already silently wrong).
+Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`, `lower_deferred_assertion`, `add_cover_report`), `src/lower/SvaMonitor.cpp` (`emit_cover_attempt`), `src/runtime/Reports.cpp` (`cover_file`, `cover_sites_write`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"), `tests/coverage_test.cpp` ("coverage: an immediate cover counts its hits ..."). Design: `docs/design/functional-coverage.md` (Cover statements).
 
 ## 22. `disable` of a procedure's outermost block (16.4.4)
 
@@ -679,12 +695,10 @@ example relies on a delay not flushing.
 
 `wait fork` and `wait_order` are `wait_statement`s in the grammar (A.6.5), but the clause does
 not say it means them, and whether a `wait fork` that finds no child suspended is not known
-to the frontend, so a process that holds a deferred assertion is refused both. It is
-refused a call to a task that can wait on an event control too, because the resume inside
-the task is the calling process's and the task cannot reach the process's reports. That
-covers a task that waits itself, one that calls a task that waits, and a virtual task called
-anywhere along the way, directly or through another task or method: the body read for the
-callee is the declared method's, and any override may be the one that runs and waits.
+to the frontend, so a process that holds a deferred assertion is refused both. A task the
+process calls that waits on an event control flushes the process's reports where it
+resumes, as the process's own event control does: the generation of the calling thread is
+published through the call, for a virtual task and a task reached through other tasks too.
 
 16.4.4 says disabling "a non-outermost scope of a procedure does not cause flushing", so a
 `disable` of a block nested in the process, from the process or from another one, leaves the
@@ -694,7 +708,7 @@ disable and not because its event occurred, and 16.4.2's first bullet, read alon
 flush it. Clotho takes 16.4.4's explicit sentence. Disabling "a specific deferred assertion"
 by its label cancels its reports; that is refused (docs/TODO.md).
 
-Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`subroutine_waits_on_event`), `src/lower/Subroutines.cpp` (`lower_task_call`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: shapes whose flush points are not reachable are refused", "deferred assertion: a virtual task called through another task is refused like a direct one"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.
+Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`design_has_reports`, `task_flushes_reports`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case), `src/ir/llvm/Inst.cpp` (`DeferFlush` in a task). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: wait fork and wait_order are refused", "deferred assertion: a wait inside a called task flushes the calling process's report"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.
 
 ## 55. `$fread` start address outside the memory (21.3.4.4)
 
@@ -722,3 +736,17 @@ own signedness). `reg [7:0] s = 200` is address 200, not -56; that was also wron
 What a short final element holds is note 34, which the clause does not decide either.
 
 Code: `src/runtime/Io.cpp` (`rt_fread`), `src/runtime/Reports.cpp` (`rt_fread_range_report`), `src/lower/SystemTasks.cpp` (`lower_address_arg`), `src/ir/llvm/SystemTasks.cpp` (`lower_fread_mem`). Tests: `tests/llvm_backend_test.cpp` ("$fread with a start address outside the memory reads nothing and warns", "$fread start and count follow the declared address range", "$fread and $readmem take an unsigned start as an address"). Oracle: iverilog 13 (`ivltests/fread.v`).
+
+## 56. Negative, NaN and infinite real delays (9.4.1, 6.12.1)
+
+9.4.1 reads a negative delay as a two's-complement unsigned time, and a real
+delay is first rounded to the time precision, ties away from zero (6.12.1). Clotho
+applies both in that order, so `#(-1.5)` under a 1ns precision rounds to -2 and
+waits 2**64 - 2 ticks, which never fires, and `#(-0.4)` rounds to 0 and fires at
+once. The LRM says nothing of NaN or infinity. Clotho reads NaN as 0, as LLVM's
+saturating float-to-integer conversion gives, and saturates an infinity, like any
+tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
+`#(-1.0/0.0)` never fire. The rule covers the delay control, intra-assignment
+delays and continuous-assignment delays alike.
+
+Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.

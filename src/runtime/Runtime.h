@@ -141,8 +141,15 @@ extern unsigned char rt_finishing;
 // prefix (static lifetime); `now` is the simulation time of the violation, in
 // design ticks; `kind` selects the message: 0 = no case item matched (priority
 // or unique, no default), 1 = more than one case item matched (unique /
-// unique0 overlap). Pending reports are not flushed on re-execution (docs/LRM_NOTES.md, note 18).
-void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind);
+// unique0 overlap). `gen` is the executing thread's report generation counter (null
+// when nothing can flush the report): the report is dropped at the flush if the
+// counter has moved on since (docs/LRM_NOTES.md, note 18).
+void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind, const uint64_t* gen);
+
+// A report generation counter for a fork child, and its release when the child ends
+// (its pending reports then mature, as nothing can flush them).
+uint64_t* rt_gen_cell_alloc(void);
+void      rt_gen_cell_free(uint64_t* cell);
 
 // Emit and clear every Observed-region report queued this instant. Called by
 // the sim loop at the settled point (between the NBA-settle and Postponed
@@ -590,6 +597,9 @@ typedef struct rt_alloc_site {
     // 1-based column one past its last character, so the caret spans
     // [column, end_column). Equals `column` when no extent was recorded.
     int32_t end_column;
+    // Declared name of the container the operation works on, for a report that names
+    // it (a bounded-queue overflow); null when the site has none.
+    const char* name;
 } rt_alloc_site;
 
 // The runtime's one heap allocation. Returns `size` bytes, null for a zero-byte
@@ -899,10 +909,11 @@ void rt_fflush(int32_t desc);
 // state buffer, strided by `stride` (`z_base` is null when the memory's slot stores
 // no z word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
 // declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
-// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward.
-void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
-                uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
-                int64_t finish, uint32_t flags);
+// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward. Returns the
+// number of elements whose value the load changed.
+uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
+                    uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
+                    int64_t finish, uint32_t flags);
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 //
@@ -1196,6 +1207,10 @@ struct rt_elem_ops {
     // queue moves and copies those by memcpy.
     void (*copy)(void* dst, const void* src, const rt_alloc_site* site);
     void (*destroy)(void* slot);
+    // rt_elem_queue only: the `[$:N]` max index N of the queue the element IS (0 is
+    // unbounded), so copying one over another truncates to what the destination
+    // holds (LRM 7.10.5 [unverified wording]). Appended, like the GC fields.
+    uint64_t bound;
 };
 
 // The words of a key shape: a sequence of nodes in serialization order, each an
@@ -1384,13 +1399,19 @@ static inline uint64_t rt_queue_slot(const rt_queue* h, uint64_t i) {
 void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site* site);
 
 // Destroy the elements of a bounded queue past its limit and keep the first
-// `bound + 1` (LRM 7.10.4). Called only when `bound != 0 && h->len > bound + 1`, for
+// `bound + 1` (LRM 7.10.5 [unverified wording]), then report the overflow at `site`
+// (rt_queue_overflow_report). Called only when `bound != 0 && h->len > bound + 1`, for
 // the same reason as rt_queue_grow: the engine tests that itself, and an overflow
 // does not belong in the code a design inlines.
-void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound);
+void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const rt_alloc_site* site);
+
+// The run-time warning for a bounded queue that was handed more elements than it
+// holds: `wanted` is how many the operation would have left in it, `bound` the `[$:N]`
+// max index. Printed once per overflowing operation, never suppressed.
+void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_t wanted, uint64_t now);
 
 // Bounded-queue max size argument for the push helpers: `bound` is the `[$:N]`
-// maximum index (max size N+1); 0 means unbounded (LRM §7.10.4).
+// maximum index (max size N+1); 0 means unbounded (LRM §7.10.5 [unverified wording]).
 //
 // An overflowing push keeps the first `bound + 1` elements, i.e. it always drops
 // from the TAIL. The two directions therefore lose different elements, and the
@@ -1399,7 +1420,7 @@ void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound);
 //     old tail -- the end opposite the push.
 //   - push_back lands the new element at the tail, so the dropped one is the
 //     element just pushed: pushing onto a full bounded queue has no effect.
-// The same rule governs insert(). LRM 7.10.4 does not pin which end an
+// The same rule governs insert(). LRM 7.10.5 does not pin which end an
 // overflowing push sacrifices (docs/LRM_NOTES.md, note 6).
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
@@ -1433,9 +1454,9 @@ void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops);
 // dst = src: deep copy `src`'s elements into `dst`, linearised so dst->head
 // == 0 (value semantics, LRM §7.10). A no-op when dst == src. `site` is the
 // assignment's source location, for the report if the copy cannot be allocated.
-void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
+void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops, uint64_t bound,
                      const rt_alloc_site* site);
-void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops,
+void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops, uint64_t bound,
                             const rt_alloc_site* site);
 
 // dst = src: deep copy a QUEUE's elements into a dynamic array (LRM 7.5.1's
@@ -2098,6 +2119,13 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // Prints a FATAL naming the task and ends the simulation (never returns).
 [[noreturn]] void rt_dpi_export_task_no_task_frame(const char* name);
 
+// An export thunk that several scopes share (LRM 35.4) was called from C while the
+// current scope (LRM 35.5.3) is none of the scopes that export it: there is no instance
+// to run, and picking the first would answer for the wrong one. Prints a FATAL naming
+// the exported c_identifier `name`, the scope C was in and `exporters` (every scope
+// that does export it, with the declaration) and ends the simulation (never returns).
+[[noreturn]] void rt_dpi_export_no_scope(const char* name, const char* exporters);
+
 // Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
 // calling `on_expire(timer, ctx)` when it fires.
 void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);
@@ -2331,13 +2359,28 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 // the DPI return for an allocation-failure report.
 void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site);
 
-// Register one DPI scope (LRM 35.5.3) for the svScope API — a top-level instance's
-// hierarchical name, at its position `index` in the design's top order. Called from
-// main, once per top, when the design uses DPI. `index == 0` clears the table first
-// (so a fresh simulation in the same process starts with no stale user data) and the
-// scope registered there becomes the default svGetScope returns.
+// Register one DPI scope (LRM 35.5.3) for the svScope API: the hierarchical name of a
+// top, of an instance or generate block that exports a subroutine or declares a
+// `context` import, or of a package or `$unit` that does, at its position `index` in
+// the design's scope order (the tops first). Called from main, once per scope, when
+// the design uses DPI. `index == 0` clears the table first (so a fresh simulation in the
+// same process starts with no stale user data) and the scope registered there becomes
+// the default svGetScope returns.
 // Implemented in Svdpi.cpp alongside svGetScope / svSetScope / svGetUserData.
 void rt_svdpi_scope_register(const char* name, uint32_t name_len, uint32_t index);
+
+// The current DPI scope (LRM 35.5.3): the one svGetScope answers, svSetScope changes
+// and an export that several scopes share dispatches on. A call of a `context` import
+// makes its declaration scope current for the call's duration: rt_svdpi_scope_enter
+// makes the scope registered at `index` current and returns the scope it replaced, and
+// rt_svdpi_scope_leave puts that one back when the call returns, whatever svSetScope
+// the C did. rt_svdpi_scope_index is the registration index of the current scope, for
+// the dispatch, and UINT32_MAX when none is current (C gave svSetScope a null).
+// rt_svdpi_scope_name is its name for a diagnostic, null when none is current.
+void*       rt_svdpi_scope_enter(uint32_t index);
+void        rt_svdpi_scope_leave(void* previous);
+uint32_t    rt_svdpi_scope_index(void);
+const char* rt_svdpi_scope_name(void);
 
 // -- DPI open arrays (LRM 35.5.6.2) --
 //

@@ -992,12 +992,16 @@ struct RandcInfo {
 // Severity level of a `severity` instruction. Selects the diagnostic label the
 // runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
 // with a Finish carrying the finish number, so the report itself never
-// terminates).
+// terminates). Cover is no report at all: it files a `cover` site's counts for the
+// `--coverage` report and prints nothing (see rt_severity), and rides this
+// instruction because a site's name is exactly a report's banner, instance path and scope text,
+// and a deferred `cover #0` is counted where its report would mature.
 enum class Severity : uint32_t {
     Info,
     Warning,
     Error,
     Fatal,
+    Cover,
 };
 
 // Extra payload for `severity`: an $info / $warning / $error / $fatal report

@@ -550,6 +550,46 @@ TEST_CASE("a real delay beyond 2**63 ticks saturates instead of wrapping into an
     CHECK(out == "t=15\nt=35\n1 1 0\n");
 }
 
+// A negative real delay rounds to the precision first, then reads as a 64-bit
+// unsigned time like a negative integer delay (9.4.1), so -1.5 is 2**64 - 2 and
+// never fires, while -0.4 rounds to 0 and fires at once. A NaN delay is 0
+// (docs/LRM_NOTES.md note 56). Each holds for the delay control, the intra-
+// assignment delay, the nonblocking intra-assignment delay and the continuous
+// assignment delay. Oracle: iverilog 13 gives the same for every case here.
+TEST_CASE("a negative or NaN real delay reads as an unsigned time after rounding") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ns
+        module m;
+          real n15, n04, nan, zero;
+          logic a = 0, b = 0, c = 0, d = 0, e = 0, src = 0;
+          integer t_n04 = -1, t_nan = -1, t_n15 = -1, t_a = -1, t_b = -1, t_c = -1;
+          wire w1, w2, w3;
+          assign #(n15) w1 = src;
+          assign #(n04) w2 = src;
+          assign #(nan) w3 = src;
+          initial begin
+            zero = 0.0; n15 = -1.5; n04 = -0.4; nan = zero / zero;
+            #5;
+            fork
+              begin #(n15) t_n15 = $time; end
+              begin #(n04) t_n04 = $time; end
+              begin #(nan) t_nan = $time; end
+              begin a = #(n04) 1; t_a = $time; end
+              begin b = #(nan) 1; t_b = $time; end
+              begin c = #(n15) 1; t_c = $time; end
+            join_none
+            d <= #(n15) 1;
+            e <= #(nan) 1;
+            src <= #(n04) 1;
+            #10 $display("%0d %0d %0d %0d %0d %0d", t_n15, t_n04, t_nan, t_a, t_b, t_c);
+            $display("%b%b%b %b%b%b %b%b%b", a, b, c, d, e, src, w1, w2, w3);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "-1 5 5 5 5 -1\n110 011 011\n");
+}
+
 // The same when the design tick is finer than the delaying module's precision:
 // a delay of N ps is N * 1000 fs, and N = 18446744073709552 makes that
 // 2**64 + 384, which wrapped to a delay of 384 fs. The count that saturates is the

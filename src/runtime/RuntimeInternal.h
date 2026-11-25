@@ -358,15 +358,55 @@ void append_finish_time(std::string& out, uint64_t now);
 // violation reports use it because LRM 12.4.2 / 12.5.3 place them in that
 // region (docs/LRM_NOTES.md, note 18).
 //
-// The queue has no flush when a statement executes again in the same instant,
-// so a statement that violates transiently on several settle passes queues one
-// report per pass.
+// A report carries the report generation of the thread that executed it and that
+// generation's value then. The thread bumps it at each of its flush points (LRM
+// 16.4.2: resuming from an event control or wait, or starting an activation), so a
+// report whose generation has moved on is dropped at the flush below, as a deferred
+// assertion's is (docs/LRM_NOTES.md, note 18). A null `gen` is a thread nothing can
+// flush, whose reports always mature.
 struct ObservedCaseViol {
-    const char* banner; // compile-time "<file>:<line>: " prefix, static lifetime
-    uint64_t    now;    // instant the violation occurred (== Observed flush time)
-    int32_t     kind;   // 0 = no match, 1 = overlap
+    const char*     banner; // compile-time "<file>:<line>: " prefix, static lifetime
+    uint64_t        now;    // instant the violation occurred (== Observed flush time)
+    int32_t         kind;   // 0 = no match, 1 = overlap
+    const uint64_t* gen;    // the executing thread's generation counter, or null
+    uint64_t        gen_val;
 };
 extern std::vector<ObservedCaseViol> g_observed_case;
+extern std::vector<std::unique_ptr<uint64_t>> g_gen_cells;
+extern std::vector<uint64_t*>                 g_gen_free;
+
+// ---- Cover statements (docs/design/functional-coverage.md) ----
+//
+// A `cover` site files its counts with an rt_severity of level Cover, which prints nothing:
+// `fmt` is "<op>\x1f<kind>\x1f<ordinal>\x1f<file:line>" and the site's name is what the
+// banner, the instance path and the scope text after it spell. Op 'r' files the counts it
+// carries (one: hits; two: attempts then matches; none: declares the site), op 'h' is one
+// matured hit of a deferred cover. The sites are listed by rt_cover_report in the order they
+// were first filed, which is the order the Final processes ran, so a design reports the same
+// way every time.
+struct CoverSite {
+    std::string kind;
+    std::string where;
+    std::string name;
+    uint64_t    attempts     = 0;
+    uint64_t    matches      = 0;
+    bool        has_attempts = false;
+};
+
+// What a record says of its site, resolved while the banner and path still exist: a
+// deferred one is held until it matures.
+struct CoverRef {
+    char        op = 'r';
+    std::string kind;
+    std::string where;
+    std::string name;
+};
+
+CoverRef cover_ref(const char* banner, const rt_string* path, const char* tail, const char* fmt);
+void     cover_file(const CoverRef& ref, uint32_t argc, const rt_arg* argv);
+// Write the sites filed so far to `f` (the `--coverage` report; null writes nothing), then
+// forget them: a report is one run's.
+void cover_sites_write(std::FILE* f);
 
 // Set by a fatal severity report: rt_sim_run folds it into the exit status.
 inline bool g_fatal_seen = false;

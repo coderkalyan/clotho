@@ -3,6 +3,7 @@
 #include "lower/Lowerer.h"
 
 #include <slang/diagnostics/AllDiags.h>
+#include <slang/diagnostics/JsonDiagnosticClient.h>
 
 #include "ir/Verify.h"
 namespace clotho {
@@ -202,8 +203,8 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // config parameter set through every module and using the subset each needs
     // IS the idiom -- so the check reports a pattern rather than a problem, at a
     // volume that buries the three findings that matter. Not a semantic question,
-    // hence here rather than in the policy below. NOTE: `-W` options do not
-    // reach this engine (see main.cpp), so it cannot be re-enabled per design.
+    // hence here rather than in the policy below. NOTE: this runs after the
+    // user's `-W` options (style_of), so it holds against `-Wunused-parameter`.
     engine.setSeverity(slang::diag::UnusedParameter, slang::DiagnosticSeverity::Ignored);
     engine.setSeverity(slang::diag::UnusedPackageParameter, slang::DiagnosticSeverity::Ignored);
 
@@ -694,6 +695,54 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         timings->frontend_ms += ms_since(t_fe);
     }
 
+    // `-G NAME=value`: slang applies a simple-name override to every top with a
+    // parameter of that name and says nothing when none has one, and it does not
+    // skip a localparam, which a command-line override may not change (LRM 6.20.4)
+    // [unverified wording]. Either way the run would not be the design asked for,
+    // so both are errors, as an unknown name is in iverilog (`-P`). A dotted name
+    // is a defparam path, which slang resolves and reports itself.
+    bool bad_override = false;
+    for (const std::string& opt : comp.getOptions().paramOverrides) {
+        const std::string_view whole(opt);
+        const size_t           eq   = whole.find('=');
+        const std::string_view name = whole.substr(0, eq);
+        if (eq == std::string_view::npos || name.empty() || !std::ranges::all_of(name, [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '$';
+            })) {
+            continue;
+        }
+        bool        found = false;
+        std::string local_in;
+        for (const InstanceSymbol* top : root.topInstances) {
+            for (const auto& p : top->getDefinition().parameters) {
+                if (p.name != name) {
+                    continue;
+                }
+                found = true;
+                if (p.isLocalParam && local_in.empty()) {
+                    local_in = std::string(top->name);
+                }
+            }
+        }
+        std::string msg;
+        if (!found) {
+            msg = "-G " + std::string(name) + ": no top-level module has a parameter named '" + std::string(name) + "'";
+        } else if (!local_in.empty()) {
+            msg = "-G " + std::string(name) + ": '" + std::string(name) + "' is a localparam of top '" + local_in +
+                  "', which cannot be overridden (LRM 6.20.4)";
+        }
+        if (!msg.empty()) {
+            bad_override = true;
+            result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                     .origin   = DiagnosticOrigin::Driver,
+                                                     .code     = "bad-param-override",
+                                                     .message  = std::move(msg) });
+        }
+    }
+    if (bad_override) {
+        return result;
+    }
+
     // A compilation unit with no top-level module/interface/program instance
     // (e.g. a package-only file) is not an elaboration error -- LRM
     // elaboration (§23.3) resolves whatever top instances exist; nothing
@@ -731,24 +780,36 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     }
     // Packages and `$unit` sit outside the instance tree but declare subroutines
     // the design calls, and those bodies scale by their OWN timescale, so their
-    // units join the GCD too (global_scope_tick_fs).
-    const auto fold_global = [&](const Scope& scope) {
-        const uint64_t p = global_scope_tick_fs(scope, any_explicit);
-        if (p != 0 && (prec_fs == 0 || p < prec_fs)) {
+    // units join the GCD too (global_scope_tick_fs). A `$unit` with no time scale
+    // of its own takes the default only once the rest of the design is known to
+    // be timed (effective_time_scale), so it is folded in a second pass.
+    const auto fold_global = [&](const Scope& scope, bool timed) {
+        const auto ts = effective_time_scale(scope, timed);
+        if (!ts || !scope_declares_subroutine(scope)) {
+            return;
+        }
+        any_explicit     = true;
+        const uint64_t p = global_scope_tick_fs(scope, *ts);
+        if (prec_fs == 0 || p < prec_fs) {
             prec_fs = p;
         }
-        if (const auto ts = scope.getTimeScale(); ts && scope_declares_subroutine(scope)) {
-            const uint64_t mp = tsv_to_fs(ts->precision);
-            if (min_prec_fs == 0 || mp < min_prec_fs) {
-                min_prec_fs = mp;
-            }
+        const uint64_t mp = tsv_to_fs(ts->precision);
+        if (min_prec_fs == 0 || mp < min_prec_fs) {
+            min_prec_fs = mp;
         }
     };
     for (const PackageSymbol* pkg : comp.getPackages()) {
-        fold_global(*pkg);
+        fold_global(*pkg, false);
     }
     for (const CompilationUnitSymbol* unit : root.compilationUnits) {
-        fold_global(*unit);
+        fold_global(*unit, false);
+    }
+    if (any_explicit) {
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            if (!unit->getTimeScale()) {
+                fold_global(*unit, true);
+            }
+        }
     }
     const uint64_t tick_fs = any_explicit ? prec_fs : 0;
 
@@ -847,12 +908,12 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
-            // Exported functions resolve in the scope that owns them: this top's
-            // module-scope functions through `lw` (its own lowered bodies address its
-            // own instance state), $unit/package ones through the shared `globals`
-            // delegation in function_id — those have no instance multiplicity, so
-            // only the first top admits them.
-            lw.collect_dpi_exports(comp, top, /*collect_globals=*/top == root.topInstances.front());
+            // Exported functions resolve in the scope that owns them: the scopes this top
+            // walked (its own instances) through `lw`, whose lowered bodies address its own
+            // instance state, and the $unit/package ones, which have no instance
+            // multiplicity, through the shared `globals` delegation in function_id --
+            // so only the first top collects them.
+            lw.collect_dpi_exports(comp, /*collect_globals=*/top == root.topInstances.front());
             const std::span<const Diagnostic> recovered = lw.recovered_diags();
             result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
             poisoned  = poisoned || lw.poisoned();
@@ -867,7 +928,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             // here (globals_ is never set on the globals Lowerer itself), so this
             // reaches build_reserved_body directly, exactly as the per-top delegation
             // path above does.
-            globals.collect_dpi_exports(comp, nullptr, /*collect_globals=*/true);
+            globals.collect_dpi_exports(comp, /*collect_globals=*/true);
         }
         // Any package/$unit class-method body still queued (a design with no top
         // instance, or a body the last top's own drain queued) builds now, and the
@@ -963,6 +1024,17 @@ struct DiagStyle {
     // Whether a Clotho item names its code, as slang names a warning's option
     // (`--diag-option`).
     bool show_code = true;
+    // The Driver's own engine, which `processOptions` configured with `-W`, `-Werror`,
+    // `--error-limit`, `--suppress-warnings` and `--waiver-file`; the design's
+    // diagnostics go through it so those options reach them. Null: a fresh engine, for an
+    // entry that has no Driver.
+    slang::DiagnosticEngine* engine = nullptr;
+    // The Driver's `--diag-json` client, or null. slang's own items reach it through
+    // `engine`; Clotho's are reported into it by hand (render_through_client).
+    slang::DiagnosticClient* json = nullptr;
+    // What the `-W` options themselves drew (an unknown warning name), to be shown with
+    // the design's diagnostics.
+    slang::Diagnostics option_diags;
 };
 
 // Whether the Driver's text client colours what it formats. The decision is
@@ -1004,6 +1076,22 @@ DiagStyle style_of(slang::driver::Driver& dr) {
     c.showHierarchyInstance(o.diagHierarchy.value_or(slang::ShowHierarchyPathOption::Auto));
     style.show_code = o.diagOptionName.value_or(true);
 
+    // Every warning shows unless the user says otherwise, as when Clotho had an engine
+    // of its own: `-Weverything` goes first, so the user's `-W` options narrow it, and
+    // `-Werror` and `--suppress-warnings` apply on top. A fresh engine had no error
+    // limit, so the Driver's default of 20 is lifted unless `--error-limit` asks for one.
+    // setWarningOptions rebuilds the severity table from the current one, and Clotho's
+    // own severity policy is applied after this (apply_severity_policy), so no `-W`
+    // option can demote a promotion it makes.
+    std::vector<std::string> warning_options{ "everything" };
+    warning_options.insert(warning_options.end(), o.warningOptions.begin(), o.warningOptions.end());
+    style.option_diags = dr.diagEngine.setWarningOptions(warning_options);
+    if (!o.errorLimit.has_value()) {
+        dr.diagEngine.setErrorLimit(0);
+    }
+    style.engine = &dr.diagEngine;
+    style.json   = dr.jsonDiagClient.get();
+
     return style;
 }
 
@@ -1027,6 +1115,7 @@ void render_through_client(const Diagnostic&           d,
                            const slang::SourceManager& sm,
                            slang::TextDiagnosticClient& client,
                            bool                         show_code,
+                           slang::DiagnosticClient*     json,
                            std::string&                 out) {
     std::string message = d.message;
     if (show_code && !d.code.empty()) {
@@ -1058,9 +1147,12 @@ void render_through_client(const Diagnostic&           d,
     client.report(reported);
     out += client.getString();
     client.clear();
+    if (json != nullptr) {
+        json->report(reported);
+    }
 
     for (const Diagnostic& note : d.notes) {
-        render_through_client(note, sm, client, show_code, out);
+        render_through_client(note, sm, client, show_code, json, out);
     }
 }
 
@@ -1090,13 +1182,27 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         return bare;
     }
 
-    slang::DiagnosticEngine engine(*sm);
+    slang::DiagnosticEngine own_engine(*sm);
+    slang::DiagnosticEngine& engine = style.engine != nullptr ? *style.engine : own_engine;
     if (style.client == nullptr) {
         style.client = std::make_shared<slang::TextDiagnosticClient>();
     }
     engine.addClient(style.client);
+    // What the options themselves drew comes first, as the Driver's would.
+    std::vector<Diagnostic> option_items;
+    for (const slang::Diagnostic& d : style.option_diags) {
+        style.client->clear();
+        engine.issue(d);
+        if (!style.client->empty()) {
+            Diagnostic item = from_slang(engine, d);
+            item.rendered   = style.client->getString();
+            option_items.push_back(std::move(item));
+        }
+    }
     LowerResult result =
       lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion, stats);
+    result.diagnostics.insert(result.diagnostics.begin(), std::make_move_iterator(option_items.begin()),
+                              std::make_move_iterator(option_items.end()));
     assert_well_typed(result);
 
     // slang's own items arrive rendered (lower_design harvests them one by one).
@@ -1104,7 +1210,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     // driver notices. Items the driver already printed are not rendered again.
     for (Diagnostic& d : result.diagnostics) {
         if (d.rendered.empty() && !d.reported) {
-            render_through_client(d, *sm, *style.client, style.show_code, d.rendered);
+            render_through_client(d, *sm, *style.client, style.show_code, style.json, d.rendered);
         }
     }
 
@@ -1325,8 +1431,16 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // The design's diagnostics are rendered the way the Driver renders its own, so
     // colour and `--diag-source`, `--diag-column`, `--diag-location`, ... apply to
     // them alike.
-    return lower_compilation(
+    result = lower_compilation(
       cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr), allow_port_coercion, stats);
+    // `--diag-json`: the Driver closes the array and writes the file, or prints it to
+    // stdout for `-`. Its own text client has collected the same items a second time;
+    // emptied, so the Driver prints none of it and the caller's rendering is the text.
+    if (dr.options.diagJson.has_value()) {
+        dr.textDiagClient->clear();
+        (void)dr.reportDiagnostics(/*quiet=*/true);
+    }
+    return result;
 }
 
 LowerResult lower_sources(std::span<const std::string_view> args,

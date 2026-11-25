@@ -890,7 +890,7 @@ void Lowerer::init_static_props_of(const std::vector<const ClassType*>& classes)
         for (const Symbol& m : cls->members()) {
             const auto* prop = m.as_if<ClassPropertySymbol>();
             if (prop == nullptr || prop->lifetime != slang::ast::VariableLifetime::Static ||
-                prop->getInitializer() == nullptr) {
+                (prop->getInitializer() == nullptr && !aggregate_has_field_defaults(prop->getType()))) {
                 continue;
             }
             cur_range_ = slang::SourceRange{ prop->location, prop->location };
@@ -934,6 +934,12 @@ void Lowerer::lower_members(const Scope&       scope,
     // (procedural blocks, variable initializers) run in Emit alone.
     const bool driver_pass = pass != Pass::Collect;
     cur_pass_              = pass;
+    // The export directives of this scope (LRM 35.5): slang resolves them only for the
+    // scopes it elaborates, which leaves out an instance whose body duplicates an earlier
+    // one, so each scope of this top is scanned as it is met (scan_dpi_exports).
+    if (pass == Pass::Collect) {
+        scan_dpi_exports(scope, dpi_export_decls_);
+    }
     for (const Symbol& m : scope.members()) {
         cur_range_ = slang::SourceRange{ m.location, m.location };
         switch (m.kind) {
@@ -1076,6 +1082,13 @@ void Lowerer::lower_members(const Scope&       scope,
             case SymbolKind::Subroutine:
                 if ((pass == Pass::Collect || emit) && is_iface_body_subroutine(m.as<SubroutineSymbol>())) {
                     recover([&] { declare_interface_statics(m.as<SubroutineSymbol>(), pass == Pass::Collect); });
+                }
+                // A `context` import registers its scope (LRM 35.5.3, H.9.3:
+                // svGetScopeFromName finds "an arbitrary function declaration"), called
+                // or not, so it is lowered with its scope rather than on demand.
+                if (emit && m.as<SubroutineSymbol>().flags.has(MethodFlags::DPIImport) &&
+                    m.as<SubroutineSymbol>().flags.has(MethodFlags::DPIContext)) {
+                    recover([&] { (void)function_id(m.as<SubroutineSymbol>()); });
                 }
                 break;
             // Known-inert members: elaboration artifacts and declarations

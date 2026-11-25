@@ -123,8 +123,6 @@ Milestones, in order; lower ones unblock higher ones:
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
-- [ ] **Wake time of a `ref` write after a suspend** — a task writing a
-  `ref` actual after a suspend wakes its waiters at the task's return, not at the write.
 - [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate and
   container-valued waits are refused.
   - [ ] **`@` over a container property expression** (9.4.2) — needs the value
@@ -203,9 +201,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Concurrent fractional-delay timers (performance)** (3.14) — fine-tick periods past
   the wheel window spill to the overflow heap; needs a hierarchical wheel or a coarser tick.
-- [ ] **Negative, NaN or infinite real delay** — not clamped, as for the integer path.
-- [ ] **Time unit of a `$unit`-scope subroutine or class** (3.14.2.2) — with no `timeunit`
-  in `$unit`, `#d` and `$time` count raw wheel ticks; needs a fixed default timescale.
 - [ ] **`%c`, `%u` and `%z` of a real argument**.
 
 ### Observability & debug
@@ -213,8 +208,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Located backend refusals outside instruction lowering** — refusals from the
   program-region pre-passes, DPI and class-descriptor emission, and VCD variable
   emission name their subject but carry no source location.
-- [ ] **`-W` and `--diag-json` for design diagnostics** — both are accepted, but `-W`
-  does not change what a design reports and nothing writes the JSON.
 - [ ] **Selective VCD dump** — `$dumpvars` scope-subset and sparse selection; only a
   whole-design dump is produced.
 - [ ] **VCD of a string signal** (21.7.2) — the format has no `string` var type; needs a
@@ -274,8 +267,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
 - [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
   returned to power-on between designs in one process (docs/design/cooperative-finish.md).
-- [ ] **`-G` override naming a parameter no top-level module has** — accepted without a
-  diagnostic, so a mistyped name simulates the design with its defaults.
 - [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
   - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
   - [ ] **Aggregate or container argument** — refused at compile time.
@@ -367,8 +358,6 @@ Milestones, in order; lower ones unblock higher ones:
   container element, is refused.
 - [ ] **Queue, dynamic-array or associative-array port** (23.3.3) — a container port connection
   is refused; it needs a handle-aware continuous copy.
-- [ ] **Member defaults of a struct used as an unpacked-array element** (7.2.2) — such an array
-  with no initializer of its own is refused.
 - [ ] **By-value read of a whole unpacked struct or array** (7.2, 7.4) — as an operand outside
   copy, equality, argument and `%p` positions; needs a by-value aggregate ABI.
 - [ ] **Whole aggregate element of an associative array in a by-value context** (7.8) — as a
@@ -486,8 +475,6 @@ Milestones, in order; lower ones unblock higher ones:
   are refused.
 - [ ] **`case … inside` unbounded range bounds** (12.5.4) — `[$:a]` and `[a:$]` labels are
   refused.
-- [ ] **`unique` / `unique0` / `priority` violation maturation** (12.4.2) — a pending report
-  is not flushed when the statement re-executes in the same time step, so glitches report.
 - [ ] **`always_ff` non-sequential body warning** (9.2.2.4) — no diagnostic is issued when
   the body does not describe sequential logic.
 - [ ] **`foreach` skipping an outer dimension over a nested runtime one** (12.7.3) —
@@ -510,24 +497,19 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Bare instance-method call with no receiver in scope** (8.7) — refused when neither
   an object under construction nor an enclosing method supplies `this`.
-- [ ] **Static class property of a struct type with member defaults** (8.9) — with no
-  initializer of its own it silently reads the power-on default, not the member defaults.
 - [ ] **Monomorphic inline cache for virtual calls (performance)** (8.20) — every virtual
   call dispatches through the method table; benchmark a per-call-site cache keyed on the class.
 
 ### Assertions (immediate)
 
-- [ ] **Immediate `cover` statistics** (16.3) — no per-statement coverage count and no
-  end-of-simulation report.
 - [~] **Deferred immediate assertions** (16.4) — missing pieces:
   - [ ] **Subroutine-call action block** — a user task or void function as the action is
     refused.
   - [ ] **`$display` / `$write` / `$fatal` action** — refused.
-  - [ ] **Deferred assertion inside a function or task** — refused.
   - [ ] **`disable` of one deferred assertion** (16.4.4) — `disable a1;` naming an assertion's
     label is refused: a pending report carries no identity of its assertion to cancel by.
   - [ ] **Flush at a resume the process cannot see** (16.4.2) — a process holding a deferred
-    assertion is refused `wait fork`, `wait_order` and a call to a task that can wait on an event.
+    assertion is refused `wait fork` and `wait_order`.
   - [ ] **Action block scheduled in the Reactive region** — the report matures through the
     deferred queue instead of scheduling the action block in Reactive.
 - [ ] **`$countbits` with a non-constant control bit** — refused.
@@ -723,9 +705,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Coverage database tasks** (19.9) — `$set_coverage_db_name`, `$load_coverage_db`,
   `$coverage_merge`, `$coverage_save`, `$coverage_control`, `$coverage_get` and
   `$coverage_get_max`; the LRM defines no database format.
-- [ ] **Immediate `cover` hit count** — nothing is counted or reported, and nothing is
-  refused.
-- [ ] **`cover property` hit report** — hit counts are kept but never reported.
 - [ ] **Coverpoint, bin bound or enum value wider than 64 bits** (19.5) — a sampled value
   crosses the runtime ABI as one word.
 - [ ] **Tolerance range in a coverage bin** (19.5.1, 11.4.13) — `[c +/- d]` and `[c +%- d]`.
@@ -751,10 +730,6 @@ Milestones, in order; lower ones unblock higher ones:
   runtime-sized marshal scratch.
 - [ ] **DPI multi-dimensional open arrays** — needs `svGetArrElemPtr2/3` and a recursive
   descriptor.
-- [ ] **One `c_identifier` exported from several scopes** — slang drops the duplicate
-  exports before Clotho can see them.
-- [ ] **`svScope` handles for non-top instances** — `svGetScopeFromName` cannot name a
-  nested instance.
 - [ ] **DPI unpacked struct or fixed-size unpacked array argument** (35.5.6) — a non-open
   unpacked formal is refused.
 - [ ] **DPI open array of scalar `bit` / `logic`, `real`, `string` or `chandle` elements**

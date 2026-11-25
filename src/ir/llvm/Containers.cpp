@@ -231,6 +231,7 @@ llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
     llvm::Constant* inner = llvm::Constant::getNullValue(raw_ptr_ty());
     llvm::Constant* leaves  = llvm::Constant::getNullValue(raw_ptr_ty());
     uint32_t        nleaves = 0;
+    uint64_t        queue_bound = 0;
     std::vector<uint32_t> key_shape_words;
     if (std::get<Type>(mod_.pool.get(elem_type)).kind == Type::Kind::Event) {
         // An event element is a 64-bit handle word like a class handle, but
@@ -252,6 +253,9 @@ llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
         // at cannot disagree -- an equality the collector asserts.
         const Type& et = std::get<Type>(mod_.pool.get(elem_type));
         kind           = gc_container_kind(elem_type);
+        if (et.kind == Type::Kind::Queue) {
+            queue_bound = et.left;
+        }
         if (et.kind == Type::Kind::Assoc) {
             key_shape_words = assoc_key_shape(elem_type);
         }
@@ -283,7 +287,8 @@ llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
         b_.getInt32(static_cast<uint32_t>(key_shape_words.size())),
         gc_offsets_global(handle_offs, "clotho.elem.handles"),
         gc_offsets_global(key_shape_words, "clotho.elem.keyshape"),
-        llvm::Constant::getNullValue(raw_ptr_ty()), llvm::Constant::getNullValue(raw_ptr_ty()) }));
+        llvm::Constant::getNullValue(raw_ptr_ty()), llvm::Constant::getNullValue(raw_ptr_ty()),
+        b_.getInt64(queue_bound) }));
     env_->elem_ops_inits.emplace(static_cast<uint32_t>(elem_type), init);
     return init;
 }
@@ -347,20 +352,25 @@ llvm::StructType* Backend::handle_slot_ty(Ref type) {
 // function and element descriptor from the type.
 //
 // Emitted for subroutine copy-in / copy-out and return copy-out. Those are ABI
-// plumbing at the call boundary rather than a lowered instruction, so no Index
-// is in scope and the allocation reports its location as "<unknown>".
-void Backend::emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type) {
-    const SourceText at{ .where = "<unknown>" };
+// plumbing at the call boundary rather than a lowered instruction, so a caller with
+// no Index in scope leaves `at` as "<unknown>". `type` is the DESTINATION's, and a
+// queue destination's bound truncates the copy.
+void Backend::emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type, const SourceText& at,
+                                 std::string_view name) {
     if (is_assoc_type(type)) {
         b_.CreateCall(
           assoc_assign_fn(),
           { dst, src, elem_ops_global(type), alloc_site_global(at, "associative array") });
         return;
     }
-    const bool q = is_queue_type(type);
-    b_.CreateCall(q ? queue_assign_fn() : dynarr_assign_fn(),
-                  { dst, src, elem_ops_global(type),
-                    alloc_site_global(at, q ? "queue" : "dynamic array") });
+    if (is_queue_type(type)) {
+        // The destination's bound governs: the copy keeps its first `bound + 1` elements.
+        const uint64_t bound = std::get<Type>(mod_.pool.get(type)).left;
+        b_.CreateCall(queue_assign_fn(), { dst, src, elem_ops_global(type), b_.getInt64(bound),
+                                           alloc_site_global(at, "queue", bound != 0 ? name : std::string_view{}) });
+        return;
+    }
+    b_.CreateCall(dynarr_assign_fn(), { dst, src, elem_ops_global(type), alloc_site_global(at, "dynamic array") });
 }
 
 // Destroy a handle's elements and free its storage (reset to empty).
@@ -466,6 +476,14 @@ llvm::Value* Backend::lv_handle_ptr(const Guarded& g, HandleUse use) {
 // container bound to a `ref`/`inout` formal of a task -- use `Place` here and
 // fire from the call's own after-write bracket instead.
 void Backend::notify_container_mutation(const LValueInfo& lv) {
+    if (lv.ref_wake_fn != nullptr) {
+        // A container bound to a `ref` formal: the call's thunk wakes its waiters at each
+        // mutation, not at the return of the call.
+        if (!silent_stores_) {
+            emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+        }
+        return;
+    }
     if (lv.chg == nullptr) {
         // A container living in a SIGNAL -- a module-level queue / dynamic /
         // associative array, or a static class property's shared slot -- has
@@ -510,7 +528,7 @@ void Backend::service_signal_container_mutation(Signal sig) {
         service_dynamic_queue(sig, e);
     }
     if (vif_wait_[i][e]) {
-        emit_event_wake_list(vif_head_ptr(sig, e));
+        emit_event_wake_list(vif_head_ptr(sig, e), { .kind = RT_TRACE_VIF, .sig = sig, .fact = e });
     }
     fire_event_trigger(sig, e);
 }
@@ -526,7 +544,8 @@ void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
     const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)];
     llvm::Value*   slot =
       b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
-    emit_event_wake_list(event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot)));
+    llvm::Value* obj = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot));
+    emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
 }
 
 // Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on
@@ -545,10 +564,10 @@ void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
 // slot rather than growing the stack, and the init / deinit pair is balanced
 // across the bracket so each pass copies into a fresh handle.
 llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
-    if (lv.chg == nullptr) {
+    if (lv.chg == nullptr && lv.ref_wake_fn == nullptr) {
         return nullptr;
     }
-    if (lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
+    if (lv.chg != nullptr && lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
         // `@(posedge s)` is refused in the frontend (no LSB lattice, Table 9-2),
         // so a notified string property carries the any-change field and nothing
         // else. A gap means the two sides disagreed.
@@ -574,6 +593,19 @@ void Backend::str_chg_after(const Guarded& lv, llvm::Value* snap) {
     llvm::Value* changed =
       b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }),
                       b_.getInt32(0));
+    if (lv.ref_wake_fn != nullptr) {
+        // A write through a `ref` formal: the call's thunk wakes what the actual's owner has waiting.
+        auto* f    = b_.GetInsertBlock()->getParent();
+        auto* body = llvm::BasicBlock::Create(ctx_, "refs.body", f);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "refs.cont", f);
+        b_.CreateCondBr(changed, body, cont);
+        b_.SetInsertPoint(body);
+        emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+        b_.CreateCall(str_deinit_fn(), { snap });
+        return;
+    }
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* body = llvm::BasicBlock::Create(ctx_, "chgs.body", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "chgs.cont", fn);
@@ -888,7 +920,8 @@ void Backend::lower_queue_push(Index i, bool front) {
     const auto    qa    = ir_->extra_data<QueueArg>(p.extra);
     const DynElem e     = dynarr_elem(qa.queue_type);
     llvm::Value*  ops   = elem_ops_global(qa.queue_type);
-    llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
+    const uint64_t bound_v = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
+    llvm::Value*  bound = queue_bound_of(lvalue_of(p.op), bound_v);
     // The write barrier for a container mutation reached through a class property
     // (§7). The barrier goes on the OWNING OBJECT rather than on the container,
     // because the container ABI carries no owner identity -- rt_queue_push_back
@@ -916,7 +949,7 @@ void Backend::lower_queue_push(Index i, bool front) {
                             ops,
                             bound,
                             str_of(qa.arg),
-                            alloc_site_global(loc_text(i), "queue") });
+                            alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound_v)) });
         return;
     }
     if (e.is_agg || e.is_handle) {
@@ -933,7 +966,7 @@ void Backend::lower_queue_push(Index i, bool front) {
                             ops,
                             bound,
                             src,
-                            alloc_site_global(loc_text(i), "queue") });
+                            alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound_v)) });
         return;
     }
     auto* scratch = entry_alloca(e.slot_ty, "q.elem");
@@ -943,7 +976,7 @@ void Backend::lower_queue_push(Index i, bool front) {
                         ops,
                         bound,
                         scratch,
-                        alloc_site_global(loc_text(i), "queue") });
+                        alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound_v)) });
 }
 
 void Backend::lower_queue_pop(Index i, bool front) {
@@ -1021,8 +1054,9 @@ void Backend::lower_queue_insert(Index i) {
     const DynElem e     = dynarr_elem(qi.queue_type);
     llvm::Value*  ops   = elem_ops_global(qi.queue_type);
     llvm::Value*  idx   = cast(must_of(qi.idx), 64, false);
-    llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
+    const uint64_t bound_v = std::get<Type>(mod_.pool.get(qi.queue_type)).left;
     const Guarded& qlv  = lvalue_of(p.op);
+    llvm::Value*  bound = queue_bound_of(qlv, bound_v);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     // A new element, so a new reference. See lower_queue_push.
     emit_gc_barrier_for(qlv);
@@ -1030,20 +1064,20 @@ void Backend::lower_queue_insert(Index i) {
     emit_queue_bounds_check(i, handle, qi.idx, qlv, /*allow_append=*/true);
     if (e.is_string) {
         queue_engine_call(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val),
-                                               alloc_site_global(loc_text(i), "queue") });
+                                               alloc_site_global(loc_text(i), "queue", queue_site_name(qlv, bound_v)) });
         return;
     }
     if (e.is_agg || e.is_handle) {
         llvm::Value* src = e.is_agg ? agg_read_ptr(lvalue_of(qi.val), e.elem_type)
                                     : lv_handle_ptr(lvalue_of(qi.val), HandleUse::Read);
         queue_engine_call(queue_insert_fn(),
-                          { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
+                          { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue", queue_site_name(qlv, bound_v)) });
         return;
     }
     auto* scratch = entry_alloca(e.slot_ty, "q.elem");
     lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
     queue_engine_call(queue_insert_fn(),
-                      { handle, ops, bound, idx, scratch, alloc_site_global(loc_text(i), "queue") });
+                      { handle, ops, bound, idx, scratch, alloc_site_global(loc_text(i), "queue", queue_site_name(qlv, bound_v)) });
 }
 
 void Backend::lower_queue_delete_idx(Index i) {
@@ -1067,11 +1101,13 @@ void Backend::lower_queue_copy(Index i) {
     // Whole-container assign: the owner acquires every reference the source held.
     // See lower_queue_push.
     emit_gc_barrier_for(lvalue_of(p.op));
+    const uint64_t bound = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
     b_.CreateCall(queue_assign_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read),
                     elem_ops_global(qa.queue_type),
-                    alloc_site_global(loc_text(i), "queue") });
+                    queue_bound_of(lvalue_of(p.op), bound),
+                    alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound)) });
 }
 
 // q = d: deep copy a dynamic array (arg) into a queue (op). Source handle is
@@ -1081,17 +1117,20 @@ void Backend::lower_queue_copy_dynarr(Index i) {
     const auto  qa = ir_->extra_data<QueueArg>(p.extra);
     // Whole-container assign from a dynamic array. See lower_queue_push.
     emit_gc_barrier_for(lvalue_of(p.op));
+    const uint64_t bound = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
     b_.CreateCall(queue_assign_dynarr_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read),
                     elem_ops_global(qa.queue_type),
-                    alloc_site_global(loc_text(i), "queue") });
+                    queue_bound_of(lvalue_of(p.op), bound),
+                    alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound)) });
 }
 
 void Backend::lower_queue_append_range(Index i) {
     const auto& p     = ir_->payload(i).op_extra;
     const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
-    llvm::Value* bound = b_.getInt64(std::get<Type>(mod_.pool.get(qs.queue_type)).left);
+    const uint64_t bound_v = std::get<Type>(mod_.pool.get(qs.queue_type)).left;
+    llvm::Value* bound = queue_bound_of(lvalue_of(p.op), bound_v);
     // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
     llvm::Value* lo = cast(must_of(qs.lo), 64, /*sign=*/true);
     llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
@@ -1104,7 +1143,7 @@ void Backend::lower_queue_append_range(Index i) {
                         bound,
                         lo,
                         hi,
-                        alloc_site_global(loc_text(i), "queue") });
+                        alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound_v)) });
 }
 
 // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants

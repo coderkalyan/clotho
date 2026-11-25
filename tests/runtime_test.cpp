@@ -187,7 +187,8 @@ constexpr rt_alloc_site kSite{ .where      = "<runtime test>",
                                .what       = "string",
                                .line_no    = 0,
                                .column     = 0,
-                               .end_column = 0 };
+                               .end_column = 0,
+                               .name       = nullptr };
 
 // A guard pairing init with deinit so tests can't leak on CHECK failures.
 struct Str {
@@ -702,6 +703,34 @@ TEST_CASE("svdpi scope: multiple tops each get their own scope handle") {
     REQUIRE(fresh != nullptr);
     CHECK(svGetScope() == fresh);
     CHECK(svGetUserData(fresh, const_cast<char*>("k")) == nullptr);
+}
+
+// A call of a context import makes its declaration scope current and puts the caller's
+// back: nested calls unwind in order, the index follows the current scope, and a null
+// svSetScope leaves none current.
+TEST_CASE("svdpi scope: enter and leave bracket a call, and the index follows the current scope") {
+    rt_svdpi_scope_register("top", 3, 0);
+    rt_svdpi_scope_register("top.u0", 6, 1);
+    rt_svdpi_scope_register("top.u0.blk[1]", 13, 2);
+    CHECK(rt_svdpi_scope_index() == 0);
+    CHECK(std::string(rt_svdpi_scope_name()) == "top");
+
+    void* const outer = rt_svdpi_scope_enter(1);
+    CHECK(rt_svdpi_scope_index() == 1);
+    CHECK(svGetScope() == svGetScopeFromName("top.u0"));
+    void* const inner = rt_svdpi_scope_enter(2);
+    CHECK(std::string(svGetNameFromScope(svGetScope())) == "top.u0.blk[1]");
+    // C changes the scope and does not put it back: the call's end does.
+    svSetScope(svGetScopeFromName("top"));
+    rt_svdpi_scope_leave(inner);
+    CHECK(rt_svdpi_scope_index() == 1);
+    rt_svdpi_scope_leave(outer);
+    CHECK(rt_svdpi_scope_index() == 0);
+
+    svSetScope(nullptr);
+    CHECK(rt_svdpi_scope_index() == UINT32_MAX);
+    CHECK(rt_svdpi_scope_name() == nullptr);
+    rt_svdpi_scope_register("top", 3, 0);
 }
 
 // -- svdpi open-array descriptor + element marshal (LRM 35.5.6.2) --

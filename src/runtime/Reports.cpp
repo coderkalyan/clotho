@@ -12,16 +12,12 @@ using namespace rt_internal;
 
 namespace {
 
-// Shared tail of the two DPI export-task fatals: both are reached from inside a
-// native C frame the simulator cannot unwind, so neither can hand a settled state
-// back the way rt_finish_coop does. Same reasoning as rt_oscillation_abort --
-// report, close the dump while the design state is still live, exit nonzero.
-[[noreturn]] void dpi_export_task_fatal(const char* name, const char* what) {
+// Shared tail of the DPI export fatals: all are reached from inside a native C frame
+// the simulator cannot unwind, so none can hand a settled state back the way
+// rt_finish_coop does. Same reasoning as rt_oscillation_abort -- report, close the dump
+// while the design state is still live, exit nonzero.
+[[noreturn]] void dpi_export_fatal(std::string line) {
     std::fflush(stdout);
-    std::string line = "FATAL: exported task '";
-    line += name;
-    line += "' ";
-    line += what;
     line += " at ";
     append_finish_time(line, rt_diag_now());
     line += '\n';
@@ -30,6 +26,14 @@ namespace {
     rt_vcd_close();
     rt_finishing = 1;
     std::exit(1);
+}
+
+[[noreturn]] void dpi_export_task_fatal(const char* name, const char* what) {
+    std::string line = "FATAL: exported task '";
+    line += name;
+    line += "' ";
+    line += what;
+    dpi_export_fatal(std::move(line));
 }
 
 } // namespace
@@ -60,8 +64,53 @@ extern "C" void rt_dpi_export_task_no_task_frame(const char* name) {
                           "function)");
 }
 
-extern "C" void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind) {
-    g_observed_case.push_back({ banner, now, kind });
+extern "C" void rt_dpi_export_no_scope(const char* name, const char* exporters) {
+    const char* const current = rt_svdpi_scope_name();
+    std::string       line    = "FATAL: DPI export '";
+    line += name;
+    line += "' was called from C with ";
+    if (current != nullptr) {
+        line += "scope '";
+        line += current;
+        line += "'";
+    } else {
+        line += "no scope";
+    }
+    line += " current, which does not export it; it is exported from ";
+    line += exporters;
+    line += " (select one with svSetScope, LRM 35.5.3)";
+    dpi_export_fatal(std::move(line));
+}
+
+extern "C" void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind, const uint64_t* gen) {
+    g_observed_case.push_back({ banner, now, kind, gen, gen != nullptr ? *gen : 0 });
+}
+
+// A fork child's report generation (LRM 16.4.2: a child is a thread of its own, so
+// its resumes flush its own reports). Cells come from a pool because the child's
+// frame is gone when its last report matures. The pool never shrinks and a cell
+// has a stable address, so a pending report can name it.
+extern "C" uint64_t* rt_gen_cell_alloc() {
+    if (g_gen_free.empty()) {
+        g_gen_cells.push_back(std::make_unique<uint64_t>(0));
+        g_gen_free.push_back(g_gen_cells.back().get());
+    }
+    uint64_t* cell = g_gen_free.back();
+    g_gen_free.pop_back();
+
+    return cell;
+}
+
+// The child ended: nothing can flush its pending reports any more, so they are
+// issued at the Observed flush like any report of a finished process.
+extern "C" void rt_gen_cell_free(uint64_t* cell) {
+    for (ObservedCaseViol& r : g_observed_case) {
+        if (r.gen == cell) {
+            r.gen = nullptr;
+        }
+    }
+    *cell = 0;
+    g_gen_free.push_back(cell);
 }
 
 extern "C" void rt_observed_flush() {
@@ -75,6 +124,10 @@ extern "C" void rt_observed_flush() {
     // warning interleaves.
     std::fflush(stdout);
     for (const ObservedCaseViol& r : g_observed_case) {
+        // A report whose process has run since (a flush point, LRM 16.4.2) is dropped.
+        if (r.gen != nullptr && *r.gen != r.gen_val) {
+            continue;
+        }
         std::string line = r.banner;
         line += r.kind == 0 ? "no condition is true in the unique/priority if/case at time "
                             : "if/case statement is not unique (overlapping items) at time ";
@@ -87,13 +140,19 @@ extern "C" void rt_observed_flush() {
 }
 namespace {
 
-// ir::Severity::Fatal, the one level that changes how the run ends.
+// ir::Severity::Fatal, the one level that changes how the run ends, and ir::Severity::Cover,
+// which is no report: it files a cover site's counts (rt_internal::cover_file).
 constexpr int32_t kSeverityFatal = 3;
+constexpr int32_t kSeverityCover = 4;
 
 } // namespace
 namespace rt_internal {
 
 std::vector<ObservedCaseViol>                    g_observed_case;
+std::vector<std::unique_ptr<uint64_t>>           g_gen_cells;
+std::vector<uint64_t*>                           g_gen_free;
+std::vector<CoverSite>                           g_cover_sites;
+ankerl::unordered_dense::map<std::string, size_t> g_cover_index;
 ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
 ankerl::unordered_dense::set<const void*>        g_ref_stale_seen;
 
@@ -142,8 +201,82 @@ std::string severity_line(int32_t           level,
 
 } // namespace rt_internal
 
+namespace rt_internal {
+
+CoverRef cover_ref(const char* banner, const rt_string* path, const char* tail, const char* fmt) {
+    // "<op>\x1f<kind>\x1f<ordinal>\x1f<file:line>": the ordinal only tells two sites on a
+    // line apart, and is part of the key, not of the report.
+    CoverRef    ref;
+    std::string parts[4];
+    size_t      n = 0;
+    for (const char* p = fmt; *p != '\0'; ++p) {
+        if (*p == '\x1f' && n < 3) {
+            ++n;
+        } else {
+            parts[n] += *p;
+        }
+    }
+    ref.op    = parts[0].empty() ? 'r' : parts[0][0];
+    ref.kind  = parts[1];
+    ref.where = parts[3];
+    // The banner starts with "<file:line>: ", and a site outside an instance carries its
+    // scope text after that; inside one the text is the path and the tail.
+    const std::string_view head = banner;
+    ref.name                    = std::string(head.substr(std::min(head.size(), ref.where.size() + 2)));
+    if (path != nullptr) {
+        ref.name.append(str_data(path), str_len(path));
+    }
+    if (tail != nullptr) {
+        ref.name += tail;
+    }
+    ref.kind += '\x1f' + parts[2];
+    return ref;
+}
+
+void cover_file(const CoverRef& ref, uint32_t argc, const rt_arg* argv) {
+    const std::string key = ref.kind + '\x1f' + ref.where + '\x1f' + ref.name;
+    auto [it, fresh]      = g_cover_index.try_emplace(key, g_cover_sites.size());
+    if (fresh) {
+        const size_t sep = ref.kind.find('\x1f');
+        g_cover_sites.push_back(CoverSite{ .kind = ref.kind.substr(0, sep), .where = ref.where, .name = ref.name });
+    }
+    CoverSite& site = g_cover_sites[it->second];
+    if (ref.op == 'h') {
+        ++site.matches;
+    } else if (argc == 1) {
+        site.matches = argv[0].val[0];
+    } else if (argc == 2) {
+        site.has_attempts = true;
+        site.attempts     = argv[0].val[0];
+        site.matches      = argv[1].val[0];
+    }
+}
+
+void cover_sites_write(std::FILE* f) {
+    if (f != nullptr && !g_cover_sites.empty()) {
+        std::fprintf(f, "\ncover statements (LRM 16.3, 16.12)\n");
+        for (const CoverSite& s : g_cover_sites) {
+            const char* name = s.name.empty() ? "<unnamed>" : s.name.c_str();
+            if (s.has_attempts) {
+                std::fprintf(f, "  %s %s  %s  attempts %" PRIu64 "  matches %" PRIu64 "\n", s.kind.c_str(), name,
+                             s.where.c_str(), s.attempts, s.matches);
+            } else {
+                std::fprintf(f, "  %s %s  %s  hits %" PRIu64 "\n", s.kind.c_str(), name, s.where.c_str(), s.matches);
+            }
+        }
+    }
+    g_cover_sites.clear();
+    g_cover_index.clear();
+}
+
+} // namespace rt_internal
+
 extern "C" void rt_severity(int32_t level, const char* banner, const rt_string* path, const char* tail,
                             const char* fmt, uint32_t argc, const rt_arg* argv) {
+    if (level == kSeverityCover) {
+        cover_file(cover_ref(banner, path, tail, fmt), argc, argv);
+        return;
+    }
     // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
     // default failure (LRM 16.3). A simulator diagnostic, not design output, so
     // it goes to stderr like the $finish / case-violation banners; flush stdout
@@ -379,6 +512,45 @@ extern "C" void rt_divzero_report(const rt_null_site* site, uint64_t now) {
         fmt::print(stderr, body, " further reports from this operation are suppressed");
         fmt::print(stderr, "\n");
     }
+    std::fflush(stderr);
+}
+
+// ---- Bounded queue overflow (docs/LRM_NOTES.md 6) ----
+
+extern "C" void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_t wanted,
+                                         uint64_t now) {
+    // One report per overflowing operation, none suppressed: LRM_NOTES 6 has every
+    // overflow announced, so a loop that overflows a queue prints a line per pass.
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+
+    const uint64_t    limit = bound + 1;
+    std::string       when;
+    append_finish_time(when, now);
+    const std::string subject = site->name != nullptr && site->name[0] != '\0'
+                                  ? fmt::format("bounded queue '{}'", site->name)
+                                  : std::string("bounded queue");
+    fmt::print(stderr, label, "warning:");
+    fmt::print(stderr, head, " {} overflows: {} elements do not fit, it holds at most {} ([$:{}])", subject,
+               wanted, limit, bound);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        print_snippet(snippet_text(site->line), site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } }, loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " the first {} elements are kept and the last {} dropped, at {}", limit,
+               wanted - limit, when);
+    fmt::print(stderr, "\n");
     std::fflush(stderr);
 }
 

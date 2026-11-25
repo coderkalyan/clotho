@@ -134,6 +134,7 @@ void Backend::lower_strobe_pend(Index i) {
     argv.push_back(callee_home());
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+    emit_trace_spawn(b_, hdl, RT_TRACE_ORG_STROBE, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
     b_.CreateCall(strobe_pend_fn(), { hdl });
 }
 
@@ -162,6 +163,8 @@ void Backend::lower_reactive_pend(Index i) {
     argv.push_back(b_.getInt8(kReactiveHomeTag));
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+    emit_trace_spawn(b_, hdl, RT_TRACE_ORG_PEND, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
+    emit_trace_wake(b_, hdl, { .kind = RT_TRACE_PEND });
     emit_reactive_push(b_, hdl);
 }
 
@@ -261,7 +264,7 @@ void Backend::lower_expect_wait(Index i) {
     // sits in no other queue, so the flag must say "not scheduled" or a later
     // event wake would be dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("expect.resume");
+    emit_suspend("expect.resume", { .kind = RT_TRACE_CTL_EXPECT });
 
     // Past the resume point, so this thread is now running in the Reactive
     // region -- and by LRM 24.3.1 it stays there: "all subsequent blocking
@@ -312,8 +315,10 @@ void Backend::lower_expect_wake(Index i) {
     b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* slot = expect_handle_slot(q, idx);
-    emit_reactive_push(b_, b_.CreateLoad(ptr_ty, slot));
+    llvm::Value* slot   = expect_handle_slot(q, idx);
+    llvm::Value* parked = b_.CreateLoad(ptr_ty, slot);
+    emit_trace_wake(b_, parked, { .kind = RT_TRACE_EXPECT });
+    emit_reactive_push(b_, parked);
     llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
     idx->addIncoming(next, b_.GetInsertBlock());
     b_.CreateBr(head);
@@ -462,16 +467,19 @@ void Backend::lower_finish(Index i) {
 }
 
 // Lower a unique/priority case violation report: pass the compile-time banner
-// prefix, the simulation time of the violation, and the message kind. The
-// runtime queues it and reports in the Observed region, where LRM 12.4.2 /
-// 12.5.3 place it (docs/LRM_NOTES.md, note 18), rather than emitting here in
-// the Active region, so the region continues normally.
+// prefix, the simulation time of the violation, the message kind and the report
+// generation of the thread executing it. The runtime queues it and reports in the
+// Observed region, where LRM 12.4.2 / 12.5.3 place them (docs/LRM_NOTES.md, note
+// 18), unless the thread reached a flush point first (LRM 16.4.2), so the region
+// continues normally.
 void Backend::lower_case_viol(Index i) {
     const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
     const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
     llvm::Value*      now    = b_.CreateCall(wheel_now_fn(), { wheel_ });
+    llvm::Value*      gen    = gen_gv_ != nullptr ? load_gen()
+                                                  : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     b_.CreateCall(observed_case_violation_fn(),
-                  { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
+                  { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind), gen });
 }
 
 // Lower a severity report ($info / $warning / $error / $fatal, or an
@@ -509,11 +517,22 @@ void Backend::lower_severity(Index i) {
     // deferred Severity lowers, since is_simple_always forces the group to a
     // coroutine and lower_group set cur_defer_group_. defer == 2 selects the
     // Postponed (final) maturation, defer == 1 the Observed (`#0`).
-    llvm::Value* gen = defer_gen_ptr();
+    // In a subroutine the report belongs to the thread that called it: its published generation
+    // (a task keeps what it read at entry in its frame; a fork child's is its own cell), which is
+    // null at run time when that thread has no counter.
+    llvm::Value* gen = cur_fn_ == nullptr ? defer_gen_ptr()
+                       : gen_gv_ == nullptr ? nullptr
+                       : gen_slot_ != nullptr ? static_cast<llvm::Value*>(b_.CreateLoad(raw_ptr_ty(), gen_slot_))
+                                              : load_gen();
     auto*        i64 = b_.getInt64Ty();
-    llvm::Value* gen_val =
-      gen != nullptr ? b_.CreateLoad(i64, gen)
-                     : static_cast<llvm::Value*>(b_.getInt64(0));
+    llvm::Value* gen_val = static_cast<llvm::Value*>(b_.getInt64(0));
+    if (gen != nullptr && cur_fn_ == nullptr) {
+        gen_val = b_.CreateLoad(i64, gen);
+    } else if (gen != nullptr) {
+        auto* zero = new llvm::GlobalVariable(env_->llmod, i64, true, llvm::GlobalValue::PrivateLinkage,
+                                              b_.getInt64(0), "clotho.gen.zero");
+        gen_val = b_.CreateLoad(i64, b_.CreateSelect(b_.CreateIsNull(gen), zero, gen));
+    }
     llvm::Value* gen_arg =
       gen != nullptr ? gen
                      : static_cast<llvm::Value*>(null);
@@ -1228,17 +1247,25 @@ void Backend::lower_readmem(Index i) {
                            (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
                            (fname_is_str ? 16u : 0u) | (!s.four_state ? 32u : 0u);
 
-    b_.CreateCall(readmem_fn(),
-                  { path, path_len, mm_base, z_base, b_.getInt32(stride),
-                    b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
-                    b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+    llvm::Value* changed = b_.CreateCall(readmem_fn(),
+                                         { path, path_len, mm_base, z_base, b_.getInt32(stride),
+                                           b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
+                                           b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+    // A whole-memory load has no per-element edge facts: wake the memory's Any-edge
+    // readers when the load changed an element, as lower_fread_mem does.
+    if (!silent_stores_ && signal_has_waiters(info.target)) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* svc  = llvm::BasicBlock::Create(ctx_, "readmem.svc", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "readmem.cont", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(changed, b_.getInt32(0)), svc, cont);
+        b_.SetInsertPoint(svc);
+        service_any_waiters(info.target);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
     if (!silent_stores_) {
         vcd_touch_array(info.target);   // bulk write: mark the array for the dump
     }
-    // TODO: $readmem services no wait queues — a process already waiting on
-    // the memory sleeps through the load (pre-existing gap). rt_readmem would
-    // need a did-write result (it returns void) to gate an Any-edge wake the
-    // way lower_fread_mem does.
 }
 
 // The runtime rt_finishing byte, set once a $finish / $stop has been taken.
@@ -1302,6 +1329,43 @@ void Backend::emit_defer_gen_bump_at(llvm::Value* gen) {
     }
     auto* i64 = b_.getInt64Ty();
     b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(1)), gen);
+}
+
+// The ptr global holding the report generation of the running thread. Created at the
+// start of the lowering (Backend::run) in a design that can use it, so that no body
+// lowering makes it: root must come out of a verifying re-lowering as it went in.
+llvm::Value* Backend::gen_global() {
+    if (gen_gv_ == nullptr) {
+        auto* null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        gen_gv_    = new llvm::GlobalVariable(root_env_->llmod, raw_ptr_ty(), false,
+                                              llvm::GlobalValue::InternalLinkage, null, "clotho.gen");
+    }
+    return sym(gen_gv_);
+}
+
+llvm::Value* Backend::load_gen() {
+    return b_.CreateLoad(raw_ptr_ty(), gen_global());
+}
+
+void Backend::store_gen(llvm::Value* gen) {
+    b_.CreateStore(gen, gen_global());
+}
+
+// The generation this body republishes after a resume: a process group's own
+// counter, or what a task read at its entry. Null for a body that does not need it.
+llvm::Value* Backend::body_gen() {
+    if (gen_slot_ != nullptr) {
+        return b_.CreateLoad(raw_ptr_ty(), gen_slot_);
+    }
+    if (cur_fn_ == nullptr && cur_defer_group_ >= 0) {
+        return defer_gen_ptr();
+    }
+    return nullptr;
+}
+
+bool Backend::fn_needs_gen(FunctionId id) const {
+    const auto k = static_cast<uint32_t>(id);
+    return k < facts_.fn_gen.size() && facts_.fn_gen[k] != 0;
 }
 
 // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array

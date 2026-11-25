@@ -20,6 +20,7 @@
 #include "ConfigMatrix.h"
 #include "Lower.h"
 #include "Subprocess.h"
+#include "TraceCheck.h"
 #include "Twin.h"
 #include "ir/Jit.h"
 #include "runtime/Runtime.h"
@@ -41,7 +42,9 @@ void binary_std_streams() {
 // run_design_subprocess runs a design in its own process; see Subprocess.h for
 // when that is needed. Lowers the file's *text* rather than going
 // through lower_files so the buffer is named "source", matching what the same
-// design produces in-process.
+// design produces in-process. CLOTHO_TEST_DPI_LIB, when set, names a relocatable
+// object to link into the JIT (`--dpi-lib`): the C side of a design whose C calls
+// an export (dpi_test.cpp).
 int run_design(const char* path) {
     binary_std_streams();
     const std::string         text = clotho::test::detail::read_file(path);
@@ -54,8 +57,11 @@ int run_design(const char* path) {
     // Same resolver the CLI installs, so a runtime diagnostic emitted here
     // carries the file position and source snippet a real run would show —
     // which is the whole payload of a test that asserts on one.
-    return clotho::ir::run_jit(*r.module, /*timings=*/nullptr, /*config=*/{}, /*plusargs=*/{},
-                               clotho::loc_resolver(r));
+    clotho::ir::SimulationConfig config;
+    if (const char* const dpi_lib = std::getenv("CLOTHO_TEST_DPI_LIB"); dpi_lib != nullptr) {
+        config.dpi_libs.emplace_back(dpi_lib);
+    }
+    return clotho::ir::run_jit(*r.module, /*timings=*/nullptr, config, /*plusargs=*/{}, clotho::loc_resolver(r));
 }
 
 // Encoding-violation mode: call the report the extra-asserts check reaches, as the
@@ -147,10 +153,14 @@ struct ConfigMatrixListener : doctest::IReporter {
     void report_query(const doctest::QueryData&) override {}
     void test_run_start() override {}
     void test_run_end(const doctest::TestRunStats&) override {}
-    void test_case_start(const doctest::TestCaseData& tc) override { clotho::test::config_matrix::begin_test(tc.m_name); }
+    void test_case_start(const doctest::TestCaseData& tc) override {
+        clotho::test::config_matrix::begin_test(tc.m_name);
+        clotho::test::trace_check::begin_test(tc.m_name);
+    }
     void test_case_reenter(const doctest::TestCaseData&) override {}
     void test_case_end(const doctest::CurrentTestCaseStats& stats) override {
         clotho::test::config_matrix::end_test(stats.testCaseSuccess);
+        clotho::test::trace_check::end_test(stats.testCaseSuccess);
     }
     void test_case_exception(const doctest::TestCaseException&) override {}
     void subcase_start(const doctest::SubcaseSignature&) override {}
@@ -188,6 +198,20 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // Trace-check mode (TraceCheck.h): every design the suite simulates is checked against the
+    // scheduler's rules while it runs. CLOTHO_NO_TRACE_CHECK=1 turns it off (and the backend
+    // then emits none of the calls), to time the suite without it.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (std::getenv("CLOTHO_NO_TRACE_CHECK") == nullptr) {
+        try {
+            clotho::test::trace_check::install();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            return 2;
+        }
+    }
+#endif
+
     // Config-matrix mode (ConfigMatrix.h): every design the suite lowers is run under
     // each backend gate in child processes. Opt-in, because it costs a process per
     // variant per design: CLOTHO_CONFIG_MATRIX=1.
@@ -219,5 +243,6 @@ int main(int argc, char** argv) {
         }
     }
     const int matrix_rc = clotho::test::config_matrix::finish();
-    return rc != 0 ? rc : matrix_rc;
+    const int trace_rc  = clotho::test::trace_check::finish();
+    return rc != 0 ? rc : (matrix_rc != 0 ? matrix_rc : trace_rc);
 }

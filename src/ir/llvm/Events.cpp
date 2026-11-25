@@ -34,7 +34,7 @@ void Backend::lower_delay(Index amount) {
             // A nonzero delay is region-aware through the awaiter, above.
             emit_delay_timer(ticks);
         }
-        emit_suspend("coro.resume");
+        emit_suspend("coro.resume", { .kind = RT_TRACE_CTL_DELAY, .delay = ticks });
         return;
     }
 
@@ -54,7 +54,7 @@ void Backend::lower_delay(Index amount) {
     b_.CreateBr(susp);
 
     b_.SetInsertPoint(susp);
-    emit_suspend("coro.resume");
+    emit_suspend("coro.resume", { .kind = RT_TRACE_CTL_DELAY, .delay = ticks });
 }
 
 // Schedule a wheel timer for `now + ticks` that resumes this coroutine: stash
@@ -182,7 +182,7 @@ void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
     // port instead of baking it.
     llvm::Value* cap =
       port_reachable(s) && binding_of(s) != no_bind
-        ? static_cast<llvm::Value*>(b_.CreateLoad(i32, port_elem_ptr(s, port_of(s)->dyn[edge].cap)))
+        ? static_cast<llvm::Value*>(fixed_field_load(i32, port_elem_ptr(s, port_of(s)->dyn[edge].cap)))
         : b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()));
     emit_len_full_check(b_, len, cap, kRingWaitDynamic);
     emit_entry(q, len, parked_handle(b_, hdl_), sched_ptr_);
@@ -193,8 +193,8 @@ void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
 // queue rather than a wheel timer. Like a #delay's suspend: the default edge
 // returns to the resumer, case 0 resumes here, case 1 is a destroy while
 // suspended.
-void Backend::emit_wait_suspend() {
-    emit_suspend("coro.wait_resume");
+void Backend::emit_wait_suspend(const TracePark& park) {
+    emit_suspend("coro.wait_resume", park);
 }
 
 // Lower an intra-body `@(a or posedge b ...)` event wait: register on EVERY
@@ -222,7 +222,7 @@ void Backend::lower_wait(ExtraIndex info) {
 
 // A process that waits at its head (waits_at_head) calls this with its leading list,
 // at the top of its loop.
-void Backend::lower_wait_edges(std::span<const WaitEdge> events) {
+void Backend::lower_wait_edges(std::span<const WaitEdge> events, const SourceText* where) {
     // An event waiter links a frame-resident node onto the event object's list;
     // a signal waiter appends to the (signal, edge) dynamic bucket. A mixed
     // `@(e or clk)` does both -- they are independent registrations before one
@@ -253,7 +253,7 @@ void Backend::lower_wait_edges(std::span<const WaitEdge> events) {
         }
     }
     emit_arm_wake_word(); // ready to be woken
-    emit_wait_suspend();  // park until any event fires
+    emit_wait_suspend({ .kind = RT_TRACE_CTL_EVENT, .edges = events, .where = where }); // park until any event fires
     // A remote `disable` is a second way to be resumed here, and it neither
     // fires nor clears the bucket we are in -- so with one in the design a
     // single-signal wait has to compact itself out too, or its stale entry would
@@ -804,6 +804,17 @@ Backend::ServiceSnapshot Backend::service_snapshot(const Guarded& g) {
         // waiter can exist yet anyway.
         return {};
     }
+    if (g.ref_wake_fn != nullptr && !g.is_string) {
+        // A write through a `ref` formal: the old words, and the thunk the call passed to wake
+        // the actual's waiters (null at run time when it has none).
+        const LValue    lv = safe_lvalue(g);
+        ServiceSnapshot old;
+        old.mm      = load_lv_mm(lv);
+        old.z       = lv.has_z ? load_lv_z(lv) : nullptr;
+        old.ref_fn  = g.ref_wake_fn;
+        old.ref_ctx = g.ref_wake_ctx;
+        return old;
+    }
     if (g.is_string) {
         // A string's value is its CONTENT, not the handle the place holds, so the
         // old value has to be copied out rather than loaded as a word. Covers
@@ -857,7 +868,15 @@ void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
         // the owner's: its record, when the write reached it through a binding or a
         // virtual interface handle.
         CtxOverride ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
-        if (old.str != nullptr) {
+        if (old.ref_fn != nullptr) {
+            // The callee classifies its own write (it knows the formal's leaf) and the thunk
+            // the call passed wakes what the actual's owner has waiting.
+            llvm::Value* new_mm = load_lv_mm(lv);
+            llvm::Value* new_z  = old.z != nullptr ? load_lv_z(lv) : nullptr;
+            const EdgeFacts f   = emit_edge_facts(old.mm, new_mm, lv.store_width, lv.four_state, old.z,
+                                                  new_z, true, true, true);
+            emit_ref_wake_call(old.ref_fn, old.ref_ctx, f.changed, f.pos, f.neg);
+        } else if (old.str != nullptr) {
             str_chg_after(lv, old.str);
         } else if (old.container) {
             notify_container_mutation(lv);
@@ -1123,7 +1142,7 @@ void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
             // Waiters that reached this member through a virtual interface: an
             // intrusive list on the instance the write is landing in, walked
             // exactly like an event object's (each waiter unlinks itself).
-            emit_event_wake_list(vif_head_ptr(sig, e));
+            emit_event_wake_list(vif_head_ptr(sig, e), { .kind = RT_TRACE_VIF, .sig = sig, .fact = e });
         }
         fire_event_trigger(sig, e);
         b_.CreateBr(cont);
@@ -1273,7 +1292,7 @@ llvm::Value* Backend::wait_base(WaitPart part, Signal sig, uint32_t edge) {
         const uint32_t    elem = part == WaitPart::Static    ? pl.sta[edge].base
                                  : part == WaitPart::Dynamic ? pl.dyn[edge].base
                                                              : pl.dyn[edge].len;
-        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
+        return fixed_field_load(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
     }
     if (s.anchor != SignalSlot::no_anchor) {
         taint("names a wait bucket of one instance");
@@ -1295,7 +1314,7 @@ llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
     const auto        i = static_cast<uint32_t>(sig);
     const SignalSlot& s = slots_[i];
     if (s.anchor != SignalSlot::no_anchor && wait_sta_gv_[i][edge] != nullptr) {
-        return b_.CreateLoad(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
+        return fixed_field_load(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
     }
     if (wait_sta_trig_gv_[i][edge] != nullptr) {
         return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
@@ -1324,13 +1343,15 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
     const auto        i    = static_cast<uint32_t>(sig);
     const SignalSlot& s    = slots_[i];
     llvm::Value*      base = wait_base(WaitPart::Static, sig, edge);
+    // The bucket's edge is the fact the writer's scan knows: the entries wake for this change.
+    const TraceCause why{ .kind = RT_TRACE_STATIC, .sig = sig, .fact = edge };
     if (port_reachable(s)) {
-        emit_static_scan_rt(base, b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
-                            static_trig_bits(sig, edge));
+        emit_static_scan_rt(base, fixed_field_load(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
+                            static_trig_bits(sig, edge), why);
         return;
     }
     emit_static_scan_rt(base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
-                        static_trig_bits(sig, edge));
+                        static_trig_bits(sig, edge), why);
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -1339,7 +1360,8 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
 // resets to 0); the firing process deregisters its stale entries from any
 // OTHER buckets itself on resume (eager removal in lower_wait).
 void Backend::service_dynamic_queue(Signal sig, uint32_t edge) {
-    emit_dynamic_scan_rt(wait_base(WaitPart::Dynamic, sig, edge), wait_base(WaitPart::DynamicLen, sig, edge));
+    emit_dynamic_scan_rt(wait_base(WaitPart::Dynamic, sig, edge), wait_base(WaitPart::DynamicLen, sig, edge),
+                         { .kind = RT_TRACE_DYNAMIC, .sig = sig, .fact = edge });
 }
 
 // The design's one detached on-expiry thunk of `->> #d e`. The wheel calls it as
@@ -1487,7 +1509,7 @@ void Backend::emit_event_pend_drain(llvm::Value* wheel) {
 void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
-    emit_event_wake_list(obj);
+    emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here, and
     // only an object some such statement registered on has an id to fire.
@@ -1543,7 +1565,7 @@ void Backend::emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel) {
 // One-shot nodes are NOT bulk-cleared the way a dynamic bucket is (which resets
 // its whole length on fire): each waiter unlinks itself on resume, which is also
 // what makes a multi-event wait correct without a compaction pass.
-void Backend::emit_event_wake_list(llvm::Value* obj) {
+void Backend::emit_event_wake_list(llvm::Value* obj, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* nty  = event_node_ty();
     auto* null = llvm::ConstantPointerNull::get(ptr);
@@ -1571,7 +1593,7 @@ void Backend::emit_event_wake_list(llvm::Value* obj) {
     b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), wake, step);
 
     b_.SetInsertPoint(wake);
-    emit_wake_push(b_, hdl);
+    emit_wake_push(b_, hdl, why);
     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
     b_.CreateBr(step);
 
@@ -1746,7 +1768,7 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
 // in, or a group woken by two of its events in one instant loses the second
 // one's bit and skips the members that were waiting for it. With a constant 0
 // that path is empty and the emission is exactly the unguarded scan.
-void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig) {
+void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* word = sched_word_ty();
@@ -1781,7 +1803,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
     if (none != nullptr && none->isZero()) {
         b_.CreateCondBr(queued, cont, wake);
         b_.SetInsertPoint(wake);
-        emit_wake_push(b_, h);
+        emit_wake_push(b_, h, why);
         b_.CreateStore(b_.getInt64(1), fptr);
     } else {
         // The word becomes the entry's bits OR-ed in if it was already queued, else
@@ -1789,7 +1811,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
         b_.CreateStore(b_.CreateSelect(queued, b_.CreateOr(old, trig), b_.CreateOr(trig, b_.getInt64(1))), fptr);
         b_.CreateCondBr(queued, cont, wake);
         b_.SetInsertPoint(wake);
-        emit_wake_push(b_, h);
+        emit_wake_push(b_, h, why);
     }
     b_.CreateBr(cont);
 
@@ -1805,7 +1827,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
 // Generic dynamic-queue scan (base + length pointer values), null base =>
 // skip. Serves both callers, like emit_static_scan_rt. Wakes every live
 // entry (flag-deduped) and resets the length to 0.
-void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
+void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* elem = wait_elem_ty();
@@ -1838,7 +1860,7 @@ void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
     b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(sched_word_ty(), fptr), b_.getInt64(0)), cont, wake);
 
     b_.SetInsertPoint(wake);
-    emit_wake_push(b_, h);
+    emit_wake_push(b_, h, why);
     b_.CreateStore(b_.getInt64(1), fptr);
     b_.CreateBr(cont);
 
@@ -1890,6 +1912,143 @@ llvm::Value* Backend::event_wait_node(uint32_t k) {
         it->second = ab.CreateAlloca(event_node_ty(), nullptr, "event_wait_node");
     }
     return it->second;
+}
+
+// The wake of a `ref` actual that has waiters, as a function the callee calls after each write
+// through the formal (LRM 9.4.2: every change wakes at the change; 13.5.2: the formal is the
+// actual). The callee holds only a pointer, while the buckets are static per signal or reached
+// through a class object, so the call site makes `void(ptr ctx, i1 changed, i1 pos, i1 neg)`:
+// the callee classifies its own write (it knows the leaf it wrote) and the thunk services what
+// the actual's owner has waiting. `ctx` is the record of the code that made the call, the
+// owner's for a virtual interface member, or the object body of a class property, so the thunk
+// addresses the buckets as that code does. Built like a block commit function: in the module of
+// the caller, with its lowering state put back after.
+llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
+    auto*                          ptr = llvm::PointerType::getUnqual(ctx_);
+    auto*                          i1  = b_.getInt1Ty();
+    const std::vector<llvm::Type*> pt{ ptr, i1, i1, i1 };
+    const std::string name = fn_->getName().str() + ".refwake" + std::to_string(ref_wake_seq_[fn_]++);
+    auto*             th   = llvm::Function::Create(llvm::FunctionType::get(b_.getVoidTy(), pt, false),
+                                                    llvm::Function::InternalLinkage, name, env_->llmod);
+
+    llvm::IRBuilderBase::InsertPoint saved_ip     = b_.saveIP();
+    llvm::Function* const            saved_fn     = fn_;
+    llvm::Value* const               saved_state  = state_;
+    const uint32_t                   saved_anchor = own_anchor_;
+    llvm::Value* const               saved_ctx    = own_ctx_;
+    llvm::Value* const               saved_ovr    = ctx_override_;
+    const uint32_t                   saved_ovr_a  = ctx_override_anchor_;
+    const bool                       saved_silent = silent_stores_;
+    fn_                  = th;
+    state_               = sym(state_global_);
+    ctx_override_        = nullptr;
+    ctx_override_anchor_ = SignalSlot::no_anchor;
+    silent_stores_       = false;
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", th));
+    llvm::Value* ctx_arg = th->getArg(0);
+    if (lv.chg != nullptr || lv.vif_ctx != nullptr || saved_ctx == nullptr) {
+        own_anchor_ = SignalSlot::no_anchor;
+        own_ctx_    = nullptr;
+    } else {
+        own_ctx_ = ctx_arg;
+    }
+    {
+        CtxOverride ov(*this, lv.vif_ctx != nullptr ? ctx_arg : nullptr, lvalue_ctx_anchor(lv));
+        llvm::Value* const changed = th->getArg(1);
+        llvm::Value* const pos     = th->getArg(2);
+        llvm::Value* const neg     = th->getArg(3);
+        if (lv.chg != nullptr) {
+            // A class property: the notifiers live in the object body, which `ctx` is.
+            LValueInfo li;
+            li.chg         = lv.chg;
+            li.chg_body    = ctx_arg;
+            li.chg_body_ty = lv.chg_body_ty;
+            const std::array<std::pair<Edge, llvm::Value*>, 3> notifiers = {
+                std::make_pair(Edge::Any, changed),
+                std::make_pair(Edge::Positive, pos),
+                std::make_pair(Edge::Negative, neg),
+            };
+            for (const auto& [edge, fact] : notifiers) {
+                if (lv.chg->field[static_cast<uint32_t>(edge)] == kNoNotify) {
+                    continue;
+                }
+                auto* body = llvm::BasicBlock::Create(ctx_, "chg.body", th);
+                auto* cont = llvm::BasicBlock::Create(ctx_, "chg.cont", th);
+                b_.CreateCondBr(fact, body, cont);
+                b_.SetInsertPoint(body);
+                fire_prop_notifier(li, edge);
+                b_.CreateBr(cont);
+                b_.SetInsertPoint(cont);
+            }
+        } else {
+            const Signal sig = lv.is_signal ? lv.sig : lv.mut_sig;
+            EdgeFacts    f;
+            f.changed = signal_has_bucket(sig, Edge::Any) ? changed : nullptr;
+            f.pos     = signal_has_bucket(sig, Edge::Positive) ? pos : nullptr;
+            f.neg     = signal_has_bucket(sig, Edge::Negative) ? neg : nullptr;
+            service_wake_buckets(sig, f);
+            if (slot_of(sig).is_array) {
+                vcd_touch_array(sig);
+            } else {
+                vcd_touch_signal(sig);
+            }
+        }
+        b_.CreateRetVoid();
+    }
+    silent_stores_       = saved_silent;
+    ctx_override_anchor_ = saved_ovr_a;
+    ctx_override_        = saved_ovr;
+    own_ctx_             = saved_ctx;
+    own_anchor_          = saved_anchor;
+    state_               = saved_state;
+    fn_                  = saved_fn;
+    b_.restoreIP(saved_ip);
+
+    return th;
+}
+
+// Call the wake thunk of a `ref` formal after a write, when the call passed one.
+void Backend::emit_ref_wake_call(llvm::Value* fn, llvm::Value* ctx, llvm::Value* changed, llvm::Value* pos,
+                                 llvm::Value* neg) {
+    auto* f    = b_.GetInsertBlock()->getParent();
+    auto* call = llvm::BasicBlock::Create(ctx_, "refwake.call", f);
+    auto* cont = llvm::BasicBlock::Create(ctx_, "refwake.cont", f);
+    b_.CreateCondBr(b_.CreateIsNotNull(fn), call, cont);
+    b_.SetInsertPoint(call);
+    auto* i1  = b_.getInt1Ty();
+    auto* ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(llvm::FunctionType::get(b_.getVoidTy(), { ptr, i1, i1, i1 }, false), fn,
+                  { ctx, changed, pos, neg });
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+}
+
+bool Backend::push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref) {
+    if (!design_ref_wake_) {
+        return false;
+    }
+    auto* null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    if (lv.ref_wake_fn != nullptr) {
+        // A ref formal passed on: the next callee wakes through the same thunk.
+        argv.push_back(lv.ref_wake_fn);
+        argv.push_back(lv.ref_wake_ctx);
+        return true;
+    }
+    const bool by_signal = (lv.is_signal && signal_has_waiters(lv.sig)) ||
+                           (!lv.is_signal && lv.mut_sig_valid && signal_has_waiters(lv.mut_sig));
+    if (silent_stores_ || lv.is_assoc || (lv.chg == nullptr && !by_signal)) {
+        argv.push_back(null);
+        argv.push_back(null);
+        return false;
+    }
+    llvm::Function* th  = emit_ref_wake_thunk(lv);
+    llvm::Value*    ctx = lv.chg != nullptr       ? lv.chg_body
+                          : lv.vif_ctx != nullptr ? lv.vif_ctx
+                          : own_ctx_ != nullptr   ? own_ctx_
+                                                  : static_cast<llvm::Value*>(null);
+    argv.push_back(th);
+    argv.push_back(ctx);
+    return true;
 }
 
 } // namespace clotho::ir::backend

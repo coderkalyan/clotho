@@ -8,6 +8,7 @@
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "runtime/svdpi.h"
@@ -123,8 +124,9 @@ namespace {
 // run_jit's process-symbol generator finds them with no --dpi-lib needed. The
 // scalar marshaling (int / longint / real) is exercised end to end; the
 // byte/shortint/bit/logic and svLogic x/z paths, and the --dpi-lib .so path, are
-// exercised at the CLI instead (see docs/design/dpi-c.md).
-std::string run_capture(std::string_view source) {
+// exercised at the CLI instead (see docs/design/dpi-c.md). `config` carries a
+// `--dpi-lib` object for the tests whose C calls an export.
+std::string run_capture(std::string_view source, const ir::SimulationConfig& config = {}) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
@@ -136,7 +138,7 @@ std::string run_capture(std::string_view source) {
     const int saved = dup(fileno(stdout));
     dup2(fileno(tmp), fileno(stdout));
 
-    ir::run_jit(*r.module);
+    ir::run_jit(*r.module, nullptr, config);
 
     std::fflush(stdout);
     dup2(saved, fileno(stdout));
@@ -192,6 +194,22 @@ std::string llvm_definition(const std::string& ir_text, std::string_view name) {
     FAIL("no LLVM definition of ", name);
     return {};
 }
+
+#if !defined(_WIN32)
+// A simulation that links the relocatable object `object` (`--dpi-lib`): the C side
+// of a design whose C calls an export. Only an object can, because the export's
+// thunk lives in the JIT's own dylib, which a shared library cannot see.
+ir::SimulationConfig linking(std::string_view object) {
+    ir::SimulationConfig config;
+    config.dpi_libs.emplace_back(object);
+    return config;
+}
+
+// The same, in a child process: for a design that ends in a runtime fatal.
+test::DesignRun run_captured_linking(std::string_view source, std::string_view object) {
+    return test::run_design_captured(source, "CLOTHO_TEST_DPI_LIB=\"" + std::string(object) + "\" ");
+}
+#endif
 
 } // namespace
 
@@ -714,14 +732,11 @@ TEST_CASE("DPI export: the exported-task thunk drives a coroutine and guards bot
     CHECK(thunk.find("ret i32 0") != std::string::npos);
 }
 
-// One c_identifier exported from two scopes is dropped by slang before
-// getDPIExports() is visible (measured: only ONE @dup thunk is emitted, bound to
-// the first scope's task). Clotho's own duplicate-extern_name guard in
-// collect_dpi_exports is therefore unreachable today and stays as the invariant's
-// statement; this pins the upstream behaviour a task inherits, so a slang change
-// that started handing both entries over would surface here rather than silently
-// binding C to an arbitrary instance.
-TEST_CASE("DPI export: one c_identifier from two scopes collapses upstream in slang") {
+// One c_identifier exported from several scopes (LRM 35.4) is one C symbol. slang
+// keeps only the first of them, so the frontend collects every scope's directive
+// itself, and the one thunk picks the instance by the scope current when C calls it
+// (svSetScope, LRM 35.5.3). A task shares the symbol exactly as a function does.
+TEST_CASE("DPI export: one c_identifier from two scopes is one thunk that dispatches on the scope") {
     constexpr std::string_view src = R"(
         module ma;
           export "DPI-C" dup = task t;
@@ -738,6 +753,72 @@ TEST_CASE("DPI export: one c_identifier from two scopes collapses upstream in sl
         ++n;
     }
     CHECK(n == 1);
+    const std::string thunk = llvm_definition(ir, "dup");
+    CHECK(thunk.find("rt_svdpi_scope_index") != std::string::npos);
+    CHECK(thunk.find("rt_dpi_export_no_scope") != std::string::npos);
+    CHECK(thunk.find(".task.t") != std::string::npos);
+    CHECK(thunk.find(".task.u") != std::string::npos);
+}
+
+// The same module instantiated twice exports its function from two scopes, which is
+// the shape slang's own dedup hid most often.
+TEST_CASE("DPI export: two instances of one module dispatch, one instance does not") {
+    constexpr std::string_view two = R"(
+        module m;
+          export "DPI-C" function who;
+          function int who(); return 1; endfunction
+        endmodule
+        module top; m u0(); m u1(); endmodule)";
+    const std::string thunk = llvm_definition(emit_llvm_text(two), "who");
+    CHECK(thunk.find("rt_svdpi_scope_index") != std::string::npos);
+    CHECK(thunk.find("rt_dpi_export_no_scope") != std::string::npos);
+
+    // A c_identifier with one exporting scope has nothing to choose between, so its
+    // thunk is the plain call it has always been (C that reaches a package's export
+    // from whatever scope it happens to run in keeps working).
+    constexpr std::string_view one = R"(
+        module m;
+          export "DPI-C" function who;
+          function int who(); return 1; endfunction
+        endmodule
+        module top; m u(); endmodule)";
+    const std::string plain = llvm_definition(emit_llvm_text(one), "who");
+    CHECK(plain.find("rt_svdpi_scope_index") == std::string::npos);
+    CHECK(plain.find("rt_dpi_export_no_scope") == std::string::npos);
+}
+
+// Only a `context` import is instrumented (LRM 35.5.3): its call sets the current
+// scope to the import's declaration scope for the duration of the call.
+TEST_CASE("DPI import: only a context import call sets the scope") {
+    SUBCASE("context") {
+        constexpr std::string_view src = R"(
+            module m;
+              import "DPI-C" context function int cf(input int x);
+              initial $display("%0d", cf(1));
+            endmodule)";
+        const std::string ir = emit_llvm_text(src);
+        CHECK(ir.find("rt_svdpi_scope_enter") != std::string::npos);
+        CHECK(ir.find("rt_svdpi_scope_leave") != std::string::npos);
+    }
+    SUBCASE("plain import") {
+        constexpr std::string_view src = R"(
+            module m;
+              import "DPI-C" function int abs(input int x);
+              initial $display("%0d", abs(-1));
+            endmodule)";
+        const std::string ir = emit_llvm_text(src);
+        CHECK(ir.find("rt_svdpi_scope_enter") == std::string::npos);
+        CHECK(ir.find("rt_svdpi_scope_leave") == std::string::npos);
+    }
+}
+
+// Nothing of the scope machinery is emitted for a design that does not use it.
+TEST_CASE("DPI scope: a design without DPI carries no scope machinery") {
+    constexpr std::string_view src = R"(
+        module m;
+          initial $display("hi");
+        endmodule)";
+    CHECK(emit_llvm_text(src).find("rt_svdpi") == std::string::npos);
 }
 
 // An exported FUNCTION keeps the plain-call thunk it always had: no coroutine
@@ -846,3 +927,257 @@ TEST_CASE("DPI export: a package-scope export is collected in a design with no t
     const std::string ir_text = emit_llvm_text(src);
     CHECK(llvm_definition(ir_text, "f").find("clotho.inst.") == std::string::npos);
 }
+
+#if !defined(_WIN32)
+
+// -- svScope (LRM 35.5.3, H.9.3) --
+//
+// What C sees as the current scope, and so which instance a c_identifier exported
+// from several scopes reaches. The C side is tests/dpi_scope/dpi_scope.c, a
+// relocatable object linked into the JIT (only an object can call an export); each
+// step is a small import and the design prints every result.
+//
+// No oracle: iverilog's DPI is VPI-based and Verilator keeps one svScope per top, so
+// the expected output is derived from the LRM text, read from the public 1800-2017
+// edition (the 2023 PDF was not available; the DPI clause numbers are unchanged).
+// 35.5.3: "When an import invokes the svSetScope utility prior to calling the export,
+// it sets the context explicitly. Otherwise, the context will be the context of the
+// instantiated scope where the import declaration is located." H.9.3: svGetScope is
+// "the scope of the function's declaration site, not call site", svSetScope "returns
+// the previous active scope", svGetScopeFromName "shall be NULL for unrecognized scope
+// names" and "it is never possible to share user data storage across different
+// contexts".
+
+// The reported bug: two instances of one module export `who`, and C picks one with
+// svSetScope. Clotho bound C's `who` to the first instance whatever the scope.
+TEST_CASE("DPI scope: svSetScope selects the instance a shared export runs in") {
+    constexpr std::string_view src = R"(
+        module m #(parameter int ID = 0);
+          export "DPI-C" function who;
+          function int who(); return ID; endfunction
+        endmodule
+        module top;
+          m #(10) u0();
+          m #(11) u1();
+          import "DPI-C" function chandle c_scope(input string name);
+          import "DPI-C" context function int c_who_in(input chandle s);
+          initial begin
+            $display("u1 %0d", c_who_in(c_scope("top.u1")));
+            $display("u0 %0d", c_who_in(c_scope("top.u0")));
+            $display("u1 %0d", c_who_in(c_scope("top.u1")));
+          end
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "u1 11\nu0 10\nu1 11\n");
+}
+
+// Without svSetScope the export runs where the import is declared, so each instance's
+// own import reaches its own export. A call chain that leaves for another scope (the
+// export calls a package's context import) returns to the scope it left: the C sees
+// its own scope again afterwards.
+TEST_CASE("DPI scope: a context import runs in its declaration scope and the scope is restored") {
+    constexpr std::string_view src = R"(
+        package pk;
+          import "DPI-C" context function string c_here();
+        endpackage
+        module m #(parameter int ID = 0);
+          export "DPI-C" function who;
+          import "DPI-C" context function string c_here();
+          import "DPI-C" context function int c_who_here();
+          string trail;
+          function int who();
+            trail = pk::c_here();
+            return ID;
+          endfunction
+          string here;
+          int    r;
+          initial begin
+            #(ID);
+            here = c_here();
+            r    = c_who_here();
+            $display("%s %0d %s", here, r, trail);
+          end
+        endmodule
+        module top;
+          m #(1) u0();
+          m #(2) u1();
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "top.u0 1 pk\ntop.u1 2 pk\n");
+}
+
+// svGetScopeFromName finds every scope that has an export or a context import, however
+// deep, and answers NULL for a name that is none; svSetScope returns the scope that was
+// current and svGetScope then sees the new one.
+TEST_CASE("DPI scope: names resolve for nested scopes, and svSetScope swaps") {
+    constexpr std::string_view src = R"(
+        module inner;
+          import "DPI-C" context function string c_here();
+          // Never called: its scope is registered all the same (LRM H.9.3).
+        endmodule
+        module outer;
+          inner i();
+        endmodule
+        module top;
+          outer o();
+          import "DPI-C" function chandle c_scope(input string name);
+          import "DPI-C" function string c_name(input chandle s);
+          import "DPI-C" context function int c_swap(input chandle s);
+          initial begin
+            $display("%s", c_name(c_scope("top.o.i")));
+            $display("%s", c_name(c_scope("top")));
+            $display("%s", c_name(c_scope("top.nope")));
+            $display("%0d", c_swap(c_scope("top.o.i")));
+          end
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "top.o.i\ntop\n(null)\n3\n");
+}
+
+// User data belongs to a scope: the same context import declared in two instances
+// counts separately, because the two run under different values of svScope.
+TEST_CASE("DPI scope: user data is per instance") {
+    constexpr std::string_view src = R"(
+        module leaf #(parameter int ID = 0);
+          import "DPI-C" context function int c_count();
+          import "DPI-C" context function string c_here();
+          int n1, n2;
+          initial begin
+            #(ID);
+            n1 = c_count();
+            n2 = c_count();
+            $display("%s %0d %0d", c_here(), n1, n2);
+          end
+        endmodule
+        module top;
+          leaf #(1) a();
+          leaf #(2) b();
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "top.a 1 2\ntop.b 1 2\n");
+}
+
+// A generate block is a scope of its own (LRM H.9.2): the export of each iteration is
+// reached by the block's name, though all of them sit in one instance.
+TEST_CASE("DPI scope: generate blocks are scopes") {
+    constexpr std::string_view src = R"(
+        module top;
+          for (genvar i = 0; i < 2; i++) begin : blk
+            export "DPI-C" function who;
+            function int who(); return 100 + i; endfunction
+          end
+          import "DPI-C" function chandle c_scope(input string name);
+          import "DPI-C" function string c_name(input chandle s);
+          import "DPI-C" context function int c_who_in(input chandle s);
+          initial begin
+            $display("%s %0d", c_name(c_scope("top.blk[1]")), c_who_in(c_scope("top.blk[1]")));
+            $display("%s %0d", c_name(c_scope("top.blk[0]")), c_who_in(c_scope("top.blk[0]")));
+          end
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "top.blk[1] 101\ntop.blk[0] 100\n");
+}
+
+// A package and a module may export one c_identifier too (LRM 35.4: different scopes),
+// and a package's scope is its name.
+TEST_CASE("DPI scope: a package and a module export one c_identifier") {
+    constexpr std::string_view src = R"(
+        package p;
+          export "DPI-C" function who;
+          function int who(); return 7; endfunction
+        endpackage
+        module top;
+          export "DPI-C" who = function mine;
+          function int mine(); return 8; endfunction
+          import "DPI-C" function chandle c_scope(input string name);
+          import "DPI-C" context function int c_who_in(input chandle s);
+          initial begin
+            $display("p %0d", c_who_in(c_scope("p")));
+            $display("top %0d", c_who_in(c_scope("top")));
+          end
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "p 7\ntop 8\n");
+}
+
+// Each of several top-level modules is a scope, and exports from different tops share a
+// c_identifier like any others.
+TEST_CASE("DPI scope: every top is a scope") {
+    constexpr std::string_view src = R"(
+        module ta;
+          export "DPI-C" function who;
+          function int who(); return 1; endfunction
+        endmodule
+        module tb;
+          export "DPI-C" function who;
+          function int who(); return 2; endfunction
+          import "DPI-C" function chandle c_scope(input string name);
+          import "DPI-C" context function int c_who_in(input chandle s);
+          initial begin
+            $display("ta %0d", c_who_in(c_scope("ta")));
+            $display("tb %0d", c_who_in(c_scope("tb")));
+          end
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "ta 1\ntb 2\n");
+}
+
+// An exported task is reached the same way (LRM 35.8: all of 35.7 applies to it).
+TEST_CASE("DPI scope: svSetScope selects the instance a shared exported task runs in") {
+    constexpr std::string_view src = R"(
+        module m #(parameter int ID = 0);
+          export "DPI-C" task who;
+          task who(output int o); o = ID; endtask
+        endmodule
+        module top;
+          m #(5) u0();
+          m #(6) u1();
+          import "DPI-C" function chandle c_scope(input string name);
+          import "DPI-C" context task c_who_task(input chandle s, output int r);
+          int r;
+          initial begin
+            c_who_task(c_scope("top.u1"), r);
+            $display("u1 %0d", r);
+            c_who_task(c_scope("top.u0"), r);
+            $display("u0 %0d", r);
+          end
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_TASK_OBJECT)) == "u1 6\nu0 5\n");
+}
+
+// An export that exists in several scopes but not in the one that is current has no
+// instance to run: the call is a located fatal rather than a guess at the first one.
+TEST_CASE("DPI scope: a shared export called from a scope that lacks it is a located fatal") {
+    constexpr std::string_view src = R"(
+        module m #(parameter int ID = 0);
+          export "DPI-C" function who;
+          function int who(); return ID; endfunction
+        endmodule
+        module top;
+          m #(1) u0();
+          m #(2) u1();
+          import "DPI-C" context function int c_who_here();
+          initial $display("%0d", c_who_here());
+        endmodule)";
+    const test::DesignRun run = run_captured_linking(src, CLOTHO_DPI_SCOPE_OBJECT);
+    CHECK(test::design_exit_code(run) == 1);
+    CHECK(run.out.empty());
+    CHECK(run.err.find("FATAL: DPI export 'who'") != std::string::npos);
+    // It names the scope C was in, and every scope that does export it.
+    CHECK(run.err.find("'top'") != std::string::npos);
+    CHECK(run.err.find("top.u0") != std::string::npos);
+    CHECK(run.err.find("top.u1") != std::string::npos);
+    CHECK(run.err.find("svSetScope") != std::string::npos);
+}
+
+// A c_identifier exported from ONE scope has nothing to choose between, so C reaches it
+// whatever scope is current: native code that calls a package's export from the scope of
+// an unrelated import (UVM's m__uvm_report_dpi) is not an error.
+TEST_CASE("DPI scope: an export from a single scope is reached from any scope") {
+    constexpr std::string_view src = R"(
+        module m;
+          export "DPI-C" function who;
+          function int who(); return 42; endfunction
+        endmodule
+        module top;
+          m u();
+          import "DPI-C" context function int c_who_here();
+          initial $display("%0d", c_who_here());
+        endmodule)";
+    CHECK(run_capture(src, linking(CLOTHO_DPI_SCOPE_OBJECT)) == "42\n");
+}
+
+#endif // !defined(_WIN32)

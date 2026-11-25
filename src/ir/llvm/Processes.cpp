@@ -222,11 +222,16 @@ void Backend::lower_fork_inst(Index i) {
     // before it runs, exactly as before.
     const bool ramp_first =
       !kids.empty() && !mod_.function(static_cast<FunctionId>(static_cast<uint32_t>(kids[0]))).fork_targets.empty();
-    const auto ramp = [&](Index kid) {
+    // Where the fork is, for the report of what a child does: the trace names an activation
+    // by the construct that created it.
+    const std::string fork_where = trace_here();
+    const auto        ramp       = [&](Index kid) {
         llvm::Function*           cf = sym(fn_decls_[static_cast<uint32_t>(kid)]);
         std::vector<llvm::Value*> args = argv;
         args[0] = callee_record(static_cast<FunctionId>(static_cast<uint32_t>(kid)));
-        return b_.CreateCall(cf->getFunctionType(), cf, args);
+        llvm::Value* child = b_.CreateCall(cf->getFunctionType(), cf, args);
+        emit_trace_spawn(b_, child, RT_TRACE_ORG_FORK, fork_where, in_coroutine_body() ? hdl_ : nullptr);
+        return child;
     };
     std::vector<llvm::Value*> ramped;
     if (ramp_first) {
@@ -277,6 +282,7 @@ void Backend::lower_fork_inst(Index i) {
         // still null -> it wakes nobody); destroy its frame here, since it never
         // reached a ring for the drain to do it. One that suspends is parked in
         // the wheel / a wait queue and decrements + wakes on completion.
+        emit_trace_dispatch(b_, hdl, RT_TRACE_INLINE);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
         auto*        dz   = llvm::BasicBlock::Create(ctx_, "fork.child.done", fn_);
@@ -289,6 +295,12 @@ void Backend::lower_fork_inst(Index i) {
         if (joined != nullptr) {
             b_.CreateBr(joined);
             b_.SetInsertPoint(joined);
+        }
+    }
+    // An inline child published its own generation (it is a thread of its own, LRM 16.4.2).
+    if (!none && gen_gv_ != nullptr) {
+        if (llvm::Value* gen = body_gen(); gen != nullptr) {
+            store_gen(gen);
         }
     }
 
@@ -323,7 +335,7 @@ void Backend::lower_fork_inst(Index i) {
         if (park_claim_wanted() && sched_ptr_ != nullptr) {
             b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
         }
-        emit_suspend("fork.join.resume");
+        emit_suspend("fork.join.resume", { .kind = RT_TRACE_CTL_JOIN });
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(cont);
@@ -414,7 +426,7 @@ void Backend::emit_node_force_wake(llvm::Value* node, llvm::Value* hdl, llvm::Ba
     b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), push, after);
 
     b_.SetInsertPoint(push);
-    emit_wake_push(b_, hdl);
+    emit_wake_push(b_, hdl, { .kind = RT_TRACE_FORCE });
     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, node, 4)));
     b_.CreateBr(after);
 }
@@ -852,7 +864,7 @@ void Backend::emit_proc_wake_waiters(llvm::Value* head) {
     b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), wake, step);
 
     b_.SetInsertPoint(wake);
-    emit_wake_push(b_, hdl);
+    emit_wake_push(b_, hdl, { .kind = RT_TRACE_AWAIT });
     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
     b_.CreateBr(step);
 
@@ -1135,7 +1147,7 @@ void Backend::emit_proc_park_while_suspended() {
     // Record that the wake we were parked for has already been delivered, so
     // `resume` schedules instead of waiting for a source that will not fire twice.
     b_.CreateStore(b_.CreateOr(b_.CreateLoad(i32, ctlp), b_.getInt32(kProcWakePend)), ctlp);
-    emit_suspend("susp.resume");
+    emit_suspend("susp.resume", { .kind = RT_TRACE_CTL_SUSPENDED });
     b_.CreateBr(test);
 
     b_.SetInsertPoint(done);
@@ -1214,7 +1226,7 @@ void Backend::emit_proc_resume(llvm::Value* pcb) {
 
     b_.SetInsertPoint(push);
     llvm::Value* hdl = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 2));
-    emit_wake_push(b_, hdl);
+    emit_wake_push(b_, hdl, { .kind = RT_TRACE_PROC });
     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 4)));
     b_.CreateBr(skip);
 
@@ -1265,7 +1277,7 @@ void Backend::lower_wait_fork() {
     b_.SetInsertPoint(armed);
     b_.CreateStore(node, headp);
     emit_arm_wake_word();
-    emit_suspend("waitfork.resume");
+    emit_suspend("waitfork.resume", { .kind = RT_TRACE_CTL_WAIT_FORK });
     emit_proc_unlink_node(node);
     // Killed while parked (LRM 9.7): leave the barrier now. Re-testing instead
     // would re-park on a still-live child list and the force-wake would be lost;
@@ -1410,7 +1422,7 @@ void Backend::lower_proc_wait(Index i) {
     // in no other queue, so the flag has to read "not scheduled" or the wake is
     // dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("await.resume");
+    emit_suspend("await.resume", { .kind = RT_TRACE_CTL_AWAIT });
     // Unlink on resume, whoever woke us: the waker only walks and pushes, it does
     // not unlink, which is what keeps a multi-waiter list correct without a
     // compaction pass.
@@ -1621,7 +1633,7 @@ void Backend::emit_sync_wake(llvm::Value* qhead, bool all) {
         b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), push,
                         skip);
         b_.SetInsertPoint(push);
-        emit_wake_push(b_, hdl);
+        emit_wake_push(b_, hdl, { .kind = RT_TRACE_SYNC });
         b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
         b_.CreateBr(skip);
         b_.SetInsertPoint(skip);
@@ -1685,7 +1697,7 @@ void Backend::lower_sync_wait(Index i) {
     // sits in no other queue, so the flag must read "not scheduled" or the wake
     // is dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("coro.sync_resume");
+    emit_suspend("coro.sync_resume", { .kind = RT_TRACE_CTL_SYNC });
     if (llvm::Value* aborting = emit_abort_pending(); aborting != nullptr) {
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* leave = llvm::BasicBlock::Create(ctx_, "sync.abort", fn);

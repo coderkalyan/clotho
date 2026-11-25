@@ -47,14 +47,29 @@ const Symbol* Lowerer::outermost_named_block(const Statement& body) {
 
 namespace {
 
-// Whether `body` itself queues deferred assertion reports: a deferred statement anywhere in it,
-// but not in a subroutine it calls (a deferred assertion there is refused,
-// lower_immediate_assertion).
+// What `body` itself queues reports of: a deferred statement anywhere in it, or a
+// unique/priority if or case, but not in a subroutine it calls (a deferred assertion there
+// is refused, lower_immediate_assertion; the reports of a called subroutine are tagged with
+// the caller's generation by the backend).
 struct DeferredAssertionScan : ASTVisitor<DeferredAssertionScan, VisitFlags::AllGood> {
-    bool found = false;
+    bool found   = false; // a deferred assertion
+    bool flushes = false; // a deferred assertion or a unique/priority statement
 
     void handle(const ImmediateAssertionStatement& s) {
-        found = found || s.isDeferred;
+        found   = found || s.isDeferred;
+        flushes = flushes || s.isDeferred;
+        visitDefault(s);
+    }
+    void handle(const ConditionalStatement& s) {
+        flushes = flushes || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const CaseStatement& s) {
+        flushes = flushes || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const slang::ast::PatternCaseStatement& s) {
+        flushes = flushes || s.check != slang::ast::UniquePriorityCheck::None;
         visitDefault(s);
     }
 };
@@ -64,6 +79,13 @@ bool holds_deferred_assertion(const Statement& body) {
     body.visit(scan);
 
     return scan.found;
+}
+
+bool holds_flushable_reports(const Statement& body) {
+    DeferredAssertionScan scan;
+    body.visit(scan);
+
+    return scan.flushes;
 }
 
 // The implicit block a label gives a deferred assertion (`a1: assert #0 (...) ...;`, LRM 9.3.5).
@@ -98,7 +120,8 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
 
     // Whether its own body queues deferred assertion reports, which makes each event control and
     // wait statement in it a flush point (LRM 16.4.2); see flush_deferred_on_resume.
-    proc_defers_ = holds_deferred_assertion(sym.getBody());
+    proc_defers_  = holds_deferred_assertion(sym.getBody());
+    proc_flushes_ = holds_flushable_reports(sym.getBody()) || body_may_report(sym.getBody());
 
     // A module-item concurrent assertion is not a process of its own. slang
     // wraps it in ProceduralBlockSymbol(Always, isFromAssertion) purely to
@@ -1042,7 +1065,7 @@ void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool forc
     if (aggregate_has_field_defaults(vs.getType())) {
         // The struct type declares field-level defaults (LRM 7.2 / 8.8), which
         // override the type defaults just written.
-        emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+        emit_field_defaults(value_lvalue(vs, b, l), vs.getType(), b, l);
     }
 }
 
@@ -1163,7 +1186,7 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
             }
             ir::Builder&        b = *preinit_;
             const ir::SourceLoc l = to_source_loc(vs.location);
-            emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+            emit_field_defaults(value_lvalue(vs, b, l), vs.getType(), b, l);
         }
         return;
     }

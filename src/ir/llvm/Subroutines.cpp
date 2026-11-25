@@ -44,9 +44,18 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // group is the same code in every instance of its unit.
     cur_defer_group_ = -1;
     if (std::any_of(members.begin(), members.end(),
-                    [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
+                    [&](uint32_t m) { return facts_.processes[m].gen_counter; })) {
         cur_defer_group_ = static_cast<int32_t>(g_);
     }
+    gen_slot_ = nullptr;
+    // An activation start is a flush point of the group's reports (LRM 16.4.2), and the
+    // group is the running thread from here until it parks, so it publishes its counter.
+    const auto begin_activation = [&] {
+        emit_defer_gen_bump();
+        if (gen_gv_ != nullptr && cur_defer_group_ >= 0) {
+            store_gen(defer_gen_ptr());
+        }
+    };
 
     // Same-eligibility NBA prep: the function's block registrations pass
     // (instance block base + function-local ordinal) instead of the absolute
@@ -70,6 +79,15 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
                             : std::string(kRootSymbol) + ".p" + std::to_string(proc_index);
     if (members.size() > 1) {
         name += ".f" + std::to_string(members.size());
+    }
+    // Where the process is, for the trace: the park of its static control and of the wait at
+    // its head name it.
+    SourceText trace_at;
+    if (trace_on()) {
+        trace_at = trace_process_text(proc);
+        if (!resolve_) {
+            trace_at.where = name;
+        }
     }
 
     // Per-member table setup, run before lowering anything of that member.
@@ -233,6 +251,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         rng_slot_  = sym(rng_global_);
         own_ctx_   = own_anchor_ != SignalSlot::no_anchor ? fn_->getArg(0) : nullptr;
         sched_ptr_ = takes_flag ? fn_->getArg(2) : nullptr;
+        begin_activation();
         // Run each member body per activation, freeing its string temporaries
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
@@ -517,7 +536,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.loop", fn_);
         b_.CreateBr(loop_bb);
         b_.SetInsertPoint(loop_bb);
-        emit_defer_gen_bump(); // activation start = deferred-assertion flush point
+        begin_activation(); // activation start = flush point
         const bool guarded = open_group(g_);
         static_sub_body_ = true;
         for (size_t i = 0; i < members.size(); ++i) {
@@ -533,7 +552,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         // The park of the static subscription itself: the one park that arms the word and
         // is not a body's (emit_arm_wake_word).
         b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
-        emit_wait_suspend();                        // park until next trigger
+        emit_wait_suspend({ .kind = RT_TRACE_CTL_STATIC, .where = &trace_at }); // park until next trigger
         b_.CreateBr(loop_bb);
         // The forever back-edge means the shared final-suspend tail below is
         // unreachable; build it in a dead block so the IR stays well-formed.
@@ -565,7 +584,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.head", fn_);
         b_.CreateBr(loop_bb);
         b_.SetInsertPoint(loop_bb);
-        lower_wait_edges(head);
+        lower_wait_edges(head, &trace_at);
         emit_resume_polls();
         emit_defer_gen_bump(); // activation start = deferred-assertion flush point
         lower_region(ir_->root());
@@ -573,7 +592,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "always.exit", fn_));
     } else {
         // Never fused: a non-always (or sensitivity-less) group is a singleton.
-        emit_defer_gen_bump(); // single-shot body: one activation, one flush point
+        begin_activation(); // single-shot body: one activation, one flush point
         select_member(proc_index);
         str_vals_     = member_strs.front();
         dynarr_ret_   = member_dynarr.front();
@@ -603,6 +622,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // `await`ers woken. An `always` body reaches this only through $finish, which
     // is also the end of its thread, so the hook is right for both shapes.
     emit_proc_complete();
+    emit_trace_end(hdl_);
     auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
     auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
     sw->addCase(b_.getInt8(0), trap_bb);
@@ -806,6 +826,13 @@ llvm::Function* Backend::declare_function(FunctionId id) {
             // signature never depends on how any of them binds the formal.
             params.push_back(ptr); // &actual storage
             params.push_back(ptr); // witness chain, or null
+            if (is_queue_type(pt)) {
+                params.push_back(b_.getInt64Ty()); // the actual's bound
+            }
+            if (design_ref_wake_) {
+                params.push_back(ptr); // wake thunk, or null
+                params.push_back(ptr); // its context
+            }
             continue;
         }
         // A dynamic array or queue is one handle pointer regardless of
@@ -883,6 +910,13 @@ llvm::Function* Backend::declare_task(FunctionId id) {
             // The same shape declare_function builds.
             params.push_back(ptr); // &actual storage
             params.push_back(ptr); // witness chain, or null
+            if (is_queue_type(f.param_types[k])) {
+                params.push_back(b_.getInt64Ty()); // the actual's bound
+            }
+            if (design_ref_wake_) {
+                params.push_back(ptr); // wake thunk, or null
+                params.push_back(ptr); // its context
+            }
         } else if (is_handle_type(f.param_types[k])) {
             params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
         } else if (is_agg_abi(f.param_types[k])) {
@@ -1012,7 +1046,8 @@ void Backend::reserve_export_records() {
 }
 
 // How many LLVM parameters formal k occupies:
-//   2 — a `ref`: the aliased storage pointer and the witness chain
+//   2 — a `ref`: the aliased storage pointer and the witness chain, and a queue's
+//       actual's bound as a third (i64)
 //   1 — an aggregate storage pointer, a container handle pointer, a string
 //       handle (each one pointer in every direction), or a 2-state scalar (one
 //       iW, or the one pointer to its slot for an out / inout)
@@ -1020,7 +1055,9 @@ void Backend::reserve_export_records() {
 //       out / inout pointer pair
 uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-        return 2;
+        // A queue also carries its actual's bound (ref_queue_bound), and a design
+        // with ref wakes passes the wake thunk and its context after it.
+        return 2 + (is_queue_type(f.param_types[k]) ? 1 : 0) + (design_ref_wake_ ? 2 : 0);
     }
     // An aggregate is one storage pointer, in every direction (function or task).
     if (is_agg_abi(f.param_types[k])) {
@@ -1334,6 +1371,7 @@ void Backend::lower_function(FunctionId id) {
     body_home_is_runtime_ = is_shared_home_fn(id) || ir_has_expect_wait(f.ir);
     home_ptr_         = nullptr;
     cur_is_task_      = false;
+    gen_slot_         = nullptr;
     runs_once_        = false; // a function runs as often as it is called
     param_llvm_index_ = param_indices(f);
     build_frame_layout(f);
@@ -1604,6 +1642,27 @@ void Backend::lower_task(FunctionId id) {
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
     group_first_block_ = -1;
+    // The report generation of the thread this task runs in (LRM 16.4.2), read in the RAMP
+    // while the caller is still the running thread. A task that waits resumes its CALLER's
+    // thread, so it republishes this after each park (emit_suspend) and bumps it where the
+    // wait resumes (DeferFlush). A fork child is a thread of its own: it takes a counter
+    // cell of its own when it can reach a report, else publishes null; so does a body the
+    // runtime ramps itself.
+    gen_slot_        = nullptr;
+    cur_defer_group_ = -1;
+    llvm::Value* gen_cell = nullptr;
+    if (gen_gv_ != nullptr && fn_needs_gen(id)) {
+        gen_slot_ = b_.CreateAlloca(raw_ptr_ty(), nullptr, "gen");
+        llvm::Value* init;
+        if (f.is_fork_child && facts_.fn_report[static_cast<uint32_t>(id)] != 0) {
+            gen_cell = init = b_.CreateCall(gen_cell_alloc_fn(), {});
+        } else if (f.is_fork_child || gen_root_[static_cast<uint32_t>(id)] != 0) {
+            init = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        } else {
+            init = load_gen();
+        }
+        b_.CreateStore(init, gen_slot_);
+    }
     // And, for a task some `disable` names, this activation's list node — same
     // placement and for the same reason: a `disable` reads it while we are parked.
     disable_node_ = f.disable_target != kNoDisableTarget
@@ -1684,6 +1743,10 @@ void Backend::lower_task(FunctionId id) {
     if (gc_frame) {
         emit_gc_frame_unlink();
     }
+    if (gen_cell != nullptr) {
+        // The child ends: its pending reports can no longer be flushed and mature.
+        b_.CreateCall(gen_cell_free_fn(), { b_.CreateLoad(raw_ptr_ty(), gen_slot_) });
+    }
     auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { cid, hdl_ });
     b_.CreateCondBr(b_.CreateICmpNE(freed, null), free_bb, coro_ret_bb_);
 
@@ -1731,6 +1794,10 @@ void Backend::lower_task(FunctionId id) {
         emit_disable_link(f.disable_target, disable_node_);
     }
     emit_pcb_acts_link();
+    // A fork child or a runtime-ramped body is its own thread: publish its generation.
+    if (gen_slot_ != nullptr && (f.is_fork_child || gen_root_[static_cast<uint32_t>(id)] != 0)) {
+        store_gen(b_.CreateLoad(raw_ptr_ty(), gen_slot_));
+    }
     if (!fork_disable_nodes_.empty()) {
         // The body is starting: publish the real scheduled flag in place of the one the
         // ramp held at 1 ...
@@ -1841,7 +1908,7 @@ void Backend::lower_task(FunctionId id) {
                                    : final_bb;
         b_.CreateCondBr(wake, has_bb, after);
         b_.SetInsertPoint(has_bb);
-        emit_wake_push(b_, parent);
+        emit_wake_push(b_, parent, { .kind = RT_TRACE_CHILD });
         b_.CreateBr(after);
         if (heap) {
             b_.SetInsertPoint(after);
@@ -1852,11 +1919,12 @@ void Backend::lower_task(FunctionId id) {
         llvm::Value* parent = b_.CreateLoad(ptr_ty, rec);
         b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
         b_.SetInsertPoint(has_bb);
-        emit_wake_push(b_, parent);
+        emit_wake_push(b_, parent, { .kind = RT_TRACE_CALLEE });
         b_.CreateBr(final_bb);
     }
 
     b_.SetInsertPoint(final_bb);
+    emit_trace_end(hdl_);
     auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
     auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
     sw->addCase(b_.getInt8(0), trap_bb);
@@ -1872,6 +1940,7 @@ void Backend::lower_task(FunctionId id) {
     home_ptr_         = nullptr;
     home_arg_             = nullptr;
     cur_is_task_      = false;
+    gen_slot_         = nullptr;
     frame_            = nullptr;
     task_epilogue_bb_ = nullptr;
     own_anchor_       = SignalSlot::no_anchor;
@@ -1890,6 +1959,14 @@ void Backend::bind_ref_formals(const Function& f) {
         const uint32_t p  = param_llvm_index_[k];
         ref_ptr_[k].slot  = fn_->getArg(p);
         ref_ptr_[k].chain = fn_->getArg(p + 1);
+        uint32_t next     = p + 2;
+        if (is_queue_type(f.param_types[k])) {
+            ref_ptr_[k].bound = fn_->getArg(next++);
+        }
+        if (design_ref_wake_) {
+            ref_ptr_[k].wake_fn  = fn_->getArg(next);
+            ref_ptr_[k].wake_ctx = fn_->getArg(next + 1);
+        }
         // `formal` names the binding in a staleness report. It is a property of
         // the CALLEE, so it is held here rather than shipped per call.
         ref_ptr_[k].formal = f.name + " argument " + std::to_string(k + 1);
@@ -1919,8 +1996,11 @@ void Backend::emit_copyin(const Function& f) {
             // keeps the empty frame — it is filled by the body, copied out at
             // return.
             if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Inout) {
-                emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
-                                   f.param_types[k]);
+                // A bounded formal truncates what the actual holds. No call site is in
+                // scope in a prologue, so the report points at the subroutine.
+                emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base), f.param_types[k],
+                                   resolve_ ? resolve_(f.span) : SourceText{ .where = "<unknown>" },
+                                   f.name + " argument " + std::to_string(k + 1));
             }
             continue;
         }
@@ -2051,8 +2131,8 @@ void Backend::lower_ret(Index value) {
         // handles (the value may be a frame local or a call result temp). Resolved
         // through lv_handle_ptr so returning a struct member, class property
         // or container element copies THAT handle, not its parent's root.
-        emit_handle_assign(
-          fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read), cur_fn_->return_type);
+        emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read),
+                           cur_fn_->return_type, loc_text(value), cur_fn_->name + " result");
         b_.CreateBr(fn_copyout_bb_);
         return;
     }
@@ -2212,7 +2292,13 @@ void Backend::lower_call_common(Index               i,
             const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
-            if (!is_handle_type(f.param_types[k])) {
+            if (is_queue_type(f.param_types[k])) {
+                argv.push_back(ref_queue_bound(lv, a));
+            }
+            const bool woken = push_ref_wake(argv, lv, f.param_types[k]);
+            if (woken) {
+                // The callee wakes at each write.
+            } else if (!is_handle_type(f.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
                        lv.mut_sig_valid) {
@@ -2464,7 +2550,13 @@ void Backend::lower_task_call_inst(Index i) {
             const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
-            if (!is_handle_type(tf.param_types[k])) {
+            if (is_queue_type(tf.param_types[k])) {
+                argv.push_back(ref_queue_bound(lv, args[k]));
+            }
+            const bool woken = push_ref_wake(argv, lv, tf.param_types[k]);
+            if (woken) {
+                // The callee wakes at each write, not at this call's return.
+            } else if (!is_handle_type(tf.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
                        lv.mut_sig_valid) {
@@ -2518,6 +2610,7 @@ void Backend::lower_task_call_inst(Index i) {
     argv.push_back(record);
 
     llvm::Value* task_hdl = b_.CreateCall(fnty, cf, argv);
+    emit_trace_spawn(b_, task_hdl, RT_TRACE_ORG_TASK, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
     // The callee runs INLINE, with this body on the stack and its scheduled flag clear. A
     // `disable` of a block this body is an occupant of, or a `kill` of this thread, issued
     // by the callee would force-wake it -- push its handle while it is running -- and the
@@ -2527,6 +2620,7 @@ void Backend::lower_task_call_inst(Index i) {
     if (park_claim_wanted() && sched_ptr_ != nullptr) {
         b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
     }
+    emit_trace_dispatch(b_, task_hdl, RT_TRACE_INLINE);
     b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { task_hdl });
     llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { task_hdl });
 
@@ -2547,7 +2641,7 @@ void Backend::lower_task_call_inst(Index i) {
     // completion (coro.done in the drain loop).
     b_.SetInsertPoint(async_bb);
     b_.CreateStore(parked_handle(b_, hdl_), record);
-    emit_suspend("task.resume");
+    emit_suspend("task.resume", { .kind = RT_TRACE_CTL_CALL });
     b_.CreateBr(cont_bb);
 
     b_.SetInsertPoint(cont_bb);

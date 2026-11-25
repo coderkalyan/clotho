@@ -15,10 +15,12 @@
 
 #include "Runtime.h" // rt_svopen
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <string>
+#include <string_view>
 
 #include <ankerl/unordered_dense.h>
 
@@ -26,44 +28,74 @@
 //   svLogic 0 = (a0,b0)   1 = (a1,b0)   Z(2) = (a0,b1)   X(3) = (a1,b1)
 // so svLogic == aval_bit | (bval_bit << 1).
 
-// -- svScope (LRM 35.5.3): one scope per top-level instance --
+// -- svScope (LRM 35.5.3): one scope per DPI scope --
 //
-// A scope carries a design instance's hierarchical name and a per-key C user-data
-// map (svPutUserData / svGetUserData). `g_current` is the active scope svGetScope
-// returns and svSetScope swaps, so a context import can save/restore it around
-// export calls. main registers one scope per top (rt_svdpi_scope_register) before
-// any process runs, and `index == 0` clears the table first so a second simulation
-// in the same process starts with fresh user data. A svScope handle IS an
-// SvScopeObj*, hence the deque: registering a further scope must not move the
-// handles already handed out. Per-instance (non-top) scope handles are deferred.
+// A scope carries the hierarchical name of a top, of an instance or generate block
+// that exports a subroutine or declares a `context` import, or of a package or `$unit`
+// that does; its position in the registration order, which is what the generated code
+// names it by (rt_svdpi_scope_enter); and a per-key C user-data map (svPutUserData /
+// svGetUserData). `g_current` is the scope svGetScope returns and svSetScope swaps: a
+// call of a context import makes the import's scope current and puts the caller's back
+// when it returns, and an export several scopes share reads it to pick its instance.
+// main registers the scopes (rt_svdpi_scope_register) before any process runs, and
+// `index == 0` clears the table first so a second simulation in the same process starts
+// with fresh user data. A svScope handle IS an SvScopeObj*, hence the deque: registering
+// a further scope must not move the handles already handed out.
 
 namespace {
 struct SvScopeObj {
     std::string                                name;
+    uint32_t                                   index = 0;
     ankerl::unordered_dense::map<void*, void*> user_data;
 };
 std::deque<SvScopeObj> g_scopes;
-void*                  g_current = nullptr;
+// The scopes by name; a name two scopes share (a package and an instance both called
+// `p`) resolves to the one registered first, which is a top's before any other.
+ankerl::unordered_dense::map<std::string_view, uint32_t> g_by_name;
+void*                                                    g_current = nullptr;
 } // namespace
 
 extern "C" void rt_svdpi_scope_register(const char* name, uint32_t name_len, uint32_t index) {
     if (index == 0) {
         g_scopes.clear();
+        g_by_name.clear();
         g_current = nullptr;
     }
-    g_scopes.emplace_back().name.assign(name, name_len);
+    SvScopeObj& scope = g_scopes.emplace_back();
+    scope.name.assign(name, name_len);
+    scope.index = static_cast<uint32_t>(g_scopes.size() - 1);
+    assert(scope.index == index && "scopes are registered in index order");
+    // A deque never moves its elements, so a view of a name outlives later registrations.
+    g_by_name.try_emplace(scope.name, scope.index);
     if (g_current == nullptr) {
         g_current = &g_scopes.front(); // the first top registered is the default
     }
 }
 
+extern "C" void* rt_svdpi_scope_enter(uint32_t index) {
+    assert(index < g_scopes.size() && "the backend registers every scope a call enters");
+    void* const previous = g_current;
+    g_current            = &g_scopes[index];
+    return previous;
+}
+
+extern "C" void rt_svdpi_scope_leave(void* previous) {
+    g_current = previous;
+}
+
+extern "C" uint32_t rt_svdpi_scope_index(void) {
+    return g_current == nullptr ? UINT32_MAX : static_cast<const SvScopeObj*>(g_current)->index;
+}
+
+extern "C" const char* rt_svdpi_scope_name(void) {
+    return g_current == nullptr ? nullptr : static_cast<const SvScopeObj*>(g_current)->name.c_str();
+}
+
 extern "C" {
 
 svScope svGetScope(void) {
-    if (g_current == nullptr) {
-        if (g_scopes.empty()) {
-            g_scopes.emplace_back(); // defensive: a design that registered nothing
-        }
+    if (g_scopes.empty()) {
+        g_scopes.emplace_back(); // defensive: a design that registered nothing
         g_current = &g_scopes.front();
     }
     return g_current;
@@ -80,12 +112,11 @@ const char* svGetNameFromScope(const svScope scope) {
 }
 
 svScope svGetScopeFromName(const char* scopeName) {
-    for (SvScopeObj& s : g_scopes) {
-        if (s.name == scopeName) {
-            return &s;
-        }
+    if (scopeName == nullptr) {
+        return nullptr;
     }
-    return nullptr;
+    const auto it = g_by_name.find(std::string_view(scopeName));
+    return it != g_by_name.end() ? &g_scopes[it->second] : nullptr;
 }
 
 int svPutUserData(const svScope scope, void* userKey, void* userData) {

@@ -644,6 +644,8 @@ void Backend::lower_inst(Index i) {
             // static-property map must wake the map SIGNAL's Any waiters.
             el.mut_sig_valid = hlv.is_signal || hlv.mut_sig_valid;
             el.mut_sig       = hlv.is_signal ? hlv.sig : hlv.mut_sig;
+            el.ref_wake_fn   = hlv.ref_wake_fn;
+            el.ref_wake_ctx  = hlv.ref_wake_ctx;
             // An entry's slot lives until that entry is erased, so a `ref`
             // through it records the map's relocation epoch, appended to whatever
             // containers the MAP itself sits inside (docs/design/data-model.md
@@ -714,6 +716,8 @@ void Backend::lower_inst(Index i) {
             el.chg_body_ty      = dlv.chg_body_ty;
             el.mut_sig_valid    = dlv.is_signal || dlv.mut_sig_valid;
             el.mut_sig          = dlv.is_signal ? dlv.sig : dlv.mut_sig;
+            el.ref_wake_fn      = dlv.ref_wake_fn;
+            el.ref_wake_ctx     = dlv.ref_wake_ctx;
             el.epoch_chain      = dlv.epoch_chain;
             el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
                                                         handle_epoch_field(pt.type)));
@@ -1973,7 +1977,22 @@ void Backend::lower_inst(Index i) {
             // does, so a report queued before this point never matures. A target
             // id names ANOTHER procedure's counter -- the remote case, where the
             // reports to drop are not this group's.
-            if (p.label == kNoDisableTarget) {
+            if (p.label == kNoDisableTarget && cur_fn_ != nullptr) {
+                // The resume of a task is a flush point of the thread that called it
+                // (LRM 16.4.2), whose counter the task read at entry. Null when that
+                // thread holds none, or the task does not need the generation.
+                if (gen_slot_ != nullptr) {
+                    llvm::Value* gen  = b_.CreateLoad(raw_ptr_ty(), gen_slot_);
+                    auto*        fn   = b_.GetInsertBlock()->getParent();
+                    auto*        bump = llvm::BasicBlock::Create(ctx_, "gen.bump", fn);
+                    auto*        cont = llvm::BasicBlock::Create(ctx_, "gen.cont", fn);
+                    b_.CreateCondBr(b_.CreateIsNotNull(gen), bump, cont);
+                    b_.SetInsertPoint(bump);
+                    emit_defer_gen_bump_at(gen);
+                    b_.CreateBr(cont);
+                    b_.SetInsertPoint(cont);
+                }
+            } else if (p.label == kNoDisableTarget) {
                 emit_defer_gen_bump();
             } else {
                 emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));
@@ -2662,6 +2681,10 @@ LValue Backend::local_lvalue(uint32_t index) {
         lv.root_ty   = s.storage_ty;
         lv.is_agg    = true;
         lv.is_signal = false;
+        if (s.is_ref && design_ref_wake_) {
+            lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
+            lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
+        }
         return lv;
     }
     if (base == nullptr) {
@@ -2669,6 +2692,7 @@ LValue Backend::local_lvalue(uint32_t index) {
     }
     LValue lv;
     lv.base        = base;
+    lv.queue_bound = s.is_ref ? ref_ptr_[index].bound : nullptr;
     lv.slot_ty     = s.slot_ty;
     lv.four_state  = s.four_state;
     lv.has_z       = s.four_state;
@@ -2678,6 +2702,10 @@ LValue Backend::local_lvalue(uint32_t index) {
     lv.is_signal   = false;
     lv.sig         = Signal{ 0 };
     lv.is_string   = s.is_string;
+    if (s.is_ref && design_ref_wake_) {
+        lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
+        lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
+    }
     return lv;
 }
 

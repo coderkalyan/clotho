@@ -33,6 +33,7 @@
 #include "runtime/Runtime.h"
 #include "runtime/Gc.h"
 #include "runtime/Coverage.h"
+#include "runtime/Trace.h"
 #include "runtime/svdpi.h"
 
 #if defined(__MINGW32__)
@@ -57,6 +58,18 @@ extern "C" void ___chkstk_ms(void);
 #endif
 
 namespace clotho::ir {
+
+#ifdef CLOTHO_EXTRA_ASSERTS
+namespace {
+
+TraceHook g_trace_hook;
+
+} // namespace
+
+void set_trace_hook(TraceHook hook) {
+    g_trace_hook = std::move(hook);
+}
+#endif
 
 int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
            std::span<const std::string_view> plusargs, const LocResolver& resolve) {
@@ -221,6 +234,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
+    expose("rt_gen_cell_alloc", &rt_gen_cell_alloc);
+    expose("rt_gen_cell_free", &rt_gen_cell_free);
     expose("rt_observed_flush", &rt_observed_flush);
     expose("rt_defer_report", &rt_defer_report);
     expose("rt_defer_flush_observed", &rt_defer_flush_observed);
@@ -464,6 +479,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("svPutUserData", &svPutUserData);
     expose("svGetUserData", &svGetUserData);
     expose("rt_svdpi_scope_register", &rt_svdpi_scope_register);
+    expose("rt_svdpi_scope_enter", &rt_svdpi_scope_enter);
+    expose("rt_svdpi_scope_leave", &rt_svdpi_scope_leave);
+    expose("rt_svdpi_scope_index", &rt_svdpi_scope_index);
+    expose("rt_dpi_export_no_scope", &rt_dpi_export_no_scope);
     expose("svDimensions", &svDimensions);
     expose("svSize", &svSize);
     expose("svLeft", &svLeft);
@@ -515,6 +534,19 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_wheel_schedule_rel", &rt_wheel_schedule_rel);
     expose("rt_wheel_tick", &rt_wheel_tick);
     expose("rt_wheel_advance", &rt_wheel_advance);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The scheduler trace's events (docs/design/scheduler-trace.md): exposed only where the
+    // checker is, so a shipped build has no rt_trace_* symbol for generated code to name.
+    expose("rt_trace_spawn", &rt_trace_spawn);
+    expose("rt_trace_subscribe", &rt_trace_subscribe);
+    expose("rt_trace_subscribe_event", &rt_trace_subscribe_event);
+    expose("rt_trace_waits_for", &rt_trace_waits_for);
+    expose("rt_trace_park", &rt_trace_park);
+    expose("rt_trace_wake", &rt_trace_wake);
+    expose("rt_trace_dispatch", &rt_trace_dispatch);
+    expose("rt_trace_resume", &rt_trace_resume);
+    expose("rt_trace_end", &rt_trace_end);
+#endif
     // libc mem* helpers that LLVM's loop-idiom pass synthesizes under -O (a
     // zeroing loop becomes memset, a copy loop memcpy, etc.). A dynamically
     // linked clotho resolves these through the process symbol table below, but
@@ -682,6 +714,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The run is over and nothing of the design is on this stack, so the hook may throw.
+    if (const char* const rule = rt_trace_rule(); rule != nullptr && g_trace_hook) {
+        g_trace_hook(TraceViolation{ rule, rt_trace_report() });
+    }
+#endif
     return rc;
 }
 

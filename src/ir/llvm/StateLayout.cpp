@@ -243,6 +243,12 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
         for (uint32_t k = 0; k < an.fn_externs.size(); ++k) {
             an.fn_bind_of.try_emplace(static_cast<uint32_t>(an.fn_externs[k]), k);
         }
+        for (const FunctionId f : an.fn_locals) {
+            const Function& fn = mod_.function(f);
+            if (fn.is_dpi && fn.dpi_context) {
+                an.dpi_ctx_locals.push_back(f);
+            }
+        }
     }
     const std::vector<Signal>& defined = scope.unit == InstanceScope::no_unit ? scope.signals : scope.locals;
     std::vector<llvm::Type*>   fields;
@@ -628,16 +634,16 @@ uint32_t Backend::binding_of(const SignalSlot& s) {
     return it->second;
 }
 
-// A field of the own instance's record: the parameter of a thunk row, else the
-// instance's record global.
+// A fixed field (see fixed_field_load) of the own instance's record: the parameter
+// of a thunk row, else the instance's record global.
 llvm::Value* Backend::own_field(uint32_t field, llvm::Type* ty) {
     Anchor& a = anchors_[own_anchor_];
     if (own_ctx_ != nullptr) {
-        return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, own_ctx_, { b_.getInt32(0), b_.getInt32(field) }));
+        return fixed_field_load(ty, b_.CreateInBoundsGEP(a.ctx_ty, own_ctx_, { b_.getInt32(0), b_.getInt32(field) }));
     }
     auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
       a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
-    return b_.CreateLoad(ty, gep);
+    return fixed_field_load(ty, gep);
 }
 
 // The address of a signal's storage as a link-time constant: what a binding to
@@ -761,7 +767,7 @@ llvm::Value* Backend::vif_head_ptr(Signal sig, uint32_t edge) {
     // is an element of the signal's port.
     if (llvm::Value* port = bound_port(s); port != nullptr && port_of(s)->vif[edge] != no_port_elem) {
         const PortLayout& pl = *port_of(s);
-        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), b_.CreateStructGEP(pl.ty, port, pl.vif[edge]));
+        return fixed_field_load(llvm::PointerType::getUnqual(ctx_), b_.CreateStructGEP(pl.ty, port, pl.vif[edge]));
     }
     // Exactly storage_ptr's base rule: an instance's own group loads its
     // instance base rather than bake the instance's symbol.
@@ -816,7 +822,7 @@ llvm::Value* Backend::shadow_ptr(const SignalSlot& owner, uint32_t field) {
         if (llvm::Value* port = bound_port(owner); port != nullptr) {
             const PortLayout& pl = *port_of(owner);
             assert(field >= owner.sh_first && field - owner.sh_first < pl.n_shadow);
-            return b_.CreateLoad(ptr, b_.CreateStructGEP(pl.ty, port, pl.shadow + (field - owner.sh_first)));
+            return fixed_field_load(ptr, b_.CreateStructGEP(pl.ty, port, pl.shadow + (field - owner.sh_first)));
         }
         // An NBA target's anchor always carries a shadow struct (the
         // fields were assigned per anchor in build_state_types).
@@ -932,9 +938,20 @@ llvm::Value* Backend::ctx_field_ptr(Anchor& a, uint32_t field) {
       a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
 }
 
-// A def-relative load of one instance-record field.
+// NOTE: tier 0 only. There `!invariant.load` lets EarlyCSE keep one load of a
+// field across the stores between its reads (hazard3: 7% fewer loads, 2.1% fewer
+// instructions simulated, 0.3% more compile). Under -O it changed no simulated
+// instruction and cost 13% more compile.
+llvm::LoadInst* Backend::fixed_field_load(llvm::Type* ty, llvm::Value* ptr) {
+    llvm::LoadInst* const load = b_.CreateLoad(ty, ptr);
+    if (!config_.o3) {
+        load->setMetadata(llvm::LLVMContext::MD_invariant_load, llvm::MDNode::get(ctx_, {}));
+    }
+    return load;
+}
+
 llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
-    return b_.CreateLoad(ty, ctx_field_ptr(a, field));
+    return fixed_field_load(ty, ctx_field_ptr(a, field));
 }
 
 // The record of the instance a deferred store to `s` lands in, which its
@@ -1118,6 +1135,45 @@ RefActual Backend::ref_actual_arg(const Guarded& raw, Ref type) {
 // checks), else a caller-frame array of (&epoch, expected epoch) pairs, outermost
 // first, ended by a pair whose epoch is null. One shape whatever the actual, so
 // the formal's signature does not depend on any caller.
+llvm::Value* Backend::ref_queue_bound(const Guarded& actual, Index actual_ix) {
+    // A ref formal passed on keeps the bound it was given.
+    if (actual.queue_bound != nullptr) {
+        return actual.queue_bound;
+    }
+    // Otherwise the declared type of the place the actual names. The shapes with no
+    // single declared type (a class property reached through a handle) pass 0.
+    const Inst::Payload& p = ir_->payload(actual_ix);
+    std::optional<Ref>   declared;
+    switch (ir_->tag(actual_ix)) {
+        case Inst::Tag::Signal:
+            declared = mod_.signal(p.signal).type;
+            break;
+        case Inst::Tag::IfaceSignal:
+            declared = mod_.signal(ir_->extra_data<IfaceMember>(p.op_extra.extra).signal).type;
+            break;
+        case Inst::Tag::Local:
+            declared = p.local.type;
+            break;
+        case Inst::Tag::ElemSelect:
+            declared = std::get<Type>(mod_.pool.get(ir_->extra_data<ElemSelect>(p.op_extra.extra).array_type)).element;
+            break;
+        case Inst::Tag::MemberSelect: {
+            const auto  ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+            const Type& st = std::get<Type>(mod_.pool.get(ms.struct_type));
+            declared       = mod_.pool.struct_fields(st.fields_id)[ms.field_index].type;
+            break;
+        }
+        default:
+            break;
+    }
+    const uint64_t bound = declared && is_queue_type(*declared) ? std::get<Type>(mod_.pool.get(*declared)).left : 0;
+    return b_.getInt64(bound);
+}
+
+llvm::Value* Backend::queue_bound_of(const LValueInfo& lv, uint64_t type_bound) {
+    return lv.queue_bound != nullptr ? lv.queue_bound : b_.getInt64(type_bound);
+}
+
 llvm::Value* Backend::ref_witness_chain(const RefActual& ra) {
     auto* const ptr = llvm::PointerType::getUnqual(ctx_);
     if (ra.epochs.empty()) {
@@ -1456,6 +1512,7 @@ void Backend::build_instance_ctx_layout() {
     build_ports();
     disable_owner_.assign(mod_.disable_targets, { SignalSlot::no_anchor, 0 });
     cover_owner_.assign(mod_.cover_types.size(), { SignalSlot::no_anchor, 0 });
+    dpi_ctx_owner_.assign(mod_.function_count(), { SignalSlot::no_anchor, 0 });
     expect_owner_.assign(mod_.monitors.size(), { SignalSlot::no_anchor, 0 });
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
         for (uint32_t k = 0; k < anchors_[ai].disable_locals.size(); ++k) {
@@ -1466,6 +1523,9 @@ void Backend::build_instance_ctx_layout() {
         }
         for (uint32_t k = 0; k < anchors_[ai].expect_locals.size(); ++k) {
             expect_owner_.at(anchors_[ai].expect_locals[k]) = { ai, k };
+        }
+        for (uint32_t k = 0; k < anchors_[ai].dpi_ctx_locals.size(); ++k) {
+            dpi_ctx_owner_.at(static_cast<uint32_t>(anchors_[ai].dpi_ctx_locals[k])) = { ai, k };
         }
     }
     // Twin instances own the same number of processes; size blk fields by the
@@ -1479,7 +1539,7 @@ void Backend::build_instance_ctx_layout() {
 
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     any_defer_ = std::any_of(facts_.processes.begin(), facts_.processes.end(),
-                             [](const auto& p) { return p.deferred_severity; });
+                             [](const auto& p) { return p.gen_counter; });
     const bool any_rng = std::any_of(rng_procs_.begin(), rng_procs_.end(), [](bool b) { return b; });
     auto* i32 = b_.getInt32Ty();
     // Per unit, not per state type: two units can lay their own signals out
@@ -1513,6 +1573,7 @@ void Backend::build_instance_ctx_layout() {
         a.ctx_cov_base    = a.ctx_dis_base + static_cast<uint32_t>(a.disable_locals.size());
         a.ctx_subblk_base = a.ctx_cov_base + static_cast<uint32_t>(a.cover_locals.size());
         a.ctx_expect_base = a.ctx_subblk_base + static_cast<uint32_t>(a.fn_locals.size());
+        a.ctx_dpi_base    = a.ctx_expect_base + static_cast<uint32_t>(a.expect_locals.size());
         const auto [it, fresh] = def_ctx.try_emplace({ a.ty, a.unit }, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ i32, ptr, ptr };
@@ -1532,11 +1593,13 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), a.cover_locals.size(), i32);
             f.insert(f.end(), a.fn_locals.size(), i32);
             f.insert(f.end(), a.expect_locals.size(), ptr);
+            f.insert(f.end(), a.dpi_ctx_locals.size(), i32);
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }
         a.ctx_ty = it->second;
-        assert(a.ctx_ty->getNumElements() == a.ctx_expect_base + a.expect_locals.size() &&
+        assert(a.ctx_ty->getNumElements() ==
+                 a.ctx_dpi_base + a.dpi_ctx_locals.size() &&
                "instances of one unit lay their records out alike");
     }
 }

@@ -754,6 +754,8 @@ Function signature_of(const Function& f) {
         .dpi_arg_ctypes      = f.dpi_arg_ctypes,
         .dpi_ret_ctype       = f.dpi_ret_ctype,
         .dpi_arg_elem_ctypes = f.dpi_arg_elem_ctypes,
+        .dpi_context         = f.dpi_context,
+        .dpi_scope           = f.dpi_scope,
         .span                = f.span,
         .scope               = f.scope,
     };

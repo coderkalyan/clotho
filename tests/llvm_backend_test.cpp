@@ -286,9 +286,20 @@ TEST_CASE("alu emits verifiable llvm ir") {
 
     // Signal access via constant typed GEPs off a base the instance's record
     // holds, def-relative (%alu.state): a unit's code names no instance's state
-    // global (asserted on raw IR; instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("%alu.state, ptr %") != std::string::npos);
-    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
+    // global (asserted on raw IR; instcombine canonicalizes GEP shapes). The root's trace
+    // tables (extra asserts) name each instance's storage by its global on purpose, so the
+    // search leaves out the `@clotho.trace.*` definitions.
+    std::string unit_code;
+    for (size_t at = 0; at < raw.size();) {
+        const size_t end  = std::min(raw.find('\n', at), raw.size());
+        const auto   line = std::string_view(raw).substr(at, end - at);
+        if (!line.starts_with("@clotho.trace.")) {
+            unit_code.append(line).push_back('\n');
+        }
+        at = end + 1;
+    }
+    CHECK(unit_code.find("%alu.state, ptr %") != std::string::npos);
+    CHECK(unit_code.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -1907,6 +1918,41 @@ TEST_CASE("$printtimescale names the $unit and $root scopes") {
 
     CHECK(out == "Time scale of ($unit) is 1ns / 1ps\n"
                  "Time scale of ($root) is 1s / 1s\n");
+}
+
+// A `timescale directive does not set `$unit`'s time scale (LRM 3.14.2.3), so a
+// task or class declared there with no `timeunit` takes the tool default,
+// 1ns/1ns (the default slang and --loose-timescale give a module). Its delays and
+// time reads are in that unit whatever tick the rest of the design forces: the
+// `#0.5` makes the tick 1ps, and `#3` used to wait 3 ticks. No oracle: iverilog's
+// default unit is 1s, a choice 3.14.2.3 leaves to the tool.
+TEST_CASE("a $unit task or class with no timeunit runs on the 1ns default in a timed design") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        task automatic ut;
+            #3 $display("ut %0.1f", $realtime);
+            $printtimescale;
+        endtask
+        class C;
+            static task w;
+                #2 $display("C %0.1f", $realtime);
+            endtask
+        endclass
+        module top;
+            initial begin
+                #0.5;
+                ut();
+                C::w();
+                $display("top %0.1f", $realtime);
+                $printtimescale($unit);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "ut 3.5\n"
+                 "Time scale of ($unit) is 1ns / 1ns\n"
+                 "C 5.5\n"
+                 "top 5.5\n"
+                 "Time scale of ($unit) is 1ns / 1ns\n");
 }
 
 // An instance's path is a borrowed, read-only string (Inst::Tag::InstPath), so a body
@@ -3580,6 +3626,38 @@ TEST_CASE("$readmemh loads a memory with @address and comments") {
         endmodule
     )";
     CHECK(run_capture(src) == "deadbeef\n01234567\nxxxxxxxx\nxxxxxxxx\naabbccdd\nxxxxxxxx\n");
+    std::remove(path);
+}
+
+// A $readmem load is a write of the memory, so it wakes the memory's waiters: an
+// always_comb reading an element, an @ on an element and a level wait (LRM 9.4.2).
+// A load that changes nothing wakes nobody. Matches Icarus Verilog.
+TEST_CASE("$readmemh wakes the memory's waiters only when it changes it") {
+    const char* path = "clotho_readmem_wake_test.hex";
+    write_file(path, "11 22 33\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:2];
+            logic [7:0] y;
+            integer at0 = -1, again0 = -1, at2 = -1;
+            always_comb y = mem[1];
+            initial begin
+                @(mem[0]) at0 = $time;
+                @(mem[0]) again0 = $time;
+            end
+            initial begin
+                wait (mem[2] == 8'h33) at2 = $time;
+            end
+            initial begin
+                #5 $readmemh(")") + path + R"(", mem);
+                #1 $display("y=%h at0=%0d at2=%0d", y, at0, at2);
+                $readmemh(")" + path + R"(", mem);
+                #1 $display("again0=%0d", again0);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "y=22 at0=5 at2=5\nagain0=-1\n");
     std::remove(path);
 }
 
@@ -5579,7 +5657,8 @@ TEST_CASE("a ref to a whole container handle passes no witness chain") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(call_arity(ir, ".fn.f") == 6);
+    // state, rng, proc, home, slot, chain and the actual's queue bound.
+    CHECK(call_arity(ir, ".fn.f") == 7);
     CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
 }
 
