@@ -472,6 +472,19 @@ TEST_CASE("assoc key types Clotho still refuses loudly") {
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("combining a class handle") != std::string::npos);
     }
+    // An event handle is traced the same way, so it is refused the same way.
+    SUBCASE("struct key combining an event with a string member") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { event e; string s; } k_t;
+                int a [k_t];
+                k_t k;
+                initial a[k] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("or an event with a string") != std::string::npos);
+    }
     SUBCASE("dynamic-array key from a non-lvalue expression") {
         const LowerResult r = lower_text(R"(
             module m;

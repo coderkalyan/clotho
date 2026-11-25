@@ -302,10 +302,8 @@ then makes a fresh object — unobservable, because the program no longer holds 
 one. This asymmetry (object → block strong, block → object weak) is what keeps the pair
 acyclic; making the memo strong would leak every named thread's object for the run.
 
-No generation counter is needed anywhere, which is the one place this differs from
-`rt_event`'s `{slot, gen}`: a block cannot be recycled while an object names it,
-because that object holds a count. The stale-handle class of bug the generation
-half exists to catch cannot arise.
+No generation counter is needed anywhere: a block cannot be recycled while an
+object names it, because that object holds a count.
 
 The object is allocated from the collected heap like any class body (`emit_proc_object`),
 so it reaches the collector through every location a class handle can sit in: design

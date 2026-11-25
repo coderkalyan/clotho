@@ -86,11 +86,13 @@ bool Lowerer::key_type_is_variable(ir::Ref type) const {
     }
 }
 
-// True if a class handle is reachable anywhere inside `type`.
+// True if a class or event handle -- a reference the collector must trace -- is
+// reachable anywhere inside `type`.
 bool Lowerer::key_type_has_class_handle(ir::Ref type) const {
     const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
     switch (t.kind) {
         case ir::Type::Kind::Class:
+        case ir::Type::Kind::Event:
             return true;
         case ir::Type::Kind::Struct:
             for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
@@ -111,7 +113,7 @@ bool Lowerer::key_type_has_class_handle(ir::Ref type) const {
     }
 }
 
-// A class handle anywhere inside a VARIABLE key is refused: the collector's
+// A class or event handle anywhere inside a VARIABLE key is refused: the collector's
 // key-handle trace (assoc_key_handle_offsets, ir/llvm/AssocArrays.cpp) is a
 // compile-time STATIC offset table, correct only for a FIXED key -- a
 // variable key's byte offsets depend on runtime data (a string's length, a
@@ -125,7 +127,7 @@ void Lowerer::guard_key_no_handle_in_variable(ir::Ref key_ty) {
     if (!key_type_is_variable(key_ty) || !key_type_has_class_handle(key_ty)) {
         return;
     }
-    fail("associative array key type combining a class handle with a string / "
+    fail("associative array key type combining a class handle or an event with a string / "
          "queue / dynamic-array member is not supported");
 }
 
@@ -137,21 +139,20 @@ void Lowerer::guard_container_element(const slang::ast::Type& et, ir::Ref er, st
     if (et.isIntegral() || et.isFloating() || et.isString()) {
         return;
     }
-    // A class handle or a chandle is a plain 64-bit word: objects are never
-    // freed (docs/design/classes.md §7), so an element needs no lifecycle
-    // beyond the POD copy rt_elem_ops already does, `null` is the all-zero
-    // power-on default Table 7-1 asks for, and `==` on two handles is the
-    // identity compare a word compare gives (LRM 6.14 gives a chandle the
-    // same closed == / != / null / assignment operator set). Nothing else is
-    // required of it.
+    // A class handle or a chandle is a plain 64-bit word: an element needs no
+    // lifecycle beyond the POD copy rt_elem_ops already does (the collector, not
+    // the element, frees an object), `null` is the all-zero power-on default
+    // Table 7-1 asks for, and `==` on two handles is the identity compare a word
+    // compare gives (LRM 6.14 gives a chandle the same closed == / != / null /
+    // assignment operator set). Nothing else is required of it.
     //
     // The two diverge in exactly one place -- whether the GC traces the word
     // -- and that fork needs no code here. `lower_type` puts a class handle in
     // Kind::Class and a chandle in a plain Kind::Int, and collect_class_handles
-    // (ir/llvm/Analyses.cpp) keys on Kind::Class alone, so a chandle element's
-    // rt_elem_ops::handles table comes out empty by construction: tracing one
-    // would hand the collector a foreign pointer it never allocated
-    // (docs/design/garbage-collection.md §0, "Never in scope").
+    // (ir/llvm/Analyses.cpp) lists only the words types::is_object_handle
+    // admits, so a chandle element's rt_elem_ops::handles table comes out empty
+    // by construction: tracing one would hand the collector a foreign pointer it
+    // never allocated (docs/design/garbage-collection.md §0, "Never in scope").
     if (et.isClass() || et.isCHandle()) {
         return;
     }
@@ -175,9 +176,9 @@ void Lowerer::guard_container_element(const slang::ast::Type& et, ir::Ref er, st
         e.kind == ir::Type::Kind::Assoc) {
         return;
     }
-    // An event element is a 64-bit handle word, like a class handle, with one
-    // extra requirement its descriptor carries: rt_elem_event CONSTRUCTS a new
-    // object per slot (LRM Table 6-7's "New event"), where every other kind
+    // An event element is a 64-bit handle word, traced like a class handle, with
+    // one extra requirement its descriptor carries: rt_elem_event CONSTRUCTS a
+    // new object per slot (LRM Table 6-7's "New event"), where every other kind
     // copies a constant prototype image. Copying an element copies the handle,
     // so both slots then name one object -- LRM 15.5.5's merge.
     if (e.kind == ir::Type::Kind::Event) {

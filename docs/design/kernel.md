@@ -58,8 +58,7 @@ when it does.
   results. **Not yet:** stored and passed as integer bit patterns.
 - Handles (class, event, chandle, virtual interface) are one 64-bit word holding
   a pointer, null as 0, with no generation: nothing a handle can name is freed
-  while the handle exists. **Not yet:** an event handle is a slot and a
-  generation into a runtime table.
+  while the handle exists.
 
 ## Operators
 

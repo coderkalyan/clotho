@@ -145,15 +145,14 @@ struct Type {
         // base-class Ref for inheritance (Invalid in V1). See docs/design/classes.md.
         Class,
         // Named event (LRM §15.5): a reference type, like Class. The value is a
-        // 64-bit handle `{ u32 slot, u32 gen }` naming an entry in the backend's
-        // design-wide event object array; the object carries the trigger timestamp,
-        // the intrusive waiter list head and the `->>` pending state. Handle
-        // semantics per LRM 15.5.5: assignment aliases the same sync object
-        // (`a = b` merges), `==` is identity, and `null` is the all-zero handle,
-        // which resolves to the reserved null object at slot 0 -- so it is also the
-        // power-on default Table 7-1 asks for. Plane-sized so every storage class,
-        // container and call-ABI path carries it with no special case, exactly as a
-        // class handle is. See docs/design/event-handles.md.
+        // 64-bit handle, the address of a collected event object that carries the
+        // trigger timestamp, the intrusive waiter list head and the `->>` pending
+        // state. Handle semantics per LRM 15.5.5: assignment aliases the same sync
+        // object (`a = b` merges), `==` is identity, and `null` is the all-zero
+        // handle -- so it is also the power-on default Table 7-1 asks for.
+        // Plane-sized so every storage class, container and call-ABI path carries
+        // it with no special case, exactly as a class handle is. See
+        // docs/design/event-handles.md.
         Event,
         // Virtual interface (LRM §25.9): a reference type, like Class and Event.
         // The value is a 64-bit handle to one elaborated interface instance -- the

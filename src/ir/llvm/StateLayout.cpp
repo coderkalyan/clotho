@@ -1543,19 +1543,28 @@ void Backend::build_instance_ctx_layout() {
 
 // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
 // must 0, may 1, z all-ones), other 4-state signals X (z 0), 2-state 0.
-// Runtime power-on init: only unpacked arrays (memories). Every scalar
-// signal's power-on value — X for a 4-state plane, an empty inline string
-// handle, a clear nba dirty mask — is a compile-time constant folded into
-// the state global's initializer (`state_initializer`), so no per-signal
+// Runtime power-on init: unpacked arrays (memories) and events. Every other
+// scalar signal's power-on value — X for a 4-state plane, an empty inline
+// string handle, a clear nba dirty mask — is a compile-time constant folded
+// into the state global's initializer (`state_initializer`), so no per-signal
 // GEP+store is emitted here. Arrays stay a runtime loop: materialising a
 // large memory's X-fill as a global constant would bloat the JIT object's
 // `.data` (a non-zero pattern cannot go in `.bss`), so it is filled in
-// O(1) emitted instructions instead.
+// O(1) emitted instructions instead. A declared event is bound here because
+// its object is allocated (LRM Table 6-7's "New event"), before any PreInit
+// process can trigger or wait on it. The variables are a table one loop walks,
+// so root's code does not grow with the number of instances.
 void Backend::init_state() {
+    std::vector<llvm::Constant*> events;
     for (const SignalSlot& s : slots_) {
         if (mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data != Ref::Invalid) {
             // A materialized constant table is already its own state
             // initializer (slot_const); an X-fill would erase it.
+            continue;
+        }
+        if (mod_.signals()[static_cast<size_t>(&s - slots_.data())].is_event) {
+            events.push_back(llvm::ConstantExpr::getInBoundsGetElementPtr(
+              s.slot_ty, storage_address(s), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(0) }));
             continue;
         }
         if (s.is_agg) {
@@ -1569,6 +1578,10 @@ void Backend::init_state() {
         }
         emit_array_init(s);
     }
+    auto* ptr = raw_ptr_ty();
+    emit_rows(events, ptr, "clotho.init.events", [&](llvm::Value* row) {
+        b_.CreateStore(b_.CreateCall(event_new_fn()), b_.CreateLoad(ptr, row));
+    });
 }
 
 // Constant power-on initializer for one state global. Every state struct

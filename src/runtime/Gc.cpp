@@ -455,6 +455,9 @@ struct GcState {
     // Where it starts, and non-zero only while an emergency collection is marking: the
     // address of a frame below every register the collector has spilled.
     uintptr_t stack_lo = 0;
+    // Set for the length of rt_gc_alloc_held: the caller holds handles no collection
+    // would find, so the allocation must not run one.
+    int32_t held = 0;
     // Every word of the stack that is not a pointer into the object heap, sorted: the
     // candidates for a pointer into a malloc'd buffer the running code is still using.
     std::vector<uintptr_t> inflight;
@@ -597,6 +600,10 @@ rt_gc_mutator g_mutator{ .cursor       = nullptr,
     if (g.stack_base == nullptr) {
         std::snprintf(note, sizeof(note),
                       "reached before the simulation started, where nothing can be reclaimed");
+    } else if (g.held != 0) {
+        std::snprintf(note, sizeof(note),
+                      "reached while a container element was being constructed, where the "
+                      "collector cannot run");
     } else {
         std::snprintf(note, sizeof(note),
                       "%" PRIu64 " bytes of objects are live after an emergency collection, and "
@@ -1239,7 +1246,7 @@ uint64_t pressure_since_gc() {
 // no collection, the region boundary that normally answers the request flag never having
 // come.
 bool emergency_due() {
-    if (g.stack_base == nullptr) {
+    if (g.stack_base == nullptr || g.held != 0) {
         return false;
     }
     if (g.cfg.stress != 0) {
@@ -1290,7 +1297,7 @@ bool emergency_due() {
 // longer reach. Whether that made room is the caller's to find out by trying again, so
 // that the one definition of "room" is the allocator's own.
 void collect_for_room() {
-    if (g.stack_base != nullptr) {
+    if (g.stack_base != nullptr && g.held == 0) {
         emergency_collect(RT_GC_KIND_FULL);
     }
 }
@@ -2109,6 +2116,14 @@ void push_nba_roots() {
     }
 }
 
+// The event objects the runtime's own records name (RuntimeInternal.h, event_gc_roots).
+// Precise, and held to mark_container_handle's standard for the same reason a container
+// element is: each is a handle the runtime stored, so one that does not resolve is a bug,
+// and under verification each must already be marked.
+void push_event_roots() {
+    rt_internal::event_gc_roots(mark_container_handle);
+}
+
 // -- The native stack, for a collection run from inside an allocation (§6.1) ---
 //
 // Why this is sound is the argument in design §6.1; this is the mechanism. The stack and
@@ -2873,6 +2888,7 @@ void mark_from_roots() {
     push_frame_roots();
     push_range_roots();
     push_nba_roots();
+    push_event_roots();
     // Empty and a no-op outside an emergency collection, where it is the one root set that
     // is not a registered structure: the design's own native stack (§6.1).
     push_stack_roots();
@@ -3550,6 +3566,14 @@ extern "C" void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map*
     return alloc_object(mut, size, map, site);
 }
 
+extern "C" void* rt_gc_alloc_held(uint64_t size, const rt_gc_map* map) {
+    assert(g.held == 0 && "a held allocation does not nest");
+    g.held             = 1;
+    void* const handle = alloc_object(&g_mutator, size, map, nullptr);
+    g.held             = 0;
+    return handle;
+}
+
 extern "C" void* rt_gc_alloc_slow(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
                                   const rt_alloc_site* site) {
     // rt_gc_alloc's body behind two extra assertions, deliberately: one function means
@@ -4072,6 +4096,7 @@ extern "C" void rt_gc_verify(void) {
     g.verifying                            = 1;
     push_container_roots();
     push_nba_roots();
+    push_event_roots();
     VerifyTally tally;
     for (const Block& blk : g.blocks) {
         // Two claims about every block, kept apart because they are different claims: the

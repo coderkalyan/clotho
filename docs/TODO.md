@@ -117,7 +117,8 @@ Milestones, in order; lower ones unblock higher ones:
     operand — suppression is decided at commit, not when the update is armed.
 - [ ] **Per-event `iff` in a multi-event list** (9.4.2.3) — `@(posedge a iff x or b)` needs
   identification of the waking source.
-- [ ] **Event object reclamation** (15.5.5.2) — event objects are never freed.
+- [ ] **Records waiting on a reclaimed event (performance)** (15.5.5.2) — a `x <= @(e) v` or
+  `->> @(e) f` whose control event is reclaimed keeps its record, and `f`, until the run ends.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
 - [ ] **Wake time of a `ref` write after a suspend** — a task writing a
@@ -208,7 +209,7 @@ Milestones, in order; lower ones unblock higher ones:
   associative array or class handle is refused.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
-- [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
+- [ ] **Freeing a finished simulation** — frames and allocations of processes still
   suspended when a simulation ends are not freed, so a host running several leaks them.
 
 ### Executables (`clotho build`)
@@ -376,8 +377,6 @@ Milestones, in order; lower ones unblock higher ones:
   literal has no upfront size to stage into a temp handle.
 - [ ] **Associative-array literal with an aggregate value element** (7.9.11) — refused; it needs a
   per-leaf store per entry.
-- [ ] **Event element of a queue or dynamic array** (7.5, 7.10) — refused; each element needs its
-  own event object and the event slot array is sized at compile time.
 - [ ] **Locator methods on an associative array** (7.12) — `find`, `find_index`, `min` and the
   rest are refused; they need key traversal.
 - [ ] **`item.index(d)` for `d > 1`** (7.12.4) — the second and later dimension indices are
@@ -397,8 +396,9 @@ Milestones, in order; lower ones unblock higher ones:
   the design; the rest call the runtime through an interpreted element descriptor.
 - [ ] **Logical `==` / `!=` over an associative array with a 4-state value element** (11.4.5) —
   refused at any nesting depth until the defining clause and x on a key-set mismatch are settled.
-- [ ] **Associative-array key mixing a class handle with a variable-width component** (7.8) — a
-  `string`, queue, dynamic-array or associative-array component beside the handle is refused.
+- [ ] **Associative-array key mixing a class handle or an event with a variable-width component**
+  (7.8) — a `string`, queue, dynamic-array or associative-array component beside the handle is
+  refused.
 - [ ] **Wildcard `[*]` index wider than 64 bits** (7.8.1) — an index expression (including a
   string literal of more than 8 characters) wider than 64 bits is refused.
 - [ ] **Assignment-pattern lvalue over a container or handle** (10.9) — a queue, dynamic-array or

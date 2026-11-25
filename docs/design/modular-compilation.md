@@ -518,23 +518,15 @@ code go.
      and LLVM inlines them there.
 
      An event object is instance data reached through its variable: a declared
-     event powers on holding the handle of its own object (a slot of
-     `clotho.events`, numbered design-wide in signal order, handles being
-     design-wide), so code reads the slot from the variable's storage -- the
-     instance's own through its record, an event port's through its binding --
-     and indexes `clotho.events` with it, as it already did for an event that is
-     reassigned. A variable no store reaches (`event_mono_`) is the declared
-     object for the whole run, which is what lets waits link without reading the
-     handle a second time and unlink without recording the owner; the fact is
-     joined over a unit's instances, and over what each instance binds an event
-     port to, since the code is shared. The object's VCD index is a field of the
-     object and a trigger id of an event is its slot, so neither is code. The
-     dump of a reassigned event names its declared object by number, and so does
-     every other `$dumpvars` registration: `$dumpvars` in a body is a call of one
-     function of root (`vcd_register_fn`) that walks the design's scope tree, the
-     link glue that owns the design-wide numbering, so no unit's code names a
-     dumped signal of any instance. An event of no instance (a package's) is one
-     object for everyone and keeps its constant address.
+     event is bound to its own object when the design starts, and code reads the
+     handle, which is the object's address, from the variable's storage -- the
+     instance's own through its record, an event port's through its binding. So
+     no unit's code names an object. The object's VCD index and its trigger id
+     are fields of the object, so neither is code. Every `$dumpvars`
+     registration, an event's included, is a row of one function of root
+     (`vcd_register_fn`) that walks the design's scope tree, the link glue that
+     owns the design-wide numbering, so no unit's code names a dumped signal of
+     any instance.
 
      The taint list is a claim that the lowering of one instance is the lowering
      of all, and the frontend's equivalent (partition merging) compares, so the

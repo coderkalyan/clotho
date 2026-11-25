@@ -842,11 +842,14 @@ void Backend::lower_inst(Index i) {
                                      { gc_mutator_cur(), b_.getInt64(gc_object_bytes(class_ref)),
                                        class_gc_map_global(class_ref), site });
             }
-            emit_class_body_init(class_ref, body);
             // Install the descriptor pointer at the object header (field 0), so
             // a later virtual dispatch (LRM 8.20) and a later `$cast` (LRM 8.16)
-            // both resolve against the concrete type.
+            // both resolve against the concrete type. Before the body is
+            // initialized, not after: binding an event property allocates, an
+            // allocation can collect, and the collector recognizes an object by
+            // this word (rt_gc_find_object) while only a register names it.
             b_.CreateStore(class_vptr(class_ref), b_.CreateStructGEP(class_body_ty(class_ref), body, 0));
+            emit_class_body_init(class_ref, body);
             set_value(i, two_val(b_.CreatePtrToInt(body, b_.getInt64Ty())));
             return;
         }
@@ -1977,8 +1980,7 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::EventNew:
             // LRM Table 6-7's "New event": bind a fresh object and yield its
-            // handle. Only storage whose power-on handle cannot be a compile-time
-            // constant reaches here.
+            // handle.
             set_value(i, two_val(b_.CreateCall(event_new_fn())));
             return;
 
@@ -2010,7 +2012,9 @@ void Backend::lower_inst(Index i) {
             // `->> #d e` (LRM 15.5.1): schedule a detached wheel timer that fires
             // the event `d` ticks from now. The process does not block. The timer
             // node carries the handle, so ONE thunk serves the whole design (the
-            // target may be any event expression, not a fixed declared one).
+            // target may be any event expression, not a fixed declared one), and
+            // the runtime owns the node because it is what keeps the event alive
+            // until then.
             //
             // A zero delay cannot arm the wheel (rt_wheel_schedule_rel needs a
             // delay above 0). Its delay control expires in the current time slot,
@@ -2021,10 +2025,7 @@ void Backend::lower_inst(Index i) {
             llvm::Value* handle   = must_of(p.binary.r);
             llvm::Value* ticks    = cast(must_of(p.binary.l), 64, false);
             auto         schedule = [&] {
-                auto*        nty = event_timer_ty();
-                llvm::Value* node =
-                  b_.CreateCall(alloc_fn(), { b_.getInt64(env_->llmod.getDataLayout().getTypeAllocSize(nty)) });
-                b_.CreateStore(handle, b_.CreateStructGEP(nty, node, 2));
+                llvm::Value* node = b_.CreateCall(event_timer_new_fn(), { handle });
                 // Relative, so the runtime's saturating `now + ticks` applies.
                 b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, node, ticks, event_delay_thunk() });
             };

@@ -1100,8 +1100,16 @@ llvm::FunctionCallee Backend::event_new_fn() {
     return rt_fn("rt_event_new", b_.getInt64Ty(), {});
 }
 
-llvm::FunctionCallee Backend::event_ptr_fn() {
-    return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
+llvm::FunctionCallee Backend::event_new_elem_fn() {
+    return rt_fn("rt_event_new_elem", b_.getInt64Ty(), {});
+}
+
+llvm::FunctionCallee Backend::event_timer_new_fn() {
+    return rt_fn("rt_event_timer_new", raw_ptr_ty(), { b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::event_timer_take_fn() {
+    return rt_fn("rt_event_timer_take", b_.getInt64Ty(), { raw_ptr_ty() });
 }
 
 llvm::FunctionCallee Backend::event_trig_id_fn() {
@@ -1109,7 +1117,7 @@ llvm::FunctionCallee Backend::event_trig_id_fn() {
 }
 
 llvm::FunctionCallee Backend::run_init_fn() {
-    return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
 // -- Process control blocks (the `process` class, LRM 9.7) --

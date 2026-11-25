@@ -772,9 +772,8 @@ ir::Index Lowerer::agg_cond_elem_match(ir::Index a, ir::Index other, ir::Ref ety
 //   1. EVENT. emit_default_init binds a FRESH event (EventNew) because Table
 //      6-7 says "New event" for a declaration, and two concurrent activations
 //      of one task must not share a synchronization object. Table 7-1 says
-//      `null`, which for clotho's event handle is the all-zero word --
-//      InternPool Type::Kind::Event: "`null` is the all-zero handle, which
-//      resolves to the reserved null object at slot 0". So this stores zero.
+//      `null`, which for clotho's event handle is the all-zero word
+//      (InternPool Type::Kind::Event). So this stores zero.
 //   2. UNPACKED UNION. Table 7-1 wants the FIRST member's value, while
 //      emit_default_init walks every member of an unpacked struct-or-union
 //      alike. Refused below rather than guessed: clotho lays an unpacked union

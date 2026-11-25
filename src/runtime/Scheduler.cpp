@@ -325,7 +325,8 @@ struct EventDetach {
 };
 
 // Indexed like intra_event_pending: dense (signal, edge) ids in one vector, event-object
-// ids (RT_TRIG_EVENT | slot) in the other by slot.
+// ids (RT_TRIG_EVENT | rt_event::trig) in the other by that id. Every `handle` here is a
+// root (event_gc_roots).
 std::vector<std::vector<EventDetach>> event_detach_pending;
 std::vector<std::vector<EventDetach>> event_detach_pending_obj;
 std::vector<uint64_t>                 event_detach_ready;
@@ -1096,8 +1097,8 @@ namespace {
 // across a C ABI with no unwind tables.
 constexpr size_t kFrameAlign = 64;
 
-// A process or event pool chunk. The pools have no way to hand a failed
-// allocation back to the design, so running out of memory here ends the run.
+// A process pool chunk. The pool has no way to hand a failed allocation back to
+// the design, so running out of memory here ends the run.
 void* alloc_pool_chunk(size_t bytes) {
     void* chunk = clotho::rt::os_aligned_alloc(bytes, kFrameAlign);
     if (chunk == nullptr) {
@@ -1108,60 +1109,143 @@ void* alloc_pool_chunk(size_t bytes) {
 
 // -- Named event objects (LRM 15.5) --
 //
-// One slot space over two tiers: the backend's static block is chunk 0 (its slots
-// are the scalar declared events, so their addresses fold to constants at compile
-// time), and every other event storage location -- an array element, a struct
-// member, a class property, an automatic local, a container element -- draws from
-// the chunks after it. Chunks are never resized or moved, so an object address
-// stays valid across growth even while a process is parked on its waiter list.
+// An event object is a collected object that only the runtime allocates, so the
+// runtime owns its descriptor: the word a handle points at leads to the trace map
+// exactly as a class object's vptr does (Gc.cpp, map_probe). The map lists no
+// handle. `next_pend` links objects only while they are on the NBA pending chain,
+// and every object on the chain is a root (event_gc_roots), so the collector does
+// not follow the link and `->> e` needs no write barrier.
 
-constexpr uint32_t kEventChunk = 256;
+constexpr uint64_t kEventBytes =
+  (RT_GC_HEADER_BYTES + sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
+constexpr rt_gc_map kEventMap = { kEventBytes, 0, 0, nullptr, nullptr, nullptr };
 
-// chunk 0 is the backend's static block, of g_event_static objects; every later
-// chunk holds kEventChunk pool objects.
-std::vector<rt_event*> g_event_chunks;
-uint32_t               g_event_static = 0;
-uint32_t               g_event_pooled = 0; // pool objects handed out so far
+// The descriptor: the map pointer, then the bytes that separate it from the word
+// an object's vptr names (rt_gc_map_vptr_offset). Filled by rt_run_init.
+alignas(void*) uint8_t g_event_desc[128];
+const void*            g_event_vptr = nullptr;
+
+// The address of the design's NBA pending-chain head; null before the first run.
+void** g_event_pend_head = nullptr;
+// Trigger ids handed out this run (rt_event::trig). 0 means "never a control".
+uint32_t g_event_trig_last = 0;
+// The events a dump watches, kept for the run (event_keep).
+std::vector<void*> g_event_kept;
+
+// A `->> #d e` timer: the wheel's node, the event to trigger, and the links of the
+// list of unexpired timers, which is how the collector finds `handle`.
+struct EventTimer {
+    rt_timer    base;
+    uint64_t    handle;
+    EventTimer* prev;
+    EventTimer* next;
+};
+EventTimer* g_event_timers = nullptr;
+
+rt_event* event_init(void* body) {
+    assert(g_event_vptr != nullptr && "rt_run_init builds the event descriptor before any event exists");
+    // The collector zeroed the body: no waiter, not pending, never a control.
+    auto* e      = static_cast<rt_event*>(body);
+    e->vptr      = g_event_vptr;
+    e->last_trig = ~uint64_t{ 0 }; // never triggered; `.triggered` reads 0
+    e->vcd       = -1;             // not dumped
+    return e;
+}
 
 } // namespace
 
-extern "C" void* rt_event_ptr(uint32_t slot) {
-    if (slot < g_event_static) {
-        return g_event_chunks[0] + slot;
-    }
-    const uint32_t i = slot - g_event_static;
-    return g_event_chunks[1 + (i / kEventChunk)] + (i % kEventChunk);
-}
-
 extern "C" uint64_t rt_event_new(void) {
-    const uint32_t i = g_event_pooled++;
-    if (i % kEventChunk == 0) {
-        // A fresh chunk, zeroed: waiters / pending / next_pend all start clear.
-        g_event_chunks.push_back(static_cast<rt_event*>(alloc_pool_chunk(sizeof(rt_event) * kEventChunk)));
-        std::memset(g_event_chunks.back(), 0, sizeof(rt_event) * kEventChunk);
-    }
-    rt_event* e  = g_event_chunks[1 + (i / kEventChunk)] + (i % kEventChunk);
-    e->last_trig = ~uint64_t{ 0 }; // never triggered; `.triggered` reads 0
-    e->vcd       = -1;             // an object reached through a handle is not dumped
-    // The slot is past the static block, and gen is 0 for the run: nothing is ever
-    // freed (LRM 15.5.5.2 reclamation is GC), so a slot is never reused and its
-    // generation never advances.
-    return static_cast<uint64_t>(g_event_static + i);
+    return reinterpret_cast<uint64_t>(
+      event_init(rt_gc_alloc(rt_gc_mutator_current(), kEventMap.size, &kEventMap, nullptr)));
 }
 
-extern "C" uint32_t rt_event_trig_id(const void* obj) {
-    const auto* p = static_cast<const rt_event*>(obj);
-    if (p >= g_event_chunks[0] && p < g_event_chunks[0] + g_event_static) {
-        return RT_TRIG_EVENT | static_cast<uint32_t>(p - g_event_chunks[0]);
+extern "C" uint64_t rt_event_new_elem(void) {
+    return reinterpret_cast<uint64_t>(event_init(rt_gc_alloc_held(kEventMap.size, &kEventMap)));
+}
+
+extern "C" uint32_t rt_event_trig_id(void* obj) {
+    auto* e = static_cast<rt_event*>(obj);
+    if (e->trig == 0) {
+        // TODO: the records registered on an id outlive the object: an event that
+        // dies while a `<= @e` or `->> @(e) f` still waits on it leaves them (and
+        // the event `f` a subscription names) until the run ends. They can never
+        // fire, so this is a leak, not a wrong result.
+        g_event_trig_last += 1;
+        if ((g_event_trig_last & RT_TRIG_EVENT) != 0) {
+            format_fatal("more than 2^31 events were used as the control of an assignment or a trigger");
+        }
+        e->trig = g_event_trig_last;
     }
-    for (size_t c = 1; c < g_event_chunks.size(); ++c) {
-        if (p >= g_event_chunks[c] && p < g_event_chunks[c] + kEventChunk) {
-            const auto within = static_cast<uint32_t>(p - g_event_chunks[c]);
-            return RT_TRIG_EVENT | (g_event_static + static_cast<uint32_t>(c - 1) * kEventChunk + within);
+    return RT_TRIG_EVENT | e->trig;
+}
+
+extern "C" void* rt_event_timer_new(uint64_t handle) {
+    auto* t = static_cast<EventTimer*>(std::malloc(sizeof(EventTimer)));
+    if (t == nullptr) {
+        format_fatal("out of memory: the system refused a `->> #d` timer");
+    }
+    t->handle = handle;
+    t->prev   = nullptr;
+    t->next   = g_event_timers;
+    if (g_event_timers != nullptr) {
+        g_event_timers->prev = t;
+    }
+    g_event_timers = t;
+    return &t->base;
+}
+
+extern "C" uint64_t rt_event_timer_take(void* timer) {
+    auto* t = reinterpret_cast<EventTimer*>(timer);
+    if (t->prev != nullptr) {
+        t->prev->next = t->next;
+    } else {
+        assert(g_event_timers == t && "a timer with no predecessor is the head of the list");
+        g_event_timers = t->next;
+    }
+    if (t->next != nullptr) {
+        t->next->prev = t->prev;
+    }
+    const uint64_t handle = t->handle;
+    std::free(t);
+    return handle;
+}
+
+namespace rt_internal {
+
+void event_gc_roots(void (*visit)(void* handle)) {
+    const auto visit_word = [&](uint64_t handle) { visit(reinterpret_cast<void*>(handle)); };
+    // The NBA pending chain. Its head is a JIT global and its links are in the
+    // objects, which the trace map does not list.
+    if (g_event_pend_head != nullptr) {
+        for (void* p = *g_event_pend_head; p != nullptr; p = static_cast<rt_event*>(p)->next_pend) {
+            visit(p);
         }
     }
-    return RT_TRIG_EVENT; // unreachable for an object the pool handed out
+    for (const EventTimer* t = g_event_timers; t != nullptr; t = t->next) {
+        visit_word(t->handle);
+    }
+    for (const auto* lists : { &event_detach_pending, &event_detach_pending_obj }) {
+        for (const std::vector<EventDetach>& list : *lists) {
+            for (const EventDetach& d : list) {
+                visit_word(d.handle);
+            }
+        }
+    }
+    // Matured by rt_event_detach_fire and not yet read back by the caller's loop.
+    for (const uint64_t handle : event_detach_ready) {
+        visit_word(handle);
+    }
+    for (void* e : g_event_kept) {
+        visit(e);
+    }
 }
+
+void event_keep(rt_event* e) {
+    assert(e != nullptr && "only an event object can be kept");
+    g_event_kept.push_back(e);
+}
+
+} // namespace rt_internal
 namespace {
 
 // -- Process control blocks (the `process` class, LRM 9.7) --
@@ -1253,7 +1337,7 @@ void proc_maybe_free(rt_proc* p) {
 // host-armed configuration -- g_plusargs, g_system_access, g_ref_stale_warn -- is
 // installed by the embedder BEFORE the module runs (src/ir/Jit.cpp:681/686/692),
 // so touching it here would discard the run's own options.
-extern "C" void rt_run_init(void* event_static_block, uint32_t event_static_count) {
+extern "C" void rt_run_init(void* event_pend_head) {
     // 1. Process control blocks, first: the only pool that can hold pointers into
     // the outgoing module, since rt_proc::parent chains through blocks a dead
     // design's fork tree linked. proc_take (:5824) allocates chunks and never
@@ -1269,17 +1353,24 @@ extern "C" void rt_run_init(void* event_static_block, uint32_t event_static_coun
     g_proc_used = 0;
     g_proc_free = nullptr;
 
-    // 2. Event objects. Chunk 0 is the PREVIOUS module's static block -- a JIT
-    // global, not ours to free -- so the walk starts at 1. Re-registering chunk 0
-    // alone would orphan every chunk rt_event_new (:5791) had allocated, which is
-    // what this pool's reset did before it moved here: freeing 1..N is a fix.
-    for (size_t i = 1; i < g_event_chunks.size(); ++i) {
-        clotho::rt::os_aligned_free(g_event_chunks[i]);
+    // 2. Event objects. They are the collector's, which rt_gc_init (emitted just
+    // before this call) has already reset, so what is left is the runtime's own
+    // record of them: the descriptor every object names, the pending-chain head
+    // of the incoming module, the trigger ids, the dump's list and any `->> #d e`
+    // timer a finished run left unexpired.
+    const auto map_off = static_cast<size_t>(-rt_gc_map_vptr_offset());
+    assert(map_off + sizeof(void*) <= sizeof(g_event_desc) && "the event descriptor has room for a vptr word");
+    const rt_gc_map* const map = &kEventMap;
+    std::memcpy(g_event_desc, &map, sizeof(map));
+    g_event_vptr      = g_event_desc + map_off;
+    g_event_pend_head = static_cast<void**>(event_pend_head);
+    g_event_trig_last = 0;
+    g_event_kept.clear();
+    while (g_event_timers != nullptr) {
+        EventTimer* next = g_event_timers->next;
+        std::free(g_event_timers);
+        g_event_timers = next;
     }
-    g_event_chunks.clear();
-    g_event_chunks.push_back(static_cast<rt_event*>(event_static_block));
-    g_event_static = event_static_count;
-    g_event_pooled = 0;
 
     // 3. Detached `->> @(x) e` subscriptions, keyed by the dense trigger id the
     // next design reuses from zero. A record surviving a $finish would let

@@ -15,10 +15,11 @@ namespace clotho::ir::backend {
 // BOUNDARY here, not a hole. reaches_class_handle answers the transitive
 // question.
 //
-// A class handle is Kind::Class here, which is precisely what keeps a `chandle`
-// out of the table: chandle lowers to a plain unsigned 64-bit integer type
-// (lower/Types.cpp, lower_type) and never reaches the Class arm. Tracing one would hand
-// the collector a foreign DPI pointer, which it never allocated
+// "Class handle" here means any handle to a collected object, which an event
+// handle is too (types::is_object_handle). That predicate is precisely what
+// keeps a `chandle` out of the table: chandle lowers to a plain unsigned 64-bit
+// integer type (lower/Types.cpp, lower_type). Tracing one would hand the
+// collector a foreign DPI pointer, which it never allocated
 // (docs/design/garbage-collection.md §0, "Never in scope").
 //
 // Explicit worklist, never recursion (TigerStyle): the storage tree of an
@@ -44,8 +45,8 @@ void Backend::collect_class_handles(Ref type, uint64_t base, llvm::Type* storage
         const Node  n = work.back();
         work.pop_back();
         const Type& t = std::get<Type>(mod_.pool.get(n.type));
-        if (t.kind == Type::Kind::Class) {
-            assert(n.base % 8 == 0 && "a class handle word is 8-byte aligned");
+        if (types::is_object_handle(mod_.pool, n.type)) {
+            assert(n.base % 8 == 0 && "a handle word is 8-byte aligned");
             out.push_back(static_cast<uint32_t>(n.base));
             continue;
         }
@@ -73,10 +74,10 @@ void Backend::collect_class_handles(Ref type, uint64_t base, llvm::Type* storage
     }
 }
 
-// Whether a value of `type` can transitively REACH a class handle: one in its own
-// inline storage, one in the elements of a container it holds at any nesting
-// depth, or -- for an associative array -- one in its KEY, which LRM 7.8.3 makes
-// a strong reference.
+// Whether a value of `type` can transitively REACH a class or event handle: one in
+// its own inline storage, one in the elements of a container it holds at any
+// nesting depth, or -- for an associative array -- one in its KEY, which LRM 7.8.3
+// makes a strong reference.
 //
 // This is the collector's REACHABILITY question, and it is deliberately wider
 // than the storage question collect_class_handles answers. Since P4 a container
@@ -121,6 +122,7 @@ bool Backend::reaches_class_handle(Ref type) {
         const Type& t = std::get<Type>(mod_.pool.get(r));
         switch (t.kind) {
             case Type::Kind::Class:
+            case Type::Kind::Event:
                 found = true;
                 break;
             case Type::Kind::UnpackedArray:
@@ -149,11 +151,11 @@ bool Backend::reaches_class_handle(Ref type) {
                 }
                 break;
             default:
-                break; // scalar, real, string, event, chandle, virtual interface
+                break; // scalar, real, string, chandle, virtual interface
         }
     }
-    assert((std::get<Type>(mod_.pool.get(type)).kind != Type::Kind::Class || found) &&
-           "a class-typed value is itself a reference");
+    assert((!types::is_object_handle(mod_.pool, type) || found) &&
+           "a handle-typed value is itself a reference");
     reaches_class_handle_.emplace(key, found);
     return found;
 }
@@ -1506,17 +1508,19 @@ bool Backend::frame_may_hold_gc_ref(const Process& p) {
 // Door 4: does any instruction of this body produce or consume a value that is,
 // or points into, a class object?
 //
-// Every class-typed value in a body traces back to one of five producers, so
+// Every handle-typed value in a body traces back to one of six producers, so
 // testing those plus the class-specific consumers covers every temporary
 // CoroSplit could spill:
-//   * `new` (ClassNew);
-//   * a read of class-typed module storage (Signal -- a module-scope handle
-//     variable, or a static class property block);
+//   * `new` (ClassNew), and the object of an automatic `event` (EventNew);
+//   * a read of handle-typed module storage (Signal -- a module-scope handle
+//     variable, a declared event, or a static class property block);
 //   * a call whose return type is a handle (Call), or any virtual dispatch;
 //   * a reference to a formal or a declared local of handle type (Arg / Local);
 //   * `process::self()` (ProcQuery), which reads no storage and calls nothing: its
 //     object is a collected class body (docs/design/process-class.md §4.2) that only
-//     a handle in a frame word may keep alive across a suspend.
+//     a handle in a frame word may keep alive across a suspend;
+//   * a wait on a declared event (Wait), whose frame-resident node names the
+//     object without the body ever reading the variable.
 // Everything else -- HandleDeref, ClassIsA, a store, a `$cast`, passing an
 // argument -- can only forward a handle one of those already produced. TaskCall
 // needs no case of its own: a task returns nothing (LRM 13.3) and writes its
@@ -1571,6 +1575,22 @@ bool Backend::ir_may_hold_gc_ref(const Ir& ir) {
                 // `get_randstate()` a string.
                 if (ir.extra_data<ProcCtlInfo>(p.extra).op == ProcOp::Self) {
                     return true;
+                }
+                break;
+            case Inst::Tag::EventNew:
+                return true;
+            case Inst::Tag::Wait:
+                // A wait on a declared event parks a node of this frame on the
+                // object the variable names, and the node's owner word is then
+                // what keeps that object alive if the variable is reassigned
+                // meanwhile. The frontend reads the variable ahead of the wait
+                // today, which the Signal case already answers, but nothing in
+                // the wait itself needs that read, so this does not rely on it.
+                for (const WaitEdge& e : ir.wait_edges(p.extra)) {
+                    if (e.inst == kNoWaitHandle && e.handle == kNoWaitHandle &&
+                        mod_.signal(e.signal).is_event) {
+                        return true;
+                    }
                 }
                 break;
             default:

@@ -17,28 +17,27 @@ automatic-lifetime locals, subroutine arguments in all four directions, module
 ports, `@(<any event expression>)`, `->> e`, `->> #d e`, `->> @(x) e` /
 `->> repeat(n) @(x) e`, `wait_order`, and event operations inside a function.
 
-Three deviations from the design as first written, each measured or forced by the
-LRM text:
+Where the code differs from the design as first written. §3, §5, §9, §10 and
+§12 describe the code; the rest reads as written.
 
-- **Two storage tiers, one slot space.** A scalar declared event keeps a
-  compile-time slot in a codegen-owned static block, so the common case folds to a
-  constant object address; every other storage location draws from a chunked
-  runtime pool. The backend registers the static block as the pool's first chunk,
-  so one handle format and one `rt_event_ptr` cover both. §5's monomorphism
-  analysis is what makes the fast path reachable.
-- **No refcounting.** Objects are never freed, because LRM 15.5.5.2's reclamation
-  is garbage collection, which Clotho does not have — the same direction class
-  bodies already take. The `gen` half of the handle is carried and reserved for the
-  day that changes; nothing consults it today.
+- **A handle is the object's address and the object is collected.** No slot
+  table, no generation and no reference count: `docs/design/kernel.md` makes a
+  handle one pointer, and `docs/design/architecture.md` makes every built-in
+  handle kind a collected object. LRM 15.5.5.2's reclamation is the collector's
+  (§3, §9).
+- **One tier.** A declared event's object is allocated when the design starts,
+  like every other event's, and code reads its handle from the variable. The
+  static block and the monomorphic fast path are gone (§5).
 - **The wheel is a module global.** Cheaper than threading `ptr wheel` through
   every function signature (the RNG precedent), and it lifts the restriction that
   event operations could not appear in a function. Measured a 16% *win* on a pure
   `#delay` loop.
 
-Measured against `main` on 3M triggers: **−19%** with three `always @(e)` waiters,
-**−16%** on a pure `#delay` loop, **+15%** with two one-shot `@(e)` waiters in a
-loop — the price of a doubly-linked node's link/unlink over the old bucket's append
-plus bulk clear, which is what buys the unbounded waiter set and handle semantics.
+Measured against `main` when the list landed, on 3M triggers: **−19%** with three
+`always @(e)` waiters, **−16%** on a pure `#delay` loop, **+15%** with two one-shot
+`@(e)` waiters in a loop — the price of a doubly-linked node's link/unlink over
+the old bucket's append plus bulk clear, which is what buys the unbounded waiter
+set and handle semantics.
 
 ## 1. Decision summary
 
@@ -46,7 +45,7 @@ Three moves, in dependency order. Everything else follows.
 
 | # | Move | Replaces |
 |---|---|---|
-| **A** | An event is a **64-bit plane word** — `{ u32 slot, u32 gen }` into a runtime-owned slot table. | `lower_type(EventType) -> logic_type`, a 1-bit placeholder (`lower/Types.cpp, lower_type`) |
+| **A** | An event is a **64-bit plane word**: a handle to its object. | `lower_type(EventType) -> logic_type`, a 1-bit placeholder (`lower/Types.cpp, lower_type`) |
 | **B** | An event's waiters are an **intrusive doubly-linked list of frame-resident nodes**, unbounded. | statically-sized per-`(signal,edge)` buckets `clotho.wait.<sig>.{sta,dyn}.*` for events only |
 | **C** | The trigger is **one generated function** `clotho.event_fire(ptr obj, ptr wheel)`, called from generated code *and* from runtime callbacks. | per-event inlined `emit_event_fire` against named globals (`ir/llvm/Events.cpp`) |
 
@@ -54,12 +53,9 @@ Move A buys every storage class and the whole call ABI for free (§4). Move B
 removes the static-capacity blocker (§6). Move C keeps `clotho.active`
 codegen-private, so the scheduler core is **not** touched (§2).
 
-The efficiency claim is concentrated in one idea, §5: an event variable that is
-never assigned, never `ref`/`out`-passed and never aliased is **monomorphic**;
-its handle is a compile-time constant, its object address folds to a constant,
-and its lowering is byte-for-byte what Tier 1 emits today. Essentially all RTL
-and most testbench events are monomorphic, so generality is paid for only where
-it is used.
+The efficiency claim was first concentrated in §5's monomorphic fast path. It is
+now that a handle is the object's address: every use is one load of the variable
+and a field access, with no table and no call.
 
 ---
 
@@ -145,86 +141,55 @@ Three real constraints survive, all local:
 ### 3.1 The handle word
 
 ```
-handle : i64  =  { u32 slot ; u32 gen }        // slot in low half
-null   : i64  =  0                              // slot 0 reserved, gen 0
+handle : i64  =  the address of the event object
+null   : i64  =  0
 ```
 
 A 64-bit 2-state plane word, identical in every mechanical respect to a class
-handle. `Type::Kind::Event` interns as:
+handle. `Type::Kind::Event` interns as `{ Domain::Two, 64 }` beside
+`Kind::Class` (`src/ir/InternPool.cpp`), and `types::storage_class` maps it to
+`StorageClass::Plane`. `types::is_object_handle` (`src/ir/TypeModel.h`) is the one
+predicate that says "the collector traces this word", true of a class handle and
+an event handle alike.
 
-```cpp
-// src/ir/InternPool.cpp — alongside Kind::Class at 175-182
-case Type::Kind::Event: return { Domain::Two, 64, plane_bytes(64) };
-```
-
-and `types::storage_class` maps it to `StorageClass::Plane`
-(`TypeModel.h:56-58`, whose doc comment at `:22-27` already reads "a class handle
-or chandle (a 64-bit word with reference semantics)" — events join that
-sentence).
-
-Why `{slot, gen}` and not a bare pointer:
-
-| Property | Bare `rt_event*` | `{slot, gen}` |
-|---|---|---|
-| `null` == power-on zero (LRM Table 7-1) | yes | yes |
-| identity `==` is one `icmp` | yes | yes |
-| rides `rt_elem_pod` in containers | yes | yes (with a refcounting variant, §9) |
-| **use-after-free** | undefined behaviour | **located fatal** `rt_event_stale` |
-| table locality | scattered `rt_alloc` blocks | one contiguous `std::vector<rt_event>` |
-
-The generation half is what makes "strictly managed lifetimes" enforceable rather
-than aspirational. Releasing a slot bumps its generation, so every stale handle
-is *detected*. The precedent is exact: the `ref` ABI already carries a witness
-chain of `{epoch, expect}` pairs (`ref_witness_chain`, `ir/llvm/StateLayout.cpp`) to
-catch a container reference invalidated by relocation, and `rt_null_handle`
-(`Runtime.h:312`) is the located-fatal shape to copy.
+The handle was first `{ u32 slot, u32 gen }` into a runtime table, the
+generation being there to detect a stale handle once slots were released. With
+a collector nothing a handle names is freed while the handle exists, so there is
+nothing to detect.
 
 ### 3.2 The object
 
 ```c
-// src/runtime/Runtime.h — new
+// src/runtime/Runtime.h
 typedef struct rt_event {
-    uint64_t last_trig;   // sim tick of the last fire, or UINT64_MAX == never
-    void*    waiters;     // intrusive list head (rt_event_node*), or NULL
-    uint32_t gen;         // generation of the live occupant of this slot
-    uint32_t refs;        // reference count; RT_EVENT_IMMORTAL pins a static event
-    uint32_t pending;     // ->> nonblocking-trigger state (bitfield, §7.2)
-    uint32_t next_pend;   // slot index of the next event on the NBA pending chain
-} rt_event;               // 32 bytes, one cache line holds two
+    const void* vptr;      // names the collector's trace map, as a class object's does
+    uint64_t    last_trig; // sim tick of the last fire, or UINT64_MAX == never
+    void*       waiters;   // intrusive list head (event node), or NULL
+    void*       next_pend; // next object on the NBA pending chain (§7.2)
+    int32_t     vcd;       // dump-var index, or -1 (§12)
+    uint32_t    trig;      // id as a `<= @e` / `->> @(e)` control, 0 until it is one
+    uint8_t     pending;   // a `->> e` awaiting the NBA region
+} rt_event;
 ```
 
-`last_trig` is field 0 deliberately: VCD registers `&obj->last_trig` and the
-offset must be zero so an `rt_event*` and the tick pointer are the same address
-(§12).
-
-The slot table is runtime-owned and growable:
-
-```c
-static std::vector<rt_event> g_events;   // g_events[0] is the reserved null slot
-static uint32_t              g_event_free;  // freelist head, 0 == empty
-```
-
-Growth is amortised `push_back`; a released slot is pushed on the freelist and
-its `gen` incremented. Static events occupy slots `1..N` in a deterministic
-elaboration order (§5), so their indices are compile-time constants.
+An event object is a collected object (`docs/design/garbage-collection.md`) that
+only the runtime allocates: `rt_event_new`, and `rt_event_new_elem` for a
+container element, which never collects because element construction runs inside
+container operations whose buffers the collector cannot see until they are
+installed. The runtime owns the descriptor the `vptr` word names
+(`src/runtime/Scheduler.cpp`), and the trace map lists no handle.
 
 ### 3.3 Deref
 
-`rt_event* obj = &g_events[slot]` after two checks:
+`inttoptr`. A null handle must not be dereferenced, and two forms deal with it:
 
-- `slot < g_events.size()` — bounds
-- `obj->gen == gen` — liveness
-
-Both fold away for a monomorphic static handle (§5). For a dynamic handle they
-are one compare each against a base/length pair the backend loads once per
-region, exactly as the container element path does with its `Guarded` verdict
-(`ir/llvm/Inst.cpp, lower_inst`). Failure calls
-`rt_event_stale(const rt_null_site*, uint64_t now)` — a `[[noreturn]]` located
-fatal modelled on `rt_null_handle` (`runtime/Reports.cpp`), reusing the existing
-`rt_null_site` record and `null_site_global` emitter (`ir/llvm/Sanitizers.cpp`).
-A `null` handle triggered or waited on is **not** an error: LRM 15.5.5 makes
-`-> null` a no-op and `@(null)` block forever, so the deref path tests slot 0
-first and branches to the no-op.
+- A trigger (`-> e`, `->> e`) branches on null and does nothing, which is LRM
+  15.5.5's no-op.
+- A wait and `.triggered` select the design's **null object**
+  (`clotho.event_null`) in place of a null handle. Nothing triggers it, so a wait
+  on it blocks forever and its tick stays the never-triggered sentinel, without a
+  branch. It is a global of the design, not a collected object, and no handle
+  holds its address.
 
 ---
 
@@ -243,7 +208,7 @@ exactly one cell).
 | `a = null;` | `lower/Assign.cpp, lower_assign` | peel the `ConversionExpression` slang inserts over the `NullLiteral` |
 | `a == b`, `a == null`, `a !== b` | `lower/Expr.cpp, lower_expr` | none — `icmp` via the generic scalar compare |
 | `event arr[4];`, `arr[i]` | `lower/Types.cpp, lower_type` | none — 8-byte plane element |
-| `event q[$]`, `event d[]`, `event aa[string]` | `lower/Types.cpp, guard_container_element` (one predicate, three names) | `rt_elem_event` ops kind (§9) |
+| `event q[$]`, `event d[]`, `event aa[string]` | `lower/Types.cpp, guard_container_element` (one predicate, three names) | `rt_elem_event` ops kind: constructed per slot, traced like a class handle |
 | `int aa[event]` (event as key) | the key arm at `lower/Types.cpp, lower_type` | none — word key |
 | `struct { event e; }` | `lower/Types.cpp, lower_type` | none — aggregate leaf slot |
 | `class C; event e;` | `lower/Lowerer.h` | none — body field, `agg_member` adds the header word |
@@ -292,49 +257,20 @@ LRM semantics, and it is why the plane-copy port model must not be used here.
 
 ---
 
-## 5. The monomorphic fast path
+## 5. The monomorphic fast path (removed)
 
-Generality must not cost the common case. Define:
+As first built, a scalar declared event had a compile-time slot in a static
+block of objects, and an event variable that no store reached was
+**monomorphic**: its object address folded to a constant and its handle was never
+loaded. A whole-design analysis (`analyze_event_monomorphism`) decided it.
 
-> An event variable is **monomorphic** iff its handle is provably a single
-> compile-time-known object for the whole run: it is a static-lifetime
-> declaration (module, package, `$unit`, generate block, `static` local, `static`
-> class property), it is never the target of an assignment, it is never passed as
-> `ref`/`out`/`inout`, and it is not an aggregate element or non-static class
-> property.
-
-A one-pass analysis over the AST computes this; it is the same shape as
-`facts_.ref_arg` in the existing analysis. Every event in `tests/event_test.cpp`
-and every event in ordinary RTL is monomorphic.
-
-For a monomorphic event:
-
-- its slot index is a compile-time constant, assigned during
-  `collect_*_signals` in declaration order;
-- `rt_event_bind_static(slot)` runs once in PreInit, setting
-  `refs = RT_EVENT_IMMORTAL`;
-- `&g_events[slot]` folds to `base + slot*32` off a single loaded table base,
-  and the generation check is **omitted** (a static slot's `gen` never bumps);
-- `-> e` is `store now, [obj+0]` then the list walk;
-- `e.triggered` is `icmp eq (load [obj+0]), rt_wheel_now()` — bit-identical to
-  today (`ir/llvm/Events.cpp, lower_event_triggered`);
-- **no refcount traffic is emitted at all** (§9).
-
-So the delta for a design that never uses a handle form is: one indirection
-through a table base instead of a named global, and the list walk of §6 instead
-of a fixed-trip array scan. Both are measurable and both are small; if the table
-base load shows up, it is loadable once per function into a register, since the
-table only ever grows and never moves the *slots* (see §9 note on reallocation).
-
-Under modular compilation (docs/design/modular-compilation.md, step 3c) a
-declared event of an instance is no longer an immediate: unit code is shared
-by the unit's instances, so the slot is the handle the variable's storage holds
-(the instance's own, or an event port's through its binding), and only an event
-of no instance (a package's) keeps the constant.
-
-Non-monomorphic events pay the full path: load the handle word, split
-`{slot, gen}`, bounds+generation check, deref. That is the price of
-`evq[i]`/`obj.e`/`ref event`, and it is paid only there.
+It is gone, for two reasons. Unit code is shared by a unit's instances
+(docs/design/modular-compilation.md), so only an event of no instance (a
+package's) could still fold; every other use already loaded the handle. And an
+object in a static block is not a collected object, so the collector would need
+a second kind of handle. A declared event's object is now allocated by
+`init_state` when the design starts, before any PreInit process runs, and every
+use loads the handle from the variable and casts it.
 
 ---
 
@@ -424,22 +360,19 @@ events that fired, not every `->>` target in the design.
 
 ### 7.3 `->> #d e` (delayed detached, landed)
 
-The timer node grows a payload and the per-event thunk collapses to one:
+The timer node carries the handle and the per-event thunk collapses to one. The
+runtime owns the node, because it is what keeps the event alive until the delay
+expires:
 
 ```c
-typedef struct rt_event_timer { rt_timer base; uint64_t handle; } rt_event_timer;
+void*    rt_event_timer_new(uint64_t handle);   // a wheel node holding `handle`
+uint64_t rt_event_timer_take(void* timer);      // the handle back; frees the node
 ```
 
-`clotho.ev_delay(rt_timer* t, void* ctx)` reads `t->handle`, resolves it, calls
-`clotho.event_fire(obj, ctx)` — `ctx` is the wheel, per
-`rt_wheel_advance(wheel, wheel)` (`:9297`) — and `rt_free`s the node. This
-replaces `build_delay_event_thunks`' one-function-per-event
-(`:7662-7679`) with one function per design, and removes the `nb_delay_event_sigs_`
-static set for the same reason as §7.2.
-
-The follow-up already flagged in `named-events.md:202` (a per-event freelist for
-hot `->> #d` loops) becomes a single design-wide freelist, since the node is now
-type-uniform.
+`clotho.ev_delay(rt_timer* t, void* ctx)` takes the handle back and pends that
+event for the NBA region. This replaces `build_delay_event_thunks`'
+one-function-per-event with one function per design, and removes the
+`nb_delay_event_sigs_` static set for the same reason as §7.2.
 
 ### 7.4 `->> @(x) e` and `->> repeat(n) @(x) e`
 
@@ -497,47 +430,32 @@ scoped as a follow-on (§13, Phase 5), not part of the core.
 
 ## 9. Lifetime
 
-Refcount, with the common case emitting nothing.
+An event object is reclaimed by the collector once nothing names it. What names
+it, exhaustively:
 
-| Object origin | Lifetime rule |
+| Holder | How the collector finds it |
 |---|---|
-| Static declaration (module / package / `$unit` / generate / `static` local / `static` class property) | bound in PreInit with `refs = RT_EVENT_IMMORTAL`; never released; **no refcount traffic emitted** because every reference is monomorphic |
-| Automatic declaration (per subroutine call, per block entry) | `rt_event_alloc()` in the prologue, `rt_event_release()` in the epilogue |
-| Aggregate element | created lazily on first write/subscribe; released by the container's element deinit |
-| Non-static class property | created by `emit_class_property_inits`; released never, because class bodies leak by direction (`docs/design/classes.md:299-303`) — consistent, and documented as such |
-| Parked waiter | holds a reference for the duration of the park: incref on link, decref on unlink |
+| An event variable in design state, a class property, a container element or key, a frame local | The tables and scans that find a class handle there: `types::is_object_handle` puts an event word in the same root tables, trace maps and element descriptors |
+| A parked waiter | Its frame-resident node records the object it is linked onto, and frames are scanned conservatively. This is what keeps the object while `@(e)` is parked and `e` is reassigned, and the unlink on resume or `disable` stores into the object |
+| A pending `->> e` | The NBA pending chain, walked from its head |
+| A `->> #d e` timer | The runtime's list of unexpired timers |
+| A `->> @(x) e` subscription | The runtime's subscription records |
+| A dump | The object a dumped variable named at `$dumpvars` is kept for the run (§12) |
 
-The waiter reference is what makes this sound: an object with parked waiters
-cannot reach zero, so `clotho.event_fire` can never run against a freed object.
+The last four are the runtime's own records, enumerated by
+`rt_internal::event_gc_roots` (`src/runtime/Scheduler.cpp`) at every collection.
 
-Containers need one new element-ops kind. `rt_elem_ops` already carries a
-per-kind copy/deinit protocol (`Runtime.h:889-906`, `rt_elem_pod = 0` being "raw
-bytes; proto init, memcpy copy, no deinit"), and a class handle uses the POD kind
-precisely because class objects never die. An event element takes a new
-`rt_elem_event`: proto = all-zero (so `null` is the power-on default LRM Table 7-1
-asks for, for free), copy = incref-then-word-copy, deinit = decref. `q2 = q1`
-then shares objects and refcounts correctly.
+A persistent `always @(e)` node does not name its object. If the variable is
+reassigned and nothing else names the old object, the object is reclaimed with
+the node still linked; nothing can trigger a reclaimed object, and a persistent
+node is never unlinked, so the node is never read again.
 
-Where refcount traffic is emitted at all, it is `add`/`sub` on
-`obj->refs` plus a zero test on the decrement — no atomics; the simulator is
-single-threaded through the scheduler.
+A store of an event handle into a class object runs the write barrier, as a
+store of a class handle does. `->> e` writes the chain link into an event object
+without one, because every object on the chain is a root.
 
-Two notes, stated because they are the sharp edges:
-
-- **`refs` reaching zero bumps `gen`.** Any handle word still holding the old
-  `{slot, gen}` therefore fails its generation check and produces a located
-  fatal instead of silently aliasing the slot's next occupant. This is the
-  "strictly managed" guarantee, and it converts a whole class of refcount bugs
-  from memory corruption into a diagnosable error.
-- **`g_events` reallocation must not invalidate an `rt_event*` held across a
-  suspend.** Either resolve handles freshly at every use (the design's default —
-  a deref is two compares and an add) or make the table a deque of stable
-  chunks. Prefer the former; do not cache `rt_event*` across a coroutine
-  suspend.
-
-Allocation goes through the **checked** family (`rt_alloc_checked`,
-`Runtime.h:467`), not the raw `rt_alloc` that `ClassNew` uses unchecked
-(`ir/llvm/Inst.cpp, lower_inst`), so OOM is a located fatal rather than a null deref.
+Open: the records a `<= @e` or `->> @(e) f` registers on an event's trigger id
+stay until the run ends if that event is reclaimed first (`docs/TODO.md`).
 
 ---
 
@@ -550,25 +468,23 @@ declaration — the convention `rt_null_site` follows
 exactly, so the two change together").
 
 ```c
-// slot table
-uint64_t rt_event_alloc(void);                 // -> {slot,gen}, refs = 1
-void     rt_event_bind_static(uint32_t slot);  // PreInit; refs = RT_EVENT_IMMORTAL
-void     rt_event_retain(uint64_t h);
-void     rt_event_release(uint64_t h);
-void*    rt_event_table_base(void);            // for constant-folded static deref
-uint32_t rt_event_table_len(void);
-[[noreturn]] void rt_event_stale(const rt_null_site* site, uint64_t now);
+// objects
+uint64_t rt_event_new(void);                   // a fresh object's handle
+uint64_t rt_event_new_elem(void);              // the same for a container element; never collects
+uint32_t rt_event_trig_id(void* obj);          // RT_TRIG_EVENT | the object's id, assigned on first use
 
-// ->> pending chain
-uint32_t rt_event_pending_head(void);
-void     rt_event_pending_link(uint64_t h);
-void     rt_event_pending_clear(void);
+// ->> #d timers
+void*    rt_event_timer_new(uint64_t handle);
+uint64_t rt_event_timer_take(void* timer);
 
 // ->> @(x) detached subscriptions (mirrors rt_intra_event_*)
-void     rt_event_detach_register(int32_t trig_id, uint64_t h, uint32_t count);
-void*    rt_event_detach_base(int32_t trig_id);
-uint32_t rt_event_detach_count(int32_t trig_id);
+void     rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count);
+uint32_t rt_event_detach_fire(uint32_t trig_id);
+uint64_t rt_event_detach_ready(uint32_t i);
 ```
+
+`rt_run_init` takes the address of the pending-chain head, a global of the
+design, so the collector can walk the chain.
 
 Deliberately **absent**: any `rt_event_trigger` / `rt_event_wait`. Triggering and
 waiting stay in generated code (Move C). The runtime owns storage and
@@ -606,29 +522,28 @@ effect and `.triggered` reads out-of-model state.
 
 ## 12. VCD
 
-Today the VCD layer aims a raw pointer at the trigger tick and diffs it:
+The VCD layer watches an event's trigger tick and diffs it:
 
 - `vcd_register` takes the event branch with `mm_bytes = 8`, `seen = true` and a
   `0xFF`-seeded shadow (`runtime/Vcd.cpp`);
-- `VcdVar::mm` points at `clotho.event_trig.<name>` and "the ordinary shadow diff
-  detects a trigger" (`runtime/Vcd.cpp, VcdVar`);
 - the change emits the bare pulse `1<id>` (`runtime/Vcd.cpp, vcd_emit`);
 - the declaration is `$var event 1` (`vcd_register`).
 
-This survives with one substitution: register `&g_events[slot].last_trig` instead
-of the named global. That is why `last_trig` is field 0 of `rt_event` — the
-object address *is* the tick address, so `rt_vcd_var`'s raw-pointer ABI
-(`Runtime.h:715`) is unchanged and `rt_vcd_touch`'s dense `u32` index
-(`:736`) is unchanged.
+The registration row carries the address of the event *variable*. At
+`$dumpvars` the runtime reads the handle, points the dump variable at that
+object's `last_trig`, stores the dump index in the object (so a trigger reached
+through any handle marks the variable dirty) and keeps the object for the run.
 
-Two constraints follow, both acceptable:
+Consequences:
 
-1. Only **static** events are dumpable, so only immortal slots are registered and
-   the pointer is stable for the run. Procedural locals are already skipped by
-   VCD (`lower/Lower.cpp, check_vcd_scope` skips `loc == SourceLoc{0}`), and a container element or
-   class property is not a `$var` in the first place.
-2. `$dumpvars` must still loud-fail on anything unrepresentable. An event handle
-   is now a real 64-bit value, so the `is_event` check must be kept *ahead* of the
+1. A dumped variable follows the object it named at `$dumpvars`, not later
+   assignments to the variable. Of two dumped variables naming one object, the
+   first registered pulses.
+2. Only declared events are dumpable. Procedural locals are already skipped by
+   VCD (`lower/Lower.cpp, check_vcd_scope` skips `loc == SourceLoc{0}`), and a
+   container element or class property is not a `$var` in the first place.
+3. `$dumpvars` must still loud-fail on anything unrepresentable. An event handle
+   is a real 64-bit value, so the `is_event` check must be kept *ahead* of the
    generic width-based path, or an event would start dumping as a 64-bit vector.
 
 ---
@@ -732,9 +647,12 @@ support.** Rejected: it pays the same waiter-list cost for a strict subset, and
 the "bounded" pool cannot express automatic-lifetime events created in a loop.
 The growable slot table is simpler *and* more general.
 
-**A bare `rt_event*` as the handle.** Rejected: gives up use-after-free detection
-and table locality for nothing. The generation half of the word is free — the
-handle is 64 bits either way.
+**`{ slot, gen }` into a runtime slot table as the handle.** What was first
+built, for stale-handle detection under a reference-counted release that never
+landed. Replaced by the object's address once events became collected objects:
+a collected object is not freed while a handle names it, so the generation had
+nothing to detect, and the table was a second lifetime discipline beside the
+collector's.
 
 **Keeping the Tier-1 bucket path for monomorphic events and adding a list path
 for handles.** Rejected: two event engines, which the old design doc correctly
@@ -742,13 +660,11 @@ identified as the trap. §5 gets the performance back through constant folding
 instead, and §6.2 gets bucket-like locality by placing static nodes
 contiguously.
 
-**Refcount-free owner-based lifetimes.** Tempting, because the intrusive
-frame-resident waiter list means an event object owns no external heap, so a
-leaked event is as invisible as a leaked class body. Rejected because
-`event a; begin automatic event b; a = b; end` then leaves `a` dangling with no
-defined behaviour, and containers of events cannot express shared ownership at
-all. Refcount is the only sound answer once merge exists — and §5 makes it free
-for every event that does not use merge.
+**Reference counting.** The first design's answer to
+`event a; begin automatic event b; a = b; end`, where an owner-based lifetime
+leaves `a` dangling. Never built; the collector answers the same case without
+retain and release traffic on every handle copy and without a container element
+kind that counts.
 
 **A toggling 1-bit wire per event** (the model clocking blocks use,
 `src/lower/`). Already rejected in `named-events.md:104-107` and still

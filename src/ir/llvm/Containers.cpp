@@ -217,7 +217,9 @@ std::vector<uint32_t> Backend::elem_handle_offsets(Ref elem_type, const DynElem&
 //   aggregate          -> every handle reachable without leaving the element
 //                         image, by byte offset within it
 //   nested container   -> nhandles 0; its handles are reached through `inner`
-//   string / event / other POD -> nhandles 0
+//   string / other POD -> nhandles 0
+//   event              -> nhandles 1, handles { 0 }, like a class handle; its kind
+//                         differs only because it is constructed per slot
 //
 // and, for an associative array, its key-handle offsets in `keyhandles`.
 llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
@@ -524,7 +526,7 @@ void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
     const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)];
     llvm::Value*   slot =
       b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
-    emit_event_wake_list(event_obj_of(b_.CreateLoad(b_.getInt64Ty(), slot)));
+    emit_event_wake_list(event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot)));
 }
 
 // Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on

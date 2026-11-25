@@ -29,7 +29,7 @@ std::vector<uint32_t> Backend::assoc_key_handle_offsets(Ref assoc_type) {
     }
     if (info.is_agg) {
         agg_key_handle_offsets(info.key_ty, 0, out);
-    } else if (std::get<Type>(mod_.pool.get(info.key_ty)).kind == Type::Kind::Class) {
+    } else if (types::is_object_handle(mod_.pool, info.key_ty)) {
         out.push_back(0);
     }
     assert(std::ranges::is_sorted(out) && "the key offsets are ascending");

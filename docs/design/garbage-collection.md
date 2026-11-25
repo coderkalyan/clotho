@@ -116,9 +116,8 @@ The leak is also second-order: because a class body is never freed, every
 its own heap too (`emit_class_body_init`, `ir/llvm/Aggregates.cpp`, has no
 matching `emit_agg_deinit` call anywhere).
 
-**In scope.** Class bodies; the heap they own through managed properties; the
-`rt_event` sync objects that named-event handles will need
-(`named-events.md:208-271`); `std::weak_reference` when it lands (`TODO.md`).
+**In scope.** Class bodies; the heap they own through managed properties; event
+objects (`event-handles.md` §9); `std::weak_reference` when it lands (`TODO.md`).
 `std::mailbox` and `std::semaphore` are ordinary traced class bodies
 (`mailbox-and-semaphore.md` §4.4).
 
@@ -532,7 +531,7 @@ collection fails to satisfy the request.
 | Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
 | NBA record queues (`rt_nba_arr_slot`: array element, virtual-interface member, aggregate leaf, whole container) | Registered by shape at start-up (`rt_gc_nba_words_add` / `rt_gc_nba_container_add`); the staged records are read at each collection | conservative words, or precise through the container's element descriptor |
 | `$strobe` / `$monitor` pended bodies | No image of their own: the body is a zero-formal coroutine whose frame is registered (above), and it evaluates its arguments in the Postponed region on the native stack. `$monitor` keeps only the last rendered text. | conservative frame / stack |
-| Detached `->> #d e` timer node (`src/ir/llvm/`), later `rt_event` waiter lists | Explicit root registration at creation | precise |
+| What the runtime holds of an event object: the NBA pending chain, a `->> #d e` timer, a `->> @(x) e` subscription, a dumped event | Enumerated at each collection (`rt_internal::event_gc_roots`, `src/runtime/Scheduler.cpp`) | precise |
 | Wheel timers, wait buckets, the active ring, fork/disable records | Nothing to do — they hold *frame* pointers, and frames are enumerated above | — |
 | VCD var tables, `rt_ref_names`, `chandle` | **Not roots.** VCD caches only pointers into `clotho.state`; `chandle` is foreign | — |
 
@@ -649,6 +648,13 @@ exists, and it is a young or full collection by the ordinary policy. Failing lou
 was rejected: the loop is legal SV. `rt_sim_run` records the address of one of its
 locals as the stack base (`rt_gc_run_enter`); with none recorded -- static
 initialization, a test calling the allocator -- allocation never collects.
+
+One allocation never collects by design: an event object constructed as a
+container ELEMENT (`rt_gc_alloc_held`, through `rt_event_new_elem`). Element
+construction runs inside container operations, and the elements an operation has
+built so far sit in a buffer its container does not name yet, where no collection
+would find them. The budget is still charged, so the next ordinary allocation or
+safepoint collects.
 
 **`--gc-heap-max` is enforced here.** When the heap would have to grow past the
 ceiling (in whole 4 MiB chunks, at least one), the allocation runs a full emergency
@@ -984,17 +990,17 @@ assertable.
 referenced only by its locals die at the next collection — which is also why
 `disable`'s raw-destroy paths must unlink (§5.1).
 
-**Named event handles.** `named-events.md:208-271` turns an event into a heap sync
-object reached through a handle; it becomes the second GC-managed family and
-should use this document's GC word and trace map. Two requirements follow:
+**Named event handles.** An event object is the second collected family: it has
+this document's GC word and a trace map of its own, which the runtime owns
+because only the runtime allocates one (`event-handles.md` §3.2, §9). An event
+handle is traced wherever a class handle is. Two things are particular to it:
 
-1. A process suspended on `@(ev)` must keep `ev` alive. Wait buckets store
-   coroutine handles, not event handles, so the event handle must be reachable
-   from the waiting frame — which it is if it is a frame local, and Option A must
-   not drop it as a dead SSA value at the subscribe site (the mistake
-   `fork-join.md:466-470` records for child process handles).
-2. A pending `->> #d e` timer node holds an event reference with no handle anywhere
-   (`src/ir/llvm/`) and must be an explicit root until it fires.
+1. A process suspended on `@(ev)` keeps `ev` alive through the waiter node in its
+   frame, which records the object it is linked onto and is found by the
+   conservative frame scan.
+2. The runtime's own records of an event (a pending `->> e`, a `->> #d e` timer, a
+   `->> @(x) e` subscription, a dumped event) hold a reference with no handle
+   anywhere, and are roots until they are consumed.
 
 **`std::weak_reference` (LRM 8.30)** becomes implementable: a weak table cleared
 after marking, before sweeping. `TODO.md` already notes it presupposes a
@@ -1269,9 +1275,9 @@ validate-on-trace as the canonical pair.
 - **Nothing is refused that was accepted before the collector existed.** Every guard this work
   introduced has since been lifted: class handles as container elements and aggregate
   leaves (P4, §3.3), and an associative-array key containing a class handle (§3.3a).
-- Event handles, event arrays, events as class properties — already guarded
-  (`src/lower/`); guard stays until P4, and `named-events.md` Option A should
-  adopt this document's header and trace map rather than inventing a second.
+- Event handles are traced like class handles (`types::is_object_handle`). One
+  refusal came with that: an event inside a variable-length associative key, for
+  the reason a class handle there is refused (§3.3a).
 - `std::weak_reference` — already loud (`lower/Classes.cpp, lower_class_type`).
 - Virtual interfaces (`src/lower/`) — unrelated to GC, but another
   handle-shaped family; whether it becomes GC-managed is that design's question.
