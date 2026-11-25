@@ -364,8 +364,6 @@ Milestones, in order; lower ones unblock higher ones:
   container element, is refused.
 - [ ] **Queue, dynamic-array or associative-array port** (23.3.3) — a container port connection
   is refused; it needs a handle-aware continuous copy.
-- [ ] **Member defaults of a struct used as an unpacked-array element** (7.2.2) — such an array
-  with no initializer of its own is refused.
 - [ ] **By-value read of a whole unpacked struct or array** (7.2, 7.4) — as an operand outside
   copy, equality, argument and `%p` positions; needs a by-value aggregate ABI.
 - [ ] **Whole aggregate element of an associative array in a by-value context** (7.8) — as a
@@ -507,8 +505,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Bare instance-method call with no receiver in scope** (8.7) — refused when neither
   an object under construction nor an enclosing method supplies `this`.
-- [ ] **Static class property of a struct type with member defaults** (8.9) — with no
-  initializer of its own it silently reads the power-on default, not the member defaults.
 - [ ] **Monomorphic inline cache for virtual calls (performance)** (8.20) — every virtual
   call dispatches through the method table; benchmark a per-call-site cache keyed on the class.
 

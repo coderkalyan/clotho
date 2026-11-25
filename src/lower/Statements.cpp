@@ -1042,7 +1042,7 @@ void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool forc
     if (aggregate_has_field_defaults(vs.getType())) {
         // The struct type declares field-level defaults (LRM 7.2 / 8.8), which
         // override the type defaults just written.
-        emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+        emit_field_defaults(value_lvalue(vs, b, l), vs.getType(), b, l);
     }
 }
 
@@ -1163,7 +1163,7 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
             }
             ir::Builder&        b = *preinit_;
             const ir::SourceLoc l = to_source_loc(vs.location);
-            emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+            emit_field_defaults(value_lvalue(vs, b, l), vs.getType(), b, l);
         }
         return;
     }

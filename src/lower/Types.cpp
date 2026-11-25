@@ -1727,6 +1727,19 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
             pb.binary(ir::Inst::Tag::Store, dst, val, il);
         }
         home_init.commit();
+    } else if (aggregate_has_field_defaults(prop.getType())) {
+        // No initializer of its own: the field-level defaults its struct type
+        // declares (LRM 7.2.1), once, as for a module-level variable.
+        HomePreInit home_init(*this, home);
+        if (!preinit_) {
+            preinit_.emplace(module_);
+        }
+        const ir::SourceLoc                    pl = to_source_loc(prop.location);
+        const Restore<FnCtx*>                  no_frame(fn_ctx_, nullptr);
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
+        emit_field_defaults(preinit_->signal(sig, pl), prop.getType(), *preinit_, pl);
+        home_init.commit();
     }
     return sig;
 }

@@ -890,7 +890,7 @@ void Lowerer::init_static_props_of(const std::vector<const ClassType*>& classes)
         for (const Symbol& m : cls->members()) {
             const auto* prop = m.as_if<ClassPropertySymbol>();
             if (prop == nullptr || prop->lifetime != slang::ast::VariableLifetime::Static ||
-                prop->getInitializer() == nullptr) {
+                (prop->getInitializer() == nullptr && !aggregate_has_field_defaults(prop->getType()))) {
                 continue;
             }
             cur_range_ = slang::SourceRange{ prop->location, prop->location };

@@ -1044,21 +1044,30 @@ TEST_CASE("static local struct field default applies once") {
     CHECK(out == "6 7\n");  // init once to 5, ++ each call -> 6, 7
 }
 
-// An array of a struct with field defaults, and no array initializer of its
-// own, is a documented follow-up (not yet element-wise defaulted) -- guarded
-// loudly rather than silently leaving every element's fields at their plain
-// power-on value.
-TEST_CASE("an array of a struct with field defaults fails loudly") {
-    const LowerResult r = lower_text(R"(
+// LRM 7.2.1: a struct type's member defaults apply to every variable of the type
+// declared with no initializer of its own, so to each element of an array of it,
+// and to a class property of it, static or not. No oracle: iverilog 13 does not
+// support unpacked structs; the expected values follow from 7.2.1 (the member
+// with no default keeps its type's default, 0 for an int).
+TEST_CASE("struct member defaults apply to array elements and class properties") {
+    CHECK(run_capture(R"(
         module m;
-            typedef struct { int x = 5; } s_t;
-            s_t arr [1:0];
-            initial $display("%0d", arr[0].x);
+            typedef struct { int a = 5; logic [3:0] b = 4'h9; int c; } s_t;
+            class C;
+                static s_t ss;
+                s_t s;
+                s_t arr [2];
+            endclass
+            s_t marr [1:0];
+            initial begin
+                static C o = new;
+                $display("marr %0d %0d %h", marr[0].a, marr[1].a, marr[1].b);
+                $display("static %0d %h %0d", C::ss.a, C::ss.b, C::ss.c);
+                $display("prop %0d %h %0d", o.s.a, o.s.b, o.s.c);
+                $display("arr %0d %h", o.arr[1].a, o.arr[0].b);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("array of a struct with field-level default initializers") !=
-          std::string::npos);
+    )") == "marr 5 5 9\nstatic 5 9 0\nprop 5 9 0\narr 5 9\n");
 }
 
 TEST_CASE("whole unpacked struct copy is field-wise") {

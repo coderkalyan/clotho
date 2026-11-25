@@ -1555,7 +1555,7 @@ private:
 
     static bool aggregate_has_field_defaults(const slang::ast::Type& t);
 
-    void emit_var_field_defaults(const VariableSymbol& vs, ir::Index lv, ir::Builder& b, ir::SourceLoc l);
+    void emit_field_defaults(ir::Index lv, const slang::ast::Type& sv_type, ir::Builder& b, ir::SourceLoc l);
 
     void emit_string_literal_array_store(ir::Index        lhs,
                                          ir::Ref          type,
