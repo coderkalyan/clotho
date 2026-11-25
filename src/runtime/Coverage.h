@@ -90,9 +90,12 @@ typedef struct rt_cover_type {
     const char*           banner;
     uint32_t              npoints;
     const rt_cover_point* points;
-    uint32_t              weight;
-    uint32_t              goal;
-    uint32_t              per_instance;
+    // option.weight: each instance's weight in the type's average (LRM 19.11.3).
+    uint32_t weight;
+    // type_option.weight: the type's weight in $get_coverage (LRM 19.7.1).
+    uint32_t type_weight;
+    uint32_t goal;
+    uint32_t per_instance;
 } rt_cover_type;
 
 // Emitted once per design as `clotho.cover.config` and handed to rt_cover_init.

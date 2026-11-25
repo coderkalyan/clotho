@@ -691,8 +691,8 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
     `max(at_least)` across instances.
   - [ ] **`option.get_inst_coverage`** — refused as a coverage option.
-  - [ ] **`type_option.weight` / `goal` / `comment`, `option.name` / `comment`** — not
-    implemented.
+  - [ ] **`option.name`, `option.comment` and `type_option.comment`** — refused; the model has
+    no field for them.
   - [ ] **`option.detect_overlap`** — no overlap warnings.
 - [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
   floats.

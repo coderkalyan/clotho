@@ -285,6 +285,48 @@ TEST_CASE("coverpoint weights scale the covergroup average (LRM 19.7, 19.11)") {
     CHECK(out.find("cov=75.000000") != std::string::npos);
 }
 
+// LRM 19.7.1, 19.11.3: type_option.weight is not option.weight.
+// - cgp: a coverpoint's type option weights it only in the merged type form, so
+//   the instance average is (50 + 100)/2 = 75, not (3*50 + 100)/4 = 62.5.
+// - g5: option.weight weights an instance inside its type's average, and the
+//   type's weight in $get_coverage is its type_option.weight (default 1).
+// - g1: option.weight 0 leaves its type nothing to average, so it stays out of
+//   $get_coverage and get_coverage() is 0.0 by 19.11 (b) at type weight 1.
+// $get_coverage is (75 + 50 + 100)/3 = 75; folding the two weights gave 62.5.
+// No oracle: iverilog has no functional coverage; values follow from the clauses.
+TEST_CASE("type_option.weight weights only type coverage (LRM 19.7.1, 19.11.3)") {
+    const std::string out = run_capture(R"(
+        module m;
+          bit a = 0, b = 0;
+          covergroup cgp;
+             cpA: coverpoint a { bins a0 = {0}; bins a1 = {1}; type_option.weight = 3; }
+             cpB: coverpoint b { bins b0 = {0}; }
+          endgroup
+          covergroup g1;
+             option.weight = 0;
+             coverpoint a { bins a0 = {0}; bins a1 = {1}; }
+          endgroup
+          covergroup g5;
+             option.weight = 3;
+             coverpoint a { bins a0 = {0}; bins a1 = {1}; }
+          endgroup
+          covergroup g3;
+             coverpoint b { bins b0 = {0}; }
+          endgroup
+          cgp p = new;
+          g1 c1 = new;
+          g5 c5 = new;
+          g3 c3 = new;
+          initial begin
+             p.sample(); c1.sample(); c5.sample(); c3.sample();
+             $display("inst=%0f g1=%0f all=%0f", p.get_inst_coverage(), c1.get_coverage(), $get_coverage());
+             $finish;
+          end
+        endmodule
+    )");
+    CHECK(out.find("inst=75.000000 g1=0.000000 all=75.000000") != std::string::npos);
+}
+
 // LRM 19.7 Table 19-1: at_least is the minimum hit count for a bin to count as
 // covered, and the covergroup level supplies the default for its coverpoints
 // (Table 19-2).

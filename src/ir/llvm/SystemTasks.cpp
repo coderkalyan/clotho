@@ -80,6 +80,7 @@ llvm::Constant* Backend::cover_config_global() {
                                                     b_.getInt32(static_cast<uint32_t>(ct.points.size())),
                                                     cover_array(cover_point_ty(), points, tn + ".points"),
                                                     b_.getInt32(ct.weight),
+                                                    b_.getInt32(ct.type_weight),
                                                     b_.getInt32(ct.goal),
                                                     b_.getInt32(ct.per_instance ? 1u : 0u) }));
     }

@@ -893,7 +893,9 @@ struct CoverType {
     // names an instance by ("top.u1.") is read when the covergroup is constructed
     // (CoverOp::New), so the instances of one module share the one type.
     std::vector<CoverPoint> points;
+    // option.weight, and type_option.weight (the weight in $get_coverage).
     uint32_t                weight       = 1;
+    uint32_t                type_weight  = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
 

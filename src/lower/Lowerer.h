@@ -5580,10 +5580,11 @@ private:
 
     // A covergroup's own instance / type options, as far as this phase resolves
     // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
-    // type set; the two share `weight` and `goal`, and a type option is not an
-    // independent knob here because merge_instances is refused (19.11.3).
+    // type set. `weight` is option.weight; `type_weight` is a covergroup's
+    // type_option.weight, which only weights the group in $get_coverage (19.11.3).
     struct CoverOpts {
         uint32_t weight       = 1;
+        uint32_t type_weight  = 1;
         uint32_t goal         = 100;
         uint32_t at_least     = 1;
         uint32_t auto_bin_max = 64; // LRM Table 19-1's default

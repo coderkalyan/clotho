@@ -348,6 +348,28 @@ void Lowerer::cover_apply_option(const slang::ast::CoverageOptionSetter& set, Co
         }
         return static_cast<uint32_t>(v);
     };
+    if (set.isTypeOption()) {
+        // LRM 19.7.1, 19.11.3. With merge_instances false (true is refused below),
+        // type coverage is the average of the instances weighted by each one's
+        // option.weight, so a type option never changes an instance's coverage
+        // or a type's. A covergroup's type_option.weight weights the group in the
+        // design-wide $get_coverage; a coverpoint's weights it only in the merged
+        // form. `goal` and `comment` are report metadata, and Clotho reports no
+        // goal or comment at either level, so they change nothing either.
+        if (name == "weight") {
+            opts.type_weight = as_u32("coverage option 'type_option.weight'");
+            return;
+        }
+        if (name == "goal") {
+            as_u32("coverage option 'type_option.goal'");
+            return;
+        }
+        // TODO: the remaining type options of LRM Table 19-3. `comment` is report
+        // metadata the model has no field for; `strobe`, `merge_instances`,
+        // `distribute_first` and `real_interval` each change a semantic this
+        // phase does not implement.
+        fail("coverage option 'type_option." + std::string(name) + "' is not supported");
+    }
     if (name == "weight") {
         opts.weight = as_u32("coverage option 'weight'");
         return;
@@ -414,6 +436,7 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
         cover_apply_option(set, gopts);
     }
     ct.weight       = gopts.weight;
+    ct.type_weight  = gopts.type_weight;
     ct.goal         = gopts.goal;
     ct.per_instance = gopts.per_instance;
 

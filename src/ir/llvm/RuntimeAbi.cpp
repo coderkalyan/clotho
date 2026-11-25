@@ -1612,6 +1612,7 @@ llvm::StructType* Backend::cover_type_ty() {
                                                     raw_ptr_ty(),
                                                     b_.getInt32Ty(),
                                                     b_.getInt32Ty(),
+                                                    b_.getInt32Ty(),
                                                     b_.getInt32Ty() },
                                                   "clotho.covertype");
     }

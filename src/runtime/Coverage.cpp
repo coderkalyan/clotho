@@ -577,7 +577,8 @@ TypeResult type_result(uint32_t type_idx) {
     const rt_cover_type& ty = g_config->types[type_idx];
 
     // LRM 19.11.3 with merge_instances false: the weighted average of the
-    // instances' coverage, each weighted by its covergroup weight. Every instance
+    // instances' coverage, each weighted by its option.weight (not by
+    // type_option.weight). Every instance
     // of one type carries the same resolved option.weight in this phase, so the
     // sum reduces to a plain average -- written in the weighted form anyway,
     // because that is the form the clause states and the form a per-instance
@@ -597,7 +598,10 @@ TypeResult type_result(uint32_t type_idx) {
 
     TypeResult out;
     out.contributes = !acc.empty();
-    out.coverage    = acc.value(ty.weight);
+    // NOTE: 19.11 (b)-(c) pick 0.0 or 100.0 by "the covergroup's weight" for
+    // get_coverage too; for the type that is read as its type_option.weight,
+    // the weight the type carries one level up.
+    out.coverage    = acc.value(ty.type_weight);
     out.bins        = out.contributes ? bins : Ratio{ 0, 0 };
     return out;
 }
@@ -1099,7 +1103,7 @@ extern "C" double rt_cover_design_coverage(void) {
         if (!r.contributes) {
             continue;
         }
-        acc.add(r.coverage, g_config->types[t].weight);
+        acc.add(r.coverage, g_config->types[t].type_weight);
     }
     // LRM 19.11's closing sentence: with no covergroup instances at all -- or with
     // every weight zero -- the overall coverage is 100%, not 0%. There is no
