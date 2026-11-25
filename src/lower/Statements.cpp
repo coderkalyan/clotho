@@ -1142,7 +1142,10 @@ void Lowerer::emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::So
 // 23.2.2.2) is initialized by that port declaration, and slang keeps the
 // initializer on the port rather than on the variable. slang binds it to the
 // port's own type, which for a select port (`module m(x[3:2])`, LRM 23.2.2.1) is
-// the select's, so that one is bound again to the variable from its declarator.
+// the select's, so that one is bound again to the variable's type, from the
+// syntax of the declarator that carries it: the variable's own, or the port
+// declaration's when the variable is declared apart (`output x = 1;` and
+// `reg [3:0] x;`). The initializer assigns the variable, so it is sized by it.
 const Expression* Lowerer::declaration_initializer(const VariableSymbol& vs) {
     if (const Expression* init = vs.getInitializer()) {
         return init;
@@ -1155,19 +1158,32 @@ const Expression* Lowerer::declaration_initializer(const VariableSymbol& vs) {
     if (p.getInternalExpr() == nullptr) {
         return p.getInitializer();
     }
-    const slang::syntax::SyntaxNode* syn = vs.getSyntax();
-    if (syn == nullptr || syn->kind != slang::syntax::SyntaxKind::Declarator ||
-        syn->as<slang::syntax::DeclaratorSyntax>().initializer == nullptr) {
-        // TODO: the initializer of a select port whose variable is declared apart from
-        // the port (`output x = 1;` and `reg [3:0] x;`): it is not on the variable's
-        // own declarator.
-        fail("an initializer on a select port of a variable declared apart from the port is not supported");
+    const slang::syntax::ExpressionSyntax* init_syntax = nullptr;
+    slang::SourceRange                     assign_range;
+    const slang::syntax::SyntaxNode*       syn = vs.getSyntax();
+    if (syn != nullptr && syn->kind == slang::syntax::SyntaxKind::Declarator &&
+        syn->as<slang::syntax::DeclaratorSyntax>().initializer != nullptr) {
+        const slang::syntax::EqualsValueClauseSyntax& eq = *syn->as<slang::syntax::DeclaratorSyntax>().initializer;
+        init_syntax                                      = eq.expr;
+        assign_range                                     = { eq.equals.location(), eq.equals.location() + 1 };
+    } else {
+        // slang's own expression carries the syntax it was bound from, under the
+        // implicit conversion to the select's type.
+        const Expression* e = p.getInitializer();
+        while (e != nullptr && e->syntax == nullptr && e->kind == ExpressionKind::Conversion &&
+               e->as<ConversionExpression>().isImplicit()) {
+            e = &e->as<ConversionExpression>().operand();
+        }
+        if (e == nullptr || e->syntax == nullptr) {
+            fail("internal: the initializer of a select port has no syntax to bind again");
+        }
+        init_syntax  = e->syntax;
+        assign_range = e->sourceRange;
     }
-    const slang::syntax::EqualsValueClauseSyntax& eq = *syn->as<slang::syntax::DeclaratorSyntax>().initializer;
     const slang::ast::ASTContext ctx(*p.getParentScope(),
                                      slang::ast::LookupLocation::after(vs),
                                      slang::ast::ASTFlags::NonProcedural | slang::ast::ASTFlags::StaticInitializer);
-    return &Expression::bindRValue(vs.getType(), *eq.expr, { eq.equals.location(), eq.equals.location() + 1 }, ctx);
+    return &Expression::bindRValue(vs.getType(), *init_syntax, assign_range, ctx);
 }
 
 // Apply a module-level (static) variable's declaration initializer (LRM 6.8)
