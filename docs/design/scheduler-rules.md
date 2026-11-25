@@ -71,10 +71,10 @@ the speedup cannot be turned off for a differential run.
 
 | ID | Mechanism | Where | Gate | As-if argument (and what it relies on) |
 |---|---|---|---|---|
-| S1 | **Static subscription.** When an `always` has a leading event control, the frontend hoists it. The seed subscribes the process once into per-(signal, edge) static buckets, and its body runs body-first in a forever loop. | `RootTables.cpp:emit_seed`; `Events.cpp:plan_static_subscribe`, `build_wait_queues`; `Subroutines.cpp:lower_group`; `lower/Statements.cpp:lower_procedural_block` | none | A bucket entry is the event control, evaluated once for the whole run. It must be inert whenever the process is not waiting at that control; S2 makes it inert. **Broken while the body parks at an intra-body event wait (B51).** |
-| S2 | **Wake word as one-wake token.** A waker pushes only if the word is 0, and sets it. The word stays set from the wake to the re-arm store before the next park. Parks that a second waker can reach hold it too: `#0`, join, inline fork or task, and `#delay` under S16. Ring and bucket capacities are sized from this one-entry-per-process bound. | `Events.cpp:emit_static_scan_rt`, `emit_dynamic_scan_rt`, `emit_event_wake_list`, `lower_wait`, `wait_counts`; `Subroutines.cpp:lower_group`; `Groups.cpp:emit_sched_entries`; `Processes.cpp:emit_node_force_wake` | none | A queued or running process is not at an event control, so a further event has nothing to wake (9.4.2). The bound holds only while every park is accounted for (B11). |
+| S1 | **Static subscription.** When an `always` has a leading event control, the frontend hoists it as the process's list. While no park of the body arms the wake word (`TagInfo::arms_wake`: an event control or `wait`, `expect`, a sync queue, `wait fork`, `await`), the seed subscribes the process once into per-(signal, edge) static buckets, and its body runs body-first in a forever loop. A body that has such a park waits for the list at the top of its loop instead, as a dynamic waiter, and the seed starts it to register at its first run (B51). | `RootTables.cpp:emit_seed`; `Events.cpp:plan_static_subscribe`, `build_wait_queues`, `lower_wait_edges`; `Groups.cpp:subscribed_statically`, `waits_at_head`; `Subroutines.cpp:lower_group`; `Analysis.cpp:tag_info`; `lower/Statements.cpp:lower_procedural_block` | none | A bucket entry is the event control, evaluated once for the whole run. It must be inert whenever the process is not waiting at that control, and S2 makes it inert only while the word is held set, from the wake to the re-arm store of the loop's own park. A park that arms the word makes the entry live there and it would resume the process at that park, so a body that has one is not subscribed. The cost is a registration per activation, on processes that are coroutines already. |
+| S2 | **Wake word as one-wake token.** A waker pushes only if the word is 0, and sets it. The word stays set from the wake to the re-arm store before the next park, the loop's own or an intra-body one's (`emit_arm_wake_word`). Parks that a second waker can reach hold it too: `#0`, join, inline fork or task, and `#delay` under S16. Ring and bucket capacities are sized from this one-entry-per-process bound. | `Events.cpp:emit_static_scan_rt`, `emit_dynamic_scan_rt`, `emit_event_wake_list`, `lower_wait`, `emit_arm_wake_word`, `wait_counts`; `Subroutines.cpp:lower_group`; `Groups.cpp:emit_sched_entries`; `Processes.cpp:emit_node_force_wake` | none | A queued or running process is not at an event control, so a further event has nothing to wake (9.4.2). The bound holds only while every park is accounted for (B11), and while no static entry is live at a park that arms the word (S1). |
 | S3 | **Topological subscription order and FIFO ring.** Bucket entries are in topological order of the blocking-write wake graph and are popped FIFO, so producers run before consumers. | `Analyses.cpp:compute_subscription_order`; `RootTables.cpp:emit_seed`; `Scheduler.cpp:emit_active_push`, `emit_active_run` | none | 4.7 leaves active order open, so the order affects performance only. |
-| S4 | **Table-driven seed and time-zero runs.** One row per schedule group, in creation order. `self_start` groups (continuous assigns, port copies, always_comb, event nets) are queued with their word preset to 1 plus every trigger bit. Buckets and persistent event nodes are filled before the drain. PreInit stores are silent. | `RootTables.cpp:emit_seed` (`clotho.seed.rows`, `.slots`, `.late`, `.events`) | none | Time-zero evaluation (10.3, 4.9.1, 9.2.2.2). The preset word stops a time-zero store from queuing a second entry (B3). Nothing scans before the drain, so fill order does not matter. |
+| S4 | **Table-driven seed and time-zero runs.** One row per schedule group, in creation order. `self_start` groups (continuous assigns, port copies, always_comb, event nets) are queued with their word preset to 1 plus every trigger bit. Buckets and persistent event nodes are filled before the drain. An always that waits at its head (S1) is queued ahead of every other group and registers at its first run, so it listens before any other body runs, as a static subscription does. PreInit stores are silent. | `RootTables.cpp:emit_seed` (`clotho.seed.rows`, `.slots`, `.late`, `.events`) | none | Time-zero evaluation (10.3, 4.9.1, 9.2.2.2). The preset word stops a time-zero store from queuing a second entry (B3). Nothing scans before the drain, so fill order does not matter. |
 | S5 | **Deferred always_comb start.** A schedule group with an always_comb or always_latch member is queued after every other body. A continuous assign fused with one starts with it. | `RootTables.cpp:emit_seed` (`starts_late`); `Module.h` `Process::starts_after_procedures` | none | 9.2.2.2. 4.9.1 and 4.7 leave a continuous assign's time-zero order open (LRM_NOTES 44). |
 | S6 | **Thunk.** A suspension-free `always` becomes a plain function, called through a tagged pointer. | `Groups.cpp:compute_fusion_groups` (`thunkable`); `Subroutines.cpp:lower_group`; `Scheduler.cpp:emit_active_run` | `thunk` | Same wake-word timeline and FIFO order as a coroutine (SimConfig.h). |
 | S7 | **V1 fusion.** Processes with identical canonical sensitivity run as one body. | `Groups.cpp:compute_fusion_groups`; `Analysis.cpp:is_simple_always` | `fuse` | Each member's wake set equals the group's; the member order is one 4.7 order; no member blocking-writes its own sensitivity. |
@@ -135,7 +135,7 @@ Wording is not yet checked against the LRM text.
 | R2 | A delay control resumes the process at t+d, never earlier. `#0` resumes in the Inactive region of the same slot, after Active empties and before NBA, and every such process becomes active together. A delay with an x or z bit is zero. | 4.4.2.3, 9.4.1; LRM_NOTES 39 | S13, S28 | `gate_test.cpp` "gates settle before a #0 resumption observes them"; `event_test.cpp` "->> #0 e triggers in the current slot's NBA region"; `llvm_backend_test.cpp` "a delay with an x or z bit is a zero delay" |
 | R3 | Events in one region run in any order, and processes woken by one event resume in any order. Statements of one begin-end still run in order. | 4.7 | S3, S6, S7, S8, S9, S10, S14, S15, S27, S28 | `comb_fusion_test.cpp` "comb fusion: diamond reconvergence settles to final values"; `region_test.cpp` "regions: unequal-depth reconvergence settles to final values" |
 | R4 | Preponed samples before any process of the slot, and Observed runs after Active and NBA settle. `$strobe`, `$monitor`, VCD and final deferred reports read settled values in Postponed. | 4.4.2.1, 4.4.2.5, 16.4, 21.2.2 | S12, S13 | `case_test.cpp` "priority case: Observed-region report is stamped with the settled instant"; `severity_test.cpp` "deferred final assertion: report matures in the Postponed region"; `strobe_test.cpp` "$monitor prints once per change" |
-| R5 | A process waits only from the moment it reaches an event control. It resumes once however many listed events occur, and only on a listed event. **Not yet:** an `always` with a leading event control that parks at an intra-body wait is also resumed by its own list (B51). | 9.4.2 | S1, S2, S4, S6, S7, S8, S9, S10, S11, S15, S16 | `llvm_backend_test.cpp` "bare initial @(event) fires once when the edge arrives"; `region_test.cpp` "regions: the wake word keeps its queued/not-queued discipline"; `comb_fusion_test.cpp` "comb fusion: narrow explicit sensitivity keeps stale reads" |
+| R5 | A process waits only from the moment it reaches an event control. It resumes once however many listed events occur, and only on a listed event. | 9.4.2 | S1, S2, S4, S6, S7, S8, S9, S10, S11, S15, S16 | `llvm_backend_test.cpp` "bare initial @(event) fires once when the edge arrives"; `region_test.cpp` "regions: the wake word keeps its queued/not-queued discipline"; `comb_fusion_test.cpp` "comb fusion: narrow explicit sensitivity keeps stale reads"; `event_test.cpp` "an always parked at an intra-body @ is not woken by its own leading control" and the cases after it |
 | R6 | Every change of a variable or net, by any write path, wakes its waiters. A write that changes nothing wakes nobody. **Not yet:** `$readmem`, and a `ref` write after a suspend (§5.2). | 9.4.2 | S6, S9, S10, S11, S18, S19, S21, S22, S23 | `llvm_backend_test.cpp` "$sscanf / $sformat / $fgets / scalar $fread wake waiting processes", "a fused group lowered after a declaration initializer still wakes its readers"; `comb_fusion_test.cpp` "comb fusion: external observer wakes once per real change" |
 | R7 | Only bit 0 makes an edge. 0→x, 0→z, 0→1, x→1 and z→1 are posedges, the mirrors are negedges, and `edge` is either. x↔z changes the value but is no edge. | 9.4.2, Table 9-2 | S18, S20, S21 | `llvm_backend_test.cpp` "posedge/negedge classify x/z transitions per LRM Table 9-2", "the edge keyword fires on posedge or negedge, not x<->z", "NBA commits classify x/z edges and z-only changes the same way" |
 | R8 | Each update in a slot is its own event, on its own transition, whether it comes from a blocking store or an NBA. A change that reverts within the slot is still a posedge and a negedge, and `repeat(n) @` counts each occurrence. **Not yet** for NBAs (fix on `nba-glitch`, §4). | 4.6 b), 9.4.2, 9.4.5 | S8, S9, S22, S23, S24 | `region_test.cpp` "regions: a signal stored twice in one instant keeps its trigger" (blocking only) |
@@ -238,7 +238,7 @@ their earliest commit, then the unmerged ones, then the open one.
 | B48 | 8a89563d (`nba-glitch`) | R8, R12 | S22 | not recorded | iverilog also merges updates of some target shapes (msg); earlier tests checked final values. [INFERENCE] |
 | B49 | b0b268aa (`nba-glitch`) | R8, R12 | S23, S24 | not recorded | Plain and timed NBAs to one waited-on scalar were never mixed with an observer. [INFERENCE] |
 | B50 | c76469be (`nba-glitch`) | R9 | S21 | not recorded | iverilog evaluates once per pass (msg), so it was no oracle for a select that changes and changes back. |
-| B51 | — | R5 | S1, S2 | this review: code reading, then a probe | The one test with an always that parks mid-body (`gc_test.cpp`) waits on its own sensitivity's signal and edge, which hides it. |
+| B51 | 2bff14f1 | R5 | S1, S2 | the scheduler-rules postmortem (this document): code reading, then a probe | The one test with an always that parks mid-body (`gc_test.cpp`) waits on its own sensitivity's signal and edge, which hides it. |
 
 **B51.** The prebuilt main binary (`build/clotho`, built 2026-11-24 18:14)
 printed `3 woke n=1` for the design below; iverilog 13 printed `4 woke n=1`, which
@@ -252,13 +252,23 @@ module t;
 endmodule
 ```
 
-Clotho printed one line, at t=3, and none at t=4. Mechanism, read from the code
-and not traced [INFERENCE]: `lower_wait` arms the always-loop's wake word to 0
-before the intra-body wait while the process's static entries (S1) stay live, so
-the second posedge of `clk` resumes the process at that wait. The stale
-single-signal entry in the `done` bucket (no disable or process control, so
-`lower_wait` does not compact it) then resumes the next activation at its loop
-top, which runs the body from the start and parks again.
+Clotho printed one line, at t=3, and none at t=4. Traced: the process was in `clk`'s
+static `pos` bucket (S1) and, parked at `@(posedge done)`, in `done`'s dynamic `pos`
+bucket, both entries naming one wake word. `lower_wait` arms the word to 0 for the
+dynamic entry, so the second posedge of `clk` found it armed through the static entry
+and resumed the process at that wait. The entry the wait left in the `done` bucket (a
+single-signal wait is not compacted without `disable` or process control) then resumed
+the next activation at its loop top at t=4, which ran the body again from its first
+statement: with a `$display` as the first statement the output was `1 enter`, `3 woke
+n=1`, `4 enter`. Where `done` never fires, the stale entry made the next activation
+register twice in a bucket sized for one, and the store past its end ended a 40-cycle
+run in "simulation did not converge". An `expect` in that place was resumed at its
+park too. `wait fork`, `await` and the mailbox and semaphore queues test their
+condition again after a wake, which is why they printed the right text.
+
+Fixed in 2bff14f1: a body with a park that arms the wake word (`TagInfo::arms_wake`)
+is not subscribed. It waits for its list at the top of its loop, as `forever begin
+@(list) body end` says (S1).
 
 Patterns:
 
@@ -306,7 +316,7 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 | change wakes × store-site service and skipping | R6, R10 × S18, S19 | B7, B8, B12, B16 | none | `llvm_backend_test.cpp`; open gaps in §5.2 |
 | thunk and shared code × wakes and `expect` | R5, R6 × S6, S10, S11 | B25, B43 | `thunk`, `dedup` | `llvm_backend_test.cpp`, `sva_test.cpp` |
 | member guards × change wakes | R6 × S9 | B15 | `regions` | `region_test.cpp` |
-| event control × static subscription and the token | R5 × S1, S2 | B3, B51 | none | **none** |
+| event control × static subscription and the token | R5 × S1, S2 | B3, B51 | none | `event_test.cpp` |
 | timed records and event objects | R11, R21 × S24, S27 | B23, B30, B42 | none | `intra_assign_test.cpp`, `event_test.cpp` |
 | edges × store service and z elision | R7 × S18, S20 | B5, B33 | S20: `z_elision` | `llvm_backend_test.cpp` |
 | program ring × seed order | R25 × S3, S4 | B39 | none | `program_test.cpp` |
@@ -318,7 +328,6 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 
 | Cell | What nothing checks |
 |---|---|
-| R5 × S1, S2 | An always with a hoisted list that parks at an intra-body `@` on another signal (B51). |
 | R8 × S22, R9 × S21 | Two NBAs to an observed scalar in one slot, and a select that changes and changes back. The fixes and tests are on `nba-glitch`. |
 | R6 × S18 | `$readmem` services no waiters (a `TODO:` in `SystemTasks.cpp`, missing from `docs/TODO.md`). A `ref` write after a suspend wakes its waiters at the task's return (`docs/TODO.md`). |
 | R6 × S19 | Waiter kinds crossed with write paths. Waiter kinds: static, dynamic, vif, `<= @` trigger, class-property notifier, event net. Write paths: blocking, block commit, record queues, intra commit, file I/O, DPI output, `ref`, vif, force/release, resolver. [INFERENCE: no such matrix found in `tests/`] |
@@ -326,6 +335,7 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 | R2 × S13 | `#0` resuming in Inactive, before NBA, all together: pinned only through `->> #0` and gate tests [INFERENCE: grep of `tests/`]. |
 | R17 × S5, S10 | The late start of an always_comb group whose schedule group has rows from several instances [INFERENCE]. |
 | R24 × S17 | NBAs staged in the slot of a `$finish` stay uncommitted [INFERENCE: no test found]. |
+| R23 × S1 | `p.kill()` of an always parked at its static leading control resumes its body once and does not stop it: the loop's park has no abort poll (probed on 32ee5c3e). An always that waits at its head polls. |
 | R1 × S12 | Observed reached again from the reactive set, for an assertion clocked by a program signal: refused (`docs/TODO.md`). |
 | R26 × S12 | A unique/priority report flushed when its statement re-executes in the same slot: open gap (`docs/TODO.md`). |
 | Gates | `comb_fuse` and `o3` are never set in a test (`fuse = false` also turns comb fusion off); `dedup`, `split` and `z_elision` in one case each. |

@@ -531,6 +531,26 @@ bool Backend::tag_suspends(Inst::Tag t) {
     }
 }
 
+// The polls after a park, which lower_region emits after every op for which tag_suspends
+// holds, and an always that waits at its head (waits_at_head) after its list.
+//
+// A remote `disable` may have landed on an enclosing block while we were suspended (LRM
+// 9.6.2). Emitted only inside a remotely-named block, and only after an op that can park, so
+// nothing else in the design pays for it.
+//
+// A `kill` may have landed on this thread (LRM 9.7). Same placement and the same reason as
+// the `disable` polls -- after the parking op's own resume bookkeeping, so a `wait` has
+// compacted itself out of its buckets before we leave.
+void Backend::emit_resume_polls() {
+    if (design_uses_disable_) {
+        emit_disable_poll();
+        emit_task_abort_poll();
+    }
+    if (design_uses_process_) {
+        emit_proc_abort_poll();
+    }
+}
+
 // Whether an abort has landed on this activation while it was parked: a
 // `kill` / `disable fork` on its thread, or a remote `disable` of a block or
 // task activation it is inside. Null when the design uses neither feature, so
@@ -1244,7 +1264,7 @@ void Backend::lower_wait_fork() {
     b_.CreateBr(armed);
     b_.SetInsertPoint(armed);
     b_.CreateStore(node, headp);
-    b_.CreateStore(b_.getInt64(0), sched_ptr_);
+    emit_arm_wake_word();
     emit_suspend("waitfork.resume");
     emit_proc_unlink_node(node);
     // Killed while parked (LRM 9.7): leave the barrier now. Re-testing instead
@@ -1389,7 +1409,7 @@ void Backend::lower_proc_wait(Index i) {
     // Armed for the reason `wait` and `expect` arm: parked here this thread sits
     // in no other queue, so the flag has to read "not scheduled" or the wake is
     // dropped as a duplicate.
-    b_.CreateStore(b_.getInt64(0), sched_ptr_);
+    emit_arm_wake_word();
     emit_suspend("await.resume");
     // Unlink on resume, whoever woke us: the waker only walks and pushes, it does
     // not unlink, which is what keeps a multi-waiter list correct without a
@@ -1664,7 +1684,7 @@ void Backend::lower_sync_wait(Index i) {
     // Armed for the reason every intra-body park arms: parked here this thread
     // sits in no other queue, so the flag must read "not scheduled" or the wake
     // is dropped as a duplicate.
-    b_.CreateStore(b_.getInt64(0), sched_ptr_);
+    emit_arm_wake_word();
     emit_suspend("coro.sync_resume");
     if (llvm::Value* aborting = emit_abort_pending(); aborting != nullptr) {
         auto* fn    = b_.GetInsertBlock()->getParent();

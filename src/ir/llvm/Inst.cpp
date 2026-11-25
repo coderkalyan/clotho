@@ -31,20 +31,9 @@ void Backend::lower_region(std::span<const Index> region) {
         if (b_.GetInsertBlock()->getTerminator() != nullptr) {
             break;
         }
-        // Back from a park: a remote `disable` may have landed on an enclosing
-        // block while we were suspended (LRM 9.6.2). Emitted only inside a
-        // remotely-named block, and only after an op that can park, so nothing
-        // else in the design pays for it.
-        if (design_uses_disable_ && tag_suspends(t)) {
-            emit_disable_poll();
-            emit_task_abort_poll();
-        }
-        // Back from a park: a `kill` may have landed on this thread (LRM 9.7).
-        // Same placement and the same reason as the `disable` polls -- after the
-        // parking op's own resume bookkeeping, so a `wait` has compacted itself
-        // out of its buckets before we leave.
-        if (design_uses_process_ && tag_suspends(t)) {
-            emit_proc_abort_poll();
+        // Back from a park (emit_resume_polls).
+        if (tag_suspends(t)) {
+            emit_resume_polls();
         }
     }
     ++cur_seg_epoch_;

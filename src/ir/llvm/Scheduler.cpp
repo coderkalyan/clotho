@@ -987,7 +987,7 @@ void Backend::emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, 
 }
 
 llvm::Value* Backend::ring_mask(llvm::IRBuilder<>& b) {
-    if (env_ == root_env_.get()) {
+    if (env_->is_root) {
         return b.getInt32(active_mask_);
     }
     return b.CreateLoad(b.getInt32Ty(), sym(ring_mask_gv_));

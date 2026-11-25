@@ -363,7 +363,8 @@ void Backend::emit_run_once(Activation which, llvm::Value* wheel, const std::vec
 }
 
 // The seed. Every group the drain runs (not the ones that run once, above) has a row
-// of `clotho.seed.rows`, in the order the groups were created in:
+// of `clotho.seed.rows`, in the order the groups were created in, except that the
+// groups of the always processes that wait at their head (waits_at_head) come first:
 //
 //   { ramp, first argument, wake word, kind, subscriptions }
 //
@@ -412,7 +413,21 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
                                [&](uint32_t m) { return all[m].starts_after_procedures; });
         });
     };
-    for (uint32_t g = 0; g < procs.size(); ++g) {
+    // The groups in the order their rows are made, which is the order they are queued for
+    // the first drain. An always that waits at its head goes first: its first run only
+    // registers it, and it has to be listening before any other body runs, as a static
+    // subscription (made before the drain, S4) is. The others keep the order they were
+    // created in.
+    std::vector<uint32_t> order;
+    order.reserve(procs.size());
+    for (const bool head : { true, false }) {
+        for (uint32_t g = 0; g < procs.size(); ++g) {
+            if (waits_at_head(sched_[g].front) == head) {
+                order.push_back(g);
+            }
+        }
+    }
+    for (const uint32_t g : order) {
         const uint32_t k = sched_[g].front;
         const Process& p = all[k];
         switch (p.activation) {
@@ -432,7 +447,7 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             row.arg  = ramp_arg(g);
         }
         uint32_t ring = RingNone;
-        if (p.activation == Activation::Always && !p.wait_events.empty()) {
+        if (subscribed_statically(k)) {
             // Subscribed below. A continuously-active process (continuous assign / port
             // copy / always_comb) also runs once now, so it settles from the pre-init
             // values rather than waiting for an input edge that a declaration
@@ -480,6 +495,9 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             row.kind |= kSeedLate;
             ring = p.reactive_home ? RingCont : RingActive;
         } else {
+            // A process that starts running now: an initial, an always that loops in its
+            // body, or one that waits for its list at its head (waits_at_head), which runs
+            // only as far as that wait.
             ring = RingActive;
         }
         row.kind |= ring << kSeedRingShift;
@@ -515,7 +533,7 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
     for (const uint32_t k : sub_order_) {
         const uint32_t g = sched_of_[group_of_[k]];
         const uint32_t f = sched_[g].front;
-        if (subscribed[g] || all[f].activation != Activation::Always || all[f].wait_events.empty()) {
+        if (subscribed[g] || !subscribed_statically(f)) {
             continue;
         }
         subscribed[g] = true;
@@ -532,7 +550,7 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         }
     }
     std::vector<llvm::Constant*> slots;
-    for (uint32_t g = 0; g < procs.size(); ++g) {
+    for (const uint32_t g : order) {
         if (row_of[g] == ~0u) {
             continue;
         }

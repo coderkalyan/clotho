@@ -502,8 +502,10 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
           b_.CreateICmpNE(b_.CreateAnd(ctl, b_.getInt32(kProcAbort)), b_.getInt32(0)), program_end_bb_, live);
         b_.SetInsertPoint(live);
     }
-    const bool always_loop = proc.activation == Activation::Always && !proc.wait_events.empty();
-    if (always_loop) {
+    static_sub_body_ = false; // set only while a statically subscribed body lowers, below
+    if (subscribed_statically(proc_index)) {
+        assert(std::ranges::all_of(members, [&](uint32_t m) { return subscribed_statically(m); }) &&
+               "the members of a fused group are all simple_always, so none arms its wake word");
         // An always block with a sensitivity list. It is subscribed to its
         // signals' static queues from the seed loop (emit_active_run) and left
         // parked at the initial suspend; the first wake resumes here. So the
@@ -517,6 +519,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.SetInsertPoint(loop_bb);
         emit_defer_gen_bump(); // activation start = deferred-assertion flush point
         const bool guarded = open_group(g_);
+        static_sub_body_ = true;
         for (size_t i = 0; i < members.size(); ++i) {
             select_member(members[i]);
             str_vals_     = member_strs[i];
@@ -526,11 +529,47 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
+        static_sub_body_ = false;
+        // The park of the static subscription itself: the one park that arms the word and
+        // is not a body's (emit_arm_wake_word).
         b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
         emit_wait_suspend();                        // park until next trigger
         b_.CreateBr(loop_bb);
         // The forever back-edge means the shared final-suspend tail below is
         // unreachable; build it in a dead block so the IR stays well-formed.
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "always.exit", fn_));
+    } else if (waits_at_head(proc_index)) {
+        // An always whose body parks at an intra-body control that arms its wake word. Its
+        // leading list cannot be a static subscription: the entry would find the word armed
+        // at that park and wake the process there, for an event the park does not name
+        // (S1, B51). So the list is the first wait of the loop, as LRM 9.2.2 and 9.4.2 write
+        // it, `forever begin @(list) body end`: the seed runs the process as far as that
+        // wait, and from then on it is an ordinary waiter that holds a bucket slot only
+        // while it is parked there (wait_counts).
+        //
+        // Never fused: a fused member is simple_always, and none of these is. Nor
+        // continuously active or reactive-home, which have no intra-body park.
+        if (members.size() != 1 || proc.self_start || proc.starts_after_procedures || proc.reactive_home) {
+            throw BackendError{ "internal: a fused, continuously active or reactive-home process parks at an "
+                                "intra-body control" };
+        }
+        std::vector<WaitEdge> head;
+        head.reserve(proc.wait_events.size());
+        for (const WaitEvent& w : proc.wait_events) {
+            head.push_back(WaitEdge{ .signal = w.signal, .edge = static_cast<uint32_t>(w.edge) });
+        }
+        select_member(proc_index);
+        str_vals_     = member_strs.front();
+        dynarr_ret_   = member_dynarr.front();
+        agg_elem_ret_ = member_agg_elem.front();
+        auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.head", fn_);
+        b_.CreateBr(loop_bb);
+        b_.SetInsertPoint(loop_bb);
+        lower_wait_edges(head);
+        emit_resume_polls();
+        emit_defer_gen_bump(); // activation start = deferred-assertion flush point
+        lower_region(ir_->root());
+        b_.CreateBr(loop_bb);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "always.exit", fn_));
     } else {
         // Never fused: a non-always (or sensitivity-less) group is a singleton.

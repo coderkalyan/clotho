@@ -269,6 +269,13 @@ struct Process {
     // Sensitivity list: the signal events that wake the process. Empty for an
     // `initial` block, and (for now) for processes whose sensitivity is implicit
     // or not yet inferred (continuous assigns, @*).
+    //
+    // For an Always it is the leading control of the forever loop the process is (LRM
+    // 9.2.2, 9.4.2): `always @(list) body` is `forever begin @(list) body end`. The
+    // backend has the seed subscribe it once while the body holds no park that arms the
+    // process's wake word, and otherwise waits for it at the top of the loop
+    // (TagInfo::arms_wake; S1 of docs/design/scheduler-rules.md). The two are the same
+    // process to everything above the backend.
     std::vector<WaitEvent> wait_events;
     // True for a continuously-active process (continuous assign, module-port copy,
     // always_comb / always_latch): it must evaluate once at time zero so it settles

@@ -65,6 +65,22 @@ struct TagInfo {
     // violations are enumerable. Do not merge them.
     bool blocks_thunk = false;
 
+    // The park stores 0 into the process's wake word before it suspends, so that the word
+    // reads "not queued" and a waker of the park's own queue pushes the process
+    // (Backend::emit_arm_wake_word). Implies `blocks_thunk`.
+    //
+    // A process whose body holds one cannot be subscribed statically
+    // (docs/design/scheduler-rules.md S1, B51): its static entry tests the same word, finds
+    // it armed at this park and resumes the process there, for an event the park does not
+    // name. Such a process waits for its leading list at its head instead, like any
+    // `forever begin @(list) ... end` (Backend::waits_at_head). A park that leaves the word
+    // set -- a `#delay`, a join, a task call -- does not arm it.
+    //
+    // Defaults to false, like `blocks_thunk`. What fails closed is the assert in
+    // Backend::emit_arm_wake_word, which fires when a statically subscribed body reaches an
+    // arming park that this table does not name.
+    bool arms_wake = false;
+
     // Maps to hardware. This is the process-legalization WHITELIST and it defaults
     // to false, so an unclassified opcode makes its process unsynthesizable rather
     // than silently legalizing into the wrong thing -- the same fail-safe polarity
@@ -192,6 +208,10 @@ struct ProcessFacts {
     // list, no suspension point, no task call, no deferred store, no $strobe, and
     // no blocking write to a signal in its own sensitivity list.
     bool simple_always = false;
+    // Holds an op with TagInfo::arms_wake: the process parks at a control where its own wake
+    // word is armed. An `always` with a leading list and this shape is not subscribed
+    // statically (S1); it waits at its head (Backend::waits_at_head).
+    bool arms_wake = false;
     // Carries a deferred immediate assertion (`Severity` with defer set). Needed
     // per process, not just design-wide: the backend also asks this per fusion
     // group while lowering.
