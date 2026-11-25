@@ -80,6 +80,16 @@ void Lowerer::guard_container_element(const slang::ast::Type& et, ir::Ref er, st
     if (et.isClass() || et.isCHandle()) {
         return;
     }
+    // A virtual interface handle (LRM 25.9) is the same plain 64-bit word: the
+    // address of one elaborated instance's context record, which lives for the
+    // whole run, so an element needs no lifecycle beyond the POD copy, `null` is
+    // the all-zero power-on default Table 7-1 asks for, and `==` is the word
+    // compare. lower_type gives it Kind::VirtualIface, whose layout is the
+    // handle shape, and types::is_object_handle lists only Class and Event, so
+    // the collector never traces one -- it did not allocate the record.
+    if (et.isVirtualInterface()) {
+        return;
+    }
     // An unpacked struct / union or fixed unpacked array element: the slot holds
     // the recursive storage image and `q[i]` is a heap-anchored aggregate lvalue
     // (dyn_agg_elem_lvalue), so member / element selects and whole-element copies
