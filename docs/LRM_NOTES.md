@@ -760,3 +760,16 @@ tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
 delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
+
+## 57. A runtime width on an indexed queue slice (7.4.5, 7.10.1)
+
+Deliberate deviation. 7.4.5 says "The size of the part-select or slice shall be constant, but the
+position can be variable", and 7.4.6 writes the slice `A[i+:c]` with a constant `c`. 7.10.1 exempts a
+queue's `Q[a:b]` only: "the slice bounds may be arbitrary integral expressions and, in particular,
+are not required to be constant expressions". It does not mention `Q[i +: n]`. Clotho also accepts a
+runtime width `n` there (slang accepts it too). The slice is well defined for any `n`: it is the
+`Q[a:b]` slice with `a = i`, `b = i + n - 1` for `+:` and `a = i - n + 1`, `b = i` for `-:`, so it clamps
+against the queue's length and yields the empty queue for a width below 1 exactly as `Q[a:b]` does.
+Rejecting it would break designs that run correctly.
+
+Code: `src/lower/Containers.cpp` (`append_queue_pieces`, the indexed range-select case). Tests: `tests/queue_test.cpp` ("queue indexed part-select slice", whose `q[2 +: n]` case has a runtime width). Oracle: none; iverilog 13 crashes compiling any indexed part-select of a queue.
