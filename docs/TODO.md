@@ -242,9 +242,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Process fusion across instances (performance)** — groups fuse only within one
   instance, and comb-fused groups never share a subscription across instances, so a comb
   chain through many instances runs one wake per instance (docs/design/comb-fusion.md).
-- [ ] **`memset`, `memcpy` and `memmove` are byte loops (performance)** — the simulator links
-  libsva's bundled compiler-rt, whose definitions take the C library's place in the whole
-  binary and in generated code; the default tier calls `memset` at every `new`.
+- [ ] **compiler-rt's `memset` may replace the C library's on macOS and Windows
+  (performance)** — libsva bundles Zig's compiler-rt and keeps its C library names to itself
+  only in an ELF archive; what a Mach-O or COFF link does with them is not measured.
 
 ### File and string I/O
 
@@ -531,9 +531,6 @@ Milestones, in order; lower ones unblock higher ones:
     identity number.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
-  - [ ] **A mapping made and unmade per large object (performance)** — about 50 microseconds
-    for each object over 32 KiB; allocating them at a high rate is 3x slower than it was
-    from malloc'd cells (docs/design/garbage-collection.md §4.4).
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
   fails to lower aborts the whole compilation instead of stubbing that one method.
 - [~] **Class scope and nesting** — open pieces of class scope resolution.
