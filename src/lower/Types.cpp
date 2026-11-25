@@ -865,12 +865,27 @@ void Lowerer::emit_const_seed(ir::Index                   lhs,
             fail("constant table value does not match its associative array type");
         }
         const auto& at = ct.as<slang::ast::AssociativeArrayType>();
-        if (at.hasWildcardIndexType()) {
-            // TODO: `int a[*]` as a constant — a wildcard key has no declared
-            // type to intern the key constant against, and the runtime keys on
-            // the byte span, so a mismatched width would never be found.
-            fail("a constant associative array with a wildcard index is not supported");
-        }
+        // LRM 7.8.1: a wildcard index has no declared key type; an entry is
+        // named by the numeric value of its integral key alone. Intern each
+        // key at its own width and signedness: the backend normalizes it to
+        // the same 64-bit value-canonical form a runtime key gets
+        // (lower_assoc_key), so `4'd3` and `32'd3` name one entry.
+        const bool wildcard = at.hasWildcardIndexType();
+        auto       key_ref  = [&](const slang::ConstantValue& key) -> ir::Ref {
+            if (!wildcard) {
+                return lower_constant(key, *at.indexType);
+            }
+            if (!key.isInteger()) {
+                fail("constant table value does not match its associative array type");
+            }
+            const slang::SVInt& v = key.integer();
+            if (v.getBitWidth() > 64) {
+                // TODO: a wildcard index wider than 64 bits; same limit and
+                // reason as a runtime key (lower_assoc_key).
+                fail("a wildcard [*] index of more than 64 bits is not supported");
+            }
+            return svint_to_ref(v, make_int_type(v.getBitWidth(), v.isSigned()));
+        };
         if (!is_scalar_element(t.element)) {
             fail("a constant associative array of aggregate or container elements is not supported");
         }
@@ -894,7 +909,7 @@ void Lowerer::emit_const_seed(ir::Index                   lhs,
             // construction this function already gives queue / dynarray /
             // assoc VALUES, applied to the key instead, if that restriction
             // is ever lifted.
-            const ir::Index k        = b.constant(lower_constant(key, *at.indexType), l);
+            const ir::Index k        = b.constant(key_ref(key), l);
             const ir::Index slot     = b.assoc_select(lhs, k, ty, l);
             const ir::Index elem_val = b.constant(lower_constant(val, at.elementType), l);
             b.binary(ir::Inst::Tag::Store, slot, elem_val, l);
