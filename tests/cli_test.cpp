@@ -1628,7 +1628,7 @@ TEST_CASE("cli: instances of one module share a unit when each builds a covergro
         const fs::path design = s.write("design.sv", std::format(R"(
             module leaf;
               bit [1:0] v = 0;
-              covergroup cg; coverpoint v; endgroup
+              covergroup cg; option.per_instance = 1; coverpoint v; endgroup
               {}
             endmodule
             module top;
@@ -1668,7 +1668,7 @@ TEST_CASE("cli: per-instance initializers keep %m, assertion banners and covergr
     const fs::path design = s.write("design.sv", R"(
         module leaf(input bit clk);
           bit [1:0] v = 0;
-          covergroup cg @(posedge clk); coverpoint v; endgroup
+          covergroup cg @(posedge clk); option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           always @(negedge clk) v <= v + 1;
           a: assert property (@(posedge clk) v != 2'd3) else $error("v hit 3");
@@ -1734,7 +1734,7 @@ TEST_CASE("cli: instances of one module share a unit when each builds a package'
     const fs::path design = s.write("design.sv", R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
         endpackage
         module leaf(input bit [1:0] hit);
           import p::*;

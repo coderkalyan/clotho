@@ -623,7 +623,11 @@ database tasks.** Specifically:
   report reflects the last committed state.
 - Ordered by (type index, instance creation order), never by hash or pointer
   order, so two runs of one design diff cleanly.
-- Content per instance: the instance name (`<scope><type>`, the scope being the
+- Per-instance lines appear only for a covergroup whose `option.per_instance` is 1
+  (LRM 19.7: instance data is saved only then [unverified wording]). With the default 0
+  the report lists the type line alone (coverage, bins, instance count), and no bin hit
+  counts; `get_inst_coverage()` still answers, because the counters are kept either way.
+- Content per instance (per_instance = 1): the instance name (`<scope><type>`, the scope being the
   constructing instance's prefix of §6.2, or whatever
   `set_inst_name` replaced it with), its percentage, then per coverpoint the
   percentage and covered/total, then one line per bin with its LRM name and hit
@@ -883,10 +887,6 @@ IEEE 1800-2023 addition gated on the language version.
 
 ## 14. Open questions
 
-- **`option.per_instance = 0`** lets an implementation not save instance data
-  (19.7 Table 19-1). Does clotho's report then omit the instance entirely, or
-  print it without bin detail? The LRM permits either; the second is more useful
-  and costs nothing since the counters exist regardless.
 - **Bin-count explosion.** `coverpoint a` on a 32-bit `a` with
   `auto_bin_max = 64` is 64 bins, fine; `bins b[] = {[0:$]}` on the same
   coverpoint is 2^32 bins, and the LRM sets no limit. A cap plus a loud refusal

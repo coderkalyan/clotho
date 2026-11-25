@@ -703,7 +703,10 @@ extern "C" void rt_cover_report(void) {
         const rt_cover_type& ty = g_config->types[t];
         std::fprintf(
           f, "\ncovergroup %s  (%s)\n", or_else(ty.name, "<covergroup>"), location(loc, sizeof(loc), ty.banner));
-        for (const Inst* in = g_reg[t].head; in != nullptr; in = in->next) {
+        // LRM 19.7 [unverified wording]: instance data is saved only when option.per_instance
+        // is 1, so a covergroup that leaves it 0 reports its type line alone.
+        // get_inst_coverage() still answers: the counts are kept either way.
+        for (const Inst* in = ty.per_instance != 0 ? g_reg[t].head : nullptr; in != nullptr; in = in->next) {
             const InstResult ir = inst_result(in);
             std::fprintf(f,
                          "  instance %s  coverage %6.2f%%  bins %u/%u\n",

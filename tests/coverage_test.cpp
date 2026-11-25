@@ -842,7 +842,7 @@ TEST_CASE("the report names each covergroup instance by its module instance's pa
     const std::string report = report_of(R"(
         module leaf;
           bit [1:0] v = 0;
-          covergroup cg; coverpoint v; endgroup
+          covergroup cg; option.per_instance = 1; coverpoint v; endgroup
           cg c;
           initial begin c = new; c.sample(); end
         endmodule
@@ -861,7 +861,7 @@ TEST_CASE("the report names a covergroup by an instance path of any shape") {
     const std::string report = report_of(R"(
         module leaf;
           bit [1:0] v = 0;
-          covergroup cg; coverpoint v; endgroup
+          covergroup cg; option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           initial c.sample();
         endmodule
@@ -881,7 +881,7 @@ TEST_CASE("a covergroup built by a declaration initializer is named and counted 
     const std::string report = report_of(R"(
         module leaf(input bit [1:0] seed);
           bit [1:0] v = 0;
-          covergroup cg; coverpoint v; endgroup
+          covergroup cg; option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           initial #1 begin v = seed; c.sample(); end
         endmodule
@@ -911,7 +911,7 @@ TEST_CASE("a covergroup with a coverage event, built by a declaration initialize
     const std::string report = report_of(R"(
         module leaf(input bit clk);
           bit [1:0] v = 0;
-          covergroup cg @(posedge clk); coverpoint v; endgroup
+          covergroup cg @(posedge clk); option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           always @(negedge clk) v <= v + 1;
         endmodule
@@ -948,12 +948,12 @@ TEST_CASE("the report names a covergroup in a generate block by the block too") 
         module leaf;
           bit [1:0] v = 0;
           if (1) begin : g
-            covergroup cg; coverpoint v; endgroup
+            covergroup cg; option.per_instance = 1; coverpoint v; endgroup
             cg c;
             initial begin c = new; c.sample(); end
           end
           for (genvar i = 0; i < 2; i++) begin : arr
-            covergroup cg2; coverpoint v; endgroup
+            covergroup cg2; option.per_instance = 1; coverpoint v; endgroup
             cg2 c2 = new;
             initial c2.sample();
           end
@@ -979,7 +979,7 @@ TEST_CASE("a package covergroup is named by the instance that builds it, if any"
     const std::string report = report_of(R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
           pcg pc = new;
         endpackage
         module leaf;
@@ -1003,7 +1003,7 @@ TEST_CASE("a package covergroup built by two instances is one type named by each
     const std::string report = report_of(R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
         endpackage
         module leaf(input bit [1:0] hit);
           import p::*;
@@ -1036,7 +1036,7 @@ TEST_CASE("a package covergroup built by the package and by two instances") {
     const std::string report = report_of(R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
           pcg pc = new;
         endpackage
         module leaf;
@@ -1217,4 +1217,29 @@ TEST_CASE("coverage: cover statements print nothing without --coverage") {
         endmodule
     )";
     CHECK(run_capture(src) == "pass 0\npass 2\n");
+}
+
+// With the default `option.per_instance = 0` the report lists a covergroup's type line
+// alone (LRM 19.7: instance data is saved only when per_instance is 1 [unverified
+// wording]); get_inst_coverage() still answers. With 1, the instance lines appear.
+TEST_CASE("coverage: per-instance lines appear only when option.per_instance is 1") {
+    constexpr std::string_view src = R"(
+        module top;
+          int v;
+          covergroup off_cg; coverpoint v { bins a = {0}; bins b = {1}; } endgroup
+          covergroup on_cg; option.per_instance = 1; coverpoint v { bins a = {0}; bins b = {1}; } endgroup
+          off_cg o = new;
+          on_cg  n = new;
+          initial begin
+            v = 0; o.sample(); n.sample();
+            $display("%0f %0f", o.get_inst_coverage(), n.get_inst_coverage());
+          end
+        endmodule
+    )";
+    const std::string report = report_of(src);
+    CHECK(report.find("instance top.off_cg ") == std::string::npos);
+    CHECK(report.find("instance top.on_cg ") != std::string::npos);
+    CHECK(report.find("type off_cg  coverage  50.00%") != std::string::npos);
+    CHECK(report.find("type on_cg  coverage  50.00%") != std::string::npos);
+    CHECK(run_capture(src) == "50.000000 50.000000\n");
 }
