@@ -165,6 +165,7 @@ TEST_CASE("an open bin array names each bin after its value (LRM 19.5.1)") {
         module m;
           bit [3:0] v = 0;
           covergroup cg;
+             option.per_instance = 1;
              cp: coverpoint v { bins hi[] = {[3:5]}; }
           endgroup
           cg c = new;
@@ -817,6 +818,7 @@ TEST_CASE("the report lists every bin with its hit count") {
         module m;
           bit [2:0] a = 0;
           covergroup cg;
+             option.per_instance = 1;
              cp: coverpoint a { bins lo = {[0:1]}; bins hi = {[6:7]}; }
           endgroup
           cg c = new;
