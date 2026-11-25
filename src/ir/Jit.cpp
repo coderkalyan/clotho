@@ -221,6 +221,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
+    expose("rt_gen_cell_alloc", &rt_gen_cell_alloc);
+    expose("rt_gen_cell_free", &rt_gen_cell_free);
     expose("rt_observed_flush", &rt_observed_flush);
     expose("rt_defer_report", &rt_defer_report);
     expose("rt_defer_flush_observed", &rt_defer_flush_observed);

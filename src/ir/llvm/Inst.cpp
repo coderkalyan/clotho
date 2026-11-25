@@ -1973,7 +1973,22 @@ void Backend::lower_inst(Index i) {
             // does, so a report queued before this point never matures. A target
             // id names ANOTHER procedure's counter -- the remote case, where the
             // reports to drop are not this group's.
-            if (p.label == kNoDisableTarget) {
+            if (p.label == kNoDisableTarget && cur_fn_ != nullptr) {
+                // The resume of a task is a flush point of the thread that called it
+                // (LRM 16.4.2), whose counter the task read at entry. Null when that
+                // thread holds none, or the task does not need the generation.
+                if (gen_slot_ != nullptr) {
+                    llvm::Value* gen  = b_.CreateLoad(raw_ptr_ty(), gen_slot_);
+                    auto*        fn   = b_.GetInsertBlock()->getParent();
+                    auto*        bump = llvm::BasicBlock::Create(ctx_, "gen.bump", fn);
+                    auto*        cont = llvm::BasicBlock::Create(ctx_, "gen.cont", fn);
+                    b_.CreateCondBr(b_.CreateIsNotNull(gen), bump, cont);
+                    b_.SetInsertPoint(bump);
+                    emit_defer_gen_bump_at(gen);
+                    b_.CreateBr(cont);
+                    b_.SetInsertPoint(cont);
+                }
+            } else if (p.label == kNoDisableTarget) {
                 emit_defer_gen_bump();
             } else {
                 emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));

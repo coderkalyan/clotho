@@ -303,7 +303,7 @@ void rt_defer_report(int32_t level, uint64_t is_final, const void* gen,
                      uint64_t gen_val, const char* banner,
                      const rt_string* path, const char* tail, const char* fmt,
                      uint32_t argc, const rt_arg* argv);              /* Runtime.h:159 */
-void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind); /* Runtime.h:137 */
+void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind, const uint64_t* gen); /* Runtime.h:137 */
 void rt_finish_coop(const char* banner, uint64_t now, int32_t arg);   /* Runtime.h:119 */
 ```
 

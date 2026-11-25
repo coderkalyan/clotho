@@ -2550,11 +2550,13 @@ private:
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
-    bool subroutine_waits_on_event(const SubroutineSymbol& sub);
-
     void flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l);
 
     bool design_virtual_forks(slang::ast::Compilation& comp);
+
+    bool design_has_reports(slang::ast::Compilation& comp);
+
+    bool task_flushes_reports();
 
     bool design_virtual_parks(slang::ast::Compilation& comp);
 
@@ -5080,7 +5082,8 @@ private:
           , blocks_(l.named_blocks_, {})
           , root_(l.proc_root_block_, nullptr)
           , depth_(l.loop_depth_, 0)
-          , defers_(l.proc_defers_, false) {}
+          , defers_(l.proc_defers_, false)
+          , flushes_(l.proc_flushes_, false) {}
 
     private:
         Restore<FnCtx*>                 ctx_;
@@ -5088,6 +5091,7 @@ private:
         Restore<const Symbol*>          root_;
         Restore<uint32_t>               depth_;
         Restore<bool>                   defers_;
+        Restore<bool>                   flushes_;
     };
 
     // The PreInit segment of the instance that declares a static, while the
@@ -5786,9 +5790,14 @@ private:
     // reports it queued (LRM 16.4.2), and lower_event_wait / lower_wait_stmt say so.
     // Set per procedural block; false inside a subroutine body (FnScope).
     bool proc_defers_ = false;
-    // Memoized "calling this can wait on an event control or a wait statement", see
-    // subroutine_waits_on_event.
-    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_event_waits_;
+    // Whether its own body holds a deferred assertion or a unique/priority statement,
+    // whose pending reports an event control or wait statement in it flushes (LRM
+    // 16.4.2). Unlike proc_defers_ it never refuses anything. Set per procedural block;
+    // false inside a subroutine body (FnScope).
+    bool proc_flushes_ = false;
+    // Whether the design has a deferred assertion or a unique/priority statement
+    // anywhere (design_has_reports); computed on first use.
+    std::optional<bool> design_has_reports_;
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;

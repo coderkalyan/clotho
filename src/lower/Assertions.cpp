@@ -877,64 +877,46 @@ bool Lowerer::subroutine_parks(const SubroutineSymbol& sub) {
       });
 }
 
-// Whether calling this subroutine can wait on an event control or a wait statement: anywhere in
-// its body, transitively through the calls it makes. A delay is not one (LRM 16.4.2), so a task
-// that only delays does not count. A process that holds a deferred assertion cannot call such a
-// task yet: resuming inside it is a flush point of the calling process, which the task cannot
-// name (lower_task_call). A virtual task called anywhere along the way counts as waiting, as
-// lower_task_call counts a direct virtual call: the body read here is the declared method's, and
-// any override may be the one that runs and waits. Transitive by reaches_property, like
-// subroutine_parks.
-bool Lowerer::subroutine_waits_on_event(const SubroutineSymbol& sub) {
-    struct Waits : ASTVisitor<Waits, VisitFlags::AllGood> {
-        std::vector<const SubroutineSymbol*>* calls = nullptr;
-        bool                                  found = false;
-
-        void handle(const slang::ast::TimedStatement& s) {
-            found = found || Lowerer::is_event_control(s.timing);
+// Whether the design has a deferred assertion or a unique/priority statement anywhere, bodies
+// of subroutines and classes included. A task emits a flush at each event control or wait only
+// in such a design (task_flushes_reports), so any other design lowers exactly as before.
+// Walked once from the compilation root.
+bool Lowerer::design_has_reports(slang::ast::Compilation& comp) {
+    if (design_has_reports_) {
+        return *design_has_reports_;
+    }
+    struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const ImmediateAssertionStatement& s) {
+            found = found || s.isDeferred;
             visitDefault(s);
         }
-        void handle(const slang::ast::WaitStatement& s) {
-            found = true;
+        void handle(const slang::ast::ConditionalStatement& s) {
+            found = found || s.check != slang::ast::UniquePriorityCheck::None;
             visitDefault(s);
         }
-        void handle(const slang::ast::WaitOrderStatement& s) {
-            found = true;
+        void handle(const slang::ast::CaseStatement& s) {
+            found = found || s.check != slang::ast::UniquePriorityCheck::None;
             visitDefault(s);
         }
-        void handle(const slang::ast::WaitForkStatement& s) {
-            found = true;
+        void handle(const slang::ast::PatternCaseStatement& s) {
+            found = found || s.check != slang::ast::UniquePriorityCheck::None;
             visitDefault(s);
-        }
-        // `x = @(e) y` and `x = repeat (n) @(e) y` wait on the assignment itself.
-        void handle(const slang::ast::AssignmentExpression& a) {
-            const TimingControl* t = a.timingControl;
-            found =
-              found || (t != nullptr && (Lowerer::is_event_control(*t) || t->kind == TimingControlKind::RepeatedEvent));
-            visitDefault(a);
-        }
-        void handle(const CallExpression& c) {
-            if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
-                const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
-                if (callee != nullptr) {
-                    // The same classification lower_task_call makes: a `super.` call binds
-                    // statically, so its body is the one that runs and is read like any other.
-                    found = found || (callee->subroutineKind == slang::ast::SubroutineKind::Task &&
-                                      Lowerer::is_user_virtual(*callee) && !Lowerer::is_super_call(c));
-                    calls->push_back(callee);
-                }
-            }
-            visitDefault(c);
         }
     };
-    return reaches_property(
-      sub, sub_event_waits_, [](const SubroutineSymbol& s, std::vector<const SubroutineSymbol*>& callees) {
-          Waits w;
-          w.calls = &callees;
-          s.getBody().visit(w);
+    Scan v;
+    comp.getRoot().visit(v);
+    design_has_reports_ = v.found;
 
-          return w.found;
-      });
+    return v.found;
+}
+
+// Whether the body being lowered is a task whose event controls and waits are flush points of
+// the thread that called it (LRM 16.4.2): the calling process's pending deferred and
+// unique/priority reports are dropped when the resume happens inside the task. A fork child
+// is a thread of its own and flushes its own.
+bool Lowerer::task_flushes_reports() {
+    return fn_ctx_ != nullptr && fn_ctx_->is_task && design_has_reports(scope_->getCompilation());
 }
 
 void Lowerer::record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,

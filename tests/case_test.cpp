@@ -667,7 +667,7 @@ TEST_CASE("priority case: Observed-region report is stamped with the settled ins
         endmodule
     )";
     const std::string          err = run_capture_stderr(src);
-    // One report per violating settle pass; pending reports are not flushed (docs/LRM_NOTES.md, note 18).
+    // One report per violating activation, each in its own time step (docs/LRM_NOTES.md, note 18).
     CHECK(count_occ(err, "no condition is true") == 2);
     // Each report carries the time of its own instant, proving the deferral
     // fires at the settled instant (drain-loop Observed flush), not at t=0.
@@ -1721,4 +1721,244 @@ TEST_CASE("an unsized x or z case label takes the width of the selector") {
             end
         endmodule
     )") == "x match\nzx none\nz match\nv none\ncasez any\ncasex any\n");
+}
+
+// -- A violation report is flushed when its thread reaches a flush point (LRM 12.4.2.1,
+// 12.5.3.1, 16.4.2) --
+//
+// The reports are deferred to the Observed region like a deferred assertion's, and are discarded
+// the same way when the process that made them executes again in the time step (an activation
+// start, or a resume from an event control or wait) before the region is reached: a zero-delay
+// glitch reports nothing. Expected output is derived from those clauses; no oracle is available
+// (iverilog ignores `unique` and cannot parse `unique if`).
+
+namespace {
+
+// `STMT` is replaced in `design`. The statements read `a` and `b`.
+std::string with_stmt(std::string design, std::string_view stmt) {
+    design.replace(design.find("STMT"), 4, stmt);
+
+    return design;
+}
+
+// A statement that violates when both `a` and `b` are true (an overlap), and one that violates
+// when neither is (no match).
+constexpr std::string_view overlap_stmts[] = {
+    "unique case (1'b1) a: ; b: ; endcase",
+    "unique0 case (1'b1) a: ; b: ; endcase",
+    "unique if (a) ; else if (b) ;",
+    "unique0 if (a) ; else if (b) ;",
+};
+constexpr std::string_view no_match_stmts[] = {
+    "priority case (1'b1) a: ; b: ; endcase",
+    "unique case (1'b1) a: ; b: ; endcase",
+    "priority if (a) ; else if (b) ;",
+    "unique if (a) ; else if (b) ;",
+};
+
+} // namespace
+
+TEST_CASE("unique / priority report: a zero-delay glitch of the overlap check reports nothing") {
+    for (const std::string_view stmt : overlap_stmts) {
+        CAPTURE(stmt);
+        // The overlap exists for the activation at time 2 only: `#0 a = 0` runs the process again.
+        const std::string err = run_capture_stderr(with_stmt(R"(
+            module t;
+              logic a = 0, b = 0;
+              always @(a or b) begin STMT end
+              initial begin #1 a = 1; #1 b = 1; #0 a = 0; #1 b = 0; #0 a = 1; end
+            endmodule
+        )",
+                                                             stmt));
+        CHECK_EQ(count_occ(err, "not unique"), 0u);
+        CHECK_EQ(count_occ(err, "no condition"), 0u);
+    }
+}
+
+TEST_CASE("unique / priority report: a zero-delay glitch of the no-match check reports nothing") {
+    for (const std::string_view stmt : no_match_stmts) {
+        CAPTURE(stmt);
+        const std::string err = run_capture_stderr(with_stmt(R"(
+            module t;
+              logic a = 1, b = 0;
+              always @(a or b) begin STMT end
+              initial begin #1 a = 0; #0 a = 1; end
+            endmodule
+        )",
+                                                             stmt));
+        CHECK_EQ(count_occ(err, "no condition"), 0u);
+        CHECK_EQ(count_occ(err, "not unique"), 0u);
+    }
+}
+
+// The glitch above reported at times 2 and 3 before; the deferred assertion beside it did not.
+TEST_CASE("unique case report: the glitch of the reported design, beside a deferred assertion") {
+    const std::string err = run_capture_stderr(R"(
+        module t; logic a = 0, b = 0;
+          always @* begin unique case (1'b1) a: ; b: ; endcase end
+          always @* assert #0 (a ^ b) else $error("deferred viol");
+          initial begin #1 a = 1; #1 b = 1; #0 a = 0; #1 b = 0; #0 a = 1; end
+        endmodule
+    )");
+    CHECK_EQ(count_occ(err, "not unique"), 0u);
+    CHECK_EQ(count_occ(err, "no condition"), 0u);
+    CHECK_EQ(count_occ(err, "deferred viol"), 0u);
+}
+
+// A violation that stands at the end of the time step still reports, once.
+TEST_CASE("unique / priority report: a violation that persists is still reported once") {
+    for (const std::string_view stmt : overlap_stmts) {
+        CAPTURE(stmt);
+        const std::string err = run_capture_stderr(with_stmt(R"(
+            module t;
+              logic a = 0, b = 0;
+              always @(a or b) begin STMT end
+              initial begin #1 a = 1; #1 b = 1; #0 b = 1; end
+            endmodule
+        )",
+                                                             stmt));
+        CHECK_EQ(count_occ(err, "not unique"), 1u);
+        CHECK(err.find("at time 2 ") != std::string::npos);
+    }
+}
+
+// An always_comb is a thunk, which has no frame to hold a counter in: the counter is the group's.
+TEST_CASE("unique / priority report: an always_comb glitch reports nothing") {
+    const std::string err = run_capture_stderr(R"(
+        module t;
+          logic a = 1, b = 0;
+          always_comb begin priority case (1'b1) a: ; b: ; endcase end
+          initial begin #1 a = 0; #0 a = 1; end
+        endmodule
+    )");
+    CHECK_EQ(count_occ(err, "no condition"), 0u);
+}
+
+// The check sits in a task or a function the process calls: it is tagged with the generation of
+// the process that called it, however deep.
+TEST_CASE("unique / priority report: a check in a called task or function is flushed with its caller") {
+    const auto glitch = [](std::string_view decls, std::string_view call) {
+        std::string design = R"(
+            module t;
+              logic a = 0, b = 0;
+              DECLS
+              always @(a or b) begin CALL end
+              initial begin #1 a = 1; #1 b = 1; #0 a = 0; #1 b = 0; end
+            endmodule
+        )";
+        design.replace(design.find("DECLS"), 5, decls);
+        design.replace(design.find("CALL"), 4, call);
+
+        return run_capture_stderr(design);
+    };
+    const auto none = [&](std::string_view decls, std::string_view call) {
+        const std::string err = glitch(decls, call);
+        CHECK_EQ(count_occ(err, "not unique"), 0u);
+    };
+    SUBCASE("a task") {
+        none("task automatic chk; unique case (1'b1) a: ; b: ; endcase endtask", "chk();");
+    }
+    SUBCASE("a function") {
+        none("function automatic void chk(); unique case (1'b1) a: ; b: ; endcase endfunction", "chk();");
+    }
+    SUBCASE("a function called through another function") {
+        none("function automatic void inner(); unique if (a) ; else if (b) ; endfunction\n"
+             "function automatic void outer(); inner(); endfunction",
+             "outer();");
+    }
+    SUBCASE("a task called through a function-free chain of tasks") {
+        none("task automatic inner; unique0 case (1'b1) a: ; b: ; endcase endtask\n"
+             "task automatic outer; inner(); endtask",
+             "outer();");
+    }
+    SUBCASE("a virtual method") {
+        none("class C; virtual function void chk(); unique case (1'b1) a: ; b: ; endcase endfunction endclass\n"
+             "C h = new;",
+             "h.chk();");
+    }
+    SUBCASE("a function whose violation stands is still reported") {
+        const std::string err = run_capture_stderr(R"(
+            module t;
+              logic a = 0, b = 0;
+              function automatic void chk(); unique case (1'b1) a: ; b: ; endcase endfunction
+              always @(a or b) chk();
+              initial begin #1 a = 1; #1 b = 1; end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(err, "not unique"), 1u);
+    }
+}
+
+// A resume from an event control inside a task is a resume of the process that called it, so it
+// flushes that process's pending violation report (LRM 16.4.2); a delay inside the task is not.
+TEST_CASE("unique / priority report: a wait inside a called task flushes the calling process's report") {
+    const auto run = [](std::string_view task_body, std::string_view driver) {
+        std::string design = R"(
+            module t;
+              logic a = 1, b = 1; event e;
+              task automatic w; TASK endtask
+              initial begin
+                unique case (1'b1) a: ; b: ; endcase
+                w();
+                $display("resumed %0t", $time);
+              end
+              DRIVER
+            endmodule
+        )";
+        design.replace(design.find("TASK"), 4, task_body);
+        design.replace(design.find("DRIVER"), 6, driver);
+
+        return run_capture_stderr(design);
+    };
+    SUBCASE("an event control") {
+        CHECK_EQ(count_occ(run("@(e);", "initial #0 -> e;"), "not unique"), 0u);
+    }
+    SUBCASE("a wait statement") {
+        CHECK_EQ(count_occ(run("wait (b === 1'b0);", "initial #0 b = 0;"), "not unique"), 0u);
+    }
+    SUBCASE("a delay is not a resume from an event control") {
+        CHECK_EQ(count_occ(run("#1;", ""), "not unique"), 1u);
+    }
+}
+
+// A fork child is a thread of its own: its resumes flush its own reports, and the reports of the
+// thread that forked it are not its to flush.
+TEST_CASE("unique / priority report: a fork child flushes its own reports at its own resumes") {
+    SUBCASE("the child resumed twice in one time step reports once") {
+        const std::string err = run_capture_stderr(R"(
+            module t;
+              logic a = 1, b = 1; event e;
+              initial fork
+                forever begin @(e); unique case (1'b1) a: ; b: ; endcase end
+              join_none
+              initial begin #1 -> e; #0 -> e; end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(err, "not unique"), 1u);
+    }
+    SUBCASE("a child that has ended still has its report issued") {
+        const std::string err = run_capture_stderr(R"(
+            module t;
+              logic a = 1, b = 1;
+              initial begin
+                fork unique case (1'b1) a: ; b: ; endcase join_none
+                #1;
+              end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(err, "not unique"), 1u);
+    }
+    SUBCASE("the parent's resume does not flush the child's report") {
+        const std::string err = run_capture_stderr(R"(
+            module t;
+              logic a = 1, b = 1; event e;
+              initial begin
+                fork unique case (1'b1) a: ; b: ; endcase join_none
+                @(e);
+              end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(err, "not unique"), 1u);
+    }
 }

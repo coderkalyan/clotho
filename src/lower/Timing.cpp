@@ -622,17 +622,19 @@ void Lowerer::lower_vif_clocking_drive(const MemberAccessExpression& ma,
 }
 
 // LRM 16.4.2: a process that resumes from an event control or a wait statement has reached a
-// deferred assertion flush point, so the reports it queued before it suspended are dropped and
-// never mature. Only a procedure that holds a deferred assertion emits this, so any other design
-// is unchanged, and a subroutine body never does: a body that waits is a flush point of the
-// process that called it, which the body cannot name (lower_task_call refuses the call).
+// flush point, so the reports it queued before it suspended are dropped and never mature: its
+// deferred assertion reports and, by the same rule (12.4.2.1, 12.5.3.1), its unique/priority
+// violation reports. Only a procedure that holds one emits this, so any other design is
+// unchanged. A subroutine body that waits resumes the thread that CALLED it, so a task emits
+// it in a design that has such reports, and the backend bumps the generation the calling
+// thread published (a function cannot wait).
 //
 // A delay (`#n`, `#0`) and a cycle delay (`##n`) are not flush points: the clause names event
 // controls and wait statements, and a report queued ahead of a delay matures in the Observed
 // region the delay lets pass (the LRM's own a3 / a4 example under 16.4.2). Whether `##n`, which
 // waits for clocking events, should count as an event control is not said.
 void Lowerer::flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l) {
-    if (proc_defers_ && fn_ctx_ == nullptr) {
+    if ((proc_flushes_ && fn_ctx_ == nullptr) || task_flushes_reports()) {
         b.defer_flush(ir::kNoDisableTarget, l);
     }
 }
@@ -1841,7 +1843,7 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
         b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
     };
 
-    if (proc_defers_ && fn_ctx_ == nullptr) {
+    if ((proc_flushes_ && fn_ctx_ == nullptr) || task_flushes_reports()) {
         // LRM 16.4.2: resuming from a wait statement flushes the reports the process queued, but
         // a condition that is already true never suspends it, and a wake that finds the condition
         // still false does not resume it. So the flush follows the loop, on the path that

@@ -986,6 +986,12 @@ void sim_teardown() {
     g_strobe_queue.clear();
     g_strobe_read = 0;
     g_observed_case.clear();
+    // Cells of fork children still live at the end go back to the pool.
+    g_gen_free.clear();
+    for (const std::unique_ptr<uint64_t>& cell : g_gen_cells) {
+        *cell = 0;
+        g_gen_free.push_back(cell.get());
+    }
     g_defer.clear();
     rt_nba_arr_reset();
     rt_intra_reset();

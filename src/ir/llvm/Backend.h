@@ -2963,6 +2963,8 @@ private:
 
     llvm::FunctionCallee finish_coop_fn();
     llvm::FunctionCallee observed_case_violation_fn();
+    llvm::FunctionCallee gen_cell_alloc_fn();
+    llvm::FunctionCallee gen_cell_free_fn();
     llvm::FunctionCallee observed_flush_fn();
     llvm::FunctionCallee severity_fn();
     llvm::FunctionCallee defer_report_fn();
@@ -4135,6 +4137,22 @@ private:
 
     void emit_defer_gen_bump_at(llvm::Value* gen);
 
+    // The report generation of the running thread (LRM 16.4.2), published for the
+    // bodies it calls: a process group publishes its own counter at each activation
+    // and resume, a task reads it at entry and republishes it after each resume, a
+    // function just reads it. Null where nothing can flush. Created only by a design
+    // with a unique/priority report, so any other design emits none of it.
+    llvm::Value* gen_global();
+
+    llvm::Value* load_gen();
+
+    void store_gen(llvm::Value* gen);
+
+    // The generation this body republishes after a resume, or null when it has none.
+    llvm::Value* body_gen();
+
+    bool fn_needs_gen(FunctionId id) const;
+
     // Any $monitor / $fmonitor registration in the design? Gates the per-instant
     // Postponed-region monitor run (see emit_active_run).
 
@@ -5018,6 +5036,13 @@ private:
     // Per-group generation globals of a group that belongs to no instance, created
     // lazily; an instance's groups keep theirs in its record (Anchor::ctx_defer_base).
     std::vector<llvm::GlobalVariable*> defer_gen_gv_;
+    // The ptr global holding the running thread's report generation (gen_global).
+    llvm::GlobalVariable* gen_gv_ = nullptr;
+    // While lowering a task or function that needs the generation: the frame slot
+    // holding the pointer read at entry (a fork child's own cell), else null.
+    llvm::Value* gen_slot_ = nullptr;
+    // Per function: a body the runtime ramps on its own, which publishes no generation.
+    std::vector<uint8_t> gen_root_;
     // Whether any process of the design holds a deferred assertion (sizes the records).
     bool any_defer_ = false;
     // Who declares each flat `disable` target and covergroup type: the anchor and

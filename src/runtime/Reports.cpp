@@ -60,8 +60,35 @@ extern "C" void rt_dpi_export_task_no_task_frame(const char* name) {
                           "function)");
 }
 
-extern "C" void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind) {
-    g_observed_case.push_back({ banner, now, kind });
+extern "C" void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind, const uint64_t* gen) {
+    g_observed_case.push_back({ banner, now, kind, gen, gen != nullptr ? *gen : 0 });
+}
+
+// A fork child's report generation (LRM 16.4.2: a child is a thread of its own, so
+// its resumes flush its own reports). Cells come from a pool because the child's
+// frame is gone when its last report matures. The pool never shrinks and a cell
+// has a stable address, so a pending report can name it.
+extern "C" uint64_t* rt_gen_cell_alloc() {
+    if (g_gen_free.empty()) {
+        g_gen_cells.push_back(std::make_unique<uint64_t>(0));
+        g_gen_free.push_back(g_gen_cells.back().get());
+    }
+    uint64_t* cell = g_gen_free.back();
+    g_gen_free.pop_back();
+
+    return cell;
+}
+
+// The child ended: nothing can flush its pending reports any more, so they are
+// issued at the Observed flush like any report of a finished process.
+extern "C" void rt_gen_cell_free(uint64_t* cell) {
+    for (ObservedCaseViol& r : g_observed_case) {
+        if (r.gen == cell) {
+            r.gen = nullptr;
+        }
+    }
+    *cell = 0;
+    g_gen_free.push_back(cell);
 }
 
 extern "C" void rt_observed_flush() {
@@ -75,6 +102,10 @@ extern "C" void rt_observed_flush() {
     // warning interleaves.
     std::fflush(stdout);
     for (const ObservedCaseViol& r : g_observed_case) {
+        // A report whose process has run since (a flush point, LRM 16.4.2) is dropped.
+        if (r.gen != nullptr && *r.gen != r.gen_val) {
+            continue;
+        }
         std::string line = r.banner;
         line += r.kind == 0 ? "no condition is true in the unique/priority if/case at time "
                             : "if/case statement is not unique (overlapping items) at time ";
@@ -94,6 +125,8 @@ constexpr int32_t kSeverityFatal = 3;
 namespace rt_internal {
 
 std::vector<ObservedCaseViol>                    g_observed_case;
+std::vector<std::unique_ptr<uint64_t>>           g_gen_cells;
+std::vector<uint64_t*>                           g_gen_free;
 ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
 ankerl::unordered_dense::set<const void*>        g_ref_stale_seen;
 

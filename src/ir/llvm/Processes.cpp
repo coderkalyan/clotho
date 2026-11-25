@@ -291,6 +291,12 @@ void Backend::lower_fork_inst(Index i) {
             b_.SetInsertPoint(joined);
         }
     }
+    // An inline child published its own generation (it is a thread of its own, LRM 16.4.2).
+    if (!none && gen_gv_ != nullptr) {
+        if (llvm::Value* gen = body_gen(); gen != nullptr) {
+            store_gen(gen);
+        }
+    }
 
     if (!none) {
         // Park unless the wake we would be waiting for has already happened:

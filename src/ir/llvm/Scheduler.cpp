@@ -183,6 +183,12 @@ void Backend::emit_suspend(const char* label) {
     sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
     b_.SetInsertPoint(resume);
     emit_proc_state(kProcWaiting, kProcRunning);
+    // Whoever ran while this thread was parked published its own generation.
+    if (gen_gv_ != nullptr) {
+        if (llvm::Value* gen = body_gen(); gen != nullptr) {
+            store_gen(gen);
+        }
+    }
 }
 
 // The first argument of the ramp of schedule group `s`: the record of the

@@ -1479,7 +1479,7 @@ void Backend::build_instance_ctx_layout() {
 
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     any_defer_ = std::any_of(facts_.processes.begin(), facts_.processes.end(),
-                             [](const auto& p) { return p.deferred_severity; });
+                             [](const auto& p) { return p.gen_counter; });
     const bool any_rng = std::any_of(rng_procs_.begin(), rng_procs_.end(), [](bool b) { return b; });
     auto* i32 = b_.getInt32Ty();
     // Per unit, not per state type: two units can lay their own signals out

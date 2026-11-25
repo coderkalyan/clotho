@@ -483,8 +483,6 @@ Milestones, in order; lower ones unblock higher ones:
   are refused.
 - [ ] **`case … inside` unbounded range bounds** (12.5.4) — `[$:a]` and `[a:$]` labels are
   refused.
-- [ ] **`unique` / `unique0` / `priority` violation maturation** (12.4.2) — a pending report
-  is not flushed when the statement re-executes in the same time step, so glitches report.
 - [ ] **`always_ff` non-sequential body warning** (9.2.2.4) — no diagnostic is issued when
   the body does not describe sequential logic.
 - [ ] **`foreach` skipping an outer dimension over a nested runtime one** (12.7.3) —
@@ -524,7 +522,7 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`disable` of one deferred assertion** (16.4.4) — `disable a1;` naming an assertion's
     label is refused: a pending report carries no identity of its assertion to cancel by.
   - [ ] **Flush at a resume the process cannot see** (16.4.2) — a process holding a deferred
-    assertion is refused `wait fork`, `wait_order` and a call to a task that can wait on an event.
+    assertion is refused `wait fork` and `wait_order`.
   - [ ] **Action block scheduled in the Reactive region** — the report matures through the
     deferred queue instead of scheduling the action block in Reactive.
 - [ ] **`$countbits` with a non-constant control bit** — refused.

@@ -141,8 +141,15 @@ extern unsigned char rt_finishing;
 // prefix (static lifetime); `now` is the simulation time of the violation, in
 // design ticks; `kind` selects the message: 0 = no case item matched (priority
 // or unique, no default), 1 = more than one case item matched (unique /
-// unique0 overlap). Pending reports are not flushed on re-execution (docs/LRM_NOTES.md, note 18).
-void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind);
+// unique0 overlap). `gen` is the executing thread's report generation counter (null
+// when nothing can flush the report): the report is dropped at the flush if the
+// counter has moved on since (docs/LRM_NOTES.md, note 18).
+void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind, const uint64_t* gen);
+
+// A report generation counter for a fork child, and its release when the child ends
+// (its pending reports then mature, as nothing can flush them).
+uint64_t* rt_gen_cell_alloc(void);
+void      rt_gen_cell_free(uint64_t* cell);
 
 // Emit and clear every Observed-region report queued this instant. Called by
 // the sim loop at the settled point (between the NBA-settle and Postponed

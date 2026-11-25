@@ -462,16 +462,19 @@ void Backend::lower_finish(Index i) {
 }
 
 // Lower a unique/priority case violation report: pass the compile-time banner
-// prefix, the simulation time of the violation, and the message kind. The
-// runtime queues it and reports in the Observed region, where LRM 12.4.2 /
-// 12.5.3 place it (docs/LRM_NOTES.md, note 18), rather than emitting here in
-// the Active region, so the region continues normally.
+// prefix, the simulation time of the violation, the message kind and the report
+// generation of the thread executing it. The runtime queues it and reports in the
+// Observed region, where LRM 12.4.2 / 12.5.3 place them (docs/LRM_NOTES.md, note
+// 18), unless the thread reached a flush point first (LRM 16.4.2), so the region
+// continues normally.
 void Backend::lower_case_viol(Index i) {
     const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
     const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
     llvm::Value*      now    = b_.CreateCall(wheel_now_fn(), { wheel_ });
+    llvm::Value*      gen    = gen_gv_ != nullptr ? load_gen()
+                                                  : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     b_.CreateCall(observed_case_violation_fn(),
-                  { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
+                  { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind), gen });
 }
 
 // Lower a severity report ($info / $warning / $error / $fatal, or an
@@ -1302,6 +1305,43 @@ void Backend::emit_defer_gen_bump_at(llvm::Value* gen) {
     }
     auto* i64 = b_.getInt64Ty();
     b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(1)), gen);
+}
+
+// The ptr global holding the report generation of the running thread. Created at the
+// start of the lowering (Backend::run) in a design that can use it, so that no body
+// lowering makes it: root must come out of a verifying re-lowering as it went in.
+llvm::Value* Backend::gen_global() {
+    if (gen_gv_ == nullptr) {
+        auto* null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        gen_gv_    = new llvm::GlobalVariable(root_env_->llmod, raw_ptr_ty(), false,
+                                              llvm::GlobalValue::InternalLinkage, null, "clotho.gen");
+    }
+    return sym(gen_gv_);
+}
+
+llvm::Value* Backend::load_gen() {
+    return b_.CreateLoad(raw_ptr_ty(), gen_global());
+}
+
+void Backend::store_gen(llvm::Value* gen) {
+    b_.CreateStore(gen, gen_global());
+}
+
+// The generation this body republishes after a resume: a process group's own
+// counter, or what a task read at its entry. Null for a body that does not need it.
+llvm::Value* Backend::body_gen() {
+    if (gen_slot_ != nullptr) {
+        return b_.CreateLoad(raw_ptr_ty(), gen_slot_);
+    }
+    if (cur_fn_ == nullptr && cur_defer_group_ >= 0) {
+        return defer_gen_ptr();
+    }
+    return nullptr;
+}
+
+bool Backend::fn_needs_gen(FunctionId id) const {
+    const auto k = static_cast<uint32_t>(id);
+    return k < facts_.fn_gen.size() && facts_.fn_gen[k] != 0;
 }
 
 // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array

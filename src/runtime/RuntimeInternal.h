@@ -358,15 +358,22 @@ void append_finish_time(std::string& out, uint64_t now);
 // violation reports use it because LRM 12.4.2 / 12.5.3 place them in that
 // region (docs/LRM_NOTES.md, note 18).
 //
-// The queue has no flush when a statement executes again in the same instant,
-// so a statement that violates transiently on several settle passes queues one
-// report per pass.
+// A report carries the report generation of the thread that executed it and that
+// generation's value then. The thread bumps it at each of its flush points (LRM
+// 16.4.2: resuming from an event control or wait, or starting an activation), so a
+// report whose generation has moved on is dropped at the flush below, as a deferred
+// assertion's is (docs/LRM_NOTES.md, note 18). A null `gen` is a thread nothing can
+// flush, whose reports always mature.
 struct ObservedCaseViol {
-    const char* banner; // compile-time "<file>:<line>: " prefix, static lifetime
-    uint64_t    now;    // instant the violation occurred (== Observed flush time)
-    int32_t     kind;   // 0 = no match, 1 = overlap
+    const char*     banner; // compile-time "<file>:<line>: " prefix, static lifetime
+    uint64_t        now;    // instant the violation occurred (== Observed flush time)
+    int32_t         kind;   // 0 = no match, 1 = overlap
+    const uint64_t* gen;    // the executing thread's generation counter, or null
+    uint64_t        gen_val;
 };
 extern std::vector<ObservedCaseViol> g_observed_case;
+extern std::vector<std::unique_ptr<uint64_t>> g_gen_cells;
+extern std::vector<uint64_t*>                 g_gen_free;
 
 // Set by a fatal severity report: rt_sim_run folds it into the exit status.
 inline bool g_fatal_seen = false;

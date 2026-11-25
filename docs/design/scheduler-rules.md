@@ -99,6 +99,7 @@ the speedup cannot be turned off for a differential run.
 | S26 | **Inertial commit at the top of the slot.** A continuous assign's delayed update, fired by the wheel, commits before the slot's Active drain. An epoch cancels superseded updates. | `Stores.cpp:emit_inertial_arm`; `Scheduler.cpp:emit_active_run` (`wheel.posttick`); `runtime/Scheduler.cpp:rt_inertial_decide` | none | 10.3.3: the update is an Active-region event (LRM_NOTES 9). |
 | S27 | **Event objects.** Waiter lists are push-front. `always @(e)` nodes are linked once, by the seed. `.triggered` is `stamp == now`. A monomorphic event's object is a constant. | `Events.cpp:emit_event_link`, `emit_event_wake_list`, `lower_event_triggered`, `analyze_event_monomorphism` | none | 4.7 leaves wake order open; 15.5.3 makes `triggered` last for the slot. |
 | S28 | **Timing wheel.** Timers due in one tick fire in list order, last armed first (679e3ce2), all before that slot's Active drain. | `runtime/Wheel.h:advance`; `runtime/Scheduler.cpp:rt_wheel_advance` | none | 4.7. |
+| S29 | **Published report generation.** The running thread's deferred-report generation counter is published through one global: a process group stores it at each activation and after each park, a task reads it in its ramp and republishes it after its parks, a fork child takes a pooled cell. Bodies that cannot reach a unique/priority report or a waiting task in such a design touch none of it. | `SystemTasks.cpp:gen_global`, `body_gen`; `Scheduler.cpp:emit_suspend`; `Subroutines.cpp:lower_group`, `lower_task`; `Processes.cpp:lower_fork_inst`; `Analysis.cpp` (`fn_gen`, `gen_counter`); `runtime/Reports.cpp:rt_gen_cell_alloc` | none | A body runs in its caller's thread, so what it reports and flushes belongs to that thread (16.4.2). Relies on every park republishing (`emit_suspend`) and on a runtime-ramped body publishing null. |
 
 `o3` (the LLVM pipeline), `gc_stress` (collection cadence) and
 `verify_shared_code` (a check) are configuration axes for step 2, but do not
@@ -106,7 +107,7 @@ change scheduling.
 
 ### 2.2 Ungated
 
-22 of the 28 mechanisms cannot be turned off: S1, S2, S3, S4, S5, S10, S12, S13, S14, S15, S16, S17, S18, S19, S21, S22, S23, S24, S25, S26, S27, S28. The
+23 of the 29 mechanisms cannot be turned off: S1, S2, S3, S4, S5, S10, S12, S13, S14, S15, S16, S17, S18, S19, S21, S22, S23, S24, S25, S26, S27, S28, S29. The
 other 6 have a gate: S6, S7, S8, S9, S11, S20. A bug in an ungated speedup is
 invisible to step 2. Of the 51 rows of §4, 42 involve an
 ungated speedup, 2 only gated ones, and 7 none (code outside
@@ -156,7 +157,7 @@ Wording is not yet checked against the LRM text.
 | R23 | `disable` and `kill` end an activity once, at the moment they run, and end the children forked inside the target. An ended activation is never resumed by the wake it was parked on, and an aborted waiter hands its wake to the next. | 9.6.1, 9.6.2, 9.6.3, 9.7; 15.3, 15.4 (queues) | S2, S15, S16 | `loop_test.cpp` "a disable that runs after its target's timer expired wakes the target once", "a fork child that disables its parent's block before it suspends"; `process_test.cpp` "process: kill a parent parked at a join"; `sync_test.cpp` "semaphore: killing the queue head hands off to the next waiter" |
 | R24 | After `$finish`, nothing more of the finishing thread runs, and neither does any process it woke. `final` blocks run. | 20.2, 9.2.3 | S11, S17 | `llvm_backend_test.cpp` "$finish inside a function leaves nothing queued to run after it"; `class_test.cpp` "a $finish reached through a virtual call stops every caller" |
 | R25 | Program code and program continuous assigns run in Reactive. Clotho settles port copies before program code reads them. | 24.3.1, 24.3.2, 4.7; LRM_NOTES 50 | S3, S4, S14 | `program_test.cpp` "a program initial reads an input port settled at time zero", "a port copy woken behind a queued program thread still settles before it reads" |
-| R26 | A pending deferred report flushes when its process resumes from an event control or wait, or when its outermost scope is disabled. `$monitor` prints when an argument other than a time function changes. | 16.4.2, 16.4.4, 21.2.2; LRM_NOTES 22, 54 | S11, S12, S13 | `severity_test.cpp` "deferred assertion: resuming from an event control or a wait statement flushes the report"; `strobe_test.cpp` "$monitor ignores a changing $time argument" |
+| R26 | A pending deferred report, or unique/priority violation report, of a thread flushes when the thread starts an activation, resumes from an event control or wait (inside a task it called too), or when its outermost scope is disabled. A fork child is a thread of its own. `$monitor` prints when an argument other than a time function changes. | 12.4.2.1, 12.5.3.1, 16.4.2, 16.4.4, 21.2.2; LRM_NOTES 18, 22, 54 | S11, S12, S13, S29 | `severity_test.cpp` "deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: a wait inside a called task flushes the calling process's report"; `case_test.cpp` "unique / priority report: ..."; `strobe_test.cpp` "$monitor ignores a changing $time argument" |
 
 ## 4. Postmortem
 
@@ -337,7 +338,6 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 | R24 × S17 | NBAs staged in the slot of a `$finish` stay uncommitted [INFERENCE: no test found]. |
 | R23 × S1 | `p.kill()` of an always parked at its static leading control resumes its body once and does not stop it: the loop's park has no abort poll (probed on 32ee5c3e). An always that waits at its head polls. |
 | R1 × S12 | Observed reached again from the reactive set, for an assertion clocked by a program signal: refused (`docs/TODO.md`). |
-| R26 × S12 | A unique/priority report flushed when its statement re-executes in the same slot: open gap (`docs/TODO.md`). |
 | Gates | `comb_fuse` and `o3` are never set in a test (`fuse = false` also turns comb fusion off); `dedup`, `split` and `z_elision` in one case each. |
 
 ## 6. Not settled without the LRM

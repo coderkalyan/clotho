@@ -44,9 +44,18 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // group is the same code in every instance of its unit.
     cur_defer_group_ = -1;
     if (std::any_of(members.begin(), members.end(),
-                    [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
+                    [&](uint32_t m) { return facts_.processes[m].gen_counter; })) {
         cur_defer_group_ = static_cast<int32_t>(g_);
     }
+    gen_slot_ = nullptr;
+    // An activation start is a flush point of the group's reports (LRM 16.4.2), and the
+    // group is the running thread from here until it parks, so it publishes its counter.
+    const auto begin_activation = [&] {
+        emit_defer_gen_bump();
+        if (gen_gv_ != nullptr && cur_defer_group_ >= 0) {
+            store_gen(defer_gen_ptr());
+        }
+    };
 
     // Same-eligibility NBA prep: the function's block registrations pass
     // (instance block base + function-local ordinal) instead of the absolute
@@ -233,6 +242,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         rng_slot_  = sym(rng_global_);
         own_ctx_   = own_anchor_ != SignalSlot::no_anchor ? fn_->getArg(0) : nullptr;
         sched_ptr_ = takes_flag ? fn_->getArg(2) : nullptr;
+        begin_activation();
         // Run each member body per activation, freeing its string temporaries
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
@@ -517,7 +527,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.loop", fn_);
         b_.CreateBr(loop_bb);
         b_.SetInsertPoint(loop_bb);
-        emit_defer_gen_bump(); // activation start = deferred-assertion flush point
+        begin_activation(); // activation start = flush point
         const bool guarded = open_group(g_);
         static_sub_body_ = true;
         for (size_t i = 0; i < members.size(); ++i) {
@@ -573,7 +583,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "always.exit", fn_));
     } else {
         // Never fused: a non-always (or sensitivity-less) group is a singleton.
-        emit_defer_gen_bump(); // single-shot body: one activation, one flush point
+        begin_activation(); // single-shot body: one activation, one flush point
         select_member(proc_index);
         str_vals_     = member_strs.front();
         dynarr_ret_   = member_dynarr.front();
@@ -1334,6 +1344,7 @@ void Backend::lower_function(FunctionId id) {
     body_home_is_runtime_ = is_shared_home_fn(id) || ir_has_expect_wait(f.ir);
     home_ptr_         = nullptr;
     cur_is_task_      = false;
+    gen_slot_         = nullptr;
     runs_once_        = false; // a function runs as often as it is called
     param_llvm_index_ = param_indices(f);
     build_frame_layout(f);
@@ -1604,6 +1615,27 @@ void Backend::lower_task(FunctionId id) {
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
     group_first_block_ = -1;
+    // The report generation of the thread this task runs in (LRM 16.4.2), read in the RAMP
+    // while the caller is still the running thread. A task that waits resumes its CALLER's
+    // thread, so it republishes this after each park (emit_suspend) and bumps it where the
+    // wait resumes (DeferFlush). A fork child is a thread of its own: it takes a counter
+    // cell of its own when it can reach a report, else publishes null; so does a body the
+    // runtime ramps itself.
+    gen_slot_        = nullptr;
+    cur_defer_group_ = -1;
+    llvm::Value* gen_cell = nullptr;
+    if (gen_gv_ != nullptr && fn_needs_gen(id)) {
+        gen_slot_ = b_.CreateAlloca(raw_ptr_ty(), nullptr, "gen");
+        llvm::Value* init;
+        if (f.is_fork_child && facts_.fn_report[static_cast<uint32_t>(id)] != 0) {
+            gen_cell = init = b_.CreateCall(gen_cell_alloc_fn(), {});
+        } else if (f.is_fork_child || gen_root_[static_cast<uint32_t>(id)] != 0) {
+            init = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        } else {
+            init = load_gen();
+        }
+        b_.CreateStore(init, gen_slot_);
+    }
     // And, for a task some `disable` names, this activation's list node — same
     // placement and for the same reason: a `disable` reads it while we are parked.
     disable_node_ = f.disable_target != kNoDisableTarget
@@ -1684,6 +1716,10 @@ void Backend::lower_task(FunctionId id) {
     if (gc_frame) {
         emit_gc_frame_unlink();
     }
+    if (gen_cell != nullptr) {
+        // The child ends: its pending reports can no longer be flushed and mature.
+        b_.CreateCall(gen_cell_free_fn(), { b_.CreateLoad(raw_ptr_ty(), gen_slot_) });
+    }
     auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { cid, hdl_ });
     b_.CreateCondBr(b_.CreateICmpNE(freed, null), free_bb, coro_ret_bb_);
 
@@ -1731,6 +1767,10 @@ void Backend::lower_task(FunctionId id) {
         emit_disable_link(f.disable_target, disable_node_);
     }
     emit_pcb_acts_link();
+    // A fork child or a runtime-ramped body is its own thread: publish its generation.
+    if (gen_slot_ != nullptr && (f.is_fork_child || gen_root_[static_cast<uint32_t>(id)] != 0)) {
+        store_gen(b_.CreateLoad(raw_ptr_ty(), gen_slot_));
+    }
     if (!fork_disable_nodes_.empty()) {
         // The body is starting: publish the real scheduled flag in place of the one the
         // ramp held at 1 ...
@@ -1872,6 +1912,7 @@ void Backend::lower_task(FunctionId id) {
     home_ptr_         = nullptr;
     home_arg_             = nullptr;
     cur_is_task_      = false;
+    gen_slot_         = nullptr;
     frame_            = nullptr;
     task_epilogue_bb_ = nullptr;
     own_anchor_       = SignalSlot::no_anchor;
