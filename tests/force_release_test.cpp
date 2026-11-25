@@ -387,6 +387,113 @@ TEST_CASE("assign: suppresses writes through a virtual interface") {
     CHECK(run_capture_finish(src) == "q=170\nq=170\nq=170\nq=7\n");
 }
 
+// An interface more than one top instantiates, with a member one top forces: every
+// instance of the type carries the state, so the other top's writes, through a handle
+// and directly, land in its own unforced instance. Matches iverilog 13 on the same
+// design with the handle accesses written as `b.`.
+TEST_CASE("force: an interface member forced under one top, written under another") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+            logic [7:0] r = 0;
+        endinterface
+        module top1;
+            bus b();
+            initial begin
+                b.q <= 8'd1;
+                force b.q = 8'hAA;
+                #1 $display("top1 q=%0d", b.q);
+            end
+        endmodule
+        module top2;
+            bus b();
+            virtual bus vb;
+            initial begin
+                vb = b;
+                vb.q <= 8'd5;
+                b.r <= 8'd6;
+                #2 $display("top2 q=%0d r=%0d", b.q, b.r);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "top1 q=170\ntop2 q=5 r=6\n");
+}
+
+// A package variable forced by one top and written by another: the state is the
+// package's, so the writer under the other top is gated by it. Matches iverilog 13.
+TEST_CASE("force: a package variable forced under one top gates a writer under another") {
+    constexpr std::string_view src = R"(
+        package pkg;
+            logic [7:0] v = 0;
+        endpackage
+        module top1;
+            import pkg::*;
+            initial begin
+                #1 force v = 8'hAA;
+                #4 $display("v=%0d", v);
+                release v;
+                #4 $display("v=%0d", v);
+                $finish;
+            end
+        endmodule
+        module top2;
+            import pkg::*;
+            logic clk = 0;
+            always #2 clk = ~clk;
+            always @(posedge clk) v <= v + 1;
+        endmodule)";
+    CHECK(run_capture_finish(src) == "v=170\nv=171\n");
+}
+
+// A package function writing a forced package variable: the function lowers on the
+// package's Lowerer, before any top, and is gated all the same. Matches iverilog 13.
+TEST_CASE("force: suppresses a package function's write of a forced package variable") {
+    constexpr std::string_view src = R"(
+        package pkg;
+            logic [7:0] v = 0;
+            function automatic void bump();
+                v = v + 1;
+            endfunction
+        endpackage
+        module top;
+            import pkg::*;
+            initial begin
+                bump();
+                force v = 8'hAA;
+                bump();
+                #1 $display("v=%0d", v);
+                release v;
+                bump();
+                #1 $display("v=%0d", v);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "v=170\nv=171\n");
+}
+
+// A class static property is a variable (LRM 8.9), so a force overrides its writes
+// until the release (LRM 10.6.2). No oracle: iverilog 13 does not parse `C::s` as a
+// force target; the expected values follow from 10.6.2.
+TEST_CASE("force: a class static property") {
+    constexpr std::string_view src = R"(
+        class C;
+            static logic [7:0] s = 0;
+        endclass
+        module top;
+            initial begin
+                C::s = 8'd3;
+                force C::s = 8'hAA;
+                C::s = 8'd4;
+                #1 $display("s=%0d", C::s);
+                release C::s;
+                C::s = 8'd5;
+                #1 $display("s=%0d", C::s);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "s=170\ns=5\n");
+}
+
 // Two independent forced variables do not interfere.
 TEST_CASE("force: independent targets") {
     constexpr std::string_view src = R"(
@@ -1385,25 +1492,6 @@ TEST_CASE("force: a force inside a task or function that no procedural block reg
         const std::string err = lower_error(src);
         CHECK_MESSAGE(err.find("inside a task or function") != std::string::npos, err, " for ", src);
     }
-}
-
-// A forced interface member gets its state in every instance of the interface's type,
-// which a handle may name; an instance under another top is lowered by another pass, so
-// the design is refused, whichever top is lowered first (docs/TODO.md). No oracle: the
-// LRM allows it.
-TEST_CASE("force: a member of an interface more than one top instantiates is rejected") {
-    constexpr std::string_view src = R"(
-        interface bus;
-            logic [7:0] q = 0;
-        endinterface
-        module top1;
-            bus b();
-            initial force b.q = 8'hAA;
-        endmodule
-        module top2;
-            bus b();
-        endmodule)";
-    CHECK(lower_error(src).find("which more than one top instantiates") != std::string::npos);
 }
 
 // The boundary of that refusal: a variable that a procedural block also forces is forceable, so

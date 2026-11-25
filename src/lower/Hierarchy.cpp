@@ -687,8 +687,8 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     // Every instance is collected: a target named from outside its instance is
     // now known, and no instance has been emitted yet.
     join_disable_targets();
-    // Every instance is collected: give each forced or assigned variable, and each
-    // twin of it, its state, before Classify or Emit appends to any instance.
+    // Every instance is collected: give each instance's forced or assigned members
+    // their state, before Classify or Emit appends to any instance.
     join_pca_targets();
     // Between the passes: Collect has just enumerated every assertion and
     // said whether the design calls an LRM 20.12 control task, and the
@@ -789,6 +789,9 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
     for (const CompilationUnitSymbol* unit : root.compilationUnits) {
         register_global_scope_signals(*unit);
     }
+    // Before any initializer or body lowers, so a write of a forced package
+    // variable is gated wherever it is.
+    alloc_unscoped_pca_states();
     for (const PackageSymbol* pkg : comp.getPackages()) {
         init_global_scope_signals(*pkg);
     }
@@ -940,19 +943,16 @@ void Lowerer::lower_members(const Scope&       scope,
                 break;
             case SymbolKind::ProceduralBlock:
                 // Collect: enumerate the concurrent assertions / control tasks the
-                // block holds (LRM 20.12, see scan_assert_control), label the named
-                // blocks a `disable` targets (LRM 9.6.2, see scan_disable_targets),
-                // and note the variables a `force` / `assign` targets (LRM 10.6),
-                // which join_pca_targets gives their state once every instance is
-                // collected: a `force u.v` ahead of `sub u();` names a signal
-                // Collect has not registered yet.
+                // block holds (LRM 20.12, see scan_assert_control), and label the
+                // named blocks a `disable` targets (LRM 9.6.2, see
+                // scan_disable_targets). A variable a `force` / `assign` targets
+                // was found design-wide before anything lowered (scan_pca_targets).
                 //
                 // Classify: register a net `force` site, which needs the net
                 // resolution facts Collect finalizes (finalize_sim_nets).
                 if (pass == Pass::Collect) {
                     scan_assert_control(m.as<ProceduralBlockSymbol>());
                     scan_disable_targets(m.as<ProceduralBlockSymbol>());
-                    record_pca_var_sites(m.as<ProceduralBlockSymbol>().getBody());
                 } else if (pass == Pass::Classify) {
                     scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
                 } else if (emit) {
