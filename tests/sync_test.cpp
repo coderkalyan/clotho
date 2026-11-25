@@ -764,13 +764,33 @@ TEST_CASE("mailbox: the typeless mailbox is refused by its own name") {
             .find("the typeless std::mailbox (LRM 15.4.9) is not supported") != std::string::npos);
 }
 
-// An event element would leak one sync object per `put`: rt_queue_push_back
-// constructs the element before copying it, and constructing an event element mints
-// a new object (LRM Table 6-7) that the copy then overwrites -- and event objects
-// are never freed.
-TEST_CASE("mailbox: a mailbox of events is refused") {
-    CHECK(fails("module t; mailbox #(event) m; initial m = new(); endmodule")
-            .find("a mailbox of events is not supported") != std::string::npos);
+// An event message is a handle: `get` returns the event that was put, so
+// triggering what came out wakes a waiter parked on what went in (LRM 15.5.5).
+TEST_CASE("mailbox: an event message is the handle that was put") {
+    const std::string out = run_capture(R"(
+        module t;
+          mailbox #(event) mb;
+          event a, got;
+          int   woke;
+          initial begin
+            mb = new;
+            fork
+              begin
+                @(a);
+                woke = 1;
+              end
+            join_none
+            #1;
+            mb.put(a);
+            mb.get(got);
+            $display("same=%0d num=%0d", got == a, mb.num());
+            -> got;
+            #1;
+            $display("woke=%0d", woke);
+          end
+        endmodule
+    )");
+    CHECK(out == "same=1 num=0\nwoke=1\n");
 }
 
 // -- what is still refused ------------------------------------------------------

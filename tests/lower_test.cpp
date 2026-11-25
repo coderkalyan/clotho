@@ -1026,23 +1026,24 @@ TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
     // guard as a direct declaration, not silently accept it (PRINCIPLES.md). (`event`,
     // `chandle`, `class`, a virtual interface, an associative array with a
-    // class-handle value and one with an EVENT value, and an associative array
-    // keyed by a chandle / event / virtual interface / unpacked union, were all
-    // prior examples here; every one of them lowers now.) `mailbox #(T)` bound to
-    // T = event stands in as the still-unsupported type, reached THROUGH the type
-    // parameter rather than written directly: an event ELEMENT's construction
-    // mints a new sync object (LRM Table 6-7), which mailbox's copy-in would
-    // overwrite and leak (lower/BuiltinClasses.cpp, lower_mailbox_class).
+    // class-handle value and one with an EVENT value, an associative array
+    // keyed by a chandle / event / virtual interface / unpacked union, and a
+    // mailbox of events were all prior examples here; every one of them lowers
+    // now.) `mailbox #(T)` bound to T = a virtual interface stands in as the
+    // still-unsupported type, reached THROUGH the type parameter rather than
+    // written directly: a virtual interface is not a container element type.
     const LowerResult r = lower_text(R"(
+        interface ifc;
+        endinterface
         module m #(parameter type T = int);
             mailbox #(T) v;
         endmodule
         module top;
-            m #(.T(event)) u();
+            m #(.T(virtual ifc)) u();
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("a mailbox of events is not supported") != std::string::npos);
+    CHECK(r.diagnostic_text().find("mailbox message element type is not supported") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {

@@ -698,13 +698,12 @@ Ranked by how much damage a naive implementation does.
    message while suspended (§6.3(2)). The op must be a distinct instruction from the
    retest, so the poll interposes.
 5. **`mailbox #(event)` mints and abandons an object per `put`.** `rt_queue_push_back`
-   calls `rt_elem_init` before `rt_elem_copy`, and for `rt_elem_event` init is *not*
-   a proto copy — it calls `rt_event_new()` (LRM Table 6-7's "a new event",
-   `runtime/Containers.cpp, rt_elem_init`) — then copy overwrites the handle
-   (`rt_elem_copy`). Since event objects are never freed
-   (`Runtime.h:1399-1404`), every `put` leaks one. Either refuse
-   `mailbox #(event)` loudly in the first cut, or add an init-skipping push path;
-   refusing is the first cut's answer, with the TODO naming this hazard.
+   constructs the element before copying into it, and constructing an
+   `rt_elem_event` is *not* a proto copy — it allocates an event object (LRM Table
+   6-7's "a new event") — then the copy overwrites the handle. The abandoned object
+   is garbage the collector reclaims, so this is a cost and not a leak, and
+   `mailbox #(event)` is accepted. It was refused while event objects were never
+   freed. An init-skipping push path would remove the cost.
 6. **A moving collector would dangle the queue headers.** The node stores `q_head` /
    `q_tail` as raw interior pointers into the object body. Evacuation would move the
    body. Same class as `process-class.md` hazard 8 (a PCB pointer cached across a
@@ -792,8 +791,8 @@ keeps the ungated IR byte-identical for designs that do not use the feature.
   semantics against the LRM.
 - **P2 — `mailbox #(T)`, non-blocking half.** `new`, `num`, `try_put`, `try_get`,
   `try_peek`, plus the payload matrix (int, string, class handle, unpacked struct,
-  nested queue) and the `mailbox #(event)` refusal. No waiting, so no new substrate
-  risk; parallelizable with P1 once P0 lands.
+  nested queue). No waiting, so no new substrate risk; parallelizable with P1
+  once P0 lands.
 - **P3 — `mailbox #(T)`, blocking half.** `put`, `get`, `peek`, the three wait
   queues, the `peek` exemption, and the process/`disable` interop tests.
 - **P4 — the typeless mailbox** (§8): `rt_elem_dyn`, the run-time type identity, the
@@ -847,7 +846,7 @@ class body.
 | every `semaphore` availability case, `num()`, `try_*` returns, typed payload round-trips, bounded `put` blocking and resumption, `peek` on empty then filled, handle identity through a mailbox | Verilator 5.050 |
 | FIFO / head-of-line: three waiters served in arrival order; a later small request not bypassing a blocked larger one; `put(3)` waking two one-key waiters in order | **LRM 15.3.3 + Accellera Interpretation #1 only** — Verilator deviates |
 | `peek` unblocking behind a blocked `get` (15.4.7 vs 15.4.5) | LRM only (§15 records the reading) |
-| negative `bound` fatal, typeless-mailbox refusal, `mailbox #(event)` refusal, derivation refusal | clotho-specific; LRM 15.4.1 for the first |
+| negative `bound` fatal, typeless-mailbox refusal, derivation refusal | clotho-specific; LRM 15.4.1 for the first |
 | kill / `disable fork` / `suspend` / `resume` of a blocked waiter | LRM 9.7 + `process-class.md` only |
 
 Regardless of oracle, the suite owes:
@@ -874,7 +873,7 @@ Regardless of oracle, the suite owes:
   either class.
 - **The refusal messages, each by its own name**: `weak_reference` still refused
   after the guard narrows; the typeless mailbox by its own message; the
-  `mailbox #(event)` and derivation refusals; a non-admissible `T` reporting through
+  derivation refusal; a non-admissible `T` reporting through
   `guard_container_element`'s existing text.
 
 ---

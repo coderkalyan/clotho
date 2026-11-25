@@ -531,7 +531,6 @@ Milestones, in order; lower ones unblock higher ones:
   action block runs on the monitor's thread, not one of its own.
 - [ ] **Typeless mailbox** (15.4.9) — `dynamic_type` needs a dynamically typed element and a
   run-time type identity for the `get` check and `try_get`'s negative return.
-- [ ] **`mailbox #(event)`** — an event-typed message.
 - [ ] **Class derived from `semaphore` or `mailbox`** — extending a built-in class.
 - [ ] **`std::weak_reference`** (8.30) — the class is refused.
 - [~] **Clocking blocks** (14) — open pieces of clocking-block support.
