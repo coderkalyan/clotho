@@ -1129,6 +1129,7 @@ set(CLOTHO_TEST_SOURCES
   tests/array_locator_test.cpp
   tests/class_test.cpp
   tests/gc_test.cpp
+  tests/gc_model_test.cpp
   tests/unbased_test.cpp
   tests/preprocess_test.cpp
   tests/interface_test.cpp
