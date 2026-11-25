@@ -862,10 +862,14 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     std::optional<ir::FunctionId> pass_body;
     std::optional<ir::FunctionId> fail_body;
     if (act.pass != nullptr) {
-        pass_body = build_action_body(*act.pass, "sva.pass");
+        pass_body = build_action_body(*act.pass, "sva.pass",
+                                      mon.kind == ir::AssertionKind::Expect ? std::optional<uint32_t>(id) : std::nullopt);
     }
     if (verdicts) {
-        fail_body = act.fail != nullptr ? build_action_body(*act.fail, "sva.fail") : build_default_fail_body(mon);
+        fail_body = act.fail != nullptr
+                      ? build_action_body(*act.fail, "sva.fail",
+                                          mon.kind == ir::AssertionKind::Expect ? std::optional<uint32_t>(id) : std::nullopt)
+                      : build_default_fail_body(mon);
     }
 
     // The $past rings this monitor needs, filled in on demand while the roots
@@ -1539,7 +1543,12 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     if (mon.kind == ir::AssertionKind::Expect) {
         // After the pends, so an expect's own action block reaches the reactive
         // ring before the process whose statement it belongs to.
-        emit_expect_step(st, id, seeding, active, any_verdict(report_pass, report_fail, b, l), b, l);
+        // A verdict whose action block the user wrote is woken by that block at its end (LRM 16.17).
+        const std::vector<ir::Index> none;
+        emit_expect_step(st, id, seeding, active, any_verdict(report_pass, report_fail, b, l),
+                         any_verdict(act.pass != nullptr ? none : report_pass,
+                                     act.fail != nullptr ? none : report_fail, b, l),
+                         b, l);
     }
 
     // Last in the body, after every root above has read the pre-shift rings.
@@ -2032,7 +2041,10 @@ void Lowerer::emit_counted_step(const ir::AssertionMonitor& mon,
         const ir::Index any_match = mask_any(matches, b, l);
         const ir::Index any_fail  = mask_any(failures, b, l);
         const ir::Index verdict   = b.binary(ir::Inst::Tag::Bor, any_match, any_fail, l);
-        emit_expect_step(st, id, seeding, active, verdict, b, l);
+        const ir::Index wake_match = act.pass != nullptr ? zero_mask(1, b, l) : any_match;
+        const ir::Index wake_fail  = act.fail != nullptr ? zero_mask(1, b, l) : any_fail;
+        emit_expect_step(st, id, seeding, active, verdict,
+                         b.binary(ir::Inst::Tag::Bor, wake_match, wake_fail, l), b, l);
     }
 
     // Last in the body, for emit_monitor's reason: every root above has already
@@ -2199,6 +2211,7 @@ void Lowerer::emit_expect_step(const MonitorState& st,
                                ir::Index           seeding,
                                ir::Index           active,
                                ir::Index           verdict,
+                               ir::Index           wake,
                                ir::Builder&        b,
                                ir::SourceLoc       l) {
     const ir::Index started = b.binary(ir::Inst::Tag::Band, active, seeding, l);
@@ -2233,7 +2246,8 @@ void Lowerer::emit_expect_step(const MonitorState& st,
     const ir::Index busy_next  = b.binary(ir::Inst::Tag::Band, busy_now, unresolved, l);
     b.binary(ir::Inst::Tag::Store, busy_lv, busy_next, l);
 
-    b.expect_wake(resolved, id, l);
+    // The waiters of a verdict whose user action block runs are woken by that block, at its end.
+    b.expect_wake(b.binary(ir::Inst::Tag::Band, active, wake, l), id, l);
 }
 
 // Whether any of these verdict bits is set: one cycle's verdicts folded into

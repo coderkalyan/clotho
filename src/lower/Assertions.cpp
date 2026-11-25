@@ -1794,7 +1794,9 @@ void Lowerer::require_finish_inlinable(const Statement& action) {
 // (scope_ / prefix_ / time_mul_ unchanged) so the body's references to the
 // enclosing module's signals still resolve. It takes no formals because there
 // is nothing to pass -- the verdict that pends it is the whole input.
-ir::FunctionId Lowerer::build_action_body(const Statement& body, std::string_view name) {
+ir::FunctionId Lowerer::build_action_body(const Statement&        body,
+                                          std::string_view        name,
+                                          std::optional<uint32_t> expect_monitor) {
     const ir::FunctionId id = module_.reserve_function(module_.pool.void_type);
 
     FnCtx ctx;
@@ -1815,6 +1817,12 @@ ir::FunctionId Lowerer::build_action_body(const Statement& body, std::string_vie
         failure = e;
     }
     const ir::SourceLoc el = loc(body);
+    // The action block of an `expect` is part of the statement (LRM 16.17 [unverified wording]):
+    // the process blocked on it resumes when the block has finished, which may be after the block
+    // suspended, so the block wakes the waiters at its end rather than the monitor at the verdict.
+    if (expect_monitor.has_value()) {
+        b.expect_wake(true_const(b, el), *expect_monitor, el);
+    }
     b.ret_void(el);
 
     module_.set_function(id,

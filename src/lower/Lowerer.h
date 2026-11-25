@@ -2646,7 +2646,8 @@ private:
 
     void require_finish_inlinable(const Statement& action);
 
-    ir::FunctionId build_action_body(const Statement& body, std::string_view name);
+    ir::FunctionId build_action_body(const Statement& body, std::string_view name,
+                                     std::optional<uint32_t> expect_monitor = std::nullopt);
 
     ir::FunctionId build_default_fail_body(const ir::AssertionMonitor& mon);
 
@@ -3072,6 +3073,7 @@ private:
                           ir::Index           seeding,
                           ir::Index           active,
                           ir::Index           verdict,
+                          ir::Index           wake,
                           ir::Builder&        b,
                           ir::SourceLoc       l);
 
