@@ -1,16 +1,19 @@
 # Scheduler trace and rule checker
 
-Status: phase 1 landed (2026-11-25): `spawn`, `park`, `wake`, `dispatch`, `resume`, `end`
-and `slot`, the control table, and the R5 checks (wake, dispatch, resume, end), in
-`src/runtime/TraceCheck.cpp`; `region`, `nba`, `pend`, `trigger`, `finish` and `change` events
-and their rules are phases 2-4. Measured at landing (Debug, extra asserts, `ctest -j2`, one
-run each at load ~11): 268 s with the checker, 290 s with `CLOTHO_NO_TRACE_CHECK=1`, no
-violation in 114 test files; a Release build without extra asserts has no `rt_trace` symbol.
-Reintroducing B51 locally is reported as R5.1 at t=3; `p.kill()` of an always parked at its
-static control (S1 x R23) is not reported, because the force wake is a legal wake. Step 3 of the plan in
-`scheduler-rules.md` §1. R, S and B ids are that document's §3, §2 and §4, and its caveat
-applies: no rule is checked against the LRM text, and clauses are cited only as the code
-and `docs/LRM_NOTES.md` cite them.
+Status: phases 1 and 2 landed (2026-11-25). Phase 1: `spawn`, `park`, `wake`, `dispatch`,
+`resume`, `end` and `slot`, the control table and the R5 checks. Phase 2: `region`, `nba_create`
+(`nba_stage` and `nba_release` for timed updates), `nba_pass`, `pend`, `trigger`, `slot_end` and
+`finish`, and the checks of R12, R20 and R24; `change` and its rules are phases 3-4, all in
+`src/runtime/TraceCheck.cpp`. Measured (Debug, extra asserts, `ctest -j2`, load ~7): 226 s and
+230.6 s with the checker, 221 s with `CLOTHO_NO_TRACE_CHECK=1` (+2%, inside the 15% budget); no
+violation in 5429 in-process runs, every staging path created at least once. With the fixes
+reverted locally, the regression tests of B42 (R12.2), B38 (R12.1), B41 (R20.2), B21 (R20.1) and
+B37 (R24.2) fail with the rule named; B40 is covered by a hand-built sequence only. The Release
+build without extra asserts was not rebuilt for phase 2. `cli_test` ("-G overrides a type
+parameter") fails independent of the trace. Reintroducing B51 is reported as R5.1 at t=3.
+Step 3 of the plan in `scheduler-rules.md` §1. R, S and B ids are that document's §3, §2 and §4,
+and its caveat applies: no rule is checked against the LRM text, and clauses are cited only as
+the code and `docs/LRM_NOTES.md` cite them.
 
 The generated code and the runtime report each scheduling event to a checker in the
 runtime, which tests the rules of §3 as predicates over those events while the run goes
@@ -58,11 +61,13 @@ that first emits it.
 | `resume` | a, C | the resume block that `emit_suspend` creates | 1 |
 | `end` | a | the final suspend: `coro.final` in `lower_group` and `lower_task` | 1 |
 | `slot` | time | `runtime/Scheduler.cpp:rt_wheel_advance` (and the seed, for time 0) | 1 |
-| `region` | the region entered | blocks of `emit_active_run`: `inactive.promote`, Observed, `reactive.check`, `re_inactive.promote`, Postponed, `wheel.posttick`, and `active.check` each time control returns to it | 2 |
-| `nba_create` | target (storage address or element pointer), bytes and mask as stored, `gated`, moment and arm seq | when an update is created: `Stores.cpp:lower_store_nb`, `emit_array_nba`, `emit_agg_nba`; a zero-delay `<=` in `emit_intra_nba_arm` (not from `emit_intra_nba_ordered`, whose copy restates an update already created); a timed update at release, in `runtime/Scheduler.cpp:rt_intra_cb` and `rt_intra_event_fire` (not `rt_inertial_cb`: S26 is Active, not NBA) | 2 |
-| `nba_pass` | begin, end, region | entry to and exit from `Stores.cpp:emit_nba_commit` | 2 |
-| `pend`, `trigger` | event object; `->` or `->>` | `Events.cpp:emit_event_pend`, `build_event_delay_thunk` (the expiry of `->> #d`); `emit_event_fire`, where every trigger converges | 2 |
-| `finish` | a | `runtime/Scheduler.cpp:rt_finish_coop` | 2 |
+| `region` | the region entered | blocks of `emit_active_run`, on the edges that enter them and not on each activation's trip round the drain loop: `active.check`, `inactive.promote`, Observed, `reactive.check`, `re_inactive.promote`, Postponed and `wheel.posttick`; a region with no code emits none. `rt_sim_run` marks the start of the finals | 2 |
+| `nba_create` | the target's planes (storage addresses), the bits and mask as stored, `gated`, the staging path | when a statement creates an update: `Stores.cpp:lower_store_nb`, `emit_array_nba`, `emit_agg_nba` (one per statement, whichever way it stages); a zero-delay `<=` in `emit_intra_nba_arm` (not from `emit_intra_nba_ordered`, whose copy restates an update already created) | 2 |
+| `nba_stage`, `nba_release` | the same planes, keyed by the record; the release moment | a timed update is created when its record is released: `emit_intra_nba_arm` and `emit_intra_event_arm` report its planes when they arm it, and `runtime/Scheduler.cpp:rt_intra_cb` and `rt_intra_event_fire` create it (not `rt_inertial_cb`: S26 is Active, not NBA). The arm order is the checker's own count of the stages | 2 |
+| `nba_pass` | begin, end, region | entry to and exit from `Stores.cpp:emit_nba_commit`, the NBA region's pass and the Re-NBA region's | 2 |
+| `pend`, `trigger` | event object; `->` or `->>` | `Events.cpp:emit_event_pend`, where the object links onto the chain (the expiry thunk of `->> #d` and a detached `->> @(x)` come through it); `emit_event_fire`, where every trigger converges: `->` reports as `->`, every form of `->>` as `->>` | 2 |
+| `slot_end` | | `runtime/Scheduler.cpp:rt_wheel_advance`, on entry: every region is empty | 2 |
+| `finish` | | `runtime/Scheduler.cpp:rt_finish_coop`, which does not know which activation finishes | 2 |
 | `change` | x; bit 0 old and new (0, 1, x, z); `changed`; the facts the code computed; path | inside the store brackets: `Events.cpp:service_wait_queue`, `service_change_notify`, `service_wide_window`, `service_any_waiters`; `Containers.cpp:str_chg_after`, `notify_container_mutation` | 3 |
 
 Fork, join, `disable` and `kill` need no kinds of their own: a fork is a `spawn` per child
@@ -127,9 +132,9 @@ the same event.
 
 | Rule | Predicate | Cannot see | Would have caught |
 |---|---|---|---|
-| **R12**, phase 2 | For each NBA pass take U: the updates created and not yet applied when it began (one created during the pass waits for the next, B42). Order U by creation: a plain NBA when it executes, a timed one when released, one release moment's records in arm order. For each target x in U that takes no gated NBA (`StoreNbGated`, a forceable variable: R14's), x at `nba_pass` end must equal x at begin with U's masked stores of x applied in that order. At `slot`, no created update may be left unapplied. | values inside a pass (R8: B48, B49); strings and containers; updates a `$finish` leaves staged; the orders LRM_NOTES 51 leaves open (Clotho's reading is enforced); a wrong value or mask at creation (only order is checked) | B9, B22, B38, B40, B42; B12's NBA half if the virtual-interface staging reports the bound instance |
-| **R20**, phase 2 | A `->>` trigger happens only inside an NBA or Re-NBA pass of the slot its `pend` was made in, and one pass fires its triggers in `pend` order. At `slot` no `pend` is left unfired. | whom the trigger wakes (R5, R6) | B21, B41 (B20 already aborts on the wheel's assertion) |
-| **R24**, phase 2 | After `finish`, no `dispatch` of anything but a `final` body, and no `change`, `nba_create`, `pend`, `trigger` or `wake`, until `rt_sim_run` starts the finals. | code that runs on and only prints | B37; B19 and B34 wherever the code that ran on stored, staged, triggered or woke |
+| **R12**, phase 2 | For each NBA pass take U: the updates created and not yet applied when it began, ordered by creation: a plain NBA when it executes, a timed one when released, one release moment's records in arm order. For each plane x written by U that takes no gated NBA (`StoreNbGated`, a forceable variable: R14's) and whose bits the trace knows, x at `nba_pass` end must equal x at begin with U's masked stores applied in that order, followed by a prefix of the updates released during the pass: the commit of a record's own site may or may not have reached what the pass's own wake released (B42), so the checker takes the longest prefix the bytes allow, an update that changed nothing counting as applied, and the rest wait for the next pass. Nothing the Active set created is left unapplied at the entry of Observed, Reactive or Re-Inactive, and nothing at all at the entry of Postponed and at `slot_end`; a pass begins from the Active region (the Re-NBA pass from Reactive), and no statement creates an update inside one. | values inside a pass (R8: B48, B49); strings and containers; updates a `$finish` leaves staged; planes the backend does not spill (a runtime-offset select of a very wide vector, a plane over 1024 bits); the orders LRM_NOTES 51 leaves open (Clotho's reading is enforced); a wrong value or mask at creation (only order is checked); which occurrences made a release moment (the scheduler's count, until phase 3's `change`) | B9, B22, B38, B40, B42; B12's NBA half if the virtual-interface staging reports the bound instance |
+| **R20**, phase 2 | A `->>` trigger happens only inside an NBA or Re-NBA pass, and each trigger is of the oldest event pended and not yet triggered: a pass triggers in `pend` order, and an event is on the chain once. At `slot_end` and at the entry of Postponed nothing pended is untriggered (the Active set's at Observed and Reactive too). A `->>` form that fires its event itself, outside a pass, reports as a `->>` trigger and breaks the first clause. | whom the trigger wakes (R5, R6) | B21, B41 (B20 already aborts on the wheel's assertion) |
+| **R24**, phase 2 | After `finish`, until `rt_sim_run` starts the finals: no `nba_create` or `nba_stage`, `pend` or `trigger`; a `wake` only by the completion that makes a frame leave (`child`, `callee`, `await`); a `dispatch` only from a ring and only of an activation such a wake queued after the finish, which resumes at its call or join and leaves through its own epilogue. An activation queued before the finish is never dispatched (`lower_finish` empties the ring), and none starts inline or runs once. | code that runs on and only prints, up to its next store, wake or trigger (a `park` is the exit's own: a thunk group re-arms after its body returns) | B37; B19 and B34 wherever the code that ran on stored, staged, triggered or woke |
 | **R6**, phase 3 | **R6a:** after `change(x)` or `trigger(o)`, every `Parked(C)` with an entry the change satisfies (matched on the checker's own bit-0 ranks, not the code's facts) gets a `wake` before the next `dispatch`, `park` or `region`. **R6b:** at each `slot`, a still `Parked(C)` whose entry (x, e) is satisfied by x's change from its bytes at the park to its bytes now is a violation. R6b reads design memory, so it sees stores no bracket reports, and signals the code skipped (S19). | a change that reverts within the slot on an unbracketed path; content behind a handle (B16: a container mutation, with an empty list from the frontend); the `$readmem` and `ref` gaps (`scheduler-rules.md` §5.2), known entries until fixed | B7, B8, B25 (R6b); B12's wake half |
 | **R7**, phase 3 | Each fact in `change(x)` equals Table 9-2 on the old and new bit 0, ranking 0 < x = z < 1: `pos` when the rank rises, `neg` when it falls, only 0 and 1 for a 2-state slot. `changed` equals "a plane or the z word differs". | a skipped fact (S19: R6b) | B5 |
 | **Later**, phases 4–5 | R14 (needs the override stores marked in the IR: B10, B26, B33, B35, B47); R15 and R17 at slot 0 (B2, B24); R2; R11 and R16; R22; R23 with block occupancy (B27, B29); R25 (B39); S9 member runs (B15); R8 and R9 once `nba-glitch` merges (B48–B50); R26 | | |
@@ -242,7 +247,9 @@ bug "always parks at an intra-body event control" R5.1 B51: the leading control'
 - A listed test that runs without violating its rule fails the run, so the list does not
   outlive its cause.
 - After its summary the suite prints `trace check: N runs, E events, P parks, W wakes, V
-  violations (K known)`, so a checker that stopped emitting shows as zero counts.
+  violations (K known)` and a line with the NBA updates created by each staging path, the NBA
+  passes, the pends, the triggers and the finishes, so a checker that stopped emitting shows as
+  zero counts.
 
 ## 7. Phases
 

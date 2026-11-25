@@ -285,6 +285,10 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
 
 extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
     // The record base is the timer (timer at offset 0), so recover it by cast.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The update this record armed is created now (docs/design/scheduler-trace.md, `nba_create`).
+    rt_trace_nba_release(timer, RT_TRACE_NBA_TIMER, 0);
+#endif
     intra_ready_push(reinterpret_cast<rt_intra_rec*>(timer));
 }
 
@@ -465,6 +469,10 @@ extern "C" void rt_intra_event_fire(uint32_t trig_id) {
         if (e.weak) {
             rt_gc_range_add(rec, intra_sites[rec->idx].stride);
         }
+#ifdef CLOTHO_EXTRA_ASSERTS
+        // The occurrence that matured the record is a moment of its own (rt_intra_moment).
+        rt_trace_nba_release(rec, RT_TRACE_NBA_EVENT, intra_moment);
+#endif
         intra_ready_push(rec); // last awaited edge -> commit this instant
         // First fire wins: this record is done, so take it off every OTHER trigger
         // it was listed on. Skipping `trig_id` is what keeps the loop above stable.
@@ -636,6 +644,10 @@ volatile std::sig_atomic_t g_interrupt = 0;
 
 extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
     RuntimeWheel& w = *unwrap(wheel);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Every region is empty: nothing may be left staged for one that has passed (R12, R20).
+    rt_trace_slot_end();
+#endif
     // The boundary between two time steps: the one that just settled is complete
     // and sampled, and nothing of the next has run. It is the only point a run can
     // be ended from outside the design without leaving a step half done, so it is
@@ -806,6 +818,9 @@ void finish_report(const char* banner, uint64_t now, int32_t arg) {
 } // namespace
 
 extern "C" void rt_finish_coop(const char* banner, uint64_t now, int32_t arg) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    rt_trace_finish();
+#endif
     finish_report(banner, now, arg);
     rt_finishing = 1;
     // Returns. The caller is a JIT'd body, which leaves through its own
@@ -1188,6 +1203,10 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
             // As a $finish at the stop time would, the finals follow the report.
             report_halt("clotho: stopped at --stop-time ");
         }
+#ifdef CLOTHO_EXTRA_ASSERTS
+        // The finals run: what a `$finish` held back it holds back no longer (R24).
+        rt_trace_region(RT_TRACE_REG_FINAL);
+#endif
         finals(state, wheel);
     }
 #ifdef CLOTHO_EXTRA_ASSERTS
