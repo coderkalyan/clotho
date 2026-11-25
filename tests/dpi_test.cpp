@@ -1011,8 +1011,7 @@ TEST_CASE("DPI scope: names resolve for nested scopes, and svSetScope swaps") {
     constexpr std::string_view src = R"(
         module inner;
           import "DPI-C" context function string c_here();
-          string s;
-          initial s = c_here();
+          // Never called: its scope is registered all the same (LRM H.9.3).
         endmodule
         module outer;
           inner i();

@@ -904,11 +904,23 @@ void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp, bool coll
     std::vector<DpiExportDecl> decls = std::move(dpi_export_decls_);
     dpi_export_decls_.clear();
     if (collect_globals) {
+        const auto declare_context_imports = [&](const Scope& s) {
+            for (const Symbol& m : s.members()) {
+                if (m.kind == SymbolKind::Subroutine) {
+                    const auto& sub = m.as<SubroutineSymbol>();
+                    if (sub.flags.has(MethodFlags::DPIImport) && sub.flags.has(MethodFlags::DPIContext)) {
+                        (void)function_id(sub);
+                    }
+                }
+            }
+        };
         for (const slang::ast::PackageSymbol* pkg : comp.getPackages()) {
             scan_dpi_exports(*pkg, decls);
+            declare_context_imports(*pkg);
         }
         for (const slang::ast::CompilationUnitSymbol* unit : comp.getCompilationUnits()) {
             scan_dpi_exports(*unit, decls);
+            declare_context_imports(*unit);
         }
     }
     // The first export of each c_identifier so far (earlier tops included): every other

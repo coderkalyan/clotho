@@ -1083,6 +1083,13 @@ void Lowerer::lower_members(const Scope&       scope,
                 if ((pass == Pass::Collect || emit) && is_iface_body_subroutine(m.as<SubroutineSymbol>())) {
                     recover([&] { declare_interface_statics(m.as<SubroutineSymbol>(), pass == Pass::Collect); });
                 }
+                // A `context` import registers its scope (LRM 35.5.3, H.9.3:
+                // svGetScopeFromName finds "an arbitrary function declaration"), called
+                // or not, so it is lowered with its scope rather than on demand.
+                if (emit && m.as<SubroutineSymbol>().flags.has(MethodFlags::DPIImport) &&
+                    m.as<SubroutineSymbol>().flags.has(MethodFlags::DPIContext)) {
+                    recover([&] { (void)function_id(m.as<SubroutineSymbol>()); });
+                }
                 break;
             // Known-inert members: elaboration artifacts and declarations
             // that bear no simulation behavior of their own. Ports are wired
