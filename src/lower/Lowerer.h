@@ -2006,7 +2006,8 @@ private:
 
     void reject_concat_resolved_driver(const Expression& lhs);
 
-    void store_driver_slot(const Expression& left,
+    void store_driver_slot(ir::Signal        net,
+                           const Expression& left,
                            ir::Signal        slot,
                            ir::Index         val,
                            const Expression* delay_expr,

@@ -160,13 +160,10 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Continuous assignment delay** (10.3.3) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — `assign #(r, f)` and `assign #(r, f, t)`.
   - [ ] **Delay on a select, concatenation or aggregate target**.
-  - [ ] **Delay on a partial driver of a resolved net** — its slot powers up all-x, so the
-    undriven bits would fold as x instead of z.
 - [~] **Gate delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — `#(r, f)` and `#(r, f, t)` on any gate or
     switch, including `cmos` / `rcmos` and the turn-off delay of tri-state gates (28.6).
   - [ ] **Delayed gate with a bit-addressed output on a single-driver net**.
-  - [ ] **Delayed gate as a partial driver of a resolved net**.
 - [~] **Net delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
     declaration assignment `wire #(r, f) w = e;` (10.3.3).

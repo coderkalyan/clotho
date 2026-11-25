@@ -982,7 +982,8 @@ void Lowerer::reject_concat_resolved_driver(const Expression& lhs) {
 // transitions inertially and emit_wire_resolvers re-folds when any slot
 // changes. Delaying the resolved net instead would smear every driver's
 // timing together, so the delay always rides this slot store.
-void Lowerer::store_driver_slot(const Expression& left,
+void Lowerer::store_driver_slot(ir::Signal        net,
+                                const Expression& left,
                                 ir::Signal        slot,
                                 ir::Index         val,
                                 const Expression* delay_expr,
@@ -994,15 +995,35 @@ void Lowerer::store_driver_slot(const Expression& left,
         return;
     }
     if (!is_whole_net_lvalue(left)) {
-        // A partial driver's slot carries a Z background in the bits it does
-        // not drive, but a slot powers up all-x and a delayed driver does not
-        // write it until `now + d` — so the undriven bits would fold as x for
-        // the whole initial window instead of z. iverilog (`assign #5 v[1:0]`
-        // beside `assign v[3:2]`) shows `v=11xx` there, which needs a Z-seeded
-        // slot power-up value Clotho has no representation for.
-        // TODO: delayed partial driver of a multiply-driven net — seed the
-        // slot's power-up value with the Z background.
-        fail("delay on a partial driver of a multiply-driven (resolved) net is not supported");
+        // A partial driver's slot carries a Z background in the bits it does not
+        // drive, but a slot powers up all-x and a delayed driver does not write it
+        // until `now + d`, so the undriven bits would fold as x for the whole
+        // initial window instead of z (iverilog: `assign #5 v[1:0]` beside
+        // `assign v[3:2]` shows `v=11xx`). The slot powers up as the driver's own
+        // initial output, x, in its bits and z elsewhere, stored by the run-once
+        // initializers before any process runs. build_driver_slot_value has already
+        // refused every region that is not a constant packed one.
+        const ValueSymbol* root = lvalue_root(left);
+        assert(root != nullptr && "a partial driver slot is rooted at a net");
+        const NetRegion reg   = net_region_of(left, *root);
+        const uint32_t  net_w = module_.pool.layout(module_.signal(net).type).width;
+        std::vector<slang::SVInt> parts;
+        if (reg.bit_hi < net_w - 1) {
+            parts.push_back(slang::SVInt::createFillZ(net_w - 1 - reg.bit_hi, false));
+        }
+        parts.push_back(slang::SVInt::createFillX(reg.bit_hi - reg.bit_lo + 1, false));
+        if (reg.bit_lo > 0) {
+            parts.push_back(slang::SVInt::createFillZ(reg.bit_lo, false));
+        }
+        const slang::SVInt seed = parts.size() == 1 ? parts.front() : slang::SVInt::concat(parts);
+        if (!preinit_) {
+            preinit_.emplace(module_);
+        }
+        ir::Builder& pb = *preinit_;
+        pb.binary(ir::Inst::Tag::Store,
+                  pb.signal(slot, l),
+                  pb.constant(svint_to_ref(seed, make_int_type(net_w, true)), l),
+                  l);
     }
     b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
 }
@@ -1020,7 +1041,7 @@ void Lowerer::emit_resolved_driver(ir::Signal                  net,
                                    const Expression*           delay_expr) {
     const ir::Index  val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
     const ir::Signal slot = driver_slot(net, left, l, strength);
-    store_driver_slot(left, slot, val, delay_expr, b, l);
+    store_driver_slot(net, left, slot, val, delay_expr, b, l);
     add_continuous_process(continuous_events(a), l, b);
 }
 
@@ -3342,7 +3363,7 @@ void Lowerer::emit_gate_resolved_driver(const Expression&          left,
                                         const Expression*          delay_expr) {
     const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
     const ir::Signal slot     = driver_slot(net, left, l, strength);
-    store_driver_slot(left, slot, slot_val, delay_expr, b, l);
+    store_driver_slot(net, left, slot, slot_val, delay_expr, b, l);
     add_continuous_process(std::move(wait_events), l, b);
 }
 

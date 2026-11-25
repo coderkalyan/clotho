@@ -662,6 +662,29 @@ TEST_CASE("pullup and pulldown on a bit or part select of a net") {
     CHECK(out == "0z10 0010 1\n0\n1\n");
 }
 
+// A delayed partial driver of a resolved net powers up as x in its own bits and z
+// elsewhere, so the undriven bits fold as z (28.16, 10.3.3). Oracle: iverilog 13
+// (`1 10xx`, `6 1001`; the gate form `1 0x`, `4 01`).
+TEST_CASE("a delay on a partial driver of a resolved net") {
+    const std::string out = run_capture(R"(
+        module top;
+          tri1 [3:0] w;
+          assign #5 w[1:0] = 2'b01;
+          assign w[3:2] = 2'b10;
+          reg a = 1;
+          tri1 [1:0] g;
+          buf #3 (g[0], a);
+          assign g[1] = 1'b0;
+          initial begin
+            #1 $display("%0d %b %b", $time, w, g);
+            #3 $display("%0d %b %b", $time, w, g);
+            #2 $display("%0d %b %b", $time, w, g);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 10xx 0x\n4 10xx 01\n6 1001 01\n");
+}
+
 // supply0 / supply1 nets (LRM 6.6.5): a permanent Supply-strength (level 4)
 // driver of 0 / 1 that beats even a Strong driver.
 TEST_CASE("supply0/supply1 nets hold their value and beat strong drivers") {
