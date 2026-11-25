@@ -872,15 +872,13 @@ void table_remove(ChunkRecord* c, uint64_t bytes) {
 // One chunk from the OS, or false. Aligned to its own size, which is what lets an
 // address find its chunk and its metadata by arithmetic.
 bool grow_heap() {
-    void* raw = clotho::rt::os_aligned_alloc(static_cast<size_t>(kChunkBytes),
-                                             static_cast<size_t>(kChunkBytes));
+    void* raw = clotho::rt::os_map_aligned(static_cast<size_t>(kChunkBytes), static_cast<size_t>(kChunkBytes));
     if (raw == nullptr) {
         return false;
     }
     assert((reinterpret_cast<uintptr_t>(raw) & kChunkMask) == 0 && "aligned allocation honoured");
-    // Zero is the initial state of all of it: every granule free, every block
-    // kBlockFree with its cursor at 0 and not young.
-    std::memset(raw, 0, RT_GC_META_OFFSET + (kChunkBytes >> kGranuleShift));
+    // A fresh mapping reads as zero, which is the initial state of all of it: every
+    // granule free, every block kBlockFree with its cursor at 0 and not young.
     auto* const c  = static_cast<ChunkRecord*>(raw);
     c->slot        = static_cast<uint32_t>(g.chunks.size());
     c->blocks_free = kBlocksPerChunk;
@@ -1298,14 +1296,13 @@ uint8_t* alloc_large(rt_gc_mutator* mut, uint64_t size, const rt_alloc_site* sit
             ceiling_fatal(size, site);
         }
     }
-    void* raw = clotho::rt::os_aligned_alloc(static_cast<size_t>(bytes), static_cast<size_t>(kChunkBytes));
+    void* raw = clotho::rt::os_map_aligned(static_cast<size_t>(bytes), static_cast<size_t>(kChunkBytes));
     if (raw == nullptr) {
         oom_fatal(size, site);
     }
     assert((reinterpret_cast<uintptr_t>(raw) & kChunkMask) == 0 && "aligned allocation honoured");
-    // The record only. Of the metadata, a large object uses the byte of its first
-    // granule, which alloc_object assigns.
-    std::memset(raw, 0, sizeof(ChunkRecord));
+    // A fresh mapping reads as zero, so the record starts empty. Of the metadata, a
+    // large object uses the byte of its first granule, which alloc_object assigns.
     auto* const c  = static_cast<ChunkRecord*>(raw);
     c->large_bytes = size;
     c->slot        = static_cast<uint32_t>(g.large.size());
@@ -2510,7 +2507,7 @@ uint64_t release_large(ChunkRecord* c) {
     g.large[c->slot]       = g.large.back();
     g.large[c->slot]->slot = c->slot;
     g.large.pop_back();
-    clotho::rt::os_aligned_free(c);
+    clotho::rt::os_unmap(c, static_cast<size_t>(RT_GC_LARGE_PAYLOAD + c->large_bytes));
     return ran;
 }
 
@@ -2545,7 +2542,7 @@ void release_chunk(ChunkRecord* c) {
     g.chunks.pop_back();
     g.stats.blocks_total -= kBlocksPerChunk;
     g.stats.blocks_free -= kBlocksPerChunk;
-    clotho::rt::os_aligned_free(c);
+    clotho::rt::os_unmap(c, static_cast<size_t>(kChunkBytes));
 }
 
 // A YOUNG collection's sweep: the blocks allocated from since the last collection and
@@ -2667,11 +2664,11 @@ void release_heap() {
     // inside drop_hole() reads that block's metadata to count what it handed out.
     drop_hole(&g_mutator);
     for (ChunkRecord* c : g.large) {
-        clotho::rt::os_aligned_free(c);
+        clotho::rt::os_unmap(c, static_cast<size_t>(RT_GC_LARGE_PAYLOAD + c->large_bytes));
     }
     g.large.clear();
     for (ChunkRecord* c : g.chunks) {
-        clotho::rt::os_aligned_free(c);
+        clotho::rt::os_unmap(c, static_cast<size_t>(kChunkBytes));
     }
     g.chunks.clear();
     g.table.clear();
