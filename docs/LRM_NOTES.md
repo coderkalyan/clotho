@@ -760,3 +760,15 @@ tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
 delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
+
+## 57. `option.detect_overlap` reports only `bins` bins (19.7, Table 19-1)
+
+Table 19-1: "When true, a warning is issued if there is an overlap between the range list (or transition list) of two bins of a coverpoint." The clause does not say whether `ignore_bins` and `illegal_bins` are among "two bins". 19.5.5 removes an ignored value from every coverage bin and 19.5.6 flags an illegal one, so sharing values with them is what they are written to do. Clotho warns, once per pair, only between bins declared with `bins`.
+
+Code: `src/lower/Coverage.cpp` (`cover_report_overlaps`). Tests: `tests/coverage_test.cpp` ("coverage: detect_overlap warns on overlapping bins").
+
+## 58. `start()` and `stop()` on a coverpoint (19.8, Table 19-5)
+
+Table 19-5 gives `start()` and `stop()` to covergroup, coverpoint and cross, as "Starts collecting coverage information" and "Stops collecting coverage information", and says no more. Clotho reads the covergroup's switch and each coverpoint's as independent: a coverpoint counts a sample only while both are on, and neither call undoes the other.
+
+Code: `src/runtime/Coverage.cpp` (`rt_cover_start_point`, `rt_cover_hit`). Tests: `tests/coverage_test.cpp` ("coverage: stop and start on a coverpoint").
