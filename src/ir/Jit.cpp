@@ -461,7 +461,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("svPutBitArrElem1VecVal", &svPutBitArrElem1VecVal);
     expose("svGetLogicArrElem1VecVal", &svGetLogicArrElem1VecVal);
     expose("svPutLogicArrElem1VecVal", &svPutLogicArrElem1VecVal);
-    expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);
     expose("rt_string_move", &rt_string_move);

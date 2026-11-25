@@ -141,7 +141,7 @@ llvm::Value* Backend::lv_string_ptr(const Guarded& g, StringUse use) {
     const auto sink = [&]() -> llvm::Value* {
         llvm::Value* s = str_sink_global();
         b_.CreateCall(str_deinit_fn(), { s });
-        b_.CreateCall(str_init_fn(), { s });
+        emit_str_init(s);
         return s;
     };
     return g.pointer_or(b_, form, sink);
@@ -282,7 +282,7 @@ void Backend::build_str_temps() {
         }
         auto* temp = b_.CreateAlloca(str_slot_ty(), nullptr, "str.tmp");
         temp->setAlignment(llvm::Align(alignof(rt_string)));
-        b_.CreateCall(str_init_fn(), { temp });
+        emit_str_init(temp);
         set_str(i, temp);
         str_temp_list_.push_back(temp);
     }

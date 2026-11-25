@@ -939,10 +939,6 @@ llvm::FunctionCallee Backend::assoc_move_fn() {
 
 // String runtime (rt_string_*); every ptr is an rt_string handle except
 // where noted.
-llvm::FunctionCallee Backend::str_init_fn() {
-    return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
 llvm::FunctionCallee Backend::str_deinit_fn() {
     return rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
 }

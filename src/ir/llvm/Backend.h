@@ -1417,6 +1417,8 @@ private:
 
     llvm::Constant* str_empty_const();
 
+    void emit_str_init(llvm::Value* slot);
+
     uint32_t handle_epoch_field(Ref type) const;
 
     bool is_dynarr_type(Ref type) const;
@@ -3047,7 +3049,6 @@ private:
     llvm::FunctionCallee assoc_assign_fn();
     llvm::FunctionCallee assoc_move_fn();
 
-    llvm::FunctionCallee str_init_fn();
     llvm::FunctionCallee str_deinit_fn();
     llvm::FunctionCallee str_assign_fn();
     llvm::FunctionCallee str_move_fn();

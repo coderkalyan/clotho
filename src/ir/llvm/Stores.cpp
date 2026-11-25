@@ -1558,17 +1558,15 @@ llvm::StructType* Backend::str_rec_ty() {
 // its heap buffer does, which the commit's move releases), CONSTRUCT the staged
 // handle and deep-copy the RHS into it.
 //
-// Unlike a container handle, an empty rt_string is NOT all-zero (byte 31 holds
-// the inline capacity), so the staging handle is built with rt_string_init, not
-// a memset. Getting that wrong would make rt_string_assign read a bogus
-// capacity out of the record.
+// A reserved record is not known to be zero, so the staged handle is constructed
+// (zeroed) before the assign reads a capacity out of it.
 void Backend::emit_string_whole_nba(const LValue& lv, Index rhs) {
     auto*        rt   = str_rec_ty();
     const auto   strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value* rec  = b_.CreateCall(nba_arr_slot_fn(), { str_id_value(lv.sig), b_.getInt32(strd) });
     b_.CreateAlignedStore(lv_string_ptr(lv, StringUse::Place), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
     llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
-    b_.CreateCall(str_init_fn(), { staged });
+    emit_str_init(staged);
     b_.CreateCall(str_assign_fn(),
                   { staged, str_of(rhs), alloc_site_global(SourceText{ .where = "<unknown>" }, "string") });
 }

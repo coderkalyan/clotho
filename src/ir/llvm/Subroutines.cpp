@@ -1130,7 +1130,7 @@ void Backend::init_frame() {
             continue;
         }
         if (s.is_string) {
-            b_.CreateCall(str_init_fn(), { slot });
+            emit_str_init(slot);
             continue;
         }
         if (s.is_dynarr || s.is_queue || s.is_assoc) {

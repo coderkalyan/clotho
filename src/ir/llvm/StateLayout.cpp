@@ -159,6 +159,22 @@ llvm::Constant* Backend::str_empty_const() {
     return llvm::ConstantAggregateZero::get(str_slot_ty());
 }
 
+// Construct the empty string in `slot` by zeroing it, the image rt_string_init
+// leaves. Emitted inline so that a string nothing writes costs no call and the
+// optimizer can merge the fill with its neighbours or delete it. No alignment
+// is claimed: a staged nonblocking record holds its handle unaligned.
+//
+// NOTE: word stores, not llvm.memset. Tier-0 code generation (FastISel) lowers
+// the intrinsic to a call to libc's memset whatever its length, which measured
+// 4.6% MORE instructions than calling rt_string_init on a UVM sequence loop.
+void Backend::emit_str_init(llvm::Value* slot) {
+    static_assert(sizeof(rt_string) % sizeof(uint64_t) == 0);
+    auto* const i64 = b_.getInt64Ty();
+    for (uint64_t word = 0; word < sizeof(rt_string) / sizeof(uint64_t); ++word) {
+        b_.CreateAlignedStore(b_.getInt64(0), b_.CreateConstInBoundsGEP1_64(i64, slot, word), llvm::Align(1));
+    }
+}
+
 // Field index of the relocation epoch inside each container's handle slot
 // (docs/design/data-model.md §3.1). A `ref` formed through a place rooted in
 // one of these carries `&handle[epoch_field]` so the callee can detect a
@@ -1547,14 +1563,11 @@ void Backend::init_state() {
             emit_agg_init(s.ir_type, storage_ptr(s), path, s.storage_ty);
             continue;
         }
-        if (!s.is_array) {
+        if (!s.is_array || s.is_string) {
+            // An array of strings is all empty strings as zeroinitialized.
             continue;
         }
-        if (s.is_string) {
-            emit_string_slot_op(s, str_init_fn());
-        } else {
-            emit_array_init(s);
-        }
+        emit_array_init(s);
     }
 }
 

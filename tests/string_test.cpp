@@ -1256,6 +1256,33 @@ TEST_CASE("string-element array as a subroutine local, recursively") {
     CHECK(run_capture(src) == "45\n");
 }
 
+// Nothing constructs a string by calling the runtime: generated code zeroes a
+// frame slot at each activation, and module state is zero to begin with. So an
+// automatic local must read empty on every entry, including after an earlier
+// activation left a heap-form handle in the same stack bytes, and a string
+// array or struct member of a module must read empty with no startup fill.
+TEST_CASE("a string nothing has written is empty in a frame and in module state") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { string f; int n; } S;
+            function automatic string once(int k);
+                string unwritten;
+                string r;
+                r = {unwritten, "|"};
+                unwritten = "0123456789012345678901234567890123456789";
+                return {r, $sformatf("%0d.%0d", k, unwritten.len())};
+            endfunction
+            string arr[3];
+            S      st;
+            initial begin
+                for (int i = 0; i < 3; i++) $display("[%s]", once(i));
+                $display("[%s][%s] %0d %0d", arr[2], st.f, arr[0].len(), st.f.len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[|0.40]\n[|1.40]\n[|2.40]\n[][] 0 0\n");
+}
+
 // The by-value copy of a container leaf is a deep copy too, so a queue member of a
 // passed struct is independent in the callee.
 TEST_CASE("aggregate with a queue member passes by value") {
