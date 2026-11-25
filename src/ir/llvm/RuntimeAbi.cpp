@@ -102,12 +102,22 @@ llvm::FunctionCallee Backend::finish_coop_fn() {
                  { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
 }
 
-// void rt_observed_case_violation(ptr banner, i64 now, i32 kind) — queues the
+// void rt_observed_case_violation(ptr banner, i64 now, i32 kind, ptr gen) — queues the
 // report for the Observed region (rt_observed_flush emits it). kind selects
-// the message (0 = no match, 1 = overlap).
+// the message (0 = no match, 1 = overlap); gen is the executing thread's report
+// generation counter, or null.
 llvm::FunctionCallee Backend::observed_case_violation_fn() {
     return rt_fn("rt_observed_case_violation", b_.getVoidTy(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty() });
+}
+
+// ptr rt_gen_cell_alloc() / void rt_gen_cell_free(ptr) — a fork child's report generation.
+llvm::FunctionCallee Backend::gen_cell_alloc_fn() {
+    return rt_fn("rt_gen_cell_alloc", raw_ptr_ty(), {});
+}
+
+llvm::FunctionCallee Backend::gen_cell_free_fn() {
+    return rt_fn("rt_gen_cell_free", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
 // void rt_observed_flush() — emit + clear every Observed-region report queued

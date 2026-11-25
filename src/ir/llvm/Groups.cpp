@@ -363,7 +363,7 @@ void Backend::compute_fusion_groups() {
             bool           simple = config_.fuse;
             bool           thunk  = true;
             for (const auto& pj : u.procs) {
-                simple = simple && facts_.processes[pj[o]].simple_always;
+                simple = simple && facts_.processes[pj[o]].simple_always && !facts_.processes[pj[o]].gen_counter;
                 thunk  = thunk && thunkable(pj[o]);
             }
             u.thunk[o] = thunk ? 1 : 0;

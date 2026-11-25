@@ -31,6 +31,32 @@ void Backend::run() {
         report_comb_fuse_stat();
     }
     may_finish_ = compute_may_finish(); // before any body: lower_call reads it
+    // The running thread's report generation (LRM 16.4.2) is published through one global,
+    // made here and only when some body needs it. Bodies the runtime ramps on its own
+    // (a $strobe / $monitor / action-block body) are threads nothing can flush: they publish
+    // null, so a report they reach is never taken for the generation that happened to be
+    // published before them.
+    if (std::any_of(facts_.fn_gen.begin(), facts_.fn_gen.end(), [](uint8_t v) { return v != 0; }) ||
+        std::any_of(facts_.processes.begin(), facts_.processes.end(),
+                    [](const auto& p) { return p.gen_counter; })) {
+        gen_global();
+        gen_root_.assign(mod_.function_count(), 0);
+        const auto note_roots = [&](const Ir& ir) {
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const Index     idx = static_cast<Index>(k);
+                const Inst::Tag t   = ir.tag(idx);
+                if (t == Inst::Tag::StrobePend || t == Inst::Tag::ReactivePend || t == Inst::Tag::MonitorSet) {
+                    gen_root_[static_cast<uint32_t>(ir.extra_data<StrobePendInfo>(ir.payload(idx).extra).func)] = 1;
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            note_roots(p.ir);
+        }
+        for (uint32_t f = 0; f < mod_.function_count(); ++f) {
+            note_roots(mod_.function(static_cast<FunctionId>(f)).ir);
+        }
+    }
     if (stat_on(config_.stats, Stat::Finish)) {
         report_finish_stat();
     }
@@ -90,6 +116,13 @@ void Backend::run() {
     // then lower their bodies callees first, once per family of instances
     // (lower_subroutines). A task is a coroutine (lower_task); a function is a
     // plain call.
+    // A write through a `ref` formal wakes at the write when some ref actual has waiters: a signal
+    // with waiters, or a class property some `@` / `wait` names. Decided before any declaration,
+    // since it widens every ref formal's parameters.
+    design_ref_wake_ = !mod_.change_notifies().empty();
+    for (uint32_t s = 0; s < mod_.signals().size() && !design_ref_wake_; ++s) {
+        design_ref_wake_ = facts_.ref_arg[s] && signal_has_waiters(Signal{ s });
+    }
     const size_t nf = mod_.function_count();
     fn_decls_.assign(nf, nullptr);
     plan_subroutines();

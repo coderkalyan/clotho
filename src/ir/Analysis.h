@@ -199,6 +199,12 @@ struct BodyFacts {
     // absorbing a child's reads here would wake the parent on signals its own
     // body never samples.
     std::vector<FunctionId> calls;
+    // This body ITSELF holds a unique/priority violation report (`CaseViol`), an event
+    // control or `wait` (`Wait`), or a virtual call. Direct facts: the closures over
+    // `calls` are DesignFacts::fn_gen and ProcessFacts::gen_counter.
+    bool case_viol = false;
+    bool waits     = false;
+    bool virt_call = false;
 };
 
 // Facts about one process, beyond its body.
@@ -216,6 +222,11 @@ struct ProcessFacts {
     // per process, not just design-wide: the backend also asks this per fusion
     // group while lowering.
     bool deferred_severity = false;
+    // Holds a deferred-report generation counter: a deferred assertion, a
+    // unique/priority report, or a call that reaches either or a task that can
+    // flush it (see DesignFacts::fn_gen). The group bumps it at each activation and
+    // publishes it as the current generation. Superset of `deferred_severity`.
+    bool gen_counter = false;
     // Combinational-fusion verdict.
     CombFuse comb_fuse = CombFuse::NotSimpleAlways;
 };
@@ -330,6 +341,16 @@ struct DesignFacts {
 
     // ---- Design-wide. ----
     DesignUses uses;
+
+    // Per function (FunctionId): whether the body needs the calling thread's report
+    // generation: it can reach a unique/priority report, or it is a task that can wait
+    // on an event control in a design that has such a report or a deferred assertion
+    // (resuming in it is a flush point of the calling process, LRM 16.4.2). A virtual
+    // call counts as reaching every virtual method.
+    std::vector<uint8_t> fn_gen;
+    // Per function: whether the body can reach a unique/priority report (the subset of
+    // `fn_gen` that makes a fork child own a generation counter).
+    std::vector<uint8_t> fn_report;
 
     // Undriven-bit mask words of `s`, LSB-first; a set bit means undriven, hence
     // powers on to z. Empty for every signal without a partial mask -- fully

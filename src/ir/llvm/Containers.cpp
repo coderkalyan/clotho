@@ -466,6 +466,14 @@ llvm::Value* Backend::lv_handle_ptr(const Guarded& g, HandleUse use) {
 // container bound to a `ref`/`inout` formal of a task -- use `Place` here and
 // fire from the call's own after-write bracket instead.
 void Backend::notify_container_mutation(const LValueInfo& lv) {
+    if (lv.ref_wake_fn != nullptr) {
+        // A container bound to a `ref` formal: the call's thunk wakes its waiters at each
+        // mutation, not at the return of the call.
+        if (!silent_stores_) {
+            emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+        }
+        return;
+    }
     if (lv.chg == nullptr) {
         // A container living in a SIGNAL -- a module-level queue / dynamic /
         // associative array, or a static class property's shared slot -- has
@@ -545,10 +553,10 @@ void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
 // slot rather than growing the stack, and the init / deinit pair is balanced
 // across the bracket so each pass copies into a fresh handle.
 llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
-    if (lv.chg == nullptr) {
+    if (lv.chg == nullptr && lv.ref_wake_fn == nullptr) {
         return nullptr;
     }
-    if (lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
+    if (lv.chg != nullptr && lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
         // `@(posedge s)` is refused in the frontend (no LSB lattice, Table 9-2),
         // so a notified string property carries the any-change field and nothing
         // else. A gap means the two sides disagreed.
@@ -574,6 +582,19 @@ void Backend::str_chg_after(const Guarded& lv, llvm::Value* snap) {
     llvm::Value* changed =
       b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }),
                       b_.getInt32(0));
+    if (lv.ref_wake_fn != nullptr) {
+        // A write through a `ref` formal: the call's thunk wakes what the actual's owner has waiting.
+        auto* f    = b_.GetInsertBlock()->getParent();
+        auto* body = llvm::BasicBlock::Create(ctx_, "refs.body", f);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "refs.cont", f);
+        b_.CreateCondBr(changed, body, cont);
+        b_.SetInsertPoint(body);
+        emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+        b_.CreateCall(str_deinit_fn(), { snap });
+        return;
+    }
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* body = llvm::BasicBlock::Create(ctx_, "chgs.body", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "chgs.cont", fn);

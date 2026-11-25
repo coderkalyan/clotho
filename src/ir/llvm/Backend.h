@@ -541,6 +541,12 @@ struct LValueInfo {
     // down the mm-snapshot path with a null base.
     bool   mut_sig_valid = false;
     Signal mut_sig{ 0 };
+    // A write through a `ref` formal wakes the waiters of the actual at the write, by calling the
+    // wake thunk the call passed (null at run time when the actual has none):
+    // `void(ptr ctx, old mm, [old z,] new mm, [new z])`. Set only on the lvalue of a scalar ref
+    // formal, in a design where some ref actual has waiters (design_ref_wake_).
+    llvm::Value* ref_wake_fn  = nullptr;
+    llvm::Value* ref_wake_ctx = nullptr;
 
     // Whether a range mask decides which of the selected bits are in range.
     bool masked() const {
@@ -1264,6 +1270,9 @@ struct RefBinding {
     llvm::Value* slot  = nullptr;
     llvm::Value* chain = nullptr;
     std::string  formal;
+    // The wake thunk and context the call passed (design_ref_wake_ only).
+    llvm::Value* wake_fn  = nullptr;
+    llvm::Value* wake_ctx = nullptr;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level and
@@ -2599,7 +2608,20 @@ private:
         // The words of a wide-select store's target it can touch, in place of `mm` /
         // `z`, which stay null (wide_window_snapshot).
         std::optional<WideWindow> wide;
+        // A write through a `ref` formal: the thunk and context to call after the write; `mm` /
+        // `z` hold the old words.
+        llvm::Value* ref_fn  = nullptr;
+        llvm::Value* ref_ctx = nullptr;
     };
+
+    // Append the wake thunk and context for ref actual `lv` to `argv` (design_ref_wake_ only).
+    // True when the callee wakes at each write, so the call must not service at its return.
+    bool push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref formal_type);
+
+    llvm::Function* emit_ref_wake_thunk(const LValueInfo& lv);
+
+    void emit_ref_wake_call(llvm::Value* fn, llvm::Value* ctx, llvm::Value* changed, llvm::Value* pos,
+                            llvm::Value* neg);
 
     ServiceSnapshot service_snapshot(const Guarded& lv);
 
@@ -2971,6 +2993,8 @@ private:
 
     llvm::FunctionCallee finish_coop_fn();
     llvm::FunctionCallee observed_case_violation_fn();
+    llvm::FunctionCallee gen_cell_alloc_fn();
+    llvm::FunctionCallee gen_cell_free_fn();
     llvm::FunctionCallee observed_flush_fn();
     llvm::FunctionCallee severity_fn();
     llvm::FunctionCallee defer_report_fn();
@@ -4147,6 +4171,22 @@ private:
 
     void emit_defer_gen_bump_at(llvm::Value* gen);
 
+    // The report generation of the running thread (LRM 16.4.2), published for the
+    // bodies it calls: a process group publishes its own counter at each activation
+    // and resume, a task reads it at entry and republishes it after each resume, a
+    // function just reads it. Null where nothing can flush. Created only by a design
+    // with a unique/priority report, so any other design emits none of it.
+    llvm::Value* gen_global();
+
+    llvm::Value* load_gen();
+
+    void store_gen(llvm::Value* gen);
+
+    // The generation this body republishes after a resume, or null when it has none.
+    llvm::Value* body_gen();
+
+    bool fn_needs_gen(FunctionId id) const;
+
     // Any $monitor / $fmonitor registration in the design? Gates the per-instant
     // Postponed-region monitor run (see emit_active_run).
 
@@ -5042,6 +5082,17 @@ private:
     // Per-group generation globals of a group that belongs to no instance, created
     // lazily; an instance's groups keep theirs in its record (Anchor::ctx_defer_base).
     std::vector<llvm::GlobalVariable*> defer_gen_gv_;
+    // The ptr global holding the running thread's report generation (gen_global).
+    llvm::GlobalVariable* gen_gv_ = nullptr;
+    // While lowering a task or function that needs the generation: the frame slot
+    // holding the pointer read at entry (a fork child's own cell), else null.
+    llvm::Value* gen_slot_ = nullptr;
+    // Whether some `ref` actual is a signal with waiters: every ref formal then takes a wake thunk
+    // and context after its witness chain, so a write wakes at the write, not at the call's return.
+    bool design_ref_wake_ = false;
+    std::map<const llvm::Function*, uint32_t> ref_wake_seq_;
+    // Per function: a body the runtime ramps on its own, which publishes no generation.
+    std::vector<uint8_t> gen_root_;
     // Whether any process of the design holds a deferred assertion (sizes the records).
     bool any_defer_ = false;
     // Who declares each flat `disable` target and covergroup type: the anchor and

@@ -903,6 +903,7 @@ struct Structural {
                     break;
                 }
                 case Inst::Tag::TaskCallVirtual: {
+                    facts.virt_call = true;
                     const VirtualCallInfo vci = ir.extra_data<VirtualCallInfo>(p.extra);
                     call_actuals(ir, vci.func, vci.args, /*copy_out=*/true, &facts.writes);
                     break;
@@ -913,6 +914,7 @@ struct Structural {
                     break;
                 }
                 case Inst::Tag::CallVirtual: {
+                    facts.virt_call = true;
                     const VirtualCallInfo vci = ir.extra_data<VirtualCallInfo>(p.extra);
                     call_actuals(ir, vci.func, vci.args, /*copy_out=*/false, nullptr);
                     break;
@@ -934,7 +936,11 @@ struct Structural {
                     uses.monitor = true;
                     break;
                 case Inst::Tag::CaseViol:
-                    uses.observed = true;
+                    uses.observed   = true;
+                    facts.case_viol = true;
+                    break;
+                case Inst::Tag::Wait:
+                    facts.waits = true;
                     break;
                 case Inst::Tag::DisableRemote:
                     // The remote form is the only one with a runtime cost: the
@@ -972,12 +978,13 @@ struct Structural {
                     }
                     break;
                 case Inst::Tag::Severity:
-                    // Deferred assertions are processes-only: the frontend rejects
-                    // one inside a called function or task, so a process scan
-                    // already covers every case the backend must handle.
-                    if (for_process && ir.extra_data<SeverityInfo>(p.extra).defer != 0) {
-                        uses.defer = true;
-                        saw_defer  = true;
+                    // A deferred assertion in a function or task queues its report under the
+                    // generation of the thread that called it, like a unique/priority report
+                    // (`case_viol`); one in a process also owns that process's counter.
+                    if (ir.extra_data<SeverityInfo>(p.extra).defer != 0) {
+                        uses.defer      = true;
+                        facts.case_viol = true;
+                        saw_defer       = saw_defer || for_process;
                     }
                     break;
                 case Inst::Tag::DumpFile:
@@ -2088,6 +2095,82 @@ DesignFacts analyze(const Module& m) {
         facts.processes[k].simple_always = is_simple_always(p);
         facts.processes[k].arms_wake     = body_arms_wake(p.ir);
         facts.processes[k].comb_fuse     = comb_fuse_verdict(p, facts.processes[k], body_verdict[k]);
+    }
+
+    // ---- Report generations: who needs the calling thread's counter. ----
+    // A unique/priority report is tagged with the generation of the thread that
+    // executes it, and a resume from an event control inside a task is a flush point
+    // of the thread that called it (LRM 16.4.2), so a body needs the generation when
+    // it can reach a report, or is a task that waits in a design that has one.
+    {
+        const bool           design = facts.uses.observed || facts.uses.defer;
+        std::vector<uint8_t> reach(nfn, 0); // bit 0: reaches a report, bit 1: reaches a wait
+        std::vector<std::vector<uint32_t>> callers(nfn);
+        std::vector<uint32_t>              virt_callers;
+        for (uint32_t f = 0; f < nfn; ++f) {
+            const BodyFacts& bf = facts.functions[f];
+            reach[f]            = (bf.case_viol ? 1 : 0) | (bf.waits ? 2 : 0);
+            for (const FunctionId c : bf.calls) {
+                callers[static_cast<uint32_t>(c)].push_back(f);
+            }
+            if (bf.virt_call) {
+                virt_callers.push_back(f);
+            }
+        }
+        const auto propagate = [&] {
+            std::vector<uint32_t> work;
+            for (uint32_t f = 0; f < nfn; ++f) {
+                if (reach[f] != 0) {
+                    work.push_back(f);
+                }
+            }
+            for (size_t next = 0; next < work.size(); ++next) {
+                const uint32_t f = work[next];
+                for (const uint32_t caller : callers[f]) {
+                    if ((reach[caller] | reach[f]) != reach[caller]) {
+                        reach[caller] |= reach[f];
+                        work.push_back(caller);
+                    }
+                }
+            }
+        };
+        propagate();
+        // A virtual call can run any override, so it reaches whatever any virtual
+        // method reaches.
+        uint8_t virt = 0;
+        for (const ClassDesc& cd : m.class_descs()) {
+            for (const FunctionId s : cd.slots) {
+                virt |= reach[static_cast<uint32_t>(s)];
+            }
+            for (const FunctionId s : cd.iface_slots) {
+                virt |= reach[static_cast<uint32_t>(s)];
+            }
+        }
+        if (virt != 0) {
+            for (const uint32_t f : virt_callers) {
+                reach[f] |= virt;
+            }
+            propagate();
+        }
+        facts.fn_gen.assign(nfn, 0);
+        for (uint32_t f = 0; f < nfn; ++f) {
+            const bool task = m.function(static_cast<FunctionId>(f)).is_task;
+            facts.fn_gen[f] = ((reach[f] & 1) != 0 || (design && task && (reach[f] & 2) != 0)) ? 1 : 0;
+        }
+        facts.fn_report.assign(nfn, 0);
+        for (uint32_t f = 0; f < nfn; ++f) {
+            facts.fn_report[f] = (reach[f] & 1) != 0 ? 1 : 0;
+        }
+        const bool virt_gen = (virt & 1) != 0 || (design && (virt & 2) != 0);
+        for (size_t k = 0; k < nproc; ++k) {
+            const BodyFacts& bf = facts.processes[k].body;
+            bool             g  = facts.processes[k].deferred_severity || bf.case_viol ||
+                       (bf.virt_call && virt_gen);
+            for (const FunctionId c : bf.calls) {
+                g = g || facts.fn_gen[static_cast<uint32_t>(c)] != 0;
+            }
+            facts.processes[k].gen_counter = g;
+        }
     }
 
     // ---- Value lattices, iterated to fixpoint. ----

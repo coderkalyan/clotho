@@ -153,12 +153,17 @@ Code: `src/lower/Statements.cpp` (`lower_predicate`), `src/lower/Expr.cpp` (`low
 
 12.4.2 and 12.5.3 defer a violation report to the Observed region, and 12.4.2.1
 clears a pending report when its process reaches a flush point first. Clotho
-queues the report and issues it in the Observed region. Deviation: it does not
-clear pending reports at flush points, so a statement that violates on several
-settle passes of one time step reports once per pass. Not gated; the gap is
-listed in `docs/TODO.md`.
+queues the report and issues it in the Observed region, and drops it if its thread
+reached a flush point of 16.4.2 meanwhile: an activation start, or a resume from an
+event control or `wait`, including one inside a task or function-called task the
+thread entered (the generation travels with the call, docs/design/disable.md). So a
+zero-delay glitch of the condition reports nothing, as a deferred assertion's does.
+A fork child is a thread of its own and flushes its own reports. Not gated. The
+resumes from `wait fork` and `wait_order` are not flush points, as note 54 says for
+deferred assertions, but a process that holds only unique/priority reports is not
+refused them: its reports there are kept.
 
-Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`), `src/runtime/Reports.cpp` (`rt_observed_case_violation`, `rt_observed_flush`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant"). Design: `docs/design/x-semantics.md` (Free wins needing no new semantics).
+Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`, `gen_global`), `src/runtime/Reports.cpp` (`rt_observed_case_violation`, `rt_observed_flush`, `rt_gen_cell_alloc`), `src/lower/Statements.cpp` (`DeferredAssertionScan`), `src/lower/Timing.cpp` (`flush_deferred_on_resume`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant", "unique / priority report: ..."). Design: `docs/design/disable.md` (16.4.2's other flush point). Oracle: LRM-derived; iverilog ignores `unique` and cannot parse `unique if`.
 
 ## 19. `case` with a real selector (12.5)
 
@@ -679,12 +684,10 @@ example relies on a delay not flushing.
 
 `wait fork` and `wait_order` are `wait_statement`s in the grammar (A.6.5), but the clause does
 not say it means them, and whether a `wait fork` that finds no child suspended is not known
-to the frontend, so a process that holds a deferred assertion is refused both. It is
-refused a call to a task that can wait on an event control too, because the resume inside
-the task is the calling process's and the task cannot reach the process's reports. That
-covers a task that waits itself, one that calls a task that waits, and a virtual task called
-anywhere along the way, directly or through another task or method: the body read for the
-callee is the declared method's, and any override may be the one that runs and waits.
+to the frontend, so a process that holds a deferred assertion is refused both. A task the
+process calls that waits on an event control flushes the process's reports where it
+resumes, as the process's own event control does: the generation of the calling thread is
+published through the call, for a virtual task and a task reached through other tasks too.
 
 16.4.4 says disabling "a non-outermost scope of a procedure does not cause flushing", so a
 `disable` of a block nested in the process, from the process or from another one, leaves the
@@ -694,7 +697,7 @@ disable and not because its event occurred, and 16.4.2's first bullet, read alon
 flush it. Clotho takes 16.4.4's explicit sentence. Disabling "a specific deferred assertion"
 by its label cancels its reports; that is refused (docs/TODO.md).
 
-Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`subroutine_waits_on_event`), `src/lower/Subroutines.cpp` (`lower_task_call`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: shapes whose flush points are not reachable are refused", "deferred assertion: a virtual task called through another task is refused like a direct one"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.
+Code: `src/lower/Timing.cpp` (`flush_deferred_on_resume`, `lower_event_wait`, `lower_wait_stmt`, `lower_wait_order`), `src/lower/Assertions.cpp` (`design_has_reports`, `task_flushes_reports`), `src/lower/Statements.cpp` (`lower_disable`, the `wait fork` case), `src/ir/llvm/Inst.cpp` (`DeferFlush` in a task). Tests: `tests/severity_test.cpp` ("deferred assertion: resuming from an event control or a wait statement flushes the report", "deferred assertion: what is not a resume from an event control keeps the pending report", "deferred assertion: wait fork and wait_order are refused", "deferred assertion: a wait inside a called task flushes the calling process's report"), `tests/loop_test.cpp` ("a disable flushes a deferred report only at the outermost scope, for every deferred statement", "a disabled block's process parked on an event keeps its pending report unless it is the outermost"). Oracle: none; iverilog rejects deferred assertions and Verilator reports at the point of execution.
 
 ## 55. `$fread` start address outside the memory (21.3.4.4)
 
