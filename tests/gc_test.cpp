@@ -1210,8 +1210,8 @@ TEST_CASE("gc: the queue walker follows ring wraparound") {
 
 // An associative array KEYED by a class handle (LRM 7.8.3). The key is a strong
 // reference and the collector has to decode it out of the normalized key bytes,
-// where the handle's 64 bits were big-endian-encoded (emit_key_bytes,
-// ir/llvm/AssocArrays.cpp, emit_agg_key_bytes/normalize_agg_key). This is the ONE-WORD case of the key
+// which hold the object's identity number, big-endian (key_leaf_word,
+// ir/llvm/AssocArrays.cpp; rt_gc_identity). This is the ONE-WORD case of the key
 // shape: `{ handle }` (Runtime.h, rt_key_*). It is the only shape the
 // deleted RT_ELEM_FLAG_KEY_HANDLE bit could express, so keeping it here is what pins
 // that generalizing one flag into a shape did not cost the degenerate case. Here the
@@ -1564,8 +1564,8 @@ TEST_CASE("gc: a dropped UVM-shaped tree of assoc children is reclaimed") {
 // The key shape P4 refused and this phase describes: an associative array whose KEY
 // is an unpacked struct or fixed array CONTAINING a class handle. What replaced the
 // one-bit RT_ELEM_FLAG_KEY_HANDLE is a SHAPE -- `nkeyshape` words in `keyshape`
-// that say where each 8 big-endian bytes of a handle sit inside one normalized key
-// span (Runtime.h, rt_key_*) -- so a handle at any offset, and several handles per
+// that say where the 8 big-endian bytes of each handle's identity number sit inside
+// one normalized key span (Runtime.h, rt_key_*) -- so a handle at any offset, and several handles per
 // key, are describable. The cases of this section are the fixed layouts; a key
 // that holds a string or a container is at the end of this file.
 //
@@ -5293,4 +5293,129 @@ TEST_CASE("gc: an event takes a reclaimed event's trigger id without what waited
     const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
     CHECK(st.collections > 1u);
     CHECK(rt_event_control_count() < 1000u);
+}
+
+// -- Identity numbers -----------------------------------------------------------
+//
+// A handle is a key, and is formatted, as its object's identity number (Gc.h,
+// rt_gc_identity). The number is kept in a table beside the heap that names the
+// object by its address, so an entry must go when its object does: left behind, it
+// would hand the dead object's number to whatever is allocated at that address
+// next. Every pass numbers a new object by formatting it and drops it. The numbers
+// must keep rising, which they do not once an address is reused under a stale
+// entry, and the table must stay far below the pass count.
+TEST_CASE("gc: an identity number is forgotten with its object") {
+    std::string src = R"(
+        module m;
+            class C; int v; string tag; endclass
+            C   held[$];
+            int bad, last;
+            function automatic void once(input int i);
+                C      c;
+                string s;
+                int    id;
+                c     = new;
+                c.v   = i;
+                c.tag = "numbered";
+                $sformat(s, "%0d", c);
+                id = s.atoi();
+                if (id <= last) bad++;
+                last = id;
+                held.push_back(c);
+                if (held.size() > @HELD@) void'(held.pop_front());
+            endfunction
+            initial begin
+                for (int i = 0; i < 3000; i++) begin
+                    once(i);
+                    #1;
+                end
+                $display("bad=%0d last=%0d", bad, last);
+            end
+        endmodule
+    )";
+    const auto hold = [&](std::string_view n) { src.replace(src.find("@HELD@"), 6, n); };
+    const std::string expected = "bad=0 last=3000\n";
+    SUBCASE("with full collections") {
+        hold("0");
+        const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+        CHECK(st.collections > 1u);
+        CHECK(st.identities < 1000u);
+    }
+    // After the first collection every object here dies young, so its number is
+    // found through the list of objects numbered since the last collection.
+    SUBCASE("with young collections only") {
+        hold("0");
+        const rt_gc_stats st =
+          run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+        CHECK(st.full_collections == 1u);
+        CHECK(st.young_collections > 1u);
+        CHECK(st.identities < 1000u);
+    }
+    // Held for 300 passes, an object is old by the time it is dropped, and only a
+    // full collection, reading the whole table, can find its number. Every second
+    // collection is full: left to its policy, this small heap never grows enough
+    // to ask for one, and what is old and dead then keeps its number as it keeps
+    // its memory.
+    SUBCASE("objects that grow old before they die") {
+        hold("300");
+        const rt_gc_stats st = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, 2);
+        CHECK(st.full_collections > 1u);
+        CHECK(st.promoted > 300u);
+        CHECK(st.identities < 1000u);
+    }
+    SUBCASE("collecting at every allocation") {
+        hold("300");
+        CHECK(run_capture(src, gc_cfg(cadence_stress)) == expected);
+    }
+}
+
+// An object keeps its number across collections for as long as it lives, old or
+// young, and a key holds its object by that number alone: the collector resolves
+// the number to reach the object, and traversal resolves it to hand the handle back.
+TEST_CASE("gc: an object keeps its identity number across collections") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            int  keyed[C];
+            C    kept;
+            Junk sink;
+            function automatic string number(input C c);
+                return $sformatf("%0d", c);
+            endfunction
+            function automatic void install();
+                for (int i = 0; i < 4; i++) begin
+                    C c;
+                    c        = new;
+                    c.v      = 10 + i;
+                    c.tag    = "keyed";
+                    keyed[c] = i;
+                    if (i == 2) kept = c;
+                end
+            endfunction
+            task automatic churn();
+                repeat (4) begin
+                    for (int i = 0; i < 300; i++) begin
+                        sink     = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                    #1;
+                end
+            endtask
+            initial begin
+                string first;
+                install();
+                first = number(kept);
+                churn();
+                $write("%s %s:", first, number(kept));
+                foreach (keyed[k]) $write(" %0d-%s", k.v, number(k));
+                $display;
+            end
+        endmodule
+    )";
+    const std::string expected = "3 3: 10-1 11-2 12-3 13-4\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0u);
 }

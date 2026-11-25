@@ -504,6 +504,14 @@ struct GcState {
     // by the emitted code; the records themselves are read from the scheduler at each
     // collection, since the buffers grow and move.
     std::vector<NbaQueue> nba_queues;
+    // Identity numbers (rt_gc_identity), kept beside the heap so that an object pays for
+    // one only once something asks. The two maps are each other's inverse.
+    // `identity_fresh` lists the objects numbered since the last collection: the only
+    // numbered ones a young collection can find dead, so it need not read the maps.
+    ankerl::unordered_dense::map<const void*, uint64_t> identity;
+    ankerl::unordered_dense::map<uint64_t, void*>       identified;
+    std::vector<void*>                                  identity_fresh;
+    uint64_t                                            identity_last = 0;
     // Set only for the duration of rt_gc_verify(), which reuses the container
     // walkers with marking replaced by an assertion, so the ring and associative
     // arithmetic has exactly one implementation and cannot drift from itself.
@@ -1784,17 +1792,18 @@ uint32_t key_u32(KeyCursor& c) {
 // The ONE place the key byte order is undone. emit_key_bytes writes byte 0 as the most
 // significant and applies no sign flip, a handle being unsigned
 // (ir/llvm/AssocArrays.cpp, docs/design/assoc-keys.md §2), so the word is reassembled
-// MSB-first -- a memcpy would read it byte-reversed on this host and trace an address
-// that is not an object. Byte-wise also because nothing about a key handle is aligned:
-// the span is serialized leaf by leaf with no padding.
+// MSB-first. Byte-wise also because nothing about a key handle is aligned: the span is
+// serialized leaf by leaf with no padding. The word is the object's identity number,
+// not its address (rt_gc_identity): a key holds its object, so the number of a key in a
+// live container names a live object, and one that names none is a fatal there.
 void* key_handle(KeyCursor& c) {
     key_need(c, sizeof(uint64_t));
-    uint64_t bits = 0;
+    uint64_t id = 0;
     for (uint32_t i = 0; i < sizeof(uint64_t); ++i) {
-        bits = (bits << 8) | c.at[i];
+        id = (id << 8) | c.at[i];
     }
     c.at += sizeof(uint64_t);
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(bits));
+    return rt_gc_identity_object(id);
 }
 
 // One level of a key walk in progress.
@@ -2262,6 +2271,41 @@ void push_event_waiting() {
     void (*const skip)(const uint8_t*, uint64_t) = [](const uint8_t*, uint64_t) {};
     rt_internal::event_gc_waiting(is_marked_now, mark_container_handle,
                                   g.verifying != 0 ? skip : scan_conservative);
+}
+
+// Forget the number of every numbered object this collection did not reach. Called once
+// marking is complete. A young collection can only have found dead the objects that were
+// numbered since the last collection, since every other numbered object is old; a full
+// one reads the whole table. A number is never handed out twice, so nothing else is
+// owed: what named the object by its number named the object, and is gone with it.
+void release_dead_identities() {
+    assert(g.identity.size() == g.identified.size() && "the two identity maps are each other's inverse");
+    const auto forget = [](void* handle) {
+        const auto it = g.identity.find(handle);
+        assert(it != g.identity.end() && "a numbered object is in the table");
+        g.identified.erase(it->second);
+        g.identity.erase(it);
+    };
+    if (g.kind == RT_GC_KIND_YOUNG) {
+        for (void* handle : g.identity_fresh) {
+            if (!is_marked_now(handle)) {
+                forget(handle);
+            }
+        }
+    } else {
+        // Collected first: erasing from the map while walking it would skip entries.
+        g.identity_fresh.clear();
+        for (const auto& [handle, id] : g.identity) {
+            if (!is_marked_now(const_cast<void*>(handle))) {
+                g.identity_fresh.push_back(const_cast<void*>(handle));
+            }
+        }
+        for (void* handle : g.identity_fresh) {
+            forget(handle);
+        }
+    }
+    g.identity_fresh.clear();
+    g.stats.identities = g.identity.size();
 }
 
 // -- The native stack, for a collection run from inside an allocation (§6.1) ---
@@ -2843,6 +2887,10 @@ void release_heap() {
     g.container_work.clear();
     g.worklist.clear();
     g.pinned.clear();
+    g.identity.clear();
+    g.identified.clear();
+    g.identity_fresh.clear();
+    g.identity_last = 0;
     // Every entry names an object in a block that has just been freed, so the set must
     // not outlive the heap. The LOGGED bits go with the objects; there is nothing left
     // to re-arm and rt_gc_init re-establishes the rest of the generational state.
@@ -4089,6 +4137,7 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // The marks are complete and nothing is reclaimed yet, which is the one moment a
     // record of the runtime's can ask whether the event it waits on was reached.
     rt_internal::event_gc_release_dead(is_marked_now);
+    release_dead_identities();
 
     // The stack is read, so the words a running activation may be using a buffer through
     // are known: first let go of what an earlier collection kept for them that none of
@@ -4225,6 +4274,33 @@ extern "C" void* rt_gc_find_object(const void* addr) {
         return nullptr;
     }
     return h;
+}
+
+extern "C" uint64_t rt_gc_identity(void* handle) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    assert_resolves((g.initialized == 0 || rt_gc_find_object(handle) == handle) && "only an object has an identity");
+    const auto [it, fresh] = g.identity.try_emplace(handle, g.identity_last + 1);
+    if (fresh) {
+        g.identity_last += 1;
+        g.identified.emplace(g.identity_last, handle);
+        g.identity_fresh.push_back(handle);
+    }
+    return it->second;
+}
+
+extern "C" void* rt_gc_identity_object(uint64_t id) {
+    if (id == 0) {
+        return nullptr;
+    }
+    const auto it = g.identified.find(id);
+    if (it == g.identified.end()) {
+        char note[96];
+        std::snprintf(note, sizeof note, "identity number %llu", static_cast<unsigned long long>(id));
+        gc_fatal("an identity number names no object", note);
+    }
+    return it->second;
 }
 
 extern "C" void rt_gc_verify(void) {

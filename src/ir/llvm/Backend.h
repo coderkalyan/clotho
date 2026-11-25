@@ -3205,6 +3205,8 @@ private:
     llvm::FunctionCallee gc_alloc_fn();
     llvm::FunctionCallee gc_roots_add_fn();
     llvm::FunctionCallee gc_range_add_fn();
+    llvm::FunctionCallee gc_identity_fn();
+    llvm::FunctionCallee gc_identity_object_fn();
     llvm::FunctionCallee gc_nba_words_add_fn();
     llvm::FunctionCallee gc_nba_container_add_fn();
     llvm::FunctionCallee gc_containers_add_fn();
@@ -3576,6 +3578,9 @@ private:
                         llvm::Value*     scratch,
                         llvm::ArrayType* arr_ty,
                         uint32_t         off);
+
+    llvm::Value* key_leaf_word(llvm::Value* mustval, Ref type);
+    llvm::Value* key_leaf_value(llvm::Value* word, Ref type);
 
     std::pair<llvm::Value*, llvm::Value*> normalize_integral_key(llvm::Value* mustval, const AssocKeyInfo& info);
 

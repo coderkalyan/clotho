@@ -490,6 +490,53 @@ TEST_CASE("assoc: a struct key holding a class handle and a string") {
     CHECK(run_capture(src) == "num=4\np-one=101\nq-two exists=0\nsum=1090\nnum=3\n");
 }
 
+// The order of handle keys. The LRM leaves it to the implementation, and here it
+// is the order in which the objects were first numbered, which for these is when
+// each first became a key: a key is the object's identity number, not its address,
+// so the order does not depend on where the allocator put an object and is the
+// same in every run. An object keeps its number for as long as it lives, so
+// deleting and re-inserting a key puts it back where it was. Events order the same
+// way, and inside an aggregate key a handle orders as a member in its place: null
+// first, then by number, then by what follows.
+TEST_CASE("assoc: handle keys iterate in the order their objects were first numbered") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; int x; endclass
+            typedef struct { C h; int i; } k_t;
+            int by_obj [C];
+            int by_ev  [event];
+            int by_agg [k_t];
+            initial begin
+                C     h[6];
+                event ev[4];
+                k_t   k;
+                foreach (h[i]) begin
+                    h[i]   = new;
+                    h[i].x = i;
+                end
+                by_obj[h[3]] = 1; by_obj[h[0]] = 2; by_obj[h[5]] = 3; by_obj[h[1]] = 4;
+                foreach (by_obj[c]) $write("%0d ", c.x);
+                $display;
+                by_obj.delete(h[0]);
+                by_obj[h[4]] = 5;
+                by_obj[h[0]] = 6;
+                foreach (by_obj[c]) $write("%0d ", c.x);
+                $display;
+                by_ev[ev[2]] = 2; by_ev[ev[0]] = 0; by_ev[ev[3]] = 3; by_ev[ev[1]] = 1;
+                foreach (by_ev[e]) $write("%0d ", by_ev[e]);
+                $display;
+                k.h = h[5]; k.i = 2; by_agg[k] = 52;
+                k.h = h[3]; k.i = 9; by_agg[k] = 39;
+                k.h = h[5]; k.i = 1; by_agg[k] = 51;
+                k.h = null; k.i = 7; by_agg[k] = 7;
+                foreach (by_agg[a]) $write("%0d ", by_agg[a]);
+                $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 0 5 1 \n3 0 5 1 4 \n2 0 3 1 \n7 39 51 52 \n");
+}
+
 // docs/design/assoc-keys.md's P0-P3 phases admit every LRM 7.8.5 index type;
 // what remains here is one non-lvalue-expression corner.
 TEST_CASE("assoc key types Clotho still refuses loudly") {

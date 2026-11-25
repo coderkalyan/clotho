@@ -17,9 +17,13 @@ LRM's example); P4 fixed four independent correctness debts found while
 scoping (§7).
 
 A class or event handle may sit anywhere in a key, variable-length ones included.
-The collector finds it by walking the key bytes as this encoding wrote them, from a
-shape the backend emits per key type (`garbage-collection.md` §3.3a). The decode
-side of that walk is the one piece of this encoding the runtime also has to know.
+It is serialized as its object's identity number, 8 big-endian bytes, never as
+its address (`garbage-collection.md` §3.1): handle keys therefore order by when
+their objects were first numbered, null first, and the order is the same in every
+run. The collector finds the handles by walking the key bytes as this encoding
+wrote them, from a shape the backend emits per key type (§3.3a there), and
+resolves each number to its object. The decode side of that walk is the one piece
+of this encoding the runtime also has to know.
 
 ## 1. What the LRM requires
 

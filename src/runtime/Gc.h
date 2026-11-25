@@ -74,16 +74,14 @@ struct rt_alloc_site;
 //           marks. 0 is "never marked".
 // bit  2    PINNED    -- a conservative root reached this object; never move it.
 // bit  3    FINALIZE  -- this object is on the finalizable list.
-// bit  4    HAS_ID    -- the payload holds a lazily-assigned object id.
+// bit  4    unused. An object's identity number is kept beside the heap, not here
+//           (rt_gc_identity).
 // bit  5    FORWARDED -- the payload holds a forwarding address (evacuation only;
 //                        never set while the collector is non-moving).
-// bits 8-63 payload   -- object id or forwarding address, never both: the id
-//                        travels with the copy and the original's word is dead
-//                        after the collection that forwarded it.
+// bits 9-63 payload   -- a forwarding address.
 #define RT_GC_MARK_MASK      0x3ull
 #define RT_GC_FLAG_PINNED    (1ull << 2)
 #define RT_GC_FLAG_FINALIZE  (1ull << 3)
-#define RT_GC_FLAG_HAS_ID    (1ull << 4)
 #define RT_GC_FLAG_FORWARDED (1ull << 5)
 
 // -- Generational bits (docs/design/garbage-collection.md §7) ------------------
@@ -515,6 +513,9 @@ typedef struct rt_gc_stats {
     // everything it allocates, which every design ending by running out of events
     // does, so a test can assert it to find a free site that does not report.
     uint64_t owned_bytes;
+    // Objects that held an identity number (rt_gc_identity) once the last
+    // collection had forgotten the numbers of those it did not reach.
+    uint64_t identities;
 } rt_gc_stats;
 
 void rt_gc_get_stats(rt_gc_stats* out);
@@ -526,6 +527,17 @@ void rt_gc_get_stats(rt_gc_stats* out);
 // `ref` into a class property (a raw interior pointer that passes no witness
 // chain, ir/llvm/StateLayout.cpp, ref_actual_arg) safe with no epoch machinery.
 void* rt_gc_find_object(const void* addr);
+
+// The identity number of the object at `handle`: assigned by the first call for
+// that object, counting from 1 in the order of those calls, and never given to
+// another object in the same run. 0 for null. It is what stands for the object
+// wherever its address must not: in the bytes of an associative-array key, which
+// decide the array's order, and in formatted output.
+uint64_t rt_gc_identity(void* handle);
+
+// The object an identity number names; null for 0. A number whose object has been
+// reclaimed names nothing, and asking for it ends the run.
+void* rt_gc_identity_object(uint64_t id);
 
 // Walk the heap asserting every live object's descriptor, size and handle fields
 // are self-consistent. The verify mode from

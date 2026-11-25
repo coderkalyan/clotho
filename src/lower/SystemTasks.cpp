@@ -2663,6 +2663,13 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             // Whether the decimal conversions print `v` as a signed number: the
             // argument's own signedness, unless it is converted below.
             bool v_signed = arg->type->isSigned();
+            // A class or event handle formats as its object's identity number, not
+            // as its address, which differs from run to run. (%p prints a handle by
+            // name and went the other way above.)
+            if (const slang::ast::Type& at = arg->type->getCanonicalType(); at.isClass() || at.isEvent()) {
+                v        = b.handle_identity(v, al);
+                v_signed = false;
+            }
             if (fl && !real_conv) {
                 switch (conv) {
                     case 'd':

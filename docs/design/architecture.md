@@ -98,10 +98,12 @@ them in step.
 - Objects do not move, but only what the collector scans may rely on that: an
   object's address is held in object fields, design state, frames and the stack
   and nowhere else, and identity and ordering never use it, so that moving can be
-  added. **Not yet:** an associative array keyed by a class or event handle
-  orders by address, and the runtime's own records of an event (a `->> #d` timer,
-  a `->> @(x)` subscription, a dump variable, the table of events that are a
-  control) hold its address where the collector reads it but could not update it.
+  added. Where a handle must stand for its object outside those places (the bytes
+  of an associative-array key, formatted output) it is the object's identity
+  number, assigned on first request and kept in a table beside the heap. **Not
+  yet:** the runtime's own records of an event (a `->> #d` timer, a `->> @(x)`
+  subscription, a dump variable, the table of events that are a control) hold its
+  address where the collector reads it but could not update it.
 - Suspended frames and the native stack are scanned conservatively until frames
   have explicit stack maps; object fields and design state are scanned precisely.
 - A young collection costs what happened since the last collection (allocation,

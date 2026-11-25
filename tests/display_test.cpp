@@ -839,6 +839,35 @@ TEST_CASE("%p of a class handle prints null or the class name") {
     CHECK(out == "null:   null\nlive:   Outer\nmember: '{a:3, h:Outer}\nmnull:  '{a:3, h:null}\n");
 }
 
+// A class handle under an integral conversion, and an event as a bare argument
+// (slang accepts no conversion but %p for an event). The form is ours to choose,
+// and it is the object's identity number: 1 for the first object anything asked
+// the number of, 2 for the next, 0 for null. The address is not printed because it
+// differs from run to run. The same number orders an associative array keyed by
+// the handle, so `b`, formatted first, is also the first key.
+TEST_CASE("a handle under an integral conversion prints its identity number") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C; int x; endclass
+            C     a, b, n;
+            event e;
+            int   by_obj [C];
+            initial begin
+                a = new;
+                b = new;
+                $display("%0d %0d %0d", b, a, b);
+                $display("%0d", n);
+                $display(e);
+                by_obj[a] = 10;
+                by_obj[b] = 20;
+                foreach (by_obj[k]) $write("%0d ", by_obj[k]);
+                $display;
+            end
+        endmodule
+    )");
+    CHECK(out == "1 2 1\n0\n                   3\n20 10 \n");
+}
+
 // `%p` of a chandle, an event and a virtual-interface handle. This used to be
 // refused loud, which was a refusal of an LRM `shall`: 21.2.1.6 says "a chandle,
 // class handle, interface class handle, event, or virtual interface shall print its

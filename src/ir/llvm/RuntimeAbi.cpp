@@ -1472,6 +1472,16 @@ llvm::FunctionCallee Backend::gc_range_add_fn() {
     return rt_fn("rt_gc_range_add", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
+// An object's identity number and its inverse (Gc.h, rt_gc_identity): what a handle
+// is serialized as in an associative-array key.
+llvm::FunctionCallee Backend::gc_identity_fn() {
+    return rt_fn("rt_gc_identity", b_.getInt64Ty(), { raw_ptr_ty() });
+}
+
+llvm::FunctionCallee Backend::gc_identity_object_fn() {
+    return rt_fn("rt_gc_identity_object", raw_ptr_ty(), { b_.getInt64Ty() });
+}
+
 // The NBA staging queues that can hold a class handle (Gc.h, rt_gc_nba_words_add): the
 // collector reads the staged records of the shared rt_nba_arr_* buffers at every collection.
 llvm::FunctionCallee Backend::gc_nba_words_add_fn() {

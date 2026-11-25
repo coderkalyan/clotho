@@ -140,6 +140,9 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::EventTriggered:
             // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
             return { 1, false };
+        case Inst::Tag::HandleIdentity:
+            // An identity number: a definite 2-state 64-bit unsigned count.
+            return { 64, false };
         case Inst::Tag::Random:
             return { 32, false };
         case Inst::Tag::Clog2:

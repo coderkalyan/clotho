@@ -393,6 +393,8 @@ const char* tag_name(Inst::Tag tag) {
             return "event_trigger";
         case T::EventTriggered:
             return "event_triggered";
+        case T::HandleIdentity:
+            return "handle_identity";
         case T::EventTriggerNb:
             return "event_trigger_nb";
         case T::EventTriggerNbEvent:

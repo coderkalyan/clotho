@@ -1202,7 +1202,8 @@ struct rt_elem_ops {
 // opcode followed by its operands. A body is a nested sequence of `w` words.
 //
 //   skip n              n bytes that hold no handle
-//   handle              8 big-endian bytes: a class or event handle
+//   handle              8 big-endian bytes: the identity number of a class or
+//                       event object (Gc.h, rt_gc_identity), 0 for null
 //   string              a u32 big-endian length, then that many bytes
 //   seq w body          a u32 big-endian count, then the body once per element
 //                       (a queue or dynamic array)

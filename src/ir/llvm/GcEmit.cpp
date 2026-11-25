@@ -174,8 +174,8 @@ bool Backend::key_shape(Ref type, std::vector<uint32_t>& out, size_t& last_skip)
         return handle || !key.empty();
     }
     if (types::is_object_handle(mod_.pool, type)) {
-        // 64-bit unsigned (InternPool.cpp), so emit_key_bytes writes exactly 8
-        // big-endian bytes here with no sign flip for the collector to undo.
+        // The object's identity number (key_leaf_word): 64-bit unsigned, so exactly 8
+        // big-endian bytes with no sign flip, which the collector resolves to the object.
         assert(agg_key_bytes(type) == 8 && "a handle normalizes to 8 key bytes");
         out.push_back(rt_key_handle);
         last_skip = npos;
@@ -1253,8 +1253,8 @@ llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site) {
     // FINALIZE is the only header bit `new` ever sets, and whether it is set is a
     // compile-time property of the class. Mark bits 0-1 stay 0, which is "never
     // marked" and is what makes the next collection trace the object (Gc.h:47-52);
-    // PINNED, HAS_ID and FORWARDED are the collector's own and start clear; the
-    // payload is empty until an object id or a forwarding address lands in it.
+    // PINNED and FORWARDED are the collector's own and start clear; the payload is
+    // empty until a forwarding address lands in it.
     // This is the same word rt_gc_alloc writes (Gc.cpp:1704), and the bit MUST
     // agree with `map->finalize` being non-null because run_finalizers() asserts
     // the two agree (Gc.cpp:1297, 1337).
