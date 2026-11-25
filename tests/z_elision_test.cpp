@@ -53,8 +53,10 @@ struct Analyzed {
     }
 };
 
+// May-z of every signal as lowered, logic nothing reads included.
 Analyzed analyze(std::string_view source) {
-    Analyzed a{ .lowered = lower_text(source), .may_z = {} };
+    Analyzed a{ .lowered = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*keep_unread=*/true),
+                .may_z   = {} };
     REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostic_text());
     REQUIRE(a.lowered.module != nullptr);
     a.may_z = ir::analyze(*a.lowered.module).may_z;

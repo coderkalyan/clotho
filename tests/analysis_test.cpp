@@ -35,8 +35,10 @@ struct Analyzed {
     }
 };
 
+// The facts of every process as lowered, logic nothing reads included.
 Analyzed run(std::string_view source) {
-    Analyzed a{ .lowered = lower_text(source), .facts = {} };
+    Analyzed a{ .lowered = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*keep_unread=*/true),
+                .facts   = {} };
     REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostic_text());
     REQUIRE(a.lowered.module != nullptr);
     a.facts = ir::analyze(*a.lowered.module);

@@ -36,12 +36,18 @@ TEST_CASE("source spans round-trip and report validity") {
 // SourceManager was a stack local in each entry point, so every location in the
 // IR became garbage the moment control left `lower_*`.
 TEST_CASE("locations survive lowering and resolve to real positions") {
+    // Nothing reads `counter`, so its initial block is kept explicitly to have a
+    // process to locate.
     const LowerResult r = lower_text(R"(
 module m;
   logic [3:0] counter;
   initial counter = 0;
 endmodule
-)");
+)",
+                                     nullptr,
+                                     ir::SystemAccess::Off,
+                                     false,
+                                     /*keep_unread=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.sources != nullptr);
     REQUIRE_FALSE(r.sources->empty());

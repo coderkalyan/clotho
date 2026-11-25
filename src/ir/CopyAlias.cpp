@@ -284,28 +284,7 @@ void alias_copies(Design& design) {
                 u.signals[h].alias = r;
             }
         }
-        // Drop the copies, then renumber what counts processes.
-        std::vector<uint32_t> kept_before(u.processes.size() + 1, 0);
-        for (uint32_t k = 0; k < u.processes.size(); ++k) {
-            kept_before[k + 1] = kept_before[k] + (drop[k] == 0 ? 1 : 0);
-        }
-        for (ChildSlot& c : u.children) {
-            c.process_pos = kept_before[c.process_pos];
-        }
-        for (UnitDisableTarget& t : u.disable_targets) {
-            if (t.import == kLocal && t.flush_proc != Module::no_flush_proc) {
-                assert(drop[t.flush_proc] == 0);
-                t.flush_proc = kept_before[t.flush_proc];
-            }
-        }
-        std::vector<Process> kept;
-        kept.reserve(kept_before.back());
-        for (uint32_t k = 0; k < u.processes.size(); ++k) {
-            if (drop[k] == 0) {
-                kept.push_back(std::move(u.processes[k]));
-            }
-        }
-        u.processes = std::move(kept);
+        remove_processes(u, drop);
     }
 }
 

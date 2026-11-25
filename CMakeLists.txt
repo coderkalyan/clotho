@@ -515,6 +515,7 @@ add_library(clotho_ir_core STATIC
   src/ir/Ir.cpp
   src/ir/Design.cpp
   src/ir/CopyAlias.cpp
+  src/ir/UnreadProcesses.cpp
   src/ir/Partition.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
@@ -1065,6 +1066,7 @@ set(CLOTHO_TEST_SOURCES
   tests/intra_assign_test.cpp
   tests/continuous_assign_delay_test.cpp
   tests/copy_alias_test.cpp
+  tests/unread_logic_test.cpp
   tests/net_delay_test.cpp
   tests/string_test.cpp
   tests/dpi_test.cpp

@@ -105,20 +105,26 @@ LowerResult lower_sources(std::span<const std::string_view> args,
 // the returned `sources` keeps the Driver (hence its SourceManager) alive so a
 // `SourceLoc` stays resolvable. `path_prefix_map` changes how the simulation's
 // messages show source paths (SourceContext::shown_file). `stats` selects the
-// frontend's `--stat` reports (ir::Stat).
+// frontend's `--stat` reports (ir::Stat). `keep_unread` keeps the processes
+// whose results nothing in the design reads, which are otherwise removed, so a
+// debugger can show the signals they write (`--keep-unread-logic`).
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          Timings*                               timings             = nullptr,
                          ir::SystemAccess                       allow_system        = ir::SystemAccess::Off,
                          PathPrefixMap                          path_prefix_map     = {},
                          bool                                   allow_port_coercion = false,
-                         uint32_t                               stats               = 0);
+                         uint32_t                               stats               = 0,
+                         bool                                   keep_unread         = false);
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.
+// `keep_unread` as for lower_driver: a test that inspects how a construct
+// lowers, rather than what a design does, keeps logic nothing reads.
 LowerResult lower_text(std::string_view source,
                        Timings*         timings             = nullptr,
                        ir::SystemAccess allow_system        = ir::SystemAccess::Off,
-                       bool             allow_port_coercion = false);
+                       bool             allow_port_coercion = false,
+                       bool             keep_unread         = false);
 
 // Lower an editor's in-memory buffer, named `path` so its diagnostics can be
 // attributed back to the file the client has open.

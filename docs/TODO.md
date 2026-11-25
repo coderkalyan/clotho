@@ -252,6 +252,11 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Port copies as aliases (performance)** (23.3.3.7) — an input or output port is
   still a process copying between two instances' signals; only copies within one unit
   alias (docs/design/modular-compilation.md, "Copy aliasing").
+- [ ] **Unread output ports (performance)** — logic whose only reader is an output port no
+  parent reads still runs; needs the per-port "read" summary (docs/design/modular-compilation.md,
+  "Unread logic").
+- [ ] **Stores into unread signals in live processes (performance)** — a process that stays
+  still computes and stores the values of the unread signals it writes.
 
 ### File and string I/O
 

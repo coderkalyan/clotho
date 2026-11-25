@@ -310,6 +310,39 @@ lists it on its target's identifier code (LRM 21.7.2.3). Which members other
 units write is the one fact from outside the unit the pass reads; matched by
 name, it can only block an alias, and it belongs with the inbound facts below.
 
+### Unread logic
+
+A process whose only effect is storing into signals nothing reads is not kept.
+`remove_unread_processes` (src/ir/UnreadProcesses.cpp) runs after copy aliasing,
+per module unit, as a mark from the signals that are read:
+
+- Roots: the unit's ports, every signal another unit names by an import (read
+  or written, matched by name), every signal a child port binds, the clocks of
+  the unit's assertion monitors, and everything a function of the unit names.
+- A process stays when it has any effect but a Store / StoreNb into a local
+  signal. A candidate has nothing else but pure instructions (`TagInfo::pure`)
+  and member selects, no loop, and is an initial block or an always block that
+  waits or is a continuous assignment (one that never finishes keeps its hang).
+  A process that stays reads what it loads, waits on or names in a side table.
+- A signal is read when a staying process reads it, and a process that stores
+  into a read signal stays and its reads count. What is left is deleted; its
+  signals keep their storage and power-on values.
+
+LLVM cannot do this. The storage escapes into the runtime and into other
+units' bindings, a store's own change check loads the old value, and what a
+deleted process saves is mostly its subscription and dispatch, which the
+scheduler holds as data. Deleting a process shifts the design-wide index the
+processes after it draw their random seed from; LRM 18.14 fixes no seed values,
+and the result is still the same on every run of the same source.
+
+The pass runs only for `build` and `run`, and not for a design that calls
+`$dumpvars`, whose whole-design form reads everything, nor under
+`--keep-unread-logic`, which the debug adapter passes so a debugger sees every
+signal. `lint`, `synth`, a poisoned design and an editor's partial one keep
+every process as written. Not yet: a port read by no parent (the per-port
+"read" fact of the summaries below), and a store into an unread signal inside a
+process that stays.
+
 ## Inbound facts and summaries
 
 Each unit gets a summary computed from its body alone: per port and exported

@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <deque>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -695,7 +696,12 @@ void Adapter::on_launch(const Request& request) {
         fail(request, "'args' must carry the `clotho run` arguments for the design, and is empty");
         return;
     }
-    design_args_ = *std::move(arguments.args);
+    // A debugger shows any signal, so the design keeps the logic nothing in it
+    // reads (docs/design/modular-compilation.md, "Unread logic").
+    design_args_ = { "--keep-unread-logic" };
+    design_args_.insert(design_args_.end(),
+                        std::make_move_iterator(arguments.args->begin()),
+                        std::make_move_iterator(arguments.args->end()));
     design_cwd_  = arguments.cwd.value_or(std::string{});
     launched_    = true;
     ack(request);

@@ -16,9 +16,11 @@ using namespace clotho;
 
 namespace {
 
-// Lower and require success, returning the module.
-LowerResult lower_ok(std::string_view src) {
-    LowerResult r = lower_text(src);
+// Lower and require success, returning the module. The structural checks below
+// count the processes a gate lowers to, so by default the logic nothing reads
+// is kept (Lower.h, lower_text).
+LowerResult lower_ok(std::string_view src, bool keep_unread = true) {
+    LowerResult r = lower_text(src, nullptr, ir::SystemAccess::Off, false, keep_unread);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
@@ -27,7 +29,7 @@ LowerResult lower_ok(std::string_view src) {
 
 // JIT-run a module and capture everything it writes to stdout.
 std::string run_capture(std::string_view source) {
-    const LowerResult r = lower_ok(source);
+    const LowerResult r = lower_ok(source, false);
 
     std::FILE* tmp = std::tmpfile();
     REQUIRE(tmp != nullptr);

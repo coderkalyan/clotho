@@ -296,6 +296,11 @@ public:
 // Function is move-only because its body is.
 Function signature_of(const Function& f);
 
+// Delete the processes of `u` whose `drop` entry is non-zero, renumbering what
+// counts processes (ChildSlot::process_pos, UnitDisableTarget::flush_proc). A
+// process a `disable` target flushes must not be dropped.
+void remove_processes(Unit& u, const std::vector<uint8_t>& drop);
+
 // Remove every continuous assignment that copies one whole signal of a unit
 // into another of the same type, where one of the two can become a name for
 // the other's storage, and record that alias (UnitSignal::alias). Unit-local:
@@ -303,6 +308,14 @@ Function signature_of(const Function& f);
 // through imports, which only ever block an alias. See
 // docs/design/modular-compilation.md, "Copy aliasing".
 void alias_copies(Design& design);
+
+// Remove every process of a module unit whose only effect is storing into the
+// unit's own signals that nothing reads, directly or through other such
+// processes. Unit-local: a port, a signal another unit names, and a signal a
+// child binds are always read. Does nothing for a design that dumps (any
+// $dumpvars), which reads everything. See docs/design/modular-compilation.md,
+// "Unread logic".
+void remove_unread_processes(Design& design);
 
 // Expand `design` into the flat Module: every unit copied once per instance,
 // with each extern declaration resolved to the definition its import names. The

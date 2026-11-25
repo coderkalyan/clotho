@@ -743,9 +743,10 @@ TEST_CASE("parameter bit/part/indexed selects agree with iverilog") {
 
 namespace {
 
-// The backend's raw IR (no optimizer), and the body of the first process in it.
+// The backend's raw IR (no optimizer), and the body of the first process in it,
+// logic nothing reads included.
 std::string process_body(std::string_view source) {
-    const LowerResult r = lower_text(source);
+    const LowerResult r = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*keep_unread=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     std::string              ir;
     llvm::raw_string_ostream os(ir);
