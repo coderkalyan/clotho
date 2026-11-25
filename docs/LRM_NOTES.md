@@ -795,3 +795,34 @@ takes `start`, `finish`, `count` and `@` as flat leaf indices (`$readmemh(f, m, 
 of truth here, so the tests that name an address are derived from it.
 
 Code: `src/runtime/Io.cpp` (`RowOrder`, `rt_readmem`, `rt_fread`), `src/ir/llvm/SystemTasks.cpp` (`mem_inner_dims`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh fills a whole multi-dimensional memory row-major", "$readmem fills a multi-dimensional 4-state, 2-state and wide memory", "$fread fills a whole multi-dimensional memory row-major", "a data file address names a word of the highest dimension", "$readmem start and finish name words of the highest dimension", "$fread start and count are words of the highest dimension"). Oracle: iverilog 13 where it agrees.
+
+## 60. Slices, elements and invalid targets of `$readmem*` and `$fread` (21.4, 7.4.5, 11.5.1)
+
+21.4 lets `memory_name` be "an unpacked array or a partially indexed multidimensional
+unpacked array that resolves to a lesser dimensioned unpacked array", with "Higher order
+dimensions ... specified with an index" and the lowest "with slice syntax". The addresses
+"apply to the addresses of the unpacked array selected by memory_name", and "When slice
+syntax is used ... any start_addr and finish_addr arguments shall fall within the bounds
+of the slice's range". Clotho takes the array the argument names as the memory to load,
+with its own bounds as addresses: `a[2:5]` has addresses 2 to 5, `m[1]` those of its
+dimension, and the default start is the lowest of them, whichever way they are declared
+(note 59 gives the rows of an array of several dimensions). An indexed slice
+`a[i +: n]` / `a[i -: n]` has the bounds slang gives it, `[0:n-1]` or `[n-1:0]` by the
+direction of `a`, so its addresses do not depend on `i`.
+
+7.4.5 makes writing an array through an invalid index a no-operation, and says nothing of
+a slice that is partly outside its array, or of a load. Clotho applies the rule to each
+word, as it does to a write of a slice, so the words of a slice outside the array are
+dropped where they fall and the others keep their place: `a[1 -: 3]` of `a[0:7]` takes
+its second word for `a[0]`. A file's word that falls outside is reported by `$readmem*`
+and its bytes are read and dropped by `$fread`. A target that names no word at all, an
+element index outside the array or with an x or z bit, a slice whose base has one, or a
+slice wholly outside the array, loads nothing: no file is opened, no byte is read, and
+`$fread` returns 0.
+
+iverilog 13 accepts none of these target shapes ("Array cannot be indexed by a range"), so
+the tests take as oracle its load of the whole memory that places the same words
+(`a[2:5]` is `a` with start 2 and finish 5, `m[1]` leaves 4 to 7), and derive the rest
+from the clauses above.
+
+Code: `src/lower/SystemTasks.cpp` (`lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`), `src/runtime/Io.cpp` (`rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a constant slice of a memory", "$readmemh into an element or a slice of an element of a multi-dimensional memory", "$readmemh into a slice at a variable position", "$readmemh through an invalid index loads nothing", "$fread into a slice or an element of a memory"), `tests/runtime_test.cpp` ("rt_readmem loads the words that exist and drops the others").

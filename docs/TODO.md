@@ -69,7 +69,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Slice of an array with struct or array elements** — refused.
   - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
     or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
-- [ ] **Sliced memory target for `$readmem*` / `$fread`** — a slice destination is refused.
 - [ ] **Whole-array or slice assignment from a concatenation or streaming result** (10.10,
   11.4.14) — an unpacked-array source that is not a variable, pattern or call is refused.
 

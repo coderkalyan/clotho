@@ -3963,6 +3963,21 @@ private:
 
     ir::Index lower_address_arg(const Expression& expr, ir::Builder& b);
 
+    // The array a $readmem / $fread loads (LRM 21.4, 21.3.4.4), as ReadMemInfo and
+    // FreadMemInfo name it: `target` the array lvalue, or the one an indexed slice
+    // selects from, and `type` the array the load fills.
+    struct MemTarget {
+        ir::Index target;
+        ir::Ref   type;
+        ir::Ref   base_type  = ir::Ref::Invalid;
+        ir::Index slice_base = ir::Index{ 0 };
+        uint32_t  slice      = ir::kMemSliceNone;
+    };
+
+    static bool is_mem_target_shape(const Expression& e);
+
+    MemTarget lower_mem_target(const Expression& e, ir::Builder& b);
+
     std::vector<char> scan_conversion_chars(std::string_view fmt);
 
     ir::Index lower_scanf(const CallExpression& call, bool is_sscanf, ir::Builder& b, ir::SourceLoc l);

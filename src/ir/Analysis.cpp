@@ -892,9 +892,11 @@ struct Structural {
                     mark_partial(ir, p.op_extra.op);
                     break;
                 case Inst::Tag::ReadMem: {
-                    const Signal target                   = ir.extra_data<ReadMemInfo>(p.op_extra.extra).target;
-                    driven[static_cast<uint32_t>(target)] = true;
-                    mark_sig_whole(static_cast<uint32_t>(target));
+                    // The load writes the array its target lvalue names, whole or a
+                    // part of it.
+                    const Index target = ir.extra_data<ReadMemInfo>(p.op_extra.extra).target;
+                    mark_driven_root(ir, target);
+                    mark_partial(ir, target);
                     break;
                 }
                 case Inst::Tag::TaskCall: {
@@ -1667,9 +1669,13 @@ struct ValueSweep {
                     // Seed 3: the file may contain x and z digits. A 2-state memory
                     // reads x/z as 0 and stays clean.
                     const ReadMemInfo info = ir.extra_data<ReadMemInfo>(p.op_extra.extra);
-                    if (m.pool.layout(m.signal(info.target).type).domain == Domain::Four) {
-                        mark(sig_z[static_cast<uint32_t>(info.target)]);
-                        mark(sig_x[static_cast<uint32_t>(info.target)]);
+                    const Index       root = lvalue_root(ir, info.target).root;
+                    if (ir.tag(root) == Inst::Tag::Signal) {
+                        const auto sig = static_cast<uint32_t>(ir.payload(root).signal);
+                        if (m.pool.layout(m.signal(ir.payload(root).signal).type).domain == Domain::Four) {
+                            mark(sig_z[sig]);
+                            mark(sig_x[sig]);
+                        }
                     }
                     val_x[raw] = 0;
                     break;

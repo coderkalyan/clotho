@@ -21,9 +21,9 @@ namespace clotho::ir::backend {
 // is the same signal for every instance, so twins still match on it; a
 // cross-instance hierarchical reference differs per instance and honestly
 // blocks matching). V1 keeps the extra buffer raw, so a body carrying a
-// signal inside an extra record (Wait / StoreNbEvent / ReadMem / FreadMem /
-// EventTriggerNbDelayed) or a FunctionId (per-instance function copies)
-// hashes instance-specific — counted as blockers, not miscounted as twins.
+// signal inside an extra record (Wait / StoreNbEvent / EventTriggerNbDelayed)
+// or a FunctionId (per-instance function copies) hashes instance-specific —
+// counted as blockers, not miscounted as twins.
 void Backend::report_dedup_stat() {
     struct Key {
         llvm::StructType* ty;
@@ -109,7 +109,6 @@ void Backend::report_dedup_stat() {
             calls = calls || tag == Inst::Tag::Call || tag == Inst::Tag::CallVirtual ||
                     tag == Inst::Tag::TaskCall || tag == Inst::Tag::TaskCallVirtual;
             extra_sig = extra_sig || tag == Inst::Tag::Wait || tag == Inst::Tag::StoreNbEvent ||
-                        tag == Inst::Tag::ReadMem || tag == Inst::Tag::FreadMem ||
                         tag == Inst::Tag::EventTriggerNbDelayed;
         }
         // Raw extra buffer: region slices, operand runs, packed strings —

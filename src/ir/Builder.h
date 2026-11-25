@@ -583,9 +583,9 @@ public:
     // $fread(reg, fd): read raw bytes from `fd` into the packed-vector lvalue `dst`.
     // Yields the byte count.
     Index fread_word(Index dst, Index fd, SourceLoc loc);
-    // $fread(mem, fd[, start[, count]]): read raw bytes from `fd` into the memory
-    // signal `mem`. Yields the byte count.
-    Index fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count, SourceLoc loc);
+    // $fread(mem, fd[, start[, count]]): read raw bytes from `fd` into the array
+    // `info` names (FreadMemInfo). Yields the byte count.
+    Index fread_mem(Index fd, const FreadMemInfo& info, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. `banner` is the compile-time
     // prefix "<file>:<line>: <task>"; `arg` is the diagnostic level (0/1/2, LRM
     // Table 20-1). No SSA operands.
@@ -620,17 +620,9 @@ public:
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);
-    // $readmemh / $readmemb: load a file into the memory signal `target`. `filename`
-    // is the path value; `start` / `finish` are optional address bounds (pass any
-    // Index when the matching has_* is false). `hex` selects hex vs binary.
-    Index read_mem(Signal    target,
-                   Index     filename,
-                   Index     start,
-                   Index     finish,
-                   bool      hex,
-                   bool      has_start,
-                   bool      has_finish,
-                   SourceLoc loc);
+    // $readmemh / $readmemb: load the file `filename` names into the array `info`
+    // names (ReadMemInfo); its start / finish operands are valid per its has_* flags.
+    Index read_mem(Index filename, const ReadMemInfo& info, SourceLoc loc);
     // $timeformat: set the %t format. `units`, `precision`, and `min_width` are
     // already-lowered value operands; `suffix` is a literal string appended after
     // the formatted number.

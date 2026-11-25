@@ -239,12 +239,14 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[1]     = dps.offset;
                 return { scratch.data(), 2 };
             }
-            // fread_mem exposes its fd value plus the optional start / count
-            // operands; the target memory is a Signal handle, not an operand.
+            // fread_mem exposes its fd value, its target lvalue and the optional start
+            // / count operands; the base of an indexed slice is a tail operand
+            // (ExtraOperandTail::MemSliceBase).
             if (tag == Inst::Tag::FreadMem) {
                 const auto fm = extra_data<FreadMemInfo>(p.op_extra.extra);
                 size_t     n  = 0;
                 scratch[n++]  = p.op_extra.op;
+                scratch[n++]  = fm.target;
                 if (fm.has_start) {
                     scratch[n++] = fm.start;
                 }
@@ -253,12 +255,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 }
                 return { scratch.data(), n };
             }
-            // read_mem exposes its filename value plus the optional start / finish
-            // address operands; the target memory is a Signal handle, not an operand.
+            // read_mem exposes its filename value, its target lvalue and the optional
+            // start / finish address operands.
             if (tag == Inst::Tag::ReadMem) {
                 const auto rm = extra_data<ReadMemInfo>(p.op_extra.extra);
                 size_t     n  = 0;
                 scratch[n++]  = p.op_extra.op;
+                scratch[n++]  = rm.target;
                 if (rm.has_start) {
                     scratch[n++] = rm.start;
                 }
@@ -573,24 +576,17 @@ Ir Ir::rebased(HandleMapper& m) const {
                 put_extra(extra, p.op_extra.extra, info);
                 break;
             }
-            case T::ReadMem: {
-                auto info   = extra_data<ReadMemInfo>(p.op_extra.extra);
-                info.target = sig(info.target);
-                put_extra(extra, p.op_extra.extra, info);
-                break;
-            }
-            case T::FreadMem: {
-                auto info = extra_data<FreadMemInfo>(p.op_extra.extra);
-                info.mem  = sig(info.mem);
-                put_extra(extra, p.op_extra.extra, info);
-                break;
-            }
             case T::NamedBlock: {
                 auto info  = extra_data<BlockInfo>(p.extra);
                 info.label = target(info.label);
                 put_extra(extra, p.extra, info);
                 break;
             }
+            // The target is an lvalue operand, remapped through its own Signal
+            // instruction, so these records hold no table handle.
+            case T::ReadMem:
+            case T::FreadMem:
+                break;
             // A wait site is an identity within its body (SyncInfo::site), not a
             // handle into any table.
             case T::SyncWait:

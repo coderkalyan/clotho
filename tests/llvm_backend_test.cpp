@@ -4081,6 +4081,314 @@ TEST_CASE("$fread start and count are words of the highest dimension") {
     std::remove(path);
 }
 
+// A slice of a memory is the array a load fills, and start, finish and @ addresses are
+// in the slice's own bounds (LRM 21.4: "any start_addr and finish_addr arguments shall
+// fall within the bounds of the slice's range"). The default start is the slice's
+// lowest address, so a descending `d[5:2]` fills upward too. iverilog 13 takes no
+// slice here ("Array cannot be indexed by a range"); the oracle is its equivalent
+// load of the whole memory, `a[2:5]` as `a` with start 2 and finish 5, and so on.
+TEST_CASE("$readmemh into a constant slice of a memory") {
+    const char* w6 = "clotho_readmem_sl6_test.hex";
+    const char* at = "clotho_readmem_slat_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    write_file(at, "@3 aa bb\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:7], b [0:7], c [0:7], e [0:7];
+            logic [7:0] d [7:0], g [7:0];
+            integer i;
+            initial begin
+                $readmemh(")") + w6 + R"(", a[2:5]);
+                $readmemh(")" + w6 + R"(", b[2:5], 3);
+                $readmemh(")" + w6 + R"(", c[2:5], 5, 4);
+                $readmemh(")" + w6 + R"(", d[5:2]);
+                $readmemh(")" + at + R"(", e[2:5]);
+                $readmemh(")" + w6 + R"(", g[5:2], 4, 3);
+                for (i = 0; i < 8; i = i + 1)
+                    $display("%h %h %h %h %h %h", a[i], b[i], c[i], d[i], e[i], g[i]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx xx xx xx\n"
+                              "xx xx xx xx xx xx\n"
+                              "01 xx xx 01 xx xx\n"
+                              "02 01 xx 02 aa 02\n"
+                              "03 02 02 03 bb 01\n"
+                              "04 03 01 04 xx xx\n"
+                              "xx xx xx xx xx xx\n"
+                              "xx xx xx xx xx xx\n");
+    std::remove(w6);
+    std::remove(at);
+}
+
+// An element of a multidimensional memory that is itself an array is a target, with
+// the addresses of the array it names, and so is a slice of it (LRM 21.4: "a partially
+// indexed multidimensional unpacked array that resolves to a lesser dimensioned
+// unpacked array", its lowest dimension sliceable). The index may be a variable.
+// Oracle: iverilog 13 takes none of these shapes, so each is its equivalent load of the
+// whole memory by flat leaf numbers (`m[1]` is leaves 4..7), which has the same
+// placement when the load names no address, and `start` / `finish` are written there
+// as the leaves they come to.
+TEST_CASE("$readmemh into an element or a slice of an element of a multi-dimensional memory") {
+    const char* w6  = "clotho_readmem_pi6_test.hex";
+    const char* w12 = "clotho_readmem_pi12_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    write_file(w12, "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3], m2 [0:2][0:3], m3 [0:2][0:3], m4 [0:2][0:3];
+            logic [7:0] x1 [0:1][1:0][0:2], x2 [0:1][1:0][0:2];
+            integer i, j, k;
+            initial begin
+                $readmemh(")") + w6 + R"(", m1[1]);
+                $readmemh(")" + w6 + R"(", m2[1][1:2]);
+                k = 2;
+                $readmemh(")" + w6 + R"(", m3[k]);
+                $readmemh(")" + w6 + R"(", m4[1], 2);
+                $readmemh(")" + w12 + R"(", x1[1]);
+                $readmemh(")" + w12 + R"(", x2[0][1]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h%h%h%h %h%h%h%h %h%h%h%h %h%h%h%h", m1[i][0], m1[i][1], m1[i][2], m1[i][3],
+                             m2[i][0], m2[i][1], m2[i][2], m2[i][3], m3[i][0], m3[i][1], m3[i][2], m3[i][3],
+                             m4[i][0], m4[i][1], m4[i][2], m4[i][3]);
+                for (i = 0; i < 2; i = i + 1)
+                    for (j = 0; j < 2; j = j + 1)
+                        $display("%h%h%h %h%h%h", x1[i][j][0], x1[i][j][1], x1[i][j][2], x2[i][j][0], x2[i][j][1],
+                                 x2[i][j][2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx\n"
+                              "01020304 xx0102xx xxxxxxxx xxxx0102\n"
+                              "xxxxxxxx xxxxxxxx 01020304 xxxxxxxx\n"
+                              "xxxxxx xxxxxx\n"
+                              "xxxxxx 010203\n"
+                              "010203 xxxxxx\n"
+                              "040506 xxxxxx\n");
+    std::remove(w6);
+    std::remove(w12);
+}
+
+// A slice whose position is a variable, `a[i +: n]` and `a[i -: n]` (LRM 7.4.5, 11.5.1),
+// is an array of n words, which slang types [0:n-1] or [n-1:0] like the array it
+// slices, so its addresses do not depend on i. Its words that lie outside the array
+// are dropped where they are, not the rest shifted into them, as a write of a slice
+// does (7.4.5: writing through an invalid index is a no-operation), and a load whose
+// index has an x or z bit, or whose slice is wholly outside the array, loads nothing.
+// Oracle: iverilog 13 for the slices inside the array (the equivalent load of the
+// whole memory, `a[i +: 3]` for i = 2 as `a` with start 2 and finish 4); LRM-derived
+// for `h`, `z` and `u`.
+TEST_CASE("$readmemh into a slice at a variable position") {
+    const char* w6 = "clotho_readmem_vs6_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:7], b [0:7], c [0:7], d [0:7], h [0:7], z [0:7], u [0:7];
+            logic [7:0] q [7:0];
+            logic [3:0] xi = 4'bx;
+            integer i, k;
+            initial begin
+                i = 2;  $readmemh(")") + w6 + R"(", a[i +: 3]);
+                i = 5;  $readmemh(")" + w6 + R"(", b[i -: 3]);
+                i = 2;  $readmemh(")" + w6 + R"(", q[i +: 3]);
+                i = 6;  $readmemh(")" + w6 + R"(", c[i +: 4]);
+                i = 2;  $readmemh(")" + w6 + R"(", d[i +: 3], 1);
+                i = 1;  $readmemh(")" + w6 + R"(", h[i -: 3]);
+                        $readmemh(")" + w6 + R"(", z[xi +: 3]);
+                i = 20; $readmemh(")" + w6 + R"(", u[i +: 3]);
+                for (k = 0; k < 8; k = k + 1)
+                    $display("%h %h %h %h %h %h %h %h", a[k], b[k], q[k], c[k], d[k], h[k], z[k], u[k]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx xx xx 02 xx xx\n"
+                              "xx xx xx xx xx 03 xx xx\n"
+                              "01 xx 01 xx xx xx xx xx\n"
+                              "02 01 02 xx 01 xx xx xx\n"
+                              "03 02 03 xx 02 xx xx xx\n"
+                              "xx 03 xx xx xx xx xx xx\n"
+                              "xx xx xx 01 xx xx xx xx\n"
+                              "xx xx xx 02 xx xx xx xx\n");
+    std::remove(w6);
+}
+
+// A variable index that is outside the array, or has an x or z bit, makes an element
+// target invalid, and a load through it does nothing (LRM 7.4.5).
+TEST_CASE("$readmemh through an invalid index loads nothing") {
+    const char* w6 = "clotho_readmem_inv_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3];
+            logic [3:0] xi = 4'bx;
+            integer i;
+            initial begin
+                i = 3;  $readmemh(")") + w6 + R"(", m1[i]);
+                i = -1; $readmemh(")" + w6 + R"(", m1[i]);
+                        $readmemh(")" + w6 + R"(", m1[xi]);
+                $display("%h %h %h", m1[0][0], m1[1][0], m1[2][0]);
+                i = 1;  $readmemh(")" + w6 + R"(", m1[i]);
+                $display("%h %h %h", m1[0][0], m1[1][0], m1[2][0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx\nxx 01 xx\n");
+    std::remove(w6);
+}
+
+// A load into an element or a slice wakes what waits on the memory, as a load of the
+// whole memory does, and only if it changed something.
+TEST_CASE("$readmemh into an element wakes the memory's waiters") {
+    const char* w4 = "clotho_readmem_wk_test.hex";
+    write_file(w4, "01 02 03 04\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:2][0:3];
+            logic [7:0] y, z;
+            integer n = 0;
+            always_comb y = mem[1][0];
+            always_comb z = mem[2][3];
+            always @(mem[1][3]) n = n + 1;
+            initial begin
+                #5 $readmemh(")") + w4 + R"(", mem[1]);
+                #1 $display("%h %h %0d", y, z, n);
+                $readmemh(")" + w4 + R"(", mem[1]);
+                #1 $display("%h %h %0d", y, z, n);
+                $readmemh(")" + w4 + R"(", mem[2][0:3]);
+                #1 $display("%h %h %0d", y, z, n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "01 xx 1\n01 xx 1\n01 04 1\n");
+    std::remove(w4);
+}
+
+// The element kinds in a slice: 4-state values with x and z, a 2-state memory (x and z
+// read as 0, LRM 21.4.2) and elements wider than 64 bits. Oracle: iverilog 13, through
+// the equivalent load of the whole memory.
+TEST_CASE("$readmem into a slice of a 4-state, 2-state and wide memory") {
+    const char* bin = "clotho_readmem_sle_test.bin";
+    const char* hx2 = "clotho_readmem_sle2_test.hex";
+    const char* hxw = "clotho_readmem_slew_test.hex";
+    write_file(bin, "0x01 1zzz 1010 xx11 0000\n");
+    write_file(hx2, "ff z1 3x 77\n");
+    write_file(hxw,
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [3:0]   f [0:5];
+            bit   [7:0]   g [0:3];
+            logic [127:0] w [0:3];
+            integer i;
+            initial begin
+                $readmemb(")") + bin + R"(", f[2:4]);
+                $readmemh(")" + hx2 + R"(", g[1:3]);
+                $readmemh(")" + hxw + R"(", w[1:2]);
+                for (i = 0; i < 6; i = i + 1) $display("%b", f[i]);
+                for (i = 0; i < 4; i = i + 1) $display("%h", g[i]);
+                for (i = 0; i < 4; i = i + 1) $display("%h_%h", w[i][127:64], w[i][63:0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xxxx\nxxxx\n0x01\n1zzz\n1010\nxxxx\n"
+                              "00\nff\n01\n30\n"
+                              "xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx\n"
+                              "deadbeefcafebabe_0123456789abcdef\n"
+                              "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                              "xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx\n");
+    std::remove(bin);
+    std::remove(hx2);
+    std::remove(hxw);
+}
+
+// The same targets through a hierarchical reference and a block-local array.
+TEST_CASE("$readmemh into a slice of a hierarchical or block-local memory") {
+    const char* w6 = "clotho_readmem_hl_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    const std::string src = std::string(R"(
+        module sub;
+            logic [7:0] mem [0:3];
+        endmodule
+        module m;
+            sub u();
+            integer i;
+            initial begin
+                logic [7:0] loc [0:3];
+                $readmemh(")") + w6 + R"(", u.mem[1:2]);
+                $readmemh(")" + w6 + R"(", loc[2:3]);
+                for (i = 0; i < 4; i = i + 1) $display("%h %h", u.mem[i], loc[i]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx\n01 xx\n02 01\nxx 02\n");
+    std::remove(w6);
+}
+
+// $fread takes the same targets. Its start and count are words of the array it names,
+// a target that names no word reads nothing and leaves the file where it was, and an
+// index outside the array is such a target. Oracle: iverilog 13 through the equivalent
+// $fread of the whole memory (`a[2:5]` as `a` with start 2 and count 4).
+TEST_CASE("$fread into a slice or an element of a memory") {
+    const char* path = "clotho_fread_sl_test.bin";
+    write_file(path, std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:7], c [0:7], d [0:7];
+            logic [7:0] b [0:2][0:3], b2 [0:2][0:3];
+            integer fd, rc, i;
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                rc = $fread(a[2:5], fd);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(b[1], fd);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(b2[1], fd, 2, 1);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                i = 2;
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(c[i +: 3], fd);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                i = 20;
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(d[i +: 3], fd);
+                $display("rc=%0d first=%0h", rc, $fgetc(fd));
+                $fclose(fd);
+                for (i = 0; i < 8; i = i + 1) $display("%h %h %h", a[i], c[i], d[i]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h%h%h%h %h%h%h%h", b[i][0], b[i][1], b[i][2], b[i][3], b2[i][0], b2[i][1],
+                             b2[i][2], b2[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=4\nrc=4\nrc=1\nrc=3\nrc=0 first=11\n"
+                              "xx xx xx\nxx xx xx\n11 11 xx\n22 22 xx\n33 33 xx\n44 xx xx\nxx xx xx\nxx xx xx\n"
+                              "xxxxxxxx xxxxxxxx\n11223344 xxxx11xx\nxxxxxxxx xxxxxxxx\n");
+    std::remove(path);
+}
+
+// What a memory load still refuses, loudly: a member of an unpacked struct, and a
+// dynamic array or queue (LRM 21.4.1), which are not a variable holding a fixed array.
+TEST_CASE("a memory load into a struct member or a dynamic container is still refused") {
+    const auto refused = [](const std::string& body) {
+        const LowerResult r = lower_text("module m;\n" + body + "\nendmodule\n");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("target must be an unpacked array variable, an element of one or a slice "
+                                       "of one") != std::string::npos);
+    };
+    refused("logic [7:0] d[]; initial $readmemh(\"f.hex\", d);");
+    refused("logic [7:0] q[$]; initial $readmemb(\"f.hex\", q);");
+    refused("struct { int a; logic [7:0] m[0:3]; } s; initial $readmemh(\"f.hex\", s.m);");
+    refused("struct { int a; logic [7:0] m[0:3]; } s; integer fd, rc; initial rc = $fread(s.m, fd);");
+}
+
 // Slurp a file written by a file-I/O test.
 std::string read_file(const char* path) {
     std::FILE* f = std::fopen(path, "rb");
