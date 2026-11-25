@@ -18,7 +18,7 @@ namespace {
 // Verilog; `.triggered` is not implemented by iverilog ("Event name e can't
 // have member names"), so those cases are pinned to the LRM 15.5.3 semantics
 // (triggered true only within the triggering time step).
-std::string run_capture(std::string_view source) {
+std::string run_capture(std::string_view source, ir::SimulationConfig config = {}) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
@@ -30,7 +30,7 @@ std::string run_capture(std::string_view source) {
     const int saved = dup(fileno(stdout));
     dup2(fileno(tmp), fileno(stdout));
 
-    ir::run_jit(*r.module);
+    ir::run_jit(*r.module, nullptr, config);
 
     std::fflush(stdout);
     dup2(saved, fileno(stdout));
@@ -1982,4 +1982,327 @@ TEST_CASE("an event wait through a never-bound virtual interface is a located ru
     const test::DesignRun run = test::run_design_captured(src);
     CHECK(run.out.find("UNREACHABLE") == std::string::npos);
     CHECK(run.err.find("use of a null virtual interface") != std::string::npos);
+}
+
+namespace {
+
+// Run `source` under the default lowering and under each gate that lowers an always process
+// differently: -O, no thunks, no fusion.
+void check_every_config(std::string_view source, const std::string& expected) {
+    CHECK(run_capture(source) == expected);
+    CHECK(run_capture(source, { .o3 = true }) == expected);
+    CHECK(run_capture(source, { .thunk = false }) == expected);
+    CHECK(run_capture(source, { .fuse = false }) == expected);
+}
+
+} // namespace
+
+// IEEE 1800 9.4.2: a process waits only at the event control it has reached, so `always
+// @(posedge clk) begin @(posedge done); ... end` is `forever begin @(posedge clk); @(posedge
+// done); ... end` and the posedge of clk at t=3 below arrives while the process waits for done and
+// wakes nothing. The leading control used to be a static subscription (docs/design/
+// scheduler-rules.md S1) whose entry stayed live at the inner wait: it found the wake word armed
+// there and resumed the process at t=3, and the entry the wait had left in done's bucket then
+// resumed the next activation at its top at t=4 (the second "enter" below).
+// Oracle: Icarus Verilog 13 (iverilog -g2012, vvp -n) prints "1 enter" and "4 woke n=1"; the same
+// design without the $display of "enter" printed "4 woke n=1" there too.
+TEST_CASE("an always parked at an intra-body @ is not woken by its own leading control") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0, done = 0; integer n = 0;
+          always @(posedge clk) begin
+            $display("%0t enter", $time);
+            @(posedge done);
+            n = n + 1; $display("%0t woke n=%0d", $time, n);
+          end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(src, "1 enter\n4 woke n=1\n");
+}
+
+// The same wake delivered to a wait that never completes: the wake at t=3 left the entry the wait
+// registered at t=1 in done's bucket, the activation at t=5 registered the process a second time
+// in a bucket sized for one, and the store landed past its end (the 40-cycle form below ended in
+// "simulation did not converge" at t=13, the 5-cycle form printed "n=2"). That run ends the
+// process, so the design runs in a process of its own.
+// Oracle: Icarus Verilog 13 prints "n=0".
+TEST_CASE("a wait that never completes is never passed by its always's own clock") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0, done = 0; integer n = 0;
+          always @(posedge clk) begin @(posedge done); n = n + 1; end
+          initial begin
+            repeat (40) begin #1 clk = 1; #1 clk = 0; end
+            $display("n=%0d", n); $finish;
+          end
+        endmodule
+    )";
+    CHECK(test::run_design_subprocess(src) == "n=0\n");
+}
+
+// An intra-body control on the leading signal with the other edge: the negedge at t=2 and t=4 woke
+// the process parked at `@(posedge clk)` through the any-change entry.
+// Oracle: Icarus Verilog 13 prints "3 pos" and "5 pos".
+TEST_CASE("an inner @(posedge clk) under an always @(clk) is not woken by a negedge") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0;
+          always @(clk) begin @(posedge clk); $display("%0t pos", $time); end
+          initial begin repeat (6) #1 clk = ~clk; #1 $finish; end
+        endmodule
+    )";
+    check_every_config(src, "3 pos\n5 pos\n");
+}
+
+// `wait (c)` is a loop around an event control that re-tests c on every wake, so a wake from the
+// leading control re-evaluated c at t=3; c has a side effect to make the evaluations visible.
+// Oracle: Icarus Verilog 13 prints "1 eval d=0", "4 eval d=1" and "4 passed".
+TEST_CASE("a wait statement under an always is evaluated only when its own operands change") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0, done = 0;
+          function automatic bit ready(input bit d);
+            $display("%0t eval d=%0d", $time, d);
+            return d;
+          endfunction
+          always @(posedge clk) begin wait (ready(done)); $display("%0t passed", $time); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(src, "1 eval d=0\n4 eval d=1\n4 passed\n");
+}
+
+// The parks that keep the leading control's static subscription: a `#delay` holds the wake word
+// set across the park, and a task that waits parks on a wake word of its own.
+// Oracle: Icarus Verilog 13 prints "4 delayed" and "8 delayed" for the first design, "4 woke n=1"
+// for the second.
+TEST_CASE("an always parked at a delay or in a task is not woken by its own leading control") {
+    constexpr std::string_view delayed = R"(
+        module t;
+          reg clk = 0;
+          always @(posedge clk) begin #3 $display("%0t delayed", $time); end
+          initial begin repeat (8) #1 clk = ~clk; #4 $finish; end
+        endmodule
+    )";
+    check_every_config(delayed, "4 delayed\n8 delayed\n");
+
+    constexpr std::string_view in_task = R"(
+        module t;
+          reg clk = 0, done = 0; integer n = 0;
+          task wait_done; @(posedge done); endtask
+          always @(posedge clk) begin wait_done; n = n + 1; $display("%0t woke n=%0d", $time, n); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(in_task, "4 woke n=1\n");
+}
+
+// A named event waits on its object's list, not in a signal bucket, and so does an `always @(e)`:
+// its persistent node was the entry that woke the process at the inner wait.
+// Oracle: Icarus Verilog 13 prints "4 woke n=1" for both designs.
+TEST_CASE("an inner @e and a leading @(e) under an always do not wake the process at another control") {
+    constexpr std::string_view inner_event = R"(
+        module t;
+          reg clk = 0; event ev; integer n = 0;
+          always @(posedge clk) begin @ev; n = n + 1; $display("%0t woke n=%0d", $time, n); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 -> ev; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(inner_event, "4 woke n=1\n");
+
+    constexpr std::string_view leading_event = R"(
+        module t;
+          reg done = 0; event ev; integer n = 0;
+          always @(ev) begin @(posedge done); n = n + 1; $display("%0t woke n=%0d", $time, n); end
+          initial begin #1 -> ev; #2 -> ev; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(leading_event, "4 woke n=1\n");
+}
+
+// Several always blocks on one leading list: the two that only compute fuse into one thunk group
+// (and run on every posedge of clk), while each of the other two parks at a control of its own and
+// must not be woken by the group's subscription.
+// Oracle: Icarus Verilog 13 prints "4 b", "7 d" and "na=3 nb=1 nc=3 nd=1".
+TEST_CASE("always blocks sharing a leading list: only the one at its own control waits there") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0, done = 0; integer na = 0, nb = 0, nc = 0, nd = 0;
+          always @(posedge clk) na = na + 1;
+          always @(posedge clk) begin @(posedge done); nb = nb + 1; $display("%0t b", $time); end
+          always @(posedge clk) nc = nc + 1;
+          always @(posedge clk) begin @(negedge done); nd = nd + 1; $display("%0t d", $time); end
+          initial begin
+            #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #1 clk = 0; #1 clk = 1; #1 done = 0;
+            #2 $display("na=%0d nb=%0d nc=%0d nd=%0d", na, nb, nc, nd); $finish;
+          end
+        endmodule
+    )";
+    check_every_config(src, "4 b\n7 d\nna=3 nb=1 nc=3 nd=1\n");
+}
+
+// The other forms of a leading list and of an intra-body park: an inferred `@*` list, a list of
+// several events (one park must leave no entry in the buckets of the others), a control inside an
+// intra-assignment, a counted `repeat (2) @(...)`, and a fork whose child waits.
+// Oracle: Icarus Verilog 13 prints "4 y=1", "4 woke a=0 b=1", "4 x=1", "7 two ticks" and "4 joined".
+TEST_CASE("every form of leading list ignores its events while the body is parked") {
+    constexpr std::string_view star = R"(
+        module t;
+          reg a = 0, done = 0, y = 0;
+          always @* begin @(posedge done); y = a; $display("%0t y=%0d", $time, y); end
+          initial begin #1 a = 1; #1 a = 0; #1 a = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(star, "4 y=1\n");
+
+    constexpr std::string_view several = R"(
+        module t;
+          reg a = 0, b = 0, done = 0;
+          always @(a or b) begin @(posedge done); $display("%0t woke a=%0d b=%0d", $time, a, b); end
+          initial begin #1 a = 1; #1 b = 1; #1 a = 0; #1 done = 1; #1 b = 0; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(several, "4 woke a=0 b=1\n");
+
+    constexpr std::string_view intra = R"(
+        module t;
+          reg clk = 0, done = 0; integer x = 0;
+          always @(posedge clk) begin x = @(posedge done) x + 1; $display("%0t x=%0d", $time, x); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(intra, "4 x=1\n");
+
+    constexpr std::string_view counted = R"(
+        module t;
+          reg clk = 0, tick = 0;
+          always @(posedge clk) begin repeat (2) @(posedge tick); $display("%0t two ticks", $time); end
+          initial begin
+            #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 tick = 1; #1 tick = 0; #1 clk = 0; #1 tick = 1;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    check_every_config(counted, "7 two ticks\n");
+
+    constexpr std::string_view forked = R"(
+        module t;
+          reg clk = 0, done = 0;
+          always @(posedge clk) begin fork @(posedge done); #1; join $display("%0t joined", $time); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(forked, "4 joined\n");
+}
+
+// `iff` (9.4.2.3) gates the leading event. Icarus Verilog 13 has no `iff`, so the expected text is
+// derived from 9.4.2 as the code cites it (the clause text was not read: no copy of the LRM was
+// available): the posedge at t=3 arrives while the process waits for done.
+TEST_CASE("an always with an iff guard parked at an intra-body @ ignores its guarded event") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0, en = 1, done = 0;
+          always @(posedge clk iff en) begin @(posedge done); $display("%0t woke", $time); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 done = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(src, "4 woke\n");
+}
+
+// `wait fork` parks the process in a list of its own; a wake from the leading control is one the
+// barrier would absorb by testing again, which is why this shape printed the right text before.
+// Oracle: Icarus Verilog 13 prints "4 joined n=1" and "8 joined n=2".
+TEST_CASE("wait fork under an always is not completed by the leading control") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0; integer n = 0;
+          always @(posedge clk) begin
+            fork #3 n = n + 1; join_none
+            wait fork;
+            $display("%0t joined n=%0d", $time, n);
+          end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 clk = 0; #1 clk = 1; #6 $finish; end
+        endmodule
+    )";
+    check_every_config(src, "4 joined n=1\n8 joined n=2\n");
+}
+
+// The built-in blocking methods park in queues of the object they belong to: `semaphore::get`
+// (15.3), `mailbox::get` (15.4) and `process::await` (9.7). Icarus Verilog 13 has none of these
+// classes, so the expected text is derived from the clauses as the code cites them (not read: no
+// copy of the LRM was available): each always waits for the key, the message or the process, and
+// the posedge of clk at t=3 arrives while it waits.
+TEST_CASE("a semaphore, a mailbox and an await under an always are not completed by the leading control") {
+    constexpr std::string_view sem = R"(
+        module t;
+          reg clk = 0; semaphore s = new(0);
+          always @(posedge clk) begin s.get(1); $display("%0t got", $time); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 s.put(1); #5 $finish; end
+        endmodule
+    )";
+    check_every_config(sem, "4 got\n");
+
+    constexpr std::string_view mbox = R"(
+        module t;
+          reg clk = 0; mailbox #(int) mb = new; int v;
+          always @(posedge clk) begin mb.get(v); $display("%0t got %0d", $time, v); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 mb.put(7); #5 $finish; end
+        endmodule
+    )";
+    check_every_config(mbox, "4 got 7\n");
+
+    constexpr std::string_view await = R"(
+        module t;
+          reg clk = 0; process p;
+          initial begin p = process::self(); #4; end
+          always @(posedge clk) begin p.await(); $display("%0t awaited", $time); end
+          initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(await, "4 awaited\n");
+}
+
+// `expect` (16.17) blocks the process until its property has a verdict, and parks it in a queue
+// the monitor drains in the Reactive region. A wake from the leading control resumed the process
+// at t=3 with no verdict, so "after" printed before the property was decided. Icarus Verilog 13
+// has no `expect`, so the expected text is derived from the clause as the code cites it (not
+// read: no copy of the LRM was available). The property passes at the clk posedge at t=5, where
+// a=1, the action block runs, and the statement after the expect follows it.
+TEST_CASE("an expect under an always is not resumed by the leading control") {
+    constexpr std::string_view src = R"(
+        module t;
+          reg clk = 0, go = 0, a = 0;
+          always @(posedge go) begin
+            expect (@(posedge clk) a) $display("%0t pass", $time); else $display("%0t fail", $time);
+            $display("%0t after", $time);
+          end
+          initial begin #1 go = 1; #1 go = 0; #1 go = 1; #1 a = 1; #1 clk = 1; #5 $finish; end
+        endmodule
+    )";
+    check_every_config(src, "5 pass\n5 after\n");
+}
+
+// The one shape that would need a statically subscribed process to wait at a control its leading
+// list does not name -- a task with an event control called from an always_comb or always_ff --
+// is not legal (13.3, 9.2.2.2, 9.2.2.4), so no process of it exists to be woken wrongly. Icarus
+// Verilog 13 rejects it too.
+TEST_CASE("a task that waits cannot be called from always_comb or always_ff") {
+    const std::string comb = reject(R"(
+        module t;
+          logic a = 0, b, done = 0;
+          task automatic wait_done; @(posedge done); endtask
+          always_comb begin wait_done(); b = a; end
+        endmodule
+    )");
+    CHECK(comb.find("blocking timing controls") != std::string::npos);
+
+    const std::string ff = reject(R"(
+        module t;
+          logic clk = 0, done = 0; integer n = 0;
+          task automatic wait_done; @(posedge done); endtask
+          always_ff @(posedge clk) begin wait_done(); n <= n + 1; end
+        endmodule
+    )");
+    CHECK(ff.find("blocking timing controls") != std::string::npos);
 }

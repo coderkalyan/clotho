@@ -2126,6 +2126,22 @@ private:
 
     void lower_wait(ExtraIndex info);
 
+    // The events of an intra-body wait, from a Wait op (lower_wait) or, for a process that
+    // waits at its head (waits_at_head), from its leading list.
+    void lower_wait_edges(std::span<const WaitEdge> events);
+
+    // The one place a body arms its process's wake word before a park (TagInfo::arms_wake).
+    void emit_arm_wake_word();
+
+    // How always process `k` waits for its leading list (S1 of docs/design/scheduler-rules.md).
+    // Subscribed statically: the seed subscribes it once and the body runs body-first in a
+    // forever loop. Waits at its head: its body holds a park that arms its wake word, so
+    // the static entry would wake it there (B51); it is started by the seed and waits for the
+    // list as an ordinary intra-body control, each time round its loop. Neither for an
+    // always with no list, which loops in its body, nor for any other process.
+    bool subscribed_statically(uint32_t k) const;
+    bool waits_at_head(uint32_t k) const;
+
     // -- Root from tables (RootTables.cpp) --
     //
     // What differs per instance or per group is data root's loops walk, so the code
@@ -4551,6 +4567,10 @@ private:
 
     static bool tag_suspends(Inst::Tag t);
 
+    // The polls after a park (a `disable` or `kill` that landed while parked), as lower_region
+    // emits them after an op for which tag_suspends holds.
+    void emit_resume_polls();
+
     llvm::Value* emit_abort_pending();
 
     void emit_wait_abort_exit(llvm::BasicBlock* leave);
@@ -5163,6 +5183,9 @@ private:
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
     llvm::Value*        sched_ptr_       = nullptr;
+    // Whether the body currently lowering is subscribed statically (subscribed_statically).
+    // emit_arm_wake_word asserts it is not: its entry would wake the body at the park.
+    bool                static_sub_body_ = false;
     // The body's runtime home-region slot (home_ptr), an i8 alloca spilled into
     // the coroutine frame. Null unless body_home_is_runtime_ -- almost every body
     // folds its home at lowering time instead.
