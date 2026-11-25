@@ -1,9 +1,8 @@
 # Continuous integration
 
 `.github/workflows/ci.yml` builds clotho and runs the correctness suite
-(`clotho_test`, 1781 cases) plus a CLI smoke run on six targets. The
-performance cases under `tests/perf/` are deliberately excluded — they are
-measurement, not pass/fail.
+(`clotho_test`) plus a CLI smoke run on six targets. The performance cases under
+`tests/perf/` are deliberately excluded — they are measurement, not pass/fail.
 
 ## Triggers
 
@@ -125,22 +124,22 @@ that tries is rejected outright with no jobs scheduled at all.
 
 ## Platform status
 
+Nightly on `main`, 2026-11-24 (`bbe3b9a1`):
+
 | target | result |
 |---|---|
-| linux-x64, linux-arm64 | 1206/1206 |
-| macos-arm64, macos-x64 | 1206/1206 |
-| windows-x64 | 1206/1206 |
-| windows-arm64 | 1203/1206 |
+| linux-x64, linux-x64-sanitize, linux-arm64, windows-x64 | pass |
+| macos-arm64, macos-x64 | one failure since the case was added (`b8baaefe`): `build -j 1` and `build -j 3` link different executables (`cli_test`, "build writes the same executable whatever the number of compile threads") |
+| windows-arm64 | does not build: Zig crashes building libsva (exit `0xC0000005`) on every run since at least 2026-10-31 |
 
 Only windows-arm64 is advisory (`continue-on-error`); every other target gates.
 
-**windows-arm64's three failures** are value-correctness, not crashes:
-`interface_test:95` and `packed_range_test:226` produce `X` where a definite
-value is expected, and `string_test:415` prints the *third* `$display`
+**windows-arm64's last suite run** failed three cases, all value-correctness, not
+crashes: `interface_test:95` and `packed_range_test:226` produced `X` where a
+definite value is expected, and `string_test:415` printed the *third* `$display`
 argument's value for the first. That last one looks like argument marshalling
 rather than arithmetic, and Windows on ARM64 differs from AAPCS64 in how
-variadic and floating-point arguments are passed -- the obvious next thread,
-and unrelated to the relocation bug below.
+variadic and floating-point arguments are passed.
 
 **The crash that used to halt it after 338 cases** was a JITLink defect, worked
 around in the backend. Every design using `assign #d`, a gate delay, or
@@ -159,8 +158,8 @@ reduced case rather than leaving as folklore.
 
 What it took to get Windows this far, in case any of it recurs:
 
-- `longjmp` had to go entirely (see the $finish note below); that alone moved
-  x64 from 7 cases to a complete run.
+- `longjmp` had to go entirely (`docs/design/cooperative-finish.md`); that alone
+  moved x64 from 7 cases to a complete run.
 - CRLF, from *three* independent sources: cmd.exe's `>` redirect giving the
   re-executed child a text-mode stdout; clotho's own `$fopen` opening `"w"`
   rather than `"wb"`; and two C++ test fixtures doing the same.
@@ -174,25 +173,12 @@ What it took to get Windows this far, in case any of it recurs:
   128-bit integer, so nothing pulled them in to be exported.
 - `$system`'s return encoding is platform-defined.
 
-## A hazard the harness works around
+## Designs run out of process
 
-A design that only ends at `$finish` is simulated in a **child process**
-(`tests/Subprocess.h`), not in the test runner. `$finish` longjmps out of the
-middle of the simulation, abandoning live coroutine frames and leaving the
-runtime's globals part-way through whatever they were doing; enough of those in
-one process and the heap is corrupted, and the suite segfaults inside the
-allocator during a later, unrelated LLVM compile.
-
-The isolation is load-bearing, but it is a workaround. The underlying defect —
-**a `$finish`'d simulation leaves the process unfit to run another** — is
-reachable by any embedder that runs two simulations, and the shorter capture
-helpers still run `$finish` designs in-process, which is where linux-arm64's
-recurring SIGSEGV comes from.
-
-Both of this file's open problems reduce to `$finish` longjmping out of live
-JIT'd coroutine frames: on Windows the SEH unwind cannot walk them at all, and
-everywhere else the abandoned frames and half-updated runtime globals corrupt
-the heap for later work. Making `$finish` cooperative — set a flag, let the
-simulation loop return normally, tear the runtime down in order — fixes the
-Windows blocker, the arm64 flake, and the need for a subprocess in the test
-harness, all at once. That is the single highest-value follow-up here.
+A design whose run ends the process (a runtime fatal ends with `std::exit`) is
+simulated in a child process (`tests/Subprocess.h`) that re-executes the test
+binary rather than forking. Some callers still spawn only because their design
+ends in `$finish`, which was required while `$finish` longjmped out of live
+coroutine frames. `$finish` now returns cooperatively
+(`docs/design/cooperative-finish.md`, phases 0-2); phase 3, runtime teardown and
+reset so those designs can run in-process, is open.
