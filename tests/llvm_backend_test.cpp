@@ -1909,6 +1909,41 @@ TEST_CASE("$printtimescale names the $unit and $root scopes") {
                  "Time scale of ($root) is 1s / 1s\n");
 }
 
+// A `timescale directive does not set `$unit`'s time scale (LRM 3.14.2.3), so a
+// task or class declared there with no `timeunit` takes the tool default,
+// 1ns/1ns (the default slang and --loose-timescale give a module). Its delays and
+// time reads are in that unit whatever tick the rest of the design forces: the
+// `#0.5` makes the tick 1ps, and `#3` used to wait 3 ticks. No oracle: iverilog's
+// default unit is 1s, a choice 3.14.2.3 leaves to the tool.
+TEST_CASE("a $unit task or class with no timeunit runs on the 1ns default in a timed design") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        task automatic ut;
+            #3 $display("ut %0.1f", $realtime);
+            $printtimescale;
+        endtask
+        class C;
+            static task w;
+                #2 $display("C %0.1f", $realtime);
+            endtask
+        endclass
+        module top;
+            initial begin
+                #0.5;
+                ut();
+                C::w();
+                $display("top %0.1f", $realtime);
+                $printtimescale($unit);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "ut 3.5\n"
+                 "Time scale of ($unit) is 1ns / 1ns\n"
+                 "C 5.5\n"
+                 "top 5.5\n"
+                 "Time scale of ($unit) is 1ns / 1ns\n");
+}
+
 // An instance's path is a borrowed, read-only string (Inst::Tag::InstPath), so a body
 // that names its instance on a rare path owns no string for it: no handle to
 // initialize at entry and none to release at exit. Both instances share the body

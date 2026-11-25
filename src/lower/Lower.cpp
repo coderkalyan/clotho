@@ -731,24 +731,36 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     }
     // Packages and `$unit` sit outside the instance tree but declare subroutines
     // the design calls, and those bodies scale by their OWN timescale, so their
-    // units join the GCD too (global_scope_tick_fs).
-    const auto fold_global = [&](const Scope& scope) {
-        const uint64_t p = global_scope_tick_fs(scope, any_explicit);
-        if (p != 0 && (prec_fs == 0 || p < prec_fs)) {
+    // units join the GCD too (global_scope_tick_fs). A `$unit` with no time scale
+    // of its own takes the default only once the rest of the design is known to
+    // be timed (effective_time_scale), so it is folded in a second pass.
+    const auto fold_global = [&](const Scope& scope, bool timed) {
+        const auto ts = effective_time_scale(scope, timed);
+        if (!ts || !scope_declares_subroutine(scope)) {
+            return;
+        }
+        any_explicit     = true;
+        const uint64_t p = global_scope_tick_fs(scope, *ts);
+        if (prec_fs == 0 || p < prec_fs) {
             prec_fs = p;
         }
-        if (const auto ts = scope.getTimeScale(); ts && scope_declares_subroutine(scope)) {
-            const uint64_t mp = tsv_to_fs(ts->precision);
-            if (min_prec_fs == 0 || mp < min_prec_fs) {
-                min_prec_fs = mp;
-            }
+        const uint64_t mp = tsv_to_fs(ts->precision);
+        if (min_prec_fs == 0 || mp < min_prec_fs) {
+            min_prec_fs = mp;
         }
     };
     for (const PackageSymbol* pkg : comp.getPackages()) {
-        fold_global(*pkg);
+        fold_global(*pkg, false);
     }
     for (const CompilationUnitSymbol* unit : root.compilationUnits) {
-        fold_global(*unit);
+        fold_global(*unit, false);
+    }
+    if (any_explicit) {
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            if (!unit->getTimeScale()) {
+                fold_global(*unit, true);
+            }
+        }
     }
     const uint64_t tick_fs = any_explicit ? prec_fs : 0;
 

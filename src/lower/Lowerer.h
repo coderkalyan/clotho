@@ -288,7 +288,9 @@ uint64_t design_min_precision_fs(const InstanceSymbol& inst);
 
 bool scope_declares_subroutine(const Scope& scope);
 
-uint64_t global_scope_tick_fs(const Scope& scope, bool& any_explicit);
+uint64_t global_scope_tick_fs(const Scope& scope, const slang::TimeScale& ts);
+
+std::optional<slang::TimeScale> effective_time_scale(const Scope& scope, bool timed);
 
 int32_t fs_to_unit_exponent(uint64_t fs);
 

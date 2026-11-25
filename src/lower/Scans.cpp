@@ -637,26 +637,41 @@ bool scope_declares_subroutine(const Scope& scope) {
     return false;
 }
 
-// Wheel-tick contribution of a package or `$unit` compilation unit. Such a scope
-// sits outside the instance tree, so design_tick_fs never sees it -- yet a
-// subroutine declared there scales its delays and its $time reads by THIS
-// scope's timescale, not the caller's (LRM 3.14.2.3), so the tick has to divide
-// that unit or the delay cannot be represented at all. Folds the same two terms
-// a module does: the unit, plus the precision when a real delay is present.
+// Wheel-tick contribution of a package or `$unit` compilation unit whose time
+// scale is `ts` (effective_time_scale). Such a scope sits outside the instance
+// tree, so design_tick_fs never sees it -- yet a subroutine declared there scales
+// its delays and its $time reads by THIS scope's timescale, not the caller's (LRM
+// 3.14.2.3), so the tick has to divide that unit or the delay cannot be
+// represented at all. Folds the same two terms a module does: the unit, plus the
+// precision when a real delay is present.
 //
-// Gated on the scope actually declaring a subroutine. A package of types,
-// parameters and variables reaches simulation without ever scaling a time value,
-// and folding its (possibly much finer) unit would shrink the tick -- and with
-// it the default %t unit -- for nothing.
-uint64_t global_scope_tick_fs(const Scope& scope, bool& any_explicit) {
-    const auto ts = scope.getTimeScale();
-    if (!ts || !scope_declares_subroutine(scope)) {
-        return 0;
-    }
-    any_explicit        = true;
-    const uint64_t unit = tsv_to_fs(ts->base);
-    const uint64_t prec = tsv_to_fs(ts->precision);
+// Only for a scope that declares a subroutine (the caller checks). A package of
+// types, parameters and variables reaches simulation without ever scaling a time
+// value, and folding its (possibly much finer) unit would shrink the tick -- and
+// with it the default %t unit -- for nothing.
+uint64_t global_scope_tick_fs(const Scope& scope, const slang::TimeScale& ts) {
+    const uint64_t unit = tsv_to_fs(ts.base);
+    const uint64_t prec = tsv_to_fs(ts.precision);
     return scope_has_own_real_delay(scope) && prec < unit ? prec : unit;
+}
+
+// The time scale `scope`'s delays and time reads are in. Every design element
+// has one or slang reports MissingTimeScale; what can lack one is `$unit`, which
+// a `timescale directive does not set (LRM 3.14.2.3: only a `timeunit` there
+// does, else "the default time unit shall be used"), and so a subroutine or class
+// declared directly in it. In a `timed` design (some scope has a time scale) that
+// scope takes the tool default, 1ns/1ns: the value slang's own default and
+// --loose-timescale give a module, so the two kinds of unannotated code agree.
+// A design with no time scale anywhere stays unitless (nullopt).
+std::optional<slang::TimeScale> effective_time_scale(const Scope& scope, bool timed) {
+    if (const auto ts = scope.getTimeScale()) {
+        return ts;
+    }
+    if (!timed) {
+        return std::nullopt;
+    }
+    const slang::TimeScaleValue ns{ slang::TimeUnit::Nanoseconds, slang::TimeScaleMagnitude::One };
+    return slang::TimeScale{ ns, ns };
 }
 
 // Time-unit exponent (10^n seconds) of a power-of-ten femtosecond magnitude. A

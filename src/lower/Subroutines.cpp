@@ -900,29 +900,17 @@ void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
     }
 }
 
-// Point the delay / $time multipliers at `scope`'s effective timescale. A
-// `#5` written there means 5 of that scope's time units (LRM 3.14.2), so the
-// unit multiplier is unit/tick; a real delay first rounds to the scope's
-// precision, hence precision/tick. Both ratios are exact integers: the tick
-// is the design-wide GCD of every unit and of every precision that a real
-// delay rounds to (design_tick_fs / global_scope_tick_fs), and every
+// Point the delay / $time multipliers at `scope`'s effective timescale
+// (effective_time_scale, which gives a `$unit` subroutine or class the tool
+// default). A `#5` written there means 5 of that scope's time units (LRM
+// 3.14.2), so the unit multiplier is unit/tick; a real delay first rounds to
+// the scope's precision, hence precision/tick. Both ratios are exact integers:
+// the tick is the design-wide GCD of every unit and of every precision that a
+// real delay rounds to (design_tick_fs / global_scope_tick_fs), and every
 // timescale value is a power of ten. Callers guard on tick_fs_ != 0; unitless
 // mode leaves both at 1 and scales nothing.
-//
-// TODO: a scope slang hands back no timescale for falls into that unitless
-// branch even when the design HAS a tick, and then reads/writes time in raw
-// wheel ticks. The case that reaches it is a subroutine or class declared
-// directly in `$unit`: a `timescale directive applies to design elements
-// (LRM 3.14.2.2), so CompilationUnitSymbol::timeScale stays unset unless
-// `$unit` carries its own `timeunit` / `timeprecision`. So a `$unit` function
-// under `timescale 1ns/1ps` reports 3000 where its 1ns caller reports 3 --
-// and the number moves with unrelated code, since dropping a `#0.5` anywhere
-// shifts the tick from 1ns to 1ps. iverilog reports 0 there (its own 1s
-// default). The fix is a fixed tool-default timescale for such a scope, folded
-// into the wheel tick the way global_scope_tick_fs already folds the scopes
-// that DO declare one. Declaring in a package or module is unaffected.
 void Lowerer::apply_time_scale(const Scope& scope) {
-    const auto ts   = scope.getTimeScale();
+    const auto ts   = effective_time_scale(scope, tick_fs_ != 0);
     time_mul_       = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
     prec_over_tick_ = ts ? tsv_to_fs(ts->precision) / tick_fs_ : 1;
 }
