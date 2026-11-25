@@ -53,8 +53,6 @@ Milestones, in order; lower ones unblock higher ones:
   ambiguous `?:` over such a struct under a 4-state condition.
 - [ ] **`?:` over aggregates of a type distinct from the target's** (11.4.11, 6.22.2) — arms
   equivalent to, but interned differently from, the assignment target need a converting copy.
-- [ ] **Short-circuit `&&&` conjuncts** (12.4) — every conjunct of a `cond_predicate` is
-  evaluated, so `if (h != null &&& h.x)` fatals on a null `h`.
 
 ### Subroutines
 
