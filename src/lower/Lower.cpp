@@ -907,12 +907,12 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
-            // Exported functions resolve in the scope that owns them: this top's
-            // module-scope functions through `lw` (its own lowered bodies address its
-            // own instance state), $unit/package ones through the shared `globals`
-            // delegation in function_id — those have no instance multiplicity, so
-            // only the first top admits them.
-            lw.collect_dpi_exports(comp, top, /*collect_globals=*/top == root.topInstances.front());
+            // Exported functions resolve in the scope that owns them: the scopes this top
+            // walked (its own instances) through `lw`, whose lowered bodies address its own
+            // instance state, and the $unit/package ones, which have no instance
+            // multiplicity, through the shared `globals` delegation in function_id --
+            // so only the first top collects them.
+            lw.collect_dpi_exports(comp, /*collect_globals=*/top == root.topInstances.front());
             const std::span<const Diagnostic> recovered = lw.recovered_diags();
             result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
             poisoned  = poisoned || lw.poisoned();
@@ -927,7 +927,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             // here (globals_ is never set on the globals Lowerer itself), so this
             // reaches build_reserved_body directly, exactly as the per-top delegation
             // path above does.
-            globals.collect_dpi_exports(comp, nullptr, /*collect_globals=*/true);
+            globals.collect_dpi_exports(comp, /*collect_globals=*/true);
         }
         // Any package/$unit class-method body still queued (a design with no top
         // instance, or a body the last top's own drain queued) builds now, and the

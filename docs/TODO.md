@@ -736,10 +736,6 @@ Milestones, in order; lower ones unblock higher ones:
   runtime-sized marshal scratch.
 - [ ] **DPI multi-dimensional open arrays** — needs `svGetArrElemPtr2/3` and a recursive
   descriptor.
-- [ ] **One `c_identifier` exported from several scopes** — slang drops the duplicate
-  exports before Clotho can see them.
-- [ ] **`svScope` handles for non-top instances** — `svGetScopeFromName` cannot name a
-  nested instance.
 - [ ] **DPI unpacked struct or fixed-size unpacked array argument** (35.5.6) — a non-open
   unpacked formal is refused.
 - [ ] **DPI open array of scalar `bit` / `logic`, `real`, `string` or `chandle` elements**

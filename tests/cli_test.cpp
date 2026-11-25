@@ -1055,6 +1055,53 @@ endmodule
     }
 }
 
+// A top-level TYPE parameter takes a data type (LRM 6.20.3, 23.10.2). It was ignored
+// silently: slang skipped type parameters when it applied -G and parsed every value as
+// an expression. No oracle: iverilog -P takes values only, so these follow the LRM.
+TEST_CASE("cli: -G overrides a type parameter of the top-level module") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module top #(parameter type T = int, parameter int W = 3);
+            T v;
+            initial $display("bits=%0d W=%0d", $bits(v), W);
+        endmodule
+    )");
+    const auto run = [&](std::string_view args) { return s.run(std::format("run {} \"{}\"", args, design.string())); };
+    SUBCASE("the default stands without an override") {
+        CHECK(run("").out == "bits=32 W=3\n");
+    }
+    SUBCASE("a packed type replaces the default") {
+        const Result r = run("'-GT=logic[7:0]'");
+        CHECK(r.code == 0);
+        CHECK(r.out == "bits=8 W=3\n");
+    }
+    SUBCASE("a built-in type name, beside a value override") {
+        const Result r = run("-GT=longint -GW=9");
+        CHECK(r.code == 0);
+        CHECK(r.out == "bits=64 W=9\n");
+    }
+    SUBCASE("a value for a type parameter is an error") {
+        const Result r = run("-GT=5");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error"));
+    }
+    SUBCASE("a type for a value parameter is an error") {
+        const Result r = run("'-GW=logic[7:0]'");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error"));
+    }
+    SUBCASE("a type that does not parse is an error") {
+        const Result r = run("'-GT=logic[7:'");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "is not a valid form of parameter override"));
+    }
+    SUBCASE("a name that is no type is an error") {
+        const Result r = run("-GT=nosuchtype");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error"));
+    }
+}
+
 TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup") {
     const Scratch s;
     s.write("la/leaf.sv", "module leaf; initial $display(\"leaf from la\"); endmodule\n");

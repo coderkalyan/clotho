@@ -464,6 +464,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("svPutUserData", &svPutUserData);
     expose("svGetUserData", &svGetUserData);
     expose("rt_svdpi_scope_register", &rt_svdpi_scope_register);
+    expose("rt_svdpi_scope_enter", &rt_svdpi_scope_enter);
+    expose("rt_svdpi_scope_leave", &rt_svdpi_scope_leave);
+    expose("rt_svdpi_scope_index", &rt_svdpi_scope_index);
+    expose("rt_dpi_export_no_scope", &rt_dpi_export_no_scope);
     expose("svDimensions", &svDimensions);
     expose("svSize", &svSize);
     expose("svLeft", &svLeft);

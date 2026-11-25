@@ -41,7 +41,9 @@ void binary_std_streams() {
 // run_design_subprocess runs a design in its own process; see Subprocess.h for
 // when that is needed. Lowers the file's *text* rather than going
 // through lower_files so the buffer is named "source", matching what the same
-// design produces in-process.
+// design produces in-process. CLOTHO_TEST_DPI_LIB, when set, names a relocatable
+// object to link into the JIT (`--dpi-lib`): the C side of a design whose C calls
+// an export (dpi_test.cpp).
 int run_design(const char* path) {
     binary_std_streams();
     const std::string         text = clotho::test::detail::read_file(path);
@@ -54,8 +56,11 @@ int run_design(const char* path) {
     // Same resolver the CLI installs, so a runtime diagnostic emitted here
     // carries the file position and source snippet a real run would show —
     // which is the whole payload of a test that asserts on one.
-    return clotho::ir::run_jit(*r.module, /*timings=*/nullptr, /*config=*/{}, /*plusargs=*/{},
-                               clotho::loc_resolver(r));
+    clotho::ir::SimulationConfig config;
+    if (const char* const dpi_lib = std::getenv("CLOTHO_TEST_DPI_LIB"); dpi_lib != nullptr) {
+        config.dpi_libs.emplace_back(dpi_lib);
+    }
+    return clotho::ir::run_jit(*r.module, /*timings=*/nullptr, config, /*plusargs=*/{}, clotho::loc_resolver(r));
 }
 
 // Encoding-violation mode: call the report the extra-asserts check reaches, as the

@@ -816,27 +816,20 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
 
     emit_ref_name_table();
 
-    // Register one DPI scope per top (svGetScope / user-data, LRM 35.5.3) before
-    // any process runs, so a context import can read it. Only when DPI is used.
-    // Index 0 clears the runtime table, so the first top stays the default scope
-    // and a second simulation in one process starts clean. A design with no top
-    // instances (package-only) still registers one scope so svGetScope is never
-    // null.
+    // Register the DPI scopes (svGetScope / user-data, LRM 35.5.3) before any process
+    // runs, so a context import can enter one: the tops, then every other scope that
+    // exports or declares a context import (build_dpi_scopes), in index order. Only when
+    // DPI is used. Index 0 clears the runtime table, so the first top stays the default
+    // scope and a second simulation in one process starts clean. A design with no top
+    // instances (package-only) still registers one scope so svGetScope is never null.
     if (design_uses_dpi()) {
         const llvm::FunctionCallee reg = rt_fn("rt_svdpi_scope_register", b_.getVoidTy(),
                                                { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
-        const auto emit_reg = [&](const std::string& name, uint32_t index) {
+        for (uint32_t k = 0; k < dpi_scope_names_.size(); ++k) {
+            const std::string& name = dpi_scope_names_[k];
             b_.CreateCall(reg, { b_.CreateGlobalString(name),
                                  b_.getInt32(static_cast<uint32_t>(name.size())),
-                                 b_.getInt32(index) });
-        };
-        if (mod_.tops().empty()) {
-            emit_reg(mod_.top_name, 0);
-        } else {
-            uint32_t index = 0;
-            for (const InstanceScope& top : mod_.tops()) {
-                emit_reg(top.name, index++);
-            }
+                                 b_.getInt32(k) });
         }
     }
 

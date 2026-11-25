@@ -81,6 +81,7 @@ void Backend::run() {
     }
     build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
     build_wait_queues();
+    build_dpi_scopes();          // the anchors are built; the records below hold the scope indices
     build_instance_ctx_layout(); // after build_wait_queues (ctx sizes need wait slots) and build_sched_flags
     build_nba_state();
 

@@ -296,6 +296,12 @@ FetchContent_Declare(
   # two-bit vector. A built-in system function cannot be replaced from outside:
   # Compilation::addSystemSubroutine keeps the subroutine already registered under
   # a name. Not upstream.
+  #
+  # slang-type-param-override: `-G T=<type>` on a top-level type parameter was dropped
+  # silently: slang's cli overrides skipped `isTypeParam` and parsed every value as an
+  # expression. The value now parses as a data type when it is no expression, and the
+  # override reaches the type parameter's builder through the hierarchy override node,
+  # keyed by its declarator like a value parameter's (LRM 6.20.3, 23.10.2). Not upstream.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  "-DPATCH_SET_HASH=${clotho_slang_patch_hash}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
@@ -1289,6 +1295,22 @@ if(NOT WIN32)
   endforeach()
 endif()
 
+# The C sides of the svScope tests in tests/dpi_test.cpp: native code that selects an
+# instance with svSetScope and calls an export several scopes share. Only a relocatable
+# object can reach an export, so those tests link one into the JIT; dpi_test.cpp learns
+# its path from the definitions below, which are set on that file alone so that the
+# rest of the suite does not rebuild with them.
+if(NOT WIN32)
+  foreach(name IN ITEMS dpi_scope dpi_scope_task)
+    add_library(clotho_${name}_object OBJECT tests/dpi_scope/${name}.c)
+    set_target_properties(clotho_${name}_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(clotho_${name}_object PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime")
+    add_dependencies(clotho_test clotho_${name}_object)
+  endforeach()
+  set_source_files_properties(tests/dpi_test.cpp PROPERTIES COMPILE_DEFINITIONS
+    "CLOTHO_DPI_SCOPE_OBJECT=\"$<TARGET_OBJECTS:clotho_dpi_scope_object>\";CLOTHO_DPI_SCOPE_TASK_OBJECT=\"$<TARGET_OBJECTS:clotho_dpi_scope_task_object>\"")
+endif()
+
 # A --dpi-lib definition wins over a same-named libc symbol, under the JIT and
 # in a linked executable alike. getpid is the probe: libc defines it, LLVM never
 # synthesizes it, and the real value cannot be 31337.
@@ -1309,7 +1331,7 @@ endif()
 # there could neither link nor load. The compiler that builds it is sanitized.
 if(CLOTHO_SANITIZE)
   foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared clotho_dpi_shadow
-                 clotho_gc_dpi_object)
+                 clotho_gc_dpi_object clotho_dpi_scope_object clotho_dpi_scope_task_object)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -fno-sanitize=all)
       target_link_options(${target} PRIVATE -fno-sanitize=all)
