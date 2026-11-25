@@ -481,6 +481,11 @@ struct GcState {
 
     std::vector<void*> worklist;  // the mark stack; never recursion
     std::vector<void*> pinned;    // collection-scoped pins, cleared at the end
+    // The weak references this collection has marked (rt_gc_map::weak_referent), for
+    // the pass that clears those whose referent it did not reach, or, in a collection
+    // that keeps every referent (`weak_kept`), the pass that marks them.
+    std::vector<void*> weak_reached;
+    bool               weak_kept = false;
 
     // Containers of class handles (§3.3, Gc.h:226-268). `container_tables` is
     // borrowed exactly as `roots` is: the JIT'd module owns the constant.
@@ -790,6 +795,19 @@ void assert_map([[maybe_unused]] const rt_gc_map* map) {
     // class emit clotho.classfini, so a leaf table without a finalizer means the two
     // emissions disagree.
     assert((map->nleaves == 0 || map->finalize != nullptr) && "managed leaves imply a finalizer");
+}
+
+// The two weak fields of a weak reference's map. Checked where a weak reference is
+// met and not in assert_map(), which every object passes through several times in
+// a collection, in builds that ship with assertions on. Offset 0 is the vptr, so 0
+// can mean "no notifier".
+void assert_weak_map([[maybe_unused]] const rt_gc_map* map) {
+    assert(map->weak_referent != 0 && "only a weak reference has a referent");
+    assert(map->weak_referent % sizeof(void*) == 0 && map->weak_referent + sizeof(void*) <= map->size &&
+           "a weak referent is an aligned word of the body");
+    assert((map->weak_notify == 0 ||
+            (map->weak_notify % sizeof(void*) == 0 && map->weak_notify + sizeof(void*) <= map->size)) &&
+           "a weak notifier is an aligned word of the body");
 }
 
 // The two loads generated code does (Gc.h:70-73): the vptr at handle[0], then the
@@ -1463,6 +1481,10 @@ void push_marked(void* handle) {
     g.stats.bytes_live += map->size;
     g.worklist.push_back(handle);
     assert(g.worklist.size() <= g.stats.objects_allocated && "the mark stack outgrew the heap");
+    if (map->weak_referent != 0) {
+        assert_weak_map(map);
+        g.weak_reached.push_back(handle);
+    }
 }
 
 // Mark `handle` and queue it; do nothing if it is marked already -- reached earlier in
@@ -2190,6 +2212,73 @@ void push_event_waiting() {
                                   g.verifying != 0 ? skip : scan_conservative);
 }
 
+// A weak reference's referent, by the weak reference's map.
+void** weak_slot(void* weak) {
+    const rt_gc_map* map = map_of(weak);
+    assert(map->weak_referent != 0 && "only a weak reference has a referent");
+    return reinterpret_cast<void**>(static_cast<uint8_t*>(weak) + map->weak_referent);
+}
+
+// Mark the referent of every weak reference reached so far, and what those reach. A
+// collection run from inside an allocation does this instead of clearing: it runs in
+// the middle of some process's statement, at a point the heap's size chose, and a
+// process that runs later in the same time step could start waiting on a weak
+// reference between its clearing and the wake that reports it. So weak references
+// are cleared only at the scheduler's safepoint, where every process is parked.
+// Tracing can reach more weak references, which join the list behind `k`.
+void drain();
+void keep_weak_referents() {
+    for (size_t k = 0; k < g.weak_reached.size(); ++k) {
+        void* const referent = *weak_slot(g.weak_reached[k]);
+        if (referent != nullptr) {
+            mark_and_push(referent);
+            drain();
+        }
+    }
+    g.weak_reached.clear();
+}
+
+// Clear the weak references this collection reached whose referent it did not
+// (LRM 8.30.1). Called once marking is complete and before anything is freed, so
+// every referent is still an object and is_marked_now() is its verdict.
+//
+// The weak references this collection reached are all of those that can need it. A
+// full collection reaches every live one. A young one leaves an OLD weak reference
+// unread, and that one's referent is old or null: the referent was an object before
+// the weak reference was made, the word is written only then and by clear(), and the
+// collection that made the weak reference old either marked the referent, which made
+// it old too, or cleared the word. No young collection frees an old object.
+//
+// A wait that reads get() parks on the event whose handle is at `weak_notify`. That
+// event is a field of the weak reference, so it was marked with it. It is put on the
+// chain `->>` pends events on, and the scheduler fires that chain as soon as the
+// collection returns to it, before any process runs (ir/llvm/GcEmit.cpp,
+// emit_gc_safepoint): the collector has no wheel to stamp a trigger time from.
+void clear_weak_referents() {
+    assert(!g.weak_kept && "a collection that keeps referents clears none");
+    for (void* weak : g.weak_reached) {
+        const rt_gc_map* map      = map_of(weak);
+        uint8_t* const   body     = static_cast<uint8_t*>(weak);
+        void** const     slot     = weak_slot(weak);
+        void* const      referent = *slot;
+        if (referent == nullptr) {
+            continue; // made of null, cleared by the design, or cleared before
+        }
+        assert_resolves(rt_gc_find_object(referent) == referent && "a weak referent names an object");
+        if (is_marked_now(referent)) {
+            continue;
+        }
+        *slot = nullptr;
+        g.stats.weak_cleared += 1;
+        if (map->weak_notify != 0) {
+            void* const event = *reinterpret_cast<void**>(body + map->weak_notify);
+            assert(event != nullptr && is_marked_now(event) && "a weak reference's notifier lives with it");
+            rt_internal::event_pend(event);
+        }
+    }
+    g.weak_reached.clear();
+}
+
 // Forget the number of every numbered object this collection did not reach. Called once
 // marking is complete. A young collection can only have found dead the objects that were
 // numbered since the last collection, since every other numbered object is old; a full
@@ -2791,6 +2880,7 @@ void release_heap() {
     g.container_work.clear();
     g.worklist.clear();
     g.pinned.clear();
+    g.weak_reached.clear();
     g.identity.clear();
     g.identified.clear();
     g.identity_fresh.clear();
@@ -2953,14 +3043,19 @@ void mark_from_roots() {
     push_stack_roots();
     drain();
     // Reaching an event can make what waits on it reachable, and that can reach another
-    // event. Each pass that goes round again marked an object no pass had, so this ends.
+    // event; keeping a weak reference's referent can reach either. Each pass that goes
+    // round again marked an object no pass had, so this ends.
     for (;;) {
+        if (g.weak_kept) {
+            keep_weak_referents();
+        }
         push_event_waiting();
         if (g.worklist.empty() && g.container_work.empty()) {
             break;
         }
         drain();
     }
+    assert((!g.weak_kept || g.weak_reached.empty()) && "every referent of a kept weak reference is marked");
 }
 
 // The counters, and the invariants that are claims about the collection as a whole.
@@ -3063,6 +3158,7 @@ void print_stats(uint64_t swept_at_teardown) {
                  " logged by the write barrier\n",
                  g.stats.young_collections, g.stats.full_collections, g.stats.promoted,
                  g.stats.remembered);
+    std::fprintf(stderr, "gc: %" PRIu64 " weak references cleared\n", g.stats.weak_cleared);
     std::fflush(stderr);
 }
 
@@ -3125,6 +3221,15 @@ void verify_object(void* h, uint64_t granules, VerifyTally* t) {
     if (marked) {
         t->marked += 1;
         t->marked_bytes += map->size;
+    }
+    // A weak reference's referent is an object or null, whether or not either is
+    // marked: the collection that frees a referent clears every weak reference to it
+    // first (clear_weak_referents). Only a weak reference has a notifier.
+    assert((map->weak_referent != 0 || map->weak_notify == 0) && "a notifier without a weak referent");
+    if (map->weak_referent != 0) {
+        void* const referent = *reinterpret_cast<void**>(static_cast<uint8_t*>(h) + map->weak_referent);
+        assert((referent == nullptr || rt_gc_find_object(referent) == referent) &&
+               "a weak reference names an object that has been freed");
     }
     // The soundness precondition for NOT tracing an un-remembered OLD object, checked
     // against the heap rather than argued in a comment. mark_and_push() leaves such an
@@ -3809,7 +3914,8 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // Published before the first mark, because the kind is what mark_and_push() tests,
     // and it stays set through the sweep, which tests it too. One marking path,
     // parameterised here.
-    g.kind = kind;
+    g.kind      = kind;
+    g.weak_kept = reason == RT_GC_REASON_EMERGENCY;
     if (kind == RT_GC_KIND_FULL) {
         clear_marks();
     }
@@ -3827,10 +3933,15 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
         g.worklist.reserve(kWorklistReserve);
     }
     assert(g.pinned.empty() && "the previous collection left a pin behind");
+    assert(g.weak_reached.empty() && "the previous collection left a weak reference unexamined");
 
     mark_from_roots();
-    // The marks are complete and nothing is reclaimed yet, which is the one moment a
-    // record of the runtime's can ask whether the event it waits on was reached.
+    // The marks are complete and nothing is reclaimed yet, which is the one moment to
+    // ask whether an object was reached: of a weak reference's referent, and of the
+    // event a record of the runtime's waits on.
+    if (!g.weak_kept) {
+        clear_weak_referents();
+    }
     rt_internal::event_gc_release_dead(is_marked_now);
     release_dead_identities();
 

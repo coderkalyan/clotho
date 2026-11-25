@@ -3447,7 +3447,7 @@ private:
 
     llvm::Value* gc_mutator_cur();
 
-    void emit_gc_safepoint();
+    void emit_gc_safepoint(llvm::Value* wheel);
 
     void emit_gc_barrier(llvm::Value* owner);
 

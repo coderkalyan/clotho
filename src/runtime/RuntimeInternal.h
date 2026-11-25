@@ -532,6 +532,12 @@ void event_gc_waiting(bool (*reached)(void* handle), void (*visit)(void* handle)
 // rejects, which nothing can trigger again.
 void event_gc_release_dead(bool (*reached)(void* handle));
 
+// Trigger the event object `handle` as `->> e` does (LRM 15.5.1): link it onto the NBA
+// pending chain, whose drain fires it. The store-for-store twin of what
+// ir/llvm/Events.cpp emits (emit_event_pend), for the one trigger that does not come
+// from generated code: the collector clearing a weak reference a `wait` reads.
+void event_pend(void* handle);
+
 // Keep `e` alive for the rest of the run. The dump points at its trigger tick.
 void event_keep(rt_event* e);
 

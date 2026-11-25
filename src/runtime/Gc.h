@@ -141,6 +141,20 @@ void rt_gc_remember(void* obj);
 //     dies.
 //
 // A `string` leaf holds no handle and is skipped by the tracing half.
+//
+// `weak_referent` is nonzero for a `std::weak_reference` (LRM 8.30) and for a class
+// derived from one: the offset of the word that holds the referent's handle. That
+// word is in neither table, so the object does not keep its referent alive. Once
+// marking is complete the collector looks at each weak reference it reached, and
+// where the referent was not reached it stores null there, which is what `get()`
+// returns from then on (8.30.3). Every weak reference to an unreached referent is
+// cleared in that one pass, with nothing of the design running in between
+// (8.30.1, "atomically"). A collection run from inside an allocation clears none
+// and keeps every referent instead (RT_GC_REASON_EMERGENCY), so a design sees a
+// weak reference change only between time steps. `weak_notify` is nonzero when
+// some `wait` or `@` in the design reads `get()`: the offset of the handle of the
+// event the clearing pass pends, which the scheduler fires when the collection
+// returns to it, so that such a wait sees the change.
 typedef struct rt_gc_map {
     uint64_t                    size;
     uint32_t                    nhandles;
@@ -148,6 +162,8 @@ typedef struct rt_gc_map {
     const uint32_t*             handles;
     const struct rt_elem_leaf*  leaves;
     void                      (*finalize)(void* body);
+    uint32_t weak_referent;
+    uint32_t weak_notify;
 } rt_gc_map;
 
 // -- Precise global roots -----------------------------------------------------
@@ -492,6 +508,8 @@ typedef struct rt_gc_stats {
     // large objects, those of dead ones kept for reuse included. It falls when a
     // full collection returns empty chunks or kept mappings.
     uint64_t heap_bytes;
+    // Weak references the collector has cleared over the run (rt_gc_map::weak_referent).
+    uint64_t weak_cleared;
 } rt_gc_stats;
 
 void rt_gc_get_stats(rt_gc_stats* out);

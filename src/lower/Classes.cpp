@@ -49,19 +49,17 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // reached has its vtable numbering. See rand_pending_.
     const Restore<uint32_t> depth(class_depth_, class_depth_ + 1);
     // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4) and
-    // `std::weak_reference` (LRM 8.30) are built-in classes slang synthesizes
+    // `std::weak_reference #(T)` (LRM 8.30) are built-in classes slang synthesizes
     // into the `std` package. Slang builds their *signatures* only -- every
     // method is a bodyless SubroutineSymbol whose semantics the simulator
-    // supplies. `semaphore` and `mailbox` are ordinary traced class objects with
-    // a synthetic body (lower/BuiltinClasses.cpp,
-    // docs/design/mailbox-and-semaphore.md).
+    // supplies. All three are ordinary traced class objects with a synthetic body
+    // (lower/BuiltinClasses.cpp, docs/design/mailbox-and-semaphore.md); what is
+    // particular to a weak reference is that the collector does not follow its
+    // referent (docs/design/garbage-collection.md).
     //
     // `process` (LRM 9.7) has its own body shape and its own method lowering,
     // because a `process` object is not a user class but a handle onto a
     // thread's control block. See docs/design/process-class.md.
-    //
-    // TODO: `std::weak_reference` (LRM 8.30) -- needs a weak table the
-    // collector clears (docs/design/garbage-collection.md).
     if (const slang::ast::Scope* parent = clt.getParentScope();
         parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
         if (clt.name == "process") {
@@ -72,6 +70,9 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
         }
         if (clt.name == "mailbox") {
             return lower_mailbox_class(clt);
+        }
+        if (clt.name == "weak_reference") {
+            return lower_weak_class(clt);
         }
         fail("the built-in '" + std::string(clt.name) + "' class is not supported");
     }
@@ -221,7 +222,11 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // Owns the composed change-notifier field names; see
     // emit_change_notifier_fields for why the rows cannot hold a temporary.
     std::deque<std::string> chg_names;
-    uint32_t                idx = 0;
+    // A class derived from `std::weak_reference` starts with that class's synthetic
+    // body (push_weak_body), which has no property symbols for the two passes below
+    // to find, so its fields are counted here and pushed ahead of the second pass.
+    const slang::ast::ClassType* weak_root = is_weak_reference_class(*chain.front()) ? chain.front() : nullptr;
+    uint32_t                     idx       = weak_root != nullptr ? weak_body_fields(*weak_root) : 0;
     ClassRand               rand;
     for (const slang::ast::ClassType* k : chain) {
         if (rand.unsupported.empty() && has_constraint_blocks(*k)) {
@@ -294,6 +299,9 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     }
     class_rand_.emplace(&clt, rand);
 
+    if (weak_root != nullptr) {
+        push_weak_body(*weak_root, ref, fields);
+    }
     for (const slang::ast::ClassType* k : chain) {
         for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
             if (prop.lifetime == slang::ast::VariableLifetime::Static) {
@@ -1177,6 +1185,13 @@ void Lowerer::emit_ctor_call(const slang::ast::ClassType&       clt,
                              ir::Index                          handle,
                              ir::Builder&                       b,
                              ir::SourceLoc                      l) {
+    if (is_weak_reference_class(clt)) {
+        // `weak_reference::new` is bodyless and built in (LRM 8.30.2); every way of
+        // constructing a weak reference, `super.new` from a derived class included,
+        // arrives here.
+        emit_weak_ctor(actuals, handle, lower_type(clt), b, l);
+        return;
+    }
     if (ctor == nullptr) {
         // No constructor: only the base part needs constructing. A ctor-less
         // class cannot take constructor arguments.

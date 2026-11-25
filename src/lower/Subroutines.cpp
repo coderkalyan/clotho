@@ -1856,6 +1856,10 @@ std::optional<ir::Index> Lowerer::lower_user_call(const CallExpression& call, ir
         // body, so none of the call path below applies.
         return lower_sync_method(call, sub, b);
     }
+    if (is_weak_reference_method(sub)) {
+        // `weak_reference`'s methods (LRM 8.30), bodyless built-ins as well.
+        return lower_weak_method(call, sub, b);
+    }
     // A covergroup / coverpoint built-in method (LRM 19.8). Intercepted here for
     // the same reason the `std` classes are: slang gives these a signature and
     // no body, and a covergroup is not a class, so nothing below applies.
