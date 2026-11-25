@@ -116,6 +116,90 @@ TEST_CASE("force: suppresses an NBA clocked driver, resumes on release") {
     CHECK(run_capture_finish(src) == "q=170\nq=172\n");
 }
 
+// LRM 10.6.2: the force overrides the NBA's update when the update happens, in
+// the NBA region, not when the assignment executes. An update staged before the
+// force in the same time step is suppressed. Matches iverilog 13.
+TEST_CASE("force: suppresses an NBA staged before the force") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] q = 0;
+            initial begin
+                q <= 8'd5;
+                force q = 8'hAA;
+                #1 $display("q=%0d", q);
+                release q;
+                #1 $display("q=%0d", q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=170\n");
+}
+
+// The converse: an NBA executed while the variable is forced, whose update
+// happens after the release, lands (LRM 10.6.2). Matches iverilog 13.
+TEST_CASE("force: an NBA staged while forced lands when released before the NBA region") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] q = 0;
+            initial begin
+                force q = 8'hAA;
+                q <= 8'd5;
+                release q;
+                #1 $display("q=%0d", q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=5\n");
+}
+
+// The clocked form: the flop stages `q <= q + 1` at the edge, and the `#0`
+// orders the force after it in the same time step. Matches iverilog 13.
+TEST_CASE("force: suppresses a clocked NBA staged earlier in the time step") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] q = 0;
+            logic clk = 0;
+            always #1 clk = ~clk;
+            always @(posedge clk) q <= q + 1;
+            initial begin
+                #3;
+                #0 force q = 8'hAA;
+                #10 $display("q=%0d", q);
+                release q;
+                #4 $display("q=%0d", q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=172\n");
+}
+
+// Two instances of one module, only one forced by hierarchical name: the
+// commit-time check reads the forced instance's state and leaves its twin
+// alone. Matches iverilog 13.
+TEST_CASE("force: commit-time check is per instance") {
+    constexpr std::string_view src = R"(
+        module child(input logic clk);
+            logic [7:0] q = 0;
+            always @(posedge clk) q <= q + 1;
+        endmodule
+        module top;
+            logic clk = 0;
+            child u1(clk);
+            child u2(clk);
+            initial begin
+                #1 clk = 1;
+                #0 force u1.q = 8'd50;
+                #1 $display("u1=%0d u2=%0d", u1.q, u2.q);
+                release u1.q;
+                clk = 0;
+                #1 clk = 1;
+                #1 $display("u1=%0d u2=%0d", u1.q, u2.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "u1=50 u2=1\nu1=51 u2=2\n");
+}
+
 // Two independent forced variables do not interfere.
 TEST_CASE("force: independent targets") {
     constexpr std::string_view src = R"(
@@ -199,6 +283,25 @@ TEST_CASE("assign: continuous tracking and last-wins") {
             end
         endmodule)";
     CHECK(run_capture_finish(src) == "a=10\na=11\na=50\na=50\na=55\n");
+}
+
+// LRM 10.6.1: a procedural continuous `assign` overrides an NBA whose update
+// happens while it is active, even one staged before the `assign` executed.
+// Matches iverilog 13.
+TEST_CASE("assign: suppresses an NBA staged before the assign") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] q = 0;
+            initial begin
+                q <= 8'd5;
+                assign q = 8'hAA;
+                #1 $display("q=%0d", q);
+                deassign q;
+                #1 $display("q=%0d", q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=170\n");
 }
 
 // LRM 10.6.2: a force on a net overrides all its drivers (here a gate) and the
