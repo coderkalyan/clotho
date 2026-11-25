@@ -1097,6 +1097,31 @@ Backend::AsciiArg Backend::spill_ascii_arg(Index v, const char* name) {
     return { ptr, b_.getInt32(len), b_.getInt32(0) };
 }
 
+// The unpacked dimensions of the memory `array_type` below its highest, as the
+// constant (left, right) pairs rt_readmem and rt_fread order the leaves of one word
+// by (LRM 21.4.3), outermost first, with their count. A memory of one dimension has
+// none: null and 0.
+std::pair<llvm::Value*, uint32_t> Backend::mem_inner_dims(Ref array_type) {
+    std::vector<llvm::Constant*> bounds;
+    for (Ref e = std::get<Type>(mod_.pool.get(array_type)).element;;) {
+        const Type t = std::get<Type>(mod_.pool.get(e));
+        if (t.kind != Type::Kind::UnpackedArray) {
+            break;
+        }
+        bounds.push_back(b_.getInt64(t.left));
+        bounds.push_back(b_.getInt64(t.right));
+        e = t.element;
+    }
+    if (bounds.empty()) {
+        return { llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), 0 };
+    }
+    auto* arr_ty = llvm::ArrayType::get(b_.getInt64Ty(), bounds.size());
+    auto* gv     = new llvm::GlobalVariable(env_->llmod, arr_ty, /*isConstant=*/true,
+                                            llvm::GlobalValue::PrivateLinkage,
+                                            llvm::ConstantArray::get(arr_ty, bounds), "clotho.mem.dims");
+    return { gv, static_cast<uint32_t>(bounds.size() / 2) };
+}
+
 // Lower a $fread into a single vector: one element, no addressing. The runtime
 // reads ceil(width/8) bytes MSB-first into the destination planes.
 void Backend::lower_fread_word(Index i) {
@@ -1121,19 +1146,19 @@ void Backend::lower_fread_word(Index i) {
     const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
     const uint32_t flags  = !dest.four_state ? 4u : 0u;
     const ServiceSnapshot old = service_snapshot(lv);
+    const auto     no_ptr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     llvm::Value*   r      = b_.CreateCall(fread_fn(),
-                                          { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(dest.store_width),
-                                            b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
-                                            b_.getInt64(0), b_.getInt32(flags),
-                                            llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
-                                            b_.getInt64(0) });
+                                          { fd, mm, z, b_.getInt32(0), b_.getInt32(dest.store_width),
+                                            b_.getInt32(four), no_ptr, b_.getInt32(0), b_.getInt64(0),
+                                            b_.getInt64(0), b_.getInt64(0), b_.getInt64(0), b_.getInt32(flags),
+                                            no_ptr, b_.getInt64(0) });
     service_after_write(lv, old);
     set_value(i, two_val(r));
 }
 
-// Lower a $fread into a memory: reuse the $readmem geometry (plane bases,
-// stride, count, declared bounds) with optional start-address / element-count
-// operands, and read binary bytes MSB-first per element.
+// Lower a $fread into a memory: reuse the $readmem geometry (plane bases, stride,
+// the highest dimension's declared bounds and the dimensions below it) with optional
+// start-address / word-count operands, and read binary bytes MSB-first per leaf.
 void Backend::lower_fread_mem(Index i) {
     const Index fdi  = ir_->payload(i).op_extra.op;
     const auto  info = ir_->extra_data<FreadMemInfo>(ir_->payload(i).op_extra.extra);
@@ -1153,6 +1178,7 @@ void Backend::lower_fread_mem(Index i) {
               : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
     const auto  stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
     const Type& at     = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
+    const auto  inner  = mem_inner_dims(mod_.signal(info.mem).type);
 
     llvm::Value*   fd     = cast(must_of(fdi), 32, true);
     const auto     i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
@@ -1164,9 +1190,9 @@ void Backend::lower_fread_mem(Index i) {
     // call and the time is read once, ahead of the runtime call.
     llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
     llvm::Value* r   = b_.CreateCall(
-      fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
-                    b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
-                    b_.getInt64(at.right), start, cnt, b_.getInt32(flags),
+      fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.width),
+                    b_.getInt32(s.four_state ? 1u : 0u), inner.first, b_.getInt32(inner.second),
+                    b_.getInt64(at.left), b_.getInt64(at.right), start, cnt, b_.getInt32(flags),
                     null_site_global(loc_text(i), NullKind::Class), now });
     // A whole-array write has no per-element edge facts; wake the memory's
     // Any-edge readers when any byte landed, mirroring the deferred
@@ -1222,8 +1248,8 @@ void Backend::lower_readmem(Index i) {
         b_.CreateAlignedStore(must_of(fname), path, llvm::Align(1));
     }
 
-    // The runtime addresses element i's planes at base + i*stride, so hand it
-    // element 0's typed field pointers and the slot struct's alloc size.
+    // The runtime addresses leaf i's planes at base + i*stride, so hand it leaf 0's
+    // typed field pointers and the slot struct's alloc size.
     auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
     llvm::Value* storage = storage_ptr(s);
     llvm::Value* mm_base =
@@ -1237,7 +1263,8 @@ void Backend::lower_readmem(Index i) {
               : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
     const auto stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
 
-    const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
+    const Type& at    = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
+    const auto  inner = mem_inner_dims(mod_.signal(info.target).type);
 
     const auto   i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
     llvm::Value* start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
@@ -1247,10 +1274,11 @@ void Backend::lower_readmem(Index i) {
                            (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
                            (fname_is_str ? 16u : 0u) | (!s.four_state ? 32u : 0u);
 
-    llvm::Value* changed = b_.CreateCall(readmem_fn(),
-                                         { path, path_len, mm_base, z_base, b_.getInt32(stride),
-                                           b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
-                                           b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+    llvm::Value* changed =
+      b_.CreateCall(readmem_fn(),
+                    { path, path_len, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.width), inner.first,
+                      b_.getInt32(inner.second), b_.getInt64(at.left), b_.getInt64(at.right), start, finish,
+                      b_.getInt32(flags) });
     // A whole-memory load has no per-element edge facts: wake the memory's Any-edge
     // readers when the load changed an element, as lower_fread_mem does.
     if (!silent_stores_ && signal_has_waiters(info.target)) {

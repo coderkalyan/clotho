@@ -4282,6 +4282,8 @@ private:
     };
     AsciiArg spill_ascii_arg(Index v, const char* name);
 
+    std::pair<llvm::Value*, uint32_t> mem_inner_dims(Ref array_type);
+
     void lower_fread_word(Index i);
 
     void lower_fread_mem(Index i);

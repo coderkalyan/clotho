@@ -125,7 +125,7 @@ TEST_CASE("rt_readmem with a null z_base loads values without touching z memory"
     }
 
     uint8_t mm[4] = { 0xee, 0xee, 0xee, 0xee };
-    rt_readmem(packed.data(), static_cast<uint32_t>(packed.size()), mm, nullptr, 2, 2, 8, 0, 1, 0, 0,
+    rt_readmem(packed.data(), static_cast<uint32_t>(packed.size()), mm, nullptr, 2, 8, nullptr, 0, 0, 1, 0, 0,
                /*flags: hex, 2-state*/ 1);
 
     // must = may = value for a 2-state load: mm word is val | (val << 8).

@@ -881,18 +881,22 @@ int32_t rt_sscanf(const char* buf, uint32_t len, int32_t fwd, const char* fmt, u
                   const rt_scan_arg* args);
 
 // $fread(target, fd[, start[, count]]) (LRM §21.3.4): read raw bytes from `fd` into
-// a memory (or a scalar, `count` == 1), MSB-first per element. The destination
-// geometry matches $readmem: element i's planes are at `mm_base` / `z_base` +
-// i*`stride`, `width` bits each, over `count` elements with declared bounds
-// `decl_left` / `decl_right`. `start` / `max_count` (valid per `flags` bit0 / bit1)
-// bound the address range; `flags` bit2 marks a narrow 2-state destination (bare
-// iW elements, null `z_base`). Returns the number of bytes read. `width` must be
-// <= 64. A `start` outside the declared range reads nothing and returns 0 after a
-// run-time warning located by `site` (null for the scalar form, which has no start)
-// at simulation time `now`.
-int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
-                 uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right, int64_t start,
-                 int64_t max_count, uint32_t flags, const rt_null_site* site, uint64_t now);
+// a memory (or a scalar, a memory of one word), MSB-first per leaf. The destination
+// geometry matches $readmem: leaf i's planes are at `mm_base` / `z_base` +
+// i*`stride`, `width` bits each. `decl_left` / `decl_right` are the declared bounds of
+// the memory's highest dimension, whose words `start` and `max_count` (valid per
+// `flags` bit0 / bit1) address and count; `inner` points at the (left, right) pairs of
+// its `inner_dims` other dimensions, outermost first (null for a memory of one), and a
+// word is the row of leaves they span, filled row-major from the lowest address of
+// each (LRM 21.4.3). `flags` bit2 marks a narrow 2-state destination (bare iW leaves,
+// null `z_base`). Returns the number of bytes read. `width` must be <= 64. A `start`
+// outside the declared range reads nothing and returns 0 after a run-time warning
+// located by `site` (null for the scalar form, which has no start) at simulation time
+// `now`.
+int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t width,
+                 uint32_t four_state, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
+                 int64_t decl_right, int64_t start, int64_t max_count, uint32_t flags,
+                 const rt_null_site* site, uint64_t now);
 
 // The warning behind rt_fread's out-of-range `start` (docs/LRM_NOTES.md 55). Goes quiet
 // after a few reports from one site, like the divide-by-zero report.
@@ -907,15 +911,19 @@ void rt_fflush(int32_t desc);
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
 // vector, or as bytes in natural order when flags bit4 is set (a string-object
-// filename); `mm_base`/`z_base` point at element 0's must|may and z words in the
-// state buffer, strided by `stride` (`z_base` is null when the memory's slot stores
-// no z word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
-// declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
-// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward. Returns the
-// number of elements whose value the load changed.
+// filename); `mm_base`/`z_base` point at leaf 0's must|may and z words in the state
+// buffer, strided by `stride` (`z_base` is null when the memory's slot stores no z
+// word); `width` is a leaf's width. `decl_left`/`decl_right` are the declared bounds
+// of the memory's highest dimension, the addresses `@addr` and start/finish name; a
+// word of it is the row of leaves the other `inner_dims` dimensions span, whose
+// (left, right) pairs `inner` lists outermost first (null for a memory of one). The
+// file's numbers fill a row row-major, each dimension from its lowest address to its
+// highest (LRM 21.4.3). `flags` bit0=hex, bit1=has_start, bit2=has_finish,
+// bit3=four_state, bit4=path_forward, bit5=narrow (a 2-state memory of bare iW
+// leaves). Returns the number of leaves the load changed.
 uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
-                    uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
-                    int64_t finish, uint32_t flags);
+                    uint32_t width, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
+                    int64_t decl_right, int64_t start, int64_t finish, uint32_t flags);
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 //

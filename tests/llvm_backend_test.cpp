@@ -3830,6 +3830,257 @@ TEST_CASE("$readmemh default fill honors a descending declared range") {
     std::remove(path);
 }
 
+// A memory of several unpacked dimensions is filled row-major, each dimension from its
+// lowest address to its highest, whichever way its range is declared (LRM 21.4.3).
+// Oracle: iverilog 13, which agrees for a load that names no address. A load that took
+// the highest dimension's bounds for the whole memory filled 3 of the 12 words of `a`.
+TEST_CASE("$readmemh fills a whole multi-dimensional memory row-major") {
+    const char* path = "clotho_readmem_md_test.hex";
+    write_file(path, "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:2][0:3];
+            logic [7:0] d [2:0][3:0];
+            logic [7:0] x [0:1][1:0][0:2];
+            integer i, j;
+            initial begin
+                $readmemh(")") + path + R"(", a);
+                $readmemh(")" + path + R"(", d);
+                $readmemh(")" + path + R"(", x);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h | %h %h %h %h", a[i][0], a[i][1], a[i][2], a[i][3],
+                             d[i][0], d[i][1], d[i][2], d[i][3]);
+                for (i = 0; i < 2; i = i + 1)
+                    for (j = 0; j < 2; j = j + 1)
+                        $display("%h %h %h", x[i][j][0], x[i][j][1], x[i][j][2]);
+                // The last word of every dimension, declared high to low.
+                $display("%h %h", d[2][3], x[1][0][2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "01 02 03 04 | 01 02 03 04\n"
+                              "05 06 07 08 | 05 06 07 08\n"
+                              "09 0a 0b 0c | 09 0a 0b 0c\n"
+                              "01 02 03\n"
+                              "04 05 06\n"
+                              "07 08 09\n"
+                              "0a 0b 0c\n"
+                              "0c 09\n");
+    std::remove(path);
+}
+
+// The same fill for the other element kinds: 4-state values with x and z, a 2-state
+// memory (x and z read as 0, LRM 21.4.2) and elements wider than 64 bits. Oracle:
+// iverilog 13.
+TEST_CASE("$readmem fills a multi-dimensional 4-state, 2-state and wide memory") {
+    const char* bin  = "clotho_readmem_mdb_test.bin";
+    const char* hex2 = "clotho_readmem_md2_test.hex";
+    const char* hexw = "clotho_readmem_mdw_test.hex";
+    write_file(bin, "01x1 zzzz 1010\n0000 1111 xxxx\n");
+    write_file(hex2, "ff a5 zz 3x\n");
+    write_file(hexw,
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n"
+               "0123456789abcdef0123456789abcdef\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [3:0]   f [0:1][0:2];
+            bit   [7:0]   g [1:0][0:1];
+            logic [127:0] w [0:1][1:0];
+            integer i, j;
+            initial begin
+                $readmemb(")") + bin + R"(", f);
+                $readmemh(")" + hex2 + R"(", g);
+                $readmemh(")" + hexw + R"(", w);
+                for (i = 0; i < 2; i = i + 1)
+                    $display("%b %b %b", f[i][0], f[i][1], f[i][2]);
+                for (i = 0; i < 2; i = i + 1)
+                    $display("%h %h", g[i][0], g[i][1]);
+                for (i = 0; i < 2; i = i + 1)
+                    for (j = 0; j < 2; j = j + 1)
+                        $display("%h_%h", w[i][j][127:64], w[i][j][63:0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "01x1 zzzz 1010\n"
+                              "0000 1111 xxxx\n"
+                              "ff a5\n"
+                              "00 30\n"
+                              "deadbeefcafebabe_0123456789abcdef\n"
+                              "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                              "0000000000000000_0000000000000042\n"
+                              "0123456789abcdef_0123456789abcdef\n");
+    std::remove(bin);
+    std::remove(hex2);
+    std::remove(hexw);
+}
+
+// $fread fills a whole multi-dimensional memory the same way, byte by byte MSB-first
+// per leaf, and a short file leaves the rest alone. Oracle: iverilog 13.
+TEST_CASE("$fread fills a whole multi-dimensional memory row-major") {
+    const char* path7 = "clotho_fread_md7_test.bin";
+    const char* path8 = "clotho_fread_md8_test.bin";
+    const char* path4 = "clotho_fread_md4_test.bin";
+    write_file(path7, std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    write_file(path8, std::string("\x01\x02\x03\x04\x05\x06\x07\x08", 8));
+    write_file(path4, std::string("\x11\x22\x33\x44", 4));
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0]  r [0:1][0:2];
+            logic [7:0]  q [1:0][2:0];
+            bit   [15:0] h [0:1][1:0];
+            logic [7:0]  s [0:1][0:2];
+            integer fd, rc;
+            initial begin
+                fd = $fopen(")") + path7 + R"(", "rb");
+                rc = $fread(r, fd);
+                $display("rc=%0d %h %h %h %h %h %h", rc, r[0][0], r[0][1], r[0][2], r[1][0], r[1][1], r[1][2]);
+                $fclose(fd);
+                fd = $fopen(")" + path7 + R"(", "rb");
+                rc = $fread(q, fd);
+                $display("rc=%0d %h %h %h %h %h %h", rc, q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2]);
+                $fclose(fd);
+                fd = $fopen(")" + path8 + R"(", "rb");
+                rc = $fread(h, fd);
+                $display("rc=%0d %h %h %h %h", rc, h[0][0], h[0][1], h[1][0], h[1][1]);
+                $fclose(fd);
+                fd = $fopen(")" + path4 + R"(", "rb");
+                rc = $fread(s, fd);
+                $display("rc=%0d %h %h %h %h %h %h", rc, s[0][0], s[0][1], s[0][2], s[1][0], s[1][1], s[1][2]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=6 11 22 33 44 55 66\n"
+                              "rc=6 11 22 33 44 55 66\n"
+                              "rc=8 0102 0304 0506 0708\n"
+                              "rc=4 11 22 33 44 xx xx\n");
+    std::remove(path7);
+    std::remove(path8);
+    std::remove(path4);
+}
+
+// An address in a data file names a word of the memory's highest dimension, and the
+// words below it follow in order (LRM 21.4.3: "Address entries in the file exclusively
+// address the highest dimension's words"). A word the file leaves unfinished keeps its
+// other leaves. LRM-derived: iverilog 13 reads `@1` as the flat leaf 1.
+TEST_CASE("a data file address names a word of the highest dimension") {
+    const char* path_a = "clotho_readmem_mda_test.hex";
+    const char* path_b = "clotho_readmem_mdb2_test.hex";
+    write_file(path_a, "@1 a1 a2 a3 a4\n@0 b1 b2\n");
+    write_file(path_b, "@1 a1 a2 a3 a4 a5 a6\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:2][0:3];
+            logic [7:0] b [0:2][0:3];
+            integer i;
+            initial begin
+                $readmemh(")") + path_a + R"(", a);
+                $readmemh(")" + path_b + R"(", b);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", a[i][0], a[i][1], a[i][2], a[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", b[i][0], b[i][1], b[i][2], b[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "b1 b2 xx xx\n"
+                              "a1 a2 a3 a4\n"
+                              "xx xx xx xx\n"
+                              "xx xx xx xx\n"
+                              "a1 a2 a3 a4\n"
+                              "a5 a6 xx xx\n");
+    std::remove(path_a);
+    std::remove(path_b);
+}
+
+// start and finish name words of the highest dimension, a finish below the start loads
+// downward, and the data runs on into the next word (LRM 21.4, 21.4.3). `d` declares
+// the highest dimension high to low. LRM-derived: iverilog 13 takes them as flat leaf
+// addresses.
+TEST_CASE("$readmem start and finish name words of the highest dimension") {
+    const char* path = "clotho_readmem_mds_test.hex";
+    write_file(path, "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3];
+            logic [7:0] m2 [0:2][0:3];
+            logic [7:0] m3 [0:2][0:3];
+            logic [7:0] d  [2:0][0:3];
+            integer i;
+            initial begin
+                $readmemh(")") + path + R"(", m1, 1);
+                $readmemh(")" + path + R"(", m2, 2, 1);
+                $readmemh(")" + path + R"(", m3, 1, 1);
+                $readmemh(")" + path + R"(", d, 1, 2);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m1[i][0], m1[i][1], m1[i][2], m1[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m2[i][0], m2[i][1], m2[i][2], m2[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m3[i][0], m3[i][1], m3[i][2], m3[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", d[i][0], d[i][1], d[i][2], d[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx xx\n01 02 03 04\n05 06 07 08\n"
+                              "xx xx xx xx\n05 06 07 08\n01 02 03 04\n"
+                              "xx xx xx xx\n01 02 03 04\nxx xx xx xx\n"
+                              "xx xx xx xx\n01 02 03 04\n05 06 07 08\n");
+    std::remove(path);
+}
+
+// $fread's start is a word of the highest dimension and its count a number of those
+// words (LRM 21.3.4.4, 21.4.3); a file that ends inside a word leaves the word's other
+// leaves alone. LRM-derived: iverilog 13 takes both in leaves.
+TEST_CASE("$fread start and count are words of the highest dimension") {
+    const char* path = "clotho_fread_mds_test.bin";
+    write_file(path, std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3];
+            logic [7:0] m2 [0:2][0:3];
+            logic [7:0] m3 [0:2][0:3];
+            logic [7:0] d  [2:0][0:3];
+            integer fd, rc, i;
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                rc = $fread(m1, fd, 1, 1);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(m2, fd, 2);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(m3, fd, 0, 2);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(d, fd, 1);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m1[i][0], m1[i][1], m1[i][2], m1[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m2[i][0], m2[i][1], m2[i][2], m2[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m3[i][0], m3[i][1], m3[i][2], m3[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", d[i][0], d[i][1], d[i][2], d[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=4\nrc=4\nrc=7\nrc=7\n"
+                              "xx xx xx xx\n11 22 33 44\nxx xx xx xx\n"
+                              "xx xx xx xx\nxx xx xx xx\n11 22 33 44\n"
+                              "11 22 33 44\n55 66 77 xx\nxx xx xx xx\n"
+                              "xx xx xx xx\n11 22 33 44\n55 66 77 xx\n");
+    std::remove(path);
+}
+
 // Slurp a file written by a file-I/O test.
 std::string read_file(const char* path) {
     std::FILE* f = std::fopen(path, "rb");

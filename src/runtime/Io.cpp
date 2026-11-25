@@ -1019,19 +1019,97 @@ int64_t norm_addr(int64_t decl_left, int64_t decl_right, int64_t addr) {
     return decl_left <= decl_right ? addr - decl_left : decl_left - addr;
 }
 
+// The leaves of one word of a memory's highest dimension, in the order a $readmem
+// file and a $fread byte stream give them (LRM 21.4.3): row-major over the lower
+// dimensions, each from its lowest address to its highest. `inner` holds those
+// dimensions' declared (left, right) pairs, outermost first. Storage is row-major
+// from each dimension's left bound, so a descending dimension is walked backward. A
+// memory of one dimension has none, and one leaf per word.
+class RowOrder {
+public:
+    RowOrder(const int64_t* inner, uint32_t dims) {
+        int64_t stride = 1;
+        for (uint32_t k = dims; k-- > 0;) {
+            const int64_t left  = inner[2 * size_t{ k }];
+            const int64_t right = inner[2 * size_t{ k } + 1];
+            const int64_t size  = (left <= right ? right - left : left - right) + 1;
+            const bool    down  = left > right;
+            dims_.push_back(Dim{ size, down ? -stride : stride });
+            if (down) {
+                first_ += (size - 1) * stride;
+            }
+            stride *= size;
+        }
+        leaves_ = stride;
+        digit_.assign(dims_.size(), 0);
+        offset_ = first_;
+    }
+
+    // Leaves in one word.
+    int64_t leaves() const {
+        return leaves_;
+    }
+
+    // Storage offset of the current leaf from the first storage slot of its word.
+    int64_t offset() const {
+        return offset_;
+    }
+
+    // Step to the next leaf of the word. False after the last one, where the order is
+    // back at the first leaf.
+    bool next() {
+        for (size_t j = 0; j < dims_.size(); ++j) {
+            offset_ += dims_[j].step;
+            if (++digit_[j] < dims_[j].size) {
+                return true;
+            }
+            digit_[j] = 0;
+            offset_ -= dims_[j].step * dims_[j].size;
+        }
+        return false;
+    }
+
+    // Back to the first leaf, abandoning a word that was not completed.
+    void restart() {
+        std::fill(digit_.begin(), digit_.end(), 0);
+        offset_ = first_;
+    }
+
+private:
+    struct Dim {
+        int64_t size;
+        // Storage offset of one address step up: negative for a descending dimension.
+        int64_t step;
+    };
+    // Innermost first, the order the odometer carries in.
+    std::vector<Dim>     dims_;
+    std::vector<int64_t> digit_;
+    int64_t              leaves_ = 1;
+    // Offset of the leaf at every dimension's lowest address.
+    int64_t first_  = 0;
+    int64_t offset_ = 0;
+};
+
 } // namespace
 
 // $readmemh / $readmemb (LRM §21.4). Loads a hex/binary text file into an unpacked
-// array. The destination planes live in the JIT state buffer: element i's must|may
-// word is at mm_base + i*stride, its z word at z_base + i*stride (the backend passes
-// the two region bases, already offset to element 0). Each parsed token is assembled
-// into u64 must / may / z accumulators (element width <= 64, enforced by the backend)
-// and written through mem_write — no per-element allocation. Returns the number of
-// elements whose value the load changed, so the caller wakes the memory's waiters
-// only when it did.
+// array. The destination planes live in the JIT state buffer: leaf i's must|may word
+// is at mm_base + i*stride, its z word at z_base + i*stride (the backend passes the
+// two region bases, already offset to leaf 0). Each parsed token is assembled into
+// u64 must / may / z accumulators (element width <= 64, enforced by the backend) and
+// written through mem_write — no per-element allocation. Returns the number of
+// leaves whose value the load changed, so the caller wakes the memory's waiters only
+// when it did.
+//
+// A memory of several unpacked dimensions is a run of words of its highest dimension,
+// each a row of leaves (LRM 21.4.3): `decl_left` / `decl_right` are that dimension's
+// declared bounds, `inner` / `inner_dims` the (left, right) pairs of the others. The
+// file's numbers fill a word's leaves row-major, each dimension from its lowest
+// address to its highest, and start, finish and @ addresses name whole words.
 extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
-                               uint32_t stride, uint32_t count, uint32_t width, int64_t decl_left,
-                               int64_t decl_right, int64_t start, int64_t finish, uint32_t flags) {
+                               uint32_t stride, uint32_t width, const int64_t* inner, uint32_t inner_dims,
+                               int64_t decl_left, int64_t decl_right, int64_t start, int64_t finish,
+                               uint32_t flags) {
     const bool hex          = (flags & 1u) != 0;
     const bool has_start    = (flags & 2u) != 0;
     const bool has_finish   = (flags & 4u) != 0;
@@ -1084,16 +1162,18 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     std::vector<uint64_t> may(words);
     std::vector<uint64_t> z(words);
 
-    const MemDest dest{ mm_base, z_base, stride, count, width, four_state, narrow };
-    // An element's slot holds both of its planes, so its `stride` bytes before and
-    // after the write tell whether the value changed.
+    // The highest dimension is `rows` words of `order.leaves()` leaves each, and word
+    // r's leaves start at storage leaf r * leaves.
+    RowOrder      order(inner, inner_dims);
+    const int64_t rows   = (decl_left <= decl_right ? decl_right - decl_left : decl_left - decl_right) + 1;
+    const int64_t leaves = order.leaves();
+
+    const MemDest dest{ mm_base, z_base, stride, static_cast<uint32_t>(rows * leaves), width, four_state, narrow };
+    // A leaf's slot holds both of its planes, so its `stride` bytes before and after
+    // the write tell whether the value changed.
     std::vector<uint8_t> before(stride);
     uint32_t             changed    = 0;
-    const auto           write_elem = [&](int64_t idx) {
-        if (idx < 0 || idx >= static_cast<int64_t>(count)) {
-            std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
-            return;
-        }
+    const auto           write_leaf = [&](int64_t idx) {
         uint8_t* const slot = mm_base + static_cast<size_t>(idx) * stride;
         std::memcpy(before.data(), slot, stride);
         if (wide) {
@@ -1105,6 +1185,12 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             ++changed;
         }
     };
+    // The word the numbers are filling, once its first has arrived. `row_ok` says it
+    // names storage: an address outside the memory is reported once for its word, and
+    // the numbers that fall in it are dropped.
+    bool    in_row = false;
+    bool    row_ok = false;
+    int64_t row    = 0;
 
     const size_t n = buf.size();
     size_t       i = 0;
@@ -1136,7 +1222,11 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             for (int d; i < n && (d = hex_digit(buf[i])) >= 0; ++i) {
                 a = a * 16 + static_cast<uint64_t>(d);
             }
-            addr = static_cast<int64_t>(a);
+            // An address names a whole word of the highest dimension, so a word that
+            // was only partly filled keeps its other leaves (LRM 21.4.3).
+            addr   = static_cast<int64_t>(a);
+            in_row = false;
+            order.restart();
             continue;
         }
         // A data token: accumulate digits MSB-first; x/z (and ?) mark unknown bits.
@@ -1189,23 +1279,38 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             std::fprintf(stderr, "$readmem: more data than the memory range for '%s'\n", path.c_str());
             break;
         }
-        write_elem(norm_addr(decl_left, decl_right, addr));
-        addr += dir;
+        if (!in_row) {
+            row    = norm_addr(decl_left, decl_right, addr);
+            row_ok = row >= 0 && row < rows;
+            in_row = true;
+            if (!row_ok) {
+                std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
+            }
+        }
+        if (row_ok) {
+            write_leaf(row * leaves + order.offset());
+        }
+        if (!order.next()) {
+            in_row = false;
+            addr += dir;
+        }
     }
     return changed;
 }
 
-extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
-                            uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right,
-                            int64_t start, int64_t max_count, uint32_t flags, const rt_null_site* site,
-                            uint64_t now) {
-    // $fread (LRM §21.3.4): read raw bytes from `fd` into a memory (or a scalar,
-    // count == 1), MSB-first per element. Fills from the `start` declared address
-    // (default the lowest) toward the highest, at most `max_count` elements and never
-    // past the highest address. Shares the memory destination substrate with
-    // $readmem; only the byte source differs. Returns the number of bytes read.
-    // A `start` outside the declared range reads nothing, returns 0 and warns
-    // (docs/LRM_NOTES.md 55); `site` / `now` locate that warning.
+extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t width,
+                            uint32_t four_state, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
+                            int64_t decl_right, int64_t start, int64_t max_count, uint32_t flags,
+                            const rt_null_site* site, uint64_t now) {
+    // $fread (LRM §21.3.4): read raw bytes from `fd` into a memory (or a scalar, a
+    // memory of one word), MSB-first per leaf. Fills from the `start` declared address
+    // (default the lowest) toward the highest, at most `max_count` words and never
+    // past the highest address. An address names a word of the memory's highest
+    // dimension, a row of leaves for a memory of several, filled row-major (LRM
+    // 21.4.3 gives that order, and `count` is in the same words). Shares the memory
+    // destination substrate with $readmem; only the byte source differs. Returns the
+    // number of bytes read. A `start` outside the declared range reads nothing,
+    // returns 0 and warns (docs/LRM_NOTES.md 55); `site` / `now` locate that warning.
     io_ensure_init();
     std::FILE* f = fd_stream(fd);
     if (f == nullptr) {
@@ -1214,19 +1319,22 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
     const bool     has_start  = (flags & 1u) != 0;
     const bool     has_count  = (flags & 2u) != 0;
     const bool     narrow     = (flags & 4u) != 0;
-    const MemDest  dest{ mm_base, z_base, stride, count, width, four_state != 0, narrow };
     const uint32_t elem_bytes = (width + 7) / 8;
 
+    RowOrder      order(inner, inner_dims);
     const int64_t lo        = decl_left < decl_right ? decl_left : decl_right;
     const int64_t hi        = decl_left < decl_right ? decl_right : decl_left;
+    const int64_t rows      = hi - lo + 1;
+    const int64_t leaves    = order.leaves();
     int64_t       addr      = has_start ? start : lo;
-    int64_t       remaining = has_count ? max_count : static_cast<int64_t>(count);
+    int64_t       remaining = has_count ? max_count : rows;
     if (addr < lo || addr > hi) {
         // The file position stays where it was: no byte is consumed for an address
         // that names no element.
         rt_fread_range_report(site, addr, decl_left, decl_right, now);
         return 0;
     }
+    const MemDest dest{ mm_base, z_base, stride, static_cast<uint32_t>(rows * leaves), width, four_state != 0, narrow };
 
     // Bytes accumulate into a word array; a <= 64-bit element uses one word and
     // reduces to the scalar (val << 8) | byte path.
@@ -1237,40 +1345,46 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
     std::vector<uint64_t> z(words, 0);
 
     int32_t bytes_read = 0;
-    while (addr <= hi && remaining > 0) {
-        std::fill(val.begin(), val.end(), 0);
-        uint32_t nb = 0;
-        while (nb < elem_bytes) {
-            const int c = std::fgetc(f);
-            if (c == EOF) {
+    bool    eof        = false;
+    while (!eof && addr <= hi && remaining > 0) {
+        const int64_t row = norm_addr(decl_left, decl_right, addr);
+        do {
+            std::fill(val.begin(), val.end(), 0);
+            uint32_t nb = 0;
+            while (nb < elem_bytes) {
+                const int c = std::fgetc(f);
+                if (c == EOF) {
+                    break;
+                }
+                wide_shl(val.data(), words, 8);
+                val[0] |= static_cast<uint8_t>(c);
+                ++nb;
+                ++bytes_read;
+            }
+            if (nb == 0) {
+                eof = true; // EOF before this leaf
                 break;
             }
-            wide_shl(val.data(), words, 8);
-            val[0] |= static_cast<uint8_t>(c);
-            ++nb;
-            ++bytes_read;
-        }
-        if (nb == 0) {
-            break; // EOF before this element
-        }
-        // MSB-first: a short final element left-shifts so the bytes read occupy the
-        // high end and the missing low bytes stay 0.
-        wide_shl(val.data(), words, 8u * (elem_bytes - nb));
-        const int64_t idx = norm_addr(decl_left, decl_right, addr);
-        if (wide) {
-            // File bytes are all known (must == may, no z); mem_write_wide's
-            // 2-state override handles a narrow memory.
-            std::copy(val.begin(), val.end(), may.begin());
-            std::fill(z.begin(), z.end(), 0);
-            mem_write_wide(dest, idx, val.data(), may.data(), z.data());
-        } else {
-            mem_write(dest, idx, val[0], val[0], 0);
-        }
+            // MSB-first: a short final leaf left-shifts so the bytes read occupy the
+            // high end and the missing low bytes stay 0.
+            wide_shl(val.data(), words, 8u * (elem_bytes - nb));
+            const int64_t idx = row * leaves + order.offset();
+            if (wide) {
+                // File bytes are all known (must == may, no z); mem_write_wide's
+                // 2-state override handles a narrow memory.
+                std::copy(val.begin(), val.end(), may.begin());
+                std::fill(z.begin(), z.end(), 0);
+                mem_write_wide(dest, idx, val.data(), may.data(), z.data());
+            } else {
+                mem_write(dest, idx, val[0], val[0], 0);
+            }
+            if (nb < elem_bytes) {
+                eof = true; // hit EOF mid-leaf
+                break;
+            }
+        } while (order.next());
         ++addr;
         --remaining;
-        if (nb < elem_bytes) {
-            break; // hit EOF mid-element
-        }
     }
     return bytes_read;
 }

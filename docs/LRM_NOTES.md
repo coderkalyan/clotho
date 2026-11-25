@@ -770,3 +770,28 @@ Clotho takes `%c` of its rounded integer (6.12.1, ties away from zero), whose lo
 bits are the character, as iverilog does, and `%u` / `%z` of its IEEE 754 bit pattern,
 64 bits for a real and 32 for a shortreal, with no unknown bits. slang rejects `%u` and
 `%z` of a real in a literal format, so only a runtime format reaches it.
+
+## 59. Addresses of a multidimensional memory in `$readmem*` and `$fread` (21.4, 21.4.3, 21.3.4.4)
+
+21.4.3 fills a multidimensional unpacked array "in row-major order, with each dimension's
+entries ranging from low to high address", whichever way its ranges are declared. 21.4 says
+"The start_addr and finish_addr arguments apply to the addresses of the unpacked array
+selected by memory_name. This address range represents the highest dimension of data in
+the filename", and 21.4.3 that "Address entries in the file exclusively address the highest
+dimension's words". 21.3.4.4 gives `$fread` the same memory: `start` is "the address of the
+first element" and `count` "the maximum number of locations in mem".
+
+Decided reading (with the user): `start` and `finish` of `$readmemh` / `$readmemb`, `@`
+addresses in the data file, and `start` and `count` of `$fread` all address the highest
+dimension. A word of it is a row of the lower dimensions, whole, filled row-major, so
+`$fread`'s `count` is a number of rows and a finish below the start loads rows downward. A
+row the data leaves unfinished keeps its other leaves ("the remaining subwords are left
+unchanged"), and an `@` address abandons the row in progress. For one dimension this is the
+old behaviour.
+
+iverilog 13 agrees for a load that names no address, and differs when one is given: it
+takes `start`, `finish`, `count` and `@` as flat leaf indices (`$readmemh(f, m, 1, 2)` on
+`m[0:2][0:3]` loads leaves 1 and 2, where Clotho loads rows 1 and 2). The LRM is the source
+of truth here, so the tests that name an address are derived from it.
+
+Code: `src/runtime/Io.cpp` (`RowOrder`, `rt_readmem`, `rt_fread`), `src/ir/llvm/SystemTasks.cpp` (`mem_inner_dims`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh fills a whole multi-dimensional memory row-major", "$readmem fills a multi-dimensional 4-state, 2-state and wide memory", "$fread fills a whole multi-dimensional memory row-major", "a data file address names a word of the highest dimension", "$readmem start and finish name words of the highest dimension", "$fread start and count are words of the highest dimension"). Oracle: iverilog 13 where it agrees.
