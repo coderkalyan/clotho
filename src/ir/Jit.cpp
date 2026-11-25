@@ -13,6 +13,7 @@
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/MapperJITLinkMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/MemoryMapper.h>
+#include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/SelfExecutorProcessControl.h>
 #include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
@@ -28,6 +29,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "LlvmBackend.h"
+#include "CoffArm64.h"
 #include "runtime/Runtime.h"
 #include "runtime/Gc.h"
 #include "runtime/Coverage.h"
@@ -164,6 +166,14 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     if (!jit) {
         llvm::errs() << "jit: " << llvm::toString(jit.takeError()) << "\n";
         return -1;
+    }
+
+    // Every object the JIT links, the design's and a --dpi-lib one alike, passes
+    // through the transform layer. On Windows on Arm, LLVM 22's RuntimeDyld mislinks a
+    // load at a nonzero offset from a symbol (see fix_coff_arm64_ldr_addends): every
+    // design with an always_comb crashed on its seed table's late-handle load.
+    if ((*jit)->getTargetTriple().isAArch64() && (*jit)->getTargetTriple().isOSBinFormatCOFF()) {
+        (*jit)->getObjTransformLayer().setTransform(fix_coff_arm64_ldr_addends);
     }
 
     // Expose the native runtime to the JIT'd design as absolute symbols, mapped
