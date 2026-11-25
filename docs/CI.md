@@ -130,7 +130,7 @@ that tries is rejected outright with no jobs scheduled at all.
 | target | result |
 |---|---|
 | linux-x64, linux-x64-sanitize, linux-arm64, windows-x64, macos-arm64, macos-x64 | pass |
-| windows-arm64 | builds (with `c7978f9d`); 97 of 105 ctest entries pass. Seven segfault: `function_test`, `strobe_test`, `llvm_backend_test`, `comb_fusion_test`, `struct_test`, `fork_test`, `severity_test`. `exe_test` "simulates as run does, optimized and bounds-checked" gets a different exit code from the executable than from `run` |
+| windows-arm64 | builds (with `c7978f9d`); 97 of 105 ctest entries pass. Seven segfault, each at the file's first design with an `always_comb` or `always_latch`: `function_test`, `strobe_test`, `llvm_backend_test`, `comb_fusion_test`, `struct_test`, `fork_test`, `severity_test`. In `exe_test`'s `-O --sanitize=bounds` tier, `clotho run` crashes on `alu.v` and `nba.v` and reports a false oscillation on `wait.v`, while the built executables print the right output. Both are the JIT mislink below, fixed but not yet confirmed by a run |
 
 Only windows-arm64 is advisory (`continue-on-error`); every other target gates.
 
@@ -148,6 +148,16 @@ need Zig) failed three cases, all value-correctness: `interface_test:95` and
 That last one looks like argument marshalling rather than arithmetic, and Windows
 on ARM64 differs from AAPCS64 in how variadic and floating-point arguments are
 passed. Those three files now pass; the segfaults are new since then.
+
+**The JIT mislinks a load at an offset from a symbol.** Windows on Arm links JIT
+objects with RuntimeDyld, and LLVM 22's COFF/AArch64 support reads a
+`PAGEOFFSET_12L` addend (an LDR/STR imm12, in access-size units) as bytes, so a
+load of `sym+0x430` as an 8-byte value reads `sym+0x80`. Fixed upstream for LLVM
+23 ([811ba37d61f4](https://github.com/llvm/llvm-project/commit/811ba37d61f4)).
+Every design with an `always_comb` loads its seed table's late handle that way;
+`clotho build` executables link with lld and are unaffected.
+`fix_coff_arm64_ldr_addends` (`src/ir/CoffArm64.cpp`) rewrites each such addend
+to bytes before RuntimeDyld sees the object.
 
 **The crash that used to halt it after 338 cases** was a JITLink defect, worked
 around in the backend. Every design using `assign #d`, a gate delay, or

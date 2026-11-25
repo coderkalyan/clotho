@@ -569,12 +569,13 @@ add_library(clotho_ir STATIC
   src/ir/llvm/SystemTasks.cpp
   src/ir/llvm/Vcd.cpp
   src/ir/Jit.cpp
+  src/ir/CoffArm64.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
 # Every src/ir/llvm/ file opens with the internal Backend.h, which pulls in most of
 # LLVM; precompiling it once spares each file parsing LLVM again.
 target_precompile_headers(clotho_ir PRIVATE src/ir/llvm/Backend.h)
-set_source_files_properties(src/ir/Jit.cpp TARGET_DIRECTORY clotho_ir PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/ir/Jit.cpp src/ir/CoffArm64.cpp TARGET_DIRECTORY clotho_ir PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 # A machine with ROCm installed has a second LLVM under /opt/rocm, and
 # find_package picks it over the system one. That copy is built without RTTI, so
 # the backend emits references to `typeinfo for llvm::CallbackVH` that nothing
@@ -1089,6 +1090,7 @@ set(CLOTHO_TEST_SOURCES
   tests/real_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp
+  tests/coff_arm64_test.cpp
   tests/compound_test.cpp
   tests/final_test.cpp
   tests/comb_fusion_test.cpp
