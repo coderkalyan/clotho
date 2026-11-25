@@ -267,7 +267,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
   - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
   - [ ] **Aggregate or container argument** — refused at compile time.
-  - [ ] **Operand wider than 64 bits under `%e`, `%f`, `%g`**.
   - [ ] **Empty argument (adjacent commas)** (21.2.1) — contributes format text, which is
     unknown at compile time.
   - [ ] **Format held in an unpacked array of `byte`** (21.3.3) — refused.

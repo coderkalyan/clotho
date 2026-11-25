@@ -666,6 +666,25 @@ TEST_CASE("%c of a real is still rejected loudly") {
     expect_reject(R"(module m; initial $display("%c", 1.5); endmodule)", "%c with a real argument is not supported");
 }
 
+// A runtime format with an operand wider than 64 bits under %f converts the whole
+// value with one rounding (iverilog 13 agrees: 2**70; the third rounds the
+// 53-bit boundary up where two roundings would not).
+TEST_CASE("a wide operand under %f in a runtime format") {
+    CHECK(run_capture(R"(
+        module m;
+            string f = "%f";
+            logic [99:0] v = 100'd1 << 70;
+            logic signed [99:0] n = -(100'sd1 << 70);
+            logic [99:0] w = (100'd1 << 64) + (100'd1 << 11) + 1;
+            initial begin
+                $display("%s", $sformatf(f, v));
+                $display("%s", $sformatf(f, n));
+                $display("%s", $sformatf(f, w));
+            end
+        endmodule
+    )") == "1180591620717411303424.000000\n-1180591620717411303424.000000\n18446744073709555712.000000\n");
+}
+
 // A scan destination is written as must/may plane words, and a real slot is an
 // IEEE-754 double, so the parsed bits used to land in its mantissa: this
 // returned 1 and left `r` reading 0.000000, with no diagnostic at all. %f/%e/%g
