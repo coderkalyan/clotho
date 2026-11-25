@@ -562,10 +562,8 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`rand_mode()` on a subelement** — mode control below a whole property.
   - [ ] **`std::randomize` of a class handle** (18.12) — needs the handle's own virtual
     `randomize`.
-- [ ] **`randcase` and `randsequence` weight wider than 32 bits** (18.16, 18.17) — needs several
-  32-bit draws stitched.
-- [ ] **Object `get_randstate()` / `set_randstate()`** — the object-side randstate pair is
-  refused.
+- [ ] **Object `get_randstate()` / `set_randstate()` of a class with no rand property** — such an
+  object owns no generator, so the pair is a run-time fatal there.
 - [ ] **`randomize()` of a class in a property-type cycle** (18.6) — a call reached while that
   class is still being laid out is refused.
 

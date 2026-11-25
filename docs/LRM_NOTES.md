@@ -248,9 +248,19 @@ Code: `src/runtime/Random.cpp` (`rt_urandom_seed`). Tests: `tests/sysfunc_test.c
 18.16 forms the weight sum with unsigned addition at the widest weight's
 precision. Clotho applies that literally, so a sum that does not fit wraps
 (`8'd200 + 8'd100` is 44 in 8 bits, and the first branch always wins), and an
-all-zero sum takes no branch.
+all-zero sum takes no branch. The same holds past 32 bits: `64'hFFFF_FFFF_FFFF_FFFF
++ 64'd2` is 1, and a negative `longint` weight is its unsigned value.
 
-Code: `src/lower/Random.cpp` (`lower_randcase`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)").
+The draw over a sum of at most 32 bits is one `$urandom_range(sum - 1, 0)`. A wider
+sum takes the multi-draw scheme 18.16 names ("multiple calls to `$urandom_range()`
+to handle numbers greater than 32 bits") without fixing it: `ceil(width / 32)`
+`$urandom` words are stitched, masked to the bit length of `sum - 1` and redrawn
+while the result is not below the sum, which keeps the split exactly uniform. The
+draw count is then data-dependent (under two attempts on average) but a function of
+the process stream alone, so it stays thread-stable. `randsequence` rule weights
+(18.17.1) share the draw.
+
+Code: `src/lower/Random.cpp` (`lower_randcase`, `emit_weight_draw`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)", "randcase weights wider than 32 bits split by their ratio (LRM 18.16)", "randcase wide weights are unsigned and the sum wraps (LRM 18.16)"), `tests/randsequence_test.cpp` ("randsequence rule weights wider than 32 bits (LRM 18.17.1)").
 
 ## 27. `$bits` of a string (20.6.2)
 

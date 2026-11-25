@@ -3508,12 +3508,20 @@ private:
 
     void lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builder& b);
 
+    // One weighted-choice draw: a value below the weight sum and the type it
+    // carries, which is the type a cumulative weight is converted to for the compare.
+    struct WeightDraw {
+        ir::Index value;
+        ir::Ref   type;
+    };
+
+    WeightDraw emit_weight_draw(ir::Index sum, uint32_t width, ir::Builder& b, ir::SourceLoc l);
+
     void lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
                             size_t                               k,
                             ir::Index                            acc,
-                            ir::Index                            draw,
+                            const WeightDraw&                    draw,
                             const std::vector<ir::Index>&        weights,
-                            ir::Ref                              u32,
                             ir::Builder&                         b);
 
     // -- randsequence (LRM 18.17) --
@@ -3672,10 +3680,10 @@ private:
     // must draw at the same point so an interleaved production's stream matches a
     // plain one's).
     //
-    // Same weight domain, sum precision and zero-total rule as randcase (18.16):
-    // unsigned summands at the widest weight's self-determined precision, one draw
-    // over the total, and no draw at all when the total is zero -- there is then no
-    // rule to pick, and drawing would shift the stream.
+    // Same weight domain, sum precision, draw (emit_weight_draw) and zero-total rule
+    // as randcase (18.16): unsigned summands at the widest weight's self-determined
+    // precision, one draw over the total, and no draw at all when the total is zero
+    // -- there is then no rule to pick, and drawing would shift the stream.
     template<typename F>
     void gen_weighted_rules(const RsProd& p, std::span<const RsProd::Rule> rules, ir::Builder& b, F&& emit) {
         const ir::SourceLoc l = to_source_loc(p.location);
@@ -3688,20 +3696,6 @@ private:
         uint32_t width = 1;
         for (const RsProd::Rule& r : rules) {
             width = std::max(width, r.weightExpr != nullptr ? r.weightExpr->type->getBitWidth() : 32u);
-        }
-        if (width > 32) {
-            // TODO: a wider sum needs the LRM's several-draw scheme, stitching
-            // multiple $urandom_range results into one number ("This can result in
-            // multiple calls to $urandom_range() to handle numbers greater than 32
-            // bits", LRM 18.16, whose weight rules 18.17.1 shares).
-            //
-            // Deliberately shared with randcase's identical guard rather than lifted
-            // here alone: the two constructs weigh alternatives by the same clause,
-            // so they must agree, and stitching changes how many values a selection
-            // draws from the process stream -- a documented contract
-            // (docs/design/randsequence.md §12), not an implementation detail. One
-            // change, both sites, one recorded stream shift.
-            fail("randsequence production weight wider than 32 bits is not supported");
         }
         const ir::Ref          wty = make_int_type(width, false);
         std::vector<ir::Index> weights;
@@ -3719,15 +3713,10 @@ private:
             sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
         }
 
-        const ir::Ref   u32  = make_int_type(32, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index wide = b.convert(sum, u32, false, l);
-        const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
-        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
-        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
-        const ir::Index draw = b.urandom_range(top, low, l);
-        gen_rule_arm(rules, 0, zero, draw, weights, u32, b, emit);
+        const WeightDraw draw = emit_weight_draw(sum, width, b, l);
+        gen_rule_arm(rules, 0, zero, draw, weights, b, emit);
         const ir::ExtraSlice pick_region = b.close_region();
         b.open_region();
         const ir::ExtraSlice none_region = b.close_region();
@@ -3739,9 +3728,8 @@ private:
     void gen_rule_arm(std::span<const RsProd::Rule> rules,
                       size_t                        k,
                       ir::Index                     acc,
-                      ir::Index                     draw,
+                      const WeightDraw&             draw,
                       const std::vector<ir::Index>& weights,
-                      ir::Ref                       u32,
                       ir::Builder&                  b,
                       F&                            emit) {
         if (k == weights.size()) {
@@ -3749,14 +3737,14 @@ private:
         }
         const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
         const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw.value, b.convert(next, draw.type, false, l), l);
 
         b.open_region();
         emit(k, b);
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        gen_rule_arm(rules, k + 1, next, draw, weights, u32, b, emit);
+        gen_rule_arm(rules, k + 1, next, draw, weights, b, emit);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, l);

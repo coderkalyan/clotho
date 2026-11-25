@@ -379,8 +379,7 @@ reason `rt_dynarr_shuffle(rt_dynarr*, const rt_elem_ops*, uint64_t* rng)`
 
 The 8-bit cap is deliberate: 256 values is one 32-byte bitmap per property. LRM 18.6
 permits an implementation limit and requires at least 8 bits. Wider `randc` is
-refused loud (§12), in the same spirit as the existing
-`randcase with a weight wider than 32 bits is not supported`.
+refused loud (§12).
 
 ---
 

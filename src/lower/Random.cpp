@@ -98,7 +98,7 @@ bool Lowerer::has_constraint_blocks(const slang::ast::ClassType& clt) {
 // evaluated exactly once and the sum is formed with unsigned addition at the
 // widest weight's precision -- 18.16 makes each summand unsigned, so a signed
 // weight is reinterpreted rather than sign-extended, and a sum that does not
-// fit that precision wraps. One $urandom_range draw in [0, sum-1] then picks
+// fit that precision wraps. One emit_weight_draw over [0, sum-1] then picks
 // the first branch whose cumulative weight passes it, so a zero-weight branch
 // is never taken and an all-zero sum takes no branch at all (18.16 leaves the
 // warning for that case optional; Clotho does not emit one).
@@ -111,11 +111,6 @@ void Lowerer::lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builde
     uint32_t width = 1;
     for (const slang::ast::RandCaseStatement::Item& item : rc.items) {
         width = std::max(width, item.expr->type->getBitWidth());
-    }
-    if (width > 32) {
-        // TODO: a wider sum needs the LRM's several-draw scheme, stitching
-        // multiple $urandom_range results into one number (LRM 18.16).
-        fail("randcase with a weight wider than 32 bits is not supported");
     }
 
     // The weight domain is 2-state: an x/z weight bit reads as 0, which is how
@@ -136,46 +131,85 @@ void Lowerer::lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builde
     // The draw is guarded, not clamped: with a zero sum there is no branch to
     // take, and $urandom_range(-1, 0) would otherwise draw over the full range
     // (and consume a value from the process stream).
-    const ir::Ref   u32  = make_int_type(32, false);
     const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
     b.open_region();
-    const ir::Index wide = b.convert(sum, u32, false, l);
-    const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
-    const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
-    const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
-    const ir::Index draw = b.urandom_range(top, low, l);
-    lower_randcase_arm(rc, 0, zero, draw, weights, u32, b);
+    const WeightDraw draw = emit_weight_draw(sum, width, b, l);
+    lower_randcase_arm(rc, 0, zero, draw, weights, b);
     const ir::ExtraSlice pick_region = b.close_region();
     b.open_region();
     const ir::ExtraSlice none_region = b.close_region();
     b.cond(b.binary(ir::Inst::Tag::Ne, sum, zero, l), pick_region, none_region, l);
 }
 
+// One draw uniform over [0, sum-1], for a randcase or a randsequence rule pick
+// (LRM 18.16, whose weight rules 18.17.1 shares); `sum` is nonzero and `width`
+// bits wide. A sum of at most 32 bits takes one $urandom_range(sum-1, 0).
+// "This can result in multiple calls to $urandom_range() to handle numbers
+// greater than 32 bits" (18.16): a wider sum stitches ceil(width/32) full-range
+// draws into one number, masks it to the bit length of sum-1 and draws again
+// while it is not below the sum. Rejection keeps the wide draw exactly uniform
+// at fewer than two attempts on average; scaling one stitched number onto the
+// sum, as the 32-bit Lemire step does, would need a multiply wider than the sum.
+Lowerer::WeightDraw Lowerer::emit_weight_draw(ir::Index sum, uint32_t width, ir::Builder& b, ir::SourceLoc l) {
+    const ir::Ref u32 = make_int_type(32, false);
+    if (width <= 32) {
+        const ir::Index wide = b.convert(sum, u32, false, l);
+        const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
+        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
+        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
+        return WeightDraw{ .value = b.urandom_range(top, low, l), .type = u32 };
+    }
+    const ir::Ref wty  = make_int_type(width, false);
+    ir::Index     mask = b.binary(ir::Inst::Tag::Sub, sum, b.constant(module_.pool.put_int(wty, 1), l), l);
+    for (uint32_t s = 1; s < width; s <<= 1) {
+        const ir::Index shifted = b.binary(ir::Inst::Tag::Srl, mask, b.constant(module_.pool.put_int(u32, s), l), l);
+        mask                    = b.binary(ir::Inst::Tag::Bor, mask, shifted, l);
+    }
+    const TempCell cell = make_temp_cell(wty, "weight_draw");
+
+    b.open_region();
+    const ir::ExtraSlice no_step = b.close_region();
+    b.open_region();
+    std::vector<ir::Index> words;
+    words.reserve((width + 31) / 32);
+    for (uint32_t k = 0; k < (width + 31) / 32; ++k) {
+        words.push_back(b.urandom(l));
+    }
+    const ir::Index stitched = b.convert(b.concat(words, l), wty, false, l);
+    const ir::Index masked   = b.binary(ir::Inst::Tag::Band, stitched, mask, l);
+    b.binary(ir::Inst::Tag::Store, cell.lv(b, l), masked, l);
+    const ir::ExtraSlice body = b.close_region();
+    b.open_region();
+    const ir::Index      again = b.binary(ir::Inst::Tag::UGe, b.unary(ir::Inst::Tag::Load, cell.lv(b, l), l), sum, l);
+    const ir::ExtraSlice cond  = b.close_region();
+    b.loop(cond, again, body, no_step, /*bottom_test=*/true, l);
+    return WeightDraw{ .value = b.unary(ir::Inst::Tag::Load, cell.lv(b, l), l), .type = wty };
+}
+
 // One arm of the randcase chain: item k runs when the draw is below its
 // cumulative weight and no earlier arm claimed it. The cumulative sums carry
-// the same wrapping unsigned precision as the total and are widened to 32 bits
-// only to meet the draw, which is below the total -- so the terminal else is
-// unreachable for a nonzero total.
+// the same wrapping unsigned precision as the total and are converted to the
+// draw's type only to meet it, and the draw is below the total -- so the
+// terminal else is unreachable for a nonzero total.
 void Lowerer::lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
                                  size_t                               k,
                                  ir::Index                            acc,
-                                 ir::Index                            draw,
+                                 const WeightDraw&                    draw,
                                  const std::vector<ir::Index>&        weights,
-                                 ir::Ref                              u32,
                                  ir::Builder&                         b) {
     if (k == weights.size()) {
         return;
     }
     const ir::SourceLoc l    = loc(*rc.items[k].stmt);
     const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-    const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
+    const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw.value, b.convert(next, draw.type, false, l), l);
 
     b.open_region();
     lower_stmt(*rc.items[k].stmt, b);
     const ir::ExtraSlice then_region = b.close_region();
 
     b.open_region();
-    lower_randcase_arm(rc, k + 1, next, draw, weights, u32, b);
+    lower_randcase_arm(rc, k + 1, next, draw, weights, b);
     const ir::ExtraSlice else_region = b.close_region();
 
     b.cond(pred, then_region, else_region, l);
