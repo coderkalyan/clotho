@@ -634,8 +634,8 @@ is in the units of the scope that DECLARES it, which is what `function_id` alrea
 applies to subroutine delays and to `$time` in a task. Cross-checked against
 iverilog, which scales a package function's `$time` by the package. So `%0t` may
 be printed in the spawning function as well as in the child. `$strobe` /
-`$monitor` in a function keep the second, still-real reason (no `coro_begin_` to
-hang the ramp's record slot off).
+`$monitor` in a function are supported too: the pended body is ramped with the
+shared null record, not a record of the caller.
 
 ### V5.6 Cost
 

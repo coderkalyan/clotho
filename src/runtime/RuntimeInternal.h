@@ -323,8 +323,9 @@ inline uint64_t xoshiro_next(uint64_t* s) {
 
 // The single active $monitor (LRM 21.2.2): its body's ramp function pointer and
 // the record of the instance the body belongs to (its first argument), the enable
-// flag, and the last rendered output for change detection. `primed` is false
-// until the first emit (or after a re-arm), forcing that first print.
+// flag, and the image of the argument values at the last emit, for change
+// detection (monitor_key_image). `primed` is false until the first emit (or after
+// a re-arm), forcing that first print.
 struct MonitorState {
     void*       ramp    = nullptr;
     void*       record  = nullptr;

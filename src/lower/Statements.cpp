@@ -492,19 +492,23 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
         // rather than a single occupant slot.
         if (disable_hard_.contains(&target)) {
             // TODO: a task whose body can park where the abort cannot claim the
-            // park -- a `#0` or runtime-valued delay, a time-consuming call it
-            // makes, a fork, an `expect`. The nested-call case additionally needs
-            // the callee's activation ended too (9.6.2 disables downward along
-            // the enable chain), which is a second list walk this does not have.
-            fail("disable of a task whose body can park on a #0, a time-consuming call, a "
-                 "fork or an expect is not supported yet (the abort cannot claim that "
-                 "park)");
+            // park -- a time-consuming call it makes (one that forks included), an
+            // `expect`. A fork in the task's own body is not one: its children are
+            // activations of the target (build_fork_child) and release the join. The
+            // nested-call case additionally needs the callee's activation ended too
+            // (9.6.2 disables downward along the enable chain), which is a second
+            // list walk this does not have.
+            fail("disable of a task whose body can park on a time-consuming call (one "
+                 "that forks included) or an expect is not supported yet (the abort cannot "
+                 "claim that park)");
         }
         b.disable_remote(it->second, loc(s));
         // LRM 9.6.2 example 4: a task disabling ITSELF. The activation running
         // this statement is one of the ones that has to end, and it is the only
-        // one the force-wake above cannot reach -- it is running, not parked.
-        if (fn_ctx_ != nullptr && fn_ctx_->sym == &target) {
+        // one the force-wake above cannot reach -- it is running, not parked. A
+        // child the task forked is one of those activations too, and its own body
+        // has no subroutine symbol, so the target id is what names the task.
+        if (fn_ctx_ != nullptr && fn_ctx_->disable_target == it->second) {
             b.disable_abort(loc(s));
         }
         return;
@@ -552,14 +556,13 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
         // carry one. What has to hold is on the target side.
         if (disable_hard_.contains(&target)) {
             // TODO: a remote target whose region can park behind something the
-            // abort cannot claim — a `#0` or a runtime-valued delay (the inactive
-            // batch has no per-entry claim), a time-consuming task call or a fork
-            // (the process would be resumed a second time by that activation's
-            // completion), or an `expect`. A `#delay` and an `@event` wait are
-            // supported, as is a task call that consumes no time.
-            fail("disable of a block whose body can park on a #0, a time-consuming task "
-                 "call, a fork or an expect is not supported yet from outside the block "
-                 "(the abort cannot claim that park)");
+            // abort cannot claim -- a time-consuming task call or a fork in a
+            // callee (the process would be resumed a second time by that
+            // activation's completion), or an `expect`. A `#delay`, an `@event` wait,
+            // a `#0` and a task call that consumes no time are supported.
+            fail("disable of a block whose body can park on a time-consuming task call "
+                 "(one that forks included) or an expect is not supported yet from outside "
+                 "the block (the abort cannot claim that park)");
         }
         if (disable_roots_.contains(&target) && disable_flushes_.contains(&target)) {
             // LRM 16.4.4: this is the target procedure's OUTERMOST scope, so its

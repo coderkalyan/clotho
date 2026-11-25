@@ -190,11 +190,12 @@ TEST_CASE("$strobe inside a task") {
     )") == "in task v=7\n");
 }
 
-// $strobe is rejected inside a plain (non-task) function: the deferred body is
-// ramped through the caller's task-call record slot, which only a coroutine has.
-// (Reading the clock there is fine -- $time in a function works.)
-TEST_CASE("$strobe inside a plain function is rejected") {
-    check_rejected(R"(
+// $strobe inside a plain (non-task) function: the pended body is ramped with the
+// shared null record (pend_record_slot), not a record of the caller, so the
+// function needs no coroutine state of its own. The strobe still prints at the
+// end of the time step, after the caller's own $display. Oracle: Icarus Verilog 13.
+TEST_CASE("$strobe inside a plain function") {
+    CHECK(run_capture(R"(
         module m;
             int g;
             function automatic int f();
@@ -206,8 +207,56 @@ TEST_CASE("$strobe inside a plain function is rejected") {
                 $display("%0d", f());
             end
         endmodule
-    )",
-                   "$strobe inside a function is not supported");
+    )") == "0\ng=9\n");
+}
+
+// A function that pends a $strobe, called from an always_comb: it runs at time
+// zero and again each time its inputs change, and each run pends one print.
+// Oracle: Icarus Verilog 13 (it warns that $strobe is not synthesizable there).
+TEST_CASE("$strobe inside a function called from always_comb") {
+    CHECK(run_capture(R"(
+        module m;
+            int x = 0;
+            int y;
+            function void f();
+                $strobe("t=%0t strobe x=%0d", $time, x);
+            endfunction
+            always_comb begin
+                y = x + 1;
+                f();
+            end
+            initial begin
+                #1 x = 5;
+                #1 x = 5;
+                #1 x = 7;
+                #1 $finish;
+            end
+        endmodule
+    )") == "t=0 strobe x=0\nt=1 strobe x=5\nt=3 strobe x=7\n");
+}
+
+// Two instances of one module share one function body; each pends its own
+// print and reads its own instance's variable. The instances call at different
+// times so the output order is not a race. Oracle: Icarus Verilog 13.
+TEST_CASE("$strobe inside a function of a module with two instances") {
+    CHECK(run_capture(R"(
+        module leaf #(parameter int seed = 0, parameter int d = 1);
+            int v;
+            function void f();
+                $strobe("%m v=%0d", v);
+            endfunction
+            initial begin
+                v = seed;
+                #d f();
+                v = seed + 1;
+            end
+        endmodule
+        module top;
+            leaf #(10, 1) a();
+            leaf #(20, 2) b();
+            initial #4 $finish;
+        endmodule
+    )") == "top.a.f v=11\ntop.b.f v=21\n");
 }
 
 // An automatic-lifetime argument cannot be re-evaluated by the deferred body
@@ -275,16 +324,128 @@ TEST_CASE("$monitor on/off and replacement") {
     )") == "mon1 a=0\nmon1 a=1\nmon1 a=2\nmon1 a=3\nmon2 b=0\nmon2 b=7\n");
 }
 
-// $monitor pends its body the same way $strobe does, so it needs the same record
-// slot a plain function has not got; guard loud (like $strobe).
-TEST_CASE("$monitor in a function is rejected") {
-    check_rejected(R"(
+// $monitor does not print when only $time, $stime or $realtime changed: the
+// time argument rides along when something else prints. Oracle: Icarus Verilog
+// 13 prints the same three lines.
+TEST_CASE("$monitor ignores a changing $time argument") {
+    CHECK(run_capture(R"(
         module m;
-          function void f(); $monitor("x"); endfunction
-          initial f();
+          reg [3:0] a = 0;
+          initial begin
+            $monitor("t=%0t a=%0d", $time, a);
+            #1 a = 1;
+            #1; #1;
+            #1 a = 2;
+            #1 $finish;
+          end
         endmodule
-    )",
-                   "$monitor inside a function is not supported");
+    )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\n");
+}
+
+// The three time functions are all excluded, in any position. Oracle: Icarus
+// Verilog 13.
+TEST_CASE("$monitor ignores $stime and $realtime arguments") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $monitor("stime=%0d rt=%0t a=%0d", $stime, $realtime, a);
+            #1 a = 1; #2; #1 a = 2;
+            #1 $finish;
+          end
+        endmodule
+    )") == "stime=0 rt=0 a=0\nstime=1 rt=1 a=1\nstime=4 rt=4 a=2\n");
+}
+
+// With no argument but time, the monitor prints once, when it is armed. Oracle:
+// Icarus Verilog 13.
+TEST_CASE("$monitor of only $time prints once") {
+    CHECK(run_capture(R"(
+        module m;
+          initial begin
+            $monitor("only time %0t", $time);
+            #1; #1;
+            #1 $finish;
+          end
+        endmodule
+    )") == "only time 0\n");
+}
+
+// Change is a change of value, not of rendered text: %c prints the low byte, so
+// a change of the upper byte renders the same line again. Oracle: Icarus
+// Verilog 13 prints the line four times.
+TEST_CASE("$monitor prints again when a value changes but renders alike") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [15:0] v = 16'h0141;
+          initial begin
+            $monitor("c=%c", v);
+            #1 v = 16'h0241;
+            #1 v = 16'h0242;
+            #1 v = 16'h0342;
+            #1 $finish;
+          end
+        endmodule
+    )") == "c=A\nc=A\nc=B\nc=B\n");
+}
+
+// $monitoron reprints the current values immediately, also while the monitor is
+// already on, and the reprint carries the current time. Oracle: Icarus Verilog 13.
+TEST_CASE("$monitoron reprints with a $time argument") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $monitor("t=%0t a=%0d", $time, a);
+            #1 a = 1;
+            #1 $monitoroff;
+            #1 a = 2;
+            #1 $monitoron;
+            #1; #1 $monitoron;
+            #1 a = 3;
+            #1 $finish;
+          end
+        endmodule
+    )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\nt=6 a=2\nt=7 a=3\n");
+}
+
+// $fmonitor takes the same change detection as $monitor. Oracle: Icarus Verilog 13.
+TEST_CASE("$fmonitor ignores a changing $time argument") {
+    CHECK(run_capture(R"(
+        module m;
+          reg [3:0] a = 0;
+          initial begin
+            $fmonitor(1, "t=%0t a=%0d", $time, a);
+            #1 a = 1;
+            #2;
+            #1 a = 2;
+            #1 $finish;
+          end
+        endmodule
+    )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\n");
+}
+
+// $monitor in a function arms the same persistent monitor a task or process
+// does: the registration carries a pointer, not a record of the caller. Oracle:
+// Icarus Verilog 13 prints the same three lines.
+TEST_CASE("$monitor inside a function") {
+    CHECK(run_capture(R"(
+        module m;
+          int v = 1;
+          function int arm();
+            $monitor("mon v=%0d", v);
+            return 0;
+          endfunction
+          initial begin
+            v = 2;
+            void'(arm());
+            #1 v = 3;
+            #2 v = 3;
+            #1 v = 4;
+            #1 $finish;
+          end
+        endmodule
+    )") == "mon v=2\nmon v=3\nmon v=4\n");
 }
 
 // Each `initial` pends its $strobe and runs off its end in the same time step, so

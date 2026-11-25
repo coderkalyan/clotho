@@ -1035,7 +1035,7 @@ TEST_CASE("a remote disable refuses a block whose called task parks in any form"
           initial #1 disable t.P.B;
         endmodule)");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("can park on a #0, a time-consuming task call") != std::string::npos);
+        CHECK(r.diagnostic_text().find("can park on a time-consuming task call") != std::string::npos);
     };
     refused("logic y; task T; y = #5 1'b1; endtask");
     refused("logic y; task T; y = @(e) 1'b1; endtask");
@@ -1082,7 +1082,7 @@ TEST_CASE("a remote disable's park walk gives a recursive cycle the same answer 
     const auto refused = [](std::string_view src) {
         const LowerResult r = lower_text(src);
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("can park on a #0, a time-consuming task call") != std::string::npos);
+        CHECK(r.diagnostic_text().find("can park on a time-consuming task call") != std::string::npos);
     };
 
     SUBCASE("the member with the park is entered first") {

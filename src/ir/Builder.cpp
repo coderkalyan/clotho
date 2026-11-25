@@ -329,8 +329,8 @@ Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::AggCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
-Index Builder::agg_eq(Index lhs, Index rhs, Ref type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(AggEqInfo{ rhs, type });
+Index Builder::agg_eq(Index lhs, Index rhs, Ref type, AggEqMode mode, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AggEqInfo{ rhs, type, mode });
 
     return emit({ Inst::Tag::AggEq, Inst::Payload{ .op_extra = { lhs, extra } } }, loc);
 }
@@ -907,7 +907,7 @@ ExtraSlice Builder::add_fmt_args(std::span<const FmtArg> args, ExtraSlice& signs
     flags.reserve(args.size());
     for (const FmtArg& a : args) {
         values.push_back(a.value);
-        flags.push_back(a.is_signed ? 1u : 0u);
+        flags.push_back((a.is_signed ? 1u : 0u) | (a.is_time ? 2u : 0u));
     }
     signs = add_u32_slice(flags);
 

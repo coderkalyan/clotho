@@ -736,6 +736,27 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
     }
 }
 
+// `%p` of an indexed slice of an unpacked array (`a[i +: 2]`, `a[i -: 2]`) renders
+// exactly as the constant-bounds slice of the same positions does. Its first
+// position is a runtime value, so the operand is copied into a temp first. Oracle:
+// metamorphic -- the indexed form must print what the constant form `a[1:2]` prints
+// (iverilog cannot `%p` an aggregate), and a loop over the base checks that it is
+// read at run time.
+TEST_CASE("%p of an indexed slice matches the constant slice (LRM 21.2.1.6, 11.5.1)") {
+    CHECK(run_capture(R"(
+        module m;
+            int a [0:3] = '{1, 2, 3, 4};
+            int i = 1;
+            initial begin
+                $display("%p", a[1:2]);
+                $display("%p", a[i +: 2]);
+                $display("%p", a[i + 1 -: 2]);
+                for (i = 0; i < 3; i++) $display("%p", a[i +: 2]);
+            end
+        endmodule
+    )") == "'{2, 3}\n'{2, 3}\n'{2, 3}\n'{1, 2}\n'{2, 3}\n'{3, 4}\n");
+}
+
 // `%0p` is a SEPARATE specifier in 21.2.1.6, not a width applied to `%p`: it "shall
 // print aggregate expressions ... in a shorter, implementation specific form". slang
 // enforces the distinction ("Pattern args allow the zero-pad specifier"; every other

@@ -359,13 +359,24 @@ struct PowInfo {
     uint32_t exp_signed;
 };
 
-// Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
-// aggregate lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
+// Which equality an `agg_eq` computes (LRM 11.4.5). The two differ only at a leaf
+// that can hold x or z (docs/design/aggregate-equality.md).
+enum class AggEqMode : uint32_t {
+    // `==` / `!=`: an x or z bit makes a leaf compare ambiguous, which folds to x.
+    Logical,
+    // `===` / `!==`: x and z bits compare as values; the result is always known.
+    Case,
+};
+
+// Extra payload for `agg_eq`: whole-value equality of two unpacked aggregate or
+// container lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
 struct AggEqInfo {
     // Right-hand aggregate lvalue.
     Index rhs;
-    // The aggregate type (gives the member layout to compare).
+    // The compared type: an unpacked struct, a fixed unpacked array, a queue, a
+    // dynamic array or an associative array.
     Ref type;
+    AggEqMode mode;
 };
 
 // Extra payload for `member_select`: a member of an unpacked struct (the base is
@@ -871,6 +882,10 @@ struct SwitchInfo {
 struct FmtArg {
     Index value;
     bool  is_signed = false;
+    // The argument is a bare $time / $stime / $realtime call. $monitor does not
+    // print when only such an argument changed (LRM 21.2.2), so a monitor_emit
+    // leaves it out of its change detection. Set only for a monitor body.
+    bool  is_time = false;
 };
 
 // Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
@@ -889,7 +904,8 @@ struct DisplayInfo {
     uint32_t newline;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
-    // One word per operand of `args`: 1 when it prints as a signed number.
+    // One word per operand of `args`: bit 0 is set when it prints as a signed
+    // number, bit 1 when it is a FmtArg::is_time operand.
     ExtraSlice signs;
 };
 
@@ -1528,11 +1544,10 @@ struct Inst {
         // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
         // frontend emits it only for a string-free aggregate.
         AggCopy,
-        // 1-bit 4-state equality of two whole unpacked aggregates (payload:
-        // op_extra -> AggEqInfo; op is the left lvalue). The backend expands
-        // the member walk, AND-reducing per-leaf `==` results so LRM 11.4.5
-        // X-propagation is carried exactly (docs/LRM_NOTES.md, note 13); `!=` is a Lnot
-        // of this.
+        // 1-bit equality of two whole unpacked aggregates or containers (payload:
+        // op_extra -> AggEqInfo; op is the left lvalue), `==` or `===` by
+        // AggEqInfo::mode. The backend expands it by recursion over the type
+        // (docs/design/aggregate-equality.md); `!=` / `!==` are a Lnot of this.
         AggEq,
 
         // -- Dynamic-array operations on a handle lvalue (LRM 7.5) --
@@ -2148,8 +2163,9 @@ struct Inst {
         // whole point of $strobe is that evaluation itself is deferred to the
         // end of the time step, not merely the print, so nothing here is
         // re-evaluated later. A process containing this tag is forced to a
-        // coroutine (see is_simple_always) so its call site can ramp `func`'s
-        // coroutine frame through the task-call record ABI.
+        // coroutine (see is_simple_always). The body is ramped with the shared null
+        // record (Backend::pend_record_slot), not a record of the caller, so the
+        // tag is as legal in a plain function as in a task.
         StrobePend,
         // Schedule the compiler-synthesized zero-formal task `func` (payload:
         // extra -> StrobePendInfo) into the Reactive region of the current time
@@ -2171,8 +2187,8 @@ struct Inst {
         MonitorSet,
         // The change-detecting print inside a monitor body (payload: op_extra — op
         // is the destination descriptor, extra a DisplayInfo). Renders the format +
-        // args and emits to the descriptor only if the output changed since the
-        // last emit (rt_monitor_emit).
+        // args and emits to the descriptor only if the value of an argument other
+        // than a FmtArg::is_time one changed since the last emit (rt_monitor_emit).
         MonitorEmit,
         // $monitoron / $monitoroff (payload: none): enable / disable the monitor.
         MonitorOn,

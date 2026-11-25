@@ -49,12 +49,8 @@ Milestones, in order; lower ones unblock higher ones:
   is not produced, so an ambiguous `?:` over an aggregate holding an unpacked union is refused.
 - [ ] **`?:` over a queue, dynamic array or associative array** (11.4.11) — an ambiguous
   condition needs both arms staged in container temps.
-- [ ] **Aggregate `==` over a struct with an associative-array member** — refused, and with it an
-  ambiguous `?:` over such a struct under a 4-state condition.
 - [ ] **`?:` over aggregates of a type distinct from the target's** (11.4.11, 6.22.2) — arms
   equivalent to, but interned differently from, the assignment target need a converting copy.
-- [ ] **Short-circuit `&&&` conjuncts** (12.4) — every conjunct of a `cond_predicate` is
-  evaluated, so `if (h != null &&& h.x)` fatals on a null `h`.
 
 ### Subroutines
 
@@ -64,8 +60,6 @@ Milestones, in order; lower ones unblock higher ones:
   in the per-call frame, not static storage. Automatic variables are illegal NBA targets.
 - [ ] **Bulk default reset of an automatic aggregate (performance)** (6.21) — the Table 6-7
   default is stored per leaf; a trivially copyable aggregate could copy its prototype image.
-- [ ] **`$strobe` / `$monitor` in a function** — the deferred body needs a task-call record slot,
-  which a function lacks.
 
 ### Memories & arrays
 
@@ -74,14 +68,14 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Unpacked-array slices** (7.4.5) — two slice shapes are still refused.
   - [ ] **Slice of an array with struct or array elements** — refused.
   - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
-    or `%p` argument is refused.
+    or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
 - [ ] **Sliced memory target for `$readmem*` / `$fread`** — a slice destination is refused.
 
 ### Elaboration & structure
 
 - [~] **Runtime-indexed aggregate parameter** (6.20, 11.5.1) — two value shapes are refused.
-  - [ ] **Wildcard-index associative-array parameter** — cannot be materialized for a runtime
-    read.
+  - [ ] **Wildcard-index associative-array parameter with a key wider than 64 bits** — the
+    same limit runtime `[*]` keys have.
   - [ ] **Queue or associative-array parameter with aggregate elements** — cannot be seeded
     for a runtime read.
 - [ ] **`defparam` that changes an implicitly typed parameter's type** (6.20.2, 23.10.1) — the
@@ -92,8 +86,8 @@ Milestones, in order; lower ones unblock higher ones:
 ### Procedural control
 
 - [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
-  time-consuming task call or an `expect`, or a task that forks, cannot be aborted. A block
-  whose body calls a subroutine that forks is refused too: those children are not in it.
+  time-consuming task call or an `expect` cannot be aborted. A block or task whose body calls
+  a subroutine that forks is refused too: those children are not in it.
 - [ ] **Thousands of straight-line statements over wide values** — LLVM's type legalizer
   recurses once per store of a value above 128 bits (a 4-state vector above 64 bits) in one
   block and overflows the compile thread's stack, so the JIT dies with SIGSEGV.
@@ -212,8 +206,6 @@ Milestones, in order; lower ones unblock higher ones:
   one `$var` per leaf.
 - [ ] **VCD of a container or class-handle signal** — a dump over a queue, dynamic array,
   associative array or class handle is refused.
-- [ ] **`$monitor` with `$time` or `%t` in its arguments** (21.2.2) — change detection
-  compares rendered output, so it reprints every time step.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
 - [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
@@ -403,10 +395,8 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Dynamic-array, associative-array and string operations as linked bitcode (performance)**
   (7.5, 7.8, 6.16) — only a queue's push, pop, insert, delete and range append are linked into
   the design; the rest call the runtime through an interpreted element descriptor.
-- [ ] **`===` / `!==` over a container with a 4-state leaf** (11.4.5) — a 4-state integral, `real`
-  or associative-array leaf is refused.
 - [ ] **Logical `==` / `!=` over an associative array with a 4-state value element** (11.4.5) —
-  refused; X propagation differs from a byte compare.
+  refused at any nesting depth until the defining clause and x on a key-set mismatch are settled.
 - [ ] **Associative-array key mixing a class handle with a variable-width component** (7.8) — a
   `string`, queue, dynamic-array or associative-array component beside the handle is refused.
 - [ ] **Wildcard `[*]` index wider than 64 bits** (7.8.1) — an index expression (including a

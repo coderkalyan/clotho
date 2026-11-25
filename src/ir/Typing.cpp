@@ -373,10 +373,12 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::CasexEq:
             return { 1, false };
 
-        // An aggregate compare ANDs the leaf compares, so it can be x only when a
-        // leaf can carry x or z.
-        case Inst::Tag::AggEq:
-            return { 1, types::has_four_state_leaf(pool, ir.extra_data<AggEqInfo>(p.op_extra.extra).type), false };
+        // A logical aggregate compare ANDs the leaf compares, so it can be x only
+        // when a leaf can carry x or z; a case compare is always a known bit.
+        case Inst::Tag::AggEq: {
+            const auto info = ir.extra_data<AggEqInfo>(p.op_extra.extra);
+            return { 1, info.mode == AggEqMode::Logical && types::has_four_state_leaf(pool, info.type), false };
+        }
 
         // The selector decides: slang converts every member to its type, so a
         // member is x-free exactly when the selector is.

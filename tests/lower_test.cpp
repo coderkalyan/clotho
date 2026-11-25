@@ -655,13 +655,13 @@ TEST_CASE("a fixed-size unpacked array slice lowers in each context") {
         CHECK(r.ok);
     }
     SUBCASE("an indexed part-select slice in an unsupported context is guarded") {
-        // A general by-value read (here `%p`) still needs the whole-array rvalue
-        // ABI; the diagnostic names the contexts that do work.
+        // An array method on the slice (here `sum`) still asks for it as a plain
+        // lvalue; the diagnostic names the contexts that do work.
         const LowerResult r = lower_text(R"(
             module top;
-                bit [31:0] a [7:0];
+                int a [0:7];
                 int i;
-                initial $display("%p", a[i +: 2]);
+                initial $display("%0d", a[i +: 2].sum());
             endmodule
         )");
         CHECK_FALSE(r.ok);
@@ -743,8 +743,8 @@ TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
 }
 
 TEST_CASE("equality of a struct with a queue member lowers (element-wise walk)") {
-    // The AggEq leaf dispatch now reaches rt_container_eq for the queue member
-    // (runtime behavior pinned in queue_test.cpp); here just confirm it lowers.
+    // The queue member compares through the AggEq element walk (runtime behavior
+    // pinned in queue_test.cpp); here just confirm it lowers.
     const LowerResult r = lower_text(R"(
         module top;
             typedef struct { int q[$]; int x; } t;

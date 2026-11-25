@@ -1218,7 +1218,8 @@ LValue Backend::tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value
 // also what gives a queue of queues (or of structs holding queues) a compare at
 // all. The must / may accumulators live in allocas so the loop needs no PHI
 // plumbing; LLVM promotes them.
-Plane Backend::emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e) {
+Plane Backend::emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Ref type, const DynElem& e,
+                                      AggEqMode mode) {
     llvm::Value* ha      = lv_handle_ptr(lhs, HandleUse::Read);
     llvm::Value* hb      = lv_handle_ptr(rhs, HandleUse::Read);
     const auto [la, ba]  = container_len_base(ha, type);
@@ -1247,9 +1248,9 @@ Plane Backend::emit_container_eq_loop(const Guarded& lhs, const Guarded& rhs, Re
     b_.SetInsertPoint(body);
     llvm::Value* k    = b_.CreateLoad(b_.getInt64Ty(), idx);
     const Plane  e_eq = lower_agg_eq(
-      container_elem_lvalue(ha, ba, type, e, k), container_elem_lvalue(hb, bb, type, e, k), e.elem_type);
+      container_elem_lvalue(ha, ba, type, e, k), container_elem_lvalue(hb, bb, type, e, k), e.elem_type, mode);
     const Plane acc = lower_logical(Inst::Tag::Land, bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may)), true,
-                                    e_eq, agg_eq_four(e.elem_type));
+                                    e_eq, agg_eq_four(e.elem_type, mode));
     b_.CreateStore(b_.CreateTrunc(must_of(acc, true), i1), must);
     b_.CreateStore(b_.CreateTrunc(may_of(acc, true), i1), may);
     b_.CreateStore(b_.CreateAdd(k, b_.getInt64(1)), idx);

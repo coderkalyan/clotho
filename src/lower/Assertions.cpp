@@ -559,7 +559,7 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
         // A fork inside a named block parks its parent at the join, but its children are
         // activations of the block too (build_fork_child) and end with it, so the join
         // is released by them: not a park the abort cannot claim.
-        if (hard_park(*body, /*forked_children_are_occupants=*/true)) {
+        if (hard_park(*body)) {
             disable_hard_.insert(sym);
         }
     }
@@ -589,7 +589,9 @@ void Lowerer::register_disable_target(const Symbol* t, bool remote) {
     if (is_task) {
         // A task target is always "remote" in the sense that matters: it ends
         // every activation, never just the one running. Its parks are checked
-        // against the task's own body.
+        // against the task's own body. A fork directly in it parks the activation at
+        // the join, but its children are activations of the target too
+        // (build_fork_child) and end with it, releasing the join.
         const auto& sub = t->as<SubroutineSymbol>();
         disable_remote_.insert(t);
         if (hard_park(sub.getBody())) {
@@ -715,25 +717,21 @@ bool Lowerer::design_virtual_parks(slang::ast::Compilation& comp) {
 }
 
 // Whether a block's body can park in a way an abort cannot yet neutralize, which
-// is what decides whether the REMOTE form may name it. A `#delay` and an
+// is what decides whether the REMOTE form may name it. A `#delay`, a `#0` and an
 // `@event` wait are fine: a `disable` claims the delay's park record, so the
-// timer that fires later wakes nobody, and the wait compacts itself out of its
-// buckets on resume. The rest are not, each for its own reason -- a `#0` parks
-// in the inactive batch, which has no per-entry claim; a TIME-CONSUMING task call
-// or a fork parks the process behind ANOTHER activation's completion, which
-// would resume it
-// a second time; an `expect` parks on a reactive verdict. Refused rather than
-// silently double-woken.
-bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupants) {
+// timer that fires later wakes nobody, the wait compacts itself out of its
+// buckets on resume, and a `#0`'s batch entry is the one wake it will get. The
+// rest are not, each for its own reason -- a TIME-CONSUMING task call parks the
+// process behind ANOTHER activation's completion, which would resume it a second
+// time, and so does a fork in a callee; an `expect` parks on a reactive verdict. A
+// fork in the body itself is not a park of this kind: it parks the process only
+// behind children that are activations of the target, which release the join.
+// Refused rather than silently double-woken.
+bool Lowerer::hard_park(const Statement& body) {
     struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
         Lowerer* self         = nullptr;
         bool     found        = false;
-        bool     fork_is_hard = true;
 
-        void handle(const BlockStatement& s) {
-            found = found || (fork_is_hard && s.blockKind != StatementBlockKind::Sequential);
-            visitDefault(s);
-        }
         void handle(const slang::ast::ConcurrentAssertionStatement& s) {
             // Only `expect` parks the executing process; the other concurrent
             // forms are their own monitor process.
@@ -760,8 +758,7 @@ bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupant
         }
     };
     Park p;
-    p.self         = this;
-    p.fork_is_hard = !forked_children_are_occupants;
+    p.self = this;
     body.visit(p);
 
     return p.found;

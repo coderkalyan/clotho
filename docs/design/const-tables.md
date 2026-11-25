@@ -250,14 +250,16 @@ out-of-range / whole-array copy / `foreach` / by-value actual / constant-index
 fold; per-instance overrides and a package table; a class parameter table;
 unpacked-struct tables including a nested member array and 4-state members;
 string / queue / dynamic-array / associative-array tables (short and heap
-strings, `default:`, string and integer keys, a struct with a string member);
-scalar string and `null` parameters; a VCD-exclusion check; and the two
-rejections. Sanitizer run (`-DCLOTHO_SANITIZE=ON`) on the heap-backed shapes
+strings, `default:`, string and integer keys, a struct with a string member); a
+wildcard-index table keyed by value across literal widths; scalar string and
+`null` parameters; a VCD-exclusion check; and the aggregate-element
+rejection. Sanitizer run (`-DCLOTHO_SANITIZE=ON`) on the heap-backed shapes
 reports nothing the equivalent `const` variable design does not.
 
-**Still out of scope.** An associative array with a wildcard index (`int A[*]`) —
-no declared key type to intern the key constant against, while the runtime keys
-on the byte span. A queue / associative array whose element is itself an
+**Still out of scope.** A wildcard-index associative array (`int A[*]`) whose
+key constant is wider than 64 bits — the same limit runtime wildcard keys have
+(keys up to 64 bits are interned at their own width and normalized like a
+runtime key). A queue / associative array whose element is itself an
 aggregate or container — one entry op carries a value, not an lvalue to build
 into. Whole-array copy, by-value pass and NBA of a *string* array, which fail the
 same way for variables (`docs/TODO.md` "Unpacked arrays of `string`"). A whole

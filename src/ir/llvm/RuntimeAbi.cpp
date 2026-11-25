@@ -47,7 +47,8 @@ llvm::FunctionCallee Backend::strobe_pop_fn() {
 // -- $monitor (LRM 21.2.2) --
 
 // rt_monitor_emit(i32 desc, ptr fmt, i32 argc, ptr argv) — like rt_fwrite but
-// prints only when the rendered output differs from the last (LRM 21.2.2).
+// prints only when an argument value other than a $time one changed since the
+// last emit (LRM 21.2.2).
 llvm::FunctionCallee Backend::monitor_emit_fn() {
     auto* i32 = b_.getInt32Ty();
     return rt_fn("rt_monitor_emit", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
@@ -808,15 +809,6 @@ llvm::FunctionCallee Backend::tagged_fmt_p_fn() {
     return rt_fn("rt_tagged_format_p", b_.getVoidTy(),
                  { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty(), raw_ptr_ty(),
                    raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// i8 rt_container_eq(const void* a, const void* b, i32 is_queue, i32 kind, i32 width,
-//   i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
-llvm::FunctionCallee Backend::container_eq_fn() {
-    return rt_fn("rt_container_eq", b_.getInt8Ty(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                   b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                   b_.getInt64Ty() });
 }
 
 // -- Associative-array key scratch buffer (docs/design/assoc-keys.md P1) --

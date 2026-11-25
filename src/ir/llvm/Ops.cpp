@@ -1508,15 +1508,19 @@ Plane Backend::lower_shift(Inst::Tag tag, Plane a, bool a_four, Plane amt, bool 
                   b_.CreateSelect(unknown, zero(w), z));
 }
 
-// Whether lower_agg_eq answers in the 4-state encoding for `type`. A leaf that can
-// be x or z does, and so does one the runtime compares (a string, a container, an
+// Whether lower_agg_eq answers in the 4-state encoding for `type` in `mode`. A
+// case compare is always a known 2-state bit. A logical one is 4-state where a leaf
+// can be x or z, and where the runtime compares (a string, a container, an
 // associative array), which hands back a 4-state bit; every other leaf answers
 // 2-state. An aggregate's answer is 4-state when any member's is.
-bool Backend::agg_eq_four(Ref type) {
+bool Backend::agg_eq_four(Ref type, AggEqMode mode) {
+    if (mode == AggEqMode::Case) {
+        return false;
+    }
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         for (const auto& f : mod_.pool.struct_fields(t.fields_id)) {
-            if (agg_eq_four(f.type)) {
+            if (agg_eq_four(f.type, mode)) {
                 return true;
             }
         }
@@ -1524,7 +1528,7 @@ bool Backend::agg_eq_four(Ref type) {
     }
     switch (t.kind) {
         case Type::Kind::UnpackedArray:
-            return agg_eq_four(t.element);
+            return agg_eq_four(t.element, mode);
         case Type::Kind::String:
         case Type::Kind::Queue:
         case Type::Kind::DynArray:
@@ -1535,12 +1539,17 @@ bool Backend::agg_eq_four(Ref type) {
     }
 }
 
-// Whole-aggregate `==` (LRM 11.2.2): recursively AND-reduce per-leaf
-// logical equality over the member walk. Any definite member mismatch is
+// Whole-aggregate equality (LRM 11.2.2): recursively AND-reduce per-leaf
+// equality over the member walk. Any definite member mismatch is
 // 0, else X if any member is unknown, else 1 — the Land reduction carries
-// LRM 11.4.5 X-propagation exactly (docs/LRM_NOTES.md, note 13). The answer is in
-// the domain agg_eq_four(type) says.
-Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type) {
+// LRM 11.4.5 X-propagation exactly (docs/LRM_NOTES.md, note 13). In Case mode every
+// leaf compares x/z as values and answers a known bit. The answer is in
+// the domain agg_eq_four(type, mode) says (docs/design/aggregate-equality.md).
+Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type, AggEqMode mode) {
+    const bool  cased = mode == AggEqMode::Case;
+    // A case compare's leaf answer as a known 2-state bit, whatever encoding the leaf
+    // comparator handed back.
+    const auto known = [&](Plane p, bool four) { return cased ? two_val(four ? must_of(p, true) : p.mm) : p; };
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
         const auto fields = mod_.pool.struct_fields(t.fields_id);
@@ -1548,8 +1557,8 @@ Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type) {
         bool       acc_four = false;
         for (uint32_t k = 0; k < fields.size(); ++k) {
             const Plane e = lower_agg_eq(agg_member(lhs, type, k), agg_member(rhs, type, k),
-                                         fields[k].type);
-            const bool  e_four = agg_eq_four(fields[k].type);
+                                         fields[k].type, mode);
+            const bool  e_four = agg_eq_four(fields[k].type, mode);
             acc      = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, acc_four, e, e_four);
             acc_four = acc_four || e_four;
         }
@@ -1560,10 +1569,10 @@ Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type) {
         // same reduction as the struct case). Position order is irrelevant to
         // the reduction, so walk 0..count-1.
         const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
-        const bool     four  = agg_eq_four(t.element);
+        const bool     four  = agg_eq_four(t.element, mode);
         Plane          acc{};
         for (uint32_t k = 0; k < count; ++k) {
-            const Plane e = lower_agg_eq(agg_elem(lhs, type, k), agg_elem(rhs, type, k), t.element);
+            const Plane e = lower_agg_eq(agg_elem(lhs, type, k), agg_elem(rhs, type, k), t.element, mode);
             acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, four, e, four);
         }
         return acc;
@@ -1572,72 +1581,18 @@ Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type) {
         llvm::Value* c = b_.CreateCall(
           str_cmp_fn(), { lv_string_ptr(lhs, StringUse::Read), lv_string_ptr(rhs, StringUse::Read) });
         llvm::Value* bit = b_.CreateICmpEQ(c, b_.getInt32(0));
-        return bit_plane(bit, bit);
+        return known(bit_plane(bit, bit), true);
     }
     if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
-        const DynElem e = dynarr_elem(type);
-        if (e.is_agg || e.is_handle || e.width > 64) {
-            // The runtime comparator reads one element word from a flat
-            // descriptor, which an aggregate / nested-container element does not
-            // have and a wider-than-a-word element does not fit, so the walk
-            // happens here: sizes must match, then each element pair compares with
-            // this same recursion (which is also what makes a queue of queues
-            // work).
-            return emit_container_eq_loop(lhs, rhs, type, e);
-        }
-        // A queue / dynamic-array leaf of scalar elements compares element-wise
-        // at runtime with §11.4.5 x-propagation; the runtime tristate (0 unequal,
-        // 1 equal, 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0,
-        // must = ts == 1, so 2 -> must=0/may=1 = x).
-        const ContainerFmt cf = container_fmt(type);
-        llvm::Value*       ts   = b_.CreateCall(container_eq_fn(),
-                                                { lv_handle_ptr(lhs, HandleUse::Read),
-                                                  lv_handle_ptr(rhs, HandleUse::Read),
-                                                  b_.getInt32(cf.is_queue),
-                                                  b_.getInt32(cf.kind),
-                                                  b_.getInt32(cf.width),
-                                                  b_.getInt32(cf.is_signed),
-                                                  b_.getInt32(cf.four),
-                                                  b_.getInt32(cf.has_z),
-                                                  b_.getInt32(cf.z_off),
-                                                  b_.getInt64(cf.stride) });
-        llvm::Value* may  = b_.CreateICmpNE(ts, b_.getInt8(0));
-        llvm::Value* must = b_.CreateICmpEQ(ts, b_.getInt8(1));
-        return bit_plane(must, may);
+        // Sizes, then each element pair through this same recursion; the one path
+        // for every element shape (a flat runtime comparator was no faster, so it
+        // is gone).
+        return known(emit_container_eq_loop(lhs, rhs, type, dynarr_elem(type), mode), true);
     }
     if (t.kind == Type::Kind::Assoc) {
-        // LRM 11.4.5 / 7.9 (P4a): equal iff the same set of (key, value)
-        // pairs. Reuses the P3 assoc-key-leaf canonical serializer (count ||
-        // sorted (key, value) pairs) on each whole operand -- the same
-        // property that makes that encoding "canonical" (two equal-content
-        // maps produce identical bytes) is exactly what a byte compare here
-        // needs. Bit-exact, so this answers === directly; the frontend
-        // refuses plain == for a 4-state-capable value element, where the
-        // X-propagating answer can differ from a flat byte compare.
-        //
-        // Both spans build into the SAME rt_keybuf_* region back to back, so
-        // only the FINAL span (after both are written) is read -- an
-        // intervening rt_keybuf_append can reallocate the buffer, which
-        // would dangle a pointer captured mid-build; the byte offsets
-        // (`mark0`/`mid`/`end`, plain u32s) stay valid regardless.
-        llvm::Value* mark0     = b_.CreateCall(keybuf_begin_fn(), {});
-        llvm::Value* xz_slot   = entry_alloca(b_.getInt1Ty(), "aeq.anyx");
-        b_.CreateStore(b_.getInt1(false), xz_slot);
-        emit_variable_agg_key_bytes(type, lhs, xz_slot, /*is_signed=*/false);
-        llvm::Value* mid = b_.CreateCall(keybuf_begin_fn(), {});
-        emit_variable_agg_key_bytes(type, rhs, xz_slot, /*is_signed=*/false);
-        llvm::Value* end = b_.CreateCall(keybuf_begin_fn(), {});
-        llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "aeq.ptr");
-        llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "aeq.len");
-        b_.CreateCall(keybuf_span_fn(), { mark0, ptr_slot, len_slot });
-        llvm::Value* aptr = b_.CreateLoad(raw_ptr_ty(), ptr_slot);
-        llvm::Value* alen = b_.CreateSub(mid, mark0);
-        llvm::Value* blen = b_.CreateSub(end, mid);
-        llvm::Value* bptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), aptr, alen);
-        llvm::Value* eqb  = b_.CreateCall(key_span_eq_fn(), { aptr, alen, bptr, blen });
-        b_.CreateCall(keybuf_end_fn(), { mark0 });
-        llvm::Value* bit = b_.CreateICmpNE(eqb, b_.getInt8(0));
-        return bit_plane(bit, bit);
+        // Equal iff the same (key, value) set: keys exact, values by this same
+        // recursion (docs/design/aggregate-equality.md).
+        return known(emit_assoc_eq_loop(lhs, rhs, type, mode), true);
     }
     const ValueType vt = value_type_of(mod_.pool, type);
     // A leaf reached through a deferred associative-array element (`a[k] == x`
@@ -1654,10 +1609,14 @@ Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type) {
         // carry no x/z, so FEq's definite 1-bit result needs none of
         // lower_compare's unknown-plane machinery; this is the same helper the
         // scalar `==` reaches through Inst::Tag::FEq.
-        return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
-                                  real_plane(planes_to_real(pb, vt.width)));
+        return known(lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
+                                        real_plane(planes_to_real(pb, vt.width))),
+                     false);
     }
     // Each leaf was read from its own storage, the native slot of its type.
+    if (cased) {
+        return known(lower_case_compare(Inst::Tag::CaseEq, pa, pb, vt.four_state), vt.four_state);
+    }
     return lower_compare(Inst::Tag::Eq, pa, pb, vt.four_state);
 }
 

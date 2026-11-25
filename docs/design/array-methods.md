@@ -321,7 +321,7 @@ worked.
   `src/runtime/Containers.cpp`) — the bare form on a 4-state integral of width ≤ 64,
   which is where `time` lands. The 4-state slot is `{ i(2W) must|may, iW z }` with
   must in bits [0,W) and may in [W,2W), so `must ^ may` is the unknown mask and
-  `must` is the value — the same decode `rt_container_eq` already does, and the z
+  `must` is the value — the same decode the runtime element renderers do, and the z
   plane is never read (Z is encoded as X in must/may, and the ordering does not
   distinguish them anyway). **The 2-state fast path pays nothing**: the 4-state
   kinds are separate comparator kinds (`sort_unsigned4` / `sort_signed4`) driven by
