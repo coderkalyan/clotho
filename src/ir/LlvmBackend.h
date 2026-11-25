@@ -84,6 +84,14 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
 // (optimize_module then re-verify).
 bool optimize_module(llvm::Module& m, bool o3);
 
+// Configure LLVM's machine-code pipeline for the tier about to generate code:
+// under `o3`, LLVM's defaults for an Aggressive target machine; otherwise -O0
+// code generation with the greedy register allocator and the coalescer. Process
+// global (LLVM options), so call it before each compilation that generates code
+// and never while another one is generating code. Returns false, with the reason
+// on errs(), if this LLVM lacks one of the options.
+bool select_codegen_tier(bool o3);
+
 // A module and the LLVMContext it lives in. The context is declared first, so it
 // is destroyed after the module.
 struct OwnedModule {

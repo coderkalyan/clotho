@@ -1,8 +1,8 @@
 # Tier-Up Profiling and Code Swap (design sketch)
 
 Captured from a design discussion 2026-07-06; revisit before implementing.
-Context: tier 0 (fast pipeline + FastISel) landed; a `default<O3>` tier is
-planned; no interpreter/baseline tier exists yet.
+Context: tier 0 (fast pipeline, FastISel and the greedy register allocator)
+landed; a `default<O3>` tier is planned; no interpreter/baseline tier exists yet.
 
 ---
 
