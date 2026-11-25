@@ -328,6 +328,20 @@ there. A young collection checks only the objects numbered since the last
 collection, because every other numbered object is old; a full one reads the
 table.
 
+What the table costs is one hash probe wherever a handle and its number are
+converted. Measured in the shipped configuration (Release, extra assertions off;
+user-mode instructions, the least of three runs; `int by_obj[C]` with 256 or 4096
+keys), against the same tree with the address in the key:
+
+| operation | before | after | |
+|---|---|---|---|
+| `by_obj[h]` lookup | 334 | 378 | +44 per lookup (+13%) |
+| one `foreach (by_obj[k])` step, reading `k.x` | 784 | 901 | +117 per step (+15%) |
+| the collector visiting one handle key | | | +54 per key |
+
+A lookup converts once; a traversal step converts the current key to bytes and the
+next key back. The numbers are per operation of a loop that does nothing else.
+
 The vptr must *not* be overwritten by forwarding, because object size is derived
 from the type and is needed while sweeping. That is precisely why the GC word
 exists as a separate word rather than as stolen vptr bits, and it is a second
