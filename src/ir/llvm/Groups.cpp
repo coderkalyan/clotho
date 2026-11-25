@@ -953,7 +953,7 @@ llvm::Function* Backend::emit_unit_entry(llvm::Function* row, uint32_t g0) {
     Anchor&        a   = anchors_[ua];
     auto*          ptr = llvm::PointerType::getUnqual(ctx_);
     auto*          fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
-    env_   = &unit_env(a);
+    env_   = home_env(ua);
     fn_    = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, row->getName() + ".entry", env_->llmod);
     wheel_ = fn_->getArg(1);
     wheel_->setName("wheel");

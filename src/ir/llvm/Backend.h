@@ -1279,6 +1279,11 @@ struct BackendError {
 // unit and swaps the active one between emission passes.
 struct ModuleEnv {
     llvm::Module& llmod;
+    // Whether this is root's: the module that defines every design-wide global, so
+    // a use of one is local and a fact fixed at emission (the ring's mask) is an
+    // immediate. A scratch env of the verification is root's when the env it
+    // stands in for is.
+    bool is_root = false;
     // Defining GlobalValue -> this module's declaration of it. Identity
     // mappings are not stored (sym returns the definition directly).
     ankerl::unordered_dense::map<llvm::GlobalValue*, llvm::GlobalValue*> decls;
@@ -1324,7 +1329,9 @@ public:
       , env_(root_env_.get())
       , b_(ctx)
       , config_(config)
-      , resolve_(resolve) {}
+      , resolve_(resolve) {
+        root_env_->is_root = true;
+    }
 
     std::vector<std::unique_ptr<llvm::Module>> take_unit_modules();
 
@@ -1382,6 +1389,16 @@ private:
     void assign_id_fields();
 
     ModuleEnv& unit_env(const Anchor& a);
+
+    // The module the code of anchor `a` is emitted into: its unit's when emission
+    // is split, root's when it is not or when `a` is no instance. Every site that
+    // decides where an instance's group, subroutine or entry goes asks here, so
+    // what calls a row and the row agree on the module.
+    ModuleEnv* home_env(uint32_t a);
+
+    // A scratch env over `scratch` for the verification, standing in for `real`:
+    // code lowered into it is the code `real` would get (see ModuleEnv::is_root).
+    ModuleEnv& scratch_env(llvm::Module& scratch, const ModuleEnv& real);
 
     // Makes root the active module for its scope: what is created for every unit
     // to share (a singleton global, a trampoline) is defined in root whichever
