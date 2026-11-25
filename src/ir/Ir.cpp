@@ -297,6 +297,19 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[2]      = info.count;
                 return { scratch.data(), 3 };
             }
+            // store_nb_gated exposes its lvalue, the sampled value, and the
+            // target's state-signal lvalues (assign_site only when present).
+            if (tag == Inst::Tag::StoreNbGated) {
+                const auto info = extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.value;
+                scratch[2]      = info.force_site;
+                if (info.assign_site == kNoIndex) {
+                    return { scratch.data(), 3 };
+                }
+                scratch[3] = info.assign_site;
+                return { scratch.data(), 4 };
+            }
             if (tag == Inst::Tag::AggCopy) {
                 // Both the destination (op) and source lvalues are referenced.
                 const auto info = extra_data<AggCopyInfo>(p.op_extra.extra);
@@ -771,6 +784,7 @@ Ir Ir::rebased(HandleMapper& m) const {
             case T::Severity:
             case T::StoreNbDelay:
             case T::StoreInertialDelay:
+            case T::StoreNbGated:
             case T::Select:
             case T::SelectLazy:
             case T::PartSelect:

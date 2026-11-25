@@ -457,6 +457,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::StoreNbDelay:
         case Inst::Tag::StoreInertialDelay:
         case Inst::Tag::StoreNbEvent:
+        case Inst::Tag::StoreNbGated:
         case Inst::Tag::AggCopy:
         case Inst::Tag::Cond:
         case Inst::Tag::Switch:

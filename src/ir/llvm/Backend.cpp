@@ -388,6 +388,21 @@ std::vector<Backend::BlockCommit> Backend::shared_blocks(const SharedGroup& rep,
 
 std::vector<Backend::BlockCommit> Backend::shared_blocks_of(uint32_t rep_anchor, uint32_t block_lo, uint32_t block_hi,
                                                             uint32_t anchor) const {
+    // A signal of the representative's own instance maps to the same def-local
+    // field of `anchor`'s; one of another instance to what `anchor`'s binding at
+    // the same position names.
+    const auto map = [&](Signal sig) {
+        const SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+        if (s.anchor == rep_anchor) {
+            return anchor_signals_[anchor][s.path.back()];
+        }
+        if (s.anchor != SignalSlot::no_anchor) {
+            const auto at = anchors_[rep_anchor].bind_of.find(static_cast<uint32_t>(sig));
+            assert(at != anchors_[rep_anchor].bind_of.end() && "a signal of another instance is staged through a binding");
+            return anchors_[anchor].externs[at->second];
+        }
+        return sig;
+    };
     std::vector<BlockCommit> blocks;
     blocks.reserve(block_hi - block_lo);
     for (uint32_t b = block_lo; b < block_hi; ++b) {
@@ -396,16 +411,14 @@ std::vector<Backend::BlockCommit> Backend::shared_blocks_of(uint32_t rep_anchor,
         bc.fn     = block_commits_[b].fn;
         bc.anchor = anchor;
         for (const BlockSig& bs : block_commits_[b].sigs) {
-            const SignalSlot& s      = slots_[static_cast<uint32_t>(bs.sig)];
-            Signal            mapped = bs.sig;
-            if (s.anchor == rep_anchor) {
-                mapped = anchor_signals_[anchor][s.path.back()];
-            } else if (s.anchor != SignalSlot::no_anchor) {
-                const auto at = anchors_[rep_anchor].bind_of.find(static_cast<uint32_t>(bs.sig));
-                assert(at != anchors_[rep_anchor].bind_of.end() && "a signal of another instance is staged through a binding");
-                mapped = anchors_[anchor].externs[at->second];
+            NbaHold hold;
+            if (bs.hold.force != NbaHold::no_hold) {
+                hold.force = map(bs.hold.force);
             }
-            bc.sigs.push_back({ mapped, bs.mask, bs.dynamic });
+            if (bs.hold.assign != NbaHold::no_hold) {
+                hold.assign = map(bs.hold.assign);
+            }
+            bc.sigs.push_back({ map(bs.sig), bs.mask, bs.dynamic, hold });
         }
         blocks.push_back(std::move(bc));
     }

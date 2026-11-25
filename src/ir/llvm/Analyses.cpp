@@ -214,11 +214,12 @@ void Backend::collect_vif_nba() {
             // path so the two agree on where the member lives.
             const bool deferred =
               ir.tag(idx) == Inst::Tag::StoreNbDelay || ir.tag(idx) == Inst::Tag::StoreNbEvent;
-            if (ir.tag(idx) != Inst::Tag::StoreNb && !deferred) {
+            const bool gated = ir.tag(idx) == Inst::Tag::StoreNbGated;
+            if (ir.tag(idx) != Inst::Tag::StoreNb && !deferred && !gated) {
                 continue;
             }
             const LvalueRoot r =
-              lvalue_root(ir, deferred ? ir.payload(idx).op_extra.op : ir.payload(idx).binary.l);
+              lvalue_root(ir, deferred || gated ? ir.payload(idx).op_extra.op : ir.payload(idx).binary.l);
             if (ir.tag(r.root) == Inst::Tag::IfaceSignal) {
                 vif_nba_[static_cast<uint32_t>(
                   ir.extra_data<IfaceMember>(ir.payload(r.root).op_extra.extra).signal)] = true;
@@ -756,6 +757,7 @@ void Backend::reject_resume_once(const Ir& ir, std::string_view region, std::str
                 throw BackendError{ "a timing control in a " + std::string(region) + "-region process (" +
                                     std::string(what) + ") is not supported" };
             case Inst::Tag::StoreNb:
+            case Inst::Tag::StoreNbGated:
             case Inst::Tag::StoreNbDelay:
             case Inst::Tag::StoreNbEvent:
             case Inst::Tag::StoreInertialDelay:

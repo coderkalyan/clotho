@@ -443,7 +443,7 @@ std::string Backend::shared_code_differs(uint32_t g, SharedGroup& rep, const Own
         return x.sigs.size() == y.sigs.size() &&
                std::equal(x.sigs.begin(), x.sigs.end(), y.sigs.begin(), [](const BlockSig& p, const BlockSig& q) {
                    return p.sig == q.sig && p.dynamic == q.dynamic && p.mask.getBitWidth() == q.mask.getBitWidth() &&
-                          p.mask == q.mask;
+                          p.mask == q.mask && p.hold == q.hold;
                });
     };
     if (shared.size() != own.blocks.size()) {
@@ -572,7 +572,7 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
         return x.sigs.size() == y.sigs.size() &&
                std::equal(x.sigs.begin(), x.sigs.end(), y.sigs.begin(), [](const BlockSig& p, const BlockSig& q) {
                    return p.sig == q.sig && p.dynamic == q.dynamic && p.mask.getBitWidth() == q.mask.getBitWidth() &&
-                          p.mask == q.mask;
+                          p.mask == q.mask && p.hold == q.hold;
                });
     };
     if (shared_bl.size() != own_blocks.size() ||

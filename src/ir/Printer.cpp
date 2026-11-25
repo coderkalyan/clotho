@@ -253,6 +253,8 @@ const char* tag_name(Inst::Tag tag) {
             return "store_inertial_delay";
         case T::StoreNbEvent:
             return "store_nb_event";
+        case T::StoreNbGated:
+            return "store_nb_gated";
         case T::Add:
             return "add";
         case T::Sub:
@@ -1017,6 +1019,20 @@ private:
                 ref(p.op_extra.op);
                 os_ << " = ";
                 ref(info.src);
+                os_ << ")\n";
+                break;
+            }
+            case Inst::Tag::StoreNbGated: {
+                const StoreNbGatedInfo info = ir_.extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", ";
+                ref(info.value);
+                os_ << ", unless ";
+                ref(info.force_site);
+                if (info.assign_site != kNoIndex) {
+                    os_ << ", ";
+                    ref(info.assign_site);
+                }
                 os_ << ")\n";
                 break;
             }

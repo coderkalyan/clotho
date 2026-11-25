@@ -601,6 +601,7 @@ void Backend::analyze_event_monomorphism() {
                 case Inst::Tag::StoreNbDelay:
                 case Inst::Tag::StoreInertialDelay:
                 case Inst::Tag::StoreNbEvent:
+                case Inst::Tag::StoreNbGated:
                     lv = ir.payload(idx).op_extra.op;
                     break;
                 default:

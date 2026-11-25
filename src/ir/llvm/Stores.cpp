@@ -4,6 +4,16 @@
 
 namespace clotho::ir::backend {
 
+namespace {
+
+// The lvalue of a StoreNb or StoreNbGated, the two nonblocking stores that commit
+// in the current instant's NBA region.
+Index plain_nba_lvalue(const Ir& ir, Index store) {
+    return ir.tag(store) == Inst::Tag::StoreNb ? ir.payload(store).binary.l : ir.payload(store).op_extra.op;
+}
+
+} // namespace
+
 Backend::NbaTarget Backend::nba_target(const Ir& ir, Index lv) const {
     const LvalueRoot r = lvalue_root(ir, lv);
     // A member reached through a virtual interface stages through the
@@ -182,10 +192,10 @@ void Backend::classify_ordered_plain(const Ir& ir) {
     }
     for (size_t k = 0; k < ir.inst_count(); ++k) {
         const auto idx = static_cast<Index>(k);
-        if (ir.tag(idx) != Inst::Tag::StoreNb) {
+        if (ir.tag(idx) != Inst::Tag::StoreNb && ir.tag(idx) != Inst::Tag::StoreNbGated) {
             continue;
         }
-        const Index     lv_idx = ir.payload(idx).binary.l;
+        const Index     lv_idx = plain_nba_lvalue(ir, idx);
         const NbaTarget t      = nba_target(ir, lv_idx);
         // A string place stages an owned handle, which the record does not hold; its
         // writes take the string path and are not copied.
@@ -302,10 +312,10 @@ void Backend::nba_classify_ir(const Ir& ir) {
             }
             continue;
         }
-        if (ir.tag(idx) != Inst::Tag::StoreNb) {
+        if (ir.tag(idx) != Inst::Tag::StoreNb && ir.tag(idx) != Inst::Tag::StoreNbGated) {
             continue;
         }
-        const Index     lv_idx = ir.payload(idx).binary.l;
+        const Index     lv_idx = plain_nba_lvalue(ir, idx);
         const NbaTarget t      = nba_target(ir, lv_idx);
         // An NBA to any string PLACE — a whole string signal, a string member of
         // an unpacked struct, a string element of a fixed array — takes its own
@@ -563,8 +573,13 @@ void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) 
     std::vector<BlockSig>& sigs = block_commits_[cur_block_id_].sigs;
     auto it = std::find_if(sigs.begin(), sigs.end(), [&](const BlockSig& b) { return b.sig == sig; });
     if (it == sigs.end()) {
-        sigs.push_back({ sig, mask, dynamic });
+        sigs.push_back({ sig, mask, dynamic, nba_hold_ });
     } else {
+        // Every write rooted at a forceable variable is gated in the frontend
+        // (store_or_gate), so the block's writes to one signal agree on the hold.
+        if (it->hold != nba_hold_) {
+            throw BackendError{ "internal: gated and ungated nonblocking writes to one signal in one block" };
+        }
         it->dynamic = it->dynamic || dynamic;
         if (!dynamic) {
             it->mask |= mask; // accumulate this block's static writes to the signal
@@ -682,8 +697,26 @@ void Backend::emit_block_commit_body(uint32_t id) {
         // finds its storage in the binding and its shadow, wake buckets, ids and
         // dump-var index in the signal's port, as the store that staged it did.
         if (s.nba_agg) {
+            assert(bs.hold.force == NbaHold::no_hold && "a force target is never an unpacked aggregate");
             emit_agg_commit(bs.sig, bs.mask);
             continue;
+        }
+        // A force or procedural `assign` active now overrides the update (LRM
+        // 10.6.2 decides when the update happens, not when the NBA executed): skip
+        // the merge and the wake, and only clear the dirty mask for the next instant.
+        llvm::BasicBlock* after_hold = nullptr;
+        if (bs.hold.force != NbaHold::no_hold) {
+            auto* fn     = b_.GetInsertBlock()->getParent();
+            auto* commit = llvm::BasicBlock::Create(ctx_, "nba.free", fn);
+            auto* held   = llvm::BasicBlock::Create(ctx_, "nba.held", fn);
+            after_hold   = llvm::BasicBlock::Create(ctx_, "nba.next", fn);
+            b_.CreateCondBr(nba_hold_active(bs.hold), held, commit);
+            b_.SetInsertPoint(held);
+            if (bs.dynamic) {
+                b_.CreateStore(zero(s.width), shadow_ptr(s, s.sh_mask_field));
+            }
+            b_.CreateBr(after_hold);
+            b_.SetInsertPoint(commit);
         }
         const uint32_t    W       = s.width;
         auto*             mmty     = int_ty(s.four_state ? 2 * W : W);
@@ -739,7 +772,30 @@ void Backend::emit_block_commit_body(uint32_t id) {
         // unconditional, so a no-change commit over-touches; the flush diff
         // suppresses it.
         vcd_touch_signal(bs.sig);
+        if (after_hold != nullptr) {
+            b_.CreateBr(after_hold);
+            b_.SetInsertPoint(after_hold);
+        }
     }
+}
+
+// Whether a force or procedural `assign` holds a gated NBA target now: either
+// state signal nonzero, read from wherever the writer's code reaches it (its own
+// record, or a binding when the state lives in another instance).
+llvm::Value* Backend::nba_hold_active(const NbaHold& hold) {
+    const auto nonzero = [&](Signal sig) {
+        const SignalSlot& g = slot_of(sig);
+        if (g.four_state) {
+            throw BackendError{ "internal: a force or assign state signal is 4-state" };
+        }
+        llvm::Value* v = b_.CreateLoad(int_ty(g.width), b_.CreateStructGEP(g.slot_ty, storage_ptr(g), 0));
+        return b_.CreateICmpNE(v, zero(g.width));
+    };
+    llvm::Value* active = nonzero(hold.force);
+    if (hold.assign != NbaHold::no_hold) {
+        active = b_.CreateOr(active, nonzero(hold.assign));
+    }
+    return active;
 }
 
 // Pointer to an aggregate leaf's mm (0) / z (1) field, via the leaf's static

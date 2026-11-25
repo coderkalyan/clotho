@@ -163,6 +163,12 @@ Index Builder::store_nb_event(Index lvalue, Index value, Index count, ExtraSlice
     return emit({ Inst::Tag::StoreNbEvent, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }
 
+Index Builder::store_nb_gated(Index lvalue, Index value, Index force_site, Index assign_site, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StoreNbGatedInfo{ value, force_site, assign_site });
+
+    return emit({ Inst::Tag::StoreNbGated, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
+}
+
 Index Builder::zext(Index op, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::ZExt, Inst::Payload{ .op_type = { op, type } } }, loc);
 }

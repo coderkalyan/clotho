@@ -260,6 +260,20 @@ struct StoreNbEventInfo {
     ExtraSlice trigs;
 };
 
+// Extra payload for `store_nb_gated`: a nonblocking assignment to a variable a
+// procedural continuous assignment can own (LRM 10.6). The lvalue is the
+// enclosing op_extra `op`.
+struct StoreNbGatedInfo {
+    // Value staged now and committed in the NBA region.
+    Index value;
+    // The target's `force_site` state signal, as a bare Signal lvalue. The NBA
+    // region drops the update while it is nonzero.
+    Index force_site;
+    // The target's `assign_site` state signal, likewise, or kNoIndex when the
+    // variable is no `assign` target.
+    Index assign_site;
+};
+
 // Extra payload for `part_select`: a constant [msb:lsb] slice of the base.
 struct PartSelect {
     // Most-significant selected bit.
@@ -2539,6 +2553,13 @@ struct Inst {
         // Statement, zero-time: a coverpoint sample, `start`/`stop`,
         // `set_inst_name`.
         CoverCtl,
+        // Nonblocking assignment to a variable a `force` or procedural `assign`
+        // can own, lhs <= rhs (payload: op_extra -> StoreNbGatedInfo; op is the
+        // lvalue). Stages like StoreNb; the NBA region drops the update while the
+        // target's force or assign state is set, since LRM 10.6.2 decides the
+        // override when the update happens, not when the statement executes.
+        // Appended at the end for the reason CoverQuery gives.
+        StoreNbGated,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2929,6 +2950,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StoreNbDelay:
         case T::StoreInertialDelay:
         case T::StoreNbEvent:
+        case T::StoreNbGated:
         case T::Select:
         case T::SelectLazy:
         case T::PartSelect:
