@@ -1778,9 +1778,6 @@ void Lowerer::build_randops_body(const slang::ast::ClassType& clt, ir::Ref class
                     b.binary(ir::Inst::Tag::Band, b.binary(ir::Inst::Tag::Srl, cur, arg, l), one, l),
                     l);
         });
-        // A class with a rand block owns a generator; the others answer 0 to HasState
-        // below, which is what the call site tests before it reads or writes a word.
-        arm(kRandOpHasState, [&] { b.unary(ir::Inst::Tag::Ret, one, l); });
         for (uint32_t k = 0; k < 4; ++k) {
             // Declared-range index k of the state array, the coordinate the call
             // site's copy uses too, so a state read here and restored there lands in

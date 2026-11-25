@@ -257,6 +257,24 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
     void handle(const slang::ast::WaitStatement& w);
 };
 
+// The classes whose objects must own an RNG (LRM 18.14.2) though they declare no rand
+// property: the static receiver class of every `randomize`, `srandom`, `get_randstate`
+// and `set_randstate` call in the design. A base-typed handle may hold a derived
+// object, so a class owns one when any class in its base chain is marked. Every other
+// class keeps no generator and draws nothing at `new`. docs/LRM_NOTES.md note 59.
+struct RngClasses {
+    ankerl::unordered_dense::set<const ClassType*> marked;
+};
+
+struct RngReceiverScan : slang::ast::ASTVisitor<RngReceiverScan, VisitFlags::AllGood> {
+    RngClasses*                   out = nullptr;
+    std::vector<const ClassType*> in_class;
+
+    void handle(const slang::ast::CallExpression& call);
+
+    void handle(const ClassType& cls);
+};
+
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out);
 
 bool scope_has_own_real_delay(const Scope& scope);
@@ -1162,6 +1180,10 @@ public:
     // Point this Lowerer at the design-wide waited-on-property table (WaitPropScan).
     // Shared for the same reason ClassIds is, and consulted at exactly one place:
     // lower_class_type, laying out a class's change notifiers.
+    void set_rng_classes(const RngClasses* rc) {
+        rng_classes_ = rc;
+    }
+
     void set_waited_props(const WaitedProps* wp) {
         waited_props_ = wp;
     }
@@ -6068,6 +6090,7 @@ private:
     // Lowerer with no pre-pass -- which then lays out no notifier, so `@p` / `wait(p)`
     // fails loudly rather than parking on nothing.
     const WaitedProps* waited_props_ = nullptr;
+    const RngClasses*  rng_classes_  = nullptr;
     // (waited-on class property, ir::Edge) -> the object-body field index of its
     // hidden change-notifier event property (ir::ChangeNotify). Filled by
     // lower_class_type at the same time as class_prop_index_, and read by the wait
@@ -6104,10 +6127,8 @@ private:
     static constexpr uint64_t kRandOpModeOne   = 2;
     static constexpr uint64_t kRandOpModeQuery = 3;
     // The randstate pair (LRM 18.13.4, 18.13.5). The state is four 64-bit words and the
-    // call returns one i64, so it crosses a word at a time: HasState says whether the
-    // class owns an object RNG at all, StateGet + k returns word k of it, and StateSet + k
-    // stores `arg` into word k.
-    static constexpr uint64_t kRandOpHasState = 4;
+    // call returns one i64, so it crosses a word at a time: StateGet + k returns word k of
+    // it, and StateSet + k stores `arg` into word k.
     static constexpr uint64_t kRandOpStateGet = 8;
     static constexpr uint64_t kRandOpStateSet = 12;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ClassRand> class_rand_;

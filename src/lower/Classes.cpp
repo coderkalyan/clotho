@@ -282,7 +282,16 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
         rand.props.clear();
     }
     uint32_t block = idx;
-    if (!rand.props.empty()) {
+    // A class owns the generator when it has a rand property, or when something can call
+    // randomize / srandom / get_randstate / set_randstate on it or on a base of it (a
+    // base-typed handle may hold this class's object); see RngClasses.
+    bool owns_rng = !rand.props.empty();
+    if (rng_classes_ != nullptr) {
+        for (const slang::ast::ClassType* k : chain) {
+            owns_rng = owns_rng || rng_classes_->marked.contains(k);
+        }
+    }
+    if (owns_rng) {
         rand.present    = true;
         rand.rng_field  = block++;
         rand.mode_field = block++;

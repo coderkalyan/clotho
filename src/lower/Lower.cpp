@@ -871,6 +871,29 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     WaitPropScan wait_prop_scan;
     wait_prop_scan.out = &waited_props;
     root.visit(wait_prop_scan);
+    // Which classes own an RNG though they declare no rand property (LRM 18.14.2):
+    // the receivers of randomize / srandom / get_randstate / set_randstate. The
+    // class-side calls are found by walking every class body, which the AST visit
+    // alone does not reach for a generic class's specializations.
+    RngClasses      rng_classes;
+    RngReceiverScan rng_scan;
+    rng_scan.out = &rng_classes;
+    root.visit(rng_scan);
+    {
+        std::vector<const ClassType*> all_classes;
+        for (const PackageSymbol* pkg : comp.getPackages()) {
+            collect_class_types(*pkg, all_classes);
+        }
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            collect_class_types(*unit, all_classes);
+        }
+        for (const InstanceSymbol* top : root.topInstances) {
+            collect_class_types(top->body, all_classes);
+        }
+        for (const ClassType* cls : all_classes) {
+            cls->visit(rng_scan);
+        }
+    }
     UnitOwners unit_owners;
     ForeignCalls foreign_calls;
     // Every variable a force / procedural assign targets, before anything lowers:
@@ -888,6 +911,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_vif_defs(&vif_defs);
         globals.set_pca_targets(&pca_targets);
         globals.set_waited_props(&waited_props);
+        globals.set_rng_classes(&rng_classes);
         globals.set_unit_owners(&unit_owners);
         globals.set_foreign_calls(&foreign_calls);
         globals.lower_globals(comp, root);
@@ -904,6 +928,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_pca_targets(&pca_targets);
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
+            lw.set_rng_classes(&rng_classes);
             lw.set_unit_owners(&unit_owners);
             lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);

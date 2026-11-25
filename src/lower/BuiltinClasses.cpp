@@ -643,26 +643,6 @@ std::optional<ir::Index> Lowerer::lower_builtin_class_method(const CallExpressio
         const auto      op  = [&](uint64_t which) { return b.constant(module_.pool.put_int(u64, which), l); };
         const ir::Index zero = op(0);
 
-        // An object owns a generator only when its class has a rand property
-        // (docs/design/constrained-randomization.md section 5.1); for any other the
-        // state has nowhere to live, and inventing one would answer a different
-        // question than the LRM asks, so it is a run-time fatal rather than a value.
-        // The class is the object's own, not the handle's: a base-class handle may
-        // name a derived class that has one.
-        const ir::Index has = emit_randops_dispatch(*clt, self, op(kRandOpHasState), zero, b, l);
-        b.open_region();
-        {
-            const std::string banner = banner_at(call.sourceRange.start());
-            emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(call.sourceRange.start()),
-                        std::string(sub.name) + "() of an object whose class has no rand property is not supported", {},
-                        l);
-            b.finish(banner + "$fatal", 1, l);
-        }
-        const ir::ExtraSlice then_r = b.close_region();
-        b.open_region();
-        const ir::ExtraSlice else_r = b.close_region();
-        b.cond(b.binary(ir::Inst::Tag::Eq, has, zero, l), then_r, else_r, l, /*unlikely=*/true);
-
         const ir::Ref   state_ty = rng_state_type();
         const ir::Index state    = make_canonical_agg_temp(state_ty, b, l);
         const ir::Ref   idx_ty   = make_int_type(32, false);

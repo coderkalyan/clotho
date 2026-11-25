@@ -387,7 +387,7 @@ refused loud (§12).
 
 ### 9.1 Seeding
 
-At the `new` of a class that owns a rand block, and only there, `lower_new_class`
+At the `new` of a class that owns a rand block (a rand property, or a marked receiver, §16), and only there, `lower_new_class`
 emits two instructions before the property initializers run:
 
 ```
@@ -531,7 +531,6 @@ Each gets its own message and its own test, per `docs/design/process-class.md` �
 | `rand_mode` on a subelement of a rand property | `rand_mode is supported on a whole rand property only` | `lower_rand_mode_call` |
 | `std::randomize` of a class handle | `std::randomize of a class handle is not supported` | `lower_scope_randomize` |
 | randomizing a class whose layout is still in progress (a property-type cycle) | `randomization of a class that is still being laid out is not supported` | `rand_slot_of` |
-| `get_randstate` / `set_randstate` on an object whose class has no rand property | run-time fatal `get_randstate() of an object whose class has no rand property is not supported` | `lower_builtin_class_method`, after the `$randops` HasState query |
 | any other unimplemented `MethodFlags::BuiltIn` class method | `unsupported built-in class method '<name>'` | `lower_user_call` |
 
 Enumerating constraint blocks needs slang's own pattern, not `membersOfType`:
@@ -552,10 +551,9 @@ refuses any `BuiltIn` subroutine it does not explicitly implement, rather than
 lowering slang's empty body. New slang versions adding built-ins then fail loud
 instead of silently no-oping.
 
-`srandom` on a class with **no** rand property is a genuine no-op, not a refusal:
-such a class has no rand block, and nothing in the language can observe the RNG it
-would have seeded. `get_randstate` on it is a run-time fatal rather than inventing a state to
-print (§16).
+`srandom`, `get_randstate` and `set_randstate` on a class with **no** rand property
+work: such a class owns an RNG iff something can call one of those or `randomize` on
+it or on a base of it (`RngClasses`, §16).
 
 ---
 
@@ -639,7 +637,7 @@ UVM-scale class count makes it matter.
 
 - **P5 — the randstate codec.** (landed) `get_randstate` / `set_randstate` on an
   object: the four state words cross the `$randops` slot one at a time (ops
-  HasState, StateGet+k, StateSet+k) into a caller-side copy, which `ProcOp::StateFormat`
+  StateGet+k, StateSet+k) into a caller-side copy, which `ProcOp::StateFormat`
   / `StateParse` render and parse through the runtime entries `process::get_randstate`
   already uses, so both forms give the same 64 hex digits and reject a foreign string with
   a located fatal.
@@ -769,7 +767,8 @@ Each test comment names the LRM clause and, where §4 scored it, records
 - **The draw order is declaration order, one field rule per field**, and this is a
   contract, not an accident: it is what lets a later solver leave unconstrained fields
   bit-identical.
-- **`srandom` on a class with no rand property is a no-op**, since nothing can observe
-  the RNG it would seed; `get_randstate` on such a class is a run-time fatal rather than
-  fabricating a state string. The LRM assumes every object has an RNG and says nothing
-  about observing one that cannot be reached.
+- **An object owns an RNG iff its class can receive `randomize`, `srandom`,
+  `get_randstate` or `set_randstate`**, rand property or not: a compile-time scan marks the
+  static receiver class of every such call and a class owns one when any class in its base
+  chain is marked. Unmarked classes keep no RNG and draw nothing at `new`
+  (docs/LRM_NOTES.md note 59).
