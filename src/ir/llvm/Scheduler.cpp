@@ -117,7 +117,7 @@ void Backend::build_enqueue_trampoline() {
     if (!park_claim_wanted()) {
         llvm::Value* hp  = tb.CreateStructGEP(awaiter_ty(), enqueue_fn_->getArg(0), 2);
         llvm::Value* hdl = tb.CreateLoad(ptr, hp);
-        emit_wake_push(tb, hdl);
+        emit_wake_push(tb, hdl, { .kind = RT_TRACE_TIMER });
         tb.CreateRetVoid();
         return;
     }
@@ -140,7 +140,7 @@ void Backend::build_enqueue_trampoline() {
     // its scheduled flag instead of at a record that is about to be freed.
     tb.CreateStore(llvm::ConstantPointerNull::get(ptr),
                    tb.CreateLoad(ptr, tb.CreateStructGEP(aw, rec, 3)));
-    emit_wake_push(tb, tb.CreateLoad(ptr, tb.CreateStructGEP(aw, rec, 2)));
+    emit_wake_push(tb, tb.CreateLoad(ptr, tb.CreateStructGEP(aw, rec, 2)), { .kind = RT_TRACE_TIMER });
     tb.CreateBr(done);
 
     tb.SetInsertPoint(done);
@@ -169,12 +169,15 @@ void Backend::build_enqueue_trampoline() {
 // the home is a property of the spawning THREAD, and a child of a shared task
 // is itself shared under the classification and inherits at spawn like any
 // other callee.
-void Backend::emit_suspend(const char* label) {
+void Backend::emit_suspend(const char* label, const TracePark& park) {
     // LRM 9.7's WAITING is "waiting in a blocking statement", which is exactly
     // this: every park goes through here, so the status word is maintained in one
     // place rather than at each parking construct. Two stores, in a design that
     // names `process` and nowhere else.
     emit_proc_state(kProcRunning, kProcWaiting);
+    // The same goes for the trace: every park says what it parks for, and the resume below
+    // names it, so a park that is not reported fails its resume (docs/design/scheduler-trace.md).
+    llvm::Constant* control = emit_trace_park(park);
     auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
     auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
     auto* resume = llvm::BasicBlock::Create(ctx_, label, fn_);
@@ -183,6 +186,7 @@ void Backend::emit_suspend(const char* label) {
     sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
     b_.SetInsertPoint(resume);
     emit_proc_state(kProcWaiting, kProcRunning);
+    emit_trace_resume(hdl_, control);
 }
 
 // The first argument of the ramp of schedule group `s`: the record of the
@@ -1366,7 +1370,9 @@ bool Backend::ir_has_delay(const Ir& ir) {
 // else's handle -- the two wait-queue scans, the wheel timer trampoline and
 // the task / fork-join epilogue. The seed loop still pushes directly: it
 // creates the handles, so it knows their region without asking.
-void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked) {
+void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked, const TraceCause& why) {
+    // The checker sees every wake before the push it reports.
+    emit_trace_wake(b, parked, why);
     if (!design_uses_reactive_) {
         // No body in this design can be reactive-home, so nothing was ever
         // tagged and the reactive ring does not exist. Same code as before.
@@ -1441,6 +1447,8 @@ void Backend::emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
 // child of a reactive body belongs in the reactive ring for the same reason its
 // parent's `#0` does.
 void Backend::emit_region_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+    // Both callers are a fork that queues a child its parent does not wait for.
+    emit_trace_wake(b, handle, { .kind = RT_TRACE_SPAWN });
     emit_by_home(b, [&] { emit_reactive_push(b, handle); }, [&] { emit_active_push(b, handle); });
 }
 
@@ -1600,6 +1608,14 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     llvm::Value* idx  = b_.CreateAnd(hd, b_.getInt32(active_mask_));
     llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b_.getInt32(0), idx });
     llvm::Value* hdl  = b_.CreateLoad(ptr_ty, slot);
+    // The checker sees the activation before it runs. A dispatch it refuses -- the activation is
+    // not queued, because it was woken twice or its frame is gone -- runs nothing: neither the
+    // resume nor the done test, which would read that frame.
+    if (llvm::Value* go = emit_trace_dispatch(b_, hdl, RT_TRACE_RING)) {
+        auto* dispatch = llvm::BasicBlock::Create(ctx_, "active.dispatch", fn);
+        b_.CreateCondBr(go, dispatch, cont);
+        b_.SetInsertPoint(dispatch);
+    }
     if (has_thunk) {
         // Low bit set => a tagged thunk pointer: call it directly (no frame,
         // nothing to destroy). Clear => a coroutine handle: resume/done/
@@ -1654,7 +1670,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.SetInsertPoint(pbody);
         llvm::Value* src = b_.CreateInBoundsGEP(queue_arr_ty_, sym(inactive_gv_), { b_.getInt32(0), i });
         llvm::Value* dst = b_.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b_.getInt32(0), i });
-        b_.CreateStore(b_.CreateLoad(ptr_ty, src), dst);
+        llvm::Value* parked = b_.CreateLoad(ptr_ty, src);
+        emit_trace_wake(b_, parked, { .kind = RT_TRACE_INACTIVE });
+        b_.CreateStore(parked, dst);
         i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), pbody);
         b_.CreateBr(phead);
 
@@ -1812,6 +1830,11 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         llvm::Value* ridx  = b_.CreateAnd(rpop, b_.getInt32(active_mask_));
         llvm::Value* rslot = b_.CreateInBoundsGEP(queue_arr_ty_, rring, { b_.getInt32(0), ridx });
         llvm::Value* rhdl  = b_.CreateLoad(ptr_ty, rslot);
+        if (llvm::Value* go = emit_trace_dispatch(b_, rhdl, RT_TRACE_RING)) {
+            auto* rdispatch = llvm::BasicBlock::Create(ctx_, "reactive.dispatch", fn);
+            b_.CreateCondBr(go, rdispatch, rcont);
+            b_.SetInsertPoint(rdispatch);
+        }
         if (has_thunk) {
             // Same tagged-pointer discipline as the active drain. Nothing pends
             // a thunk today (a pend always ramps a frame), but the tag is a
@@ -1863,7 +1886,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             b_.SetInsertPoint(rpbody);
             llvm::Value* rsrc = b_.CreateInBoundsGEP(queue_arr_ty_, sym(re_inactive_gv_), { b_.getInt32(0), rk });
             llvm::Value* rdst = b_.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b_.getInt32(0), rk });
-            b_.CreateStore(b_.CreateLoad(ptr_ty, rsrc), rdst);
+            llvm::Value* rparked = b_.CreateLoad(ptr_ty, rsrc);
+            emit_trace_wake(b_, rparked, { .kind = RT_TRACE_INACTIVE });
+            b_.CreateStore(rparked, rdst);
             rk->addIncoming(b_.CreateAdd(rk, b_.getInt32(1)), rpbody);
             b_.CreateBr(rphead);
 
@@ -1962,6 +1987,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
           b_.CreateICmpNE(hdl, llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_))),
           run_bb, done_bb);
         b_.SetInsertPoint(run_bb);
+        emit_trace_dispatch(b_, hdl, RT_TRACE_RUN_ONCE);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         b_.CreateBr(pop_bb);
@@ -2000,6 +2026,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         std::vector<llvm::Value*> margv{ b_.CreateCall(monitor_active_record_fn(), {}), sym(rng_global_), wheel,
                                          llvm::ConstantPointerNull::get(ptr_ty), b_.getInt8(0), record };
         llvm::Value* hdl = b_.CreateCall(rampty, ramp, margv);
+        emit_trace_spawn(b_, hdl, RT_TRACE_ORG_MONITOR, "<$monitor>", nullptr);
+        emit_trace_dispatch(b_, hdl, RT_TRACE_RUN_ONCE);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         b_.CreateBr(cont_bb);

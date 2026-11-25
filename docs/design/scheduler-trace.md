@@ -1,6 +1,9 @@
 # Scheduler trace and rule checker
 
-Status: proposed (2026-11-25), not implemented. Step 3 of the plan in
+Status: phase 1 landed (2026-11-25): `spawn`, `park`, `wake`, `dispatch`, `resume`, `end`
+and `slot`, the control table, and the R5 checks (wake, dispatch, resume, end), in
+`src/runtime/TraceCheck.cpp`; `region`, `nba`, `pend`, `trigger`, `finish` and `change` events
+and their rules are phases 2-4. Step 3 of the plan in
 `scheduler-rules.md` §1. R, S and B ids are that document's §3, §2 and §4, and its caveat
 applies: no rule is checked against the LRM text, and clauses are cited only as the code
 and `docs/LRM_NOTES.md` cite them.

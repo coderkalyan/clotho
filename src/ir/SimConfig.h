@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -105,6 +106,16 @@ enum class Sanitizer : uint32_t {
     return (sanitizers & static_cast<uint32_t>(s)) != 0;
 }
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+// Whether a run is checked against the scheduler's rules unless the caller says otherwise:
+// it is, unless CLOTHO_NO_TRACE_CHECK is set in the environment, which times a run
+// without the checker as CLOTHO_NO_TWIN times one without twin mode.
+[[nodiscard]] inline bool trace_check_default() {
+    static const bool on = std::getenv("CLOTHO_NO_TRACE_CHECK") == nullptr;
+    return on;
+}
+#endif
+
 // Garbage collection for class objects. A class object's lifetime is exactly its
 // reachability: LRM 8.4 gives an object no destructor and no `delete`, so "no
 // handle designates it any more" is the only end of life the language defines.
@@ -189,6 +200,18 @@ struct SimulationConfig {
     bool verify_shared_code = true;
 #else
     bool verify_shared_code = false;
+#endif
+    // Check the scheduler's rules while the design runs (docs/design/scheduler-trace.md): the
+    // generated code reports each park, wake, dispatch, resume and end of an activation to a
+    // checker in the runtime, which tests rule R5 of docs/design/scheduler-rules.md over the
+    // events and ends the run at its first violation. It costs compile and simulation time, so
+    // it is one of the checks too slow to ship: on with CLOTHO_EXTRA_ASSERTS (Debug and CI)
+    // unless CLOTHO_NO_TRACE_CHECK is set, off otherwise, and when off the backend emits no
+    // call.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    bool trace_check = trace_check_default();
+#else
+    bool trace_check = false;
 #endif
     // Emit one llvm::Module per elaborated definition (unit = the definition
     // state-struct identity) holding its instances' process groups and the entry

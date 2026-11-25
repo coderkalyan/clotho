@@ -71,6 +71,15 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     if (members.size() > 1) {
         name += ".f" + std::to_string(members.size());
     }
+    // Where the process is, for the trace: the park of its static control and of the wait at
+    // its head name it.
+    SourceText trace_at;
+    if (trace_on()) {
+        trace_at = trace_process_text(proc);
+        if (!resolve_) {
+            trace_at.where = name;
+        }
+    }
 
     // Per-member table setup, run before lowering anything of that member.
     const auto select_member = [&](uint32_t m) {
@@ -533,7 +542,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         // The park of the static subscription itself: the one park that arms the word and
         // is not a body's (emit_arm_wake_word).
         b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
-        emit_wait_suspend();                        // park until next trigger
+        emit_wait_suspend({ .kind = RT_TRACE_CTL_STATIC, .where = &trace_at }); // park until next trigger
         b_.CreateBr(loop_bb);
         // The forever back-edge means the shared final-suspend tail below is
         // unreachable; build it in a dead block so the IR stays well-formed.
@@ -565,7 +574,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.head", fn_);
         b_.CreateBr(loop_bb);
         b_.SetInsertPoint(loop_bb);
-        lower_wait_edges(head);
+        lower_wait_edges(head, &trace_at);
         emit_resume_polls();
         emit_defer_gen_bump(); // activation start = deferred-assertion flush point
         lower_region(ir_->root());
@@ -603,6 +612,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // `await`ers woken. An `always` body reaches this only through $finish, which
     // is also the end of its thread, so the hook is right for both shapes.
     emit_proc_complete();
+    emit_trace_end(hdl_);
     auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
     auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
     sw->addCase(b_.getInt8(0), trap_bb);
@@ -1841,7 +1851,7 @@ void Backend::lower_task(FunctionId id) {
                                    : final_bb;
         b_.CreateCondBr(wake, has_bb, after);
         b_.SetInsertPoint(has_bb);
-        emit_wake_push(b_, parent);
+        emit_wake_push(b_, parent, { .kind = RT_TRACE_CHILD });
         b_.CreateBr(after);
         if (heap) {
             b_.SetInsertPoint(after);
@@ -1852,11 +1862,12 @@ void Backend::lower_task(FunctionId id) {
         llvm::Value* parent = b_.CreateLoad(ptr_ty, rec);
         b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
         b_.SetInsertPoint(has_bb);
-        emit_wake_push(b_, parent);
+        emit_wake_push(b_, parent, { .kind = RT_TRACE_CALLEE });
         b_.CreateBr(final_bb);
     }
 
     b_.SetInsertPoint(final_bb);
+    emit_trace_end(hdl_);
     auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
     auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
     sw->addCase(b_.getInt8(0), trap_bb);
@@ -2518,6 +2529,7 @@ void Backend::lower_task_call_inst(Index i) {
     argv.push_back(record);
 
     llvm::Value* task_hdl = b_.CreateCall(fnty, cf, argv);
+    emit_trace_spawn(b_, task_hdl, RT_TRACE_ORG_TASK, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
     // The callee runs INLINE, with this body on the stack and its scheduled flag clear. A
     // `disable` of a block this body is an occupant of, or a `kill` of this thread, issued
     // by the callee would force-wake it -- push its handle while it is running -- and the
@@ -2527,6 +2539,7 @@ void Backend::lower_task_call_inst(Index i) {
     if (park_claim_wanted() && sched_ptr_ != nullptr) {
         b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
     }
+    emit_trace_dispatch(b_, task_hdl, RT_TRACE_INLINE);
     b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { task_hdl });
     llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { task_hdl });
 
@@ -2547,7 +2560,7 @@ void Backend::lower_task_call_inst(Index i) {
     // completion (coro.done in the drain loop).
     b_.SetInsertPoint(async_bb);
     b_.CreateStore(parked_handle(b_, hdl_), record);
-    emit_suspend("task.resume");
+    emit_suspend("task.resume", { .kind = RT_TRACE_CTL_CALL });
     b_.CreateBr(cont_bb);
 
     b_.SetInsertPoint(cont_bb);

@@ -288,7 +288,9 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // holds, def-relative (%alu.state): a unit's code names no instance's state
     // global (asserted on raw IR; instcombine canonicalizes GEP shapes).
     CHECK(raw.find("%alu.state, ptr %") != std::string::npos);
+#ifndef CLOTHO_EXTRA_ASSERTS // the root's trace table names each instance's storage by its global
     CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
+#endif
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.

@@ -134,6 +134,7 @@ void Backend::lower_strobe_pend(Index i) {
     argv.push_back(callee_home());
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+    emit_trace_spawn(b_, hdl, RT_TRACE_ORG_STROBE, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
     b_.CreateCall(strobe_pend_fn(), { hdl });
 }
 
@@ -162,6 +163,8 @@ void Backend::lower_reactive_pend(Index i) {
     argv.push_back(b_.getInt8(kReactiveHomeTag));
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+    emit_trace_spawn(b_, hdl, RT_TRACE_ORG_PEND, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
+    emit_trace_wake(b_, hdl, { .kind = RT_TRACE_PEND });
     emit_reactive_push(b_, hdl);
 }
 
@@ -261,7 +264,7 @@ void Backend::lower_expect_wait(Index i) {
     // sits in no other queue, so the flag must say "not scheduled" or a later
     // event wake would be dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("expect.resume");
+    emit_suspend("expect.resume", { .kind = RT_TRACE_CTL_EXPECT });
 
     // Past the resume point, so this thread is now running in the Reactive
     // region -- and by LRM 24.3.1 it stays there: "all subsequent blocking
@@ -312,8 +315,10 @@ void Backend::lower_expect_wake(Index i) {
     b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
 
     b_.SetInsertPoint(body);
-    llvm::Value* slot = expect_handle_slot(q, idx);
-    emit_reactive_push(b_, b_.CreateLoad(ptr_ty, slot));
+    llvm::Value* slot   = expect_handle_slot(q, idx);
+    llvm::Value* parked = b_.CreateLoad(ptr_ty, slot);
+    emit_trace_wake(b_, parked, { .kind = RT_TRACE_EXPECT });
+    emit_reactive_push(b_, parked);
     llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
     idx->addIncoming(next, b_.GetInsertBlock());
     b_.CreateBr(head);
