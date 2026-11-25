@@ -413,6 +413,18 @@ TEST_CASE("defparam: a same-typed value and an explicitly typed target simulate"
     )") == "7 7\n");
 }
 
+TEST_CASE("defparam: a path into another top-level module simulates") {
+    // Icarus Verilog 13 prints "p=1".
+    CHECK(run_capture(R"(
+        module a;
+          defparam b.p = 1;
+        endmodule
+        module b #(parameter p = 0);
+          initial $display("p=%0d", p);
+        endmodule
+    )") == "p=1\n");
+}
+
 TEST_CASE("defparam: a real value onto an implicitly typed integer parameter is refused") {
     // ivtest pr1907192: aborted on an assertion; built without assertions it
     // compared the real held in an int-typed constant.

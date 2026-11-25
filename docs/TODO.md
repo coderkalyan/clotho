@@ -60,14 +60,12 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **DPI export from a shared library** (35) — a `--dpi-lib` `.so`, loaded by dlopen, cannot
   resolve the design's exported SV subroutines.
-- [ ] **Nonblocking assignment to a function frame local** (13.4.4) — refused.
-- [ ] **Automatic-lifetime `event` local** (6.21, Table 6-7) — each activation needs a fresh
-  event object.
+- [ ] **Nonblocking assignment to a static subroutine's formal** (6.21) — refused: formals live
+  in the per-call frame, not static storage. Automatic variables are illegal NBA targets.
 - [ ] **Bulk default reset of an automatic aggregate (performance)** (6.21) — the Table 6-7
   default is stored per leaf; a trivially copyable aggregate could copy its prototype image.
 - [ ] **`$strobe` / `$monitor` in a function** — the deferred body needs a task-call record slot,
   which a function lacks.
-- [ ] **Nonblocking assignment to a task frame local or `output` / `inout` formal** — refused.
 
 ### Memories & arrays
 
@@ -86,7 +84,6 @@ Milestones, in order; lower ones unblock higher ones:
     read.
   - [ ] **Queue or associative-array parameter with aggregate elements** — cannot be seeded
     for a runtime read.
-- [ ] **`defparam` across top-level modules** — a path into another top is refused.
 - [ ] **`defparam` that changes an implicitly typed parameter's type** (6.20.2, 23.10.1) — the
   parameter keeps its original initializer's type, so the override is refused.
 - [ ] **Several `defparam`s on one parameter** (23.10.1) — the last one in source order wins,
@@ -217,8 +214,6 @@ Milestones, in order; lower ones unblock higher ones:
   associative array or class handle is refused.
 - [ ] **`$monitor` with `$time` or `%t` in its arguments** (21.2.2) — change detection
   compares rendered output, so it reprints every time step.
-- [ ] **`$strobe` and `$monitor` inside a function** (21.2.2) — the deferred body needs a
-  task-call record slot that only a coroutine has.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
 - [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
