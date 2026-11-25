@@ -2244,11 +2244,8 @@ void Backend::lower_inst(Index i) {
             lower_dump_limit(i);
             return;
 
-        case Inst::Tag::DumpOff:
-        case Inst::Tag::DumpOn:
-        case Inst::Tag::DumpAll:
-        case Inst::Tag::DumpFlush:
-            lower_dump_control(ir_->tag(i));
+        case Inst::Tag::DumpControl:
+            lower_dump_control(static_cast<DumpCtl>(p.imm));
             return;
 
         case Inst::Tag::SimTime: {

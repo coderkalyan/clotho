@@ -48,10 +48,7 @@ bool Backend::design_uses_vcd() const {
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
                 case Inst::Tag::DumpLimit:
-                case Inst::Tag::DumpOff:
-                case Inst::Tag::DumpOn:
-                case Inst::Tag::DumpAll:
-                case Inst::Tag::DumpFlush:
+                case Inst::Tag::DumpControl:
                     return true;
                 default:
                     break;
@@ -546,23 +543,22 @@ void Backend::vcd_plan_var(VcdRows& rows, Signal sig) {
 
 // $dumpoff / $dumpon / $dumpall / $dumpflush: forward to the matching runtime
 // control entry.
-void Backend::lower_dump_control(Inst::Tag tag) {
-    switch (tag) {
-        case Inst::Tag::DumpOff:
+void Backend::lower_dump_control(DumpCtl ctl) {
+    switch (ctl) {
+        case DumpCtl::Off:
             b_.CreateCall(vcd_nullary_fn("rt_vcd_off"), {});
             return;
-        case Inst::Tag::DumpOn:
+        case DumpCtl::On:
             b_.CreateCall(vcd_nullary_fn("rt_vcd_on"), {});
             return;
-        case Inst::Tag::DumpAll:
+        case DumpCtl::All:
             b_.CreateCall(vcd_nullary_fn("rt_vcd_all"), {});
             return;
-        case Inst::Tag::DumpFlush:
+        case DumpCtl::Flush:
             b_.CreateCall(vcd_nullary_fn("rt_vcd_dumpflush"), {});
             return;
-        default:
-            throw BackendError{ "internal: non-control dump tag" };
     }
+    throw BackendError{ "internal: unknown dump control" };
 }
 
 } // namespace clotho::ir::backend

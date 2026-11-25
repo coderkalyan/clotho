@@ -160,19 +160,19 @@ void Lowerer::lower_call(const CallExpression& call, ir::Builder& b) {
         return;
     }
     if (name == "$dumpoff") {
-        b.dump_control(ir::Inst::Tag::DumpOff, loc(call));
+        b.dump_control(ir::DumpCtl::Off, loc(call));
         return;
     }
     if (name == "$dumpon") {
-        b.dump_control(ir::Inst::Tag::DumpOn, loc(call));
+        b.dump_control(ir::DumpCtl::On, loc(call));
         return;
     }
     if (name == "$dumpall") {
-        b.dump_control(ir::Inst::Tag::DumpAll, loc(call));
+        b.dump_control(ir::DumpCtl::All, loc(call));
         return;
     }
     if (name == "$dumpflush") {
-        b.dump_control(ir::Inst::Tag::DumpFlush, loc(call));
+        b.dump_control(ir::DumpCtl::Flush, loc(call));
         return;
     }
     if (name == "$dumplimit") {

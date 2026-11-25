@@ -1426,6 +1426,15 @@ static_assert(ExtraPayload<CountBitsInfo>);
 static_assert(ExtraPayload<TestPlusArgsInfo>);
 static_assert(ExtraPayload<ValuePlusArgsInfo>);
 
+// The VCD control a `dump_control` performs: $dumpoff, $dumpon, $dumpall,
+// $dumpflush (payload: imm).
+enum class DumpCtl : uint32_t {
+    Off,
+    On,
+    All,
+    Flush,
+};
+
 struct Inst {
     enum class Tag : uint8_t {
         // -- Leaves --
@@ -2301,13 +2310,10 @@ struct Inst {
         // $dumplimit(n): stop dumping once the file reaches `n` bytes (payload:
         // unary, the byte count). Lowers to an rt_vcd_limit call.
         DumpLimit,
-        // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: none). Suspend (with
-        // an all-x checkpoint) / resume / force-dump-now / flush-to-disk. Each
-        // lowers to the matching rt_vcd_* control call.
-        DumpOff,
-        DumpOn,
-        DumpAll,
-        DumpFlush,
+        // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: imm, a DumpCtl).
+        // Suspend (with an all-x checkpoint) / resume / force-dump-now /
+        // flush-to-disk. Lowers to the matching rt_vcd_* control call.
+        DumpControl,
 
         // -- System functions --
         // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
@@ -2542,6 +2548,8 @@ struct Inst {
         Label,
         // The u64 scale member (sim_time). No SSA operands.
         Scale,
+        // The u32 imm member: a tag-defined immediate. No SSA operands.
+        Imm,
         Ref,
         Signal,
         Unary,
@@ -2578,6 +2586,8 @@ struct Inst {
         // Time-unit multiplier for sim_time: $time returns the wheel tick count
         // rounded down by this to the calling module's time unit. 1 == unitless.
         uint64_t scale;
+        // Tag-defined immediate with no operand (dump_control's DumpCtl).
+        uint32_t imm;
         // Interned constant value (constant).
         Ref ref;
         // Module signal handle (signal).
@@ -2872,13 +2882,11 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ProgramExit:
         case T::RetVoid:
         case T::DumpVars:
-        case T::DumpOff:
-        case T::DumpOn:
-        case T::DumpAll:
-        case T::DumpFlush:
         case T::Random:
         case T::Urandom:
             return K::None;
+        case T::DumpControl:
+            return K::Imm;
         case T::SimTime:
             return K::Scale;
         case T::Finish:

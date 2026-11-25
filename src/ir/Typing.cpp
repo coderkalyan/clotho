@@ -500,10 +500,7 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::DumpFile:
         case Inst::Tag::DumpVars:
         case Inst::Tag::DumpLimit:
-        case Inst::Tag::DumpOff:
-        case Inst::Tag::DumpOn:
-        case Inst::Tag::DumpAll:
-        case Inst::Tag::DumpFlush:
+        case Inst::Tag::DumpControl:
         case Inst::Tag::EventTrigger:
         case Inst::Tag::EventTriggerNb:
         case Inst::Tag::EventTriggerNbDelayed:

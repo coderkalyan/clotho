@@ -378,10 +378,11 @@ checkpoint with only minor cleanup.
 
 ## 9. IR / plumbing (mirrors `$readmem`)
 
-`Inst::Tag`s — `DumpFile`, `DumpVars`, `DumpLimit`, `DumpOff`, `DumpOn`,
-`DumpAll`, `DumpFlush` — with a payload only where one is needed: the filename
-value for `DumpFile`, the byte cap for `DumpLimit`. `DumpVars` carries none,
-because the only form accepted is the whole-design one. Builder methods →
+`Inst::Tag`s — `DumpFile`, `DumpVars`, `DumpLimit`, `DumpControl` — with a
+payload only where one is needed: the filename value for `DumpFile`, the byte
+cap for `DumpLimit`, and for `DumpControl` the `DumpCtl` immediate that tells
+`$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` apart. `DumpVars` carries
+none, because the only form accepted is the whole-design one. Builder methods →
 backend `lower_dump*` → `rt_vcd_*` calls, the same path as
 `lower_readmem`→`rt_readmem`. The dumped set is enumerated by the backend from
 the module signal table and the scope tree; a scope-subset selector is rejected

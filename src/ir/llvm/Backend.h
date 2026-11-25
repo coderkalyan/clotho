@@ -4120,7 +4120,7 @@ private:
     // The function of root that registers every dumped signal (lower_dump_vars).
     llvm::Function* vcd_register_fn();
 
-    void lower_dump_control(Inst::Tag tag);
+    void lower_dump_control(DumpCtl ctl);
 
     void lower_ret_void();
 

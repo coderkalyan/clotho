@@ -16,6 +16,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
         case Inst::PayloadKind::None:
         case Inst::PayloadKind::Label:
         case Inst::PayloadKind::Scale:
+        case Inst::PayloadKind::Imm:
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
         case Inst::PayloadKind::Arg:
@@ -754,10 +755,7 @@ Ir Ir::rebased(HandleMapper& m) const {
             case T::ProgramExit:
             case T::RetVoid:
             case T::DumpVars:
-            case T::DumpOff:
-            case T::DumpOn:
-            case T::DumpAll:
-            case T::DumpFlush:
+            case T::DumpControl:
             case T::Random:
             case T::Urandom:
             case T::SimTime:

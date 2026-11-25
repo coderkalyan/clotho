@@ -338,10 +338,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::DumpFile:
         case Inst::Tag::DumpVars:
         case Inst::Tag::DumpLimit:
-        case Inst::Tag::DumpOff:
-        case Inst::Tag::DumpOn:
-        case Inst::Tag::DumpAll:
-        case Inst::Tag::DumpFlush:
+        case Inst::Tag::DumpControl:
         case Inst::Tag::SimTime:
         case Inst::Tag::Random:
         case Inst::Tag::DistUnary:
@@ -964,10 +961,7 @@ struct Structural {
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
                 case Inst::Tag::DumpLimit:
-                case Inst::Tag::DumpOff:
-                case Inst::Tag::DumpOn:
-                case Inst::Tag::DumpAll:
-                case Inst::Tag::DumpFlush:
+                case Inst::Tag::DumpControl:
                     uses.vcd = true;
                     break;
                 default:
@@ -1810,10 +1804,7 @@ struct ValueSweep {
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
                 case Inst::Tag::DumpLimit:
-                case Inst::Tag::DumpOff:
-                case Inst::Tag::DumpOn:
-                case Inst::Tag::DumpAll:
-                case Inst::Tag::DumpFlush:
+                case Inst::Tag::DumpControl:
                     val_x[raw] = 0;
                     break;
             }

@@ -1113,8 +1113,8 @@ Index Builder::dump_limit(Index bytes, SourceLoc loc) {
     return emit({ Inst::Tag::DumpLimit, pay(&Inst::Payload::unary, bytes) }, loc);
 }
 
-Index Builder::dump_control(Inst::Tag tag, SourceLoc loc) {
-    return emit({ tag, pay(&Inst::Payload::none, 0u) }, loc);
+Index Builder::dump_control(DumpCtl ctl, SourceLoc loc) {
+    return emit({ Inst::Tag::DumpControl, pay(&Inst::Payload::imm, static_cast<uint32_t>(ctl)) }, loc);
 }
 
 Index Builder::sim_time(uint64_t scale, SourceLoc loc) {

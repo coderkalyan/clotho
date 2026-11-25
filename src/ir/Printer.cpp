@@ -553,14 +553,8 @@ const char* tag_name(Inst::Tag tag) {
             return "dump_vars";
         case T::DumpLimit:
             return "dump_limit";
-        case T::DumpOff:
-            return "dump_off";
-        case T::DumpOn:
-            return "dump_on";
-        case T::DumpAll:
-            return "dump_all";
-        case T::DumpFlush:
-            return "dump_flush";
+        case T::DumpControl:
+            return "dump_control";
         case T::SimTime:
             return "sim_time";
         case T::TimeFormat:
@@ -756,6 +750,9 @@ private:
                 break;
             case Inst::PayloadKind::Scale:
                 os_ << "scale=" << p.scale;
+                break;
+            case Inst::PayloadKind::Imm:
+                os_ << "imm=" << p.imm;
                 break;
             case Inst::PayloadKind::Ref:
                 // ClassNew's ref is the class *type*, not an interned value.
