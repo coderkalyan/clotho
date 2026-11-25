@@ -160,13 +160,36 @@ void Backend::emit_key_bytes(llvm::Value*     mustval,
     }
 }
 
+// The word a key leaf of `type` is serialized as. A class or event handle goes in as
+// its identity number, never as its address (Gc.h, rt_gc_identity): the bytes are
+// compared, hashed and sorted, and none of that may depend on where an object is.
+// The number is assigned the first time the object is a key, so the order of handle
+// keys is the order in which their objects were first used as one. Every other leaf
+// is its own value.
+llvm::Value* Backend::key_leaf_word(llvm::Value* mustval, Ref type) {
+    if (!types::is_object_handle(mod_.pool, type)) {
+        return mustval;
+    }
+    return b_.CreateCall(gc_identity_fn(), { b_.CreateIntToPtr(cast(mustval, 64, false), raw_ptr_ty()) });
+}
+
+// The inverse: the leaf value a serialized word stands for.
+llvm::Value* Backend::key_leaf_value(llvm::Value* word, Ref type) {
+    if (!types::is_object_handle(mod_.pool, type)) {
+        return word;
+    }
+    return b_.CreatePtrToInt(b_.CreateCall(gc_identity_object_fn(), { cast(word, 64, false) }), b_.getInt64Ty());
+}
+
 // Normalize an integral (or class-handle) must-value to its fixed big-endian
 // key bytes. Returns { i8* ptr, i32 len }.
 std::pair<llvm::Value*, llvm::Value*> Backend::normalize_integral_key(llvm::Value* mustval, const AssocKeyInfo& info) {
     const uint32_t nbytes  = (info.W + 7) / 8;
     auto*          arr_ty  = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
     auto*          scratch = entry_alloca(arr_ty, "assoc.key");
-    emit_key_bytes(mustval, info.W, info.is_signed, scratch, arr_ty, 0);
+    // A wildcard index has no key type and is never a handle.
+    llvm::Value* word = info.wildcard ? mustval : key_leaf_word(mustval, info.key_ty);
+    emit_key_bytes(word, info.W, info.is_signed, scratch, arr_ty, 0);
     return { scratch, b_.getInt32(nbytes) };
 }
 
@@ -216,7 +239,7 @@ uint32_t Backend::emit_agg_key_bytes(Ref              type,
     any_x            = any_x == nullptr ? ux : b_.CreateOr(any_x, ux);
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
-    emit_key_bytes(must_of(pl, leaf.four_state), W, is_signed, scratch, arr_ty, off);
+    emit_key_bytes(key_leaf_word(must_of(pl, leaf.four_state), type), W, is_signed, scratch, arr_ty, off);
     return off + (W + 7) / 8;
 }
 
@@ -387,7 +410,7 @@ void Backend::emit_variable_agg_key_bytes(Ref type, const Guarded& lv, llvm::Val
     const uint32_t nbytes  = (W + 7) / 8;
     auto*           arr_ty = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
     auto*           scratch = entry_alloca(arr_ty, "assoc.vkey.leaf");
-    emit_key_bytes(must_of(pl, leaf.four_state), W, is_signed, scratch, arr_ty, 0);
+    emit_key_bytes(key_leaf_word(must_of(pl, leaf.four_state), type), W, is_signed, scratch, arr_ty, 0);
     b_.CreateCall(keybuf_append_fn(), { scratch, b_.getInt32(nbytes) });
 }
 
@@ -500,8 +523,8 @@ void Backend::denormalize_assoc_key(llvm::Value*  kptr,
         return;
     }
     key_lv.when_valid(b_, [&](const LValue& v) {
-        lower_store(v, known_plane(denormalize_key_word(kptr, 0, info.W, info.is_signed, v.store_width),
-                                   v.four_state));
+        llvm::Value* word = denormalize_key_word(kptr, 0, info.W, info.is_signed, v.store_width);
+        lower_store(v, known_plane(info.wildcard ? word : key_leaf_value(word, info.key_ty), v.four_state));
     });
 }
 
@@ -557,7 +580,8 @@ void Backend::denormalize_agg_key(Ref type, const Guarded& lv, llvm::Value* kptr
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
     leaf.when_valid(b_, [&](const LValue& v) {
-        lower_store(v, known_plane(denormalize_key_word(kptr, off, W, is_signed, v.store_width), v.four_state));
+        llvm::Value* word = denormalize_key_word(kptr, off, W, is_signed, v.store_width);
+        lower_store(v, known_plane(key_leaf_value(word, type), v.four_state));
     });
     off += (W + 7) / 8;
 }
@@ -715,7 +739,8 @@ void Backend::denormalize_variable_agg_key(Ref            type,
     const uint32_t w = mod_.pool.layout(type).width;
     const uint32_t W = w == 0 ? 1 : w;
     leaf.when_valid(b_, [&](const LValue& v) {
-        lower_store(v, known_plane(denormalize_key_word(leafptr, 0, W, is_signed, v.store_width), v.four_state));
+        llvm::Value* word = denormalize_key_word(leafptr, 0, W, is_signed, v.store_width);
+        lower_store(v, known_plane(key_leaf_value(word, type), v.four_state));
     });
     off = b_.CreateAdd(off, b_.getInt32((W + 7) / 8));
 }

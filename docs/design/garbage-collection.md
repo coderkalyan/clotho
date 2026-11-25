@@ -306,16 +306,27 @@ prerequisites for evacuation, and they are all fixable (§8):
 ```
 
 Low bits: mark/age state (`CLEAN` / `MARKED` / `OLD` / `OLD_MARKED`), `PINNED`,
-`HAS_ID`, `FORWARDED`. The 56-bit payload is one of three things, never two at
-once:
+`FORWARDED`. The payload is empty except during an evacuating collection, when it
+holds a **forwarding address**.
 
-- **nothing**, for the overwhelming majority of objects;
-- **an object id**, assigned lazily the first time an object is used as an
-  associative-array key or formatted (§8.1) — so the id costs nothing for objects
-  that are never keyed;
-- **a forwarding address**, during an evacuating collection. No conflict with the
-  id: the id is copied with the object, and the original's word is dead after the
-  collection.
+**Identity numbers are not in the word.** An object used as an associative-array
+key or formatted with an integral conversion needs a name that is not its address:
+key bytes are compared, hashed and sorted, output is diffed between runs, and
+neither may depend on where an object sits. That name is the object's identity
+number (`rt_gc_identity`, `runtime/Gc.h`): assigned by the first request for it,
+counting from 1 in request order, never reused within a run, 0 for null. It is
+kept in two hash maps beside the heap, address to number and number to address,
+so an object that is never asked pays nothing and the object header has nothing
+to carry. A key serializes the number; the collector and a key traversal resolve
+it back (`rt_gc_identity_object`). A key holds its object, so a number in a live
+key always resolves.
+
+A collection forgets the number of every object it did not reach, once marking is
+complete (`release_dead_identities`): the table names an object by address, and a
+stale entry would give the dead object's number to the next object allocated
+there. A young collection checks only the objects numbered since the last
+collection, because every other numbered object is old; a full one reads the
+table.
 
 The vptr must *not* be overwritten by forwarding, because object size is derived
 from the type and is needed while sweeping. That is precisely why the GC word
@@ -950,10 +961,9 @@ exhausted. It is a policy knob over the same heap, with 2.5% headroom.
 
 **Prerequisites, all independently useful:**
 
-1. **Assoc keys must not hash addresses.** Encode the lazily-assigned object id
-   (§3.1) at `emit_key_bytes` instead of the handle bits. Side benefit: `first` /
-   `next` ordering becomes allocation order, which is deterministic across runs —
-   address order is not.
+1. **Assoc keys must not hash addresses.** Done: a key encodes the object's
+   identity number (§3.1), so `first` / `next` order is the order in which objects
+   were first numbered, which is the same in every run — address order is not.
 2. **`ref` into a class property.** Either pin for the call (§5.3, cheap, chosen)
    or pass base + offset and re-derive. The same treatment covers a container
    epoch pointer that aims into a class body.
@@ -1177,8 +1187,8 @@ blocked on those features existing at all, not on the collector. `std::mailbox`,
 `semaphore` and `process` have since landed as ordinary traced class bodies.
 
 **Track A — evacuation.** Gated on P3's fragmentation and survival numbers, not on
-taste. Prerequisites in §8: lazy object ids at `emit_key_bytes`, pin-on-`ref`,
-`rt_ref_names` discipline, `data-model.md` amendment. Deliverable is a policy
+taste. Prerequisites in §8: pin-on-`ref`, `rt_ref_names` discipline, `data-model.md`
+amendment (identity numbers in keys are done). Deliverable is a policy
 switch (`--gc-defrag=off|opportunistic`) plus, if the survival numbers argue for
 it, a copying nursery over the same Immix mature space.
 
