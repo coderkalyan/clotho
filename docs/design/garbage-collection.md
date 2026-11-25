@@ -523,8 +523,9 @@ root table would trace foreign DPI pointers.
   spills (`runtime/Scheduler.cpp, rt_alloc`) and is waste for objects.
 - **An object larger than a block** (32 KiB) has a mapping of its own, aligned as
   a chunk is and entered in the same table, with the object at a fixed offset so
-  that the same arithmetic finds its metadata byte. The mapping goes back to the
-  system when the object dies.
+  that the same arithmetic finds its metadata byte. When the object dies its
+  mapping leaves the table and is kept for the next object of the same size
+  (§4.2).
 
 ### 4.2 Reclamation
 
@@ -556,6 +557,14 @@ the last collection, and never fewer than one allocation budget's worth: what th
 next cycle will want again. A chunk with no object beyond that goes back to the
 system. So a design allocating at a steady rate keeps its chunks, and one whose
 live set has shrunk returns the difference at its next full collection.
+
+Large objects follow the same rule. A dead one's mapping is kept, by object size,
+and the next object of that size is put in it with nothing mapped; a full
+collection returns, of each size, the mappings beyond the number of objects of
+that size allocated since the last collection. A kept mapping still counts as
+heap, toward the growth that brings a full collection on and against
+`--gc-heap-max`, and the heap gives all of them back before it reports that the
+ceiling or the system has no room.
 
 ### 4.3 The allocation fast path
 
@@ -602,12 +611,15 @@ collection fails to satisfy the request.
 
 ### 4.4 What the layout costs
 
-Measured against the collector it replaced (an 8-byte header word, 128-byte line
-marks, object-start and finalizable bitmaps, large objects from 8 KiB in malloc'd
-cells), in the shipped configuration: Release, extra assertions off, default tier.
-Instructions are user-mode, per iteration, the least of three runs, from two runs
-of different lengths; time is CPU time for the longer run, the least of five, and
-includes about 0.1 s of compilation.
+Two measurements, each within one tree, in the shipped configuration: Release,
+extra assertions off, default tier. Instructions are user-mode, per iteration, the
+least of three runs, from two runs of different lengths; time is CPU time for the
+longer run, the least of five, and includes about 0.1 s of compilation.
+
+**The layout against the collector it replaced** (an 8-byte header word, 128-byte
+line marks, object-start and finalizable bitmaps, large objects from 8 KiB in
+malloc'd cells). When this was measured a dead large object's mapping was unmapped
+at once, and `memset` in the simulator was a byte loop on both sides (below).
 
 | per iteration | before | after | time |
 |---|---|---|---|
@@ -629,12 +641,30 @@ What is behind the three that got worse:
   what is left of a block after the last object that fits is unused until the next
   collection sweeps the block: a 12 KiB object leaves a quarter of each block, an
   object just over 16 KiB nearly half.
-- **A mapping per large object** costs about 50 microseconds to make and unmake:
-  the system calls, and a page fault for each page the object touches. A design
-  that allocates large objects at a high rate pays that for each one.
+- **A mapping made and unmade per large object** cost about 50 microseconds: the
+  system calls, and a page fault for each page the object touches. That is the
+  last row, and why a dead object's mapping is now kept (§4.2).
 
-Most of the instructions in the last two rows, before and after, are `memset` and
-`memcpy`, which in the simulator's binary are byte loops (`docs/TODO.md`).
+**Kept mappings, and the C library's `memset`.** Two later changes, measured on a
+later tree whose generated code had changed as well, so its first column is not the
+table above's last. The simulator links libsva, which bundles Zig's compiler-rt,
+and that defines `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp` and `strlen` as
+weak symbols; linked in, they replaced the C library's for the simulator and for
+the code it generates, and its `memset` is a byte loop that the default tier calls
+at every `new`. libsva now keeps those names to itself in an ELF archive.
+
+| per iteration | before | kept mappings | and the C library's `memset` | time |
+|---|---|---|---|---|
+| allocate and drop a 24-byte-body object | 101 | 101 | 59 | 445, 437, 248 ms |
+| the same with a `string` property | 228 | 228 | 140 | 565, 583, 362 ms |
+| the same beside 200,000 live objects | 141 | 141 | 98 | 321, 306, 208 ms |
+| replace a random element of two arrays of handles | 388 | 387 | 308 | 1372, 1408, 1366 ms |
+| two handle stores into an old object | 37 | 37 | 37 | 293, 293, 293 ms |
+| allocate and drop a 12 KiB object | 36.8k | 36.8k | 19.5k | 4823, 4996, 2489 ms |
+| allocate and drop a 64 KiB object | 156.4k | 155.9k | 69.9k | 15943, 4870, 2697 ms |
+
+Peak resident memory for the last row is 214, 226 and 221 MiB: the kept mappings
+are those of one cycle.
 
 ---
 
@@ -1317,7 +1347,7 @@ protected.
 
 - **The strongest test oracle.** "Byte-identical with the collector off" compared
   against a reference in which nothing can be freed early. §13.1 states what
-  replaced it and what that no longer covers.
+  replaced it: a cadence at which the collector never runs, on the one code path.
 - **The escape hatch.** A collector bug can no longer be worked around from the
   command line. That is a deliberate trade for one code path instead of two — a
   dual path that is exercised by every test is a real maintenance asset, and one
@@ -1335,28 +1365,30 @@ the test that proved the off mode collected nothing.
 iverilog cannot check it — per `PRINCIPLES.md`, the substitute strategy is stated, and
 it is four things:
 
-1. **Cadence identity, and it is weaker than it was.** Every existing test is
-   byte-identical under the ordinary cadence and under `--gc-stress` (and later
-   under `--gc-defrag=opportunistic`). A collector that changes observable
-   behaviour is a bug by definition, and for a *moving* collector this is the bug
-   this catches.
+1. **Cadence identity.** Every design in `tests/gc_test.cpp` prints the same bytes
+   at three cadences: never (a budget no run can spend, so no collection runs),
+   ordinary (a collection when the budget is spent) and `--gc-stress` (one at every
+   safepoint). A collector that changes observable behaviour is a bug by
+   definition.
 
-   What it no longer catches: **a bug that affects both cadences equally.** Until
-   §12a the strongest leg of this oracle was "byte-identical with the collector
-   *off*", and an uncollected run is a perfect reference because nothing in it can
-   be freed early. That leg went with the flag. Stress is a far more aggressive
-   cadence than the default, so it still catches anything sensitive to *when*
-   collection happens — which is what a missing root is — but it cannot catch a
-   wrong answer that both cadences produce identically.
+   The never cadence is the reference, because nothing in it can be freed early.
+   It is what "byte-identical with the collector *off*" was before §12a, without a
+   second code path: the same generated code and the same runtime, with the one
+   number that paces collections out of reach. Without it the comparison showed
+   only that two collection schedules agree, and a wrong answer both produce
+   passed. Stress is the cadence that bites: a missing root is sensitive to *when*
+   collection happens, and stress collects whenever it can.
 
-   What covers the gap, and why the reachability cases are built the way they are:
-   each runs a filler process that recycles and poisons freed lines, so a
+   The comparison is on what a design prints, so it is as strong as the case.
+   The rest of the suite runs at the ordinary cadence only.
+
+   Why the reachability cases are built the way they are:
+   each runs a filler process that recycles and poisons freed granules, so a
    wrongly-collected object reads back as `0x5A5A5A5A` instead of its own
    stale-but-intact bytes — a value check needing no reference run. Several also
    give the object under test a `string` property, so the same mistake becomes a
    heap-use-after-free under ASan rather than a text diff. Both devices measure
-   against an absolute expectation rather than a differential one, which is
-   precisely why they were built that way while the off mode still existed.
+   against an absolute expectation rather than a differential one.
 2. **LeakSanitizer with the overrides removed.** The house method for lifetime
    work (`fork-join.md:495-497`: "a missed release leaks and a double release is a
    double free, and neither shows up in a value check"). Concrete criterion:

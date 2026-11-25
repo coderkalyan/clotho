@@ -409,10 +409,12 @@ if(CLOTHO_SVA)
   set(_libsva_include ${_libsva_prefix}/inc)
   file(GLOB _libsva_sources "${CLOTHO_LIBSVA_DIR}/src/*.zig")
 
-  # -Dcpu=baseline: Zig otherwise targets the build machine's CPU, and the
-  # compiler_rt it bundles into libsva supplies clotho's memcpy and memset, so a
-  # binary built on a machine with newer vector extensions died with SIGILL at
-  # startup on an older one.
+  # -Dcpu=baseline: Zig otherwise targets the build machine's CPU, for libsva's
+  # code and for the compiler_rt it bundles. That compiler_rt once supplied
+  # clotho's memcpy and memset as well, so a binary built on a machine with newer
+  # vector extensions died with SIGILL at startup on an older one. libsva keeps
+  # those names to itself on ELF now (tests/runtime_test.cpp holds it to that);
+  # the rest of its code still has to run wherever clotho does.
   set(_libsva_zig_args -Doptimize=${_libsva_optimize} -Dcpu=baseline)
   if(CLOTHO_LIBSVA_ZIG_TARGET)
     list(APPEND _libsva_zig_args -Dtarget=${CLOTHO_LIBSVA_ZIG_TARGET})

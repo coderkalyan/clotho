@@ -129,8 +129,9 @@ them in step.
 - An object has no collector header: its flags are in its granule's byte, and
   objects are 16-byte aligned.
 - An object too large for a block has its own mapping, found through the same
-  table and returned to the system when it dies.
-- After a full collection, empty chunks beyond a reserve go back to the system.
+  table. A dead one's mapping is kept for the next object of its size.
+- After a full collection, empty chunks and kept mappings beyond what the last
+  cycle allocated go back to the system.
 - A young collection runs after a fixed amount of allocation (8 MiB, counting
   the buffers objects own).
 - A full collection runs when the old generation has grown by a fixed factor
@@ -160,13 +161,13 @@ them in step.
   associative array keyed by a class handle) is assigned on first request and
   kept in a table beside the heap, so objects that never ask pay nothing; the
   pass that clears weak references drops a dead object's entry.
-- The collector is checked three ways: each test design runs at three collection
-  cadences (never, ordinary, stress) on one code path and its output must not
-  change; a heap verifier runs after each collection in extra-assertion builds;
-  and a model-based test drives the collector's C interface with random graphs,
-  stores and collections against a shadow reachability model. A design that uses
-  a weak reference is left out of the cadence comparison. **Not yet:** there is
-  no never cadence.
+- The collector is checked three ways: each design in the collector's tests runs
+  at three collection cadences (never, ordinary, stress) on one code path and its
+  output must not change; a heap verifier runs after each collection in
+  extra-assertion builds; and a model-based test drives the collector's C
+  interface with random graphs, stores and collections against a shadow
+  reachability model. A design that uses a weak reference is left out of the
+  cadence comparison.
 
 ## Containers and classes
 

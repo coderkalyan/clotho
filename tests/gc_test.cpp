@@ -69,6 +69,12 @@ std::string run_capture(std::string_view source, ir::SimulationConfig config) {
 // expectations off bytes actually allocated, not off the number configured here.
 constexpr uint64_t nursery_bytes_small = RT_GC_BLOCK_BYTES;
 
+// A budget no run can spend, which is the never cadence: nothing requests a
+// collection, so the run ends with every object it allocated still in the heap.
+// Not a mode of the collector -- the same generated code and the same runtime, with
+// the one number that paces collections out of reach.
+constexpr uint64_t nursery_bytes_never = UINT64_MAX;
+
 // Nonzero `gc_full_every` means "one full collection per N collections"
 // (Gc.h:241-244), so a value no design in this file can reach selects a
 // YOUNG-ONLY run. That is the only configuration in which "a young collection
@@ -78,11 +84,10 @@ constexpr uint64_t nursery_bytes_small = RT_GC_BLOCK_BYTES;
 // below collects a few hundred times.
 constexpr uint32_t full_every_never = 1u << 24;
 
-// The two cadences, named because `run_stats(src, expected, true)` says nothing
-// about which one it selected. Ordinary is what every run gets: a collection is
-// due once the nursery budget is spent. Stress is `--gc-stress`: a collection at
-// every safepoint. There is no third choice -- the collector itself is not
-// optional (garbage-collection.md §12).
+// The two cadences that collect, named because `run_stats(src, expected, true)`
+// says nothing about which one it selected. Ordinary is what every run gets: a
+// collection is due once the nursery budget is spent. Stress is `--gc-stress`: a
+// collection at every safepoint.
 constexpr bool cadence_ordinary = false;
 constexpr bool cadence_stress   = true;
 
@@ -96,28 +101,29 @@ ir::SimulationConfig gc_cfg(bool stress, uint64_t nursery_bytes = nursery_bytes_
 }
 
 // The primary oracle for the whole file. LRM 8.4 gives an object no destructor
-// and no `delete`, so a program cannot observe reclamation: both cadences must
-// print the same bytes, and a collector that changes observable behaviour is a
-// bug by definition (garbage-collection.md §13.1). Stress is the cadence that
-// bites -- it collects at every safepoint, so a root the collector does not know
-// about turns from a rare corruption into a deterministic wrong answer.
+// and no `delete`, so a program cannot observe reclamation: a design must print
+// the same bytes whether the collector never runs, runs when the budget is spent,
+// or runs at every safepoint, and a collector that changes observable behaviour
+// is a bug by definition (garbage-collection.md §13.1).
 //
-// Read the strength of this honestly. The reasoning above still holds for the
-// two cadences, but its strongest leg is gone: the collector is unconditional,
-// so there is no uncollected run left to put on the other side of the
-// comparison. This shows that two collection SCHEDULES agree, not that
-// collecting agrees with not collecting, and a bug that hits both cadences
-// equally -- a mark that misses a root whenever it runs, a finalizer that frees
-// a buffer still in use -- prints the same bytes twice and passes here.
+// The never cadence is the reference: nothing in it can be freed early, so a
+// wrong answer the two collecting cadences agree on -- a mark that misses a root
+// whenever it runs, a finalizer that frees a buffer still in use -- disagrees
+// with it. Stress is the cadence that bites: it collects at every safepoint, so a
+// root the collector does not know about turns from a rare corruption into a
+// deterministic wrong answer.
 //
-// What catches that is inside the cases, not in this comparison. §2's `Junk`
-// filler hands a wrongly-freed line straight back out overwritten with
-// 0x5A5A5A5A, so a read of a collected object sees the pattern rather than
-// stale-but-intact bytes; the `string` property on the object under test turns
-// the same mistake into an AddressSanitizer heap-use-after-free under
-// -DCLOTHO_SANITIZE=ON. Both are absolute -- neither needs a second run to
-// disagree with.
-void check_both_cadences(std::string_view source, const std::string& expected) {
+// The comparison is on the expected text, so it is only as strong as what a case
+// prints. Inside the cases, §2's `Junk` filler hands a wrongly-freed granule
+// straight back out overwritten with 0x5A5A5A5A, so a read of a collected object
+// sees the pattern rather than stale-but-intact bytes, and the `string` property
+// on the object under test turns the same mistake into an AddressSanitizer
+// heap-use-after-free under -DCLOTHO_SANITIZE=ON.
+void check_cadences(std::string_view source, const std::string& expected) {
+    CHECK(run_capture(source, gc_cfg(cadence_ordinary, nursery_bytes_never)) == expected);
+    rt_gc_stats never = {};
+    rt_gc_get_stats(&never);
+    CHECK(never.collections == 0u);
     CHECK(run_capture(source, gc_cfg(cadence_ordinary)) == expected);
     CHECK(run_capture(source, gc_cfg(cadence_stress)) == expected);
 }
@@ -197,7 +203,7 @@ TEST_CASE("gc: identity - construction, inheritance, virtual dispatch, $cast") {
             end
         endmodule
     )";
-    check_both_cadences(src, "derived 7 7\n1 14 made\n");
+    check_cadences(src, "derived 7 7\n1 14 made\n");
 }
 
 // Shallow copy (LRM 8.12): value properties are independent in the copy, handle
@@ -232,7 +238,7 @@ TEST_CASE("gc: identity - shallow copy shares handles and separates values") {
             end
         endmodule
     )";
-    check_both_cadences(src, "1 a 99 c 42 1\n");
+    check_cadences(src, "1 a 99 c 42 1\n");
 }
 
 // The same operations with time in them: a blocking task that allocates and
@@ -276,7 +282,7 @@ TEST_CASE("gc: identity - allocation across suspensions in a process and a task"
             end
         endmodule
     )";
-    check_both_cadences(src, "10 always\n");
+    check_cadences(src, "10 always\n");
 }
 
 // -- 2. Reachability through every root class ---------------------------------
@@ -336,7 +342,7 @@ TEST_CASE("gc: an object reachable only from a static class property survives") 
             end
         endmodule
     )";
-    check_both_cadences(src, "91 static-rooted\n");
+    check_cadences(src, "91 static-rooted\n");
 }
 
 // A module-scope handle lives in the design state buffer (@clotho.state), the
@@ -376,7 +382,7 @@ TEST_CASE("gc: an object reachable only from module-scope design state survives"
             end
         endmodule
     )";
-    check_both_cadences(src, "55 design-state-rooted\n");
+    check_cadences(src, "55 design-state-rooted\n");
 }
 
 // The conservative frame-root path (garbage-collection.md §5.1-5.2). A suspended
@@ -423,7 +429,7 @@ TEST_CASE("gc: an object reachable only from a process suspended on posedge surv
     // more posedges before printing, and the clock has 16.
     const std::string expected = "4242 frame-rooted\n4242 frame-rooted\n"
                                  "4242 frame-rooted\n4242 frame-rooted\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     // Negative space: the object is designated by nothing precise, so a run that
     // reports no conservative pin did not reach it through the frame registry and
     // this case has stopped testing what it names.
@@ -465,7 +471,7 @@ TEST_CASE("gc: an object reachable only from a suspended blocking task survives"
             initial hold(77);
         endmodule
     )";
-    check_both_cadences(src, "77 task-frame-rooted\n");
+    check_cadences(src, "77 task-frame-rooted\n");
 }
 
 // The frame-registration predicate, adversarially. `frame_may_hold_gc_ref`
@@ -549,7 +555,7 @@ TEST_CASE("gc: the frame-registration predicate misses no way a frame holds a ha
         endmodule
     )";
     const std::string expected = "46 206 86 126 166\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     // As in the posedge case: no precise root designates r1/r3/r4/r5's objects, so
     // a run with no conservative pin did not reach them through a frame at all.
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
@@ -610,7 +616,7 @@ TEST_CASE("gc: an object reachable only through a deep handle chain survives") {
             end
         endmodule
     )";
-    check_both_cadences(src, "32640\n");
+    check_cadences(src, "32640\n");
 }
 
 // A `ref` formal bound to a class property is a raw INTERIOR pointer into the
@@ -670,7 +676,7 @@ TEST_CASE("gc: an object reachable only through a ref into a class property surv
             end
         endmodule
     )";
-    check_both_cadences(src, "42\n");
+    check_cadences(src, "42\n");
 }
 
 // -- 3. Containers of class handles -------------------------------------------
@@ -759,7 +765,7 @@ TEST_CASE("gc: objects reachable only from a queue in design state survive") {
         endmodule
     )";
     const std::string expected = "4 50 queue-root queue-root\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -810,7 +816,7 @@ TEST_CASE("gc: objects reachable only from a dynamic array in design state survi
         endmodule
     )";
     const std::string expected = "4 90 dynarr-root dynarr-root\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -862,7 +868,7 @@ TEST_CASE("gc: objects reachable only from an associative array in design state 
         endmodule
     )";
     const std::string expected = "4 130 assoc-root\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -916,7 +922,7 @@ TEST_CASE("gc: objects reachable only from a container in a static class propert
         endmodule
     )";
     const std::string expected = "4 170 static-assoc-root\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -978,7 +984,7 @@ TEST_CASE("gc: objects reachable only from a queue local to a suspended process 
     // own trigger plus three more, and the clock has 16.
     const std::string line     = "32 528 process-local-queue process-local-queue\n";
     const std::string expected = line + line + line + line;
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1028,7 +1034,7 @@ TEST_CASE("gc: objects reachable only from a queue local to a suspended task sur
         endmodule
     )";
     const std::string expected = "32 3728 task-queue-rooted task-queue-rooted\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1084,7 +1090,7 @@ TEST_CASE("gc: objects reachable only from a queue property of a live object sur
         endmodule
     )";
     const std::string expected = "8 436 holder class-property-queue\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1202,7 +1208,7 @@ TEST_CASE("gc: the queue walker follows ring wraparound") {
     )";
     // 1012..1015 survive the pops (4054) plus the 12 wrapped 0..11 (66).
     const std::string expected = "16 4120 pre wrapped wrapped\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1272,7 +1278,7 @@ TEST_CASE("gc: an object held only as an associative-array key survives") {
         endmodule
     )";
     const std::string expected = "4 750 key-rooted\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1331,7 +1337,7 @@ TEST_CASE("gc: objects reachable only from a queue of structs holding handles su
     )";
     // 71..74 plus the four seq values.
     const std::string expected = "4 296 wrap aggregate-element\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1406,7 +1412,7 @@ TEST_CASE("gc: objects reachable only through three levels of nested containers 
     )";
     // 27 objects, values 0..26.
     const std::string expected = "3 3 3 351 nested\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1492,7 +1498,7 @@ TEST_CASE("gc: a live UVM-shaped tree of assoc children stays reachable") {
     )";
     // 1 + (10+11+12) + (100+101+110+111+120+121).
     const std::string expected = "3 697 agent2\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -1646,7 +1652,7 @@ TEST_CASE("gc: an object held only inside a struct assoc KEY survives (offset 0)
     )";
     // Keys 61..64 (250), their `i` leaves 0..3 (6), their values 122..128 (500).
     const std::string expected = "4 756 key-agg-0\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     // Paired with the filler: without allocation churn "a lost object reads back as
@@ -1732,7 +1738,7 @@ TEST_CASE("gc: an object held only in a struct assoc KEY at a NONZERO offset sur
     )";
     // Keys 71..74 (290) plus their values 142..148 (580); ends are i==0 and i==3.
     const std::string expected = "4 870 71 74 key-agg-nz\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
@@ -1805,7 +1811,7 @@ TEST_CASE("gc: several objects held only in the SAME struct assoc KEY survive") 
     )";
     // a: 81..84 (330); b: 181..184 (730); `i` leaves and values both 0..3 (6 each).
     const std::string expected = "4 1072 key-a key-b\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
@@ -1896,7 +1902,7 @@ TEST_CASE("gc: a handle nested under an array and a struct inside an assoc KEY s
     )";
     // Keys 111..114 (450), tails 0/2/4/6 (12), values 111..114 (450); first is i==0.
     const std::string expected = "4 912 111 20 nested-a\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
@@ -1976,7 +1982,7 @@ TEST_CASE("gc: an assoc KEY holding a fixed array of handles keeps every element
     )";
     // pair[0]: 91..94 (370); pair[1]: 141..144 (570); tag_ids 0/3/6/9 (18); values 6.
     const std::string expected = "4 964 91 pair-b\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
@@ -2066,7 +2072,7 @@ TEST_CASE("gc: an assoc KEY handle behind mixed-width leaves uses SERIALIZED off
     )";
     // Keys 101..104 (410) plus values 101..104 (410); first is b==0, s==1000, w==4096.
     const std::string expected = "4 820 101 1000 4096 mixed-width\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
@@ -2384,7 +2390,7 @@ TEST_CASE("gc: a fresh object stored into a promoted object survives a young col
         endmodule
     )";
     const std::string expected = "7 4242 fresh-into-old\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     // Young-only: after the mandatory first collection nothing traces `owner`
     // again, so the remembered set is the sole path to the fresh object.
     const rt_gc_stats yg =
@@ -2463,7 +2469,7 @@ TEST_CASE("gc: a fresh object pushed into a queue property of a promoted object 
         endmodule
     )";
     const std::string expected = "3 903 long-lived-bag queued-into-old\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -2546,7 +2552,7 @@ TEST_CASE("gc: a fresh object mapped into an assoc property of a promoted object
     )";
     // 12 entries, values 500..511: 12*500 + (0+..+11).
     const std::string expected = "12 6066 mapped-into-old mapped-into-old\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -2630,7 +2636,7 @@ TEST_CASE("gc: an object held only as an assoc KEY inside a promoted object surv
     )";
     // Keys 61..64 (250) plus their values 122..128 (500).
     const std::string expected = "4 750 key-into-old\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -2725,7 +2731,7 @@ TEST_CASE("gc: a struct assoc KEY holding a handle inside a promoted object surv
     )";
     // Keys 61..64 (250) plus their values 122..128 (500); first is i==0.
     const std::string expected = "4 750 61 key-agg-old\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -2821,7 +2827,7 @@ TEST_CASE("gc: a key read back into a property of a promoted object survives") {
         endmodule
     )";
     const std::string expected = "1 4242 carried-key\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -2896,7 +2902,7 @@ TEST_CASE("gc: a handle pushed through a ref into a promoted object's queue surv
         endmodule
     )";
     const std::string expected = "1 4242 pushed-after-suspend\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -2989,7 +2995,7 @@ TEST_CASE("gc: a handle assigned through a ref to a queue ELEMENT of a promoted 
         endmodule
     )";
     const std::string expected = "4242 4242 assigned-after-suspend 4 placeholder\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -3077,7 +3083,7 @@ TEST_CASE("gc: two refs into one container of a promoted object both stay regist
     )";
     const std::string expected =
         "4242 4242 first-slot 4243 second-slot 5 placeholder\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -3170,7 +3176,7 @@ TEST_CASE("gc: a young collection does not mark the stable population") {
     )";
     // 0 + 1 + ... + 499, the 800 churned, and the last churn object's value.
     const std::string expected = "124750 800 stable 799\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
 
     // An explicit full_every wins over stress, so this is "collect at every
     // region boundary, and after the first one always young".
@@ -3260,7 +3266,7 @@ TEST_CASE("gc: old garbage survives young collections and is reclaimed by a full
         endmodule
     )";
     const std::string expected = "dropped 200\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
 
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
@@ -3336,7 +3342,7 @@ TEST_CASE("gc: a promoted object between dead young objects survives") {
         endmodule
     )";
     const std::string expected = "42\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
         run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -3415,7 +3421,7 @@ TEST_CASE("gc: --gc-stress alternates young and full collections") {
 // interface regions of that descriptor sit BELOW the trace-map pointer, so this is
 // the case that would break if their placement ever moved the map's offset. The
 // `string` property turns a wrongly-freed object into a sanitizer
-// heap-use-after-free rather than a stale read (see check_both_cadences).
+// heap-use-after-free rather than a stale read (see check_cadences).
 TEST_CASE("gc: an object rooted only by an interface-class handle survives") {
     constexpr std::string_view src = R"(
         interface class Named;
@@ -3452,7 +3458,7 @@ TEST_CASE("gc: an object rooted only by an interface-class handle survives") {
             end
         endmodule
     )";
-    check_both_cadences(src, "320 319 churn\n");
+    check_cadences(src, "320 319 churn\n");
 }
 
 // -- 8. Built-in handle kinds: the `process` object ------------------------------
@@ -3512,7 +3518,7 @@ TEST_CASE("gc: a process handle held only by design state, a class property, a q
             end
         endmodule
     )";
-    check_both_cadences(src, "0 0 0 0\n1\n");
+    check_cadences(src, "0 0 0 0\n1\n");
     const rt_gc_stats st = run_stats(src, "0 0 0 0\n1\n", cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -3549,7 +3555,7 @@ TEST_CASE("gc: a process handle in a suspended task frame survives and stays the
         endmodule
     )";
     const std::string expected = "1 1\n1 1\n1 1\n1 1\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     // Negative space: nothing precise designates the object, so a run that reports no
     // conservative pin did not reach it through the frame registry and this case has
     // stopped testing what it names.
@@ -3590,7 +3596,7 @@ TEST_CASE("gc: a process handle captured by a fork child outliving its frame sur
             initial spawn();
         endmodule
     )";
-    check_both_cadences(src, "box 0\n");
+    check_cadences(src, "box 0\n");
 }
 
 // The leak: every fork child that asked for its handle took a control block and an
@@ -3665,7 +3671,7 @@ TEST_CASE("gc: a handle staged by a delayed nonblocking struct assignment surviv
             end
         endmodule
     )";
-    check_both_cadences(src, "a=7 h.x=42\n");
+    check_cadences(src, "a=7 h.x=42\n");
     const rt_gc_stats st = run_stats(src, "a=7 h.x=42\n", cadence_stress);
     CHECK(st.collections > 0);
     CHECK(st.conservative_pins > 0);
@@ -3696,7 +3702,7 @@ TEST_CASE("gc: handles staged by a delayed nonblocking array assignment survive"
             end
         endmodule
     )";
-    check_both_cadences(src, "42 43\n");
+    check_cadences(src, "42 43\n");
     const rt_gc_stats st = run_stats(src, "42 43\n", cadence_stress);
     CHECK(st.collections > 0);
     CHECK(st.conservative_pins > 0);
@@ -3734,7 +3740,7 @@ TEST_CASE("gc: handles staged by an event-controlled nonblocking assignment surv
             end
         endmodule
     )";
-    check_both_cadences(src, "a=9 h.x=42 arr1.x=44\n");
+    check_cadences(src, "a=9 h.x=42 arr1.x=44\n");
     const rt_gc_stats st = run_stats(src, "a=9 h.x=42 arr1.x=44\n", cadence_stress);
     CHECK(st.collections > 0);
     CHECK(st.conservative_pins > 0);
@@ -3777,7 +3783,7 @@ TEST_CASE("gc: a plain nonblocking write after a delayed struct assignment fired
             end
         endmodule
     )";
-    check_both_cadences(src, "a=9 h.x=43\n");
+    check_cadences(src, "a=9 h.x=43\n");
     const rt_gc_stats st = run_stats(src, "a=9 h.x=43\n", cadence_stress);
     CHECK(st.collections > 0);
 }
@@ -4394,7 +4400,7 @@ TEST_CASE("gc: an event named only by a parked waiter's frame survives until the
             end
     )");
     const std::string expected = "bad=0 held=2400\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     // Negative space, as for a class object in a frame: nothing precise names the
     // event, so a run with no conservative pin never reached it.
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
@@ -4427,7 +4433,7 @@ TEST_CASE("gc: a declared event its variable no longer names survives while a wa
             end
     )");
     const std::string expected = "bad=0 held=2400\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
     CHECK(st.conservative_pins > 0u);
@@ -4488,7 +4494,7 @@ TEST_CASE("gc: an event named only by its delayed nonblocking trigger survives u
             end
     )");
     const std::string expected = "bad=0 held=2000\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
     CHECK(st.collections > 0u);
 }
@@ -4517,7 +4523,7 @@ TEST_CASE("gc: an event named only by a detached subscription survives until its
             end
     )");
     const std::string expected = "bad=0 held=2000\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
     CHECK(st.collections > 0u);
 }
@@ -4554,7 +4560,7 @@ TEST_CASE("gc: a young event stored into an old object survives young collection
             end
     )");
     const std::string expected = "bad=0 held=3600 triggered=1\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
       run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -4606,7 +4612,7 @@ TEST_CASE("gc: events held only as container elements and as an associative key 
             end
     )");
     const std::string expected = "bad=0 held=1800 n=24\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
 }
@@ -4739,7 +4745,7 @@ static std::string key_design(std::string_view types, std::string_view build, st
 // One case in design state: both cadences print the same thing, and the stress
 // cadence collected at all.
 static void check_key_case(const std::string& src, const std::string& expected) {
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
 }
@@ -4926,7 +4932,7 @@ TEST_CASE("gc: a key created in an old object's array survives young collections
     }
     // Cells 61..64 (250) plus value lengths 1..4 (10).
     const std::string expected = "4 260\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
       run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.collections > 1u);
@@ -4987,7 +4993,7 @@ TEST_CASE("gc: a variable-length key in an array local to a suspended task survi
         endmodule
     )";
     const std::string expected = "4 760\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     // `container_roots` cannot witness the registration: it counts the last
     // collection's, and by then the task has returned. The values are the oracle.
@@ -5102,7 +5108,7 @@ TEST_CASE("gc: a value staged until an event survives while the event can be tri
     }
     const std::string src      = waiting_design(body);
     const std::string expected = "7 7 staged\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
 }
@@ -5133,7 +5139,7 @@ TEST_CASE("gc: a value staged until an old event survives young collections") {
     // Triggered through the subscription, it releases the assignment of 9 one region
     // after the staged struct lands.
     const std::string expected = "9 7 staged\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats yg =
       run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
     CHECK(yg.full_collections == 1u);
@@ -5174,7 +5180,7 @@ TEST_CASE("gc: events chained through subscriptions survive while the first can 
             end
     )");
     const std::string expected = "bad=0 held=2000 seen=1\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
     CHECK(st.collections > 0u);
 }
@@ -5282,7 +5288,7 @@ TEST_CASE("gc: an event takes a reclaimed event's trigger id without what waited
         endmodule
     )";
     const std::string expected = "777 0\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
     CHECK(st.collections > 1u);
     CHECK(rt_event_control_count() < 1000u);
@@ -5408,7 +5414,57 @@ TEST_CASE("gc: an object keeps its identity number across collections") {
         endmodule
     )";
     const std::string expected = "3 3: 10-1 11-2 12-3 13-4\n";
-    check_both_cadences(src, expected);
+    check_cadences(src, expected);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
+}
+
+// An object too large for a block has a mapping of its own (Gc.h). Generated code
+// allocates one through the runtime rather than inline, a dead one's mapping is kept
+// for the next object of its size, and its finalizer runs when the object dies, not
+// when the mapping goes. So: a kept object's first and last words survive a churn of
+// objects of the same class and of another large size, an object put where a dead
+// one was starts zeroed, and each churned object's string is freed. That a mapping
+// is reused is checked at the C interface (gc_model_test.cpp); a run cannot see it.
+TEST_CASE("gc: objects larger than a block survive while held and start zeroed") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Big;   int v; int pad[10000]; string tag; endclass
+            class Other; int v; int pad[13000]; endclass
+            Big   kept, sink;
+            Other other;
+            task automatic churn();
+                repeat (6) begin
+                    for (int i = 0; i < 40; i++) begin
+                        sink           = new;
+                        sink.v         = 32'h5A5A5A5A;
+                        sink.pad[9999] = 32'h5A5A5A5A;
+                        sink.tag       = "junk";
+                        other          = new;
+                        other.pad[0]   = 32'h5A5A5A5A;
+                    end
+                    #1;
+                end
+            endtask
+            initial begin
+                int bad;
+                bad            = 0;
+                kept           = new;
+                kept.v         = 42;
+                kept.pad[9999] = 43;
+                kept.tag       = "kept";
+                churn();
+                if (kept.v != 42 || kept.pad[9999] != 43 || kept.tag != "kept") bad++;
+                if (kept.pad[0] != 0 || kept.pad[5000] != 0) bad++;
+                sink  = new;
+                if (sink.v != 0 || sink.pad[9999] != 0 || sink.tag != "") bad++;
+                $display("big %0d", bad);
+            end
+        endmodule
+    )";
+    const std::string expected = "big 0\n";
+    check_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 10u);
+    CHECK(st.owned_bytes == 0u);
 }
