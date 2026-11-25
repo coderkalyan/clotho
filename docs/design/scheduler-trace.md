@@ -1,16 +1,19 @@
 # Scheduler trace and rule checker
 
-Status: phase 1 landed (2026-11-25): `spawn`, `park`, `wake`, `dispatch`, `resume`, `end`
-and `slot`, the control table, and the R5 checks (wake, dispatch, resume, end), in
-`src/runtime/TraceCheck.cpp`; `region`, `nba`, `pend`, `trigger`, `finish` and `change` events
-and their rules are phases 2-4. Measured at landing (Debug, extra asserts, `ctest -j2`, one
-run each at load ~11): 268 s with the checker, 290 s with `CLOTHO_NO_TRACE_CHECK=1`, no
-violation in 114 test files; a Release build without extra asserts has no `rt_trace` symbol.
-Reintroducing B51 locally is reported as R5.1 at t=3; `p.kill()` of an always parked at its
-static control (S1 x R23) is not reported, because the force wake is a legal wake. Step 3 of the plan in
-`scheduler-rules.md` §1. R, S and B ids are that document's §3, §2 and §4, and its caveat
-applies: no rule is checked against the LRM text, and clauses are cited only as the code
-and `docs/LRM_NOTES.md` cite them.
+Status: phases 1 and 2 landed (2026-11-25). Phase 1: `spawn`, `park`, `wake`, `dispatch`,
+`resume`, `end` and `slot`, the control table and the R5 checks. Phase 2: `region`, `nba_create`
+(`nba_stage` and `nba_release` for timed updates), `nba_pass`, `pend`, `trigger`, `slot_end` and
+`finish`, and the checks of R12, R20 and R24; `change` and its rules are phases 3-4, all in
+`src/runtime/TraceCheck.cpp`. Measured (Debug, extra asserts, `ctest -j2`, load ~7): 226 s and
+230.6 s with the checker, 221 s with `CLOTHO_NO_TRACE_CHECK=1` (+2%, inside the 15% budget); no
+violation in 5429 in-process runs, every staging path created at least once. With the fixes
+reverted locally, the regression tests of B42 (R12.2), B38 (R12.1), B41 (R20.2), B21 (R20.1) and
+B37 (R24.2) fail with the rule named; B40 is covered by a hand-built sequence only. The Release
+build without extra asserts was not rebuilt for phase 2. `cli_test` ("-G overrides a type
+parameter") fails independent of the trace. Reintroducing B51 is reported as R5.1 at t=3.
+Step 3 of the plan in `scheduler-rules.md` §1. R, S and B ids are that document's §3, §2 and §4,
+and its caveat applies: no rule is checked against the LRM text, and clauses are cited only as
+the code and `docs/LRM_NOTES.md` cite them.
 
 The generated code and the runtime report each scheduling event to a checker in the
 runtime, which tests the rules of §3 as predicates over those events while the run goes
