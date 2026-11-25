@@ -399,6 +399,25 @@ TEST_CASE("inside: a container of strings as a set member") {
     CHECK(out == "1 1\n0\n1 0\n0 1\n1\n0\n1 0\n0\n1\n1\n1 0\n");
 }
 
+// A `$` bound over strings (LRM 11.4.13) used to abort in slang
+// (patches/slang-string-unbounded-range.patch). A string has no lowest or highest
+// value, so `["m":$]` is "at least m" and `[$:"m"]` "at most m". No oracle parses
+// this form; the expectations are the clause's.
+TEST_CASE("inside: an unbounded bound over strings") {
+    const std::string out = run_capture(R"(
+        module m;
+          string s;
+          initial begin
+            s = "q"; $display("%b %b", s inside {["m":$]}, s inside {[$:"m"]});
+            s = "c"; $display("%b %b", s inside {["m":$]}, s inside {[$:"m"]});
+            s = "q";
+            case (s) inside ["m":$]: $display("hi"); default: $display("lo"); endcase
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0\n0 1\nhi\n");
+}
+
 // Unsupported forms fail loudly (PRINCIPLES.md: never silently accept).
 TEST_CASE("inside: unsupported forms are rejected") {
 

@@ -302,6 +302,12 @@ FetchContent_Declare(
   # expression. The value now parses as a data type when it is no expression, and the
   # override reaches the type parameter's builder through the hierarchy override node,
   # keyed by its declarator like a value parameter's (LRM 6.20.3, 23.10.2). Not upstream.
+  # slang-string-unbounded-range: `s inside {["m":$]}` and `case (s) inside ["m":$]`
+  # (IEEE 1800-2023 11.4.13) aborted in ConversionExpression::makeImplicit's assertion:
+  # ValueRangeExpression::propagateType converted the `$` bound to `string`, which
+  # an unbounded literal is not assignable to. A `$` over strings now stays unconverted;
+  # a string has no lowest or highest value, so the side bounds nothing. Not upstream.
+  #
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  "-DPATCH_SET_HASH=${clotho_slang_patch_hash}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
