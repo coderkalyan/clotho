@@ -60,8 +60,6 @@ Milestones, in order; lower ones unblock higher ones:
   in the per-call frame, not static storage. Automatic variables are illegal NBA targets.
 - [ ] **Bulk default reset of an automatic aggregate (performance)** (6.21) — the Table 6-7
   default is stored per leaf; a trivially copyable aggregate could copy its prototype image.
-- [ ] **`$strobe` / `$monitor` in a function** — the deferred body needs a task-call record slot,
-  which a function lacks.
 
 ### Memories & arrays
 
@@ -70,7 +68,7 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Unpacked-array slices** (7.4.5) — two slice shapes are still refused.
   - [ ] **Slice of an array with struct or array elements** — refused.
   - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
-    or `%p` argument is refused.
+    or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
 - [ ] **Sliced memory target for `$readmem*` / `$fread`** — a slice destination is refused.
 
 ### Elaboration & structure
@@ -208,8 +206,6 @@ Milestones, in order; lower ones unblock higher ones:
   one `$var` per leaf.
 - [ ] **VCD of a container or class-handle signal** — a dump over a queue, dynamic array,
   associative array or class handle is refused.
-- [ ] **`$monitor` with `$time` or `%t` in its arguments** (21.2.2) — change detection
-  compares rendered output, so it reprints every time step.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
 - [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
