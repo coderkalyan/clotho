@@ -16,17 +16,10 @@ key components; P3 added associative-array key components (completing the
 LRM's example); P4 fixed four independent correctness debts found while
 scoping (§7).
 
-One scope boundary beyond the original plan: a class handle anywhere inside a
-VARIABLE key (a key containing a string / queue / dynamic-array / associative-
-array component) is refused loudly (`guard_key_no_handle_in_variable`,
-lower/Types.cpp). The collector's key-handle trace is a compile-time STATIC offset
-table, correct only for a FIXED key; a variable key's byte offsets depend on
-runtime data, so a handle inside one could land at a different offset per
-entry. A runtime decode walk the collector could use instead was not built.
-A handle in an otherwise-fixed key (P0's bare handle keys, or one nested only
-through fixed struct/array members) is unaffected -- its static offset already
-works, verified under `--gc-stress` with heavy allocation churn around a live
-keyed entry.
+A class or event handle may sit anywhere in a key, variable-length ones included.
+The collector finds it by walking the key bytes as this encoding wrote them, from a
+shape the backend emits per key type (`garbage-collection.md` §3.3a). The decode
+side of that walk is the one piece of this encoding the runtime also has to know.
 
 ## 1. What the LRM requires
 
@@ -152,7 +145,7 @@ protect it.
 | unpacked struct or array containing an **associative array** (P3) | works |
 | **queue**, **dynamic array**, **associative array** as the key itself (P2/P3) | works |
 | any nesting of the above to arbitrary depth (queue of queues, assoc of structs of strings, ...) | works |
-| a class handle combined with a string / queue / dynamic-array / associative-array component | refused (GC-safety scope boundary, see header) |
+| a class or event handle combined with a string / queue / dynamic-array / associative-array component, at any nesting | works |
 | a non-lvalue dynamic-array / associative-array key expression (a literal, a slice, an in-place call result) | refused (needs the dynamic-array/assoc twin of `materialize_queue_rvalue`) |
 | real / real-containing | rejected by slang — correct, 7.8.5 |
 

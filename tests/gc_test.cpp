@@ -1211,10 +1211,10 @@ TEST_CASE("gc: the queue walker follows ring wraparound") {
 // An associative array KEYED by a class handle (LRM 7.8.3). The key is a strong
 // reference and the collector has to decode it out of the normalized key bytes,
 // where the handle's 64 bits were big-endian-encoded (emit_key_bytes,
-// ir/llvm/AssocArrays.cpp, emit_agg_key_bytes/normalize_agg_key). This is the ONE-ENTRY case of the key-handle offset
-// table: `nkeyhandles == 1` at offset 0 (Runtime.h:937-946). It is the only shape the
+// ir/llvm/AssocArrays.cpp, emit_agg_key_bytes/normalize_agg_key). This is the ONE-WORD case of the key
+// shape: `{ handle }` (Runtime.h, rt_key_*). It is the only shape the
 // deleted RT_ELEM_FLAG_KEY_HANDLE bit could express, so keeping it here is what pins
-// that generalizing one flag into a table did not cost the degenerate case. Here the
+// that generalizing one flag into a shape did not cost the degenerate case. Here the
 // VALUE is a plain int, so the key path is the only reference to any of these four
 // objects and a collector that traces element payloads but not keys frees all of them.
 //
@@ -1563,14 +1563,11 @@ TEST_CASE("gc: a dropped UVM-shaped tree of assoc children is reclaimed") {
 
 // The key shape P4 refused and this phase describes: an associative array whose KEY
 // is an unpacked struct or fixed array CONTAINING a class handle. What replaced the
-// one-bit RT_ELEM_FLAG_KEY_HANDLE is an OFFSET TABLE -- `nkeyhandles` entries in
-// `keyhandles`, each naming 8 big-endian bytes inside one normalized key span
-// (Runtime.h:937-957) -- so a handle at any offset, and several handles per key, are
-// describable. Lowering always admitted the shape (a class handle's value_cat is
-// `scalar`, lower/Types.cpp) and guard_agg_key_leaves (lower/Types.cpp) still refuses
-// only the leaves with no fixed width, so the refusal that used to stand here is
-// replaced by survival cases rather than deleted: the alternative to the guard was
-// freeing an object whose only reference is inside a key.
+// one-bit RT_ELEM_FLAG_KEY_HANDLE is a SHAPE -- `nkeyshape` words in `keyshape`
+// that say where each 8 big-endian bytes of a handle sit inside one normalized key
+// span (Runtime.h, rt_key_*) -- so a handle at any offset, and several handles per
+// key, are describable. The cases of this section are the fixed layouts; a key
+// that holds a string or a container is at the end of this file.
 //
 // There are two independent ways to get the table wrong, and the cases below are
 // chosen to separate them:
@@ -1821,8 +1818,8 @@ TEST_CASE("gc: several objects held only in the SAME struct assoc KEY survive") 
 // Depth-first leaf order, through a fixed unpacked ARRAY and then a nested STRUCT:
 // the span is pre[0], pre[1], pre[2], in.c, in.tail, so the handle is at serialized
 // offset 3. Nothing about that offset is guessable from the type's shape -- it is
-// three `byte` leaves of an array, which the offset walk has to enter and stride
-// through at 1 byte per element (agg_key_handle_offsets, ir/llvm/GcEmit.cpp).
+// three `byte` leaves of an array, which the shape walk has to enter and stride
+// through at 1 byte per element (key_shape, ir/llvm/GcEmit.cpp).
 // Storage puts `pre` in bytes 0..2 and then aligns `in` to 8, so a storage-offset
 // walk starts on byte 8 of a 15-byte span -- inside it, past the handle, and running
 // one byte off the end.
@@ -1908,8 +1905,8 @@ TEST_CASE("gc: a handle nested under an array and a struct inside an assoc KEY s
 
 // The other nesting direction: a fixed unpacked array OF HANDLES, inside a nested
 // struct, behind an int. The span is lead, in.pair[0], in.pair[1], in.tag_id, so the
-// table has two entries at 4 and 12 and the walk has to stride the array by 8
-// (agg_key_handle_offsets, ir/llvm/GcEmit.cpp) rather than by the element's
+// shape has two handles at 4 and 12 and the walk has to stride the array by 8
+// (key_shape, ir/llvm/GcEmit.cpp) rather than by the element's
 // storage size. Storage would say 8 and 16.
 TEST_CASE("gc: an assoc KEY holding a fixed array of handles keeps every element") {
     constexpr std::string_view src = R"(
@@ -2567,10 +2564,11 @@ TEST_CASE("gc: a fresh object mapped into an assoc property of a promoted object
 // KEY is a class handle and whose value is a plain int (§3's bare handle-key case is
 // the same map in design state). The four fresh objects exist nowhere but in the
 // normalized key bytes of entries inside a promoted object, so a young collection
-// reaches them only by remembering the owner and then decoding the key-handle offset
-// table -- here in its one-entry form, `nkeyhandles == 1` at offset 0
-// (Runtime.h:937-946) -- during its leaf walk. A barrier emitted at handle STORES
-// alone misses this entirely: no handle is stored here, one is hashed.
+// reaches them only by remembering the owner and then walking the key shape
+// -- here in its one-word form, `{ handle }` (Runtime.h, rt_key_*) --
+// during its leaf walk. This case pins that walk, not the key's own barrier: the
+// int value store logs the owner as every store through one does, so the barrier
+// beside the key write is pinned by the string-valued case at the end of this file.
 //
 // Failure mode: all four keys are freed while the map still holds them; the filler
 // recycles the lines, and the first/next readback either sums 0x5A5A5A5A values or
@@ -2649,16 +2647,15 @@ TEST_CASE("gc: an object held only as an assoc KEY inside a promoted object surv
 // The generational case for the key TABLE rather than for its one-entry form: the
 // promoted-owner shape directly above, but the key is an unpacked struct whose handle
 // sits at serialized offset 4 instead of a bare handle at 0. Both halves have to work
-// at once, and each fails differently. The write barrier has to log `bag` at a store
-// that writes no handle anywhere -- one is HASHED into the key span -- which is why
-// the barrier hangs off the assoc lvalue's `assoc_key_handle` on the entry-CREATING
-// put_ptr path (ir/llvm/AssocArrays.cpp, assoc_elem_lvalue) rather than off any handle store -- and then the
+// at once, and each fails differently. The owner has to be logged at an assignment
+// that writes no handle anywhere -- one is HASHED into the key span -- and then the
 // young collection's re-walk of that single remembered owner has to decode the handle
-// back out of the span at the offset the table names. A barrier keyed on handle
-// stores never logs the owner; a barrier that fires paired with a walk that reads
+// back out of the span at the offset the shape names. A walk that reads
 // offset 0 (the flag-bit shape) or offset 8 (the member's storage offset) marks
 // nothing, because the object-start bitmap rejects the `int i` bytes and the
-// past-the-end read alike.
+// past-the-end read alike. The int value store logs the owner here, so the barrier
+// beside the key write (ir/llvm/AssocArrays.cpp, assoc_elem_lvalue) is pinned by
+// the string-valued case at the end of this file instead.
 //
 // full_every_never is what makes this a statement about the YOUNG path: under a run
 // with full collections in it, a full trace reaches the map from the root a safepoint
@@ -4649,4 +4646,357 @@ TEST_CASE("gc: an object survives the collection that binding its event property
     const rt_gc_stats ss       = run_stats(src, expected, cadence_stress);
     CHECK(ss.emergency_collections > 0u);
     CHECK(run_capture(src, gc_cfg(cadence_ordinary)) == expected);
+}
+
+// -- Handles inside variable-length associative keys ---------------------------
+//
+// A key that holds a string or a container has no fixed layout, so the collector
+// cannot find its handles by offset: it walks the key bytes by a shape the backend
+// emits (Runtime.h, rt_key_*; ir/llvm/GcEmit.cpp, key_shape), the way the
+// serializer wrote them. Every case below holds its objects ONLY in key bytes, runs
+// §2's filler, and reads the objects back through `first` / `next`, which decode the
+// key into a variable and dereference what comes out. Each also looks every key up
+// again and deletes it, since a key that survives has to stay a findable key.
+//
+// `types` declares `k_t`; `build` fills `k` for entry `i` from `mk(v)`, which makes
+// a cell holding `v`; `read` adds what entry `k` holds to `s`.
+static std::string key_design(std::string_view types, std::string_view build, std::string_view read) {
+    std::string src = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            @TYPES@
+            int  keyed[k_t];
+            bit  clk;
+            Junk sink;
+            initial begin
+                clk = 0;
+                for (int i = 0; i < 32; i++) #5 clk = ~clk;
+            end
+            always @(negedge clk) begin
+                for (int i = 0; i < 64; i++) begin
+                    sink = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+            function automatic Cell mk(input int v);
+                Cell c;
+                c     = new;
+                c.v   = v;
+                c.tag = "key-var";
+                return c;
+            endfunction
+            function automatic event fresh();
+                event e;
+                return e;
+            endfunction
+            function automatic string pad(input int n);
+                string s;
+                s = "";
+                repeat (n) s = {s, "x"};
+                return s;
+            endfunction
+            function automatic int cell_v(input Cell c);
+                return c.tag == "key-var" ? c.v : 1000000;
+            endfunction
+            function automatic void install(input int base);
+                for (int i = 0; i < 4; i++) begin
+                    k_t k;
+                    @BUILD@
+                    keyed[k] = (base + i) * 2;
+                end
+            endfunction
+            function automatic int walk();
+                k_t k;
+                int s;
+                s = 0;
+                if (keyed.first(k)) begin
+                    do begin
+                        @READ@
+                        if (!keyed.exists(k)) s = s + 1000000;
+                        s = s + keyed[k];
+                    end while (keyed.next(k));
+                end
+                return s;
+            endfunction
+            function automatic int drain();
+                k_t k;
+                while (keyed.first(k)) keyed.delete(k);
+                return keyed.num();
+            endfunction
+            initial begin
+                install(61);
+                repeat (6) @(posedge clk);
+                $display("%0d %0d %0d", keyed.num(), walk(), drain());
+            end
+        endmodule
+    )";
+    const auto put = [&](std::string_view token, std::string_view text) {
+        for (size_t at = src.find(token); at != std::string::npos; at = src.find(token)) {
+            src.replace(at, token.size(), text);
+        }
+    };
+    put("@TYPES@", types);
+    put("@BUILD@", build);
+    put("@READ@", read);
+    return src;
+}
+
+// One case in design state: both cadences print the same thing, and the stress
+// cadence collected at all.
+static void check_key_case(const std::string& src, const std::string& expected) {
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0u);
+}
+
+// A handle beside a string, on either side of it. Behind the string the handle's
+// offset depends on the string's length, which differs per entry here.
+TEST_CASE("gc: an object held only in a key with a string member survives") {
+    constexpr std::string_view build = "k.h = mk(base + i); k.s = pad(i + 1);";
+    constexpr std::string_view read  = "s = s + cell_v(k.h) + k.s.len();";
+    SUBCASE("the handle before the string") {
+        check_key_case(key_design("typedef struct { Cell h; string s; } k_t;", build, read), "4 760 0\n");
+    }
+    SUBCASE("the handle behind the string") {
+        check_key_case(key_design("typedef struct { string s; Cell h; } k_t;", build, read), "4 760 0\n");
+    }
+    SUBCASE("a fixed array of handles behind the string") {
+        check_key_case(key_design("typedef struct { string s; Cell a[2]; } k_t;",
+                                  "k.a[0] = mk(base + i); k.a[1] = mk(base + i + 100); k.s = pad(i + 1);",
+                                  "s = s + cell_v(k.a[0]) + cell_v(k.a[1]) + k.s.len();"),
+                       "4 1410 0\n");
+    }
+}
+
+// The key IS a container of handles: a count, then that many handles. Each entry
+// has a different count.
+TEST_CASE("gc: objects held only in a queue or dynamic array key survive") {
+    constexpr std::string_view read = "foreach (k[j]) s = s + cell_v(k[j]);";
+    SUBCASE("a queue of handles") {
+        check_key_case(key_design("typedef Cell k_t[$];",
+                                  "k.delete(); for (int j = 0; j <= i; j++) k.push_back(mk(base + i + 10 * j));",
+                                  read),
+                       "4 1230 0\n");
+    }
+    SUBCASE("a dynamic array of handles") {
+        check_key_case(key_design("typedef Cell k_t[];",
+                                  "k = new[i + 1]; foreach (k[j]) k[j] = mk(base + i + 10 * j);", read),
+                       "4 1230 0\n");
+    }
+    SUBCASE("a queue of structs, each a string and a handle") {
+        check_key_case(
+          key_design("typedef struct { string s; Cell h; } e_t; typedef e_t k_t[$];",
+                     "k.delete(); for (int j = 0; j <= i; j++) begin e_t e; e.s = pad(j + 1); "
+                     "e.h = mk(base + i + 10 * j); k.push_back(e); end",
+                     "foreach (k[j]) s = s + cell_v(k[j].h) + k[j].s.len();"),
+          "4 1250 0\n");
+    }
+    SUBCASE("a queue of queues of handles") {
+        check_key_case(
+          key_design("typedef Cell row_t[$]; typedef row_t k_t[$];",
+                     "k.delete(); for (int j = 0; j <= i; j++) begin row_t r; r.delete(); "
+                     "r.push_back(mk(base + i + 10 * j)); r.push_back(mk(base + i + 10 * j + 1000)); "
+                     "k.push_back(r); end",
+                     "foreach (k[j]) foreach (k[j][x]) s = s + cell_v(k[j][x]);"),
+          "4 11960 0\n");
+    }
+}
+
+// The key is an associative array. Its entries are serialized as a key length, the
+// nested array's own key bytes and the value, so a handle can be in the nested key,
+// in the nested value, or in a nested key that is itself variable.
+TEST_CASE("gc: objects held only in an associative array used as a key survive") {
+    SUBCASE("the nested key is a handle") {
+        check_key_case(
+          key_design("typedef int k_t[Cell];",
+                     "k.delete(); for (int j = 0; j <= i; j++) k[mk(base + i + 10 * j)] = j;",
+                     "begin Cell c; if (k.first(c)) do s = s + cell_v(c) + k[c]; while (k.next(c)); end"),
+          "4 1240 0\n");
+    }
+    SUBCASE("the nested value is a handle and the nested key a string") {
+        check_key_case(
+          key_design("typedef Cell k_t[string];",
+                     "k.delete(); for (int j = 0; j <= i; j++) k[pad(j + 1)] = mk(base + i + 10 * j);",
+                     "begin string n; if (k.first(n)) do s = s + cell_v(k[n]) + n.len(); while (k.next(n)); end"),
+          "4 1250 0\n");
+    }
+    SUBCASE("the nested key is a struct of a string and a handle") {
+        check_key_case(
+          key_design("typedef struct { string s; Cell h; } nk_t; typedef int k_t[nk_t];",
+                     "k.delete(); for (int j = 0; j <= i; j++) begin nk_t n; n.s = pad(j + 1); "
+                     "n.h = mk(base + i + 10 * j); k[n] = j; end",
+                     "begin nk_t n; if (k.first(n)) do s = s + cell_v(n.h) + n.s.len() + k[n]; "
+                     "while (k.next(n)); end"),
+          "4 1260 0\n");
+    }
+}
+
+// The same walk finds an event handle. An event has no value to read back, so the
+// readback triggers it: on a reclaimed object that reads a waiter list out of
+// whatever took its place.
+TEST_CASE("gc: events held only in a variable-length key survive") {
+    SUBCASE("an event beside a string") {
+        check_key_case(key_design("typedef struct { string s; event e; } k_t;",
+                                  "k.e = fresh(); k.s = pad(i + 1);",
+                                  "-> k.e; s = s + k.e.triggered + k.s.len();"),
+                       "4 514 0\n");
+    }
+    SUBCASE("a queue of events") {
+        check_key_case(key_design("typedef event k_t[$];",
+                                  "k.delete(); for (int j = 0; j <= i; j++) k.push_back(fresh());",
+                                  "foreach (k[j]) begin -> k[j]; s = s + k[j].triggered; end"),
+                       "4 510 0\n");
+    }
+}
+
+// The array is a property of an object that is old by the time the keys go in, in
+// a young-only run. Creating an entry puts handles into the owner's key storage
+// without storing a handle anywhere, so the write barrier has to fire where the key
+// is written. The VALUE is a string so that nothing else can remember the owner: a
+// store of any other value through the owner logs it too, which would let this
+// pass with the key's barrier gone.
+TEST_CASE("gc: a key created in an old object's array survives young collections") {
+    std::string src = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            @TYPES@
+            class Bag;  string name; string keyed[k_t]; endclass
+            Bag  bag;
+            bit  clk;
+            Junk sink;
+            initial begin
+                clk = 0;
+                for (int i = 0; i < 96; i++) #5 clk = ~clk;
+            end
+            always @(negedge clk) begin
+                for (int i = 0; i < 128; i++) begin
+                    sink = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+            function automatic Cell mk(input int v);
+                Cell c;
+                c     = new;
+                c.v   = v;
+                c.tag = "key-into-old";
+                return c;
+            endfunction
+            function automatic void stash(input Bag b, input int base);
+                string pad;
+                pad = "";
+                for (int i = 0; i < 4; i++) begin
+                    k_t k;
+                    pad = {pad, "x"};
+                    @BUILD@
+                    b.keyed[k] = pad;
+                end
+            endfunction
+            function automatic int walk();
+                k_t k;
+                int s;
+                s = 0;
+                if (bag.keyed.first(k)) begin
+                    do begin
+                        Cell c;
+                        @READ@
+                        s = s + (c.tag == "key-into-old" ? c.v : 1000000) + bag.keyed[k].len();
+                    end while (bag.keyed.next(k));
+                end
+                return s;
+            endfunction
+            initial begin
+                bag      = new;
+                bag.name = "long-lived-bag";
+                repeat (16) @(posedge clk);
+                stash(bag, 61);
+                repeat (16) @(posedge clk);
+                $display("%0d %0d", bag.keyed.num(), walk());
+            end
+        endmodule
+    )";
+    const auto put = [&](std::string_view token, std::string_view text) {
+        src.replace(src.find(token), token.size(), text);
+    };
+    SUBCASE("the key is a handle") {
+        put("@TYPES@", "typedef Cell k_t;");
+        put("@BUILD@", "k = mk(base + i);");
+        put("@READ@", "c = k;");
+    }
+    SUBCASE("the key is a string and a handle") {
+        put("@TYPES@", "typedef struct { string s; Cell h; } k_t;");
+        put("@BUILD@", "k.s = pad; k.h = mk(base + i);");
+        put("@READ@", "c = k.h;");
+    }
+    // Cells 61..64 (250) plus value lengths 1..4 (10).
+    const std::string expected = "4 260\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats yg =
+      run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.collections > 1u);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
+    CHECK(yg.remembered > 0u);
+}
+
+// The array is local to a task that is suspended while the collector runs, so it
+// is reached as a registered container of that activation, not through a root
+// table or an object's map.
+TEST_CASE("gc: a variable-length key in an array local to a suspended task survives") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            typedef struct { string s; Cell h; } k_t;
+            bit  clk;
+            Junk sink;
+            initial begin
+                clk = 0;
+                for (int i = 0; i < 32; i++) #5 clk = ~clk;
+            end
+            always @(negedge clk) begin
+                for (int i = 0; i < 64; i++) begin
+                    sink = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+            function automatic Cell mk(input int v);
+                Cell c;
+                c     = new;
+                c.v   = v;
+                c.tag = "key-local";
+                return c;
+            endfunction
+            task automatic hold();
+                int keyed[k_t];
+                k_t k;
+                int s;
+                for (int i = 0; i < 4; i++) begin
+                    k.h = mk(61 + i);
+                    k.s = {k.s, "x"};
+                    keyed[k] = (61 + i) * 2;
+                end
+                k.h = null;
+                repeat (6) @(posedge clk);
+                s = 0;
+                if (keyed.first(k)) begin
+                    do s = s + (k.h.tag == "key-local" ? k.h.v : 1000000) + k.s.len() + keyed[k];
+                    while (keyed.next(k));
+                end
+                $display("%0d %0d", keyed.num(), s);
+            endtask
+            initial hold();
+        endmodule
+    )";
+    const std::string expected = "4 760\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    // `container_roots` cannot witness the registration: it counts the last
+    // collection's, and by then the task has returned. The values are the oracle.
+    CHECK(st.collections > 0u);
 }

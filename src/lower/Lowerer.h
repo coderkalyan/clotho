@@ -1353,12 +1353,6 @@ private:
 
     void guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr);
 
-    bool key_type_is_variable(ir::Ref type) const;
-
-    bool key_type_has_class_handle(ir::Ref type) const;
-
-    void guard_key_no_handle_in_variable(ir::Ref key_ty);
-
     void guard_container_element(const slang::ast::Type& et, ir::Ref er, std::string_view what);
 
     ir::Ref lower_type(const slang::ast::Type& type);

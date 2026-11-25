@@ -408,34 +408,53 @@ are the only copy of the handle**. The entry is a strong reference: `m[obj] = 1`
 `obj` alive, and `m.first(k)` hands the handle back for dereference. The collector
 therefore has to decode handles out of key bytes and mark them.
 
-`rt_elem_ops` carries `nkeyhandles` / `keyhandles` for that — an offset **list**, not a
-flag. A flag can only say "the key *is* a handle", which covers `int m[Cell]` and
-nothing else. An aggregate key is serialized leaf by leaf, depth first, in declaration
-order, with `ceil(W/8)` bytes per leaf and no padding (`assoc-keys.md` §2), so a handle
-can sit at any offset and a struct can carry several:
+`rt_elem_ops` carries `nkeyshape` / `keyshape` for that: a **program**, not a flag and
+not a table of offsets. A flag can only say "the key *is* a handle", which covers
+`int m[Cell]` and nothing else. An offset table covers a key of fixed layout, where a
+handle can sit at any offset and a struct can carry several, but not a key that holds
+a string or a container, whose layout differs per entry:
 
 ```systemverilog
 typedef struct { byte b; Cell c; shortint s; } off_t;  // handle at byte 1
-typedef struct { Cell a; int i; Cell b; }      two_t;  // handles at 0 and 12
+typedef struct { string s; Cell c; }           var_t;  // handle behind the string
+typedef Cell                                   row_t[$]; // a count, then handles
 int m[off_t];
-int n[two_t];
+int n[var_t];
+int q[row_t];
 ```
 
-Both work; a bare `int n[Cell]` is the one-entry case of the same table, `{ 0 }`, not a
-separate path. Each offset names 8 big-endian bytes, and a handle is unsigned, so there
-is no sign flip to undo.
+The shape is a sequence of nodes in serialization order (`Runtime.h`, `rt_key_*`):
 
-**The offsets are serialized, not storage.** That is the one thing to get right here: a
+| node | bytes it describes |
+|---|---|
+| `skip n` | `n` bytes that hold no handle |
+| `handle` | 8 big-endian bytes, a class or event handle (unsigned, so no sign flip) |
+| `string` | a `u32` length, then that many bytes |
+| `seq w body` | a `u32` count, then the body per element (queue, dynamic array) |
+| `rep n w body` | the body `n` times (fixed unpacked array) |
+| `map kw vw key value` | a `u32` count, then per entry a `u32` key length, the nested array's own key bytes and the value |
+
+A bare `int n[Cell]` is the one-word program `{ handle }`, not a separate path. A key
+type that can reach no handle has no shape at all, and `nkeyshape != 0` is what the
+write barrier asks too. Inside a shape every node is complete, handle or not, because
+the walk has to get past the bytes. The one exception is a nested array's key: it
+travels behind its own length, so it is passed over by that length when it holds no
+handle, which is also the only way past a bare string key.
+
+**The shape is serialized, not storage.** That is the one thing to get right here: a
 `getStructLayout` shortcut would place the handle after the struct's padding and decode
 the wrong bytes — passing every same-offset test and failing the moment a `byte` or a
-`shortint` precedes the handle. The backend's `agg_key_handle_offsets` is deliberately
-the third walk in the same three-arm shape as `agg_key_bytes` (which sizes the span) and
-`emit_agg_key_bytes` (which writes it), which is what makes the offsets provably the
-ones the serializer produces.
+`shortint` precedes the handle. The backend's `key_shape` (`ir/llvm/GcEmit.cpp`)
+follows the serializers arm for arm: `agg_key_bytes` (which sizes a fixed span),
+`emit_agg_key_bytes` and `emit_variable_agg_key_bytes` (which write one).
+
+The collector's `walk_key` (`runtime/Gc.cpp`) interprets it with an explicit stack and
+checks every read against the end of the key: the shape and the bytes come from two
+places, and a disagreement ends the run instead of reading past the key.
 
 Verified with the objects reachable *only* through key bytes, against a filler that
-recycles and poisons freed lines: a handle after a `byte`, and two handles in one key,
-both survive 39 stress collections and decode back correctly through `m.first()`.
+recycles and poisons freed lines, for every shape above and their nestings
+(`tests/gc_test.cpp`).
 
 ### 3.4 chandle disambiguation
 
@@ -1275,9 +1294,8 @@ validate-on-trace as the canonical pair.
 - **Nothing is refused that was accepted before the collector existed.** Every guard this work
   introduced has since been lifted: class handles as container elements and aggregate
   leaves (P4, §3.3), and an associative-array key containing a class handle (§3.3a).
-- Event handles are traced like class handles (`types::is_object_handle`). One
-  refusal came with that: an event inside a variable-length associative key, for
-  the reason a class handle there is refused (§3.3a).
+- Event handles are traced like class handles (`types::is_object_handle`), in every
+  place one can sit, a variable-length associative key included (§3.3a).
 - `std::weak_reference` — already loud (`lower/Classes.cpp, lower_class_type`).
 - Virtual interfaces (`src/lower/`) — unrelated to GC, but another
   handle-shaped family; whether it becomes GC-managed is that design's question.
