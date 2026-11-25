@@ -2271,14 +2271,19 @@ void rt_inertial_cb(rt_timer* timer, void* ctx);
 // OBJECT (rt_event::trig), fired wherever that object is triggered (`-> e`, and
 // the NBA-region service of `->> e`): an event wakes through its object, not
 // through a value change, and the record waits on the object its variable named
-// when the statement executed (LRM 15.5.5.1). An id is never reused within a run,
-// so the key cannot go stale.
+// when the statement executed (LRM 15.5.5.1). An id is its object's for as long as
+// the object is reachable. The collector drops what waits on an event it did not
+// reach and only then hands the id out again, so the key cannot go stale.
 enum { RT_TRIG_EVENT = 0x80000000u };
 
 // The trigger id of the event object at `obj`: RT_TRIG_EVENT | its id, which the
 // first call assigns. A fire reads rt_event::trig directly and skips an object
-// that was never a control.
+// that was never a control. The caller registers on the id before anything
+// allocates a collected object.
 uint32_t rt_event_trig_id(void* obj);
+
+// How many event objects hold a trigger id now.
+uint32_t rt_event_control_count(void);
 
 // Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
 void rt_intra_event_register(uint32_t trig_id, void* rec);

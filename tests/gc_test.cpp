@@ -5000,3 +5000,297 @@ TEST_CASE("gc: a variable-length key in an array local to a suspended task survi
     // collection's, and by then the task has returned. The values are the oracle.
     CHECK(st.collections > 0u);
 }
+
+// -- What waits on an event object ----------------------------------------------
+//
+// `x <= @(e) v` stages `v` in a record and `->> @(e) f` records `f`, both until `e`
+// is triggered. Nothing but `e` can release either, so each is reachable exactly
+// while `e` is (RuntimeInternal.h, event_gc_waiting): held while something can still
+// trigger `e`, and reclaimed with `e` otherwise, including when the staged value is
+// what names `e`.
+//
+// The targets `s` and `arr` take records that stage a handle. `stage` runs in a
+// task so that the record is the only thing naming the object once it returns, and
+// `churn` allocates what takes over a line a collection freed.
+static std::string waiting_design(std::string_view body) {
+    std::string src = R"(
+        module m;
+            class H; int x; string tag; endclass
+            class Junk; int x; string tag; endclass
+            typedef struct { int a; H h; } S_t;
+            S_t  s;
+            H    arr[2];
+            Junk keep;
+            bit  clk;
+            event e, e2;
+            function automatic H mk(input int v);
+                H h;
+                h     = new;
+                h.x   = v;
+                h.tag = "staged";
+                return h;
+            endfunction
+            function automatic S_t pack(input int v);
+                S_t t;
+                t.a = v;
+                t.h = mk(v);
+                return t;
+            endfunction
+            task automatic churn();
+                repeat (4) begin
+                    for (int i = 0; i < 300; i++) begin
+                        keep     = new;
+                        keep.x   = 32'h5A5A5A5A;
+                        keep.tag = "junk";
+                    end
+                    #1;
+                end
+            endtask
+            function automatic string show();
+                return $sformatf("%0d %0d %s", s.a, s.h.x, s.h.tag);
+            endfunction
+    )";
+    src += body;
+    src += "\n        endmodule\n";
+    return src;
+}
+
+TEST_CASE("gc: a value staged until an event survives while the event can be triggered") {
+    std::string body;
+    SUBCASE("one event") {
+        body = R"(
+            task automatic stage(); s <= @(e) pack(7); endtask
+            initial begin stage(); churn(); -> e; #1; $display("%s", show()); end
+        )";
+    }
+    SUBCASE("either of two events") {
+        body = R"(
+            task automatic stage(); s <= @(e or e2) pack(7); endtask
+            initial begin stage(); churn(); -> e2; #1; $display("%s", show()); end
+        )";
+    }
+    SUBCASE("the second occurrence of an event") {
+        body = R"(
+            task automatic stage(); s <= repeat (2) @(e) pack(7); endtask
+            initial begin stage(); churn(); -> e; #1; churn(); -> e; #1; $display("%s", show()); end
+        )";
+    }
+    SUBCASE("an event or a signal edge") {
+        body = R"(
+            task automatic stage(); s <= @(e or posedge clk) pack(7); endtask
+            initial begin stage(); churn(); clk = 1; #1; $display("%s", show()); end
+        )";
+    }
+    // The control of a nonblocking assignment cannot be an automatic variable, so an
+    // event goes out of reach by its variable taking another object.
+    SUBCASE("an event that is gone, or one that is not") {
+        body = R"(
+            event gone;
+            task automatic stage();
+                event other;
+                s <= @(gone or e) pack(7);
+                gone = other;
+            endtask
+            initial begin stage(); churn(); -> e; #1; $display("%s", show()); end
+        )";
+    }
+    SUBCASE("a whole array") {
+        body = R"(
+            task automatic stage();
+                H tmp[2];
+                tmp[1] = mk(7);
+                arr <= @(e) tmp;
+            endtask
+            initial begin
+                stage(); churn(); -> e; #1;
+                $display("7 %0d %s", arr[1].x, arr[1].tag);
+            end
+        )";
+    }
+    const std::string src      = waiting_design(body);
+    const std::string expected = "7 7 staged\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0u);
+}
+
+// The control is old and the value young, in a young-only run: a young collection
+// has no opinion about an old event, which has to read as "reachable" both for
+// tracing what waits on it and for not dropping it.
+TEST_CASE("gc: a value staged until an old event survives young collections") {
+    const std::string src = waiting_design(R"(
+            event f;
+            task automatic stage(); s <= @(e) pack(7); endtask
+            task automatic subscribe();
+                event other;
+                ->> @(e) f;
+                s.a <= @(f) 9;
+                f = other;
+            endtask
+            initial begin
+                churn(); churn();
+                stage(); subscribe();
+                churn(); churn();
+                -> e;
+                #1;
+                $display("%s", show());
+            end
+    )");
+    // The object `f` named is held by its subscription alone once `f` takes another.
+    // Triggered through the subscription, it releases the assignment of 9 one region
+    // after the staged struct lands.
+    const std::string expected = "9 7 staged\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats yg =
+      run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 1u);
+}
+
+// An event named only by a subscription on another event, two deep: reaching `a`
+// reaches the first object, and only then is the second known to be reachable, so
+// one pass over the subscriptions is not enough. Triggering `a` runs the chain,
+// which ends in an assignment to `seen`, and each trigger stamps its object --
+// which is a filler object's field if the event was freed.
+TEST_CASE("gc: events chained through subscriptions survive while the first can be triggered") {
+    const std::string src = event_design(EventStore::Trigger, R"(
+            event a, e1, e2;
+            int   seen;
+            task automatic chain();
+                event n1, n2;
+                e1 = n1;
+                e2 = n2;
+                ->> @(e1) e2;
+                ->> @(a) e1;
+                seen <= @(e2) 1;
+                e1 = null;
+                e2 = null;
+            endtask
+            initial begin
+                drop();
+                chain();
+                drop();
+                repeat (2) begin
+                    #1;
+                    fill(1000);
+                end
+                -> a;
+                #1;
+                check();
+                $display("bad=%0d held=%0d seen=%0d", bad, held.size(), seen);
+            end
+    )");
+    const std::string expected = "bad=0 held=2000 seen=1\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 0u);
+}
+
+// Reclamation. Every pass puts a new object in the control's variable, with
+// something waiting on it, so the object of the pass before is named by nothing.
+// The live count the last collection measured and the number of events still
+// holding a trigger id both stay far below the pass count.
+TEST_CASE("gc: what waits on an event nothing names is reclaimed with it") {
+    std::string body;
+    SUBCASE("a subscription") {
+        body = R"(
+            event a, f;
+            task automatic once(input int i);
+                event na, nf;
+                a = na;
+                f = nf;
+                ->> @(a) f;
+            endtask
+        )";
+    }
+    SUBCASE("a staged value") {
+        body = R"(
+            event a;
+            task automatic once(input int i);
+                event na;
+                a = na;
+                s <= @(a) pack(i);
+            endtask
+        )";
+    }
+    SUBCASE("a staged value waiting on two such events") {
+        body = R"(
+            event a, b;
+            task automatic once(input int i);
+                event na, nb;
+                a = na;
+                b = nb;
+                s <= @(a or b) pack(i);
+            endtask
+        )";
+    }
+    SUBCASE("a staged value that names the event it waits on") {
+        body = R"(
+            typedef struct { int a; event ev; H h; } E_t;
+            E_t   es;
+            event ctl;
+            task automatic once(input int i);
+                E_t   t;
+                event n;
+                t.a  = i;
+                t.ev = n;
+                t.h  = mk(i);
+                ctl  = n;
+                es <= @(ctl) t;
+            endtask
+        )";
+    }
+    body += R"(
+            initial begin
+                for (int i = 0; i < 3000; i++) begin
+                    once(i);
+                    #1;
+                end
+                $display("done");
+            end
+    )";
+    const std::string src      = waiting_design(body);
+    const std::string expected = "done\n";
+    const rt_gc_stats st       = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 1u);
+    CHECK(st.objects_allocated >= 3000u);
+    CHECK(st.objects_live < 256u);
+    // An id is given back by a collection, so the passes since the last one hold theirs.
+    CHECK(rt_event_control_count() < 1000u);
+    CHECK(run_capture(src, gc_cfg(cadence_stress)) == expected);
+}
+
+// A trigger id goes back when its event is reclaimed, and the next event to become
+// a control takes it. What waited on the first event must be gone by then: a record
+// left on the id would be released by the second event's trigger and write `y`.
+TEST_CASE("gc: an event takes a reclaimed event's trigger id without what waited on it") {
+    constexpr std::string_view src = R"(
+        module m;
+            int   x, y;
+            event a, b;
+            task automatic once(input int i);
+                event n;
+                a = n;
+                y <= @(a) i + 1;
+            endtask
+            task automatic last();
+                x <= @(b) 777;
+                -> b;
+            endtask
+            initial begin
+                for (int i = 0; i < 3000; i++) begin
+                    once(i);
+                    #1;
+                end
+                last();
+                #1;
+                $display("%0d %0d", x, y);
+            end
+        endmodule
+    )";
+    const std::string expected = "777 0\n";
+    check_both_cadences(src, expected);
+    const rt_gc_stats st = run_stats(src, expected, cadence_ordinary);
+    CHECK(st.collections > 1u);
+    CHECK(rt_event_control_count() < 1000u);
+}

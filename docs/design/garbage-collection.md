@@ -1018,8 +1018,11 @@ handle is traced wherever a class handle is. Two things are particular to it:
    frame, which records the object it is linked onto and is found by the
    conservative frame scan.
 2. The runtime's own records of an event (a pending `->> e`, a `->> #d e` timer, a
-   `->> @(x) e` subscription, a dumped event) hold a reference with no handle
-   anywhere, and are roots until they are consumed.
+   `->> @(x) e` subscription on a signal, a dumped event) hold a reference with no
+   handle anywhere, and are roots until they are consumed.
+3. What waits on an event object (the target of `->> @(c) e`, the value of
+   `x <= @(c) v`) is reachable only while `c` is, and is dropped with it
+   (`event-handles.md` §9).
 
 **`std::weak_reference` (LRM 8.30)** becomes implementable: a weak table cleared
 after marking, before sweeping. `TODO.md` already notes it presupposes a

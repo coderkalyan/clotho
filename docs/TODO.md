@@ -117,8 +117,6 @@ Milestones, in order; lower ones unblock higher ones:
     operand — suppression is decided at commit, not when the update is armed.
 - [ ] **Per-event `iff` in a multi-event list** (9.4.2.3) — `@(posedge a iff x or b)` needs
   identification of the waking source.
-- [ ] **Records waiting on a reclaimed event (performance)** (15.5.5.2) — a `x <= @(e) v` or
-  `->> @(e) f` whose control event is reclaimed keeps its record, and `f`, until the run ends.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
 - [ ] **Wake time of a `ref` write after a suspend** — a task writing a
