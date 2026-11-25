@@ -20,8 +20,9 @@ recommendation ("profile first") is discharged in regions.md §2.
 Everything runs in one JIT'd function, `sim_drain` (`emit_active_run`). A
 blocking store to a signal `s` with subscribers emits `service_wait_queue(s)`,
 which computes edge facts (pos/neg/any) and, per matching edge, scans the static
-bucket `clotho.wait.<s>.<edge>` (`emit_static_scan_rt`): for each `{handle,
-flag}` entry with `flag == 0`, push `handle` to the active FIFO and set
+bucket `clotho.wait.<s>.<edge>` (`emit_static_scan_rt`, emitted once per module
+and called from the store: `static_scan_fn` / `static_scan_port_fn`): for each
+`{handle, flag}` entry with `flag == 0`, push `handle` to the active FIFO and set
 `flag = 1`. The drain pops each handle and dispatches (thunk call / coro resume);
 each process clears its own flag at body end (re-arm).
 

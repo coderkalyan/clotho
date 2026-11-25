@@ -886,8 +886,15 @@ void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
             service_change_notify(lv, old.mm, load_lv_mm(lv), old.z,
                                   old.z != nullptr ? load_lv_z(lv) : nullptr);
         } else if (old.mm != nullptr) {
-            service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
-                               old.z != nullptr ? load_lv_z(lv) : nullptr);
+            // A dumped scalar's touch may ride on the Any bucket's scan, made only
+            // on a change (the flush ignores a touch without one either way).
+            const int32_t fold = design_uses_vcd_ && !silent_stores_ && lv.is_signal && !slot_of(lv.sig).is_array
+                                   ? vcd_index_[static_cast<uint32_t>(lv.sig)]
+                                   : -1;
+            if (service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z, old.z != nullptr ? load_lv_z(lv) : nullptr,
+                                   fold)) {
+                return;
+            }
         }
         // Mark the signal changed for the VCD dirty set. Independent of wait-queue
         // servicing: a dumped signal with no waiters still needs a touch.
@@ -1091,20 +1098,34 @@ void Backend::service_wide_window(const LValue& lv, const WideWindow& old) {
 //
 // The three buckets are serviced independently (not else-if): a 0->1 LSB
 // transition is both `changed` (any) and `pos`, so it services both buckets.
-void Backend::service_wait_queue(Signal       sig,
+//
+// `fold_vcd`: see the declaration. Only the Any bucket's port scan can take the
+// touch, so a signal without one, or whose bucket another writer scans without
+// a port, leaves it to the caller.
+bool Backend::service_wait_queue(Signal       sig,
                                  llvm::Value* old_mm,
                                  llvm::Value* new_mm,
                                  llvm::Value* old_z,
-                                 llvm::Value* new_z) {
+                                 llvm::Value* new_z,
+                                 int32_t      fold_vcd) {
     if (!signal_has_waiters(sig)) {
-        return;
+        return false;
     }
     const SignalSlot& slot = slot_of(sig);
     const EdgeFacts   f =
       emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
                       signal_has_bucket(sig, Edge::Positive), signal_has_bucket(sig, Edge::Negative),
                       signal_has_bucket(sig, Edge::Any));
+    // Saved, not asserted empty: a wake this one emits may service another
+    // signal's queues, which must not take this store's touch.
+    const std::optional<VcdFold> outer = std::exchange(vcd_fold_, std::nullopt);
+    if (fold_vcd >= 0) {
+        vcd_fold_ = VcdFold{ .sig = sig, .base = fold_vcd };
+    }
     service_wake_buckets(sig, f);
+    const bool taken = vcd_fold_.has_value() && vcd_fold_->taken;
+    vcd_fold_        = outer;
+    return taken;
 }
 
 // Fire each of `sig`'s per-edge buckets that exists behind one branch on its fact.
@@ -1329,29 +1350,49 @@ llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
 // Static sub-queue scan (one edge bucket): a loop over the persistent
 // subscriptions for this (signal, edge). The bucket's edge already matched the
 // transition (the caller guarded the whole scan), so there is no per-entry
-// edge check. Emitted via the generic runtime scan with a non-null base:
-// simplifycfg (lower_coroutines) folds a dead null guard, and a constant cap
-// still lets the optimizer unroll. Membership never changes — no compaction,
-// no length.
+// edge check. Membership never changes — no compaction, no length.
+//
+// The loop is a function of its own per module and shape, and a store site
+// holds one call to it: the scan is the bulk of a wake, and inlined at every
+// store it was most of a design's code (static_scan_fn).
 //
 // A body that reaches the signal's port (the owner's own code, or a writer of
-// another instance's signal through its binding) reads the bucket's subscriber
-// count from it, the exact count of that instance, so the scan needs no padding;
-// any other writer bakes the per-definition maximum (null-checked when twins
-// differ). The trigger bits are data for every writer (static_trig_bits).
+// another instance's signal through its binding) passes the port's {base, trig,
+// cap} triple, the exact count of that instance, so the scan needs no padding,
+// and the store's dump-var touch rides along when service_wait_queue offers it
+// (vcd_fold_). Any other writer passes the bucket, the per-definition maximum
+// (null-checked when twins differ) and the trigger bits (static_trig_bits).
 void Backend::service_static_queue(Signal sig, uint32_t edge) {
-    const auto        i    = static_cast<uint32_t>(sig);
-    const SignalSlot& s    = slots_[i];
-    llvm::Value*      base = wait_base(WaitPart::Static, sig, edge);
-    // The bucket's edge is the fact the writer's scan knows: the entries wake for this change.
-    const TraceCause why{ .kind = RT_TRACE_STATIC, .sig = sig, .fact = edge };
+    const auto                       i = static_cast<uint32_t>(sig);
+    const SignalSlot&                s = slots_[i];
+    llvm::SmallVector<llvm::Value*, 4> args;
+    llvm::Function*                  scan = nullptr;
     if (port_reachable(s)) {
-        emit_static_scan_rt(base, b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
-                            static_trig_bits(sig, edge), why);
-        return;
+        const PortLayout::Static& pl = port_of(s)->sta[edge];
+        assert(pl.trig == pl.base + 1 && pl.cap == pl.base + 2 && "the port holds a bucket's triple in order");
+        args.push_back(port_elem_ptr(s, pl.base));
+        const bool vcd = vcd_fold_.has_value() && vcd_fold_->sig == sig && edge == static_cast<uint32_t>(Edge::Any);
+        if (vcd) {
+            args.push_back(vcd_index_value(sig, vcd_fold_->base));
+            vcd_fold_->taken = true;
+        }
+        scan = static_scan_port_fn(vcd, edge);
+    } else {
+        llvm::Value* const trig      = static_trig_bits(sig, edge);
+        auto* const        none      = llvm::dyn_cast<llvm::ConstantInt>(trig);
+        const bool         trig_zero = none != nullptr && none->isZero();
+        args.push_back(wait_base(WaitPart::Static, sig, edge));
+        args.push_back(b_.getInt32(wait_sta_cap_[i][edge]));
+        if (!trig_zero) {
+            args.push_back(trig);
+        }
+        scan = static_scan_fn(wait_sta_padded_[i][edge] != 0, trig_zero, edge);
     }
-    emit_static_scan_rt(base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
-                        static_trig_bits(sig, edge), why);
+    if (trace_on()) {
+        // The storage the writer reaches, as the waiter's list names it.
+        args.push_back(storage_ptr(slot_of(sig)));
+    }
+    b_.CreateCall(scan, args);
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -1824,6 +1865,103 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
     b_.CreateCondBr(b_.CreateICmpNE(next, b_.getInt32(0)), body, done);
 
     b_.SetInsertPoint(done);
+}
+
+namespace {
+
+// An internal function of `m`, never inlined: the point is that store sites
+// share it.
+llvm::Function* shared_fn(llvm::Module& m, llvm::FunctionType* ty, const std::string& name) {
+    auto* const f = llvm::Function::Create(ty, llvm::Function::InternalLinkage, name, m);
+    f->addFnAttr(llvm::Attribute::NoInline);
+    f->addFnAttr(llvm::Attribute::NoUnwind);
+    return f;
+}
+
+} // namespace
+
+// (base ptr, cap i32[, trig i64][, traced storage ptr]). The cap is the caller's
+// constant bucket size, an argument because the function serves every bucket.
+llvm::Function* Backend::static_scan_fn(bool padded, bool trig_zero, uint32_t edge) {
+    const bool          traced = trace_on();
+    llvm::Module* const m      = &env_->llmod;
+    const auto          key    = std::make_tuple(m, padded, trig_zero, traced ? edge : 0u);
+    if (const auto it = static_scan_fns_.find(key); it != static_scan_fns_.end()) {
+        return it->second;
+    }
+    auto* const              ptr = llvm::PointerType::getUnqual(ctx_);
+    std::vector<llvm::Type*> params{ ptr, b_.getInt32Ty() };
+    if (!trig_zero) {
+        params.push_back(b_.getInt64Ty());
+    }
+    if (traced) {
+        params.push_back(ptr);
+    }
+    std::string name = std::string("clotho.notify.sta") + (padded ? ".pad" : "") + (trig_zero ? "" : ".trig");
+    if (traced) {
+        name += ".e" + std::to_string(edge);
+    }
+    llvm::Function* const f = shared_fn(*m, llvm::FunctionType::get(b_.getVoidTy(), params, false), name);
+    static_scan_fns_.emplace(key, f);
+
+    const llvm::IRBuilderBase::InsertPointGuard guard(b_);
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", f));
+    llvm::Value* const trig = trig_zero ? static_cast<llvm::Value*>(b_.getInt64(0)) : f->getArg(2);
+    TraceCause         why{ .kind = RT_TRACE_STATIC, .fact = edge };
+    if (traced) {
+        why.obj = f->getArg(f->arg_size() - 1);
+    }
+    emit_static_scan_rt(f->getArg(0), f->getArg(1), padded, trig, why);
+    b_.CreateRetVoid();
+    return f;
+}
+
+// (port triple ptr[, dump-var index i32][, traced storage ptr]). The triple is
+// {ptr base, i64 trig, i32 cap}, laid out in that order by build_ports. The
+// caller reaches the function only when the bucket's fact holds, so for the Any
+// bucket only when the value changed, which is when a dump-var touch matters.
+llvm::Function* Backend::static_scan_port_fn(bool vcd, uint32_t edge) {
+    const bool          traced = trace_on();
+    llvm::Module* const m      = &env_->llmod;
+    const auto          key    = std::make_tuple(m, vcd, traced ? edge : 0u);
+    if (const auto it = static_scan_port_fns_.find(key); it != static_scan_port_fns_.end()) {
+        return it->second;
+    }
+    auto* const              ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const              i64 = b_.getInt64Ty();
+    auto* const              i32 = b_.getInt32Ty();
+    std::vector<llvm::Type*> params{ ptr };
+    if (vcd) {
+        params.push_back(i32);
+    }
+    if (traced) {
+        params.push_back(ptr);
+    }
+    std::string name = vcd ? "clotho.notify.port.vcd" : "clotho.notify.port";
+    if (traced) {
+        name += ".e" + std::to_string(edge);
+    }
+    llvm::Function* const f = shared_fn(*m, llvm::FunctionType::get(b_.getVoidTy(), params, false), name);
+    static_scan_port_fns_.emplace(key, f);
+
+    const llvm::IRBuilderBase::InsertPointGuard guard(b_);
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", f));
+    auto* const        triple = llvm::StructType::get(ctx_, { ptr, i64, i32 });
+    llvm::Value* const desc   = f->getArg(0);
+    llvm::Value* const base   = b_.CreateLoad(ptr, b_.CreateStructGEP(triple, desc, 0));
+    llvm::Value* const trig   = b_.CreateLoad(i64, b_.CreateStructGEP(triple, desc, 1));
+    llvm::Value* const cap    = b_.CreateLoad(i32, b_.CreateStructGEP(triple, desc, 2));
+    TraceCause         why{ .kind = RT_TRACE_STATIC, .fact = edge };
+    if (traced) {
+        why.obj = f->getArg(f->arg_size() - 1);
+    }
+    emit_static_scan_rt(base, cap, false, trig, why);
+    if (vcd) {
+        llvm::Value* const idx = f->getArg(1);
+        emit_guarded_vcd_touch(vcd_touch_fn(), [&] { return llvm::SmallVector<llvm::Value*, 2>{ idx }; });
+    }
+    b_.CreateRetVoid();
+    return f;
 }
 
 // Generic dynamic-queue scan (base + length pointer values), null base =>
