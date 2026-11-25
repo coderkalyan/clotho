@@ -2100,15 +2100,14 @@ void Backend::lower_ret_void() {
 // is copied out through the trailing out-param here.
 //
 // The result is delivered BEFORE the epilogue copies output / inout formals
-// back: the operand of `return` is evaluated where the statement executes. It is
-// also what makes `return o;` of a string output `o` work, since the copy-out
-// moves the string out of the frame.
-//
-// TODO: check that order against the LRM text (13.5, and the clause on function
-// return values). It is the maintainer's reading, written without the text at
-// hand, and Icarus rejects output arguments on functions, so nothing has
-// confirmed it. tests/string_test.cpp, "a function returns the value of its own
-// output argument", pins it.
+// back: the operand of `return` is evaluated where the statement executes, and an
+// output formal is a local variable of the subroutine until the return passes it
+// back (LRM 13.5.1: arguments are copied into the subroutine area; 13.5: "Execution
+// of the return from the subroutine shall pass values from the output and inout
+// type arguments"). It is also what makes `return o;` of a string output `o`
+// work, since the copy-out moves the string out of the frame. Icarus rejects
+// output arguments on functions, so no oracle has run it; tests/string_test.cpp,
+// "a function returns the value of its own output argument", pins it.
 void Backend::lower_ret(Index value) {
     if (is_string_type(cur_fn_->return_type) && !is_agg_abi(cur_fn_->return_type)) {
         // The value may be one of the body's strings, which the epilogue releases.
