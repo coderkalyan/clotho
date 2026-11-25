@@ -16,6 +16,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
         case Inst::PayloadKind::None:
         case Inst::PayloadKind::Label:
         case Inst::PayloadKind::Scale:
+        case Inst::PayloadKind::Imm:
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
         case Inst::PayloadKind::Arg:
@@ -295,6 +296,19 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[1]      = info.value;
                 scratch[2]      = info.count;
                 return { scratch.data(), 3 };
+            }
+            // store_nb_gated exposes its lvalue, the sampled value, and the
+            // target's state-signal lvalues (assign_site only when present).
+            if (tag == Inst::Tag::StoreNbGated) {
+                const auto info = extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.value;
+                scratch[2]      = info.force_site;
+                if (info.assign_site == kNoIndex) {
+                    return { scratch.data(), 3 };
+                }
+                scratch[3] = info.assign_site;
+                return { scratch.data(), 4 };
             }
             if (tag == Inst::Tag::AggCopy) {
                 // Both the destination (op) and source lvalues are referenced.
@@ -754,10 +768,7 @@ Ir Ir::rebased(HandleMapper& m) const {
             case T::ProgramExit:
             case T::RetVoid:
             case T::DumpVars:
-            case T::DumpOff:
-            case T::DumpOn:
-            case T::DumpAll:
-            case T::DumpFlush:
+            case T::DumpControl:
             case T::Random:
             case T::Urandom:
             case T::SimTime:
@@ -773,6 +784,7 @@ Ir Ir::rebased(HandleMapper& m) const {
             case T::Severity:
             case T::StoreNbDelay:
             case T::StoreInertialDelay:
+            case T::StoreNbGated:
             case T::Select:
             case T::SelectLazy:
             case T::PartSelect:

@@ -231,6 +231,9 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::DisableRemote:
         case Inst::Tag::DisableAbort:
         case Inst::Tag::DeferFlush:
+        // A nonblocking write a force or procedural `assign` can override: the
+        // override is simulation semantics with no hardware form.
+        case Inst::Tag::StoreNbGated:
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
         case Inst::Tag::ClassIsA:
@@ -338,10 +341,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::DumpFile:
         case Inst::Tag::DumpVars:
         case Inst::Tag::DumpLimit:
-        case Inst::Tag::DumpOff:
-        case Inst::Tag::DumpOn:
-        case Inst::Tag::DumpAll:
-        case Inst::Tag::DumpFlush:
+        case Inst::Tag::DumpControl:
         case Inst::Tag::SimTime:
         case Inst::Tag::Random:
         case Inst::Tag::DistUnary:
@@ -822,6 +822,7 @@ struct Structural {
                     case Inst::Tag::StoreNbDelay:
                     case Inst::Tag::StoreInertialDelay:
                     case Inst::Tag::StoreNbEvent:
+                    case Inst::Tag::StoreNbGated:
                         note_verdict(CombFuse::NbaWrite);
                         break;
                     case Inst::Tag::Call:
@@ -864,6 +865,10 @@ struct Structural {
                 case Inst::Tag::StoreNb:
                     mark_driven_root(ir, p.binary.l);
                     mark_partial(ir, p.binary.l);
+                    break;
+                case Inst::Tag::StoreNbGated:
+                    mark_driven_root(ir, p.op_extra.op);
+                    mark_partial(ir, p.op_extra.op);
                     break;
                 case Inst::Tag::StoreInertialDelay:
                     // An inertially delayed driver drives its net even before the
@@ -964,10 +969,7 @@ struct Structural {
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
                 case Inst::Tag::DumpLimit:
-                case Inst::Tag::DumpOff:
-                case Inst::Tag::DumpOn:
-                case Inst::Tag::DumpAll:
-                case Inst::Tag::DumpFlush:
+                case Inst::Tag::DumpControl:
                     uses.vcd = true;
                     break;
                 default:
@@ -1318,6 +1320,12 @@ struct ValueSweep {
                 case Inst::Tag::StoreNbDelay:
                 case Inst::Tag::StoreInertialDelay: {
                     const auto info = ir.extra_data<StoreNbDelayInfo>(p.op_extra.extra);
+                    store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0, x_of(info.value) != 0);
+                    val_x[raw] = 0;
+                    break;
+                }
+                case Inst::Tag::StoreNbGated: {
+                    const auto info = ir.extra_data<StoreNbGatedInfo>(p.op_extra.extra);
                     store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0, x_of(info.value) != 0);
                     val_x[raw] = 0;
                     break;
@@ -1810,10 +1818,7 @@ struct ValueSweep {
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
                 case Inst::Tag::DumpLimit:
-                case Inst::Tag::DumpOff:
-                case Inst::Tag::DumpOn:
-                case Inst::Tag::DumpAll:
-                case Inst::Tag::DumpFlush:
+                case Inst::Tag::DumpControl:
                     val_x[raw] = 0;
                     break;
             }

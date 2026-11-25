@@ -986,6 +986,17 @@ struct PortLayout {
     std::array<uint32_t, 3> vif = { no_port_elem, no_port_elem, no_port_elem };
 };
 
+// The force / procedural-assign state signals a StoreNbGated names (LRM 10.6):
+// the NBA region drops the target's update while either is nonzero. `force` is
+// no_hold for an ungated target, `assign` for a target no `assign` names.
+struct NbaHold {
+    static constexpr Signal no_hold = static_cast<Signal>(UINT32_MAX);
+    Signal                  force   = no_hold;
+    Signal                  assign  = no_hold;
+
+    bool operator==(const NbaHold&) const = default;
+};
+
 // The fixed leading fields of an instance record (Anchor, "Instance context");
 // every field after them is addressed through its Anchor::ctx_*_base. The first
 // is the one a body reads least: a group's entry is handed the address of its
@@ -2464,6 +2475,8 @@ private:
     void emit_block_commit_fn(uint32_t id, const std::string& name);
 
     void emit_block_commit_body(uint32_t id);
+
+    llvm::Value* nba_hold_active(const NbaHold& hold);
 
     llvm::Value* agg_leaf_ptr(llvm::Value* base, llvm::Type* root_ty,
                               const std::vector<uint32_t>& path, uint32_t field);
@@ -4124,7 +4137,7 @@ private:
     // The function of root that registers every dumped signal (lower_dump_vars).
     llvm::Function* vcd_register_fn();
 
-    void lower_dump_control(Inst::Tag tag);
+    void lower_dump_control(DumpCtl ctl);
 
     void lower_ret_void();
 
@@ -5429,10 +5442,13 @@ private:
     // One NBA target the block writes, with the commit mask: `dynamic` means the mask
     // is a runtime dirty field (sh_mask_field); otherwise `mask` is the compile-time
     // union of the block's static writes to the signal (all-ones for a whole target).
+    // A target a force or procedural `assign` can own (StoreNbGated) names its
+    // state signals, and the commit skips it while either is nonzero (LRM 10.6.2).
     struct BlockSig {
         Signal      sig;
         llvm::APInt mask;
         bool        dynamic = false;
+        NbaHold     hold;
     };
     struct BlockCommit {
         std::vector<BlockSig> sigs;                           // targets, in first-store order
@@ -5440,6 +5456,9 @@ private:
         uint32_t              anchor = SignalSlot::no_anchor; // the writer's instance
     };
     std::vector<BlockCommit>                    block_commits_;
+    // The hold of the StoreNbGated being staged (lower_store_nb -> block_register);
+    // none for a plain StoreNb.
+    NbaHold nba_hold_;
 
     // A group lowered once for sharing (Backend::run): the function the first
     // instance of its unit whose imports are alike lowered for it, and what that

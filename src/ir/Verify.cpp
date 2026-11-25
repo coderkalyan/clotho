@@ -140,6 +140,18 @@ private:
             case Tag::StoreNbEvent:
                 check_store(i, p.op_extra.op, ir_.extra_data<StoreNbEventInfo>(p.op_extra.extra).value);
                 return;
+            case Tag::StoreNbGated: {
+                const auto info = ir_.extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                check_store(i, p.op_extra.op, info.value);
+                // The commit reads the state signals themselves, so they have to
+                // be bare signals, not any lvalue.
+                if (!valid(info.force_site) || ir_.tag(info.force_site) != Tag::Signal ||
+                    (info.assign_site != kNoIndex &&
+                     (!valid(info.assign_site) || ir_.tag(info.assign_site) != Tag::Signal))) {
+                    report(Rule::OperandKind, i);
+                }
+                return;
+            }
             case Tag::ZExt:
             case Tag::SExt:
             case Tag::Trunc:

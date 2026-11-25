@@ -260,6 +260,20 @@ struct StoreNbEventInfo {
     ExtraSlice trigs;
 };
 
+// Extra payload for `store_nb_gated`: a nonblocking assignment to a variable a
+// procedural continuous assignment can own (LRM 10.6). The lvalue is the
+// enclosing op_extra `op`.
+struct StoreNbGatedInfo {
+    // Value staged now and committed in the NBA region.
+    Index value;
+    // The target's `force_site` state signal, as a bare Signal lvalue. The NBA
+    // region drops the update while it is nonzero.
+    Index force_site;
+    // The target's `assign_site` state signal, likewise, or kNoIndex when the
+    // variable is no `assign` target.
+    Index assign_site;
+};
+
 // Extra payload for `part_select`: a constant [msb:lsb] slice of the base.
 struct PartSelect {
     // Most-significant selected bit.
@@ -1426,6 +1440,15 @@ static_assert(ExtraPayload<CountBitsInfo>);
 static_assert(ExtraPayload<TestPlusArgsInfo>);
 static_assert(ExtraPayload<ValuePlusArgsInfo>);
 
+// The VCD control a `dump_control` performs: $dumpoff, $dumpon, $dumpall,
+// $dumpflush (payload: imm).
+enum class DumpCtl : uint32_t {
+    Off,
+    On,
+    All,
+    Flush,
+};
+
 struct Inst {
     enum class Tag : uint8_t {
         // -- Leaves --
@@ -2300,13 +2323,10 @@ struct Inst {
         // $dumplimit(n): stop dumping once the file reaches `n` bytes (payload:
         // unary, the byte count). Lowers to an rt_vcd_limit call.
         DumpLimit,
-        // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: none). Suspend (with
-        // an all-x checkpoint) / resume / force-dump-now / flush-to-disk. Each
-        // lowers to the matching rt_vcd_* control call.
-        DumpOff,
-        DumpOn,
-        DumpAll,
-        DumpFlush,
+        // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: imm, a DumpCtl).
+        // Suspend (with an all-x checkpoint) / resume / force-dump-now /
+        // flush-to-disk. Lowers to the matching rt_vcd_* control call.
+        DumpControl,
 
         // -- System functions --
         // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
@@ -2532,6 +2552,13 @@ struct Inst {
         // Statement, zero-time: a coverpoint sample, `start`/`stop`,
         // `set_inst_name`.
         CoverCtl,
+        // Nonblocking assignment to a variable a `force` or procedural `assign`
+        // can own, lhs <= rhs (payload: op_extra -> StoreNbGatedInfo; op is the
+        // lvalue). Stages like StoreNb; the NBA region drops the update while the
+        // target's force or assign state is set, since LRM 10.6.2 decides the
+        // override when the update happens, not when the statement executes.
+        // Appended at the end for the reason CoverQuery gives.
+        StoreNbGated,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2541,6 +2568,8 @@ struct Inst {
         Label,
         // The u64 scale member (sim_time). No SSA operands.
         Scale,
+        // The u32 imm member: a tag-defined immediate. No SSA operands.
+        Imm,
         Ref,
         Signal,
         Unary,
@@ -2577,6 +2606,8 @@ struct Inst {
         // Time-unit multiplier for sim_time: $time returns the wheel tick count
         // rounded down by this to the calling module's time unit. 1 == unitless.
         uint64_t scale;
+        // Tag-defined immediate with no operand (dump_control's DumpCtl).
+        uint32_t imm;
         // Interned constant value (constant).
         Ref ref;
         // Module signal handle (signal).
@@ -2871,13 +2902,11 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ProgramExit:
         case T::RetVoid:
         case T::DumpVars:
-        case T::DumpOff:
-        case T::DumpOn:
-        case T::DumpAll:
-        case T::DumpFlush:
         case T::Random:
         case T::Urandom:
             return K::None;
+        case T::DumpControl:
+            return K::Imm;
         case T::SimTime:
             return K::Scale;
         case T::Finish:
@@ -2920,6 +2949,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StoreNbDelay:
         case T::StoreInertialDelay:
         case T::StoreNbEvent:
+        case T::StoreNbGated:
         case T::Select:
         case T::SelectLazy:
         case T::PartSelect:

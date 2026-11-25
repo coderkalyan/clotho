@@ -253,6 +253,8 @@ const char* tag_name(Inst::Tag tag) {
             return "store_inertial_delay";
         case T::StoreNbEvent:
             return "store_nb_event";
+        case T::StoreNbGated:
+            return "store_nb_gated";
         case T::Add:
             return "add";
         case T::Sub:
@@ -553,14 +555,8 @@ const char* tag_name(Inst::Tag tag) {
             return "dump_vars";
         case T::DumpLimit:
             return "dump_limit";
-        case T::DumpOff:
-            return "dump_off";
-        case T::DumpOn:
-            return "dump_on";
-        case T::DumpAll:
-            return "dump_all";
-        case T::DumpFlush:
-            return "dump_flush";
+        case T::DumpControl:
+            return "dump_control";
         case T::SimTime:
             return "sim_time";
         case T::TimeFormat:
@@ -756,6 +752,9 @@ private:
                 break;
             case Inst::PayloadKind::Scale:
                 os_ << "scale=" << p.scale;
+                break;
+            case Inst::PayloadKind::Imm:
+                os_ << "imm=" << p.imm;
                 break;
             case Inst::PayloadKind::Ref:
                 // ClassNew's ref is the class *type*, not an interned value.
@@ -1020,6 +1019,20 @@ private:
                 ref(p.op_extra.op);
                 os_ << " = ";
                 ref(info.src);
+                os_ << ")\n";
+                break;
+            }
+            case Inst::Tag::StoreNbGated: {
+                const StoreNbGatedInfo info = ir_.extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", ";
+                ref(info.value);
+                os_ << ", unless ";
+                ref(info.force_site);
+                if (info.assign_site != kNoIndex) {
+                    os_ << ", ";
+                    ref(info.assign_site);
+                }
                 os_ << ")\n";
                 break;
             }

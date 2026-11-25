@@ -1063,26 +1063,45 @@ void Backend::lower_inst(Index i) {
         // stages the value into the target's shadow and enqueues the target for
         // the NBA update region (see emit_nba_region), which commits shadow ->
         // live and services wait queues only after every active process has run.
-        case Inst::Tag::StoreNb: {
-            const Guarded&             lv = lvalue_of(p.binary.l);
+        // StoreNbGated stages the same way and hands the target's force / assign
+        // state to its block commit, which drops the update while either is set.
+        case Inst::Tag::StoreNb:
+        case Inst::Tag::StoreNbGated: {
+            const bool  gated = ir_->tag(i) == Inst::Tag::StoreNbGated;
+            Index       lv_i  = p.binary.l;
+            Index       rhs_i = p.binary.r;
+            NbaHold     hold;
+            if (gated) {
+                const auto info = ir_->extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                lv_i            = p.op_extra.op;
+                rhs_i           = info.value;
+                hold.force      = ir_->payload(info.force_site).signal;
+                if (info.assign_site != kNoIndex) {
+                    hold.assign = ir_->payload(info.assign_site).signal;
+                }
+            }
+            const Guarded&             lv = lvalue_of(lv_i);
             std::optional<CtxOverride> ov;
             ov.emplace(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
             emit_bounds_reports(lv, /*is_write=*/true);
+            if (gated && lv.is_string) {
+                throw BackendError{ "internal: a force or assign target is a string" };
+            }
             if (lv.is_string) {
                 // A whole-string NBA stages an owned deep copy in its own record
                 // and moves it into the target in the NBA region. Must precede
                 // value_of below: a string operand has no plane form. No GC
                 // barrier — a string can never hold a class handle.
-                lv.when_valid(b_, [&](const LValue& v) { emit_string_whole_nba(v, p.binary.r); });
+                lv.when_valid(b_, [&](const LValue& v) { emit_string_whole_nba(v, rhs_i); });
                 return;
             }
-            Plane         rhs = value_of(p.binary.r);
-            if (type_of(p.binary.r).is_real) {
+            Plane         rhs = value_of(rhs_i);
+            if (type_of(rhs_i).is_real) {
                 rhs = real_to_planes(fp_of(rhs));
             }
             // Every nonblocking route below stages the value in a shadow or a record
             // the NBA region replays by copy, so this is the one place to check it.
-            emit_encoding_check(rhs, type_of(p.binary.r).four_state, i);
+            emit_encoding_check(rhs, type_of(rhs_i).four_state, i);
             // The barrier for a nonblocking write into a class property (§7). It is
             // emitted at the STAGING site, not at the commit, because the commit is
             // the runtime's own memcpy out of a staging pool and carries no owner
@@ -1102,6 +1121,26 @@ void Backend::lower_inst(Index i) {
             // index defers a memcpy record; everything else (a plain signal,
             // scalar select, or aggregate static leaf) uses the block shadow.
             lv.when_valid(b_, [&](const LValue& v) {
+                if (gated) {
+                    // Only the block commit checks the hold. A force target is a
+                    // whole integral or real variable, which stages there unless it
+                    // is also a timed-NBA target, and the frontend refuses those, or
+                    // a member some virtual interface writes.
+                    if (v.is_signal && slot_of(v.sig).vif_rec) {
+                        // TODO: the vif record queue commits each record into the
+                        // instance the handle named and has no per-record hold check.
+                        throw BackendError{ "a nonblocking assignment to a force or assign target that a "
+                                            "virtual interface also writes is not supported" };
+                    }
+                    if (!v.is_signal || v.is_agg || slot_of(v.sig).is_array || is_intra_target(v.sig)) {
+                        throw BackendError{ "internal: a gated nonblocking assignment does not commit through "
+                                            "its block" };
+                    }
+                    nba_hold_ = hold;
+                    lower_store_nb(v, rhs);
+                    nba_hold_ = NbaHold{};
+                    return;
+                }
                 const bool agg_partial = v.is_agg && v.agg_leaf && !selects_whole(v);
                 // An aggregate leaf is classified before a vif member is (nba_classify_ir), so it
                 // takes its own record here too: a vif struct member sent to the array queue
@@ -2245,11 +2284,8 @@ void Backend::lower_inst(Index i) {
             lower_dump_limit(i);
             return;
 
-        case Inst::Tag::DumpOff:
-        case Inst::Tag::DumpOn:
-        case Inst::Tag::DumpAll:
-        case Inst::Tag::DumpFlush:
-            lower_dump_control(ir_->tag(i));
+        case Inst::Tag::DumpControl:
+            lower_dump_control(static_cast<DumpCtl>(p.imm));
             return;
 
         case Inst::Tag::SimTime: {

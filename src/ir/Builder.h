@@ -86,6 +86,12 @@ public:
     // occurrences of `trig`'s `edge`. `count` is a constant 1 for a plain `@e`.
     Index store_nb_event(Index lvalue, Index value, Index count, ExtraSlice trigs, SourceLoc loc);
 
+    // Nonblocking assignment `lvalue <= value` to a variable a force or procedural
+    // `assign` can own: the NBA region drops the update while `force_site`, or
+    // `assign_site` unless it is kNoIndex, is nonzero (LRM 10.6). Both are Signal
+    // lvalues of the target's state signals.
+    Index store_nb_gated(Index lvalue, Index value, Index force_site, Index assign_site, SourceLoc loc);
+
     // Pack a run of (signal, edge) triggers into the extra buffer for
     // store_nb_event. Packed ONCE per statement and shared by every leaf a
     // decomposing target expands to, so an N-leaf `{a,b} <= @(x or y) v` interns
@@ -636,9 +642,8 @@ public:
     Index dump_vars(SourceLoc loc);
     // $dumplimit: stop dumping once the file reaches `bytes` bytes.
     Index dump_limit(Index bytes, SourceLoc loc);
-    // $dumpoff / $dumpon / $dumpall / $dumpflush. `tag` selects the control; it
-    // must be one of the Dump* control tags.
-    Index dump_control(Inst::Tag tag, SourceLoc loc);
+    // $dumpoff / $dumpon / $dumpall / $dumpflush, as `ctl` selects.
+    Index dump_control(DumpCtl ctl, SourceLoc loc);
 
     // -- System functions --
     // $time / $stime: read the simulation clock. Yields a 64-bit unsigned value

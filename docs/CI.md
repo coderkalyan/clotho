@@ -124,13 +124,8 @@ that tries is rejected outright with no jobs scheduled at all.
 
 ## Platform status
 
-`main` at `21ed179d` (run 45538123706) and `ci/zig-arm64` at `c7978f9d` (run
-45538123744), 2026-11-25:
-
-| target | result |
-|---|---|
-| linux-x64, linux-x64-sanitize, linux-arm64, windows-x64, macos-arm64, macos-x64 | pass |
-| windows-arm64 | builds (with `c7978f9d`); 97 of 105 ctest entries pass. Seven segfault, each at the file's first design with an `always_comb` or `always_latch`: `function_test`, `strobe_test`, `llvm_backend_test`, `comb_fusion_test`, `struct_test`, `fork_test`, `severity_test`; that is the JIT mislink below, fixed but not yet confirmed by a run. In `exe_test`'s `-O --sanitize=bounds` tier, `clotho run` crashes on `alu.v` and `nba.v` and reports a false oscillation on `wait.v`, while the built executables print the right output; their `-O` code also has nonzero `PAGEOFFSET_12L` addends, so the same mislink is the likely cause |
+`main` at `ebe5e6e3` (run 45543738163), 2026-11-25: every target passes,
+windows-arm64 included (106 of 106 ctest entries).
 
 Only windows-arm64 is advisory (`continue-on-error`); every other target gates.
 
@@ -147,9 +142,11 @@ need Zig) failed three cases, all value-correctness: `interface_test:95` and
 `string_test:415` printed the *third* `$display` argument's value for the first.
 That last one looks like argument marshalling rather than arithmetic, and Windows
 on ARM64 differs from AAPCS64 in how variadic and floating-point arguments are
-passed. Those three files now pass; the segfaults are new since then.
+passed. Those three files now pass.
 
-**The JIT mislinks a load at an offset from a symbol.** Windows on Arm links JIT
+**The JIT mislinked a load at an offset from a symbol**, which segfaulted every
+windows-arm64 design with an `always_comb` and crashed `clotho run -O` on several
+examples until `847b6c0d`. Windows on Arm links JIT
 objects with RuntimeDyld, and LLVM 22's COFF/AArch64 support reads a
 `PAGEOFFSET_12L` addend (an LDR/STR imm12, in access-size units) as bytes, so a
 load of `sym+0x430` as an 8-byte value reads `sym+0x80`. Fixed upstream for LLVM

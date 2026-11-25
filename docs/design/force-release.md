@@ -112,11 +112,13 @@ whose store cannot carry the gate, a gate or switch output and a delayed continu
 assignment (`assign #d v = e`): the delayed commit has no predicate hook, and 10.6.2
 names neither among the drivers a release reestablishes.
 
-Ordinary procedural writers to `v` (blocking `Store`, nonblocking `StoreNb`) are gated
-`if (force_site == 0 && assign_site == 0) <store + wait-service>`. This gives
-release-hold for free: while forced/assigned the write is dropped; after release the
-gate opens and the next procedural write lands, with the forced value persisting until
-then.
+Ordinary procedural writers to `v` are gated on `force_site == 0 && assign_site == 0`.
+This gives release-hold for free: while forced/assigned the write is dropped; after
+release the gate opens and the next procedural write lands, with the forced value
+persisting until then. A blocking `Store` is gated where it executes. A nonblocking
+write is gated where its update happens, in the NBA region (see below): the force
+overrides the update, so an NBA staged before a `force` in the same time step is
+dropped, and one staged while forced lands when a `release` comes first.
 
 The gate keys off the write's **root**, not its shape, since the site state lives on the
 root signal — so a whole-variable write, a bit/part/element-select or packed-struct
@@ -133,18 +135,26 @@ gated `lower_assign` path), so no dedicated `OverrideStore` op is needed — a p
 `assign_site = k`) are plain stores to non-forceable hidden signals, so they are never
 gated.
 
-### Where the gate lives (frontend, not backend)
+### Where the gate lives
 
-The implementation is **frontend-only** — no new IR ops, no backend changes. The gate
-is applied where the store is emitted (`store_or_gate`, reached from `lower_assign`'s
-`gated_store`, the `++`/`--` path, the concatenation scatter and the call copy-out):
-when the written lvalue's root signal is forceable, that store alone is wrapped in the
-`force_site==0 && assign_site==0` conditional (a `cond` region). This reuses clotho's
-existing conditional-region and continuous-process machinery; the earlier idea of a
-backend `Store`/`StoreNb` choke was unnecessary once the gate could sit at the frontend
-store sites. Intra-assignment timing on a write to a force target (`x = #5 e`) is
-guarded loud: the update commits after the delay, so the gate would have to ride the
-deferred record rather than the sampling site.
+A blocking write's gate is frontend-only. It is applied where the store is emitted
+(`store_or_gate`, reached from `lower_assign`'s `gated_store`, the `++`/`--` path, the
+concatenation scatter and the call copy-out): when the written lvalue's root signal is
+forceable, that store alone is wrapped in the `force_site==0 && assign_site==0`
+conditional (a `cond` region).
+
+A nonblocking write cannot be gated that way, because the update happens later, in the
+NBA region, and LRM 10.6.2 decides against the state at that point. The frontend emits
+`StoreNbGated {lvalue, value, force_site, assign_site?}` instead of `StoreNb`: it stages
+like `StoreNb`, and the target's block commit function (`emit_block_commit_body`)
+loads the state signals and skips the merge and the wake while either is nonzero. The
+state signals are `Signal` operands of the op, so Partition imports them into the
+writer's unit like any other reference and the commit addresses them through the
+writer's record or bindings, per instance. Only a forceable target pays the load and
+branch. A gated NBA must take the block-commit path; a target the backend would route
+through a record queue (an array element, a virtual-interface member) is refused.
+Intra-assignment timing on a write to a force target (`x = #5 e`, `x <= #5 e`) is
+guarded loud: the intra records have no commit-time gate yet.
 
 ## Phasing
 

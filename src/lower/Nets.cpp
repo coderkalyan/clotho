@@ -1740,7 +1740,9 @@ Lowerer::ForceInfo* Lowerer::pca_info_of_lvalue(const Expression& lhs) {
 // target is no force/assign target (`fi` null), else a store dropped while an
 // override owns the target. LRM 10.6.2 suppresses the update alone — whatever
 // the statement already evaluated (RHS, lvalue selectors, the read of a
-// read-modify-write) stands, and the override's value survives untouched.
+// read-modify-write) stands, and the override's value survives untouched. A
+// blocking update happens here, so it is gated here; a nonblocking one happens
+// in the NBA region, so StoreNbGated hands the state to the commit.
 void Lowerer::store_or_gate(const ForceInfo*     fi,
                             ir::Inst::Tag        tag,
                             ir::Index            lv,
@@ -1761,6 +1763,11 @@ void Lowerer::store_or_gate(const ForceInfo*     fi,
         // armed, and store_nb_delay / store_nb_event carry no predicate.
         fail("intra-assignment timing on a write to a force-target variable "
              "is not supported");
+    }
+    if (tag == ir::Inst::Tag::StoreNb) {
+        const ir::Index assign_site = fi->has_assign ? b.signal(fi->assign_site, l) : ir::kNoIndex;
+        b.store_nb_gated(lv, v, b.signal(fi->site, l), assign_site, l);
+        return;
     }
     const ir::Index pred = not_forced(*fi, /*also_assign=*/true, b, l);
     b.open_region();

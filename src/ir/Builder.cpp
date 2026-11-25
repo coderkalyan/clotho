@@ -163,6 +163,12 @@ Index Builder::store_nb_event(Index lvalue, Index value, Index count, ExtraSlice
     return emit({ Inst::Tag::StoreNbEvent, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }
 
+Index Builder::store_nb_gated(Index lvalue, Index value, Index force_site, Index assign_site, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StoreNbGatedInfo{ value, force_site, assign_site });
+
+    return emit({ Inst::Tag::StoreNbGated, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
+}
+
 Index Builder::zext(Index op, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::ZExt, Inst::Payload{ .op_type = { op, type } } }, loc);
 }
@@ -1113,8 +1119,8 @@ Index Builder::dump_limit(Index bytes, SourceLoc loc) {
     return emit({ Inst::Tag::DumpLimit, pay(&Inst::Payload::unary, bytes) }, loc);
 }
 
-Index Builder::dump_control(Inst::Tag tag, SourceLoc loc) {
-    return emit({ tag, pay(&Inst::Payload::none, 0u) }, loc);
+Index Builder::dump_control(DumpCtl ctl, SourceLoc loc) {
+    return emit({ Inst::Tag::DumpControl, pay(&Inst::Payload::imm, static_cast<uint32_t>(ctl)) }, loc);
 }
 
 Index Builder::sim_time(uint64_t scale, SourceLoc loc) {
