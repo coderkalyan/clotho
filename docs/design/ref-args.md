@@ -25,16 +25,19 @@ entry and writes its z back live, i.e. it is analyzed like a task inout.
 
 **Sensitivity waking happens at each write.** A write through a ref is a write to the actual
 (LRM 13.5.2), so it is an update event of it. Servicing is per-signal static (inlined LLVM keyed
-on the signal's wait globals), which the callee, holding only an opaque pointer, cannot name. In a
-design where some ref actual is a signal with waiters (`design_ref_wake_`), every ref formal takes
-two more parameters after its witness chain: a wake thunk and its context. The call site makes a
-thunk per scalar signal actual with waiters (`emit_ref_wake_thunk`, `void(ctx, old, new)` over
-`service_wait_queue` and the VCD touch) and passes null for any other. The callee brackets each
-store through the formal with `service_snapshot` / `service_after_write`, which call the thunk when
-it is non-null, so a task's writes across delays, and a function's write that reverts within the
-call, wake as direct writes do (iverilog 13 oracle: the aliased variable written directly). A ref
-passed on to another subroutine forwards its thunk. A class-property, container, string or
-aggregate actual is still serviced at the call's return (docs/TODO.md).
+on the signal's wait globals) or reached through a class object, which the callee, holding only an
+opaque pointer, cannot name. In a design where some ref actual has waiters (`design_ref_wake_`: a
+signal with waiters, or a class property some `@` / `wait` names), every ref formal takes two more
+parameters after its witness chain: a wake thunk and its context. The call site makes a thunk per
+actual with waiters (`emit_ref_wake_thunk`, `void(ctx, changed, pos, neg)` over
+`service_wake_buckets` and the VCD touch, or over the class property's notifiers, the context
+being the record, the owner's for a virtual interface member, or the object body) and passes null
+for any other. The callee classifies its own write, since it knows the leaf it wrote, and calls the
+thunk when it is non-null: after a scalar or struct-leaf store (`service_after_write`), a
+whole-aggregate copy (`emit_agg_copy`), a string write (`str_chg_after`) and a container mutation
+(`notify_container_mutation`). A task's writes across delays, and a function's write that reverts
+within the call, wake as direct writes do (iverilog 13 oracle for scalars: the aliased variable
+written directly). A ref passed on to another subroutine forwards its thunk.
 
 ## Oracle
 

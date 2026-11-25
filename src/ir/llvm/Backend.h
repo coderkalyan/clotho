@@ -2612,6 +2612,9 @@ private:
 
     llvm::Function* emit_ref_wake_thunk(const LValueInfo& lv);
 
+    void emit_ref_wake_call(llvm::Value* fn, llvm::Value* ctx, llvm::Value* changed, llvm::Value* pos,
+                            llvm::Value* neg);
+
     ServiceSnapshot service_snapshot(const Guarded& lv);
 
     void service_after_write(const Guarded& lv, ServiceSnapshot old);

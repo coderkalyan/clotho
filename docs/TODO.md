@@ -123,8 +123,6 @@ Milestones, in order; lower ones unblock higher ones:
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
-- [ ] **Wake time of a `ref` write to a class property, container, string or aggregate** — such a
-  `ref` actual is serviced at the call's return with the net transition, not at each write.
 - [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate and
   container-valued waits are refused.
   - [ ] **`@` over a container property expression** (9.4.2) — needs the value

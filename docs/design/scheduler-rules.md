@@ -330,7 +330,7 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 | Cell | What nothing checks |
 |---|---|
 | R8 × S22, R9 × S21 | Two NBAs to an observed scalar in one slot, and a select that changes and changes back. The fixes and tests are on `nba-glitch`. |
-| R6 × S18 | `$readmem` services no waiters (a `TODO:` in `SystemTasks.cpp`, missing from `docs/TODO.md`). A `ref` write to a class property, container, string or aggregate wakes at the call's return (`docs/TODO.md`). |
+| R6 × S18 | `$readmem` services no waiters (a `TODO:` in `SystemTasks.cpp`, missing from `docs/TODO.md`). |
 | R6 × S19 | Waiter kinds crossed with write paths. Waiter kinds: static, dynamic, vif, `<= @` trigger, class-property notifier, event net. Write paths: blocking, block commit, record queues, intra commit, file I/O, DPI output, `ref`, vif, force/release, resolver. [INFERENCE: no such matrix found in `tests/`] |
 | R1, R13, R20 × S13 | The region-use predicates (`has_nba`, `design_uses_nb_events_`, `has_inactive`, the reactive set, `has_renba`), except through feature tests. There is no gate. |
 | R2 × S13 | `#0` resuming in Inactive, before NBA, all together: pinned only through `->> #0` and gate tests [INFERENCE: grep of `tests/`]. |

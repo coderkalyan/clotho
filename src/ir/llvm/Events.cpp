@@ -804,7 +804,7 @@ Backend::ServiceSnapshot Backend::service_snapshot(const Guarded& g) {
         // waiter can exist yet anyway.
         return {};
     }
-    if (g.ref_wake_fn != nullptr) {
+    if (g.ref_wake_fn != nullptr && !g.is_string) {
         // A write through a `ref` formal: the old words, and the thunk the call passed to wake
         // the actual's waiters (null at run time when it has none).
         const LValue    lv = safe_lvalue(g);
@@ -869,28 +869,13 @@ void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
         // virtual interface handle.
         CtxOverride ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
         if (old.ref_fn != nullptr) {
+            // The callee classifies its own write (it knows the formal's leaf) and the thunk
+            // the call passed wakes what the actual's owner has waiting.
             llvm::Value* new_mm = load_lv_mm(lv);
             llvm::Value* new_z  = old.z != nullptr ? load_lv_z(lv) : nullptr;
-            std::vector<llvm::Type*>  pt{ raw_ptr_ty(), old.mm->getType() };
-            std::vector<llvm::Value*> args{ old.ref_ctx, old.mm };
-            if (old.z != nullptr) {
-                pt.push_back(old.z->getType());
-                args.push_back(old.z);
-            }
-            pt.push_back(new_mm->getType());
-            args.push_back(new_mm);
-            if (new_z != nullptr) {
-                pt.push_back(new_z->getType());
-                args.push_back(new_z);
-            }
-            auto* fn   = b_.GetInsertBlock()->getParent();
-            auto* call = llvm::BasicBlock::Create(ctx_, "refwake.call", fn);
-            auto* cont = llvm::BasicBlock::Create(ctx_, "refwake.cont", fn);
-            b_.CreateCondBr(b_.CreateIsNotNull(old.ref_fn), call, cont);
-            b_.SetInsertPoint(call);
-            b_.CreateCall(llvm::FunctionType::get(b_.getVoidTy(), pt, false), old.ref_fn, args);
-            b_.CreateBr(cont);
-            b_.SetInsertPoint(cont);
+            const EdgeFacts f   = emit_edge_facts(old.mm, new_mm, lv.store_width, lv.four_state, old.z,
+                                                  new_z, true, true, true);
+            emit_ref_wake_call(old.ref_fn, old.ref_ctx, f.changed, f.pos, f.neg);
         } else if (old.str != nullptr) {
             str_chg_after(lv, old.str);
         } else if (old.container) {
@@ -1926,26 +1911,19 @@ llvm::Value* Backend::event_wait_node(uint32_t k) {
     return it->second;
 }
 
-
-// The wake of a `ref` actual that is a signal with waiters, as a function the callee calls after
-// each write through the formal (LRM 9.4.2: every change wakes at the change): the callee holds
-// only a pointer, while the buckets are static per signal. `void(ptr ctx, old mm, [old z,] new
-// mm, [new z])`; `ctx` is the record of the code that made the call (or the owner's, for a
-// virtual interface member), so the thunk addresses the buckets as that code does. Built like a
-// block commit function: in the module of the caller, with its lowering state put back after.
+// The wake of a `ref` actual that has waiters, as a function the callee calls after each write
+// through the formal (LRM 9.4.2: every change wakes at the change; 13.5.2: the formal is the
+// actual). The callee holds only a pointer, while the buckets are static per signal or reached
+// through a class object, so the call site makes `void(ptr ctx, i1 changed, i1 pos, i1 neg)`:
+// the callee classifies its own write (it knows the leaf it wrote) and the thunk services what
+// the actual's owner has waiting. `ctx` is the record of the code that made the call, the
+// owner's for a virtual interface member, or the object body of a class property, so the thunk
+// addresses the buckets as that code does. Built like a block commit function: in the module of
+// the caller, with its lowering state put back after.
 llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
-    auto*          ptr  = llvm::PointerType::getUnqual(ctx_);
-    const uint32_t W    = lv.store_width;
-    auto*          mmty = int_ty(lv.four_state ? 2 * W : W);
-    auto*          zty  = int_ty(W);
-    std::vector<llvm::Type*> pt{ ptr, mmty };
-    if (lv.four_state) {
-        pt.push_back(zty);
-    }
-    pt.push_back(mmty);
-    if (lv.four_state) {
-        pt.push_back(zty);
-    }
+    auto*                          ptr = llvm::PointerType::getUnqual(ctx_);
+    auto*                          i1  = b_.getInt1Ty();
+    const std::vector<llvm::Type*> pt{ ptr, i1, i1, i1 };
     const std::string name = fn_->getName().str() + ".refwake" + std::to_string(ref_wake_seq_[fn_]++);
     auto*             th   = llvm::Function::Create(llvm::FunctionType::get(b_.getVoidTy(), pt, false),
                                                     llvm::Function::InternalLinkage, name, env_->llmod);
@@ -1965,28 +1943,52 @@ llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
     silent_stores_       = false;
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", th));
     llvm::Value* ctx_arg = th->getArg(0);
-    const uint32_t vif_anchor = lvalue_ctx_anchor(lv);
-    if (lv.vif_ctx != nullptr) {
+    if (lv.chg != nullptr || lv.vif_ctx != nullptr || saved_ctx == nullptr) {
         own_anchor_ = SignalSlot::no_anchor;
         own_ctx_    = nullptr;
     } else {
-        own_ctx_ = saved_ctx != nullptr ? ctx_arg : nullptr;
+        own_ctx_ = ctx_arg;
     }
     {
-        CtxOverride ov(*this, lv.vif_ctx != nullptr ? ctx_arg : nullptr, vif_anchor);
-        llvm::Value* old_mm = th->getArg(1);
-        llvm::Value* old_z  = lv.four_state ? th->getArg(2) : nullptr;
-        llvm::Value* new_mm = th->getArg(lv.four_state ? 3 : 2);
-        llvm::Value* new_z  = lv.four_state ? th->getArg(4) : nullptr;
-        if (!signal_has_level_waiters(lv.sig)) {
-            old_z = nullptr;
-            new_z = nullptr;
-        }
-        service_wait_queue(lv.sig, old_mm, new_mm, old_z, new_z);
-        if (slot_of(lv.sig).is_array) {
-            vcd_touch_array(lv.sig);
+        CtxOverride ov(*this, lv.vif_ctx != nullptr ? ctx_arg : nullptr, lvalue_ctx_anchor(lv));
+        llvm::Value* const changed = th->getArg(1);
+        llvm::Value* const pos     = th->getArg(2);
+        llvm::Value* const neg     = th->getArg(3);
+        if (lv.chg != nullptr) {
+            // A class property: the notifiers live in the object body, which `ctx` is.
+            LValueInfo li;
+            li.chg         = lv.chg;
+            li.chg_body    = ctx_arg;
+            li.chg_body_ty = lv.chg_body_ty;
+            const std::array<std::pair<Edge, llvm::Value*>, 3> notifiers = {
+                std::make_pair(Edge::Any, changed),
+                std::make_pair(Edge::Positive, pos),
+                std::make_pair(Edge::Negative, neg),
+            };
+            for (const auto& [edge, fact] : notifiers) {
+                if (lv.chg->field[static_cast<uint32_t>(edge)] == kNoNotify) {
+                    continue;
+                }
+                auto* body = llvm::BasicBlock::Create(ctx_, "chg.body", th);
+                auto* cont = llvm::BasicBlock::Create(ctx_, "chg.cont", th);
+                b_.CreateCondBr(fact, body, cont);
+                b_.SetInsertPoint(body);
+                fire_prop_notifier(li, edge);
+                b_.CreateBr(cont);
+                b_.SetInsertPoint(cont);
+            }
         } else {
-            vcd_touch_signal(lv.sig);
+            const Signal sig = lv.is_signal ? lv.sig : lv.mut_sig;
+            EdgeFacts    f;
+            f.changed = signal_has_bucket(sig, Edge::Any) ? changed : nullptr;
+            f.pos     = signal_has_bucket(sig, Edge::Positive) ? pos : nullptr;
+            f.neg     = signal_has_bucket(sig, Edge::Negative) ? neg : nullptr;
+            service_wake_buckets(sig, f);
+            if (slot_of(sig).is_array) {
+                vcd_touch_array(sig);
+            } else {
+                vcd_touch_signal(sig);
+            }
         }
         b_.CreateRetVoid();
     }
@@ -2002,7 +2004,23 @@ llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
     return th;
 }
 
-bool Backend::push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref formal_type) {
+// Call the wake thunk of a `ref` formal after a write, when the call passed one.
+void Backend::emit_ref_wake_call(llvm::Value* fn, llvm::Value* ctx, llvm::Value* changed, llvm::Value* pos,
+                                 llvm::Value* neg) {
+    auto* f    = b_.GetInsertBlock()->getParent();
+    auto* call = llvm::BasicBlock::Create(ctx_, "refwake.call", f);
+    auto* cont = llvm::BasicBlock::Create(ctx_, "refwake.cont", f);
+    b_.CreateCondBr(b_.CreateIsNotNull(fn), call, cont);
+    b_.SetInsertPoint(call);
+    auto* i1  = b_.getInt1Ty();
+    auto* ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(llvm::FunctionType::get(b_.getVoidTy(), { ptr, i1, i1, i1 }, false), fn,
+                  { ctx, changed, pos, neg });
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+}
+
+bool Backend::push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref) {
     if (!design_ref_wake_) {
         return false;
     }
@@ -2013,17 +2031,18 @@ bool Backend::push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, 
         argv.push_back(lv.ref_wake_ctx);
         return true;
     }
-    const bool scalar = !is_handle_type(formal_type) && !is_agg_abi(formal_type) && !is_string_type(formal_type);
-    if (!scalar || silent_stores_ || lv.is_string || lv.chg != nullptr || lv.is_assoc || !lv.is_signal ||
-        !signal_has_waiters(lv.sig)) {
+    const bool by_signal = (lv.is_signal && signal_has_waiters(lv.sig)) ||
+                           (!lv.is_signal && lv.mut_sig_valid && signal_has_waiters(lv.mut_sig));
+    if (silent_stores_ || lv.is_assoc || (lv.chg == nullptr && !by_signal)) {
         argv.push_back(null);
         argv.push_back(null);
         return false;
     }
     llvm::Function* th  = emit_ref_wake_thunk(lv);
-    llvm::Value*    ctx = lv.vif_ctx != nullptr ? lv.vif_ctx
-                          : own_ctx_ != nullptr ? own_ctx_
-                                                : static_cast<llvm::Value*>(null);
+    llvm::Value*    ctx = lv.chg != nullptr       ? lv.chg_body
+                          : lv.vif_ctx != nullptr ? lv.vif_ctx
+                          : own_ctx_ != nullptr   ? own_ctx_
+                                                  : static_cast<llvm::Value*>(null);
     argv.push_back(th);
     argv.push_back(ctx);
     return true;

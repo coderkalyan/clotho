@@ -868,8 +868,10 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
     // the change with a memcmp of old dest vs new source *before* the copy.
     const bool service = !silent_stores_ && dlv.is_signal &&
                          signal_has_waiters(dlv.sig);
+    // A whole-object copy into a `ref` formal wakes through the call's thunk, when the bytes change.
+    const bool ref_service = !silent_stores_ && dlv.ref_wake_fn != nullptr;
     llvm::Value* changed = nullptr;
-    if (service) {
+    if (service || ref_service) {
         auto cmp = rt_fn("memcmp", b_.getInt32Ty(),
                          { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
         changed   = b_.CreateICmpNE(
@@ -883,6 +885,15 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
         b_.CreateCondBr(changed, svc, cont);
         b_.SetInsertPoint(svc);
         service_any_waiters(dlv.sig);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    } else if (ref_service) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* svc  = llvm::BasicBlock::Create(ctx_, "aggcopy.refwake", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "aggcopy.cont", fn);
+        b_.CreateCondBr(changed, svc, cont);
+        b_.SetInsertPoint(svc);
+        emit_ref_wake_call(dlv.ref_wake_fn, dlv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }

@@ -2017,3 +2017,56 @@ TEST_CASE("ref write: a ref passed on to another task wakes at each write") {
     CHECK(out.find("woke 1 x=1\n") != std::string::npos);
     CHECK(out.find("woke 2 x=0\n") != std::string::npos);
 }
+
+// A `ref` to a class property, a container, a string or a struct wakes its waiters at each write too.
+// Oracle: LRM 9.4.2 / 13.5.2 (the formal is the actual, each write an update event); iverilog 13 has
+// neither `ref` ports nor these waits, so the expected output is derived from the clauses.
+TEST_CASE("ref write: class property, queue, string and struct actuals wake at each write") {
+    SUBCASE("a class property") {
+        const std::string out = run_capture(R"(
+            class C; int p = 0; endclass
+            module t; C o = new;
+              task automatic tk(ref int r); #1 r = 1; #1 r = 0; endtask
+              initial forever @(o.p) $display("woke %0t p=%0d", $time, o.p);
+              initial begin tk(o.p); #5 $finish; end
+            endmodule
+        )");
+        CHECK(out.find("woke 1 p=1\n") != std::string::npos);
+        CHECK(out.find("woke 2 p=0\n") != std::string::npos);
+    }
+    SUBCASE("a queue") {
+        const std::string out = run_capture(R"(
+            module t; int q[$];
+              task automatic tk(ref int r[$]); #1 r.push_back(1); #1 r.push_back(2); endtask
+              initial begin wait (q.size() > 0); $display("saw %0t size=%0d", $time, q.size()); end
+              initial begin tk(q); #5 $finish; end
+            endmodule
+        )");
+        CHECK(out == "saw 1 size=1\n");
+    }
+    SUBCASE("a string class property") {
+        const std::string out = run_capture(R"(
+            class C; string s = ""; endclass
+            module t; C o = new;
+              task automatic tk(ref string r); #1 r = "x"; #1 r = "y"; endtask
+              initial forever @(o.s) $display("woke %0t s=%s", $time, o.s);
+              initial begin tk(o.s); #5 $finish; end
+            endmodule
+        )");
+        CHECK(out.find("woke 1 s=x\n") != std::string::npos);
+        CHECK(out.find("woke 2 s=y\n") != std::string::npos);
+    }
+    SUBCASE("a struct member, and a whole-struct assignment") {
+        const std::string out = run_capture(R"(
+            typedef struct { int a; int b; } S;
+            module t; S s = '{0,0};
+              task automatic tk(ref S r); #1 r.a = 1; #1 r.a = 0; #1 r = '{7,7}; endtask
+              initial forever @(s.a) $display("woke %0t a=%0d", $time, s.a);
+              initial begin tk(s); #5 $finish; end
+            endmodule
+        )");
+        CHECK(out.find("woke 1 a=1\n") != std::string::npos);
+        CHECK(out.find("woke 2 a=0\n") != std::string::npos);
+        CHECK(out.find("woke 3 a=7\n") != std::string::npos);
+    }
+}
