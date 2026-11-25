@@ -173,6 +173,178 @@ ir::Ref Lowerer::lower_mailbox_class(const slang::ast::ClassType& clt) {
     return ref;
 }
 
+// How many body fields `std::weak_reference` takes in this design: the referent,
+// and its change notifier when some `@` or `wait` reads `get()` of this
+// specialization (WaitPropScan). Answered from the design-wide pre-pass alone, so
+// the class and every class derived from it agree before either is laid out.
+uint32_t Lowerer::weak_body_fields(const slang::ast::ClassType& weak) const {
+    return waited_props_ != nullptr && waited_props_->waits_weak(weak) ? 2 : 1;
+}
+
+// Append the synthetic body of `std::weak_reference #(T)` (LRM 8.30) to `fields`,
+// and register what the backend needs to know about `class_ref`, which is that
+// class or one derived from it.
+//
+// The referent is a property of type T like any handle property: `get()` loads it,
+// `clear()` stores null into it, a shallow copy copies it. What makes it weak is one
+// fact about the class, recorded here: the backend leaves this field out of the
+// class's trace map and names it there as the weak referent instead, and the
+// collector stores null into it when the referent is reachable no other way
+// (ir::WeakClass, rt_gc_map::weak_referent).
+//
+// The notifier is the any-change notifier a waited-on property has
+// (ir::ChangeNotify), so a store through `clear()` fires it as any store to a
+// waited-on property does, and the collector fires it when it clears the referent.
+void Lowerer::push_weak_body(const slang::ast::ClassType& weak, ir::Ref class_ref, std::vector<ir::FieldRow>& fields) {
+    const slang::ast::Symbol* tsym = weak.find("T");
+    if (tsym == nullptr || tsym->kind != SymbolKind::TypeParameter) {
+        fail("internal: std::weak_reference without its type parameter");
+    }
+    // A class type: slang refuses any other argument (LRM 8.30.1).
+    const slang::ast::Type& referent = tsym->as<slang::ast::TypeParameterSymbol>().targetType.getType();
+    fields.push_back({ kWeakReferentField, lower_type(referent), kWeakReferent });
+    module_.set_weak_class(class_ref, kWeakReferent);
+    if (weak_body_fields(weak) > 1) {
+        fields.push_back({ kWeakNotifyField, module_.pool.event_type, kWeakNotify });
+        module_.set_change_notify(class_ref, kWeakReferent, ir::Edge::Any, kWeakNotify, /*container=*/false);
+    }
+}
+
+// Lower one `std::weak_reference #(T)` specialization (LRM 8.30). Like `mailbox` it
+// is a generic class slang monomorphizes and gives signatures only, so the body is
+// synthesized (push_weak_body) and the four methods are lowered in place
+// (lower_weak_method). In every other way it is an ordinary class: an instance is
+// collected like any object (8.30.1), two instances with one referent are two
+// objects (8.30.2), and a user class may derive from it.
+//
+// Interned before the referent type is lowered, as a user class is before its
+// properties: `class C; weak_reference #(C) w; endclass` reaches this class from
+// inside C's own layout, and lowering C from here must find it.
+ir::Ref Lowerer::lower_weak_class(const slang::ast::ClassType& clt) {
+    const uint32_t fid = module_.pool.reserve_struct_fields();
+    ir::Type       t;
+    t.kind            = ir::Type::Kind::Class;
+    t.fields_id       = fid;
+    t.element         = ir::Ref::Invalid;
+    const ir::Ref ref = module_.pool.put(ir::Item{ t });
+    bind_class_type(clt, ref);
+    // An entry for a class that failed to lower must not survive to be reused
+    // (lower_class_type's InternGuard says why).
+    struct Abandon {
+        ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::Ref>& table;
+        const slang::ast::ClassType*                                         key;
+        bool                                                                 committed = false;
+        ~Abandon() {
+            if (!committed) {
+                table.erase(key);
+            }
+        }
+    } abandon{ class_type_cache_, &clt };
+    std::vector<ir::FieldRow> fields;
+    push_weak_body(clt, ref, fields);
+    module_.pool.set_struct_fields(fid, std::move(fields));
+    // The two obligations lower_process_class has: an (empty) rand block for the
+    // reserved randomization slots, and the outermost frame's drain.
+    class_rand_.emplace(&clt, ClassRand{});
+    compute_vtable(clt, ref);
+    if (class_depth_ == 1) {
+        drain_rand_bodies();
+    }
+    abandon.committed = true;
+    return ref;
+}
+
+// `weak_reference::new(T referent)` (LRM 8.30.2), run against `handle`, an object of
+// `class_ref` or of a class derived from it. A bodyless built-in constructor, so the
+// one thing it does is stored here. A null referent is stored as it is and reported
+// by nothing (8.30.2).
+void Lowerer::emit_weak_ctor(std::span<const Expression* const> actuals,
+                             ir::Index                          handle,
+                             ir::Ref                            class_ref,
+                             ir::Builder&                       b,
+                             ir::SourceLoc                      l) {
+    if (actuals.size() != 1) {
+        fail("internal: weak_reference::new takes the referent and nothing else");
+    }
+    const ir::Index referent = lower_expr(*actuals[0], b);
+    b.binary(ir::Inst::Tag::Store,
+             b.member_select(b.handle_deref(handle, class_ref, l), kWeakReferent, class_ref, l),
+             referent,
+             l);
+}
+
+// The weak reference a built-in method acts on, and its static class: the receiver
+// the call names, or `this` for an unqualified call in a method of a class derived
+// from weak_reference.
+std::pair<ir::Index, ir::Ref> Lowerer::weak_receiver(const CallExpression& call, ir::Builder& b) {
+    if (const Expression* recv = call.thisClass(); recv != nullptr) {
+        return { lower_expr(*recv, b), lower_type(*recv->type) };
+    }
+    if (ctor_this_) {
+        return { ctor_this_->handle, ctor_this_->cls };
+    }
+    if (fn_ctx_ != nullptr && fn_ctx_->has_this) {
+        return { this_handle(b, loc(call)), fn_ctx_->this_class };
+    }
+    // slang resolves a non-static method call against an object or not at all.
+    fail("internal: weak_reference::" + std::string(call.getSubroutineName()) + " called on no object");
+}
+
+// Lower one of the four built-in `weak_reference` methods (LRM 8.30.2 to 8.30.5);
+// `new` is emit_weak_ctor.
+std::optional<ir::Index> Lowerer::lower_weak_method(const CallExpression&   call,
+                                                    const SubroutineSymbol& sub,
+                                                    ir::Builder&            b) {
+    const ir::SourceLoc l = loc(call);
+    if (sub.name == "get_id") {
+        // LRM 8.30.5, static: 0 for null, otherwise a value that is the object's own
+        // whatever class the handle is typed as, and no other live object's. That is
+        // the object's identity number (rt_gc_identity), which is never handed out
+        // twice in a run, so the reuse 8.30.5 allows after collection does not happen.
+        if (call.arguments().size() != 1) {
+            fail("internal: weak_reference::get_id takes one object");
+        }
+        return b.handle_identity(lower_expr(*call.arguments()[0], b), l);
+    }
+    const auto [handle, cls] = weak_receiver(call, b);
+    const auto referent      = [&, handle = handle, cls = cls] {
+        return b.member_select(b.handle_deref(handle, cls, l), kWeakReferent, cls, l);
+    };
+    if (sub.name == "get") {
+        // LRM 8.30.3: the referent, or null once the reference has been cleared, by
+        // clear() or by the collector. Both store null where this loads.
+        return b.unary(ir::Inst::Tag::Load, referent(), l);
+    }
+    if (sub.name == "clear") {
+        // LRM 8.30.4. An ordinary store, so a wait on get() sees it.
+        const ir::Index dst  = referent();
+        const ir::Index null = b.constant(module_.pool.put_int(make_int_type(64, false), 0), l);
+        b.binary(ir::Inst::Tag::Store, dst, null, l);
+        return std::nullopt;
+    }
+    // Every method of LRM 8.30 is handled above; a fifth would come from a slang
+    // release, not from a design.
+    fail("internal: unknown weak_reference method '" + std::string(sub.name) + "'");
+}
+
+// Load the handle of the change notifier of the weak reference `get` is called on,
+// dereferencing that weak reference where the wait is, as prop_notifier_handle does
+// for a property.
+ir::Index Lowerer::weak_notifier_handle(const CallExpression& get, ir::Builder& b) {
+    const ir::SourceLoc l      = loc(get);
+    const auto [handle, cls]   = weak_receiver(get, b);
+    const ir::ChangeNotify* cn = module_.change_notify(cls, kWeakReferent);
+    if (cn == nullptr || cn->field[static_cast<uint32_t>(ir::Edge::Any)] == ir::kNoNotify) {
+        // The design-wide pre-pass decides which weak reference classes carry a
+        // notifier and this decides which are used; they read the same resolver.
+        fail("internal: no change notifier for weak_reference::get()");
+    }
+    return b.unary(
+      ir::Inst::Tag::Load,
+      b.member_select(b.handle_deref(handle, cls, l), cn->field[static_cast<uint32_t>(ir::Edge::Any)], cls, l),
+      l);
+}
+
 // Whether `sub` is one of `process`'s nine built-in methods (LRM 9.7). Keyed on
 // the owning ClassType's name and package rather than on a remembered Ref: a
 // method call can be lowered before any `process` variable has been declared.

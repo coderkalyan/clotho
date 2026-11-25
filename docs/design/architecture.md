@@ -157,7 +157,6 @@ them in step.
   clears the referent of each weak reference it reached whose referent is
   unmarked. Collection timing is then visible to a design, so a collection
   happens at a point that is a function of the run, never of thread timing.
-  **Not yet:** the class is refused.
 - An object's identity number (`weak_reference::get_id`, the order of an
   associative array keyed by a class handle) is assigned on first request and
   kept in a table beside the heap, so objects that never ask pay nothing; the
@@ -167,8 +166,8 @@ them in step.
   output must not change; a heap verifier runs after each collection in
   extra-assertion builds; and a model-based test drives the collector's C
   interface with random graphs, stores and collections against a shadow
-  reachability model. A design that uses a weak reference is left out of the
-  cadence comparison.
+  reachability model. A design in which the collector can clear a weak reference
+  states its output for each cadence instead.
 
 ## Containers and classes
 

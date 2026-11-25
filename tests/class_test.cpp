@@ -1714,20 +1714,6 @@ TEST_CASE("virtual dispatch through a null handle is a located fatal") {
     CHECK(run.err.find("10 |         $display(\"%0d\", b.tag());\n") != std::string::npos);
 }
 
-// The `std` package's built-in classes are synthesized by slang with signatures but
-// no bodies -- the simulator supplies the semantics -- so the guard in
-// lower_class_type is keyed by class name and each name is either implemented or
-// refused. `process` (LRM 9.7), `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM
-// 15.4) are implemented (tests/process_test.cpp, tests/sync_test.cpp). What is left
-// is `std::weak_reference` (LRM 8.30), which still has no runtime, and the TYPELESS
-// mailbox (15.4.9), which is refused by its own message because it needs run-time
-// type identity -- covered in tests/sync_test.cpp.
-TEST_CASE("built-in std classes are refused in the frontend") {
-    // A declaration is enough: the type lowers before any method is reached.
-    CHECK(fails("module m; std::weak_reference #(int) w; initial w = null; endmodule")
-            .find("not supported") != std::string::npos);
-}
-
 // -- shallow copy, `dst = new src` (LRM 8.12) ---------------------------------
 
 // LRM 8.12's own worked example, values included: `b2.i = 10` changes only the

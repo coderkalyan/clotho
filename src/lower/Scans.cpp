@@ -230,6 +230,49 @@ const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e) {
     return waited_container_prop(e);
 }
 
+bool is_weak_reference_class(const slang::ast::ClassType& clt) {
+    if (clt.name != "weak_reference") {
+        return false;
+    }
+    const slang::ast::Scope* pkg = clt.getParentScope();
+    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+}
+
+const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt) {
+    // Bounded by the inheritance depth, which slang has already found finite.
+    for (const slang::ast::ClassType* k = &clt; k != nullptr;) {
+        if (is_weak_reference_class(*k)) {
+            return k;
+        }
+        const slang::ast::Type* base = k->getBaseClass();
+        k = base != nullptr ? &base->getCanonicalType().as<slang::ast::ClassType>() : nullptr;
+    }
+    return nullptr;
+}
+
+// Keyed on the owning class and its package, as is_process_method is: a call can
+// be lowered before any variable of the type has been declared.
+bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub) {
+    if (!sub.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+        return false;
+    }
+    const slang::ast::Scope* owner = sub.getParentScope();
+    return owner != nullptr && owner->asSymbol().kind == SymbolKind::ClassType &&
+           is_weak_reference_class(owner->asSymbol().as<slang::ast::ClassType>());
+}
+
+const CallExpression* weak_get_call(const Expression& e) {
+    if (e.kind != ExpressionKind::Call) {
+        return nullptr;
+    }
+    const CallExpression& call = e.as<CallExpression>();
+    if (call.subroutine.index() != 0) {
+        return nullptr;
+    }
+    const slang::ast::SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+    return sub.name == "get" && is_weak_reference_method(sub) ? &call : nullptr;
+}
+
 void ClassPropReadScan::take(const Expression& e) {
     if (const auto* p = instance_class_prop(e);
         p != nullptr && p->getType().getCanonicalType().isEvent()) {
@@ -309,6 +352,10 @@ bool WaitedProps::waits_local(const slang::ast::ValueSymbol& vs) const {
     return locals.contains(&vs);
 }
 
+bool WaitedProps::waits_weak(const slang::ast::ClassType& weak) const {
+    return weak_classes.contains(&weak);
+}
+
 void WaitedProps::add(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge) {
     props[&prop].edges |= static_cast<uint8_t>(1u << static_cast<uint32_t>(edge));
 }
@@ -369,6 +416,12 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
                 break;
         }
     }
+    if (const CallExpression* get = weak_get_call(ev.expr); get != nullptr) {
+        // `@(w.get())` (LRM 8.30.3): the referent's any-change notifier. A class
+        // handle has no edges, and slang refuses an edge control on one.
+        out->weak_classes.insert(
+          &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
+    }
     visitDefault(ev);
 }
 
@@ -390,6 +443,10 @@ void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
         } else {
             out->add(prop, ir::Edge::Any);
         }
+    }
+    for (const CallExpression* get : scan.weak_gets) {
+        out->weak_classes.insert(
+          &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
     }
     visitDefault(w);
 }

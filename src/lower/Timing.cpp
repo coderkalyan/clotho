@@ -114,6 +114,20 @@ void Lowerer::collect_wait_events_impl(const TimingControl&        tc,
                 push_prop_wait_events(ev, *prop, out);
                 break;
             }
+            if (const CallExpression* get = weak_get_call(ev.expr); get != nullptr) {
+                // `@(w.get())` (LRM 8.30.3 over 9.4.2): the value changes when the
+                // weak reference is cleared, by clear() or by the collector, and
+                // both fire the referent's change notifier. Resolved here, right
+                // before the wait, as a property's is. A class handle has no edges,
+                // and slang refuses an edge control on one.
+                if (wait_builder_ == nullptr) {
+                    fail("internal: a weak_reference::get() event control with no body builder");
+                }
+                out.push_back(ir::WaitEvent{ .signal = ir::Signal{ 0 },
+                                             .edge   = ir::Edge::Any,
+                                             .handle = weak_notifier_handle(*get, *wait_builder_) });
+                break;
+            }
             refuse_container_event_control(ev);
             const ir::Signal sig = event_signal(ev.expr);
             if (ev.edge == slang::ast::EdgeKind::BothEdges) {
@@ -342,8 +356,9 @@ bool Lowerer::sensitivity_needs_handle(const TimingControl& tc) {
             const Expression& e = tc.as<SignalEventControl>().expr;
             // A class property's notifier is reached through the object handle, so
             // `always @(c.p)` has to stay in the body too -- the seed loop that
-            // issues a static subscription cannot evaluate `c`.
-            return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr;
+            // issues a static subscription cannot evaluate `c`. So is the notifier
+            // of the weak reference `@(w.get())` names.
+            return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr || weak_get_call(e) != nullptr;
         }
         case TimingControlKind::EventList:
             for (const TimingControl* e : tc.as<EventListControl>().events) {
@@ -1767,8 +1782,8 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
     // evaluated at the park, so a reassigned one is re-read on every pass.
     const auto park = [&] {
         std::vector<ir::WaitEdge> edges;
-        edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size() +
-                      prop_reads.event_props.size());
+        edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size() + prop_reads.event_props.size() +
+                      prop_reads.weak_gets.size());
         for (const ir::WaitEvent& e : reads) {
             edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
         }
@@ -1786,6 +1801,12 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
             edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
                                           static_cast<uint32_t>(ir::Edge::Any),
                                           prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
+        }
+        for (const CallExpression* get : prop_reads.weak_gets) {
+            // `w.get()` (LRM 8.30.3) reads w's referent, which clear() and the
+            // collector change; park on that referent's notifier.
+            edges.push_back(
+              ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), weak_notifier_handle(*get, b) });
         }
         for (const Expression* pe : prop_reads.event_props) {
             // Park on the event OBJECT the property holds right now, exactly
