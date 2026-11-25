@@ -80,8 +80,8 @@ Milestones, in order; lower ones unblock higher ones:
 ### Elaboration & structure
 
 - [~] **Runtime-indexed aggregate parameter** (6.20, 11.5.1) — two value shapes are refused.
-  - [ ] **Wildcard-index associative-array parameter** — cannot be materialized for a runtime
-    read.
+  - [ ] **Wildcard-index associative-array parameter with a key wider than 64 bits** — the
+    same limit runtime `[*]` keys have.
   - [ ] **Queue or associative-array parameter with aggregate elements** — cannot be seeded
     for a runtime read.
 - [ ] **`defparam` that changes an implicitly typed parameter's type** (6.20.2, 23.10.1) — the
