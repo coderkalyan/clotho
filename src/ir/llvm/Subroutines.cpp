@@ -1160,17 +1160,45 @@ void Backend::init_frame() {
 // plus the string rvalue temporaries. Emitted once per body, in the epilogue
 // every exit of it goes through: a function's (lower_function), a task's
 // completion epilogue, a process's final suspend.
+//
+// The strings are tested together: their flag bytes are OR-ed and one branch
+// skips the releases when none of them owns a buffer, which is nearly every
+// activation (a UVM sequence loop made 438 rt_string_deinit calls per item, under
+// 1% of them on a string with a buffer). Sound because every caller is about to
+// drop the storage, so nothing reads a string this leaves un-reset. The slot
+// addresses are formed again in the release block rather than carried into it:
+// tier-0 code generation spills a value that lives across blocks.
 void Backend::deinit_body_strings() {
-    for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
-        // A ref formal owns nothing: it borrows the actual's storage, which the
-        // caller still owns and will release itself. Freeing through it would
-        // destroy a live caller value.
-        if (frame_slots_[i].is_string && !frame_slots_[i].is_ref) {
-            b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
+    const auto each_string = [&](const auto& visit) {
+        for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            // A ref formal owns nothing: it borrows the actual's storage, which the
+            // caller still owns and will release itself. Freeing through it would
+            // destroy a live caller value.
+            if (frame_slots_[i].is_string && !frame_slots_[i].is_ref) {
+                visit(b_.CreateStructGEP(frame_ty_, frame_, i));
+            }
         }
-    }
-    for (llvm::Value* temp : str_temp_list_) {
-        b_.CreateCall(str_deinit_fn(), { temp });
+        for (llvm::Value* temp : str_temp_list_) {
+            visit(temp);
+        }
+    };
+    auto* const  i8  = b_.getInt8Ty();
+    llvm::Value* any = nullptr;
+    each_string([&](llvm::Value* slot) {
+        llvm::Value* flag = b_.CreateLoad(i8, b_.CreateConstInBoundsGEP1_64(i8, slot, sizeof(rt_string) - 1));
+        any               = any == nullptr ? flag : b_.CreateOr(any, flag);
+    });
+    if (any != nullptr) {
+        auto* fn      = b_.GetInsertBlock()->getParent();
+        auto* release = llvm::BasicBlock::Create(ctx_, "str.release", fn);
+        auto* done    = llvm::BasicBlock::Create(ctx_, "str.done", fn);
+        auto* owns    = b_.CreateICmpNE(b_.CreateAnd(any, b_.getInt8(rt_string_heap_flag)), b_.getInt8(0));
+        auto* br      = b_.CreateCondBr(owns, release, done);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+        b_.SetInsertPoint(release);
+        each_string([&](llvm::Value* slot) { b_.CreateCall(str_deinit_fn(), { slot }); });
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
     }
     for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
         if (frame_slots_[i].is_ref) {

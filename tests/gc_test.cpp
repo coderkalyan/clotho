@@ -3907,6 +3907,42 @@ TEST_CASE("gc: dead objects owning large strings are collected inside a delay-fr
     CHECK(st.owned_bytes == 0u);
 }
 
+// A subroutine tests its string locals and temporaries together when it leaves and
+// releases them only when one owns a buffer. Which of them do depends on `k`
+// here, across a plain return, an early return and a task that suspends, so a
+// string left out of the test or of the release shows up as bytes still held.
+TEST_CASE("gc: a subroutine's strings give their buffers back at every exit") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int pick(int k);
+                string a, b, c;
+                if (k[0]) a = "0123456789012345678901234567890123456789";
+                if (k[1]) b = {a, "0123456789012345678901234567890123456789"};
+                c = $sformatf("%0d", k);
+                if (k == 5) return a.len() + b.len();
+                return a.len() + b.len() + c.len();
+            endfunction
+            task automatic wait_pick(int k, output int n);
+                string held;
+                if (k[0]) held = {"0123456789012345678901234567890123456789", "x"};
+                #1;
+                n = held.len();
+            endtask
+            int total, n;
+            initial begin
+                for (int k = 0; k < 8; k++) total += pick(k);
+                for (int k = 0; k < 4; k++) begin
+                    wait_pick(k, n);
+                    total += n;
+                end
+                $display("%0d", total);
+            end
+        endmodule
+    )";
+    const rt_gc_stats st = run_stats(src, "489\n", cadence_ordinary);
+    CHECK(st.owned_bytes == 0u);
+}
+
 // A dead OLD object that shares a line with a survivor is left behind by line-granular
 // reclamation, and used to keep a stale mark: the single full-collection parity read it
 // as live again two full collections later, and rt_gc_verify's heap walk (an
