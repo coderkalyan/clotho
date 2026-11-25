@@ -1919,8 +1919,11 @@ void Backend::emit_copyin(const Function& f) {
             // keeps the empty frame — it is filled by the body, copied out at
             // return.
             if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Inout) {
-                emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
-                                   f.param_types[k]);
+                // A bounded formal truncates what the actual holds. No call site is in
+                // scope in a prologue, so the report points at the subroutine.
+                emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base), f.param_types[k],
+                                   resolve_ ? resolve_(f.span) : SourceText{ .where = "<unknown>" },
+                                   f.name + " argument " + std::to_string(k + 1));
             }
             continue;
         }
@@ -2051,8 +2054,8 @@ void Backend::lower_ret(Index value) {
         // handles (the value may be a frame local or a call result temp). Resolved
         // through lv_handle_ptr so returning a struct member, class property
         // or container element copies THAT handle, not its parent's root.
-        emit_handle_assign(
-          fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read), cur_fn_->return_type);
+        emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read),
+                           cur_fn_->return_type, loc_text(value), cur_fn_->name + " result");
         b_.CreateBr(fn_copyout_bb_);
         return;
     }

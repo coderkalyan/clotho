@@ -1568,7 +1568,9 @@ void Backend::emit_handle_whole_nba(Index i) {
     llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
     const auto   hsz    = env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(qa.queue_type));
     b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(hsz), llvm::MaybeAlign{ 1 });
-    emit_handle_assign(staged, lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read), qa.queue_type);
+    const auto qbound = is_queue_type(qa.queue_type) ? std::get<Type>(mod_.pool.get(qa.queue_type)).left : 0;
+    emit_handle_assign(staged, lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read), qa.queue_type, loc_text(i),
+                       queue_site_name(dlv, qbound));
 }
 
 // Replay a container's deferred whole-NBA records: move each staged handle into

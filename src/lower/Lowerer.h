@@ -5613,6 +5613,10 @@ private:
         // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
         bool    is_agg = false;
         ir::Ref agg_ty = ir::Ref::Invalid;
+        // A queue output / inout formal whose actual is a BOUNDED queue, passed via a
+        // temp so the copy-back is a whole-queue assignment that truncates to the actual's
+        // bound (the callee only knows its formal's own, usually unbounded, type).
+        bool is_bounded_queue = false;
     };
 
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,

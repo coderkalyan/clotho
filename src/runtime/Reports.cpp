@@ -382,6 +382,45 @@ extern "C" void rt_divzero_report(const rt_null_site* site, uint64_t now) {
     std::fflush(stderr);
 }
 
+// ---- Bounded queue overflow (docs/LRM_NOTES.md 6) ----
+
+extern "C" void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_t wanted,
+                                         uint64_t now) {
+    // One report per overflowing operation, none suppressed: LRM_NOTES 6 has every
+    // overflow announced, so a loop that overflows a queue prints a line per pass.
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+
+    const uint64_t    limit = bound + 1;
+    std::string       when;
+    append_finish_time(when, now);
+    const std::string subject = site->name != nullptr && site->name[0] != '\0'
+                                  ? fmt::format("bounded queue '{}'", site->name)
+                                  : std::string("bounded queue");
+    fmt::print(stderr, label, "warning:");
+    fmt::print(stderr, head, " {} overflows: {} elements do not fit, it holds at most {} ([$:{}])", subject,
+               wanted, limit, bound);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        print_snippet(snippet_text(site->line), site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } }, loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " the first {} elements are kept and the last {} dropped, at {}", limit,
+               wanted - limit, when);
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+}
+
 // ---- $fread start address outside the memory (docs/LRM_NOTES.md 55) ----
 
 extern "C" void rt_fread_range_report(const rt_null_site* site, int64_t start, int64_t decl_left,

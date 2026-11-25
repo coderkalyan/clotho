@@ -1637,7 +1637,8 @@ private:
 
     bool is_handle_type(Ref type) const;
     llvm::StructType* handle_slot_ty(Ref type);
-    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type);
+    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type,
+                            const SourceText& at = SourceText{ .where = "<unknown>" }, std::string_view name = {});
     void emit_handle_delete(llvm::Value* handle, Ref type);
     llvm::Value* handle_sink_global(Ref elem_type);
 
@@ -3969,6 +3970,11 @@ private:
 
     std::string bounds_name(const LValueInfo& lv) const;
 
+    // The name a bounded-queue overflow report gives the queue `lv` addresses: its
+    // signal's, or empty for a queue with none to give (a frame local), and always empty
+    // for an unbounded queue, which never reports.
+    std::string queue_site_name(const LValueInfo& lv, uint64_t bound) const;
+
     void add_elem_bounds_check(LValueInfo& target, Index at, const LValueInfo& named, Index idx_expr,
                                llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent,
                                int32_t left = 0, int32_t right = 0);
@@ -4016,7 +4022,7 @@ private:
 
     llvm::Constant* tagged_site_global(const SourceText& at, const TaggedCheckInfo& info);
 
-    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what);
+    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what, std::string_view name = {});
 
     void lower_severity(Index i);
 

@@ -2595,3 +2595,196 @@ TEST_CASE("the runtime bitcode calls nothing but the runtime's growth and drop f
     // No data of its own, so there is nothing for two copies of the engine to disagree about.
     CHECK(module.global_empty());
 }
+
+namespace {
+
+struct Captured {
+    std::string out;
+    std::string err;
+};
+
+// JIT-run a module and capture stdout and stderr, the second being where a bounded
+// queue's overflow warning goes.
+Captured run_capture_both(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* out_tmp = std::tmpfile();
+    std::FILE* err_tmp = std::tmpfile();
+    REQUIRE(out_tmp != nullptr);
+    REQUIRE(err_tmp != nullptr);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const int saved_out = dup(fileno(stdout));
+    const int saved_err = dup(fileno(stderr));
+    dup2(fileno(out_tmp), fileno(stdout));
+    dup2(fileno(err_tmp), fileno(stderr));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    dup2(saved_out, fileno(stdout));
+    dup2(saved_err, fileno(stderr));
+    close(saved_out);
+    close(saved_err);
+
+    const auto slurp = [](std::FILE* f) {
+        std::rewind(f);
+        std::string s;
+        char        buf[256];
+        size_t      n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+            s.append(buf, n);
+        }
+        std::fclose(f);
+        return s;
+    };
+    return { slurp(out_tmp), slurp(err_tmp) };
+}
+
+size_t count_of_text(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t p = hay.find(needle); p != std::string_view::npos; p = hay.find(needle, p + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+// A write that leaves a bounded queue `q[$:N]` with more than N+1 elements keeps the
+// first N+1, on every path (docs/LRM_NOTES.md, note 6), and says so on stderr once per
+// overflowing operation. Oracle: iverilog 13 (`iverilog -g2012`, `vvp -n`) agrees on
+// whole assignment from a queue, a dynamic array, a slice and a function result, and on
+// push_back / push_front / insert (1 2 3, 9 1 2, 1 7 2) and an assignment pattern
+// (51 52 53). It cannot compile a fixed-array source, a nonblocking assignment, a task
+// output or a concatenation into a bounded queue (elab assertion / error); those rows
+// are the blocking rows' values by the decision of note 6 (the first N+1 kept).
+TEST_CASE("a bounded queue keeps its first N+1 elements on every write path") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int iq_t[$];
+            int qb[$:2];
+            int other[$] = '{1, 2, 3, 4, 5};
+            int da[];
+            int fa[5] = '{11, 12, 13, 14, 15};
+            function automatic iq_t mk();
+                iq_t r = '{21, 22, 23, 24, 25};
+                return r;
+            endfunction
+            task automatic fill(output iq_t q);
+                q = '{31, 32, 33, 34, 35};
+            endtask
+            task automatic bump(inout iq_t q);
+                q.push_back(99); q.push_back(98); q.push_back(97);
+            endtask
+            task show(string tag);
+                $write("%s s=%0d:", tag, qb.size());
+                for (int i = 0; i < qb.size(); i++) $write(" %0d", qb[i]);
+                $write("\n");
+            endtask
+            initial begin
+                qb = other;                 show("queue");
+                qb.delete();
+                da = new[5];
+                foreach (da[i]) da[i] = 41 + i;
+                qb = da;                    show("dynarr");
+                qb = fa;                    show("fixed");
+                qb = other[0:4];            show("slice");
+                qb = mk();                  show("func");
+                fill(qb);                   show("taskout");
+                qb = '{51, 52, 53, 54};     show("pattern");
+                qb = {other, 6};            show("concat");
+                qb <= other;                #1 show("nba");
+                qb.delete();
+                qb.push_back(1); qb.push_back(2); qb.push_back(3); qb.push_back(4);
+                show("push_back");
+                qb.delete();
+                qb.push_back(1); qb.push_back(2); qb.push_back(3); qb.push_front(9);
+                show("push_front");
+                qb.delete();
+                qb.push_back(1); qb.push_back(2); qb.push_back(3); qb.insert(1, 7);
+                show("insert");
+                qb.delete();
+                qb.push_back(1); qb.push_back(2);
+                bump(qb);                   show("inout");
+                qb = '{7, 8, 9};            show("fits");
+            end
+        endmodule
+    )";
+    const Captured c = run_capture_both(src);
+    CHECK(c.out ==
+          "queue s=3: 1 2 3\n"
+          "dynarr s=3: 41 42 43\n"
+          "fixed s=3: 11 12 13\n"
+          "slice s=3: 1 2 3\n"
+          "func s=3: 21 22 23\n"
+          "taskout s=3: 31 32 33\n"
+          "pattern s=3: 51 52 53\n"
+          "concat s=3: 1 2 3\n"
+          "nba s=3: 1 2 3\n"
+          "push_back s=3: 1 2 3\n"
+          "push_front s=3: 9 1 2\n"
+          "insert s=3: 1 7 2\n"
+          "inout s=3: 1 2 99\n"
+          "fits s=3: 7 8 9\n");
+    // One warning per overflowing operation: nine whole writes (queue, dynarr, fixed,
+    // slice, func, taskout, pattern, concat, nba), the three pushes and the inout copy-back.
+    CHECK(count_of_text(c.err, "warning: bounded queue 'qb' overflows") == 13);
+    CHECK(count_of_text(c.err, "5 elements do not fit, it holds at most 3 ([$:2])") == 8);
+    CHECK(count_of_text(c.err, "4 elements do not fit, it holds at most 3 ([$:2])") == 4);
+    CHECK(count_of_text(c.err, "6 elements do not fit, it holds at most 3 ([$:2])") == 1);
+}
+
+// Nothing is reported for a queue that is not over its bound or has none, and a bound
+// reaches the elements of a container of bounded queues (a queue element is a queue).
+TEST_CASE("a queue within its bound, or unbounded, is silent; nested bounded queues truncate") {
+    constexpr std::string_view src = R"(
+        module m;
+            int ub[$];
+            int qb[$:2];
+            int qq[$][$:2];
+            int pp[$][$];
+            int u[$] = '{1, 2, 3, 4, 5};
+            initial begin
+                ub = u; ub.push_back(6); ub.push_front(0);
+                qb = '{1, 2, 3};
+                qb.push_back(4); qb.delete(); qb.push_back(1);
+                $display("%0d %0d", ub.size(), qb.size());
+                qq.push_back(u);
+                $display("push %0d", qq[0].size());
+                qq[0] = u;
+                $display("elem %0d", qq[0].size());
+                pp.push_back(u);
+                qq = pp;
+                $display("whole %0d %0d", qq.size(), qq[0].size());
+            end
+        endmodule
+    )";
+    const Captured c = run_capture_both(src);
+    CHECK(c.out == "7 1\npush 3\nelem 3\nwhole 1 3\n");
+    // qb = '{1,2,3} fits and push onto a one-element queue fits, so only the
+    // nested truncations (push, element assignment, copy of pp) and qb.push_back(4)
+    // onto the full queue report.
+    CHECK(count_of_text(c.err, "bounded queue") == 4);
+}
+
+// A bounded formal truncates the actual it is passed (LRM 13.5: input copy-in is an
+// assignment). No call site is in scope in the callee prologue, so the report points at
+// the subroutine.
+TEST_CASE("a bounded input formal keeps the first N+1 elements of its actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            int u[$] = '{1, 2, 3, 4, 5};
+            function automatic int take(input int q[$:2]);
+                return q.size() * 10 + q[2];
+            endfunction
+            initial $display("%0d", take(u));
+        endmodule
+    )";
+    const Captured c = run_capture_both(src);
+    CHECK(c.out == "33\n");
+    CHECK(count_of_text(c.err, "argument 1' overflows") == 1);
+}

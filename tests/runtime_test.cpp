@@ -187,7 +187,8 @@ constexpr rt_alloc_site kSite{ .where      = "<runtime test>",
                                .what       = "string",
                                .line_no    = 0,
                                .column     = 0,
-                               .end_column = 0 };
+                               .end_column = 0,
+                               .name       = nullptr };
 
 // A guard pairing init with deinit so tests can't leak on CHECK failures.
 struct Str {
