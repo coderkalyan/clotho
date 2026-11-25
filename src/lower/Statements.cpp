@@ -1637,9 +1637,8 @@ void Lowerer::lower_foreach_assoc_dim(const ForeachLoopStatement& f,
     b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
 }
 
-// A for_initialization assignment or a for_step (12.7.1, A.6.8): a simple
-// assignment, or a pre/post increment/decrement. Compound assignments and
-// function-call steps are not supported yet.
+// A for_initialization assignment or a for_step (12.7.1, A.6.8): an assignment
+// (simple or compound), a pre/post increment/decrement, or a subroutine call.
 void Lowerer::lower_for_step(const Expression& e, ir::Builder& b) {
     if (e.kind == ExpressionKind::Assignment) {
         lower_assign(e.as<AssignmentExpression>(), b);
@@ -1886,9 +1885,11 @@ bool Lowerer::is_unbounded_bound(const Expression& e) {
 // Common compare type for `case ... inside` (12.5.4). As common_case_type,
 // but a range_list member may be a [lo:hi] ValueRangeExpression (itself
 // typed void) instead of a plain expression, so its bound types fold in
-// place of the range's own type. Tolerance ranges (`+/-`, `+%-`) and `$`
-// bounds guard loudly here (TODO: LRM 11.4.13 defines both, but neither
-// is exercised by ranged case-inside labels yet).
+// place of the range's own type. A `$` bound has no type of its own (it stands
+// for the lowest or highest value of the common type, LRM 11.4.13), and a
+// tolerance range `[a +/- b]` contributes only `a`: slang binds the tolerance
+// self-determined and takes the common type from the bounds alone
+// (bindMembershipExpressions).
 Lowerer::CaseCompareType Lowerer::common_inside_type(const CaseStatement& c) {
     uint32_t width = c.expr.type->getBitWidth();
     bool     four  = c.expr.type->isFourState();
@@ -1906,16 +1907,12 @@ Lowerer::CaseCompareType Lowerer::common_inside_type(const CaseStatement& c) {
                 continue;
             }
             const auto& vr = e->as<ValueRangeExpression>();
-            if (vr.rangeKind != ValueRangeKind::Simple) {
-                // TODO: absolute/relative tolerance ranges (LRM 11.4.13).
-                fail("case ... inside tolerance ranges ('+/-' / '+%-') are not supported");
+            if (!is_unbounded_bound(vr.left())) {
+                fold(vr.left());
             }
-            if (is_unbounded_bound(vr.left()) || is_unbounded_bound(vr.right())) {
-                // TODO: `$` range bound (lowest/highest value of the selector's type).
-                fail("case ... inside unbounded ('$') range bounds are not supported");
+            if (vr.rangeKind == ValueRangeKind::Simple && !is_unbounded_bound(vr.right())) {
+                fold(vr.right());
             }
-            fold(vr.left());
-            fold(vr.right());
         }
     }
     return { make_int_type(width, four), width, four, signd };
@@ -1934,11 +1931,10 @@ ir::Index Lowerer::lower_inside_label_pred(const Expression& label,
                                            bool              is_signed,
                                            ir::Builder&      b) {
     if (label.kind == ExpressionKind::ValueRange) {
-        const auto&     vr = label.as<ValueRangeExpression>();
-        const ir::Index lo = b.convert(lower_expr(vr.left(), b), ty, is_signed, loc(vr.left()));
-        const ir::Index hi = b.convert(lower_expr(vr.right(), b), ty, is_signed, loc(vr.right()));
-        const ir::Index ge = b.binary(is_signed ? ir::Inst::Tag::SGe : ir::Inst::Tag::UGe, sel, lo, loc(label));
-        const ir::Index le = b.binary(is_signed ? ir::Inst::Tag::SLe : ir::Inst::Tag::ULe, sel, hi, loc(label));
+        const auto&        vr     = label.as<ValueRangeExpression>();
+        const InsideBounds bounds = inside_range_bounds(vr, ty, is_signed, b);
+        const ir::Index    ge = b.binary(is_signed ? ir::Inst::Tag::SGe : ir::Inst::Tag::UGe, sel, bounds.lo, loc(label));
+        const ir::Index    le = b.binary(is_signed ? ir::Inst::Tag::SLe : ir::Inst::Tag::ULe, sel, bounds.hi, loc(label));
         return b.binary(ir::Inst::Tag::Land, ge, le, loc(label));
     }
     const ir::Index val = b.convert(lower_expr(label, b), ty, is_signed, loc(label));
@@ -2075,7 +2071,10 @@ bool Lowerer::has_real_case_operand(const CaseStatement& c) {
         for (const Expression* e : item.expressions) {
             if (e->kind == ExpressionKind::ValueRange) {
                 const auto& vr = e->as<ValueRangeExpression>();
-                if (vr.left().type->isFloating() || vr.right().type->isFloating()) {
+                // A tolerance range's own type is its left bound's: the tolerance
+                // is self-determined and takes no part in the comparison type.
+                if (vr.left().type->isFloating() ||
+                    (vr.rangeKind == ValueRangeKind::Simple && vr.right().type->isFloating())) {
                     return true;
                 }
                 continue;
@@ -2109,22 +2108,7 @@ ir::Index Lowerer::real_case_label_pred(const Expression& label, ir::Index sel, 
         // `case ... inside` range member (12.5.4 / 11.4.13): membership is the
         // pair of relational comparisons, which Table 11-1 DOES define for
         // reals, so this arm needs no interpretation beyond 11.4.13's own.
-        const auto& vr = label.as<ValueRangeExpression>();
-        if (vr.rangeKind != ValueRangeKind::Simple) {
-            // TODO: absolute/relative tolerance ranges (LRM 11.4.13), as for
-            // the integral path in common_inside_type.
-            fail("case ... inside tolerance ranges ('+/-' / '+%-') are not supported");
-        }
-        if (is_unbounded_bound(vr.left()) || is_unbounded_bound(vr.right())) {
-            // TODO: `$` bounds on a real range (LRM 11.4.13), as for the
-            // integral path.
-            fail("case ... inside with a '$' range bound is not supported");
-        }
-        const ir::Index lo = coerce(lower_expr(vr.left(), b), *vr.left().type, rty, b, loc(vr.left()));
-        const ir::Index hi = coerce(lower_expr(vr.right(), b), *vr.right().type, rty, b, loc(vr.right()));
-        const ir::Index ge = b.binary(ir::Inst::Tag::FGe, sel, lo, loc(label));
-        const ir::Index le = b.binary(ir::Inst::Tag::FLe, sel, hi, loc(label));
-        return b.binary(ir::Inst::Tag::Land, ge, le, loc(label));
+        return inside_real_range_pred(label.as<ValueRangeExpression>(), sel, rty, b);
     }
     const ir::Index val = coerce(lower_expr(label, b), *label.type, rty, b, loc(label));
     return b.binary(ir::Inst::Tag::FEq, sel, val, loc(label));
@@ -2175,10 +2159,28 @@ ir::Index Lowerer::real_case_item_pred(const CaseStatement::ItemGroup& item,
 // and there are nine such statements in the parts of uvm-core a testbench reaches.
 ir::Index Lowerer::string_case_label_pred(const Expression& label, ir::Index sel, ir::Builder& b) {
     if (label.kind == ExpressionKind::ValueRange) {
-        // TODO: `case (s) inside ["a":"z"]` — 11.4.13 membership over a range is
-        // the pair of relational comparisons, which 6.16.9 does define for strings
-        // (lexicographic), so this is implementable; nothing reaches it yet.
-        fail("case ... inside with a string range bound is not supported");
+        // `case (s) inside ["a":"z"]` (12.5.4 over 11.4.13): membership in a range
+        // is the pair of relational comparisons, which 6.16.9 defines for strings
+        // (lexicographic) and the backend's Ge / Le over strings already are.
+        const auto& vr = label.as<ValueRangeExpression>();
+        if (vr.rangeKind != ValueRangeKind::Simple) {
+            // slang binds a tolerance range only over numeric bounds, which
+            // 11.4.13 defines the arithmetic of, so no string reaches one.
+            fail("internal: a tolerance range over strings");
+        }
+        // A `$` side bounds nothing, as for a number (inside_real_range_pred).
+        std::optional<ir::Index> above;
+        std::optional<ir::Index> below;
+        if (!is_unbounded_bound(vr.left())) {
+            above = b.binary(ir::Inst::Tag::UGe, sel, lower_expr(vr.left(), b), loc(label));
+        }
+        if (!is_unbounded_bound(vr.right())) {
+            below = b.binary(ir::Inst::Tag::ULe, sel, lower_expr(vr.right(), b), loc(label));
+        }
+        if (!above && !below) {
+            fail("internal: an inside range with no bound");
+        }
+        return above && below ? b.binary(ir::Inst::Tag::Land, *above, *below, loc(label)) : (above ? *above : *below);
     }
     if (!is_string_expr(label)) {
         // Unreachable from source: slang rejects a mixed string case itself

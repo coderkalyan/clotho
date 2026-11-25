@@ -868,7 +868,8 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
 // nonintegral expressions ... Integral expressions use the wildcard equality
 // (==?) operator so that an x or z bit in a VALUE IN THE SET is treated as a
 // do-not-care". WildEq's wildcards are its right operand's, which is exactly
-// that asymmetry; a real has no x/z, so it compares with plain FEq.
+// that asymmetry; a real has no x/z, so it compares with plain FEq, and so does
+// a string (content equality, LRM 6.16.9), which carries none either.
 ir::Index Lowerer::inside_leaf_eq(ir::Index               sel,
                                   ir::Index               val,
                                   const slang::ast::Type& vt,
@@ -876,6 +877,9 @@ ir::Index Lowerer::inside_leaf_eq(ir::Index               sel,
                                   bool                    real,
                                   ir::Builder&            b,
                                   ir::SourceLoc           l) {
+    if (vt.isString()) {
+        return b.binary(ir::Inst::Tag::Eq, sel, val, l);
+    }
     if (real) {
         return b.binary(ir::Inst::Tag::FEq, sel, coerce(val, vt, ty, b, l), l);
     }
@@ -986,6 +990,202 @@ ir::Index Lowerer::inside_container_pred(const Expression& m,
     return b.unary(T::Load, hit.lv(b, l), l);
 }
 
+// An ASSOCIATIVE-ARRAY member of an `inside` set: the same OR over its elements,
+// walked by key. LRM 11.4.13 traverses an unpacked array member "by descending
+// into the array until reaching a singular value", and the traversal of an
+// associative array is the first / next key walk of 7.9.4-7.9.5 -- not the index
+// loop the ordered containers share -- so this is the shape `foreach` over one
+// uses (lower_foreach_assoc_dim). Like its siblings it takes no early exit: the
+// comparisons are side-effect-free and the order of evaluation is
+// nondeterministic (11.4.13), so the full OR reduction gives the same answer,
+// x propagation included.
+ir::Index Lowerer::inside_assoc_pred(const Expression& m,
+                                     ir::Index         sel,
+                                     ir::Ref           ty,
+                                     bool              real,
+                                     ir::Builder&      b,
+                                     ir::SourceLoc     l) {
+    using T    = ir::Inst::Tag;
+    using Step = ir::Builder::AssocStep;
+    const slang::ast::Type& et = *m.type->getArrayElementType();
+    if (et.getCanonicalType().isUnpackedArray() || is_agg_abi_type(et.getCanonicalType())) {
+        // TODO: descend into a non-singular element, as for a queue or dynamic
+        // array member (inside_container_pred).
+        fail("inside operator with an associative-array member whose elements are "
+             "not singular is not supported");
+    }
+    const ir::Ref  aty = lower_type(*m.type);
+    const ir::Type at  = std::get<ir::Type>(module_.pool.get(aty));
+    // A wildcard `[*]` index lowers to a synthetic u64 key (see build_assoc_p_string).
+    const ir::Ref   kr     = at.right != 0 ? make_int_type(64, false) : static_cast<ir::Ref>(at.fields_id);
+    const ir::Ref   log1   = make_int_type(1, true);
+    const ir::Ref   bit1   = make_int_type(1, false);
+    const ir::Index arr    = lower_lvalue(m, b);
+    const TempCell  hit    = make_temp_cell(log1, "inside_hit");
+    const TempCell  key    = make_temp_cell(kr, "inside_key");
+    const TempCell  ok     = make_temp_cell(bit1, "inside_ok");
+    // An aggregate key travels as an lvalue, a scalar one as a value (lower_assoc_key).
+    const auto key_operand = [&] { return is_agg_abi_ref(kr) ? key.lv(b, l) : b.unary(T::Load, key.lv(b, l), l); };
+
+    const ir::Index hit_lv   = hit.lv(b, l);
+    const ir::Index hit_init = b.constant(module_.pool.put_int(log1, 0), l);
+    b.binary(T::Store, hit_lv, hit_init, l);
+    const ir::Index ok_lv    = ok.lv(b, l);
+    const ir::Index ok_first = b.convert(b.assoc_traverse(arr, key.lv(b, l), Step::First, aty, l), bit1, false, l);
+    b.binary(T::Store, ok_lv, ok_first, l);
+
+    b.open_region();
+    const ir::Index      pred = b.unary(T::Load, ok.lv(b, l), l);
+    const ir::ExtraSlice cond = b.close_region();
+
+    b.open_region();
+    const ir::Index elem     = b.unary(T::Load, b.assoc_select(arr, key_operand(), aty, l), l);
+    const ir::Index hit_slot = hit.lv(b, l);
+    const ir::Index seen     = b.unary(T::Load, hit.lv(b, l), l);
+    const ir::Index match    = inside_leaf_eq(sel, elem, et, ty, real, b, l);
+    b.binary(T::Store, hit_slot, b.binary(T::Lor, seen, match, l), l);
+    const ir::ExtraSlice body = b.close_region();
+
+    b.open_region();
+    const ir::Index ok_step = ok.lv(b, l);
+    const ir::Index ok_next = b.convert(b.assoc_traverse(arr, key.lv(b, l), Step::Next, aty, l), bit1, false, l);
+    b.binary(T::Store, ok_step, ok_next, l);
+    const ir::ExtraSlice step = b.close_region();
+
+    b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
+    return b.unary(T::Load, hit.lv(b, l), l);
+}
+
+// The lowest or highest value of the comparison type `ty` as a constant. LRM
+// 11.4.13: a `$` bound "shall represent the lowest or highest value for the type
+// of the expression on the left-hand side". That expression has been converted
+// to the common type every compare here runs in (bindMembershipExpressions
+// propagates it), so the extreme is that type's own, and comparing with it holds
+// for every definite selector -- which is how slang folds a `$` side as well.
+ir::Index Lowerer::type_extreme(ir::Ref ty, bool is_signed, bool high, ir::Builder& b, ir::SourceLoc l) {
+    const uint32_t width = module_.pool.layout(ty).width;
+    slang::SVInt   v(width, 0, false);
+    if (high) {
+        v.setAllOnes();
+        if (is_signed) {
+            v = v.lshr(1);
+        }
+    } else if (is_signed) {
+        v = slang::SVInt(width, 1, false).shl(width - 1);
+    }
+
+    return b.constant(svint_to_ref(v, ty), l);
+}
+
+// The low and high operands of one `inside` range over an integral selector, at
+// the common type `ty` (see InsideBounds).
+//
+// [A +/- B] is [A - type(A)'(B) : A + type(A)'(B)] and [A +%- B] is
+// [A - type(A)'(A*B/100.0) : A + type(A)'(A*B/100.0)] (LRM 11.4.13); "the bounds
+// are always considered as [low_bound:high_bound], swapping the two resulting
+// values as necessary", and "for real to integral conversions of the tolerance,
+// truncation occurs instead of rounding". A and the sum run at `ty`, the type
+// slang propagates into A, and the difference may wrap there like any other
+// operation at that width. B is self-determined, so its own type decides how it
+// becomes the tolerance. A*B is the product of its operand types (an integer one
+// when both are integral, at the wider of the two) and only then a real, which
+// is the order the expression is written in.
+Lowerer::InsideBounds Lowerer::inside_range_bounds(const ValueRangeExpression& vr,
+                                                   ir::Ref                     ty,
+                                                   bool                        is_signed,
+                                                   ir::Builder&                b) {
+    using T               = ir::Inst::Tag;
+    const ir::SourceLoc l = loc(vr);
+    const Expression&   a = vr.left();
+    if (vr.rangeKind == ValueRangeKind::Simple) {
+        const auto bound = [&](const Expression& e, bool high) {
+            return is_unbounded_bound(e) ? type_extreme(ty, is_signed, high, b, loc(e))
+                                         : b.convert(lower_expr(e, b), ty, is_signed, loc(e));
+        };
+        const ir::Index lo = bound(a, false);
+        const ir::Index hi = bound(vr.right(), true);
+
+        return { lo, hi };
+    }
+
+    const Expression& bx   = vr.right();
+    const ir::Index   base = b.convert(lower_expr(a, b), ty, is_signed, loc(a));
+    const ir::Index   bv   = lower_expr(bx, b);
+    ir::Index         tol;
+    if (vr.rangeKind == ValueRangeKind::AbsoluteTolerance) {
+        tol = bx.type->isFloating() ? b.float_cvt(T::FtoITrunc, bv, ty, loc(bx))
+                                    : b.convert(bv, ty, bx.type->isSigned(), loc(bx));
+    } else {
+        const ir::Ref real_ty = module_.pool.real_type;
+        ir::Index     scaled;
+        if (bx.type->isFloating()) {
+            const ir::Index ar = b.float_cvt(is_signed ? T::SItoF : T::UItoF, base, real_ty, l);
+            scaled             = b.binary(T::FMul, ar, coerce(bv, *bx.type, real_ty, b, loc(bx)), l);
+        } else {
+            const uint32_t  w      = std::max(a.type->getBitWidth(), bx.type->getBitWidth());
+            const ir::Ref   common = make_int_type(w, a.type->isFourState() || bx.type->isFourState());
+            const ir::Index prod   = b.binary(T::Mul, b.convert(base, common, is_signed, l),
+                                              b.convert(bv, common, bx.type->isSigned(), loc(bx)), l);
+            scaled = b.float_cvt(is_signed && bx.type->isSigned() ? T::SItoF : T::UItoF, prod, real_ty, l);
+        }
+        const ir::Index hundred = b.constant(module_.pool.put_real(real_ty, 100.0), l);
+        tol                     = b.float_cvt(T::FtoITrunc, b.binary(T::FDiv, scaled, hundred, l), ty, l);
+    }
+    const ir::Index lo0  = b.binary(T::Sub, base, tol, l);
+    const ir::Index hi0  = b.binary(T::Add, base, tol, l);
+    const ir::Index swap = b.binary(is_signed ? T::SLt : T::ULt, hi0, lo0, l);
+    const ir::Index lo   = b.select(swap, hi0, lo0, l);
+    const ir::Index hi   = b.select(swap, lo0, hi0, l);
+
+    return { lo, hi };
+}
+
+// One `inside` range over a REAL selector: `sel >= lo && sel <= hi`, inclusive
+// at both ends; an inverted range is empty and matches nothing, which falls out
+// of the conjunction (LRM 11.4.13). A `$` side bounds nothing: Table 11-1 defines
+// the relationals on reals, and slang folds the side as always true. A tolerance
+// range's bounds are A -/+ the tolerance in either order, the "swapping" of
+// 11.4.13 being the choice of which one the selector is compared against first;
+// done as two conjunctions so a real needs no select.
+ir::Index Lowerer::inside_real_range_pred(const ValueRangeExpression& vr, ir::Index sel, ir::Ref rty, ir::Builder& b) {
+    using T               = ir::Inst::Tag;
+    const ir::SourceLoc l = loc(vr);
+    const Expression&   a = vr.left();
+    if (vr.rangeKind == ValueRangeKind::Simple) {
+        std::optional<ir::Index> above;
+        std::optional<ir::Index> below;
+        if (!is_unbounded_bound(a)) {
+            above = b.binary(T::FGe, sel, coerce(lower_expr(a, b), *a.type, rty, b, loc(a)), l);
+        }
+        if (!is_unbounded_bound(vr.right())) {
+            below = b.binary(T::FLe, sel, coerce(lower_expr(vr.right(), b), *vr.right().type, rty, b, loc(vr.right())), l);
+        }
+        if (above && below) {
+            return b.binary(T::Land, *above, *below, l);
+        }
+        if (!above && !below) {
+            // slang rejects a range with `$` at both ends (ValueRangeUnbounded).
+            fail("internal: an inside range with no bound");
+        }
+        return above ? *above : *below;
+    }
+
+    const Expression& bx   = vr.right();
+    const ir::Index   base = coerce(lower_expr(a, b), *a.type, rty, b, loc(a));
+    const ir::Index   bv   = coerce(lower_expr(bx, b), *bx.type, rty, b, loc(bx));
+    ir::Index         tol  = bv;
+    if (vr.rangeKind == ValueRangeKind::RelativeTolerance) {
+        const ir::Index hundred = b.constant(module_.pool.put_real(rty, 100.0), l);
+        tol                     = b.binary(T::FDiv, b.binary(T::FMul, base, bv, l), hundred, l);
+    }
+    const ir::Index lo0 = b.binary(T::FSub, base, tol, l);
+    const ir::Index hi0 = b.binary(T::FAdd, base, tol, l);
+    const ir::Index fwd = b.binary(T::Land, b.binary(T::FGe, sel, lo0, l), b.binary(T::FLe, sel, hi0, l), l);
+    const ir::Index rev = b.binary(T::Land, b.binary(T::FGe, sel, hi0, l), b.binary(T::FLe, sel, lo0, l), l);
+
+    return b.binary(T::Lor, fwd, rev, l);
+}
+
 // The `inside` set-membership operator (LRM 11.4.13): `sel inside { m0, m1, … }`
 // is 1'b1 if any member matches, 1'bx if some comparison is x with no definite
 // match, else 1'b0 — exactly a logical-OR reduction of the per-member
@@ -1003,6 +1203,16 @@ ir::Index Lowerer::inside_container_pred(const Expression& m,
 ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
     using T               = ir::Inst::Tag;
     const ir::SourceLoc l = loc(e);
+    // An unpacked-array member: traversed down to its singular elements
+    // (11.4.13). `ty` and `real` only matter to a non-string element.
+    const auto array_member = [&](const Expression& m, ir::Index sel, ir::Ref ty, bool real) {
+        if (is_assoc(m)) {
+            return inside_assoc_pred(m, sel, ty, real, b, l);
+        }
+
+        return is_unpacked_array(m) ? inside_fixed_array_pred(lower_lvalue(m, b), *m.type, sel, ty, real, b, l)
+                                    : inside_container_pred(m, sel, ty, real, b, l);
+    };
     if (is_string_expr(e.left())) {
         // A string set (LRM 11.4.13; uvm_reg_field::needs_update is
         // `get_access() inside {"RO","RC","RS"}`): per-member equality and, for
@@ -1020,18 +1230,28 @@ ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
             if (m->kind == ExpressionKind::ValueRange) {
                 const auto& vr = m->as<ValueRangeExpression>();
                 if (vr.rangeKind != ValueRangeKind::Simple) {
-                    // A tolerance range needs arithmetic, which a string has none of.
-                    fail("inside operator tolerance ranges are not supported");
+                    // slang binds a tolerance range only over numeric bounds, which
+                    // 11.4.13 defines the arithmetic of, so no string reaches one.
+                    fail("internal: a tolerance range over strings");
                 }
-                const ir::Index above = b.binary(T::UGe, sel, lower_expr(vr.left(), b), l);
-                const ir::Index below = b.binary(T::ULe, sel, lower_expr(vr.right(), b), l);
-                fold(b.binary(T::Land, above, below, l));
+                // A `$` side bounds nothing, as for a number (inside_real_range_pred).
+                std::optional<ir::Index> above;
+                std::optional<ir::Index> below;
+                if (!is_unbounded_bound(vr.left())) {
+                    above = b.binary(T::UGe, sel, lower_expr(vr.left(), b), l);
+                }
+                if (!is_unbounded_bound(vr.right())) {
+                    below = b.binary(T::ULe, sel, lower_expr(vr.right(), b), l);
+                }
+                if (!above && !below) {
+                    fail("internal: an inside range with no bound");
+                }
+                fold(above && below ? b.binary(T::Land, *above, *below, l) : (above ? *above : *below));
                 continue;
             }
             if (m->type->getCanonicalType().isUnpackedArray()) {
-                // TODO: a container of strings as a set member — the element
-                // walk above compares through resize, which rejects strings.
-                fail("inside operator with a container of strings is not supported");
+                fold(array_member(*m, sel, ir::Ref::Invalid, false));
+                continue;
             }
             fold(b.binary(T::Eq, sel, lower_expr(*m, b), l));
         }
@@ -1059,38 +1279,17 @@ ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
     for (const Expression* m : e.rangeList()) {
         if (m->kind == ExpressionKind::ValueRange) {
             const auto& vr = m->as<ValueRangeExpression>();
-            if (vr.rangeKind != ValueRangeKind::Simple) {
-                // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
-                fail("inside operator tolerance ranges are not supported");
-            }
-            if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
-                // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
-                fail("inside operator unbounded ($) range bounds are not supported");
-            }
             if (real) {
-                // `sel >= lo && sel <= hi`, inclusive both ends; an inverted
-                // range is empty and matches nothing, which falls out of the
-                // conjunction (11.4.13).
-                const ir::Index lo    = coerce(lower_expr(vr.left(), b), *vr.left().type, ty, b, loc(vr.left()));
-                const ir::Index hi    = coerce(lower_expr(vr.right(), b), *vr.right().type, ty, b, loc(vr.right()));
-                const ir::Index above = b.binary(T::FGe, sel, lo, l);
-                const ir::Index below = b.binary(T::FLe, sel, hi, l);
-                fold(b.binary(T::Land, above, below, l));
+                fold(inside_real_range_pred(vr, sel, ty, b));
                 continue;
             }
-            ranges.push_back(b.convert(lower_expr(vr.left(), b), ty, e.left().type->isSigned(), loc(vr.left())));
-            ranges.push_back(b.convert(lower_expr(vr.right(), b), ty, e.left().type->isSigned(), loc(vr.right())));
+            const InsideBounds bounds = inside_range_bounds(vr, ty, e.left().type->isSigned(), b);
+            ranges.push_back(bounds.lo);
+            ranges.push_back(bounds.hi);
             continue;
         }
         if (m->type->getCanonicalType().isUnpackedArray()) {
-            if (is_assoc(*m)) {
-                // TODO: an associative-array set member (LRM 11.4.13). Its
-                // traversal is the first/next key walk (7.9.4), not the index
-                // loop the ordered containers share.
-                fail("inside operator with an associative-array set member is not supported");
-            }
-            fold(is_unpacked_array(*m) ? inside_fixed_array_pred(lower_lvalue(*m, b), *m->type, sel, ty, real, b, l)
-                                       : inside_container_pred(*m, sel, ty, real, b, l));
+            fold(array_member(*m, sel, ty, real));
             continue;
         }
         if (real) {

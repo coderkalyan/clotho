@@ -1232,40 +1232,32 @@ TEST_CASE("unique case inside: overlapping members of the same item is not a vio
     CHECK(run_capture(src) == "A\n");
 }
 
-// A range with a tolerance bound (LRM 11.4.13's `+/-` / `+%-`) is a documented
-// gap -- guarded loudly rather than silently mis-simulated.
-TEST_CASE("case inside: tolerance range bound is reported as unsupported") {
-    const LowerResult r = lower_text(R"(
+// `$` range bounds and string ranges of `case ... inside` (LRM 12.5.4 over
+// 11.4.13): `[$:hi]` is "at most hi", `[lo:$]` "at least lo", a string range is
+// lexicographic (6.16.9). iverilog 13 cannot parse these; expectations are the LRM's.
+TEST_CASE("case inside: unbounded and string range bounds") {
+    constexpr std::string_view src = R"(
         module m;
             int x;
+            string s;
             initial begin
-                x = 5;
-                case (x) inside
-                    [3 +/- 2]: $display("hit");
-                    default:   $display("miss");
+                for (x = 0; x < 20; x += 3)
+                    case (x) inside
+                        [$:3]:   $write("L");
+                        [15:$]:  $write("H");
+                        default: $write(".");
+                    endcase
+                $display("");
+                s = "dog";
+                case (s) inside
+                    ["a":"c"]: $display("a-c");
+                    ["d":"f"]: $display("d-f");
+                    default:   $display("none");
                 endcase
             end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-}
-
-// An unbounded (`$`) range bound is likewise a documented gap.
-TEST_CASE("case inside: unbounded range bound is reported as unsupported") {
-    const LowerResult r = lower_text(R"(
-        module m;
-            int x;
-            initial begin
-                x = 5;
-                case (x) inside
-                    [$:10]:  $display("hit");
-                    default: $display("miss");
-                endcase
-            end
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("unbounded") != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "LL...HH\nd-f\n");
 }
 
 // -- Recursive switch segmentation (find_switch_run) --

@@ -3360,6 +3360,29 @@ private:
 
     static bool is_unbounded_bound(const Expression& e);
 
+    // A range bound of `inside` / `case ... inside` as comparison operands in the
+    // common type `ty` (LRM 11.4.13): a plain bound converted, `$` the lowest or
+    // highest value of `ty`, and a tolerance range `[a +/- b]` / `[a +%- b]`
+    // expanded to its low and high bounds, swapped if need be.
+    struct InsideBounds {
+        ir::Index lo;
+        ir::Index hi;
+    };
+
+    InsideBounds inside_range_bounds(const ValueRangeExpression& vr, ir::Ref ty, bool is_signed, ir::Builder& b);
+
+    // The same range over a real selector: `sel >= lo && sel <= hi` at `real`.
+    ir::Index inside_real_range_pred(const ValueRangeExpression& vr, ir::Index sel, ir::Ref rty, ir::Builder& b);
+
+    ir::Index type_extreme(ir::Ref ty, bool is_signed, bool high, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index inside_assoc_pred(const Expression& m,
+                                ir::Index         sel,
+                                ir::Ref           ty,
+                                bool              real,
+                                ir::Builder&      b,
+                                ir::SourceLoc     l);
+
     CaseCompareType common_inside_type(const CaseStatement& c);
 
     ir::Index lower_inside_label_pred(const Expression& label,

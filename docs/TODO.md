@@ -446,12 +446,8 @@ Milestones, in order; lower ones unblock higher ones:
 ### Operators & expressions
 
 - [~] **`inside` operator** (11.4.13) — missing set-member and range forms:
-  - [ ] **Associative-array set member** — needs the first/next key walk (7.9.4) rather
-    than an index loop.
-  - [ ] **Queue or dynamic-array set member with non-singular elements** — refused.
-  - [ ] **Tolerance ranges** — `[c +/- d]` and `[c +%- d]` are refused.
-  - [ ] **Unbounded `$` range bounds** — `[$:a]` and `[a:$]` are refused.
-  - [ ] **Unpacked array of strings as a set member** — refused.
+  - [ ] **Queue, dynamic-array or associative-array set member with non-singular elements** —
+    refused.
 - [~] **Streaming operators** (11.4.14) — forms that need a bit-level stream buffer:
   - [ ] **`with` clause on a stream operand** — refused.
   - [ ] **Width not a multiple of the destination granule** — e.g. `bit [5:0] q[$]` into a
@@ -469,10 +465,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Procedural control
 
-- [ ] **`case … inside` tolerance ranges** (12.5.4) — `[a +/- b]` and `[a +%- b]` labels
-  are refused.
-- [ ] **`case … inside` unbounded range bounds** (12.5.4) — `[$:a]` and `[a:$]` labels are
-  refused.
 - [ ] **`always_ff` non-sequential body warning** (9.2.2.4) — no diagnostic is issued when
   the body does not describe sequential logic.
 - [ ] **`foreach` skipping an outer dimension over a nested runtime one** (12.7.3) —
