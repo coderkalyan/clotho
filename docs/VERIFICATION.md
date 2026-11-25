@@ -11,8 +11,10 @@ In strict order:
 2. **Never crash.** Every input is simulated or rejected with a diagnostic. An
    internal error is a bug even when the input is invalid.
 3. **Complete sections, not common subsets.** What is implemented is
-   implemented completely; what is not is refused and listed in `docs/TODO.md`.
-   Sections are completed in milestone order.
+   implemented completely, rare cases and interactions included; a feature not
+   implemented at all is refused and listed in `docs/TODO.md`. Refusing a case
+   of an implemented feature is a gap, not a finish, and needs the
+   maintainer's approval. Sections are completed in milestone order.
 
 ## Oracles
 
@@ -159,7 +161,8 @@ A section, an LRM clause or a coherent part of one, is complete when:
 - the differential fuzzer covering it has run clean for a fixed budget since
   its last fix;
 - coverage shows no unreached lowering path for it;
-- what remains is refused and listed in `docs/TODO.md`.
+- nothing in it is refused: a refusal left in the section is an open gap listed
+  in `docs/TODO.md`, and the section is not complete until it closes.
 
 ## Trust levels
 
