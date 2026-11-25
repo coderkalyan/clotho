@@ -364,9 +364,6 @@ Milestones, in order; lower ones unblock higher ones:
   subroutine argument or a raw rvalue; refused in the backend.
 - [ ] **String event control / sensitivity** — `@(s)` and inferred sensitivity on a string are
   refused.
-- [ ] **`case ... inside` string range bound** (11.4.13) — a `[lo:hi]` item over a string selector
-  is refused.
-- [ ] **Enum `next` / `prev` with a non-constant step** — only a constant step is lowered.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
   - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an
@@ -502,7 +499,6 @@ Milestones, in order; lower ones unblock higher ones:
     assertion is refused `wait fork` and `wait_order`.
   - [ ] **Action block scheduled in the Reactive region** — the report matures through the
     deferred queue instead of scheduling the action block in Reactive.
-- [ ] **`$countbits` with a non-constant control bit** — refused.
 - [ ] **`$isunbounded` of a hierarchical reference** — refused; slang does not
   constant-evaluate it.
 

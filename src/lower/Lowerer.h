@@ -3986,7 +3986,7 @@ private:
 
     std::string format_typename(const slang::ast::Type& type);
 
-    uint32_t count_control_class(const Expression& ctrl);
+    std::optional<uint32_t> count_control_class(const Expression& ctrl);
 
     ir::Index lower_bit_query(std::string_view      name,
                               const CallExpression& call,

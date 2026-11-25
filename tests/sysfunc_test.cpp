@@ -118,6 +118,40 @@ TEST_CASE("$countbits over each control class") {
     CHECK(out == "3 2 2 1 3\n");
 }
 
+// A control bit that is a variable (LRM 20.9: "The control bit arguments to
+// $countbits may be variables"): which of 0 / 1 / x / z it names is a run-time
+// fact, a control wider than one bit contributes only its LSB, and a value named
+// twice counts once, whether by two variables or by a variable and a constant.
+// Expected values from iverilog 13, which agrees on every line; the operand is
+// 8'b101x_z01x (ones 3, zeros 2, x 2, z 1).
+TEST_CASE("$countbits with a control bit known only at run time") {
+    const std::string out = run_capture(prog(
+      "logic [7:0] v; logic c, d; logic [3:0] wide; bit two; logic [1:0] bad_bits; int n;",
+      "v = 8'b101x_z01x;"
+      "c = 1'b1; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'b0; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'bx; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'bz; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'b1; d = 1'bz; $display(\"%0d\", $countbits(v, c, d));"
+      "c = 1'b1; d = 1'b1; $display(\"%0d\", $countbits(v, c, d));"
+      "c = 1'b0; $display(\"%0d\", $countbits(v, c, 1'b1));"
+      "c = 1'b1; $display(\"%0d\", $countbits(v, c, 1'b1));"
+      "wide = 4'b0101; $display(\"%0d\", $countbits(v, wide));"
+      "wide = 4'b0110; $display(\"%0d\", $countbits(v, wide));"
+      "wide = 4'b010x; $display(\"%0d\", $countbits(v, wide));"
+      "wide = 4'b001z; $display(\"%0d\", $countbits(v, wide));"
+      "two = 1'b1; $display(\"%0d\", $countbits(v, two));"
+      "two = 1'b0; $display(\"%0d\", $countbits(v, two));"
+      "bad_bits[0] = 1'bx; bad_bits[1] = 1'bz;"
+      "$display(\"%0d\", $countbits(v, bad_bits[0], bad_bits[1]));"
+      "bad_bits[0] = 1'bx; bad_bits[1] = 1'bx;"
+      "$display(\"%0d\", $countbits(v, bad_bits[0], bad_bits[1]));"
+      "n = $countbits(8'hFF, c) + $countbits(8'h0F, d);"
+      "$display(\"%0d\", n);"
+      "v = 8'b0000_0000; c = 1'b0; $display(\"%0d\", $countbits(v, c));"));
+    CHECK(out == "3\n2\n2\n1\n4\n3\n5\n3\n3\n2\n2\n1\n3\n2\n3\n2\n12\n8\n");
+}
+
 // -- $onehot / $onehot0 -----------------------------------------------------
 
 // $onehot: exactly one definite-1 bit. $onehot0: at most one. x/z corners

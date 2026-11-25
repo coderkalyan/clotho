@@ -569,42 +569,71 @@ ir::Index Lowerer::lower_enum_method(std::string_view            name,
                            l);
     }
 
-    // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
-    // one in declaration order, wrapping. N is an optional constant (default
-    // 1); a non-member receiver yields X (matches iverilog; LRM leaves it
-    // undefined). Lowered as a branchless packed select chain over the member
-    // set — an integer select, so any base width works.
+    // next(N)/prev(N) (LRM 6.19.5.3, 6.19.5.4): the Nth member after/before the
+    // current one in declaration order, wrapping; N defaults to 1. A non-member
+    // receiver yields the enum's default initial value (Table 6-7: X of a 4-state
+    // base, 0 of a 2-state one). A constant N is lowered as a branchless select
+    // chain over the member set -- an integer select, so any base width works --
+    // and a run-time N as modular arithmetic on the receiver's position.
     if (name == "next" || name == "prev") {
-        int64_t step = 1;
-        if (call.arguments().size() >= 2) {
-            const slang::ConstantValue cv = fold_const(*call.arguments()[1], Fold::Runtime);
-            if (!cv.isInteger()) {
-                // TODO: a runtime (non-constant) step needs value->index lookup
-                // plus modular index arithmetic; rare, so reject for now.
-                fail("enum next/prev with a non-constant step is not supported");
-            }
-            step = cv.integer().as<int64_t>().value_or(0);
-        }
-
-        const int64_t num   = static_cast<int64_t>(members.size());
-        const int64_t delta = (name == "next") ? step : -step;
-        const auto    wrap  = [num](int64_t k) { return ((k % num) + num) % num; };
-
-        const ir::Index recv = lower_expr(*call.arguments()[0], b);
+        const int64_t num  = static_cast<int64_t>(members.size());
+        const bool    next = name == "next";
         // Default (no member matched): X of the base type (2-state base cannot
         // hold X, so it degrades to 0 via svint_to_ref's must plane).
-        ir::Index res = b.constant(svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
-                                                               : slang::SVInt(et.bitWidth, 0, et.isSigned),
-                                                base_ty),
-                                   l);
-        for (size_t i = members.size(); i-- > 0;) {
-            const ir::Index memberc = b.constant(svint_to_ref(members[i].value, base_ty), l);
-            const ir::Index targetc = b.constant(
-              svint_to_ref(members[static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta))].value, base_ty), l);
-            const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
-            res                = b.select(eq, targetc, res, l);
+        const auto default_value = [&] {
+            return b.constant(svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
+                                                          : slang::SVInt(et.bitWidth, 0, et.isSigned),
+                                           base_ty),
+                              l);
+        };
+        const auto member_value = [&](size_t i) {
+            return b.constant(svint_to_ref(members[i].value, base_ty), l);
+        };
+
+        std::optional<int64_t> step = 1;
+        if (call.arguments().size() >= 2) {
+            const slang::ConstantValue cv = fold_const(*call.arguments()[1], Fold::Runtime);
+            step = cv.isInteger() ? std::optional<int64_t>(cv.integer().as<int64_t>().value_or(0)) : std::nullopt;
         }
-        return res;
+
+        const ir::Index recv = lower_expr(*call.arguments()[0], b);
+        if (step) {
+            const int64_t delta = next ? *step : -*step;
+            const auto    wrap  = [num](int64_t k) { return ((k % num) + num) % num; };
+
+            ir::Index res = default_value();
+            for (size_t i = members.size(); i-- > 0;) {
+                const ir::Index memberc = member_value(i);
+                const ir::Index targetc = member_value(static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta)));
+                const ir::Index eq      = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
+                res                     = b.select(eq, targetc, res, l);
+            }
+            return res;
+        }
+
+        // A step known only at run time. N is an `int unsigned`, so it can exceed
+        // the member count: reduce it modulo `num` first, which also keeps the
+        // position arithmetic below from wrapping. `pos` is the receiver's index
+        // in declaration order, or `num` when it matches no member.
+        const ir::Ref   u64      = make_int_type(64, false);
+        const auto      position = [&](int64_t k) { return b.constant(module_.pool.put_int(u64, static_cast<uint64_t>(k)), l); };
+        const ir::Index count    = position(num);
+        ir::Index       pos      = count;
+        for (size_t i = 0; i < members.size(); ++i) {
+            const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, member_value(i), l);
+            pos                = b.select(eq, position(static_cast<int64_t>(i)), pos, l);
+        }
+        const ir::Index n    = b.convert(lower_expr(*call.arguments()[1], b), u64, /*sign_extend=*/false, l);
+        const ir::Index by   = b.binary(ir::Inst::Tag::UMod, n, count, l);
+        // The Nth previous is the (num - N mod num)th next.
+        const ir::Index move = next ? by : b.binary(ir::Inst::Tag::Sub, count, by, l);
+        const ir::Index to   = b.binary(ir::Inst::Tag::UMod, b.binary(ir::Inst::Tag::Add, pos, move, l), count, l);
+        ir::Index       res  = default_value();
+        for (size_t j = members.size(); j-- > 0;) {
+            res = b.select(b.binary(ir::Inst::Tag::Eq, to, position(static_cast<int64_t>(j)), l), member_value(j), res, l);
+        }
+        // `pos == num` is the receiver matching no member, whose answer is the default.
+        return b.select(b.binary(ir::Inst::Tag::Ne, pos, count, l), res, default_value(), l);
     }
 
     // LRM 6.19.2-6.19.5 defines six enum methods -- first, last, next, prev,
@@ -640,12 +669,12 @@ std::string Lowerer::format_typename(const slang::ast::Type& type) {
 }
 
 // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
-// value naming which 4-state value that control tallies. A non-constant
-// control is rejected (it would need a runtime class-mask select).
-uint32_t Lowerer::count_control_class(const Expression& ctrl) {
+// value naming which 4-state value that control tallies. Null for a control
+// that is not constant, whose class is picked at run time by lower_bit_query.
+std::optional<uint32_t> Lowerer::count_control_class(const Expression& ctrl) {
     const slang::ConstantValue cv = fold_const(ctrl, Fold::Runtime);
     if (!cv.isInteger()) {
-        fail("$countbits control bit must be a constant 0/1/x/z");
+        return std::nullopt;
     }
     const slang::logic_t bit = cv.integer()[0];
     if (bit.value == slang::logic_t::X_VALUE) {
@@ -681,8 +710,8 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
     }
 
     // The 20.9 counting family. The first argument is the counted value;
-    // $countbits additionally carries constant control-bit arguments naming
-    // which 4-state values to tally.
+    // $countbits additionally carries control-bit arguments naming which 4-state
+    // values to tally.
     const ir::Index val = lower_expr(*args[0], b);
 
     // $onehot / $onehot0 / $isunknown carry their qualifier in the tag.
@@ -696,11 +725,19 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
         return b.convert(b.unary(ir::Inst::Tag::IsUnknown, val, l), lower_type(*call.type), call.type->isSigned(), l);
     }
 
-    uint32_t mask = ir::CountOne; // $countones counts definite-1 bits
+    uint32_t               mask = ir::CountOne; // $countones counts definite-1 bits
+    std::vector<ir::Index> dynamic;             // control bits known only at run time
+    const ir::Ref          logic1 = make_int_type(1, true);
     if (name == "$countbits") {
         mask = 0;
         for (size_t k = 1; k < args.size(); ++k) {
-            mask |= count_control_class(*args[k]);
+            if (const std::optional<uint32_t> cls = count_control_class(*args[k])) {
+                mask |= *cls;
+            } else {
+                // A control wider than one bit contributes its least significant
+                // bit only (LRM 20.9); narrowing to a 4-state bit keeps its x / z.
+                dynamic.push_back(b.convert(lower_expr(*args[k], b), logic1, false, l));
+            }
         }
     }
     return b.convert(b.count_bits(val, mask, l), lower_type(*call.type), call.type->isSigned(), l);
