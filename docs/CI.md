@@ -129,8 +129,8 @@ Nightly on `main`, 2026-11-24 (`bbe3b9a1`):
 | target | result |
 |---|---|
 | linux-x64, linux-x64-sanitize, linux-arm64, windows-x64 | pass |
-| macos-arm64, macos-x64 | one failure since the case was added (`b8baaefe`): `build -j 1` and `build -j 3` link different executables (`cli_test`, "build writes the same executable whatever the number of compile threads") |
-| windows-arm64 | does not build: Zig crashes building libsva (exit `0xC0000005`) on every run since at least 2026-10-31 |
+| macos-arm64, macos-x64 | one failure since the case was added (`b8baaefe`): `build -j 1` and `build -j 3` link different executables (`cli_test`, "build writes the same executable whatever the number of compile threads"). The test linked the two under different names, which lld hashes into a Mach-O's UUID; fixed in `c785cd1d`, not yet confirmed by a run |
+| windows-arm64 | has not built since Zig entered CI (2026-10-19): the official aarch64-windows zig 0.16.0 crashes (exit `0xC0000005`) on any compile, [zig#31865](https://codeberg.org/ziglang/zig/issues/31865). CI now builds libsva with the x86_64 zig, emulated, targeting arm64 (`CLOTHO_LIBSVA_ZIG_TARGET`); not yet confirmed by a run |
 
 Only windows-arm64 is advisory (`continue-on-error`); every other target gates.
 

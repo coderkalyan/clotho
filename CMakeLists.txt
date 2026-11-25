@@ -366,6 +366,10 @@ endif()
 option(CLOTHO_SVA "Concurrent-assertion support (requires Zig and libsva)" ON)
 set(CLOTHO_LIBSVA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libsva"
     CACHE PATH "libsva source tree, built in place with `zig build`")
+# A Zig target triple for libsva, for when the zig that builds it does not run
+# natively on the target. Empty builds for the host, which is the normal case.
+set(CLOTHO_LIBSVA_ZIG_TARGET "" CACHE STRING
+    "Zig -Dtarget for libsva (empty: the host)")
 
 if(CLOTHO_SVA)
   find_program(ZIG_EXECUTABLE zig REQUIRED DOC "Zig 0.16+, used to build libsva")
@@ -403,10 +407,13 @@ if(CLOTHO_SVA)
   # compiler_rt it bundles into libsva supplies clotho's memcpy and memset, so a
   # binary built on a machine with newer vector extensions died with SIGILL at
   # startup on an older one.
+  set(_libsva_zig_args -Doptimize=${_libsva_optimize} -Dcpu=baseline)
+  if(CLOTHO_LIBSVA_ZIG_TARGET)
+    list(APPEND _libsva_zig_args -Dtarget=${CLOTHO_LIBSVA_ZIG_TARGET})
+  endif()
   add_custom_command(
     OUTPUT ${_libsva_lib} ${_libsva_include}/libsva/sva.h
-    COMMAND ${ZIG_EXECUTABLE} build --prefix ${_libsva_prefix}
-            -Doptimize=${_libsva_optimize} -Dcpu=baseline
+    COMMAND ${ZIG_EXECUTABLE} build --prefix ${_libsva_prefix} ${_libsva_zig_args}
     COMMAND ${CMAKE_COMMAND} -E copy ${_libsva_prefix}/include/sva.h
             ${_libsva_include}/libsva/sva.h
     WORKING_DIRECTORY ${CLOTHO_LIBSVA_DIR}
