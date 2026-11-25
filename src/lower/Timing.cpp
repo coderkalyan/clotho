@@ -506,29 +506,77 @@ uint32_t Lowerer::anon_local(ir::Ref type) {
     return idx;
 }
 
-// `@(<expression over virtual interface members>)` (LRM 9.4.2 + 25.9). The
-// general path synthesizes a net driven by a continuous process, which cannot
-// work through a handle: it would read the handle before it is assigned, and
-// then track whichever instance was bound at time zero. So this desugars to
-// exactly what the clause asks for -- wait until the expression's value
-// changes -- over the per-member waits that do work:
+// Whether the least significant bit of a sampled value made the edge `edge` names
+// from `old_v` to `new_v` (LRM 9.4.2, Table 9-2): posedge is 0 to 1, x or z and x
+// or z to 1, negedge 1 to 0, x or z and x or z to 0, and `edge` either. A change
+// between x and z is neither. Only the least significant bit counts, however wide
+// the expression is. The answer is a definite 1-bit value.
+ir::Index Lowerer::lsb_edge_fired(ir::Index               old_v,
+                                  ir::Index               new_v,
+                                  slang::ast::EdgeKind    edge,
+                                  ir::Builder&            b,
+                                  ir::SourceLoc           l) {
+    using T                = ir::Inst::Tag;
+    const ir::Ref logic1   = make_int_type(1, true);
+    // Narrowing to one 4-state bit keeps the least significant bit with its x / z.
+    const ir::Index prior  = b.convert(old_v, logic1, false, l);
+    const ir::Index latest = b.convert(new_v, logic1, false, l);
+    const auto      is     = [&](ir::Index v, uint64_t bit) {
+        return b.binary(T::CaseEq, v, b.constant(module_.pool.put_int(logic1, bit), l), l);
+    };
+    const ir::Index was0       = is(prior, 0);
+    const ir::Index was1       = is(prior, 1);
+    const ir::Index was_x_or_z = b.unary(T::Lnot, b.binary(T::Lor, was0, was1, l), l);
+    const auto      rise       = [&] {
+        const ir::Index from0 = b.binary(T::Land, was0, b.unary(T::Lnot, is(latest, 0), l), l);
+        const ir::Index from_unknown = b.binary(T::Land, was_x_or_z, is(latest, 1), l);
+        return b.binary(T::Lor, from0, from_unknown, l);
+    };
+    const auto fall = [&] {
+        const ir::Index from1 = b.binary(T::Land, was1, b.unary(T::Lnot, is(latest, 1), l), l);
+        const ir::Index from_unknown = b.binary(T::Land, was_x_or_z, is(latest, 0), l);
+        return b.binary(T::Lor, from1, from_unknown, l);
+    };
+    switch (edge) {
+        case slang::ast::EdgeKind::PosEdge:
+            return rise();
+        case slang::ast::EdgeKind::NegEdge:
+            return fall();
+        case slang::ast::EdgeKind::BothEdges: {
+            const ir::Index up = rise();
+            return b.binary(T::Lor, up, fall(), l);
+        }
+        case slang::ast::EdgeKind::None:
+            break;
+    }
+    fail("internal: an edge test for a control with no edge");
+}
+
+// `@([edge] <expression over virtual interface members> [iff cond])` (LRM 9.4.2 +
+// 25.9). The general path synthesizes a net driven by a continuous process, which
+// cannot work through a handle: it would read the handle before it is assigned,
+// and then track whichever instance was bound at time zero. So this desugars to
+// exactly what the clause asks for -- wait until the expression's value changes,
+// or until the least significant bit of it makes the edge, and until `cond` holds
+// then -- over the per-member waits that do work:
 //
 //   sample = expr;
-//   forever begin @(each member read) if (expr !== sample) break; sample = expr; end
+//   forever begin
+//     @(each member read);
+//     cur = expr; old = sample; sample = cur;
+//     if (cur !== old) [ or: the edge of cur[0] from old[0] ] begin
+//       if (cond) break;
+//     end
+//   end
+//
+// `cond` is evaluated when the expression changes, not when it changes (LRM
+// 9.4.2.3), so what it reads is no sensitivity. The sample follows every wake: a
+// change `cond` suppresses is still what the next one is measured from.
 //
 // The sample lives in the call frame inside a subroutine (so two activations of
 // one task do not share it) and in module storage in a process body, which is a
 // single coroutine and cannot re-enter its own wait.
 void Lowerer::lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l) {
-    if (ev.edge != slang::ast::EdgeKind::None) {
-        // TODO: an edge qualifier on an expression over virtual interface
-        // members (LRM 9.4.2 takes the edge of the expression's LSB). The
-        // change form below is the one that occurs in practice.
-        fail("an edge qualifier on an expression through a virtual interface is not supported");
-    }
-    if (ev.iffCondition != nullptr) {
-        fail("an `iff` qualifier on an expression through a virtual interface is not supported");
-    }
     const ir::Ref ty = lower_type(*ev.expr.type);
     // The sample's storage, as a maker so each use re-forms the lvalue.
     const bool       in_frame = fn_ctx_ != nullptr;
@@ -566,14 +614,27 @@ void Lowerer::lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, 
         b.wait(edges, l);
         const ir::Index cur     = b.convert(lower_expr(ev.expr, b), ty, ev.expr.type->isSigned(), l);
         const ir::Index sampled = b.unary(ir::Inst::Tag::Load, place(b), l);
-        const ir::Index same    = b.binary(ir::Inst::Tag::CaseEq, cur, sampled, l);
+        b.binary(ir::Inst::Tag::Store, place(b), cur, l);
+        const ir::Index fired =
+          ev.edge == slang::ast::EdgeKind::None
+            ? b.unary(ir::Inst::Tag::Lnot, b.binary(ir::Inst::Tag::CaseEq, cur, sampled, l), l)
+            : lsb_edge_fired(sampled, cur, ev.edge, b, l);
         b.open_region();
-        b.break_(l);
+        if (ev.iffCondition != nullptr) {
+            const ir::Index gate = lower_predicate(*ev.iffCondition, b);
+            b.open_region();
+            b.break_(l);
+            const ir::ExtraSlice take = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice skip = b.close_region();
+            b.cond(gate, take, skip, l);
+        } else {
+            b.break_(l);
+        }
         const ir::ExtraSlice then_r = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_r = b.close_region();
-        b.cond(b.unary(ir::Inst::Tag::Lnot, same, l), then_r, else_r, l);
-        b.binary(ir::Inst::Tag::Store, place(b), cur, l);
+        b.cond(fired, then_r, else_r, l);
     }
     const ir::ExtraSlice body = b.close_region();
 

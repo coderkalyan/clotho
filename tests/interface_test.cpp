@@ -516,6 +516,94 @@ TEST_CASE("virtual interface: an event control on a member expression") {
     CHECK(out == "changed 2\n");
 }
 
+// The edge qualifiers and the `iff` gate on an event control over an expression of
+// members (LRM 9.4.2, 9.4.2.3, 25.9): an edge is detected on the least
+// significant bit of the expression, a plain change on any bit, and `iff` is
+// evaluated when the expression changes, so a change it suppresses is not an
+// event and a change of what it reads is no event either. Each waiter logs the
+// times it woke. The same waiters over plain module variables are the
+// pre-existing synthesized-net path; its trace on this stimulus is the one
+// expected here (iverilog 13 agrees on the waiters without `iff`, which it does
+// not parse; the `iff` ones were worked out from 9.4.2.3).
+TEST_CASE("virtual interface: an edge or an iff on an event control over member expressions") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0, b = 0, en = 0; logic [3:0] v = 4'b0000; endinterface
+        module top;
+            ifc i();
+            virtual ifc vi;
+            string and_pos, and_neg, v_iff, v2_iff, v0_iff;
+            initial begin
+                vi = i;
+                fork
+                    forever begin @(posedge (vi.a & vi.b)); and_pos = {and_pos, $sformatf("%0t ", $time)}; end
+                    forever begin @(negedge (vi.a & vi.b)); and_neg = {and_neg, $sformatf("%0t ", $time)}; end
+                    forever begin @(vi.v iff vi.en); v_iff = {v_iff, $sformatf("%0t ", $time)}; end
+                    forever begin @(edge vi.v[2] iff vi.en); v2_iff = {v2_iff, $sformatf("%0t ", $time)}; end
+                    forever begin @(posedge (vi.v & 4'b0001) iff vi.en); v0_iff = {v0_iff, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 i.a = 1;
+                #1 i.b = 1;
+                #1 i.en = 1;
+                #1 i.v = 4'b0100;
+                #1 i.v = 4'b0000;
+                #1 i.en = 0;
+                #1 i.v = 4'b0100;
+                #1 i.en = 1;
+                #1 i.v = 4'b0100;
+                #1 i.v = 4'b0101;
+                #1 i.a = 0;
+                #1 i.b = 0; i.a = 1;
+                #1 i.b = 1;
+                #1;
+                $display("and_pos: %s", and_pos);
+                $display("and_neg: %s", and_neg);
+                $display("v_iff: %s", v_iff);
+                $display("v2_iff: %s", v2_iff);
+                $display("v0_iff: %s", v0_iff);
+            end
+        endmodule
+    )");
+    CHECK(out == "and_pos: 2 13 \nand_neg: 11 \nv_iff: 4 5 10 \nv2_iff: 4 5 \nv0_iff: 10 \n");
+}
+
+// Table 9-2 on the least significant bit of a member expression, x and z included: a
+// posedge is 0 to 1, x or z and x or z to 1, a negedge the mirror image, `edge` either,
+// and a change between x and z is none of them. iverilog 13 gives the same classes on
+// a variable's bit select.
+TEST_CASE("virtual interface: the edges of a member bit follow Table 9-2") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic [3:0] v = 4'b0000; endinterface
+        module top;
+            ifc i();
+            virtual ifc vi;
+            string pos, neg, any;
+            initial begin
+                vi = i;
+                fork
+                    forever begin @(posedge vi.v[0]); pos = {pos, $sformatf("%0t ", $time)}; end
+                    forever begin @(negedge vi.v[0]); neg = {neg, $sformatf("%0t ", $time)}; end
+                    forever begin @(edge vi.v[0]); any = {any, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 i.v = 4'b0001;
+                #1 i.v = 4'b0000;
+                #1 i.v = 4'b000x;
+                #1 i.v = 4'b000z;
+                #1 i.v = 4'b0001;
+                #1 i.v = 4'b000x;
+                #1 i.v = 4'b0000;
+                #1 i.v = 4'b000z;
+                #1 i.v = 4'b0000;
+                #1 i.v = 4'b0000;
+                #1;
+                $display("pos: %s", pos);
+                $display("neg: %s", neg);
+                $display("edge: %s", any);
+            end
+        endmodule
+    )");
+    CHECK(out == "pos: 1 3 5 8 \nneg: 2 6 7 9 \nedge: 1 2 3 5 6 7 8 9 \n");
+}
+
 // An interface subroutine reached through a handle (LRM 25.7) is lowered ONCE for
 // the definition, with the handle as formal 0, and addresses its signals through
 // the instance that names. Two handles on twin instances must therefore drive

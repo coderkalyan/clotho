@@ -724,8 +724,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Virtual interfaces** (25.9) — open pieces; see docs/design/interfaces.md:
   - [ ] **Member or clocking block of an interface instantiated inside the interface a handle
     names** (`vif.i.d`) — the context record does not carry its children's.
-  - [ ] **`edge` / `iff` qualifier on an event control over an expression of members** —
-    refused.
   - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
     — refused.
   - [ ] **Composite expression of members outside a lone procedural event control** —

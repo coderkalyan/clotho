@@ -2381,6 +2381,8 @@ private:
 
     void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
 
+    ir::Index lsb_edge_fired(ir::Index old_v, ir::Index new_v, slang::ast::EdgeKind edge, ir::Builder& b, ir::SourceLoc l);
+
     void lower_vif_clocking_drive(const MemberAccessExpression& ma, const AssignmentExpression& a,
                                   ir::Builder& b);
 
