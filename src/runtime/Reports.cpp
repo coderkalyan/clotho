@@ -12,16 +12,12 @@ using namespace rt_internal;
 
 namespace {
 
-// Shared tail of the two DPI export-task fatals: both are reached from inside a
-// native C frame the simulator cannot unwind, so neither can hand a settled state
-// back the way rt_finish_coop does. Same reasoning as rt_oscillation_abort --
-// report, close the dump while the design state is still live, exit nonzero.
-[[noreturn]] void dpi_export_task_fatal(const char* name, const char* what) {
+// Shared tail of the DPI export fatals: all are reached from inside a native C frame
+// the simulator cannot unwind, so none can hand a settled state back the way
+// rt_finish_coop does. Same reasoning as rt_oscillation_abort -- report, close the dump
+// while the design state is still live, exit nonzero.
+[[noreturn]] void dpi_export_fatal(std::string line) {
     std::fflush(stdout);
-    std::string line = "FATAL: exported task '";
-    line += name;
-    line += "' ";
-    line += what;
     line += " at ";
     append_finish_time(line, rt_diag_now());
     line += '\n';
@@ -30,6 +26,14 @@ namespace {
     rt_vcd_close();
     rt_finishing = 1;
     std::exit(1);
+}
+
+[[noreturn]] void dpi_export_task_fatal(const char* name, const char* what) {
+    std::string line = "FATAL: exported task '";
+    line += name;
+    line += "' ";
+    line += what;
+    dpi_export_fatal(std::move(line));
 }
 
 } // namespace
@@ -58,6 +62,24 @@ extern "C" void rt_dpi_export_task_no_task_frame(const char* name) {
                           "was called from C with no imported DPI task frame live (LRM 35.8: "
                           "it is never legal to call an exported task from within an imported "
                           "function)");
+}
+
+extern "C" void rt_dpi_export_no_scope(const char* name, const char* exporters) {
+    const char* const current = rt_svdpi_scope_name();
+    std::string       line    = "FATAL: DPI export '";
+    line += name;
+    line += "' was called from C with ";
+    if (current != nullptr) {
+        line += "scope '";
+        line += current;
+        line += "'";
+    } else {
+        line += "no scope";
+    }
+    line += " current, which does not export it; it is exported from ";
+    line += exporters;
+    line += " (select one with svSetScope, LRM 35.5.3)";
+    dpi_export_fatal(std::move(line));
 }
 
 extern "C" void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind) {

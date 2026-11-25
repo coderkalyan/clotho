@@ -934,6 +934,12 @@ void Lowerer::lower_members(const Scope&       scope,
     // (procedural blocks, variable initializers) run in Emit alone.
     const bool driver_pass = pass != Pass::Collect;
     cur_pass_              = pass;
+    // The export directives of this scope (LRM 35.5): slang resolves them only for the
+    // scopes it elaborates, which leaves out an instance whose body duplicates an earlier
+    // one, so each scope of this top is scanned as it is met (scan_dpi_exports).
+    if (pass == Pass::Collect) {
+        scan_dpi_exports(scope, dpi_export_decls_);
+    }
     for (const Symbol& m : scope.members()) {
         cur_range_ = slang::SourceRange{ m.location, m.location };
         switch (m.kind) {

@@ -1193,6 +1193,26 @@ llvm::FunctionCallee Backend::dpi_export_task_no_task_frame_fn() {
     return rt_fn("rt_dpi_export_task_no_task_frame", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+// The current DPI scope (LRM 35.5.3, runtime/Svdpi.cpp): enter sets the scope of an
+// index and returns the one it replaced, leave restores that one, index reads the
+// current one for an export thunk several scopes share, whose no-scope fatal takes the
+// c_identifier and the exporters' names and never returns.
+llvm::FunctionCallee Backend::svdpi_scope_enter_fn() {
+    return rt_fn("rt_svdpi_scope_enter", raw_ptr_ty(), { b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::svdpi_scope_leave_fn() {
+    return rt_fn("rt_svdpi_scope_leave", b_.getVoidTy(), { raw_ptr_ty() });
+}
+
+llvm::FunctionCallee Backend::svdpi_scope_index_fn() {
+    return rt_fn("rt_svdpi_scope_index", b_.getInt32Ty(), {});
+}
+
+llvm::FunctionCallee Backend::dpi_export_no_scope_fn() {
+    return rt_fn("rt_dpi_export_no_scope", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::wheel_now_fn() {
     return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
 }

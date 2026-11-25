@@ -5155,36 +5155,58 @@ private:
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
 
+    // The scope a DPI subroutine declared in `scope` belongs to (LRM 35.5.3, H.9.2:
+    // the subroutine's fully qualified name minus its own), spelled as
+    // ir::Function::dpi_scope spells it: free of the instance that holds it.
+    static std::string dpi_scope_text(const Scope& scope);
+
+    // One `export "DPI-C"` directive found in a scope: the subroutine it names and the
+    // c_identifier it exports it as.
+    struct DpiExportDecl {
+        const SubroutineSymbol* sub;
+        std::string             cid;
+    };
+
+    // The export directives of `scope`, resolved to the subroutines they name. slang
+    // resolves them too (Compilation::getDPIExports) but keeps one per c_identifier,
+    // and only for the scopes it elaborates, which leaves out every instance whose
+    // body duplicates an earlier one: a c_identifier exported from several scopes
+    // (LRM 35.4) would arrive as its first scope alone. The directive is not a member
+    // of the scope, so it is read from the syntax slang built the scope from.
+    static void scan_dpi_exports(const Scope& scope, std::vector<DpiExportDecl>& out);
+
+    // The directives of every scope this Lowerer walked, noted by lower_members as it
+    // meets each scope and consumed by collect_dpi_exports.
+    std::vector<DpiExportDecl> dpi_export_decls_;
+
     // Collect `export "DPI-C"` directives (LRM 35.5 / 35.8): for each, force-lower
     // the SV subroutine and record a DpiExport so the backend emits its C-callable
-    // thunk. slang resolves the export -> subroutine binding and the c_identifier
-    // (Compilation::getDPIExports). Scope: functions AND tasks; input/output/inout
+    // thunk. Scope: functions AND tasks; input/output/inout
     // scalar / chandle / real / packed-vector args; input string args;
     // scalar/chandle/real/void return. LRM 35.8 puts a task under exactly 35.7's
     // argument rules, so every guard below applies to one unchanged. Deferred
     // (loud-fail): string return (returned-char* lifetime), output/inout string,
     // open-array/unpacked args. Public: called by lower_compilation.
     //
-    // getDPIExports is compilation-wide, but every top has its own Lowerer that only
-    // knows its own symbols, and instance binding is baked into the lowered body (the
-    // backend addresses each signal absolutely off that instance's own state global).
-    // So an export must be collected by the Lowerer of the top containing it: `top`
-    // admits this top's module-scope exports, and `collect_globals` — true on exactly
-    // one call — admits the $unit/package exports, which have no instance multiplicity
+    // Every top has its own Lowerer that only knows its own symbols, and instance
+    // binding is baked into the lowered body (the backend addresses each signal
+    // absolutely off that instance's own state global). So an export must be
+    // collected by the Lowerer of the top containing it: the directives of the scopes
+    // this Lowerer walked are its own, and `collect_globals` — true on exactly one
+    // call — adds the $unit/package exports, which have no instance multiplicity
     // (LRM 6.8) and lower once through the shared globals Lowerer function_id
-    // delegates to. `top` is nullable: a design with no elaborated top module at all
-    // (e.g. an interface-only file bound into a package, LRM 23.4 -- a real shape,
-    // not a degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
+    // delegates to. A design with no elaborated top module at all (e.g. an
+    // interface-only file bound into a package, LRM 23.4 -- a real shape, not a
+    // degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
     // single top-less interface) still has $unit/package exports to collect, and the
-    // caller passes null with collect_globals=true exactly once for it, since there is
-    // no "first top" to piggyback the one-time collection on. A null top can never
-    // equal a module-scope export's real owning instance, so the module-scope branch
-    // below just skips every such export via the same `continue` an ordinary
-    // wrong-top mismatch already takes -- correctly, since a design with no top module
-    // has no module-scope subroutine any export could belong to either.
+    // caller collects them once through the globals Lowerer, since there is no
+    // "first top" to piggyback the one-time collection on.
+    //
+    // One c_identifier may be exported from several scopes (LRM 35.4): each scope's
+    // directive becomes a DpiExport of its own and the backend makes one thunk that
+    // dispatches on the current scope (docs/design/dpi-c.md, "Scopes").
 public:
-    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol* top,
-                             bool collect_globals);
+    void collect_dpi_exports(const slang::ast::Compilation& comp, bool collect_globals);
 
 private:
     void apply_time_scale(const Scope& scope);

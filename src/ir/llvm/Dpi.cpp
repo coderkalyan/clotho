@@ -551,7 +551,14 @@ void Backend::lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
     // task illegal from one, and the export-task thunk detects exactly that by
     // finding in_import_task still 0.
     const DpiCallerSave saved = f.is_dpi_task ? dpi_publish_caller() : DpiCallerSave{};
-    llvm::Value*        r     = b_.CreateCall(cf->getFunctionType(), cf, argv);
+    // A context import runs in its declaration scope (LRM 35.5.3) and gives the caller's
+    // back when it returns, whatever svSetScope the C did.
+    llvm::Value* scope_prev =
+      f.dpi_context ? b_.CreateCall(svdpi_scope_enter_fn(), { dpi_scope_value(ci.func) }) : nullptr;
+    llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+    if (scope_prev != nullptr) {
+        b_.CreateCall(svdpi_scope_leave_fn(), { scope_prev });
+    }
     if (f.is_dpi_task) {
         dpi_restore_caller(saved);
     }
@@ -594,11 +601,93 @@ bool Backend::design_uses_dpi() const {
     return false;
 }
 
+// The DPI scopes (LRM 35.5.3) in registration order: the tops first, so the first of
+// them stays the default scope, then the scope of every export and every context
+// import. Keyed by "i:" + the instance-path name, or "g:" + a package's / `$unit`'s.
+void Backend::build_dpi_scopes() {
+    dpi_scope_names_.clear();
+    dpi_scope_index_.clear();
+    if (!design_uses_dpi()) {
+        return;
+    }
+    const auto add = [&](const std::string& key, const std::string& name) {
+        if (dpi_scope_index_.try_emplace(key, static_cast<uint32_t>(dpi_scope_names_.size())).second) {
+            dpi_scope_names_.push_back(name);
+        }
+    };
+    const auto add_of = [&](const Function& declaring, const std::string& text) {
+        const std::string name = dpi_scope_name(declaring, text);
+        add((subroutine_anchor(declaring) != SignalSlot::no_anchor ? "i:" : "g:") + name, name);
+    };
+    if (mod_.tops().empty()) {
+        add("i:" + mod_.top_name, mod_.top_name);
+    } else {
+        for (const InstanceScope& top : mod_.tops()) {
+            add("i:" + top.name, top.name);
+        }
+    }
+    for (const DpiExport& ex : mod_.dpi_exports) {
+        add_of(mod_.function(ex.func), ex.scope);
+    }
+    for (size_t i = 0; i < mod_.function_count(); ++i) {
+        const Function& fn = mod_.function(static_cast<FunctionId>(i));
+        if (fn.is_dpi && fn.dpi_context) {
+            add_of(fn, fn.dpi_scope);
+        }
+    }
+}
+
+// The full name of the scope `text` (Function::dpi_scope / DpiExport::scope) names for
+// a subroutine of `declaring`'s instance: the instance's path, then the generate blocks.
+// A subroutine of no instance carries the whole name.
+std::string Backend::dpi_scope_name(const Function& declaring, const std::string& text) const {
+    const uint32_t a = subroutine_anchor(declaring);
+    return a == SignalSlot::no_anchor ? text : anchors_[a].name + text;
+}
+
+uint32_t Backend::dpi_scope_of(const Function& declaring, const std::string& text) const {
+    const std::string name = dpi_scope_name(declaring, text);
+    const auto        it   = dpi_scope_index_.find((subroutine_anchor(declaring) != SignalSlot::no_anchor ? "i:" : "g:") + name);
+    if (it == dpi_scope_index_.end()) {
+        throw BackendError{ "internal: DPI scope '" + name + "' is not registered" };
+    }
+    return it->second;
+}
+
+// The index of the scope the context import `callee` runs in, as an IR value. An import
+// the instance whose code is being lowered declares is its unit's ordinal-th, whose scope
+// sits in the instance's record, so the code names no scope; one of no instance has the
+// same scope in every instance and is the constant, and another instance's is that
+// instance's own, which a shared lowering cannot have.
+llvm::Value* Backend::dpi_scope_value(FunctionId callee) {
+    const auto [owner, ordinal] = dpi_ctx_owner_.at(static_cast<uint32_t>(callee));
+    const Function& fn          = mod_.function(callee);
+    if (owner != SignalSlot::no_anchor) {
+        if (owner == own_anchor_ && own_ctx_ != nullptr) {
+            Anchor& a = anchors_[owner];
+            return ctx_field(a, a.ctx_dpi_base + ordinal, b_.getInt32Ty());
+        }
+        taint("names the DPI scope of another instance");
+    }
+    return b_.getInt32(dpi_scope_of(fn, fn.dpi_scope));
+}
+
 // Emit one C-ABI thunk per `export "DPI-C"` (LRM 35.5). Runs last (after
 // emit_main creates @clotho.state and every SV function is declared).
 void Backend::emit_dpi_exports() {
+    // One C symbol per c_identifier: the exports of it from several scopes (LRM 35.4)
+    // share it, in the order the design declares them.
+    std::vector<std::vector<const DpiExport*>>              groups;
+    ankerl::unordered_dense::map<std::string_view, size_t> by_name;
     for (const DpiExport& ex : mod_.dpi_exports) {
-        emit_dpi_export(ex);
+        const auto [it, fresh] = by_name.try_emplace(ex.extern_name, groups.size());
+        if (fresh) {
+            groups.emplace_back();
+        }
+        groups[it->second].push_back(&ex);
+    }
+    for (const auto& targets : groups) {
+        emit_dpi_export(targets);
     }
 }
 
@@ -647,9 +736,19 @@ void Backend::emit_dpi_export_copyout(const std::vector<ExpOut>& outs, const std
 // `int` whatever the SV side says, the callee is a coroutine that must be
 // ramped and resumed rather than called, and the caller identity is real
 // rather than absent (see dpi_publish_caller).
-void Backend::emit_dpi_export(const DpiExport& ex) {
-    const Function& f    = mod_.function(ex.func);
-    llvm::Function* svfn = sym(fn_decls_[static_cast<uint32_t>(ex.func)]);
+void Backend::emit_dpi_export(const std::vector<const DpiExport*>& targets) {
+    const DpiExport& ex = *targets.front();
+    const Function&  f  = mod_.function(ex.func);
+    std::vector<llvm::Function*> svfns;
+    for (const DpiExport* t : targets) {
+        svfns.push_back(sym(fn_decls_[static_cast<uint32_t>(t->func)]));
+        if (t->arg_ctypes != ex.arg_ctypes || t->arg_dirs != ex.arg_dirs || t->ret_ctype != ex.ret_ctype ||
+            t->is_task != ex.is_task ||
+            svfns.back()->getFunctionType() != svfns.front()->getFunctionType()) {
+            throw BackendError{ "internal: the exports of c_identifier '" + ex.extern_name +
+                                "' differ in signature" };
+        }
+    }
 
     std::vector<llvm::Type*> cparams;
     cparams.reserve(ex.arg_ctypes.size());
@@ -695,7 +794,7 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
     std::vector<llvm::Value*> argv;
     // The record of the instance that declares the subroutine (reserved before main
     // filled it), or the root state for a package's.
-    argv.push_back(callee_record(ex.func));
+    argv.push_back(nullptr); // the record of the instance: per target, filled at the call
     // The RNG stream the exported subroutine draws from (LRM 18.13). A FUNCTION
     // has no calling process -- native C drove the call -- so it draws from the
     // module-wide state main seeds at startup. A TASK does have one: it runs on
@@ -776,8 +875,61 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
         }
     }
 
+    // The call into the exported subroutine. One scope exports it: that one, whatever
+    // scope is current. Several: the one whose scope is current, else a located fatal.
+    const auto dispatch = [&]() -> llvm::Value* {
+        const auto call_into = [&](size_t k) -> llvm::Value* {
+            argv[0] = callee_record(targets[k]->func);
+            return b_.CreateCall(svfns[k]->getFunctionType(), svfns[k], argv);
+        };
+        if (targets.size() == 1) {
+            return call_into(0);
+        }
+        std::string exporters;
+        for (const DpiExport* t : targets) {
+            const Function& tf = mod_.function(t->func);
+            if (!exporters.empty()) {
+                exporters += ", ";
+            }
+            exporters += dpi_scope_name(tf, t->scope);
+            if (resolve_) {
+                if (const SourceText where = resolve_(tf.span); where.where != "<unknown>") {
+                    exporters += " (" + where.where + ")";
+                }
+            }
+        }
+        auto* none_bb = llvm::BasicBlock::Create(ctx_, "dpi.scope.none", thunk);
+        auto* join_bb = llvm::BasicBlock::Create(ctx_, "dpi.scope.join", thunk);
+        auto* sw = b_.CreateSwitch(b_.CreateCall(svdpi_scope_index_fn(), {}, "dpi.scope"), none_bb, targets.size());
+        std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> arms;
+        ankerl::unordered_dense::set<uint32_t>                  seen;
+        for (size_t k = 0; k < targets.size(); ++k) {
+            const uint32_t index = dpi_scope_of(mod_.function(targets[k]->func), targets[k]->scope);
+            if (!seen.insert(index).second) {
+                throw BackendError{ "internal: c_identifier '" + ex.extern_name + "' is exported twice from one scope" };
+            }
+            auto* bb = llvm::BasicBlock::Create(ctx_, "dpi.scope." + std::to_string(k), thunk);
+            sw->addCase(b_.getInt32(index), bb);
+            b_.SetInsertPoint(bb);
+            llvm::Value* v = call_into(k);
+            b_.CreateBr(join_bb);
+            arms.emplace_back(v, b_.GetInsertBlock());
+        }
+        b_.SetInsertPoint(none_bb);
+        b_.CreateCall(dpi_export_no_scope_fn(), { b_.CreateGlobalString(ex.extern_name), b_.CreateGlobalString(exporters) });
+        b_.CreateUnreachable();
+        b_.SetInsertPoint(join_bb);
+        if (arms.front().first->getType()->isVoidTy()) {
+            return arms.front().first;
+        }
+        auto* phi = b_.CreatePHI(arms.front().first->getType(), static_cast<unsigned>(arms.size()));
+        for (const auto& [v, bb] : arms) {
+            phi->addIncoming(v, bb);
+        }
+        return phi;
+    };
     if (!ex.is_task) {
-        llvm::Value* r = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+        llvm::Value* r = dispatch();
         emit_dpi_export_copyout(outs, str_temps);
         if (ex.ret_ctype == DpiCType::Void) {
             b_.CreateRetVoid();
@@ -801,7 +953,7 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
     llvm::Value* record = entry_alloca(ptr_ty, "dpi.task_record");
     b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
     argv.push_back(record);
-    llvm::Value* hdl  = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+    llvm::Value* hdl  = dispatch();
     b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
     llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
 

@@ -2098,6 +2098,13 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // Prints a FATAL naming the task and ends the simulation (never returns).
 [[noreturn]] void rt_dpi_export_task_no_task_frame(const char* name);
 
+// An export thunk that several scopes share (LRM 35.4) was called from C while the
+// current scope (LRM 35.5.3) is none of the scopes that export it: there is no instance
+// to run, and picking the first would answer for the wrong one. Prints a FATAL naming
+// the exported c_identifier `name`, the scope C was in and `exporters` (every scope
+// that does export it, with the declaration) and ends the simulation (never returns).
+[[noreturn]] void rt_dpi_export_no_scope(const char* name, const char* exporters);
+
 // Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
 // calling `on_expire(timer, ctx)` when it fires.
 void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);
@@ -2331,13 +2338,28 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 // the DPI return for an allocation-failure report.
 void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site);
 
-// Register one DPI scope (LRM 35.5.3) for the svScope API — a top-level instance's
-// hierarchical name, at its position `index` in the design's top order. Called from
-// main, once per top, when the design uses DPI. `index == 0` clears the table first
-// (so a fresh simulation in the same process starts with no stale user data) and the
-// scope registered there becomes the default svGetScope returns.
+// Register one DPI scope (LRM 35.5.3) for the svScope API: the hierarchical name of a
+// top, of an instance or generate block that exports a subroutine or declares a
+// `context` import, or of a package or `$unit` that does, at its position `index` in
+// the design's scope order (the tops first). Called from main, once per scope, when
+// the design uses DPI. `index == 0` clears the table first (so a fresh simulation in the
+// same process starts with no stale user data) and the scope registered there becomes
+// the default svGetScope returns.
 // Implemented in Svdpi.cpp alongside svGetScope / svSetScope / svGetUserData.
 void rt_svdpi_scope_register(const char* name, uint32_t name_len, uint32_t index);
+
+// The current DPI scope (LRM 35.5.3): the one svGetScope answers, svSetScope changes
+// and an export that several scopes share dispatches on. A call of a `context` import
+// makes its declaration scope current for the call's duration: rt_svdpi_scope_enter
+// makes the scope registered at `index` current and returns the scope it replaced, and
+// rt_svdpi_scope_leave puts that one back when the call returns, whatever svSetScope
+// the C did. rt_svdpi_scope_index is the registration index of the current scope, for
+// the dispatch, and UINT32_MAX when none is current (C gave svSetScope a null).
+// rt_svdpi_scope_name is its name for a diagnostic, null when none is current.
+void*       rt_svdpi_scope_enter(uint32_t index);
+void        rt_svdpi_scope_leave(void* previous);
+uint32_t    rt_svdpi_scope_index(void);
+const char* rt_svdpi_scope_name(void);
 
 // -- DPI open arrays (LRM 35.5.6.2) --
 //

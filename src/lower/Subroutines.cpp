@@ -684,13 +684,10 @@ void Lowerer::build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
     // a located fatal if the task it drives does not complete in zero time
     // (rt_dpi_export_task_suspended). Lifting that needs the baton-pool stack
     // handoff and a task call site here (docs/design/dpi-c.md, "DPI tasks").
-    // `context` (LRM 35.5.3) is accepted and lowered identically to a plain
-    // import: its purpose is to let the C call exported SV functions (and the
-    // svScope APIs), and an export thunk needs no scope to find its instance —
-    // the lowered SV function it calls already addresses that instance's state
-    // absolutely. The svScope C API is provided (svGetScope / svSetScope /
-    // svGetScopeFromName / user data, exposed as JIT symbols in Jit.cpp) with one
-    // scope per top; a handle naming a nested instance is the deferred piece.
+    // `context` (LRM 35.5.3): the call sets the current scope to the one declaring the
+    // import (dpi_scope, below) for its duration, so the C sees it through svGetScope and
+    // an export several scopes share runs in the right instance (docs/design/dpi-c.md,
+    // "Scopes").
 
     // A DPI import has no body, so slang leaves returnValVar null even for a
     // non-void function; decide void-ness from the declared return type.
@@ -789,6 +786,10 @@ void Lowerer::build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
                                        .dpi_arg_ctypes      = std::move(arg_cts),
                                        .dpi_ret_ctype       = ret_ct,
                                        .dpi_arg_elem_ctypes = std::move(arg_elem_cts),
+                                       .dpi_context         = sub.flags.has(MethodFlags::DPIContext),
+                                       .dpi_scope           = sub.flags.has(MethodFlags::DPIContext)
+                                                                ? dpi_scope_text(*sub.getParentScope())
+                                                                : std::string(),
                                        .span                = span_of(sub),
                                        .ir                  = b.finish() });
 }
@@ -832,19 +833,95 @@ void Lowerer::build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
     arg_elem_cts.push_back(*ec);
 }
 
-void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
-                                  const InstanceSymbol*          top,
-                                  bool                           collect_globals) {
-    for (const auto& ex : comp.getDPIExports()) {
-        const SubroutineSymbol& sub = *ex.subroutine;
-        if (is_global_subroutine(sub)) {
-            if (!collect_globals) {
-                continue; // collected once for the design, not once per top
-            }
-        } else if (top == nullptr || owning_top(sub) != top) {
-            continue; // another top's export (or no elaborated instance at all)
+std::string Lowerer::dpi_scope_text(const Scope& scope) {
+    for (const Scope* s = &scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        const Symbol& sym = s->asSymbol();
+        switch (sym.kind) {
+            case SymbolKind::InstanceBody:
+                return generate_path(&scope);
+            case SymbolKind::Package:
+                return std::string(sym.name);
+            case SymbolKind::CompilationUnit:
+                return "$unit";
+            default:
+                break;
         }
-        const bool is_task = sub.subroutineKind == SubroutineKind::Task;
+    }
+    return "$unit";
+}
+
+void Lowerer::scan_dpi_exports(const Scope& scope, std::vector<DpiExportDecl>& out) {
+    using namespace slang::syntax;
+    const SyntaxNode* const syntax = scope.asSymbol().getSyntax();
+    if (syntax == nullptr) {
+        return;
+    }
+    // A directive is a member of the scope's syntax, or of a `generate` region in it
+    // (a region is transparent). A directive slang rejected names nothing and is skipped:
+    // slang has reported it.
+    const auto member = [&](const auto& self, const SyntaxNode& node) -> void {
+        if (node.kind == SyntaxKind::GenerateRegion) {
+            for (const MemberSyntax* m : node.as<GenerateRegionSyntax>().members) {
+                self(self, *m);
+            }
+        } else if (node.kind == SyntaxKind::DPIExport) {
+            const auto&            d    = node.as<DPIExportSyntax>();
+            const std::string_view name = d.name.valueText();
+            const Symbol* const    sym  = name.empty() ? nullptr : scope.find(name);
+            if (sym == nullptr || sym->kind != SymbolKind::Subroutine) {
+                return;
+            }
+            const std::string_view cid = d.c_identifier ? d.c_identifier.valueText() : name;
+            out.push_back(DpiExportDecl{ &sym->as<SubroutineSymbol>(), std::string(cid) });
+        }
+    };
+    switch (syntax->kind) {
+        case SyntaxKind::ModuleDeclaration:
+        case SyntaxKind::InterfaceDeclaration:
+        case SyntaxKind::ProgramDeclaration:
+        case SyntaxKind::PackageDeclaration:
+            for (const MemberSyntax* m : syntax->as<ModuleDeclarationSyntax>().members) {
+                member(member, *m);
+            }
+            break;
+        case SyntaxKind::CompilationUnit:
+            for (const MemberSyntax* m : syntax->as<CompilationUnitSyntax>().members) {
+                member(member, *m);
+            }
+            break;
+        case SyntaxKind::GenerateBlock:
+            for (const MemberSyntax* m : syntax->as<GenerateBlockSyntax>().members) {
+                member(member, *m);
+            }
+            break;
+        default:
+            member(member, *syntax); // a generate block of one member, not wrapped in begin/end
+            break;
+    }
+}
+
+void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp, bool collect_globals) {
+    std::vector<DpiExportDecl> decls = std::move(dpi_export_decls_);
+    dpi_export_decls_.clear();
+    if (collect_globals) {
+        for (const slang::ast::PackageSymbol* pkg : comp.getPackages()) {
+            scan_dpi_exports(*pkg, decls);
+        }
+        for (const slang::ast::CompilationUnitSymbol* unit : comp.getCompilationUnits()) {
+            scan_dpi_exports(*unit, decls);
+        }
+    }
+    // The first export of each c_identifier so far (earlier tops included): every other
+    // export of it must agree with it in C signature (LRM 35.5.4), and no scope may
+    // export one c_identifier twice (LRM 35.4).
+    ankerl::unordered_dense::map<std::string, size_t> first_of;
+    for (size_t i = 0; i < module_.dpi_exports.size(); ++i) {
+        first_of.try_emplace(module_.dpi_exports[i].extern_name, i);
+    }
+    std::set<std::pair<std::string, const Scope*>> in_scope;
+    for (const DpiExportDecl& d : decls) {
+        const SubroutineSymbol& sub     = *d.sub;
+        const bool              is_task = sub.subroutineKind == SubroutineKind::Task;
         // An exported TASK (LRM 35.8) is admitted here and lowers as an ordinary
         // task coroutine; the backend thunk drives it (emit_dpi_export). Only the
         // ZERO-TIME case works: a task that actually suspends is a located
@@ -882,21 +959,24 @@ void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
             arg_cts.push_back(*c);
             arg_dirs.push_back(to_arg_dir(fa->direction));
         }
-        // One C symbol cannot name two SV functions: llvm::Function::Create
-        // would silently rename the second thunk to `<name>.1`, leaving C bound
-        // to an arbitrary instance. slang's own c_identifier dedup makes this
-        // unreachable today, but the invariant has to be Clotho's.
-        for (const ir::DpiExport& prev : module_.dpi_exports) {
-            if (prev.extern_name == ex.cIdentifier) {
-                fail("duplicate DPI export c_identifier '" + ex.cIdentifier +
-                     "' (one C name cannot bind two SystemVerilog functions)");
+        if (!in_scope.emplace(d.cid, sub.getParentScope()).second) {
+            fail("DPI export c_identifier '" + d.cid + "' is exported twice from one scope (LRM 35.4)");
+        }
+        if (const auto it = first_of.find(d.cid); it != first_of.end()) {
+            const ir::DpiExport& first = module_.dpi_exports[it->second];
+            if (first.is_task != is_task || first.ret_ctype != ret_ct || first.arg_ctypes != arg_cts ||
+                first.arg_dirs != arg_dirs) {
+                fail("DPI exports of c_identifier '" + d.cid +
+                     "' differ in C signature (LRM 35.5.4: all declarations of one c_identifier have "
+                     "exactly the same type signature)");
             }
         }
         // function_id force-lowers the SV subroutine: a task takes build_task,
         // so the thunk has a real coroutine ramp to drive.
         const ir::FunctionId id = function_id(sub);
-        module_.dpi_exports.push_back(ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts),
-                                                     std::move(arg_dirs), ret_ct, is_task });
+        first_of.try_emplace(d.cid, module_.dpi_exports.size());
+        module_.dpi_exports.push_back(ir::DpiExport{ id, d.cid, std::move(arg_cts), std::move(arg_dirs), ret_ct,
+                                                     is_task, dpi_scope_text(*sub.getParentScope()) });
     }
 }
 

@@ -1183,6 +1183,14 @@ struct Anchor {
     // the wake of an `expect`, both code of the unit, name no monitor of the design.
     std::vector<uint32_t> expect_locals;
     uint32_t              ctx_expect_base = 0;
+    // The `context` DPI imports the instance's unit declares (its functions that are
+    // DPI imports with the context property, in the unit's order) and, one i32 field
+    // each at ctx_dpi_base + ordinal, the DPI scope each runs in: the index main
+    // registers the scope under, which a call of the import makes current (LRM
+    // 35.5.3). Data of the record, so the code of a unit that calls one names no scope
+    // and is the same for every instance.
+    std::vector<FunctionId> dpi_ctx_locals;
+    uint32_t                ctx_dpi_base = 0;
     uint32_t n_bind        = 0;
     std::vector<Signal> externs;
     ankerl::unordered_dense::map<uint32_t, uint32_t> bind_of;
@@ -3161,6 +3169,10 @@ private:
     llvm::FunctionCallee ring_overflow_fn();
     llvm::FunctionCallee dpi_export_task_suspended_fn();
     llvm::FunctionCallee dpi_export_task_no_task_frame_fn();
+    llvm::FunctionCallee dpi_export_no_scope_fn();
+    llvm::FunctionCallee svdpi_scope_enter_fn();
+    llvm::FunctionCallee svdpi_scope_leave_fn();
+    llvm::FunctionCallee svdpi_scope_index_fn();
     llvm::FunctionCallee wheel_now_fn();
     llvm::FunctionCallee wheel_schedule_rel_fn();
     llvm::FunctionCallee wheel_advance_fn();
@@ -4266,6 +4278,16 @@ private:
 
     bool design_uses_dpi() const;
 
+    // The DPI scopes (LRM 35.5.3) in the order main registers them with the runtime,
+    // each scope's index being what a context import makes current and what an export
+    // that several scopes share dispatches on. build_dpi_scopes numbers them from the
+    // design's tops, exports and context imports; `declaring` is the function that
+    // sits in the scope (an export's, an import's) and `text` its dpi_scope.
+    void         build_dpi_scopes();
+    std::string  dpi_scope_name(const Function& declaring, const std::string& text) const;
+    uint32_t     dpi_scope_of(const Function& declaring, const std::string& text) const;
+    llvm::Value* dpi_scope_value(FunctionId callee);
+
     void emit_dpi_exports();
 
     llvm::Type* dpi_export_c_param_ty(DpiCType ct, ArgDir dir);
@@ -4286,7 +4308,9 @@ private:
     void emit_dpi_export_copyout(const std::vector<ExpOut>&       outs,
                                  const std::vector<llvm::Value*>& str_temps);
 
-    void emit_dpi_export(const DpiExport& ex);
+    // One C-callable thunk for a c_identifier, over the exports of it (one per scope that
+    // exports it, in the order the design declares them).
+    void emit_dpi_export(const std::vector<const DpiExport*>& targets);
 
     llvm::Value* dpi_arg_to_c(DpiCType t, Plane p, bool four);
 
@@ -5027,6 +5051,14 @@ private:
     // Who declares each flat `expect` monitor, and its ordinal among its unit's
     // own `expect`s (no_anchor for a monitor no instance declares).
     std::vector<std::pair<uint32_t, uint32_t>> expect_owner_;
+    // Who declares each flat context DPI import, and its ordinal among its unit's own
+    // (Anchor::dpi_ctx_locals); no_anchor for an import no instance declares.
+    std::vector<std::pair<uint32_t, uint32_t>> dpi_ctx_owner_;
+    // The names of the DPI scopes in registration order (build_dpi_scopes) and their
+    // index by name, behind "i:" for an instance's scope and "g:" for a package's or
+    // `$unit`'s so that a package and an instance of one name stay two scopes.
+    std::vector<std::string>                            dpi_scope_names_;
+    ankerl::unordered_dense::map<std::string, uint32_t> dpi_scope_index_;
     std::vector<int32_t>  vcd_index_;
 
     // Function declarations, indexed by FunctionId; filled before any body is

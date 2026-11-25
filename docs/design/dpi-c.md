@@ -19,16 +19,17 @@ the C array), packed `bit`/`logic` elements marshal through autovectorized
 width-specialized C loops (≤ 64 bits) or inline LLVM IR (wider).
 **svdpi.h runtime**: the packed-vector bit/part-select accessors
 (`svGet/PutBitselBit/Logic`, `svGet/PutPartselBit/Logic`, `svDpiVersion`), the
-per-top scope API (`svGetScope`/`svSetScope`/`svGetNameFromScope`/
-`svGetScopeFromName`/`svPutUserData`/`svGetUserData`), and the open-array accessors
+scope API (`svGetScope`/`svSetScope`/`svGetNameFromScope`/
+`svGetScopeFromName`/`svPutUserData`/`svGetUserData`; one scope per top, per instance
+or generate block that declares an export or a `context` import, and per such package
+or `$unit`), and the open-array accessors
 (`svSize`/`svLeft`/`svRight`/`svLow`/`svHigh`/`svIncrement`/`svGetArrElemPtr1`/
 `svGet/PutBit|LogicArrElem1VecVal`/…) are implemented (`src/runtime/svdpi.h`). Still
 **loud-fails** / unresolved with a TODO: import `output`/`inout` string, multi-dim /
 dynamic open arrays, open-array export args, a **suspending** exported task (T2) and
 the LRM 35.9 **disable protocol** (T3) — both **scoped in full** under "DPI tasks"
-below — export string return + `output`/`inout` string, one
-c_identifier exported from several scopes (blocked upstream in slang), `svScope`
-handles for non-top instances, and `svGetCallerInfo` / the disable API.
+below — export string return + `output`/`inout` string, and `svGetCallerInfo` / the
+disable API.
 
 This doc is written design-first: the early sections capture the original
 scalar-first plan and its rationale, and the **Directions — phasing** and **Phase
@@ -341,10 +342,11 @@ deliberately not supported — it would need `-rdynamic`/`ENABLE_EXPORTS`.)
 function. The SV function is ordinary (it has an IR body and lowers normally);
 export adds a C-callable entry point named by its c_identifier.
 
-**Landed:** functions, any number of tops (module-scope or `$unit`-scope). Args:
+**Landed:** functions, any number of tops (module-scope or `$unit`-scope) and any
+number of scopes exporting one c_identifier ("Scopes" below). Args:
 `input`/`output`/`inout` scalar / `chandle` / real / packed-vector, plus `input`
-string. Return: scalar / chandle / real / void. `context` imports accepted (they
-lower like a plain import — see below). The thunk marshal reuses the import helpers
+string. Return: scalar / chandle / real / void. A `context` import sets the current
+scope for its call (below). The thunk marshal reuses the import helpers
 in reverse: input scalar via `dpi_c_to_plane`, input vec via `dpi_vec_copyout`,
 input string builds an `rt_string` via `rt_dpi_str_out`; `output`/`inout` pass the
 SV `(mm_ptr, z_ptr)` cell ABI and copy back after the call (`dpi_arg_to_c` /
@@ -355,33 +357,63 @@ caveat: **verilator is not a 4-state oracle** — for an `output logic[N]` carry
 x/z it drops the unknowns (`bval=0`), so clotho's correct svLogicVecVal encoding
 (the same `dpi_vec_copyin` the import path uses) diverges there; that path is
 covered by the import marshal's own tests rather than by verilator. Deferred:
-string return
-(returned-`char*` lifetime), `output`/`inout` string, and one c_identifier exported
-from more than one scope. Exported **tasks** were deferred out of V1 and have since
-landed for the zero-time case — see "DPI tasks" below.
+string return (returned-`char*` lifetime) and `output`/`inout` string. Exported
+**tasks** were deferred out of V1 and have since landed for the zero-time case — see
+"DPI tasks" below.
 
-**Why `context` is accepted, not required.** LRM 35.5.3: C may only call an
-exported function from within a `context` import, which establishes the SV scope
-(verilator enforces this — a plain import that calls an export aborts "scope wasn't
-set"). Clotho bakes the instance into the lowered function at lowering time — its
-body GEPs that instance's own `@clotho.inst.<hier>.state` global, a link-time
-constant — so the thunk needs nothing at run time to find "which instance." Clotho
-therefore *accepts* `context` (lowering it identically to a plain import) but never
-*needs* it to route a call. The svScope C API is provided (`svGetScope` /
-`svSetScope` / `svGetNameFromScope` / `svGetScopeFromName` / `svPutUserData` /
-`svGetUserData`, exposed as JIT absolute symbols in `src/ir/Jit.cpp`), with one scope
-registered per top; a handle for a nested instance is the deferred piece.
+**Scopes (LRM 35.4, 35.5.3, H.9).** A c_identifier may be exported from several
+scopes, the C caller picks the instance with `svSetScope`, and a `context` import
+runs with its declaration scope current. A DPI scope is a top, an instance or
+generate block that exports a subroutine or declares a `context` import, or a
+package or `$unit` that does. Its name is the fully qualified name of the
+subroutines it holds minus their own (`top.u1`, `top.blk[1]`, `pkg`, `$unit`),
+spelled as `%m` spells it. The backend numbers the scopes (`build_dpi_scopes`: the
+tops first, so the first top stays the default `svGetScope` answers before any
+context import runs) and `main` registers each with the runtime
+(`rt_svdpi_scope_register`), which is what `svGetScopeFromName` resolves and
+`svGetScope` / `svSetScope` hand out. The current scope is one runtime variable.
 
-**How multi-top export routes.** `getDPIExports()` is compilation-wide, but each top
-is lowered by its own `Lowerer`, so `collect_dpi_exports` keeps only the entries it
-owns: it walks the exported subroutine's scopes outward through
-`InstanceBodySymbol::parentInstance` to the root instance and takes the entry iff
-that root is the top being lowered. A `$unit`/package export has no instance
-multiplicity (LRM 6.8) and is admitted by exactly one top, lowering once through the
-shared `globals` Lowerer that `function_id` delegates to. Collecting one c_identifier
-twice would make `llvm::Function::Create` silently rename the second thunk
-`<name>.1` and bind C to an arbitrary instance, so the collector `fail`s on a
-duplicate `extern_name`.
+- **A `context` import** brackets its C call with `rt_svdpi_scope_enter(index)` and
+  `rt_svdpi_scope_leave(previous)`: the scope is the import's for the call and the
+  caller's again afterwards, whatever `svSetScope` the C did and however imports and
+  exports nest (35.5.3: "when a call from an import call chain to an exported
+  SystemVerilog subroutine finishes and returns to the chain, the call chain's context
+  is set equal to its value when the call to the export was made"). Only a `context`
+  import pays for it (35.5.3: other calls "are not instrumented"), and a design with
+  no DPI emits none of it. The index is data of the instance, not code: the record of
+  the instance that declares the import holds one i32 per `context` import of its
+  unit (`Anchor::ctx_dpi_base`, filled at link time like the `disable` ids), so a
+  unit's code is the same for every instance and the instances still share it.
+  `Function::dpi_scope` is free of instances for the same reason (the generate path
+  under the instance, `.blk[1]` or empty; the whole name for a package or `$unit`);
+  the backend joins it to the instance's path.
+- **An export from one scope** is the thunk it always was. **From several**, every
+  scope's directive reaches the backend (one `DpiExport` each, carrying its scope as
+  `dpi_scope` does) and the one C symbol dispatches on `rt_svdpi_scope_index()` to that
+  instance's function with that instance's record: the marshal runs once and only the
+  call differs (`emit_dpi_export`). A current scope that is none of them is a located
+  run-time fatal (`rt_dpi_export_no_scope`: the c_identifier, the scope C was in, and
+  every scope and declaration that does export it), never a guess at the first
+  instance. A c_identifier with ONE exporting scope is not dispatched, so it is
+  reached whatever scope is current: the LRM leaves an export called outside its
+  scope's context undefined, every simulator accepts it for a package's (UVM's
+  `m__uvm_report_dpi` is called that way), and with one instance to run none can be
+  mistaken.
+
+**How exports are collected.** slang resolves `export` directives itself
+(`Compilation::getDPIExports`) but keeps one per c_identifier, and only for the
+scopes it elaborates, which skips every instance whose body duplicates an earlier
+one: two instances of one module, or two modules, exporting one c_identifier arrive
+as the first alone. Clotho reads the directives from the syntax of each scope
+instead (`scan_dpi_exports`, resolved against that scope's own symbols). Each top's
+walk scans every instance body and generate block it lowers (`lower_members`), so a
+top owns exactly the exports of its own hierarchy; the packages and `$unit` are
+scanned once, by the first top's `Lowerer`, which lowers them through the shared
+`globals` `Lowerer` that `function_id` delegates to (they have no instance
+multiplicity, LRM 6.8). Exports of one c_identifier must agree in C signature (35.5.4:
+"exactly the same type signature") and may not share a scope (35.4); both are checked
+again here, because slang accepts types that are equivalent yet pass differently in C
+(`int` and `bit signed [31:0]`).
 
 **A design with NO top module** (an interface bound into a package, no `module`
 anywhere — a real shape, not a degenerate one: uvm-examples/apb_protocol_monitor
@@ -392,11 +424,9 @@ one top admits them" had no top to be that one, so `uvm_pkg.sv`'s
 `uvm_dpi.o`'s own C calls back into — never collected, and the JIT failed at
 `--dpi-lib` link time with `Symbols not found: [ m__uvm_report_dpi ]`, not a
 compile-time diagnostic (`lower_top`'s per-top loop simply never ran, so nothing
-was there to refuse). `collect_dpi_exports` now takes a nullable top; the caller
-collects globals once against `nullptr` when `root.topInstances` is empty, which
-`function_id` needs no special-casing for (a null top can only ever match a
-module-scope export, which a topless design has none of by construction, so it
-takes the same "wrong top" `continue` an ordinary mismatch already does).
+was there to refuse). The caller now collects the globals once through the `globals`
+`Lowerer` when `root.topInstances` is empty, and `collect_dpi_exports` has no top to
+filter by anyway: it takes what its own hierarchy holds.
 
 The rest of this section is the original scoping; it matches what landed.
 
@@ -422,9 +452,9 @@ emission below.
 
 ### Part 2 — the reverse thunk (medium, mostly reuse)
 
-- **Frontend**: walk `comp.getDPIExports()` → `{subroutine, cIdentifier, syntax}`
-  (slang gives the export→SV-subroutine binding and the c_identifier directly —
-  no syntax-digging as imports needed). Record an export request per entry; the SV
+- **Frontend**: one `{subroutine, c_identifier}` per `export` directive of every
+  scope (`scan_dpi_exports`: slang's `getDPIExports()` keeps one per c_identifier, see
+  "How exports are collected" above). Record an export request per entry; the SV
   function lowers as a normal `ir::Function`.
 - **Backend thunk** (all new, but small): emit `<c_ret> <cid>(<c_args>)` with
   **external** linkage, signature from `dpi_c_llvm_ty` per formal + return. Body:
@@ -449,11 +479,10 @@ emission below.
   wheel, a `main`-local alloca, not a global" — was already stale when it was
   written: the wheel is `@clotho.wheel`, a module global, and the export-task thunk
   simply loads it.)
-- **One c_identifier exported from several scopes** (LRM 35.5.3) — `svSetScope`
-  selecting *which instance* a shared C name reaches. Absolute addressing means every
-  distinct c_identifier already binds to its own instance with no scope lookup, so
-  what is left is the shared-name case, and slang drops those duplicates before
-  `getDPIExports()` is visible. Blocked upstream; guard.
+- **One c_identifier exported from several scopes** (LRM 35.4, 35.5.3) — landed; see
+  "Scopes" above. The original plan guarded it ("absolute addressing means every
+  distinct c_identifier already binds to its own instance with no scope lookup"),
+  because it assumed slang would hand over one entry per scope.
 - Open arrays / unpacked aggregates.
 
 ### Caveat
@@ -469,7 +498,7 @@ and consider a "sim started" guard.
 Symbol resolution: **small** (the `.o` loader already exists per the unified
 `--dpi-lib` dispatch; export adds only the "gave a `.so`, need a `.o`" guard).
 Reverse thunk + scalar/vec/chandle marshal: **medium**, dominated by reuse.
-`context`/`svScope` are the genuinely deferred pieces here; exported tasks were
+`context`/`svScope` landed with it (see "Scopes" above); exported tasks were
 scoped separately below and were not the large item that line once claimed — their
 zero-time case landed as an extra arm in the same thunk emitter. A
 functions-only, scalar+vec+chandle+string-return export V1 is medium and mostly
@@ -771,18 +800,14 @@ task with no imported-task frame live (LRM 35.8,
 `rt_dpi_export_task_no_task_frame`); the disable protocol and
 `svIsDisabledState`/`svAckDisabledState` (T3); `pure` on an imported task (LRM
 35.5.1.3, permanent); everything the export *function* path already refuses
-(string return, `output`/`inout` string, open-array formals, one c_identifier from
-several scopes) — a task inherits every one of those, since 35.7 says exported tasks
-share the function argument rules, and the inheritance is tested rather than
-assumed; and a `.so` given to a design that exports, which the existing `run_jit`
-guard already covers.
+(string return, `output`/`inout` string, open-array formals) — a task inherits every
+one of those, since 35.7 says exported tasks share the function argument rules, and
+the inheritance is tested rather than assumed; and a `.so` given to a design that
+exports, which the existing `run_jit` guard already covers.
 
-One of those inherited refusals is enforced upstream rather than by clotho, and T1
-re-measured it for tasks: **one c_identifier exported from two scopes** is collapsed
-by slang before `getDPIExports()` is visible, so exactly one thunk is emitted and
-clotho's own duplicate-`extern_name` `fail` in `collect_dpi_exports` is unreachable.
-It stays as the invariant's statement, and a test pins the upstream behaviour so a
-slang change surfaces rather than silently binding C to an arbitrary instance.
+A c_identifier exported from several scopes is no refusal at all: a task shares it
+exactly as a function does, dispatched on the current scope ("Scopes" above), so
+`svSetScope` picks the instance whose task the imported task's C runs.
 
 ### Oracle — measured, not assumed
 
@@ -871,11 +896,13 @@ does — unavoidable for any simulator that cannot unwind a foreign frame, as th
   resolving against libc `puts` that lowers, runs and prints; the emitted
   `declare i32 @t(i32)` C prototype; an exported task that lowers and runs
   SV-side; the export-task thunk's shape (i32 return, task coroutine callee, the
-  `done`/`suspended`/`no_frame` arms, both fatal symbols, `ret i32 0`); the upstream
-  slang collapse of one c_identifier from two scopes; and a regression check that an
+  `done`/`suspended`/`no_frame` arms, both fatal symbols, `ret i32 0`); the
+  dispatching thunk of one c_identifier from two scopes (once the upstream slang
+  collapse, now "Scopes" above); and a regression check that an
   exported *function*'s thunk gained none of the task machinery. The C-calls-into-SV
   round trip needs a `.o` through `addObjectFile`, which the doctest harness does
-  not wire, so it stays the CLI cross-check above.
+  not wire, so it stays the CLI cross-check above (the svScope tests wire it: see
+  "Scopes").
 - **T1 fatals** are CLI-checked (both transcripts above); the thunk test pins that
   each fatal is reachable from the emitted IR.
 - T2: the non-LIFO case that kills the nested drain — two processes, two import-task
@@ -921,19 +948,27 @@ against the JITDylib. Ship `src/runtime/svdpi.h` for users to `-I` (any standard
 `svGetPartselBit`); the x/z encoding is unit-tested in `runtime_test.cpp` and
 matches the logic-vec marshal (verilator can't parse a `z` literal).
 
-**Landed — scope (one per top).** `svGetScope`, `svSetScope`, `svGetNameFromScope`,
-`svGetScopeFromName`, `svPutUserData`/`svGetUserData`. Each top-level instance gets a
-runtime scope object holding its hierarchical name and a per-key C user-data map;
-`emit_main` emits one `rt_svdpi_scope_register(name, len, index)` call per
-`Module::tops()` entry when the design uses DPI, and `index == 0` clears the table so
-a second simulation in one process starts with no stale user data. The table is a
-`std::deque` because a `svScope` handle *is* the object's address, so registering a
-further scope must not move the handles already handed out. `svGetScope` returns the
-active scope, defaulting to the first top; `svSetScope` swaps it (a context import may
-save/restore it around an export call); `svGetScopeFromName` linear-searches the
-table. Verified vs verilator (user-data counter, save/restore, non-empty name all
-match; the name is each tool's own top — clotho `top`, verilator `vtop`); unit-tested
-in `runtime_test.cpp`. A handle for a nested (non-top) instance is still deferred.
+**Landed — scope (one per DPI scope, see "Scopes" above).** `svGetScope`,
+`svSetScope`, `svGetNameFromScope`, `svGetScopeFromName`,
+`svPutUserData`/`svGetUserData`. Each DPI scope gets a runtime scope object holding
+its hierarchical name, its registration index and a per-key C user-data map;
+`emit_main` emits one `rt_svdpi_scope_register(name, len, index)` call per scope the
+backend numbered (`build_dpi_scopes`) when the design uses DPI, and `index == 0`
+clears the table so a second simulation in one process starts with no stale user
+data. The table is a `std::deque` because a `svScope` handle *is* the object's
+address, so registering a further scope must not move the handles already handed
+out; names resolve through a hash map over it. `svGetScope` returns the current scope,
+which is the first top until a context import runs or C calls `svSetScope`;
+`svSetScope` swaps it and returns the one it replaced. A context import call sets it
+(`rt_svdpi_scope_enter`) and restores the caller's when it returns
+(`rt_svdpi_scope_leave`); an export thunk that several scopes share reads its
+registration index (`rt_svdpi_scope_index`). Verified vs verilator for the one scope
+it has (user-data counter, save/restore, non-empty name all match; the name is each
+tool's own top — clotho `top`, verilator `vtop`); unit-tested in `runtime_test.cpp`,
+and end to end for several scopes by the "DPI scope" cases of `dpi_test.cpp`, which
+link `tests/dpi_scope/*.c` into the JIT. Neither iverilog (VPI-based DPI) nor
+Verilator (one scope per top) can oracle several scopes, so those cases are derived
+from the LRM text (35.5.3, H.9.3).
 
 **Landed — open arrays (1-D, all directions, LRM 35.5.6.2).** An unsized `[]` formal
 arrives as an `svOpenArrayHandle` (an `rt_svopen` descriptor: `data`, `left`,
@@ -1021,13 +1056,9 @@ TODO:
   open arrays are supported in all directions** (named-scalar zero-copy / packed-vec
   marshal at any width, above); still loud-fail: multi-dim, dynamic-array / queue
   actuals.
-- Export string return (returned-`char*` lifetime), export `output`/`inout` string,
-  and one c_identifier exported from more than one scope (`svScope`, LRM 35.5.3, would
-  pick the instance; blocked upstream — slang drops the duplicate cId entries).
+- Export string return (returned-`char*` lifetime) and export `output`/`inout` string.
   An exported **task** inherits every one of these (LRM 35.8 puts a task under
   35.7's argument rules), and the inheritance is tested, not assumed.
-- The svScope C API is provided with one scope per top; a handle naming a nested
-  instance is not available.
 - `pure` on an imported **task** (LRM 35.5.1.3, "An imported task can never be
   declared `pure`") — a permanent refusal, not a phase. slang only warns.
 - An exported task that **suspends** (executes a delay, event control or `wait`):

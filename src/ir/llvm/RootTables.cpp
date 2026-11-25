@@ -138,6 +138,11 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
         for (uint32_t k = 0; k < a.expect_locals.size(); ++k) {
             set(ai, a.ctx_expect_base + k, sym(expect_queue(a.expect_locals[k])));
         }
+        // The DPI scope each context import it declares runs in.
+        for (uint32_t k = 0; k < a.dpi_ctx_locals.size(); ++k) {
+            const Function& fn = mod_.function(a.dpi_ctx_locals[k]);
+            set(ai, a.ctx_dpi_base + k, b_.getInt32(dpi_scope_of(fn, fn.dpi_scope)));
+        }
         // The imports this instance's code reads: where each signal is, who owns it
         // (nobody, for a package's) and where its port is in the owner's record
         // (nowhere, for a signal with no port).

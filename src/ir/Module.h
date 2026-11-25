@@ -734,6 +734,17 @@ struct Function {
     // LogicVec/...); DpiCType::Void for a non-OpenArray argument. Parallel to
     // dpi_arg_ctypes; only populated when is_dpi.
     std::vector<DpiCType> dpi_arg_elem_ctypes;
+    // A `context` DPI import (LRM 35.5.3): its call sets the current scope -- the one
+    // svGetScope answers and an export several scopes share dispatches on -- to the
+    // scope that declares the import, and puts the caller's back when it returns.
+    // `dpi_scope` names that scope without naming an instance, so every instance of a
+    // specialization lowers identically: for a subroutine of an instance it is the
+    // generate blocks between the instance and the declaration (".blk[1]", empty for
+    // the instance body itself), which the backend appends to the instance's path;
+    // for a package's or `$unit`'s, which belong to no instance, it is the whole name.
+    // Only meaningful when dpi_context.
+    bool        dpi_context = false;
+    std::string dpi_scope;
     // Full source extent of the subroutine declaration. Empty for a
     // compiler-synthesized body (a $strobe/$monitor thunk, a fork child).
     SourceSpan span;
@@ -770,6 +781,11 @@ struct DpiExport {
     // `int` whatever ret_ctype says (a task has no SV return; the int is 35.9's
     // disable channel). ret_ctype is always Void here.
     bool is_task = false;
+    // The scope the export is declared in, spelled as Function::dpi_scope spells the
+    // scope of a context import. A c_identifier exported from several scopes (LRM
+    // 35.4) is one C symbol with one DpiExport per scope, and the symbol runs the
+    // export of the scope that is current when C calls it.
+    std::string scope;
 };
 
 // Deepest inheritance chain a class may have (LRM 8.13 puts no limit on it).
