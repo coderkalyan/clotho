@@ -2260,6 +2260,11 @@ private:
     // which is any expression. A part-select bound is always Required.
     std::optional<GateTerm> gate_static_term(const Expression& e, Fold mode);
 
+    // The (signal, bit) a 1-bit constant select of a packed signal names through any
+    // chain of selects and packed-struct members (LRM 7.2.1), which gate_static_term
+    // does not follow. Output terminals only: the indexes fold as Required.
+    std::optional<GateTerm> gate_packed_term(const Expression& lhs);
+
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index);
 
     GateTerm lower_gate_output(const Expression& conn);

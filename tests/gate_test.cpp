@@ -881,19 +881,25 @@ TEST_CASE("gate driving a 2-state member of a 4-state packed net resolves") {
     CHECK(out == "zzz1\nzzzx\nzzz0\nzzzx\n");
 }
 
-// The remaining gate-output shapes stay guarded loud: a struct/union MEMBER is
-// not a static (signal, bit) terminal, so a lone gate driving one has no slot to
-// stage into and no bit-addressed store path.
-TEST_CASE("a single gate driving a packed-net member is rejected") {
-    const LowerResult r = lower_text(R"(
+// A struct MEMBER is a (signal, bit) terminal through its packed offset (LRM 7.2.1),
+// so a lone gate drives it directly; the other bits stay z, and a 2-state member
+// converts x to 0. Oracle: iverilog 13 for the 4-state member; the 2-state one is
+// the conversion of the case above.
+TEST_CASE("a single gate driving a packed-struct member") {
+    const std::string out = run_capture(R"(
         module top;
             logic a, b;
             wire struct packed { bit [3:0] lo; logic [3:0] hi; } s;
             and g0(s.lo[0], a, b);
+            and g1(s.hi[3], a, b);
+            initial begin
+                a = 1; b = 1; #1 $display("%b", s);
+                a = 1'bx;     #1 $display("%b", s);
+            end
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("unsupported gate output terminal") != std::string::npos);
+    // lo is the high half: s.lo[0] is bit 4 and s.hi[3] is bit 3.
+    CHECK(out == "zzz11zzz\nzzz0xzzz\n");
 }
 
 // LRM 28.13 / 28.14: a MOS switch passes the strength of its data input to its

@@ -2635,15 +2635,53 @@ Lowerer::GateTerm Lowerer::lower_gate_output(const Expression& conn) {
     if (conn.kind != ExpressionKind::Assignment) {
         fail("malformed gate output terminal");
     }
-    const Expression& lhs  = conn.as<AssignmentExpression>().left();
-    const auto        term = gate_static_term(lhs, Fold::Required);
-    if (!term) {
-        // TODO: concatenation / part-select / unpacked-element gate output
-        // lvalues (rare in netlists).
-        fail("unsupported gate output terminal");
+    const Expression& lhs = conn.as<AssignmentExpression>().left();
+    if (const auto term = gate_static_term(lhs, Fold::Required)) {
+        return *term;
     }
+    if (const auto term = gate_packed_term(lhs)) {
+        return *term;
+    }
+    // TODO: concatenation / part-select / unpacked-element gate output
+    // lvalues (rare in netlists).
+    fail("unsupported gate output terminal");
+}
 
-    return *term;
+// A bit of a packed net or variable reached through packed-struct members and
+// constant selects (`s.lo[0]`, `s.f[3:3]`): the region net_region_of gives a
+// multiply driven net's partial driver, when it is one bit of an integral root.
+std::optional<Lowerer::GateTerm> Lowerer::gate_packed_term(const Expression& lhs) {
+    const Expression* base = &lhs;
+    for (;;) {
+        if (base->kind == ExpressionKind::ElementSelect) {
+            base = &base->as<ElementSelectExpression>().value();
+        } else if (base->kind == ExpressionKind::RangeSelect) {
+            base = &base->as<RangeSelectExpression>().value();
+        } else if (base->kind == ExpressionKind::MemberAccess) {
+            base = &base->as<MemberAccessExpression>().value();
+        } else if (base->kind == ExpressionKind::Conversion) {
+            base = &base->as<ConversionExpression>().operand();
+        } else {
+            break;
+        }
+    }
+    if (base->kind != ExpressionKind::NamedValue) {
+        return std::nullopt;
+    }
+    const ValueSymbol& sym = base->as<NamedValueExpression>().symbol;
+    if (sym.kind == SymbolKind::Parameter || !sigmap_.contains(&sym) ||
+        !sym.getType().getCanonicalType().isIntegral()) {
+        return std::nullopt;
+    }
+    const NetRegion reg = net_region_of(lhs, sym);
+    if (reg.elem_lo != 0 || reg.elem_hi != 0 || reg.bit_hi == UINT32_MAX || reg.bit_lo != reg.bit_hi) {
+        return std::nullopt;
+    }
+    const ir::Signal sig = signal_of(sym);
+    if (reg.bit_hi >= module_.pool.layout(module_.signal(sig).type).width) {
+        return std::nullopt;
+    }
+    return GateTerm{ .sig = sig, .bit = reg.bit_lo };
 }
 
 // A pullup (drives constant 1) / pulldown (drives constant 0) source (LRM
@@ -3334,6 +3372,10 @@ void Lowerer::emit_gate_as_process(GateTerm                   output,
                                    ir::Builder&               b,
                                    ir::SourceLoc              l,
                                    const Expression*          delay_expr) {
+    // A 2-state member of a 4-state packed net converts the gate's value to 2-state
+    // (gate_output_value), but the bit it stores to is a bit of the 4-state net.
+    const bool four = module_.pool.layout(module_.signal(output.sig).type).domain == ir::Domain::Four;
+    val             = b.convert(val, make_int_type(1, four), false, l);
     const ir::Index lv = gate_bit_lvalue(output.sig, output.bit, b, l);
     if (delay_expr != nullptr) {
         b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);

@@ -277,8 +277,6 @@ Milestones, in order; lower ones unblock higher ones:
 ### Structural primitives
 
 - [~] **Gate output terminals** — missing pieces:
-  - [ ] **Member of a packed-struct net driven by a single gate** — `s.lo[0]` has no static
-    terminal; only the multi-driver resolved form works.
   - [ ] **Concatenation or part-select output**.
 - [ ] **Bit-select gate output (performance)** — each update rewrites the whole word and
   drops thunk/fusion eligibility; needs per-bit packed-signal fusion.
