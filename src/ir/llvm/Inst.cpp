@@ -1061,22 +1061,14 @@ void Backend::lower_inst(Index i) {
         // the NBA update region (see emit_nba_region), which commits shadow ->
         // live and services wait queues only after every active process has run.
         // StoreNbGated stages the same way and hands the target's force / assign
-        // state to its block commit, which drops the update while either is set.
+        // state to its commit, which drops the update while either is set: the
+        // block commit, or for a member a virtual interface writes, the record
+        // replay (arr_hold_).
         case Inst::Tag::StoreNb:
         case Inst::Tag::StoreNbGated: {
-            const bool  gated = ir_->tag(i) == Inst::Tag::StoreNbGated;
-            Index       lv_i  = p.binary.l;
-            Index       rhs_i = p.binary.r;
-            NbaHold     hold;
-            if (gated) {
-                const auto info = ir_->extra_data<StoreNbGatedInfo>(p.op_extra.extra);
-                lv_i            = p.op_extra.op;
-                rhs_i           = info.value;
-                hold.force      = ir_->payload(info.force_site).signal;
-                if (info.assign_site != kNoIndex) {
-                    hold.assign = ir_->payload(info.assign_site).signal;
-                }
-            }
+            const bool gated = ir_->tag(i) == Inst::Tag::StoreNbGated;
+            Index      lv_i  = gated ? p.op_extra.op : p.binary.l;
+            Index      rhs_i = gated ? ir_->extra_data<StoreNbGatedInfo>(p.op_extra.extra).value : p.binary.r;
             const Guarded&             lv = lvalue_of(lv_i);
             std::optional<CtxOverride> ov;
             ov.emplace(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
@@ -1119,21 +1111,21 @@ void Backend::lower_inst(Index i) {
             // scalar select, or aggregate static leaf) uses the block shadow.
             lv.when_valid(b_, [&](const LValue& v) {
                 if (gated) {
-                    // Only the block commit checks the hold. A force target is a
-                    // whole integral or real variable, which stages there unless it
-                    // is also a timed-NBA target, and the frontend refuses those, or
-                    // a member some virtual interface writes.
-                    if (v.is_signal && slot_of(v.sig).vif_rec) {
-                        // TODO: the vif record queue commits each record into the
-                        // instance the handle named and has no per-record hold check.
-                        throw BackendError{ "a nonblocking assignment to a force or assign target that a "
-                                            "virtual interface also writes is not supported" };
+                    // A force target is a whole integral or real variable, which
+                    // stages in its block unless it is also a timed-NBA target, which
+                    // the frontend refuses, or a member a virtual interface writes,
+                    // whose writes all take the record queue.
+                    if (v.is_signal && !v.is_agg && slot_of(v.sig).vif_rec) {
+                        emit_array_nba(v, rhs);
+                        return;
                     }
-                    if (!v.is_signal || v.is_agg || slot_of(v.sig).is_array || is_intra_target(v.sig)) {
+                    const auto info = ir_->extra_data<StoreNbGatedInfo>(p.op_extra.extra);
+                    if (!v.is_signal || v.is_agg || slot_of(v.sig).is_array || is_intra_target(v.sig) ||
+                        ir_->tag(info.force_site) != Inst::Tag::Signal) {
                         throw BackendError{ "internal: a gated nonblocking assignment does not commit through "
                                             "its block" };
                     }
-                    nba_hold_ = hold;
+                    nba_hold_ = nba_hold_of(*ir_, i);
                     lower_store_nb(v, rhs);
                     nba_hold_ = NbaHold{};
                     return;

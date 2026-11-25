@@ -165,20 +165,27 @@ A blocking write's gate is frontend-only. It is applied where the store is emitt
 (`store_or_gate`, reached from `lower_assign`'s `gated_store`, the `++`/`--` path, the
 concatenation scatter and the call copy-out): when the written lvalue's root signal is
 forceable, that store alone is wrapped in the `force_site==0 && assign_site==0`
-conditional (a `cond` region).
+conditional (a `cond` region). A write through a handle reads both through the handle.
 
 A nonblocking write cannot be gated that way, because the update happens later, in the
 NBA region, and LRM 10.6.2 decides against the state at that point. The frontend emits
-`StoreNbGated {lvalue, value, force_site, assign_site?}` instead of `StoreNb`: it stages
-like `StoreNb`, and the target's block commit function (`emit_block_commit_body`)
-loads the state signals and skips the merge and the wake while either is nonzero. The
-state signals are `Signal` operands of the op, so Partition imports them into the
-writer's unit like any other reference and the commit addresses them through the
-writer's record or bindings, per instance. Only a forceable target pays the load and
-branch. A gated NBA must take the block-commit path; a target the backend would route
-through a record queue (an array element, a virtual-interface member) is refused.
-Intra-assignment timing on a write to a force target (`x = #5 e`, `x <= #5 e`) is
-guarded loud: the intra records have no commit-time gate yet.
+`StoreNbGated {lvalue, value, force_site, assign_site?}` instead of `StoreNb`, with the
+state operands as `Signal`, or `IfaceSignal` through a handle. It stages like
+`StoreNb`, and the commit drops the update while either state is nonzero:
+
+- A target that commits through its block: the block commit function
+  (`emit_block_commit_body`) loads the state and skips the merge and the wake. The state
+  operands are IR references, so Partition imports them into the writer's unit like any
+  other and the commit addresses them through the writer's record or bindings, per
+  instance.
+- A member a virtual interface writes: every write of it takes the record queue, and each
+  record carries the instance it landed in. The replay (`emit_array_commit`) reads the
+  member's state through that record (`arr_hold_`), which works because the state sits
+  beside the member in every instance.
+
+Only a forceable target pays the load and branch. Intra-assignment timing on a write to a
+force target (`x = #5 e`, `x <= #5 e`) is guarded loud: the intra records have no
+commit-time gate yet.
 
 ## Phasing
 

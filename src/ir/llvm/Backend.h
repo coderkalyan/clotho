@@ -2474,6 +2474,8 @@ private:
 
     llvm::Value* nba_hold_active(const NbaHold& hold);
 
+    static NbaHold nba_hold_of(const Ir& ir, Index store);
+
     llvm::Value* agg_leaf_ptr(llvm::Value* base, llvm::Type* root_ty,
                               const std::vector<uint32_t>& path, uint32_t field);
 
@@ -5463,6 +5465,11 @@ private:
     // The hold of the StoreNbGated being staged (lower_store_nb -> block_register);
     // none for a plain StoreNb.
     NbaHold nba_hold_;
+    // The hold of each member a virtual interface writes whose writes are gated: its
+    // record replay (emit_array_commit) drops a record while the instance the record
+    // landed in is forced or assigned. Every writer of one member names the same
+    // state (nba_classify_ir checks).
+    ankerl::unordered_dense::map<uint32_t, NbaHold> arr_hold_;
 
     // A group lowered once for sharing (Backend::run): the function the first
     // instance of its unit whose imports are alike lowered for it, and what that

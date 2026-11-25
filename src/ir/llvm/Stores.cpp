@@ -370,6 +370,13 @@ void Backend::nba_classify_ir(const Ir& ir) {
             if (lvalue_has_subselect(ir, lv_idx)) {
                 slots_[static_cast<uint32_t>(t.sig)].arr_masked = true;
             }
+            if (ir.tag(idx) == Inst::Tag::StoreNbGated) {
+                const NbaHold hold        = nba_hold_of(ir, idx);
+                const auto [it, inserted] = arr_hold_.try_emplace(static_cast<uint32_t>(t.sig), hold);
+                if (!inserted && it->second != hold) {
+                    throw BackendError{ "internal: the writers of one member name different force state" };
+                }
+            }
             continue;
         }
         // An unpacked-array element NBA uses the runtime deferred queue, not
@@ -796,6 +803,23 @@ llvm::Value* Backend::nba_hold_active(const NbaHold& hold) {
         active = b_.CreateOr(active, nonzero(hold.assign));
     }
     return active;
+}
+
+// The state signals a StoreNbGated names. Through a virtual interface handle an
+// operand is IfaceSignal(handle, state); the state named is then the
+// representative's, at the def-local position every instance shares.
+NbaHold Backend::nba_hold_of(const Ir& ir, Index store) {
+    const auto info  = ir.extra_data<StoreNbGatedInfo>(ir.payload(store).op_extra.extra);
+    const auto state = [&](Index lv) {
+        return ir.tag(lv) == Inst::Tag::IfaceSignal ? ir.extra_data<IfaceMember>(ir.payload(lv).op_extra.extra).signal
+                                                    : ir.payload(lv).signal;
+    };
+    NbaHold hold;
+    hold.force = state(info.force_site);
+    if (info.assign_site != kNoIndex) {
+        hold.assign = state(info.assign_site);
+    }
+    return hold;
 }
 
 // Pointer to an aggregate leaf's mm (0) / z (1) field, via the leaf's static
@@ -2659,6 +2683,28 @@ void Backend::emit_array_commit(Signal sig, llvm::Value* state) {
 
     b_.SetInsertPoint(body);
     llvm::Value* recp   = b_.CreateInBoundsGEP(i8, base, b_.CreateMul(idx, b_.getInt32(stride)));
+    // A gated member (arr_hold_): a record that landed in an instance whose force
+    // or assign is active now is dropped, as its block commit would drop it (LRM
+    // 10.6.2). The state sits beside the member in the record's own instance.
+    llvm::BasicBlock* next = nullptr;
+    if (const auto h = arr_hold_.find(static_cast<uint32_t>(sig)); h != arr_hold_.end()) {
+        const auto same_instance = [&](Signal state) {
+            return state == NbaHold::no_hold || slot_of(state).anchor == s.anchor;
+        };
+        if (!same_instance(h->second.force) || !same_instance(h->second.assign)) {
+            // The replay reads the state through the record's instance.
+            throw BackendError{ "internal: a member's force state is not in the member's instance" };
+        }
+        llvm::Value* held = nullptr;
+        {
+            CtxOverride hov(*this, b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_ctx(s))), s.anchor);
+            held = nba_hold_active(h->second);
+        }
+        auto* go = llvm::BasicBlock::Create(ctx_, "arr.free", fn);
+        next     = llvm::BasicBlock::Create(ctx_, "arr.next", fn);
+        b_.CreateCondBr(held, next, go);
+        b_.SetInsertPoint(go);
+    }
     llvm::Value* mm_ptr = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, 0));
     llvm::Value* mm_val = b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 1), a1);
     // A member written through a virtual interface wakes per record, not once
@@ -2708,6 +2754,10 @@ void Backend::emit_array_commit(Signal sig, llvm::Value* state) {
         CtxOverride  ov(*this, rec_ctx, s.anchor);
         service_wait_queue(sig, old_mm, new_mm, old_z, new_z);
         vcd_touch_signal(sig);
+    }
+    if (next != nullptr) {
+        b_.CreateBr(next);
+        b_.SetInsertPoint(next);
     }
     idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
     b_.CreateBr(head);

@@ -200,6 +200,193 @@ TEST_CASE("force: commit-time check is per instance") {
     CHECK(run_capture_finish(src) == "u1=50 u2=1\nu1=51 u2=2\n");
 }
 
+// Writes through a virtual interface handle (LRM 25.9) are writes of the member of
+// the instance the handle names, so a force of that member overrides them (LRM
+// 10.6.2). iverilog 13 does not parse virtual interfaces; each expected output is
+// iverilog's on the same design with every `vb.` written as the instance's name.
+
+// Blocking and nonblocking writes through a handle, an NBA staged before the force
+// among them; after the release the next write lands.
+TEST_CASE("force: suppresses writes through a virtual interface") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+        endinterface
+        module top;
+            bus b();
+            virtual bus vb;
+            initial begin
+                vb = b;
+                vb.q <= 8'd5;
+                force b.q = 8'hAA;
+                #1 $display("q=%0d", b.q);
+                vb.q <= 8'd6;
+                #1 $display("q=%0d", b.q);
+                vb.q = 8'd7;
+                #1 $display("q=%0d", b.q);
+                release b.q;
+                vb.q <= 8'd9;
+                #1 $display("q=%0d", b.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=170\nq=170\nq=9\n");
+}
+
+// The interface's own clocked writer of a member a handle also writes: all of the
+// member's NBAs commit from the record queue, which checks the force per record.
+TEST_CASE("force: suppresses an interface's own NBA to a member a handle writes") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+            logic clk = 0;
+            always @(posedge clk) q <= q + 1;
+        endinterface
+        module top;
+            bus b();
+            virtual bus vb;
+            initial begin
+                vb = b;
+                vb.q <= 8'd5;
+                #1 force b.q = 8'hAA;
+                b.clk = 1;
+                #1 $display("q=%0d", b.q);
+                release b.q;
+                b.clk = 0;
+                #1 b.clk = 1;
+                #1 $display("q=%0d", b.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=171\n");
+}
+
+// One handle naming two instances in turn, only one of them forced: each write
+// reads the state of the instance the handle names when it runs.
+TEST_CASE("force: a write through a virtual interface checks the instance it names") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+        endinterface
+        module top;
+            bus b1();
+            bus b2();
+            virtual bus vb;
+            initial begin
+                vb = b1;
+                vb.q <= 8'd1;
+                vb = b2;
+                vb.q <= 8'd2;
+                force b1.q = 8'd50;
+                #1 $display("b1=%0d b2=%0d", b1.q, b2.q);
+                vb = b1;
+                vb.q = 8'd3;
+                vb = b2;
+                vb.q = 8'd4;
+                #1 $display("b1=%0d b2=%0d", b1.q, b2.q);
+                release b1.q;
+                vb = b1;
+                vb.q <= 8'd5;
+                #1 $display("b1=%0d b2=%0d", b1.q, b2.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "b1=50 b2=2\nb1=50 b2=4\nb1=5 b2=4\n");
+}
+
+// A task of the interface called through a handle writes the member by its bare
+// name, against the instance the handle names.
+TEST_CASE("force: suppresses an interface task's NBA called through a handle") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+            task set(input logic [7:0] v);
+                q <= v;
+            endtask
+        endinterface
+        module top;
+            bus b();
+            virtual bus vb;
+            initial begin
+                vb = b;
+                vb.set(8'd5);
+                force b.q = 8'hAA;
+                #1 $display("q=%0d", b.q);
+                vb.set(8'd6);
+                #1 $display("q=%0d", b.q);
+                release b.q;
+                vb.set(8'd7);
+                #1 $display("q=%0d", b.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=170\nq=7\n");
+}
+
+// A package class method writing through its handle: lowered by the package's
+// Lowerer, not the top's that forces the member.
+TEST_CASE("force: suppresses a package class's write through a virtual interface") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+        endinterface
+        package pkg;
+            class driver;
+                virtual bus vb;
+                function new(virtual bus h);
+                    vb = h;
+                endfunction
+                task put(input logic [7:0] v);
+                    vb.q <= v;
+                endtask
+            endclass
+        endpackage
+        module top;
+            import pkg::*;
+            bus b();
+            initial begin
+                static driver d = new(b);
+                d.put(8'd5);
+                force b.q = 8'hAA;
+                #1 $display("q=%0d", b.q);
+                d.put(8'd6);
+                #1 $display("q=%0d", b.q);
+                release b.q;
+                d.put(8'd7);
+                #1 $display("q=%0d", b.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=170\nq=7\n");
+}
+
+// LRM 10.6.1: a procedural continuous `assign` overrides writes through a handle as
+// it overrides direct ones, until `deassign`.
+TEST_CASE("assign: suppresses writes through a virtual interface") {
+    constexpr std::string_view src = R"(
+        interface bus;
+            logic [7:0] q = 0;
+        endinterface
+        module top;
+            bus b();
+            virtual bus vb;
+            initial begin
+                vb = b;
+                vb.q <= 8'd5;
+                assign b.q = 8'hAA;
+                #1 $display("q=%0d", b.q);
+                vb.q = 8'd6;
+                #1 $display("q=%0d", b.q);
+                deassign b.q;
+                #1 $display("q=%0d", b.q);
+                vb.q <= 8'd7;
+                #1 $display("q=%0d", b.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=170\nq=170\nq=170\nq=7\n");
+}
+
 // Two independent forced variables do not interfere.
 TEST_CASE("force: independent targets") {
     constexpr std::string_view src = R"(
