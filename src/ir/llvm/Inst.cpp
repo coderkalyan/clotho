@@ -2693,6 +2693,10 @@ LValue Backend::local_lvalue(uint32_t index) {
     lv.is_signal   = false;
     lv.sig         = Signal{ 0 };
     lv.is_string   = s.is_string;
+    if (s.is_ref && design_ref_wake_ && !s.is_string && !s.is_dynarr && !s.is_queue && !s.is_assoc) {
+        lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
+        lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
+    }
     return lv;
 }
 

@@ -804,6 +804,17 @@ Backend::ServiceSnapshot Backend::service_snapshot(const Guarded& g) {
         // waiter can exist yet anyway.
         return {};
     }
+    if (g.ref_wake_fn != nullptr) {
+        // A write through a `ref` formal: the old words, and the thunk the call passed to wake
+        // the actual's waiters (null at run time when it has none).
+        const LValue    lv = safe_lvalue(g);
+        ServiceSnapshot old;
+        old.mm      = load_lv_mm(lv);
+        old.z       = lv.has_z ? load_lv_z(lv) : nullptr;
+        old.ref_fn  = g.ref_wake_fn;
+        old.ref_ctx = g.ref_wake_ctx;
+        return old;
+    }
     if (g.is_string) {
         // A string's value is its CONTENT, not the handle the place holds, so the
         // old value has to be copied out rather than loaded as a word. Covers
@@ -857,7 +868,30 @@ void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
         // the owner's: its record, when the write reached it through a binding or a
         // virtual interface handle.
         CtxOverride ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
-        if (old.str != nullptr) {
+        if (old.ref_fn != nullptr) {
+            llvm::Value* new_mm = load_lv_mm(lv);
+            llvm::Value* new_z  = old.z != nullptr ? load_lv_z(lv) : nullptr;
+            std::vector<llvm::Type*>  pt{ raw_ptr_ty(), old.mm->getType() };
+            std::vector<llvm::Value*> args{ old.ref_ctx, old.mm };
+            if (old.z != nullptr) {
+                pt.push_back(old.z->getType());
+                args.push_back(old.z);
+            }
+            pt.push_back(new_mm->getType());
+            args.push_back(new_mm);
+            if (new_z != nullptr) {
+                pt.push_back(new_z->getType());
+                args.push_back(new_z);
+            }
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* call = llvm::BasicBlock::Create(ctx_, "refwake.call", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "refwake.cont", fn);
+            b_.CreateCondBr(b_.CreateIsNotNull(old.ref_fn), call, cont);
+            b_.SetInsertPoint(call);
+            b_.CreateCall(llvm::FunctionType::get(b_.getVoidTy(), pt, false), old.ref_fn, args);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        } else if (old.str != nullptr) {
             str_chg_after(lv, old.str);
         } else if (old.container) {
             notify_container_mutation(lv);
@@ -1890,6 +1924,109 @@ llvm::Value* Backend::event_wait_node(uint32_t k) {
         it->second = ab.CreateAlloca(event_node_ty(), nullptr, "event_wait_node");
     }
     return it->second;
+}
+
+
+// The wake of a `ref` actual that is a signal with waiters, as a function the callee calls after
+// each write through the formal (LRM 9.4.2: every change wakes at the change): the callee holds
+// only a pointer, while the buckets are static per signal. `void(ptr ctx, old mm, [old z,] new
+// mm, [new z])`; `ctx` is the record of the code that made the call (or the owner's, for a
+// virtual interface member), so the thunk addresses the buckets as that code does. Built like a
+// block commit function: in the module of the caller, with its lowering state put back after.
+llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
+    auto*          ptr  = llvm::PointerType::getUnqual(ctx_);
+    const uint32_t W    = lv.store_width;
+    auto*          mmty = int_ty(lv.four_state ? 2 * W : W);
+    auto*          zty  = int_ty(W);
+    std::vector<llvm::Type*> pt{ ptr, mmty };
+    if (lv.four_state) {
+        pt.push_back(zty);
+    }
+    pt.push_back(mmty);
+    if (lv.four_state) {
+        pt.push_back(zty);
+    }
+    const std::string name = fn_->getName().str() + ".refwake" + std::to_string(ref_wake_seq_[fn_]++);
+    auto*             th   = llvm::Function::Create(llvm::FunctionType::get(b_.getVoidTy(), pt, false),
+                                                    llvm::Function::InternalLinkage, name, env_->llmod);
+
+    llvm::IRBuilderBase::InsertPoint saved_ip     = b_.saveIP();
+    llvm::Function* const            saved_fn     = fn_;
+    llvm::Value* const               saved_state  = state_;
+    const uint32_t                   saved_anchor = own_anchor_;
+    llvm::Value* const               saved_ctx    = own_ctx_;
+    llvm::Value* const               saved_ovr    = ctx_override_;
+    const uint32_t                   saved_ovr_a  = ctx_override_anchor_;
+    const bool                       saved_silent = silent_stores_;
+    fn_                  = th;
+    state_               = sym(state_global_);
+    ctx_override_        = nullptr;
+    ctx_override_anchor_ = SignalSlot::no_anchor;
+    silent_stores_       = false;
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", th));
+    llvm::Value* ctx_arg = th->getArg(0);
+    const uint32_t vif_anchor = lvalue_ctx_anchor(lv);
+    if (lv.vif_ctx != nullptr) {
+        own_anchor_ = SignalSlot::no_anchor;
+        own_ctx_    = nullptr;
+    } else {
+        own_ctx_ = saved_ctx != nullptr ? ctx_arg : nullptr;
+    }
+    {
+        CtxOverride ov(*this, lv.vif_ctx != nullptr ? ctx_arg : nullptr, vif_anchor);
+        llvm::Value* old_mm = th->getArg(1);
+        llvm::Value* old_z  = lv.four_state ? th->getArg(2) : nullptr;
+        llvm::Value* new_mm = th->getArg(lv.four_state ? 3 : 2);
+        llvm::Value* new_z  = lv.four_state ? th->getArg(4) : nullptr;
+        if (!signal_has_level_waiters(lv.sig)) {
+            old_z = nullptr;
+            new_z = nullptr;
+        }
+        service_wait_queue(lv.sig, old_mm, new_mm, old_z, new_z);
+        if (slot_of(lv.sig).is_array) {
+            vcd_touch_array(lv.sig);
+        } else {
+            vcd_touch_signal(lv.sig);
+        }
+        b_.CreateRetVoid();
+    }
+    silent_stores_       = saved_silent;
+    ctx_override_anchor_ = saved_ovr_a;
+    ctx_override_        = saved_ovr;
+    own_ctx_             = saved_ctx;
+    own_anchor_          = saved_anchor;
+    state_               = saved_state;
+    fn_                  = saved_fn;
+    b_.restoreIP(saved_ip);
+
+    return th;
+}
+
+bool Backend::push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref formal_type) {
+    if (!design_ref_wake_) {
+        return false;
+    }
+    auto* null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    if (lv.ref_wake_fn != nullptr) {
+        // A ref formal passed on: the next callee wakes through the same thunk.
+        argv.push_back(lv.ref_wake_fn);
+        argv.push_back(lv.ref_wake_ctx);
+        return true;
+    }
+    const bool scalar = !is_handle_type(formal_type) && !is_agg_abi(formal_type) && !is_string_type(formal_type);
+    if (!scalar || silent_stores_ || lv.is_string || lv.chg != nullptr || lv.is_assoc || !lv.is_signal ||
+        !signal_has_waiters(lv.sig)) {
+        argv.push_back(null);
+        argv.push_back(null);
+        return false;
+    }
+    llvm::Function* th  = emit_ref_wake_thunk(lv);
+    llvm::Value*    ctx = lv.vif_ctx != nullptr ? lv.vif_ctx
+                          : own_ctx_ != nullptr ? own_ctx_
+                                                : static_cast<llvm::Value*>(null);
+    argv.push_back(th);
+    argv.push_back(ctx);
+    return true;
 }
 
 } // namespace clotho::ir::backend

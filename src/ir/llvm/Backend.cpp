@@ -115,6 +115,11 @@ void Backend::run() {
     // then lower their bodies callees first, once per family of instances
     // (lower_subroutines). A task is a coroutine (lower_task); a function is a
     // plain call.
+    // A write through a `ref` formal wakes at the write when some ref actual is a signal with waiters;
+    // decided before any declaration, since it widens every ref formal's parameters.
+    for (uint32_t s = 0; s < mod_.signals().size() && !design_ref_wake_; ++s) {
+        design_ref_wake_ = facts_.ref_arg[s] && signal_has_waiters(Signal{ s });
+    }
     const size_t nf = mod_.function_count();
     fn_decls_.assign(nf, nullptr);
     plan_subroutines();

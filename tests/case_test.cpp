@@ -1962,3 +1962,58 @@ TEST_CASE("unique / priority report: a fork child flushes its own reports at its
         CHECK_EQ(count_occ(err, "not unique"), 1u);
     }
 }
+
+// -- A write through a `ref` formal wakes its waiters at the write (LRM 9.4.2, 13.5.2) --
+//
+// 13.5.2 makes the formal the actual itself, so each write is an update event of it. Oracle:
+// iverilog 13 on the same designs with the ref formal replaced by the variable it aliases (it
+// rejects `ref` ports): a task that writes across delays wakes `@(x)` and `always_comb` at each
+// write, and a function's 0 -> 1 -> 0 inside one call wakes the waiter once, which then reads 0.
+TEST_CASE("ref write: a task's writes across delays wake waiters at each write") {
+    const std::string out = run_capture(R"(
+        module t;
+          logic x = 0, y;
+          task automatic tk(ref logic r);
+            #1 r = 1;
+            #1 r = 0;
+          endtask
+          always_comb y = x;
+          initial forever @(x) $display("woke %0t x=%b", $time, x);
+          always @(y) $display("y %0t %b", $time, y);
+          initial begin tk(x); #5 $finish; end
+        endmodule
+    )");
+    CHECK(out.find("woke 1 x=1\n") != std::string::npos);
+    CHECK(out.find("woke 2 x=0\n") != std::string::npos);
+    CHECK(out.find("y 1 1\n") != std::string::npos);
+    CHECK(out.find("y 2 0\n") != std::string::npos);
+}
+
+TEST_CASE("ref write: a value that reverts inside a function call still wakes its waiter") {
+    const std::string out = run_capture(R"(
+        module t;
+          logic x = 0;
+          function automatic void f(ref logic r);
+            r = 1;
+            r = 0;
+          endfunction
+          initial forever @(x) $display("woke %0t x=%b", $time, x);
+          initial begin #1 f(x); #5 $finish; end
+        endmodule
+    )");
+    CHECK_EQ(count_occ(out, "woke 1 x=0\n"), 1u);
+}
+
+TEST_CASE("ref write: a ref passed on to another task wakes at each write") {
+    const std::string out = run_capture(R"(
+        module t;
+          logic x = 0;
+          task automatic inner(ref logic r); #1 r = 1; #1 r = 0; endtask
+          task automatic outer(ref logic r); inner(r); endtask
+          initial forever @(x) $display("woke %0t x=%b", $time, x);
+          initial begin outer(x); #5 $finish; end
+        endmodule
+    )");
+    CHECK(out.find("woke 1 x=1\n") != std::string::npos);
+    CHECK(out.find("woke 2 x=0\n") != std::string::npos);
+}

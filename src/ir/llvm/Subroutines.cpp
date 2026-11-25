@@ -816,6 +816,10 @@ llvm::Function* Backend::declare_function(FunctionId id) {
             // signature never depends on how any of them binds the formal.
             params.push_back(ptr); // &actual storage
             params.push_back(ptr); // witness chain, or null
+            if (design_ref_wake_) {
+                params.push_back(ptr); // wake thunk, or null
+                params.push_back(ptr); // its context
+            }
             continue;
         }
         // A dynamic array or queue is one handle pointer regardless of
@@ -893,6 +897,10 @@ llvm::Function* Backend::declare_task(FunctionId id) {
             // The same shape declare_function builds.
             params.push_back(ptr); // &actual storage
             params.push_back(ptr); // witness chain, or null
+            if (design_ref_wake_) {
+                params.push_back(ptr); // wake thunk, or null
+                params.push_back(ptr); // its context
+            }
         } else if (is_handle_type(f.param_types[k])) {
             params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
         } else if (is_agg_abi(f.param_types[k])) {
@@ -1030,7 +1038,7 @@ void Backend::reserve_export_records() {
 //       out / inout pointer pair
 uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-        return 2;
+        return design_ref_wake_ ? 4 : 2;
     }
     // An aggregate is one storage pointer, in every direction (function or task).
     if (is_agg_abi(f.param_types[k])) {
@@ -1931,6 +1939,10 @@ void Backend::bind_ref_formals(const Function& f) {
         const uint32_t p  = param_llvm_index_[k];
         ref_ptr_[k].slot  = fn_->getArg(p);
         ref_ptr_[k].chain = fn_->getArg(p + 1);
+        if (design_ref_wake_) {
+            ref_ptr_[k].wake_fn  = fn_->getArg(p + 2);
+            ref_ptr_[k].wake_ctx = fn_->getArg(p + 3);
+        }
         // `formal` names the binding in a staleness report. It is a property of
         // the CALLEE, so it is held here rather than shipped per call.
         ref_ptr_[k].formal = f.name + " argument " + std::to_string(k + 1);
@@ -2253,7 +2265,10 @@ void Backend::lower_call_common(Index               i,
             const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
-            if (!is_handle_type(f.param_types[k])) {
+            const bool woken = push_ref_wake(argv, lv, f.param_types[k]);
+            if (woken) {
+                // The callee wakes at each write.
+            } else if (!is_handle_type(f.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
                        lv.mut_sig_valid) {
@@ -2505,7 +2520,10 @@ void Backend::lower_task_call_inst(Index i) {
             const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
-            if (!is_handle_type(tf.param_types[k])) {
+            const bool woken = push_ref_wake(argv, lv, tf.param_types[k]);
+            if (woken) {
+                // The callee wakes at each write, not at this call's return.
+            } else if (!is_handle_type(tf.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
                        lv.mut_sig_valid) {

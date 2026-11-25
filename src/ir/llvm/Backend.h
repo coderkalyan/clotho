@@ -541,6 +541,12 @@ struct LValueInfo {
     // down the mm-snapshot path with a null base.
     bool   mut_sig_valid = false;
     Signal mut_sig{ 0 };
+    // A write through a `ref` formal wakes the waiters of the actual at the write, by calling the
+    // wake thunk the call passed (null at run time when the actual has none):
+    // `void(ptr ctx, old mm, [old z,] new mm, [new z])`. Set only on the lvalue of a scalar ref
+    // formal, in a design where some ref actual has waiters (design_ref_wake_).
+    llvm::Value* ref_wake_fn  = nullptr;
+    llvm::Value* ref_wake_ctx = nullptr;
 
     // Whether a range mask decides which of the selected bits are in range.
     bool masked() const {
@@ -1256,6 +1262,9 @@ struct RefBinding {
     llvm::Value* slot  = nullptr;
     llvm::Value* chain = nullptr;
     std::string  formal;
+    // The wake thunk and context the call passed (design_ref_wake_ only).
+    llvm::Value* wake_fn  = nullptr;
+    llvm::Value* wake_ctx = nullptr;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level and
@@ -2591,7 +2600,17 @@ private:
         // The words of a wide-select store's target it can touch, in place of `mm` /
         // `z`, which stay null (wide_window_snapshot).
         std::optional<WideWindow> wide;
+        // A write through a `ref` formal: the thunk and context to call after the write; `mm` /
+        // `z` hold the old words.
+        llvm::Value* ref_fn  = nullptr;
+        llvm::Value* ref_ctx = nullptr;
     };
+
+    // Append the wake thunk and context for ref actual `lv` to `argv` (design_ref_wake_ only).
+    // True when the callee wakes at each write, so the call must not service at its return.
+    bool push_ref_wake(std::vector<llvm::Value*>& argv, const Guarded& lv, Ref formal_type);
+
+    llvm::Function* emit_ref_wake_thunk(const LValueInfo& lv);
 
     ServiceSnapshot service_snapshot(const Guarded& lv);
 
@@ -5041,6 +5060,10 @@ private:
     // While lowering a task or function that needs the generation: the frame slot
     // holding the pointer read at entry (a fork child's own cell), else null.
     llvm::Value* gen_slot_ = nullptr;
+    // Whether some `ref` actual is a signal with waiters: every ref formal then takes a wake thunk
+    // and context after its witness chain, so a write wakes at the write, not at the call's return.
+    bool design_ref_wake_ = false;
+    std::map<const llvm::Function*, uint32_t> ref_wake_seq_;
     // Per function: a body the runtime ramps on its own, which publishes no generation.
     std::vector<uint8_t> gen_root_;
     // Whether any process of the design holds a deferred assertion (sizes the records).
