@@ -2386,6 +2386,8 @@ private:
 
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
 
+    void lower_implicit_event_wait(const Statement& body, ir::Builder& b, ir::SourceLoc l);
+
     void lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b);
 
     void emit_guarded_body(const Statement& body, const Expression& guard, ir::Builder& b, ir::SourceLoc l);

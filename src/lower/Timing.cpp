@@ -667,12 +667,10 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
             // pass it.
             return;
         }
-        // Reachable for an event control that resolves to nothing at all --
-        // an implicit `@*` inside a procedural body infers no sensitivity
-        // here. An event class property no longer lands here: it parks on its
-        // object through the handle path (event_wait_needs_handle).
-        fail("an event control here names no signal or event object (an "
-             "implicit '@*' inside a procedural body is not supported)");
+        // An implicit `@*` never gets here (lower_implicit_event_wait infers its
+        // own list), and an event class property no longer lands here: it parks
+        // on its object through the handle path (event_wait_needs_handle).
+        fail("internal: an event control that names no signal or event object");
     }
     std::vector<ir::WaitEdge> edges;
     edges.reserve(events.size());
@@ -685,6 +683,29 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
     } else {
         b.wait(edges, l);
     }
+    flush_deferred_on_resume(b, l);
+}
+
+// An implicit event control `@*` before a statement of a procedural body (LRM
+// 9.4.2.2): wait for a change in any net or variable the statement reads, leaving
+// out an identifier that only names an assignment target or appears in a timing
+// control. That is the inference `always @*` makes over its body, here over the
+// statement it controls (the LRM's example 4: the inner `@*` of `always @* begin
+// x = a ^ b; @* x = c ^ d; end` is `@(c or d)`).
+//
+// A statement that reads no signal gives an empty list, and an event control with
+// no event never triggers: the process parks for the rest of the run, as `always
+// @*` over such a body never runs and `wait (0)` parks (iverilog 13 agrees: "@*
+// found no sensitivities so it will never trigger").
+void Lowerer::lower_implicit_event_wait(const Statement& body, ir::Builder& b, ir::SourceLoc l) {
+    std::vector<ir::WaitEvent> events;
+    collect_inferred_sensitivity(body, SensitivityMode::ImplicitEvent, events);
+    std::vector<ir::WaitEdge> edges;
+    edges.reserve(events.size());
+    for (const ir::WaitEvent& e : events) {
+        edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+    }
+    b.wait(edges, l);
     flush_deferred_on_resume(b, l);
 }
 

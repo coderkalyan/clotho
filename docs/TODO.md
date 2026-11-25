@@ -130,8 +130,6 @@ Milestones, in order; lower ones unblock higher ones:
     needs DPI.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
-- [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
-  refused.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
   `wait(vif.q.size())` is not exercised end to end.
 - [~] **Event control and `wait` on a fork-captured automatic** (9.4.2, 9.4.3, 9.3.2) — only

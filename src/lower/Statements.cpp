@@ -345,6 +345,10 @@ void Lowerer::lower_stmt(const Statement& stmt, ir::Builder& b) {
             if (timed.timing.kind == TimingControlKind::Delay) {
                 const Expression& amount = timed.timing.as<DelayControl>().expr;
                 b.unary(ir::Inst::Tag::Delay, scaled_delay(amount, b), loc(stmt));
+            } else if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
+                // `@*` waits on what the statement under it reads, so it needs the
+                // statement as well as the control.
+                lower_implicit_event_wait(timed.stmt, b, loc(stmt));
             } else if (is_event_control(timed.timing)) {
                 lower_event_wait(timed.timing, b, loc(stmt));
             } else if (timed.timing.kind == TimingControlKind::CycleDelay) {

@@ -2306,3 +2306,72 @@ TEST_CASE("a task that waits cannot be called from always_comb or always_ff") {
     )");
     CHECK(ff.find("blocking timing controls") != std::string::npos);
 }
+
+// An implicit event control `@*` before a statement of a procedural body (LRM
+// 9.4.2.2): wait for a change in any net or variable that statement reads, so a
+// statement that reads nothing gives an empty list and the process never wakes (the
+// LRM names no other outcome; iverilog 13 warns "@* found no sensitivities so it
+// will never trigger"). Expected output from iverilog 13 on each of these four.
+TEST_CASE("implicit @* before a statement that reads nothing parks the process") {
+    const std::string out = run_capture(R"(
+        module top;
+          initial begin
+            $display("before");
+            @* $display("never");
+            $display("after");
+          end
+          initial #10 $display("done %0t", $time);
+        endmodule
+    )");
+    CHECK(out == "before\ndone 10\n");
+}
+
+// The list is what the statement READS, and an identifier that only names the
+// target of an assignment is left out: y is written by another process at 1 without
+// waking the controlled statement, a changes at 2 and does.
+TEST_CASE("implicit @* waits on the operands of the statement it controls") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [3:0] a, b, y;
+          initial begin
+            a = 1; b = 2;
+            @* y = a + b;
+            $display("woke %0t y=%0d", $time, y);
+          end
+          initial begin #1 y = 9; #1 a = 5; end
+        endmodule
+    )");
+    CHECK(out == "woke 2 y=7\n");
+}
+
+// LRM 9.4.2.2 example 3: `@* begin @(i) kid = b; end` is `@(b)`: an identifier that
+// appears only in a timing control inside the statement is not added.
+TEST_CASE("implicit @* leaves out an identifier that only appears in a timing control") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic i = 0, b = 0, kid = 0;
+          initial begin
+            @* begin @(i) kid = b; end
+            $display("kid=%b %0t", kid, $time);
+          end
+          initial begin #1 i = 1; #1 b = 1; #1 i = 0; #1 i = 1; end
+        endmodule
+    )");
+    CHECK(out == "kid=1 3\n");
+}
+
+// LRM 9.4.2.2 example 4: the outer `@*` of the always block is `@(a or b or c or d)`
+// and the inner one, over `x = c ^ d`, is `@(c or d)`.
+TEST_CASE("implicit @* nested in an always @*") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a = 0, b = 0, c = 0, d = 0, x;
+          always @* begin
+            x = a ^ b; $display("outer %0t %b", $time, x);
+            @* x = c ^ d; $display("inner %0t %b", $time, x);
+          end
+          initial begin #1 a = 1; #1 c = 1; #1 b = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "outer 1 1\ninner 2 1\nouter 3 0\n");
+}
