@@ -97,6 +97,18 @@ VCD, not only what a test prints.
   longer differs fails the run. `CLOTHO_CONFIG_MATRIX_TIMEOUT` (seconds per child)
   and `CLOTHO_CONFIG_MATRIX_LOG` (one line per design) tune it. It costs a process
   per variant per design, so it is not in CI.
+- **Scheduler trace check.** A build with `CLOTHO_EXTRA_ASSERTS` makes the generated
+  code and the scheduler report each spawn, park, wake, dispatch, resume and end to
+  `src/runtime/TraceCheck.cpp`, which tests the rules of docs/design/scheduler-rules.md
+  R5 online (a wake needs a parked activation waiting for its cause, a dispatch a
+  queued one, a resume the control it parked at, nothing touches an ended one). It is
+  on by default in such a build, for the suite and for `clotho run`;
+  `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status 99,
+  `clotho: scheduler trace violation:` and a report naming the rule, the activation,
+  its control, the time and the cause) and fails the test that ran the design, unless
+  `tests/trace-check-known.txt` lists it as `bug` or `rule`; an entry whose test no
+  longer violates fails the run. The sv-tests summary classifies the marker as `trace`.
+  A shipped build emits no call and links no checker (`trace_check_test.cpp`).
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.
 - **sv-tests.** Outcomes are classified as pass, refused, crash or fail; the
   crash count is zero. A pass there means only that nothing failed, not that

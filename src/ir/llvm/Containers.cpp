@@ -510,7 +510,7 @@ void Backend::service_signal_container_mutation(Signal sig) {
         service_dynamic_queue(sig, e);
     }
     if (vif_wait_[i][e]) {
-        emit_event_wake_list(vif_head_ptr(sig, e));
+        emit_event_wake_list(vif_head_ptr(sig, e), { .kind = RT_TRACE_VIF, .sig = sig, .fact = e });
     }
     fire_event_trigger(sig, e);
 }
@@ -526,7 +526,8 @@ void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
     const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)];
     llvm::Value*   slot =
       b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
-    emit_event_wake_list(event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot)));
+    llvm::Value* obj = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot));
+    emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
 }
 
 // Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on

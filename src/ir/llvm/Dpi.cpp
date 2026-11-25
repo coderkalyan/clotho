@@ -802,6 +802,8 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
     b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
     argv.push_back(record);
     llvm::Value* hdl  = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+    emit_trace_spawn(b_, hdl, RT_TRACE_ORG_EXPORT, "export \"DPI-C\" " + ex.extern_name, nullptr);
+    emit_trace_dispatch(b_, hdl, RT_TRACE_INLINE);
     b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
     llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
 

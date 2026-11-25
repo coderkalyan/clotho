@@ -34,7 +34,7 @@ void Backend::lower_delay(Index amount) {
             // A nonzero delay is region-aware through the awaiter, above.
             emit_delay_timer(ticks);
         }
-        emit_suspend("coro.resume");
+        emit_suspend("coro.resume", { .kind = RT_TRACE_CTL_DELAY, .delay = ticks });
         return;
     }
 
@@ -54,7 +54,7 @@ void Backend::lower_delay(Index amount) {
     b_.CreateBr(susp);
 
     b_.SetInsertPoint(susp);
-    emit_suspend("coro.resume");
+    emit_suspend("coro.resume", { .kind = RT_TRACE_CTL_DELAY, .delay = ticks });
 }
 
 // Schedule a wheel timer for `now + ticks` that resumes this coroutine: stash
@@ -193,8 +193,8 @@ void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
 // queue rather than a wheel timer. Like a #delay's suspend: the default edge
 // returns to the resumer, case 0 resumes here, case 1 is a destroy while
 // suspended.
-void Backend::emit_wait_suspend() {
-    emit_suspend("coro.wait_resume");
+void Backend::emit_wait_suspend(const TracePark& park) {
+    emit_suspend("coro.wait_resume", park);
 }
 
 // Lower an intra-body `@(a or posedge b ...)` event wait: register on EVERY
@@ -222,7 +222,7 @@ void Backend::lower_wait(ExtraIndex info) {
 
 // A process that waits at its head (waits_at_head) calls this with its leading list,
 // at the top of its loop.
-void Backend::lower_wait_edges(std::span<const WaitEdge> events) {
+void Backend::lower_wait_edges(std::span<const WaitEdge> events, const SourceText* where) {
     // An event waiter links a frame-resident node onto the event object's list;
     // a signal waiter appends to the (signal, edge) dynamic bucket. A mixed
     // `@(e or clk)` does both -- they are independent registrations before one
@@ -253,7 +253,7 @@ void Backend::lower_wait_edges(std::span<const WaitEdge> events) {
         }
     }
     emit_arm_wake_word(); // ready to be woken
-    emit_wait_suspend();  // park until any event fires
+    emit_wait_suspend({ .kind = RT_TRACE_CTL_EVENT, .edges = events, .where = where }); // park until any event fires
     // A remote `disable` is a second way to be resumed here, and it neither
     // fires nor clears the bucket we are in -- so with one in the design a
     // single-signal wait has to compact itself out too, or its stale entry would
@@ -1123,7 +1123,7 @@ void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
             // Waiters that reached this member through a virtual interface: an
             // intrusive list on the instance the write is landing in, walked
             // exactly like an event object's (each waiter unlinks itself).
-            emit_event_wake_list(vif_head_ptr(sig, e));
+            emit_event_wake_list(vif_head_ptr(sig, e), { .kind = RT_TRACE_VIF, .sig = sig, .fact = e });
         }
         fire_event_trigger(sig, e);
         b_.CreateBr(cont);
@@ -1324,13 +1324,15 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
     const auto        i    = static_cast<uint32_t>(sig);
     const SignalSlot& s    = slots_[i];
     llvm::Value*      base = wait_base(WaitPart::Static, sig, edge);
+    // The bucket's edge is the fact the writer's scan knows: the entries wake for this change.
+    const TraceCause why{ .kind = RT_TRACE_STATIC, .sig = sig, .fact = edge };
     if (port_reachable(s)) {
         emit_static_scan_rt(base, fixed_field_load(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
-                            static_trig_bits(sig, edge));
+                            static_trig_bits(sig, edge), why);
         return;
     }
     emit_static_scan_rt(base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
-                        static_trig_bits(sig, edge));
+                        static_trig_bits(sig, edge), why);
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -1339,7 +1341,8 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
 // resets to 0); the firing process deregisters its stale entries from any
 // OTHER buckets itself on resume (eager removal in lower_wait).
 void Backend::service_dynamic_queue(Signal sig, uint32_t edge) {
-    emit_dynamic_scan_rt(wait_base(WaitPart::Dynamic, sig, edge), wait_base(WaitPart::DynamicLen, sig, edge));
+    emit_dynamic_scan_rt(wait_base(WaitPart::Dynamic, sig, edge), wait_base(WaitPart::DynamicLen, sig, edge),
+                         { .kind = RT_TRACE_DYNAMIC, .sig = sig, .fact = edge });
 }
 
 // The design's one detached on-expiry thunk of `->> #d e`. The wheel calls it as
@@ -1487,7 +1490,7 @@ void Backend::emit_event_pend_drain(llvm::Value* wheel) {
 void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
-    emit_event_wake_list(obj);
+    emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here, and
     // only an object some such statement registered on has an id to fire.
@@ -1543,7 +1546,7 @@ void Backend::emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel) {
 // One-shot nodes are NOT bulk-cleared the way a dynamic bucket is (which resets
 // its whole length on fire): each waiter unlinks itself on resume, which is also
 // what makes a multi-event wait correct without a compaction pass.
-void Backend::emit_event_wake_list(llvm::Value* obj) {
+void Backend::emit_event_wake_list(llvm::Value* obj, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* nty  = event_node_ty();
     auto* null = llvm::ConstantPointerNull::get(ptr);
@@ -1571,7 +1574,7 @@ void Backend::emit_event_wake_list(llvm::Value* obj) {
     b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), wake, step);
 
     b_.SetInsertPoint(wake);
-    emit_wake_push(b_, hdl);
+    emit_wake_push(b_, hdl, why);
     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
     b_.CreateBr(step);
 
@@ -1746,7 +1749,7 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
 // in, or a group woken by two of its events in one instant loses the second
 // one's bit and skips the members that were waiting for it. With a constant 0
 // that path is empty and the emission is exactly the unguarded scan.
-void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig) {
+void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* word = sched_word_ty();
@@ -1781,7 +1784,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
     if (none != nullptr && none->isZero()) {
         b_.CreateCondBr(queued, cont, wake);
         b_.SetInsertPoint(wake);
-        emit_wake_push(b_, h);
+        emit_wake_push(b_, h, why);
         b_.CreateStore(b_.getInt64(1), fptr);
     } else {
         // The word becomes the entry's bits OR-ed in if it was already queued, else
@@ -1789,7 +1792,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
         b_.CreateStore(b_.CreateSelect(queued, b_.CreateOr(old, trig), b_.CreateOr(trig, b_.getInt64(1))), fptr);
         b_.CreateCondBr(queued, cont, wake);
         b_.SetInsertPoint(wake);
-        emit_wake_push(b_, h);
+        emit_wake_push(b_, h, why);
     }
     b_.CreateBr(cont);
 
@@ -1805,7 +1808,7 @@ void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padd
 // Generic dynamic-queue scan (base + length pointer values), null base =>
 // skip. Serves both callers, like emit_static_scan_rt. Wakes every live
 // entry (flag-deduped) and resets the length to 0.
-void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
+void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* elem = wait_elem_ty();
@@ -1838,7 +1841,7 @@ void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
     b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(sched_word_ty(), fptr), b_.getInt64(0)), cont, wake);
 
     b_.SetInsertPoint(wake);
-    emit_wake_push(b_, h);
+    emit_wake_push(b_, h, why);
     b_.CreateStore(b_.getInt64(1), fptr);
     b_.CreateBr(cont);
 

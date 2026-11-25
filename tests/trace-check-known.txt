@@ -1,0 +1,17 @@
+# Test cases whose designs break a rule of the scheduler (docs/design/scheduler-trace.md, the
+# trace check that every design the suite simulates runs through in a CLOTHO_EXTRA_ASSERTS
+# build, docs/VERIFICATION.md, "Detectors") and are understood. Read by tests/TraceCheck.h: a
+# listed test case is not failed for a violation of its rule, and a run in which a listed test
+# case passes without breaking its rule fails, so an entry is deleted when its cause is gone.
+#
+# One entry per line: <category> "<doctest test case name>" <rule> <reason, to end of line>
+# This is the format of tests/config-matrix-known.txt, with the rule first in the reason. A test
+# case with several designs is listed once. An entry covers only its own rule: a violation of
+# another rule still fails the test.
+#
+#   bug    A real Clotho bug that the fix of is not landed: a row in docs/design/
+#          scheduler-rules.md §4 or an entry in docs/TODO.md says which.
+#   rule   The LRM allows what the predicate refuses. Names the rule of
+#          docs/design/scheduler-rules.md §3 to reword.
+#
+# The wording of LRM clauses cited here is not yet checked against the LRM text.

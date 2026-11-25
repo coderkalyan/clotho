@@ -455,6 +455,7 @@ add_library(clotho_runtime STATIC
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
   src/runtime/Wheel.cpp
+  src/runtime/TraceCheck.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # unordered_dense is header-only (INTERFACE), so it adds only an include dir:
@@ -567,6 +568,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/Stores.cpp
   src/ir/llvm/Subroutines.cpp
   src/ir/llvm/SystemTasks.cpp
+  src/ir/llvm/Trace.cpp
   src/ir/llvm/Vcd.cpp
   src/ir/Jit.cpp
   src/ir/CoffArm64.cpp
@@ -823,6 +825,7 @@ add_library(clotho_runtime_exe STATIC
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
   src/runtime/Wheel.cpp
+  src/runtime/TraceCheck.cpp
   src/runtime/ExeMain.cpp
   src/runtime/ExeSupport.cpp
 )
@@ -1123,6 +1126,7 @@ set(CLOTHO_TEST_SOURCES
   tests/memory_bounds_test.cpp
   tests/invalid_index_test.cpp
   tests/encoding_check_test.cpp
+  tests/trace_check_test.cpp
   tests/queue_test.cpp
   tests/associative_array_test.cpp
   tests/array_ordering_test.cpp

@@ -56,6 +56,7 @@
 #include "ir/Typing.h"
 #include "runtime/Gc.h"
 #include "runtime/Runtime.h"
+#include "runtime/Trace.h"
 
 // LLVM backend rationale.
 //
@@ -2123,7 +2124,95 @@ private:
     llvm::Function* enqueue_trampoline();
     void build_enqueue_trampoline();
 
-    void emit_suspend(const char* label);
+    // -- The scheduler trace (docs/design/scheduler-trace.md) --
+    //
+    // Each emit_trace_* helper plants one call into the runtime's checker (runtime/Trace.h) in a
+    // build with CLOTHO_EXTRA_ASSERTS when the config asks for the check, and emits nothing
+    // otherwise, so the code a shipped build generates is unchanged. A park site cannot compile
+    // without saying what it parks for (TracePark), nor a wake site without its cause
+    // (TraceCause).
+
+    // What a park waits for. `kind` is RT_TRACE_CTL_*.
+    struct TracePark {
+        uint32_t                  kind  = 0;
+        // An event control: its list, from the IR facts and not from the buckets.
+        std::span<const WaitEdge> edges = {};
+        // A delay control: the ticks, an i64 (0: the `#0` region).
+        llvm::Value*              delay = nullptr;
+        // Where the construct is, when it is not the instruction being lowered.
+        const SourceText*         where = nullptr;
+    };
+
+    // What pushed an activation: RT_TRACE_*, and what it names -- the signal a store wrote and
+    // the change it made (RT_TRACE_POS ...) for a bucket's scan, the object for an event's.
+    struct TraceCause {
+        uint32_t              kind = 0;
+        std::optional<Signal> sig  = std::nullopt;
+        uint32_t              fact = 0;
+        llvm::Value*          obj  = nullptr;
+    };
+
+    bool trace_on() const;
+
+    // Where the instruction being lowered is, for a control or an origin.
+    std::string trace_here();
+
+    // `where` as the control of a park names it.
+    std::string trace_where(const TracePark& park);
+
+    // Where process `proc` is, for the control of its static subscription: its span, resolved.
+    SourceText trace_process_text(const Process& proc);
+
+    // A NUL-terminated string constant of module `m`, once per text.
+    llvm::Constant* trace_string(llvm::Module& m, const std::string& text);
+
+    // The constant record of a park site or an origin (rt_trace_control), in the module `m`.
+    llvm::Constant* trace_control(llvm::Module& m, uint32_t kind, const std::string& where);
+
+    // A signal's name as a constant string for a report, or a null pointer where the code that
+    // names it is shared by instances that bind it differently.
+    llvm::Constant* trace_signal_name(Signal sig);
+
+    // The entry of a list for one wait edge: the storage or object it names, and its name and
+    // edge.
+    struct TraceEntry {
+        llvm::Value* x;
+        llvm::Value* name;
+        uint32_t     edge;
+    };
+    TraceEntry trace_entry(const WaitEdge& e);
+
+    // A new activation: `a` is the handle its ramp returned, `parent` the creator's (null: none).
+    void emit_trace_spawn(llvm::IRBuilder<>& b, llvm::Value* a, uint32_t origin, const std::string& where,
+                          llvm::Value* parent);
+
+    // The park of the body being lowered. Returns its control, which the resume names; null when
+    // nothing is emitted.
+    llvm::Constant* emit_trace_park(const TracePark& park);
+
+    void emit_trace_wake(llvm::IRBuilder<>& b, llvm::Value* a, const TraceCause& why);
+
+    // Whether the dispatch of `a` may go on (an i1), or null when nothing is emitted.
+    llvm::Value* emit_trace_dispatch(llvm::IRBuilder<>& b, llvm::Value* a, uint32_t how);
+
+    void emit_trace_resume(llvm::Value* a, llvm::Constant* control);
+
+    void emit_trace_end(llvm::Value* a);
+
+    // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
+    void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
+
+    // The seed's reports of one row: the spawn of its handle `h`, its static list (`n` entries at
+    // `list`, from the IR's wait events) and, when `parked_now` (an i1), its park at the static
+    // control `ctl`, which is where a group that is not queued now waits.
+    void emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list, llvm::Value* n,
+                             llvm::Value* parked_now);
+
+    // One event the seed links a persistent waiter onto joins the static list of the group `h`.
+    void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
+
+    // Every park of a coroutine goes through here, and says what it parks for.
+    void emit_suspend(const char* label, const TracePark& park);
 
     void lower_delay(Index amount);
 
@@ -2148,13 +2237,13 @@ private:
 
     void emit_dynamic_register(Signal sig, uint32_t edge);
 
-    void emit_wait_suspend();
+    void emit_wait_suspend(const TracePark& park);
 
     void lower_wait(ExtraIndex info);
 
     // The events of an intra-body wait, from a Wait op (lower_wait) or, for a process that
     // waits at its head (waits_at_head), from its leading list.
-    void lower_wait_edges(std::span<const WaitEdge> events);
+    void lower_wait_edges(std::span<const WaitEdge> events, const SourceText* where = nullptr);
 
     // The one place a body arms its process's wake word before a park (TagInfo::arms_wake).
     void emit_arm_wake_word();
@@ -2673,7 +2762,7 @@ private:
 
     void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel);
 
-    void emit_event_wake_list(llvm::Value* obj);
+    void emit_event_wake_list(llvm::Value* obj, const TraceCause& why);
 
     void emit_event_link(llvm::Value* obj, llvm::Value* node, llvm::Value* handle,
                          llvm::Value* flag, bool record_owner = true);
@@ -2860,7 +2949,7 @@ private:
 
     static bool ir_has_delay(const Ir& ir);
 
-    void emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked);
+    void emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked, const TraceCause& why);
 
     void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle);
 
@@ -2904,9 +2993,9 @@ private:
         b.SetInsertPoint(cont);
     }
 
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig);
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig, const TraceCause& why);
 
-    void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr);
+    void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
@@ -5068,6 +5157,12 @@ private:
     // Renders a SourceLoc for a sanitizer report baked into the emitted code.
     // Empty for a caller with no SourceContext (the tests); see loc_text.
     const LocResolver&      resolve_;
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The constants the trace emits, once per module: a control by (kind, location), a string by
+    // its text.
+    std::map<std::tuple<const llvm::Module*, uint32_t, std::string>, llvm::Constant*> trace_controls_;
+    std::map<std::pair<const llvm::Module*, std::string>, llvm::Constant*>            trace_strings_;
+#endif
     llvm::Value*           frame_ = nullptr;
     std::vector<FrameSlot> frame_slots_;
     // Per-ref-formal fat pointer, indexed by Local index; all-null for a non-ref
