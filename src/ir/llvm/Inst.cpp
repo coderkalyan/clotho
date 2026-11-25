@@ -644,6 +644,8 @@ void Backend::lower_inst(Index i) {
             // static-property map must wake the map SIGNAL's Any waiters.
             el.mut_sig_valid = hlv.is_signal || hlv.mut_sig_valid;
             el.mut_sig       = hlv.is_signal ? hlv.sig : hlv.mut_sig;
+            el.ref_wake_fn   = hlv.ref_wake_fn;
+            el.ref_wake_ctx  = hlv.ref_wake_ctx;
             // An entry's slot lives until that entry is erased, so a `ref`
             // through it records the map's relocation epoch, appended to whatever
             // containers the MAP itself sits inside (docs/design/data-model.md
@@ -714,6 +716,8 @@ void Backend::lower_inst(Index i) {
             el.chg_body_ty      = dlv.chg_body_ty;
             el.mut_sig_valid    = dlv.is_signal || dlv.mut_sig_valid;
             el.mut_sig          = dlv.is_signal ? dlv.sig : dlv.mut_sig;
+            el.ref_wake_fn      = dlv.ref_wake_fn;
+            el.ref_wake_ctx     = dlv.ref_wake_ctx;
             el.epoch_chain      = dlv.epoch_chain;
             el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
                                                         handle_epoch_field(pt.type)));
