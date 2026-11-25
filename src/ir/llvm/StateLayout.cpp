@@ -634,16 +634,16 @@ uint32_t Backend::binding_of(const SignalSlot& s) {
     return it->second;
 }
 
-// A field of the own instance's record: the parameter of a thunk row, else the
-// instance's record global.
+// A fixed field (see fixed_field_load) of the own instance's record: the parameter
+// of a thunk row, else the instance's record global.
 llvm::Value* Backend::own_field(uint32_t field, llvm::Type* ty) {
     Anchor& a = anchors_[own_anchor_];
     if (own_ctx_ != nullptr) {
-        return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, own_ctx_, { b_.getInt32(0), b_.getInt32(field) }));
+        return fixed_field_load(ty, b_.CreateInBoundsGEP(a.ctx_ty, own_ctx_, { b_.getInt32(0), b_.getInt32(field) }));
     }
     auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
       a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
-    return b_.CreateLoad(ty, gep);
+    return fixed_field_load(ty, gep);
 }
 
 // The address of a signal's storage as a link-time constant: what a binding to
@@ -767,7 +767,7 @@ llvm::Value* Backend::vif_head_ptr(Signal sig, uint32_t edge) {
     // is an element of the signal's port.
     if (llvm::Value* port = bound_port(s); port != nullptr && port_of(s)->vif[edge] != no_port_elem) {
         const PortLayout& pl = *port_of(s);
-        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), b_.CreateStructGEP(pl.ty, port, pl.vif[edge]));
+        return fixed_field_load(llvm::PointerType::getUnqual(ctx_), b_.CreateStructGEP(pl.ty, port, pl.vif[edge]));
     }
     // Exactly storage_ptr's base rule: an instance's own group loads its
     // instance base rather than bake the instance's symbol.
@@ -822,7 +822,7 @@ llvm::Value* Backend::shadow_ptr(const SignalSlot& owner, uint32_t field) {
         if (llvm::Value* port = bound_port(owner); port != nullptr) {
             const PortLayout& pl = *port_of(owner);
             assert(field >= owner.sh_first && field - owner.sh_first < pl.n_shadow);
-            return b_.CreateLoad(ptr, b_.CreateStructGEP(pl.ty, port, pl.shadow + (field - owner.sh_first)));
+            return fixed_field_load(ptr, b_.CreateStructGEP(pl.ty, port, pl.shadow + (field - owner.sh_first)));
         }
         // An NBA target's anchor always carries a shadow struct (the
         // fields were assigned per anchor in build_state_types).
@@ -938,9 +938,20 @@ llvm::Value* Backend::ctx_field_ptr(Anchor& a, uint32_t field) {
       a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
 }
 
-// A def-relative load of one instance-record field.
+// NOTE: tier 0 only. There `!invariant.load` lets EarlyCSE keep one load of a
+// field across the stores between its reads (hazard3: 7% fewer loads, 2.1% fewer
+// instructions simulated, 0.3% more compile). Under -O it changed no simulated
+// instruction and cost 13% more compile.
+llvm::LoadInst* Backend::fixed_field_load(llvm::Type* ty, llvm::Value* ptr) {
+    llvm::LoadInst* const load = b_.CreateLoad(ty, ptr);
+    if (!config_.o3) {
+        load->setMetadata(llvm::LLVMContext::MD_invariant_load, llvm::MDNode::get(ctx_, {}));
+    }
+    return load;
+}
+
 llvm::Value* Backend::ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
-    return b_.CreateLoad(ty, ctx_field_ptr(a, field));
+    return fixed_field_load(ty, ctx_field_ptr(a, field));
 }
 
 // The record of the instance a deferred store to `s` lands in, which its

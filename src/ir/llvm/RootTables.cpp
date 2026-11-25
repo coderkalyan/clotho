@@ -325,6 +325,9 @@ llvm::Function* Backend::run_once_fn() {
     llvm::Value* fn  = tb.CreateLoad(ptr, tb.CreateStructGEP(row, r, 0));
     llvm::Value* arg = tb.CreateLoad(ptr, tb.CreateStructGEP(row, r, 1));
     llvm::Value* hdl = tb.CreateCall(ramp, fn, { arg, wheel });
+    // The processes of these regions have no row of their own to name them by.
+    emit_trace_spawn(tb, hdl, RT_TRACE_ORG_PROCESS, "<run-once process>", nullptr);
+    emit_trace_dispatch(tb, hdl, RT_TRACE_RUN_ONCE);
     tb.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
     tb.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
     i->addIncoming(tb.CreateAdd(i, tb.getInt32(1)), body);
@@ -403,6 +406,18 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
     std::vector<uint32_t> row_of(procs.size(), ~0u);
     std::vector<uint32_t> late;
     std::array<bool, 4>   rings{};
+    // The trace's view of each row (docs/design/scheduler-trace.md): what created it, the control
+    // its static subscription parks at, and that subscription's list, which the IR's wait events
+    // give and the buckets do not.
+    struct TraceRow {
+        llvm::Constant* origin = nullptr;
+        llvm::Constant* ctl    = nullptr;
+        llvm::Constant* list   = nullptr;
+        uint32_t        n      = 0;
+    };
+    std::vector<TraceRow>                     trace_rows;
+    std::vector<std::vector<llvm::Constant*>> trace_entries(procs.size());
+    auto* const                               trace_entry_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i64 });
 
     // Schedule groups with an always_comb / always_latch member start after every other
     // body. A fused group is ONE body, so a continuous assignment fused with such a
@@ -518,6 +533,17 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         }
         row_of[g] = static_cast<uint32_t>(rows.size());
         rows.push_back(row);
+        if (trace_on()) {
+            // Where the group is: its process, resolved, or else the function the scheduler holds.
+            SourceText at = trace_process_text(p);
+            if (!resolve_) {
+                at.where = procs[g]->getName().str();
+            }
+            llvm::Module& root = root_env_->llmod;
+            trace_rows.push_back(TraceRow{ trace_control(root, RT_TRACE_ORG_PROCESS, at.where),
+                                           subscribed_statically(k) ? trace_control(root, RT_TRACE_CTL_STATIC, at.where)
+                                                                    : null_ptr });
+        }
     }
     if (rows.empty()) {
         return;
@@ -531,8 +557,9 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
     std::vector<bool>                         subscribed(procs.size(), false);
     std::vector<std::vector<llvm::Constant*>> slots_of(procs.size());
     struct EventSub {
-        uint32_t  row;
-        StaticSub sub;
+        uint32_t        row;
+        StaticSub       sub;
+        llvm::Constant* name = nullptr;
     };
     std::vector<EventSub> event_subs;
     for (const uint32_t k : sub_order_) {
@@ -546,11 +573,17 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         assert((!all[f].reactive_home || !design_uses_reactive_ || design_uses_reactive_cont_) &&
                "a continuous tag needs the continuous ring's strip");
         for (const WaitEvent& w : sched_[g].events) {
-            StaticSub s = plan_static_subscribe(w.signal, static_cast<uint32_t>(w.edge));
+            StaticSub       s    = plan_static_subscribe(w.signal, static_cast<uint32_t>(w.edge));
+            llvm::Constant* name = trace_on() ? trace_string(root_env_->llmod, mod_.signal(w.signal).name) : nullptr;
             if (s.is_event) {
-                event_subs.push_back({ row_of[g], s });
+                event_subs.push_back({ row_of[g], s, name });
             } else {
                 slots_of[g].push_back(s.slot);
+                if (trace_on()) {
+                    trace_entries[g].push_back(llvm::ConstantStruct::get(
+                      trace_entry_ty,
+                      { storage_address(slot_of(w.signal)), name, b_.getInt64(static_cast<uint32_t>(w.edge)) }));
+                }
             }
         }
     }
@@ -561,6 +594,43 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         }
         rows[row_of[g]].subs = static_cast<uint32_t>(slots_of[g].size());
         slots.insert(slots.end(), slots_of[g].begin(), slots_of[g].end());
+    }
+
+    // The trace's tables: one row per seed row, the list of each row's static subscription, and
+    // the name of the variable of each persistent event waiter.
+    auto* const           trace_row_ty   = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, ptr_ty, i32 });
+    llvm::GlobalVariable* trace_rows_gv  = nullptr;
+    llvm::GlobalVariable* trace_names_gv = nullptr;
+    if (trace_on()) {
+        for (const uint32_t g : order) {
+            if (row_of[g] == ~0u || trace_entries[g].empty()) {
+                continue;
+            }
+            auto* const arr = llvm::ArrayType::get(trace_entry_ty, trace_entries[g].size());
+            trace_rows[row_of[g]].list =
+              new llvm::GlobalVariable(root_env_->llmod, arr, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage,
+                                       llvm::ConstantArray::get(arr, trace_entries[g]), "clotho.trace.list");
+            trace_rows[row_of[g]].n = static_cast<uint32_t>(trace_entries[g].size());
+        }
+        std::vector<llvm::Constant*> v;
+        for (const TraceRow& r : trace_rows) {
+            v.push_back(llvm::ConstantStruct::get(
+              trace_row_ty, { r.origin, r.ctl, r.list != nullptr ? r.list : null_ptr, b_.getInt32(r.n) }));
+        }
+        auto* const arr = llvm::ArrayType::get(trace_row_ty, v.size());
+        trace_rows_gv   = new llvm::GlobalVariable(root_env_->llmod, arr, /*isConstant=*/true,
+                                                   llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(arr, v),
+                                                   "clotho.trace.rows");
+        if (!event_subs.empty()) {
+            std::vector<llvm::Constant*> names;
+            for (const EventSub& e : event_subs) {
+                names.push_back(e.name != nullptr ? e.name : null_ptr);
+            }
+            auto* const narr = llvm::ArrayType::get(ptr_ty, names.size());
+            trace_names_gv   = new llvm::GlobalVariable(root_env_->llmod, narr, /*isConstant=*/true,
+                                                        llvm::GlobalValue::PrivateLinkage,
+                                                        llvm::ConstantArray::get(narr, names), "clotho.trace.names");
+        }
     }
 
     // The tables.
@@ -631,9 +701,11 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             emit(b_, h);
             b_.CreateBr(done);
         };
-        arm(RingActive, "seed.active", [&](llvm::IRBuilder<>& b, llvm::Value* v) { emit_active_push(b, v); });
-        arm(RingReactive, "seed.reactive", [&](llvm::IRBuilder<>& b, llvm::Value* v) { emit_reactive_push(b, v); });
-        arm(RingCont, "seed.cont", [&](llvm::IRBuilder<>& b, llvm::Value* v) { emit_reactive_cont_push(b, v); });
+        // The checker sees a queued group as a wake of the activation the seed just created.
+        const auto seeded = [&](llvm::IRBuilder<>& b, llvm::Value* v) { emit_trace_wake(b, v, { .kind = RT_TRACE_SEED }); };
+        arm(RingActive, "seed.active", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v); emit_active_push(b, v); });
+        arm(RingReactive, "seed.reactive", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v); emit_reactive_push(b, v); });
+        arm(RingCont, "seed.cont", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v); emit_reactive_cont_push(b, v); });
         b_.SetInsertPoint(done);
     };
     const auto ring_of = [&](llvm::Value* kind) {
@@ -698,6 +770,14 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         h->addIncoming(tagged, thunk);
         h->addIncoming(made, coro);
         b_.CreateStore(h, handle_slot(i));
+        if (trace_rows_gv != nullptr) {
+            auto* const trow   = b_.CreateInBoundsGEP(trace_row_ty, trace_rows_gv, i);
+            const auto  tfield = [&](uint32_t f, llvm::Type* ty) {
+                return b_.CreateLoad(ty, b_.CreateStructGEP(trace_row_ty, trow, f));
+            };
+            emit_trace_seed_row(h, tfield(0, ptr_ty), tfield(1, ptr_ty), tfield(2, ptr_ty), tfield(3, i32),
+                                b_.CreateICmpEQ(ring_of(kind), b_.getInt32(RingNone)));
+        }
         // The time-zero settle run must evaluate every member.
         auto* const flag = block("seed.flag");
         auto* const next = block("seed.next");
@@ -779,6 +859,12 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             llvm::Value* wake = b_.CreateLoad(ptr_ty, row_field(row, 2));
             // A persistent subscription is never unlinked, so it needs no owner.
             emit_event_link(obj, node, sub_handle(row, kind), wake, /*record_owner=*/false);
+            if (trace_names_gv != nullptr) {
+                llvm::Value* group = b_.CreateLoad(ptr_ty, handle_slot(row));
+                llvm::Value* name  = b_.CreateLoad(
+                  ptr_ty, b_.CreateInBoundsGEP(trace_names_gv->getValueType(), trace_names_gv, { b_.getInt32(0), t }));
+                emit_trace_subscribe_event(group, obj, name);
+            }
         });
     }
     b_.CreateRetVoid();

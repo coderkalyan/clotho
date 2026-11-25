@@ -7,6 +7,7 @@
 // Simulation kernel: time wheel, run loop, processes, NBA and intra-assignment staging, finish.
 
 #include "Gc.h"
+#include "Trace.h"
 #include "RuntimeInternal.h"
 
 using namespace rt_internal;
@@ -613,7 +614,7 @@ namespace {
 
 // Why rt_wheel_advance refused to start the next time step, for rt_sim_run to tell
 // the ways a run ends from outside the design apart.
-enum class Halt : uint8_t { None, StopTime, Interrupt };
+enum class Halt : uint8_t { None, StopTime, Interrupt, Trace };
 
 Halt g_halt = Halt::None;
 
@@ -659,6 +660,19 @@ extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
             return 0;
         }
     }
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The scheduler trace's checker found a violation (docs/design/scheduler-trace.md): the
+    // run ends here, before any consequence of it, without the finals.
+    if (rt_trace_halted() != 0) [[unlikely]] {
+        g_halt = Halt::Trace;
+        return 0;
+    }
+    // Time moves to the next tick before the timers of that tick fire, so the checker knows the
+    // time a timer wake happens at. An idle wheel moves to no tick.
+    if (const uint64_t next = w.next_tick(); !w.empty()) {
+        rt_trace_slot(next);
+    }
+#endif
     return w.advance(ctx) ? 1 : 0;
 }
 namespace rt_internal {
@@ -1106,6 +1120,32 @@ int32_t g_run_status = 0;
 // reports for a process that SIGINT killed.
 constexpr int32_t kInterruptedStatus = 130;
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+// The exit status of a run the scheduler trace's checker ended (docs/design/scheduler-trace.md):
+// its own, so that a script tells it from a design's `$fatal` (1) and from an interrupt.
+constexpr int32_t kTraceViolationStatus = 99;
+
+// What the checker found, on stderr after the design's own output, and in the file
+// CLOTHO_TRACE_REPORT names, which the test runner's child processes use to hand it to their
+// parent. It is a Clotho bug or a rule that needs rewording, never a property of the design.
+void report_trace_violation() {
+    const char* const rule = rt_trace_rule();
+    if (rule == nullptr) {
+        return;
+    }
+    std::fflush(stdout);
+    std::fputs("clotho: scheduler trace violation:\n", stderr);
+    std::fputs(rt_trace_report(), stderr);
+    std::fflush(stderr);
+    if (const char* const path = std::getenv("CLOTHO_TRACE_REPORT"); path != nullptr && path[0] != '\0') {
+        if (std::FILE* const file = std::fopen(path, "w")) {
+            std::fprintf(file, "%s\n%s", rule, rt_trace_report());
+            std::fclose(file);
+        }
+    }
+}
+#endif
+
 } // namespace
 
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
@@ -1132,9 +1172,17 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // The drain stopped at a time-step boundary, so the design's state is settled
     // and the dump has every step that ran, whichever way it ended.
     const Halt halt = g_halt;
+#ifdef CLOTHO_EXTRA_ASSERTS
+    const bool traced_early = rt_trace_halted() != 0;
+#else
+    const bool traced_early = false;
+#endif
     if (halt == Halt::Interrupt) {
         // The user asked for the run to end, not for it to wrap up: no finals.
         report_halt("clotho: interrupted at ");
+    } else if (traced_early) {
+        // The checker ended the run at a violation: the design is not in a state the finals
+        // could be asked to observe.
     } else {
         if (halt == Halt::StopTime) {
             // As a $finish at the stop time would, the finals follow the report.
@@ -1142,6 +1190,15 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
         }
         finals(state, wheel);
     }
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // A final block is a trace too, so the checker is asked again.
+    const bool traced = rt_trace_halted() != 0;
+    if (traced) {
+        report_trace_violation();
+    }
+#else
+    const bool traced = false;
+#endif
     rt_gc_run_leave();
     // Functional coverage (LRM 19.9: the database is written "at the end of a
     // simulation run"). Here rather than from a synthesized `final` process
@@ -1151,12 +1208,17 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // covergroup writes nothing: rt_cover_report returns immediately on an empty
     // model. An interrupted run reports what it covered so far.
     rt_cover_report();
-    if (halt != Halt::None) {
+    if (halt != Halt::None || traced) {
         // The dump is closed by the drain; this is every other open file, which the
         // process would flush on exit but a host that keeps running would not.
         std::fflush(nullptr);
     }
     g_run_status = halt == Halt::Interrupt ? kInterruptedStatus : (g_fatal_seen ? 1 : 0);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (traced && halt != Halt::Interrupt) {
+        g_run_status = kTraceViolationStatus;
+    }
+#endif
     g_diag_wheel = nullptr;
     sim_teardown();
 }
@@ -1730,6 +1792,10 @@ extern "C" void rt_free(void* p) {
 
 // Defined last so every process-global it arms is in scope.
 int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void)) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Every activation of the last run is gone, and so is its violation.
+    rt_trace_begin();
+#endif
     g_plusargs.clear();
     g_plusargs.reserve(config->plusarg_count);
     for (uint32_t k = 0; k < config->plusarg_count; ++k) {

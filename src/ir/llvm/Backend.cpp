@@ -318,7 +318,7 @@ llvm::Value* Backend::id_value(Signal sig, IdFamily family, uint32_t id) {
     if (port_reachable(s)) {
         const uint32_t elem = port_of(s)->id[static_cast<uint32_t>(family)];
         if (elem != no_port_elem) {
-            return b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, elem));
+            return fixed_field_load(b_.getInt32Ty(), port_elem_ptr(s, elem));
         }
     }
     // The design-wide number of a signal of some instance is that instance's own:
