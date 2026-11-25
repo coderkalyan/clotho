@@ -2560,6 +2560,14 @@ struct Inst {
         // override when the update happens, not when the statement executes.
         // Appended at the end for the reason CoverQuery gives.
         StoreNbGated,
+        // The identity number of the object a class or event handle refers to
+        // (payload: unary -> the handle value), -> a definite 2-state 64-bit
+        // unsigned value, 0 for a null handle. It is what a handle formats as
+        // under an integral conversion: the number is assigned on first request
+        // and is the same in every run, which the object's address is not
+        // (runtime/Gc.h, rt_gc_identity). Appended at the end for the reason
+        // CoverQuery gives.
+        HandleIdentity,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2702,6 +2710,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
 
         case T::EventTrigger:
         case T::EventTriggered:
+        case T::HandleIdentity:
         case T::EventTriggerNb:
         case T::Load:
         case T::Bnot:

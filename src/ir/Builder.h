@@ -58,6 +58,8 @@ public:
     Index event_trigger(Index handle, SourceLoc loc);
     // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
     Index event_triggered(Index handle, SourceLoc loc);
+    // The identity number of the object a class or event handle refers to.
+    Index handle_identity(Index handle, SourceLoc loc);
     // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
     Index event_trigger_nb(Index handle, SourceLoc loc);
     // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.

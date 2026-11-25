@@ -2288,6 +2288,11 @@ void Backend::lower_inst(Index i) {
             set_value(i, lower_event_triggered(event_obj_of(must_of(p.unary))));
             return;
 
+        case Inst::Tag::HandleIdentity:
+            set_value(i, two_val(b_.CreateCall(
+                           gc_identity_fn(), { b_.CreateIntToPtr(cast(must_of(p.unary), 64, false), raw_ptr_ty()) })));
+            return;
+
         case Inst::Tag::Random: {
             // The PRNG draw is always known (no x/z): must == may, z == 0.
             llvm::Value* draw = b_.CreateCall(random_fn(), {});

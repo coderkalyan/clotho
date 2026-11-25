@@ -608,6 +608,7 @@ Ir Ir::rebased(HandleMapper& m) const {
             case T::Local:
             case T::EventTrigger:
             case T::EventTriggered:
+            case T::HandleIdentity:
             case T::EventTriggerNb:
             case T::Load:
             case T::Bnot:

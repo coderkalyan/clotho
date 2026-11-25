@@ -123,6 +123,10 @@ Index Builder::event_triggered(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::EventTriggered, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
+Index Builder::handle_identity(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::HandleIdentity, pay(&Inst::Payload::unary, handle) }, loc);
+}
+
 Index Builder::event_trigger_nb(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::EventTriggerNb, pay(&Inst::Payload::unary, handle) }, loc);
 }

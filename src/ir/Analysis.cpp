@@ -251,6 +251,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::HandleDeref:
         case Inst::Tag::ClassIsA:
         case Inst::Tag::ClassImplements:
+        case Inst::Tag::HandleIdentity:
         case Inst::Tag::IfaceRef:
         case Inst::Tag::InstPath:
         case Inst::Tag::IfaceSignal:
@@ -1779,6 +1780,7 @@ struct ValueSweep {
                 case Inst::Tag::EventTriggerNb:
                 case Inst::Tag::EventTriggerNbDelayed:
                 case Inst::Tag::EventTriggered:
+                case Inst::Tag::HandleIdentity:
                 case Inst::Tag::Clog2:
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
