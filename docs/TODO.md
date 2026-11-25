@@ -541,9 +541,9 @@ Milestones, in order; lower ones unblock higher ones:
     owning large associative arrays can fill memory before a collection runs.
   - [ ] **Covergroup instances are freed only at exit** (19.3) — an instance created in a loop
     is never reclaimed during the run.
-  - [ ] **A covergroup handle formats as its instance's address** (19.3) — `$display(cg)`
-    prints a number that differs between runs; an instance is not a collected object, so it
-    has no identity number.
+  - [ ] **A covergroup handle formats as its instance's address** — `$display(cg)` prints a
+    number that differs between runs; an instance is not a collected object, so it has no
+    identity number.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
