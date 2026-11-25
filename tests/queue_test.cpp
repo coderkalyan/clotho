@@ -2788,3 +2788,77 @@ TEST_CASE("a bounded input formal keeps the first N+1 elements of its actual") {
     CHECK(c.out == "33\n");
     CHECK(count_of_text(c.err, "argument 1' overflows") == 1);
 }
+
+// A `ref` formal aliases the variable, so the VARIABLE's bound governs every write through
+// it, though slang gives the formal an unbounded type (LRM 13.5.2; docs/LRM_NOTES.md, note
+// 6). The bound travels beside the reference, also through a ref passed on. Oracle: none
+// (iverilog cannot pass a queue by ref); expectations follow note 6 and the blocking rows
+// of "a bounded queue keeps its first N+1 elements on every write path".
+TEST_CASE("a ref formal bound to a bounded queue enforces the actual's bound") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int iq_t[$];
+            int qb[$:2];
+            int qu[$];
+            typedef struct { int pad; int q[$:1]; } s_t;
+            s_t st;
+            task automatic fill(ref iq_t q);
+                q.push_back(1); q.push_back(2); q.push_back(3); q.push_back(4);
+            endtask
+            function automatic void pf(ref iq_t q);
+                q.push_front(9);
+            endfunction
+            task automatic outer(ref iq_t q);
+                fill(q);
+            endtask
+            task automatic whole(ref iq_t q, input iq_t src);
+                q = src;
+            endtask
+            initial begin
+                iq_t src = '{5, 6, 7, 8, 9};
+                fill(qb);
+                $display("push %0d %0d %0d %0d", qb.size(), qb[0], qb[1], qb[2]);
+                pf(qb);
+                $display("front %0d %0d %0d %0d", qb.size(), qb[0], qb[1], qb[2]);
+                qb.delete();
+                outer(qb);
+                $display("passed on %0d", qb.size());
+                qb.delete();
+                whole(qb, src);
+                $display("whole %0d %0d", qb.size(), qb[2]);
+                fill(qu);
+                $display("unbounded %0d", qu.size());
+                fill(st.q);
+                $display("member %0d", st.q.size());
+            end
+        endmodule
+    )";
+    const Captured c = run_capture_both(src);
+    CHECK(c.out ==
+          "push 3 1 2 3\n"
+          "front 3 9 1 2\n"
+          "passed on 3\n"
+          "whole 3 7\n"
+          "unbounded 4\n"
+          "member 2\n");
+    // push_back(4) overflows once in each of: fill(qb), outer(qb); push_front once;
+    // whole once; the member (bound 1 holds 2) overflows on pushes 3 and 4: six in all.
+    CHECK(count_of_text(c.err, "warning: bounded queue") == 6);
+}
+
+// A declaration initializer that slang folds to a constant longer than the bound truncates
+// and reports ONE overflow with the whole literal's count, for the pattern and the
+// concatenation spelling alike. Oracle: iverilog 13 truncates the pattern to 1 2 3 and warns once.
+TEST_CASE("a folded initializer longer than a bounded queue warns once and truncates") {
+    constexpr std::string_view src = R"(
+        module m;
+            int qb[$:2] = '{1, 2, 3, 4, 5};
+            int qc[$:2] = {1, 2, 3, 4, 5};
+            initial $display("%0d %0d %0d %0d", qb.size(), qb[2], qc.size(), qc[2]);
+        endmodule
+    )";
+    const Captured c = run_capture_both(src);
+    CHECK(c.out == "3 3 3 3\n");
+    CHECK(count_of_text(c.err, "5 elements do not fit, it holds at most 3 ([$:2])") == 2);
+    CHECK(count_of_text(c.err, "warning: bounded queue") == 2);
+}

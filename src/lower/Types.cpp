@@ -778,9 +778,24 @@ void Lowerer::emit_const_seed(ir::Index                   lhs,
             // container or an aggregate would need a temp built per entry.
             fail("a constant queue of aggregate or container elements is not supported");
         }
-        b.queue_delete(lhs, lhs, /*has_idx=*/false, ty, l);
+        // A literal longer than a bounded queue holds is built whole in an unbounded temp and
+        // assigned once, so it reports one overflow with its full count (LRM_NOTES 6) rather
+        // than one per element past the bound.
+        const bool overflows = t.left != 0 && cv.queue()->size() > static_cast<size_t>(t.left) + 1;
+        ir::Ref    build_ty  = ty;
+        ir::Index  build     = lhs;
+        if (overflows) {
+            ir::Type unbounded = t;
+            unbounded.left     = 0;
+            build_ty           = module_.pool.put(ir::Item{ unbounded });
+            build              = make_arg_temp(build_ty, b, l);
+        }
+        b.queue_delete(build, build, /*has_idx=*/false, build_ty, l);
         for (const slang::ConstantValue& e : *cv.queue()) {
-            b.queue_push(lhs, b.constant(lower_constant(e, et), l), /*front=*/false, ty, l);
+            b.queue_push(build, b.constant(lower_constant(e, et), l), /*front=*/false, build_ty, l);
+        }
+        if (overflows) {
+            b.queue_copy(lhs, build, ty, l);
         }
         return;
     }
