@@ -161,9 +161,8 @@ rt_gc_stats run_stats(std::string_view source, const std::string& expected, bool
 // Construction, inheritance, virtual dispatch through a base handle, a handle
 // returned out of a subroutine and passed into another, and a down-cast that
 // reads the object's own class from field 0 (LRM 8.4/8.20, $cast at
-// ir/llvm/Inst.cpp, lower_inst). The GC word sits BELOW the vptr precisely so
-// none of this arithmetic moves (Gc.h:41-46) -- if it did, `who()` would
-// dispatch through the header and $cast would read the wrong display.
+// ir/llvm/Inst.cpp, lower_inst). The collector keeps nothing inside an object, so
+// none of this arithmetic has anything to step over (Gc.h).
 TEST_CASE("gc: identity - construction, inheritance, virtual dispatch, $cast") {
     constexpr std::string_view src = R"(
         module m;
@@ -1286,7 +1285,7 @@ TEST_CASE("gc: an object held only as an associative-array key survives") {
 // right. A walker that only recognises a whole-element handle (offset 0, the shape
 // of the four cases above) frees all four objects here; one that reads the handle
 // at the wrong offset within the image marks `seq` or the rt_string as if it were
-// a handle, which the object-start bitmap rejects, so it marks nothing.
+// a handle, which names no object, so it marks nothing.
 TEST_CASE("gc: objects reachable only from a queue of structs holding handles survive") {
     constexpr std::string_view src = R"(
         module m;
@@ -1658,8 +1657,8 @@ TEST_CASE("gc: an object held only inside a struct assoc KEY survives (offset 0)
 
 // The case a flag bit could never express, and the most valuable one in the set: the
 // handle is the SECOND leaf, at serialized offset 4 behind one `int`. Three distinct
-// bugs land here. A walk that only knows offset 0 marks the `int i` bytes, which the
-// object-start bitmap rejects, so it marks nothing. A walk off by one leaf reads the
+// bugs land here. A walk that only knows offset 0 marks the `int i` bytes, which
+// name no object, so it marks nothing. A walk off by one leaf reads the
 // wrong 8 bytes for the same result. A walk on STORAGE offsets reads the 8 bytes at
 // byte 8 -- the member's padded LLVM offset -- which run 4 past the end of a 12-byte
 // span.
@@ -2652,8 +2651,8 @@ TEST_CASE("gc: an object held only as an assoc KEY inside a promoted object surv
 // young collection's re-walk of that single remembered owner has to decode the handle
 // back out of the span at the offset the shape names. A walk that reads
 // offset 0 (the flag-bit shape) or offset 8 (the member's storage offset) marks
-// nothing, because the object-start bitmap rejects the `int i` bytes and the
-// past-the-end read alike. The int value store logs the owner here, so the barrier
+// nothing, because the `int i` bytes name no object and neither does the
+// past-the-end read. The int value store logs the owner here, so the barrier
 // beside the key write (ir/llvm/AssocArrays.cpp, assoc_elem_lvalue) is pinned by
 // the string-valued case at the end of this file instead.
 //
@@ -3282,25 +3281,22 @@ TEST_CASE("gc: old garbage survives young collections and is reclaimed by a full
     CHECK(fl.finalized >= 190u);
 }
 
-// Promotion is per OBJECT, reclamation is per LINE, and a 128-byte line holds four
-// of these objects (Gc.h:37-40): `Tiny` is an 8-byte header plus a vptr and an
-// int, 32 bytes once rounded to RT_GC_ALIGN. So the keeper necessarily shares its
-// line with objects that die immediately, and four same-shaped neighbours on each
-// side make that deterministic rather than lucky -- whichever of the four slots
-// the bump allocator hands the keeper, at least one other slot in the same line
-// holds a dead Junk.
+// Promotion is per object and so is reclamation, at the 16-byte granule: `Tiny` is a
+// vptr and an int, one granule. So the keeper sits between objects that die
+// immediately, four same-shaped neighbours on each side, and every granule around
+// it is freed and handed out again while it lives.
 //
-// This is the first hazard at Gc.h:87-91. A young collection does not mark the
-// promoted keeper, so its line's mark does not equal the epoch and the line looks
-// free by the ordinary rule; only the per-line `line_old` record says otherwise.
-// A collector missing it hands the line to the filler, which writes 0x5A5A5A5A
-// over the keeper's own field -- 1515870810 instead of 42, in the same line, at
-// the same alignment, with no allocator misbehaviour anywhere.
+// A young collection does not mark the promoted keeper again. The mark it already
+// carries is all that keeps the sweep from freeing it with its neighbours, and all
+// that keeps the allocator off its granule: a collector that swept an old object in
+// a young collection hands the granule to the filler, which writes 0x5A5A5A5A over
+// the keeper's own field -- 1515870810 instead of 42, at the same address, with no
+// allocator misbehaviour anywhere.
 //
-// No `string` property here, deliberately: 32 bytes is the whole point of the
-// case, and an rt_string is 32 on its own. That costs the ASan half of §2's
-// device, so this case's only signal is the value.
-TEST_CASE("gc: a promoted object sharing a line with dead young objects survives") {
+// No `string` property here, deliberately: one granule is the whole point of the
+// case. That costs the ASan half of §2's device, so this case's only signal is the
+// value.
+TEST_CASE("gc: a promoted object between dead young objects survives") {
     constexpr std::string_view src = R"(
         module m;
             class Tiny; int v; endclass
@@ -3940,20 +3936,17 @@ TEST_CASE("gc: a subroutine's strings give their buffers back at every exit") {
     CHECK(st.owned_bytes == 0u);
 }
 
-// A dead OLD object that shares a line with a survivor is left behind by line-granular
-// reclamation, and used to keep a stale mark: the single full-collection parity read it
-// as live again two full collections later, and rt_gc_verify's heap walk (an
-// extra-asserts build) found the disagreement. Full collections now retire such corpses
-// -- the start bit goes -- so nothing can resolve to one.
+// An OLD object that dies beside a survivor is freed by the next full collection and
+// stays freed: a full collection clears every mark before it marks, so nothing is
+// read as live on the strength of a mark an earlier collection left.
 //
-// The cadence is pinned because the failure needs three FULL collections after the death:
-// `drop` and `keep` are allocated side by side (one line), both survive the first full
-// collection (promoted, stamped with the parity P), `drop` dies, the second full leaves
-// it as a corpse with the stale P, and the third full toggles back to P and reads it
-// marked. Without the fix this design fails the heap walk of a Debug / CLOTHO_EXTRA_ASSERTS
-// build ("the heap walk disagrees on live objects"); a release build has no walk, so there
-// it checks the output and the collection counts.
-TEST_CASE("gc: a dead object sharing a line with a survivor is not read as live later") {
+// The cadence is pinned at three FULL collections after the death, which is what a
+// stale mark needs to be read again: `drop` and `keep` are allocated side by side,
+// both survive the first full collection, `drop` dies, and each later full collection
+// must count `keep` without it. An extra-asserts build checks that count against a
+// walk of the heap ("the heap walk disagrees on live objects"); a release build has
+// no walk, so there it checks the output and the collection counts.
+TEST_CASE("gc: a dead object beside a survivor is not read as live later") {
     constexpr std::string_view src = R"(
         module t;
           class C; int v; endclass
@@ -4208,7 +4201,7 @@ TEST_CASE("gc: handles held by a clocking block's drive and sample state survive
           Junk sink;
           function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
           task automatic churn();
-            for (int i = 0; i < 3000; i++) begin
+            for (int i = 0; i < 6000; i++) begin
               sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
             end
           endtask

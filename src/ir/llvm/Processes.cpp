@@ -778,7 +778,7 @@ void Backend::emit_proc_state(uint32_t from, uint32_t to) {
 // handles with a bare icmp (docs/design/process-class.md §5.1).
 //
 // The object is a collected class body like any other (§4.2): the allocator returns
-// the handle with the body zeroed and the GC word written, FINALIZE included, and its
+// the handle with the body zeroed and its metadata written, FINALIZE included, and its
 // finalizer (class_finalizer_fn) drops the reference the object takes on the block
 // below and clears the memo. The memo is weak -- a PCB is native storage the collector
 // never scans -- so a handle the program drops lets the object die.

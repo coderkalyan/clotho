@@ -1418,15 +1418,14 @@ llvm::StructType* Backend::gc_frame_ty() {
     return gc_frame_ty_;
 }
 
-// rt_gc_mutator (Gc.h:163-182): { ptr cursor, ptr limit, i64 budget_left,
-// i32 block_index, i32 request, ptr block_base, ptr start_bitmap,
-// ptr fin_bitmap, ptr frames_head }.
+// rt_gc_mutator (Gc.h): { ptr cursor, ptr limit, i64 budget_left, i32 reserved,
+// i32 request, ptr frames_head }.
 //
 // Mirrored because this one is an ADDRESSING contract, not just an argument
 // type, and since P2 it is the widest one in the file: generated code reads AND
 // WRITES these fields directly. `request` at every safepoint
-// (emit_gc_safepoint); `cursor` / `limit` / `block_base` / `start_bitmap` /
-// `fin_bitmap` at every inlined allocation (emit_gc_alloc_fast); `frames_head` at
+// (emit_gc_safepoint); `cursor` / `limit` at every inlined allocation
+// (emit_gc_alloc_fast); `frames_head` at
 // every coroutine ramp and cleanup (emit_gc_frame_link / emit_gc_frame_unlink).
 // So a field added, widened or reordered ahead of any of them silently moves the
 // bytes generated code touches -- and unlike the poll, the allocator's stores
@@ -1435,7 +1434,7 @@ llvm::StructType* Backend::gc_frame_ty() {
 // rt_gc_init catches exactly that: gc_mutator_request_offset() and
 // gc_mutator_bytes() below are handed over in rt_gc_config and compared against
 // the runtime's own offsetof and sizeof (Gc.h:196-203). The size check is what
-// makes the other eight offsets trustworthy: this mirror and the C struct are
+// makes the other offsets trustworthy: this mirror and the C struct are
 // both padding-free LP64 layouts, so agreeing on the total is agreeing on every
 // field boundary.
 llvm::StructType* Backend::gc_mutator_ty() {
@@ -1443,7 +1442,7 @@ llvm::StructType* Backend::gc_mutator_ty() {
         gc_mutator_ty_ = llvm::StructType::create(
           ctx_,
           { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-            raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() },
+            raw_ptr_ty() },
           "clotho.gcmutator");
     }
     return gc_mutator_ty_;
@@ -1544,7 +1543,7 @@ llvm::FunctionCallee Backend::gc_container_remove_fn() {
 
 // The out-of-line half of the inlined allocation fast path (Gc.h:243-253): the
 // current hole cannot satisfy the request, so the runtime refills and allocates,
-// and refreshes cursor / limit / block_base / start_bitmap / fin_bitmap. Reached
+// and refreshes cursor / limit. Reached
 // only on the cold edge emit_gc_alloc_fast branches to.
 llvm::FunctionCallee Backend::gc_alloc_slow_fn() {
     return rt_fn("rt_gc_alloc_slow", raw_ptr_ty(),

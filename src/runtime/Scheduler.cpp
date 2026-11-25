@@ -1249,8 +1249,7 @@ void* alloc_pool_chunk(size_t bytes) {
 // and every object on the chain is a root (event_gc_roots), so the collector does
 // not follow the link and `->> e` needs no write barrier.
 
-constexpr uint64_t kEventBytes =
-  (RT_GC_HEADER_BYTES + sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
+constexpr uint64_t kEventBytes = (sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
 constexpr rt_gc_map kEventMap = { kEventBytes, 0, 0, nullptr, nullptr, nullptr };
 
 // The descriptor: the map pointer, then the bytes that separate it from the word

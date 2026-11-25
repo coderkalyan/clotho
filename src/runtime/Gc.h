@@ -6,12 +6,11 @@
 
 // Garbage collection for SystemVerilog class objects (LRM 8.4).
 //
-// Design: docs/design/garbage-collection.md. An Immix-shaped mark-region heap
-// (32 KiB blocks of 128 B lines), traced precisely through the per-class map the
-// backend emits beside each class descriptor, rooted precisely in the design
-// state and conservatively in live coroutine frames. Non-moving in this phase;
-// the header reserves the forwarding and pin encodings so evacuation stays a
-// policy change rather than a redesign.
+// Design: docs/design/garbage-collection.md. A non-moving mark-sweep heap of
+// 4 MiB chunks cut into 32 KiB blocks, with one metadata byte beside the heap for
+// every 16-byte granule and no header in the object. Traced precisely through the
+// per-class map the backend emits beside each class descriptor, rooted precisely
+// in the design state and conservatively in live coroutine frames.
 //
 // Everything here is part of the JIT-callable C ABI, so the struct layouts below
 // are mirrored bit-for-bit by the backend (ir/llvm/RuntimeAbi.cpp, `gc_map_ty` /
@@ -38,93 +37,77 @@ struct rt_alloc_site;
 
 // -- Geometry -----------------------------------------------------------------
 //
-// Immix's experimentally-selected sizes (Blackburn & McKinley, PLDI 2008 §5): a
-// 128-byte line and a 32 KiB block. RT_GC_ALIGN is the object alignment: 16, not
-// the 64 rt_alloc gives, because rt_alloc's 64 exists for over-aligned coroutine
-// frame plane spills (runtime/Scheduler.cpp, rt_alloc) and would waste 62% of a 24-byte
-// transaction object.
-#define RT_GC_BLOCK_BYTES     32768u
-#define RT_GC_LINE_BYTES      128u
-#define RT_GC_LINES_PER_BLOCK (RT_GC_BLOCK_BYTES / RT_GC_LINE_BYTES)
-#define RT_GC_ALIGN           16u
-
-// Objects strictly above this go to the large-object space instead of a block.
-// Published rather than file-static in Gc.cpp because the INLINED allocation fast
-// path must skip them, so the backend needs the same number: three reasons for the
-// value, in decreasing weight -- a block-resident object this big leaves at most
-// three usable quarter-block holes behind and so fragments a block far out of
-// proportion to the space it uses; four of them exhaust a block, so the per-block
-// acquisition cost the block structure exists to amortise would be paid every
-// fourth allocation; and it keeps every block-resident object strictly inside one
-// block, which is the precondition all the line-mark and start-bitmap index
-// arithmetic relies on.
-#define RT_GC_LARGE_OBJECT_BYTES (RT_GC_BLOCK_BYTES / 4u)
-
-// The GC word sits BELOW the descriptor pointer: a handle points at the vptr, and
-// the header is at handle[-1]. That keeps class_header_words() == 1, every
-// property GEP index at `1 + declIndex`, and the `$cast` display arithmetic
-// (`4*depth - 64` off the vptr) untouched -- the same reason jl_taggedvalue_t
-// sits below a Julia object.
-#define RT_GC_HEADER_BYTES 8u
-
-// -- The GC word --------------------------------------------------------------
+// A granule is the unit of everything: an object starts on one, its size is a
+// whole number of them, and free space is found and reclaimed one at a time.
+// 16 bytes, not the 64 rt_alloc gives, because rt_alloc's 64 exists for
+// over-aligned coroutine frame plane spills (runtime/Scheduler.cpp, rt_alloc) and
+// would waste most of a 24-byte transaction object.
 //
-// bits 0-1  mark state, compared against the collector's current epoch value
-//           (1 or 2, toggled per collection) so a collection never has to clear
-//           marks. 0 is "never marked".
-// bit  2    PINNED    -- a conservative root reached this object; never move it.
-// bit  3    FINALIZE  -- this object is on the finalizable list.
-// bit  4    unused. An object's identity number is kept beside the heap, not here
-//           (rt_gc_identity).
-// bit  5    FORWARDED -- the payload holds a forwarding address (evacuation only;
-//                        never set while the collector is non-moving).
-// bits 9-63 payload   -- a forwarding address.
-#define RT_GC_MARK_MASK      0x3ull
-#define RT_GC_FLAG_PINNED    (1ull << 2)
-#define RT_GC_FLAG_FINALIZE  (1ull << 3)
-#define RT_GC_FLAG_FORWARDED (1ull << 5)
+// A chunk is what the heap grows and shrinks by. It is aligned to its own size,
+// so the chunk an address belongs to is the address with its low bits cleared,
+// and it carries the metadata of its own granules at a fixed offset, so that
+// metadata is found from an object's address by arithmetic alone.
+//
+// A block is what a mutator allocates from: it owns one at a time and bumps
+// through the free runs in it. No object crosses a block boundary.
+#define RT_GC_ALIGN       16u
+#define RT_GC_BLOCK_BYTES 32768u
+#define RT_GC_CHUNK_BYTES (4u << 20)
 
-// -- Generational bits (docs/design/garbage-collection.md §7) ------------------
+// An object larger than this gets a mapping of its own instead of a place in a
+// block. Published because the inlined allocation fast path must skip such an
+// object, so the backend needs the same number.
+#define RT_GC_LARGE_OBJECT_BYTES RT_GC_BLOCK_BYTES
+
+// -- The metadata byte --------------------------------------------------------
 //
-// Sticky mark bits, not a copied nursery: an object that survives a collection is
-// promoted in place by setting RT_GC_FLAG_OLD, and a young collection then treats
-// it as live-and-opaque. LOGGED says the object is already in the remembered set,
-// so the inlined write barrier can skip a cold call it has already made.
+// One byte per granule, at `chunk + RT_GC_META_OFFSET + granule index`, where the
+// chunk is the address rounded down to RT_GC_CHUNK_BYTES and the index is the
+// offset within it over RT_GC_ALIGN. Generated code computes exactly that at an
+// allocation and at a write barrier, so both numbers are ABI.
 //
-// Three places must respect OLD or they turn a young collection into a
-// use-after-free, and each is a separate assertion in Gc.cpp:
-//   * reclamation must not free a line that holds an OLD object, which is what the
-//     per-line `line_old` record exists for;
-//   * the finalizer sweep must not finalize an unmarked OLD object -- in a young
-//     collection unmarked does not mean dead;
-//   * the large-object sweep must not reclaim an unmarked OLD cell, same reason.
-// bit  6    OLD    -- survived a collection; a young collection treats it as
-//                     live-and-opaque and its lines are held by `line_old`.
-// bit  7    LOGGED -- already in the remembered set, so the inlined barrier can
-//                     skip a cold call it has already made.
-// bit  8    OMARK  -- reached by the current FULL collection, compared against a
-//                     parity that toggles only at full collections.
+//   0                    a free granule.
+//   START | flags        the first granule of an object.
+//   1 .. BACK_MAX        a later granule of an object: how many granules back its
+//                        first one is, or BACK_MAX when it is at least that far,
+//                        in which case the byte that far back says the rest.
 //
-// TWO mark bits, not one, and the reason is a bug this design already had once:
-// epoch parity is sound only while EVERY collection stamps EVERY live object. A
-// young collection deliberately skips OLD objects, so an old object's stored parity
-// can be arbitrarily stale -- and a stale value matches any fixed-length epoch
-// cycle, which made a FULL collection read a live object as already-marked, skip
-// marking its lines, and then unprotect them. Each bit is now stamped by every
-// collection of its own kind, which bounds each one's staleness to one such
-// collection. Julia's four states (CLEAN / MARKED / OLD / OLD_MARKED) exist for
-// exactly this reason.
-#define RT_GC_FLAG_OLD    (1ull << 6)
-#define RT_GC_FLAG_LOGGED (1ull << 7)
-#define RT_GC_FLAG_OMARK  (1ull << 8)
-#define RT_GC_PAYLOAD_SHIFT  9u
+// So an address inside an object leads to the object's start in a few steps
+// without reading the object, a sweep finds an object's extent the same way, and
+// a run of zero bytes is free space.
+//
+// The flags of an object:
+//   MARK      reached by a collection, and so OLD: an object is old once a
+//             collection has marked it, and this bit is the only record of
+//             either. A young collection leaves a marked object alone; a full
+//             collection clears every mark before it starts.
+//   LOGGED    already in the remembered set, so the write barrier's inline test
+//             skips a call it has already made.
+//   PINNED    reached from a conservative root during the collection now running.
+//   FINALIZE  the object's class has a finalizer that has not run.
+//
+// The chunk's first RT_GC_META_OFFSET bytes are its own record, the metadata
+// follows, and objects start RT_GC_CHUNK_PAYLOAD in. A large object's mapping is
+// laid out the same way with the object RT_GC_LARGE_PAYLOAD in, so its one
+// metadata byte is found by the same arithmetic.
+#define RT_GC_META_OFFSET   4096u
+#define RT_GC_META_START    0x80u
+#define RT_GC_META_MARK     0x01u
+#define RT_GC_META_LOGGED   0x02u
+#define RT_GC_META_PINNED   0x04u
+#define RT_GC_META_FINALIZE 0x08u
+#define RT_GC_META_BACK_MAX 127u
+#define RT_GC_CHUNK_PAYLOAD (9u * RT_GC_BLOCK_BYTES)
+#define RT_GC_LARGE_PAYLOAD 8192u
 
 // The write barrier's out-of-line half. Generated code tests
-// `(gcword & (OLD|LOGGED)) == OLD` inline at every store of a class handle into a
-// heap object and calls this only on the taken edge, so reaching here means an old
-// object has just acquired a reference that a young collection would otherwise
-// never look at. Idempotent: it sets LOGGED, so a hot object costs the call once
-// per collection cycle rather than once per store.
+// `(meta & (MARK|LOGGED)) == MARK` on the owner's metadata byte inline at every
+// store of a class handle into a heap object and calls this only on the taken
+// edge, so reaching here means an old object has just acquired a reference that a
+// young collection would otherwise never look at. It makes the same test itself,
+// so a caller without the inline half may call it for any object. Idempotent: it
+// sets LOGGED, so a hot object costs the call once per collection cycle rather
+// than once per store.
 //
 // Design state, statics and frame locals need NO barrier -- they are scanned in
 // full at every collection, young or not -- so this is emitted only for a store
@@ -138,9 +121,9 @@ void rt_gc_remember(void* obj);
 // constant negative offset from it (rt_gc_map_vptr_offset(), asserted against the
 // backend's own computation at rt_gc_init).
 //
-// `size` covers the header: RT_GC_HEADER_BYTES + the body's alloc size, rounded
-// up to RT_GC_ALIGN. Offsets in `handles` and `leaves` are from the HANDLE (the
-// body base), not from the header, so they are exactly the byte offsets
+// `size` is the body's alloc size rounded up to RT_GC_ALIGN: an object is its body
+// and nothing else. Offsets in `handles` and `leaves` are from the handle, which
+// is the object's first byte, so they are exactly the byte offsets
 // getStructLayout() reports for class_body_ty.
 //
 // `leaves` describes the class's managed properties (string / dynarr / queue /
@@ -212,10 +195,9 @@ typedef struct rt_gc_frame {
 // foreclose it. Under one mutator rt_gc_mutator_current() returns the same
 // pointer forever and the indirection folds away.
 //
-// `cursor` / `limit` are the bump range inside the mutator's current block hole.
-// The inlined allocation fast path (a later phase) loads them at these offsets;
-// today the allocation slow path owns them and generated code only calls
-// rt_gc_alloc.
+// `cursor` / `limit` are the bump range inside the mutator's current free run.
+// Generated code bumps the cursor inline and reaches the runtime only when the run
+// cannot hold the object.
 //
 // `request` is polled INLINE by generated code at every safepoint -- a load, a
 // test and a not-taken branch, no call. Measured before that: one out-of-line
@@ -227,20 +209,10 @@ typedef struct rt_gc_mutator {
     uint8_t*             cursor;
     uint8_t*             limit;
     uint64_t             budget_left;
-    uint32_t             block_index;
+    uint32_t             reserved;
     uint32_t             request;
-    // Cached so the INLINED allocation fast path needs no address arithmetic
-    // beyond this struct: the object-start bit of an address is
-    // `((addr - block_base) >> 4)` in `start_bitmap`, and the finalizable bit is
-    // the same index in `fin_bitmap`. The slow path refreshes all three whenever
-    // it hands out a new hole, so a fast-path allocation can never index the wrong
-    // block's metadata.
-    uint8_t*             block_base;
-    uint8_t*             start_bitmap;
-    uint8_t*             fin_bitmap;
-    // The coroutine frame registry head, moved here from a file-static so the
-    // link/unlink pair can be inlined too, and so it becomes per-mutator for free
-    // when simulation goes multi-threaded (§6.2).
+    // The coroutine frame registry head, here so the link/unlink pair can be
+    // inlined, and so it is per-mutator when simulation goes multi-threaded (§6.2).
     struct rt_gc_frame*  frames_head;
 } rt_gc_mutator;
 
@@ -277,7 +249,7 @@ typedef struct rt_gc_config {
     int32_t  mutator_bytes;
     // One full collection per `full_every` collections; 0 lets the runtime choose
     // by heap growth. A full collection is the only thing that reclaims old
-    // garbage or re-derives which lines hold old survivors (§7).
+    // garbage (§7).
     int32_t  full_every;
     int32_t  reserved;
 } rt_gc_config;
@@ -297,19 +269,18 @@ int32_t rt_gc_map_vptr_offset(void);
 
 rt_gc_mutator* rt_gc_mutator_current(void);
 
-// Allocate an object of `size` bytes INCLUDING the header (i.e. map->size) and
-// return the HANDLE -- the body base, one word above the header. Zeroes the body
-// (2-state leaves and handle properties power on 0 / null, LRM Table 7-1), writes
-// the GC word, and records the object as finalizable when map->finalize is
-// non-null. Never returns null: an unsatisfiable request takes the runtime's
-// located-fatal path, matching rt_alloc's contract at the ClassNew site
-// (ir/llvm/Inst.cpp elides the null guard on a fresh handle). `site` names the
-// statement for that fatal and is null where there is none.
+// Allocate an object of `size` bytes (map->size) and return its handle, which is
+// its first byte. Zeroes the body (2-state leaves and handle properties power on
+// 0 / null, LRM Table 7-1), writes the object's metadata bytes, and records it as
+// finalizable when map->finalize is non-null. Never returns null: an
+// unsatisfiable request takes the runtime's located-fatal path, matching
+// rt_alloc's contract at the ClassNew site (ir/llvm/Inst.cpp elides the null
+// guard on a fresh handle). `site` names the statement for that fatal and is null
+// where there is none.
 //
-// Generated code INLINES the bump-and-mark sequence against the mutator fields
-// above and reaches the runtime only when the current hole cannot satisfy the
-// request, so in a collected run this entry point serves large objects, the
-// runtime's own callers and the tests.
+// Generated code INLINES the bump and the metadata stores and reaches the runtime
+// only when the current free run cannot hold the object, so in a collected run
+// this entry point serves large objects, the runtime's own callers and the tests.
 //
 // This is also where a collection can happen in the middle of the design: when
 // the budget has been exceeded by a large factor with no safepoint reached, the
@@ -329,12 +300,12 @@ void* rt_gc_alloc(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
 // ceiling without a collection ends the run.
 void* rt_gc_alloc_held(uint64_t size, const rt_gc_map* map);
 
-// The out-of-line half of the inlined fast path: the current hole is exhausted,
-// so refill (next hole, then a recycled or fresh block, then a new chunk) and
-// allocate. Refreshing `cursor` / `limit` / `block_base` / `start_bitmap` /
-// `fin_bitmap` is this function's job, and the nursery budget is charged HERE, per
-// hole handed out, rather than per object -- which is what keeps the fast path free
-// of budget arithmetic while leaving the accounting exact in bytes made available.
+// The out-of-line half of the inlined fast path: the current free run cannot hold
+// the object, so find another (the next run in this block, then a block with
+// room, then a new chunk) and allocate. Refreshing `cursor` / `limit` is this
+// function's job, and the nursery budget is charged HERE, per run handed out,
+// rather than per object -- which is what keeps the fast path free of budget
+// arithmetic while leaving the accounting exact in bytes made available.
 void* rt_gc_alloc_slow(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map,
                        const struct rt_alloc_site* site);
 
@@ -426,10 +397,11 @@ void rt_gc_container_remove(void* handle);
 #define RT_GC_REASON_EMERGENCY 3u
 
 // Collection KIND, orthogonal to the reason above. A young collection marks from
-// the roots plus the remembered set and treats an OLD object as live without
-// tracing into it; a full collection traces everything and re-derives which lines
-// hold old survivors. Old garbage therefore accumulates until the next full
-// collection, which is the generational trade and is why `full_every` exists.
+// the roots plus the remembered set, treats an OLD object as live without tracing
+// into it, and sweeps only the blocks allocated from since the last collection; a
+// full collection clears every mark, traces everything and sweeps everything. Old
+// garbage therefore accumulates until the next full collection, which is the
+// generational trade and is why `full_every` exists.
 #define RT_GC_KIND_YOUNG 0u
 #define RT_GC_KIND_FULL  1u
 
@@ -452,11 +424,11 @@ void rt_gc_safepoint_slow(void);
 // Equivalent to `if (rt_gc_mutator_current()->request) rt_gc_safepoint_slow();`.
 void rt_gc_safepoint(void);
 
-// Stop-the-world mark-region collection. Marks from the precise global tables,
-// the conservative frame registry and the conservative runtime ranges; runs the
-// finalizers of unreachable objects; then reclaims free lines and recycles empty
-// blocks. The mark phase is an explicit bounded worklist -- never recursion
-// (TigerStyle) -- because a testbench object graph is arbitrarily deep.
+// Stop-the-world mark and sweep. Marks from the precise global tables, the
+// conservative frame registry and the conservative runtime ranges; then sweeps,
+// which runs the finalizer of each unreachable object and frees its granules.
+// The mark phase is an explicit bounded worklist -- never recursion (TigerStyle)
+// -- because a testbench object graph is arbitrarily deep.
 void rt_gc_collect(uint32_t reason);
 
 // Bracket the span in which generated code runs under the scheduler: rt_sim_run
@@ -516,16 +488,20 @@ typedef struct rt_gc_stats {
     // Objects that held an identity number (rt_gc_identity) once the last
     // collection had forgotten the numbers of those it did not reach.
     uint64_t identities;
+    // Bytes the heap holds from the system right now: its chunks and the mappings of
+    // large objects. It falls when a full collection returns empty chunks and when
+    // a large object dies.
+    uint64_t heap_bytes;
 } rt_gc_stats;
 
 void rt_gc_get_stats(rt_gc_stats* out);
 
 // Resolve a candidate word to the handle of the object containing it, or null.
-// The validation predicate behind conservative scanning: the address must land in
-// a live block, be RT_GC_ALIGN-aligned once walked back, and have its
-// object-start bit set. Also resolves interior pointers, which is what makes a
-// `ref` into a class property (a raw interior pointer that passes no witness
-// chain, ir/llvm/StateLayout.cpp, ref_actual_arg) safe with no epoch machinery.
+// The validation predicate behind conservative scanning: the address must lie in
+// a chunk of the heap or in a large object's mapping, and its granule must belong
+// to an object. Also resolves interior pointers, which is what makes a `ref` into
+// a class property (a raw interior pointer that passes no witness chain,
+// ir/llvm/StateLayout.cpp, ref_actual_arg) safe with no epoch machinery.
 void* rt_gc_find_object(const void* addr);
 
 // The identity number of the object at `handle`: assigned by the first call for

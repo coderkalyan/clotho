@@ -1,7 +1,9 @@
 # Garbage collection (LRM 8.4)
 
 Status: **P0-P4 landed, and the collector is unconditional. Both tracks
-(evacuation, multi-mutator) remain the proposal (§12).** What runs today: the Immix-shaped heap
+(evacuation, multi-mutator) remain the proposal (§12).** The heap layout of §3.1 and
+§4 has since replaced the header word, line marks and bitmaps those phases describe.
+What runs today: a mark-region heap
 with an inlined bump-allocation fast path, the object model, precise global roots,
 precise container roots, conservative pinned coroutine-frame roots, per-class trace
 maps and finalizers, generational collection in place with an inlined write
@@ -161,9 +163,11 @@ reclaim it.
   store, and under multiple mutators those become atomic RMWs on shared objects —
   the worst possible scaling shape.
 
-- **Immix, not size-class pools.** Mark-region: 32 KiB blocks divided into 128 B
-  lines, bump allocation within a block, line-granularity reclamation
-  (Blackburn & McKinley, PLDI 2008). It is chosen because it is the one heap
+- **Immix, not size-class pools.** Mark-region: 32 KiB blocks, bump allocation
+  within a block, reclamation of free runs rather than cells
+  (Blackburn & McKinley, PLDI 2008, which divides a block into 128 B lines; the
+  heap as built reclaims at the 16-byte granule instead, §4.2).
+  It is chosen because it is the one heap
   organisation that does not force the moving/non-moving decision at design time:
   the same heap runs strictly non-moving, generationally in place (StickyImmix),
   or with opportunistic evacuation, as a *policy* setting. It also gets
@@ -210,10 +214,11 @@ reclaim it.
   scanned word-wise, every candidate validated against our own metadata, and hits
   are pinned.
 
-- **One extra header word, at offset −8.** Below the descriptor pointer, so
-  `class_header_words()` stays 1, every property GEP index stays `1 + declIndex`,
-  and `$cast`'s negative-offset display arithmetic (`ir/llvm/Inst.cpp, lower_inst`)
-  is untouched. This is `jl_taggedvalue_t`'s placement for the same reason.
+- **No header word.** What the collector records about an object lives in a
+  metadata byte beside the heap (§4.1), found from the object's address by
+  arithmetic. So `class_header_words()` stays 1, every property GEP index stays
+  `1 + declIndex`, `$cast`'s negative-offset display arithmetic
+  (`ir/llvm/Inst.cpp, lower_inst`) is untouched, and an object is 16-byte aligned.
 
 - **Finalize; do not re-own.** A collected object runs a per-class finalizer that
   is exactly the existing `emit_agg_deinit` walk. Managed buffers keep their
@@ -294,22 +299,32 @@ prerequisites for evacuation, and they are all fixable (§8):
 
 ## 3. Object model
 
-### 3.1 The GC word
+### 3.1 An object and its metadata
 
 ```
-        handle - 8   ┌──────────────────────────┐
-                     │ gcword : u64             │  state | pin | payload
-        handle + 0   ├──────────────────────────┤
+        handle + 0   ┌──────────────────────────┐
                      │ vptr   : ptr             │  → clotho.classdesc.<Ref>.slots[0]
         handle + 8   │ property 0 …             │
                      └──────────────────────────┘
 ```
 
-Low bits: mark/age state (`CLEAN` / `MARKED` / `OLD` / `OLD_MARKED`), `PINNED`,
-`FORWARDED`. The payload is empty except during an evacuating collection, when it
-holds a **forwarding address**.
+A handle is the address of the object's first byte, which is 16-byte aligned. The
+object's size is its body rounded up to 16 bytes, and comes from the class's trace
+map (§3.2). There is nothing before the body.
 
-**Identity numbers are not in the word.** An object used as an associative-array
+What the collector records about an object is in the metadata byte of its first
+granule (§4.1): that an object starts there, and four flags.
+
+- `MARK`. The only generation state: an object is old exactly when it is marked. A
+  young collection marks what it reaches and leaves a marked object alone; a full
+  collection clears every mark before it marks anything.
+- `LOGGED`. The remembered set holds the object (§7).
+- `PINNED`. A conservative root named the object in the collection now running. A
+  bit plus a side list of the pinned objects, cleared when the collection ends.
+- `FINALIZE`. The class has a finalizer, which the sweep runs when it frees the
+  object.
+
+**Identity numbers are not in the metadata either.** An object used as an associative-array
 key or formatted with an integral conversion needs a name that is not its address:
 key bytes are compared, hashed and sorted, output is diffed between runs, and
 neither may depend on where an object sits. That name is the object's identity
@@ -342,16 +357,8 @@ keys), against the same tree with the address in the key:
 A lookup converts once; a traversal step converts the current key to bytes and the
 next key back. The numbers are per operation of a loop that does nothing else.
 
-The vptr must *not* be overwritten by forwarding, because object size is derived
-from the type and is needed while sweeping. That is precisely why the GC word
-exists as a separate word rather than as stolen vptr bits, and it is a second
-reason not to steal them (the first: a mask on every virtual dispatch and every
-`$cast`).
-
-`PINNED` is a bit, not a count, plus a side list of pinned objects for the current
-collection — pins from conservative roots are collection-scoped and cleared at the
-end. Pins with lifetime (an outstanding `ref`, §5.3) use a small count in the
-payload's spare bits, asserted non-saturating.
+**Objects do not move.** There is no forwarding address and nowhere to put one;
+§8 records what evacuation would need.
 
 ### 3.2 The trace map
 
@@ -493,32 +500,62 @@ root table would trace foreign DPI pointers.
 
 ## 4. Heap
 
-### 4.1 Blocks, lines, and metadata
+### 4.1 Chunks, blocks and metadata
 
-- **32 KiB blocks, 128 B lines**, the paper's experimentally-selected sizes. Block
-  metadata (line mark bytes, hole count, a `has_young` flag) is off-heap and
-  block-aligned.
-- **Line marks are bytes, not bits**, and so are object mark states (in the GC
-  word). Parallel marking therefore needs no CAS and no atomics: two threads
-  racing to mark the same line or object write the same value. This is the single
-  cheapest MT accommodation available and it costs 0.8% of the heap.
-- **An object-start bitmap**, one bit per 8 bytes (1.6%), written only by the
-  owning mutator and block-aligned so no two mutators share a bitmap word. It
-  serves four purposes: validating conservative candidate words, resolving
-  interior pointers to object starts, heap parsability for the verify mode, and
-  the sweep cursor.
+- **4 MiB chunks, aligned to 4 MiB.** A chunk is one mapping: a record page, the
+  metadata for the whole chunk, then 119 blocks of 32 KiB. Because a chunk is
+  aligned, the chunk an address belongs to is the address with its low 22 bits
+  cleared, and nothing is searched to find it.
+- **One metadata byte per 16-byte granule**, at `chunk + 4096 + (offset >> 4)`:
+  6.25% of the heap. The byte is 0 for a free granule, has its top bit set with
+  the object's flags (§3.1) for the first granule of an object, and otherwise
+  holds the distance back to the object's first granule, capped at 127 so that a
+  long object is walked in hops. An interior pointer therefore resolves to its
+  object in one load for an object up to 2 KiB and a few for a larger one.
+- **A table of chunks** (a hash map keyed by `address >> 22`, behind a lowest
+  and highest heap address) says whether an address is in the heap at all. Only
+  the conservative scan and `rt_gc_find_object` consult it: generated code and
+  the marker reach metadata from an object they already know to be one.
+- **Marks are bytes, not bits.** Parallel marking therefore needs no CAS and no
+  atomics for the mark itself: two threads racing to mark an object write the
+  same value.
 - **Alignment 16, not 64.** The 64-byte guarantee exists for coroutine frame plane
-  spills (`runtime/Scheduler.cpp, rt_alloc`) and is waste for objects. Frames keep
-  `rt_alloc`; objects get the Immix allocator.
-- **Large objects** (larger than a line, or larger than some fraction of a block)
-  go to a separate large-object space with the same GC word, never evacuated.
+  spills (`runtime/Scheduler.cpp, rt_alloc`) and is waste for objects.
+- **An object larger than a block** (32 KiB) has a mapping of its own, aligned as
+  a chunk is and entered in the same table, with the object at a fixed offset so
+  that the same arithmetic finds its metadata byte. The mapping goes back to the
+  system when the object dies.
 
 ### 4.2 Reclamation
 
-Line-granularity: a collection marks lines, and reclamation threads free *holes*
-(runs of unmarked lines) rather than individual cells, which is what makes sweep
-cost independent of the number of dead objects. Blocks with no marked line are
-recycled whole. Sweeping is lazy — a mutator sweeps a block when it acquires it.
+A sweep walks a block's metadata from object to object. A marked object stays; an
+unmarked one has its finalizer run if it owes one, and then its metadata bytes are
+zeroed. That is all freeing is: the allocator finds free space as runs of zero
+metadata bytes, and uses any run the request fits in. No object is read except to
+be finalized.
+
+The sweep reads the metadata eight granules to a word. A block in which nothing is
+marked, the usual end of a block of short-lived objects, is freed whole: its
+finalizers are run if any object owes one, and its metadata is zeroed in one go.
+Only a block that keeps something is walked object by object.
+
+A young collection sweeps only the blocks allocated from since the last collection
+and the large objects allocated since then, because nothing else can hold an
+unmarked object. A full collection sweeps every block that is not wholly free. So
+a young collection's sweep costs what was allocated, not the size of the heap.
+
+The sweep leaves each block it visits wholly free, full, or partial with its longest
+free run recorded. Partial blocks are listed by that run's length, one list per
+power of two, so an allocation that needs a block takes one whose run is known to
+fit without searching: a partial block first, a free block only when no partial one
+is certain to fit. A block in the class just below the request may fit and is
+passed over; it serves smaller requests.
+
+A full collection leaves the heap as many free blocks as were allocated from since
+the last collection, and never fewer than one allocation budget's worth: what the
+next cycle will want again. A chunk with no object beyond that goes back to the
+system. So a design allocating at a steady rate keeps its chunks, and one whose
+live set has shrunk returns the difference at its next full collection.
 
 ### 4.3 The allocation fast path
 
@@ -534,7 +571,7 @@ almost every `new` site because `getTypeAllocSize` is known at codegen.
 br %fits, label %fast, label %refill
 fast:
 store ptr %next, ptr %mut.cursor
-; object-start bit, gcword, vptr stores follow
+; metadata bytes, zeroed body, vptr store follow
 ```
 
 The **mutator context pointer is the whole MT story of the allocator**. Under a
@@ -562,6 +599,42 @@ does not check (`ir/llvm/Inst.cpp, lower_inst` elides null guards on a fresh
 handle). The Immix allocator must preserve "never returns null" by taking the
 existing located-fatal path (`alloc_bytes`, `runtime/Reports.cpp`) after a
 collection fails to satisfy the request.
+
+### 4.4 What the layout costs
+
+Measured against the collector it replaced (an 8-byte header word, 128-byte line
+marks, object-start and finalizable bitmaps, large objects from 8 KiB in malloc'd
+cells), in the shipped configuration: Release, extra assertions off, default tier.
+Instructions are user-mode, per iteration, the least of three runs, from two runs
+of different lengths; time is CPU time for the longer run, the least of five, and
+includes about 0.1 s of compilation.
+
+| per iteration | before | after | time |
+|---|---|---|---|
+| allocate and drop a 24-byte-body object | 121 | 110 | 474 to 427 ms |
+| the same with a `string` property (a finalizer) | 306 | 237 | 665 to 547 ms |
+| the same beside 200,000 live objects | 215 | 150 | 395 to 295 ms |
+| replace a random element of two arrays of handles (20-byte and 100-byte bodies) | 457 | 395 | 2621 to 1262 ms |
+| two handle stores into an old object | 32 | 42 | 313 to 307 ms |
+| allocate and drop a 12 KiB object | 29.7k | 36.8k | 4269 to 4621 ms |
+| allocate and drop a 64 KiB object | 157.0k | 156.4k | 5025 to 15004 ms |
+
+What is behind the three that got worse:
+
+- **The barrier** finds the owner's metadata byte by arithmetic on its address,
+  where it used to load the word before the object: five instructions more per
+  handle store into an object.
+- **An object of 8 KiB to 32 KiB** is now in a block and allocated inline, where it
+  had a malloc'd cell. Its metadata is 1/16 of its size to write and to clear, and
+  what is left of a block after the last object that fits is unused until the next
+  collection sweeps the block: a 12 KiB object leaves a quarter of each block, an
+  object just over 16 KiB nearly half.
+- **A mapping per large object** costs about 50 microseconds to make and unmake:
+  the system calls, and a page fault for each page the object touches. A design
+  that allocates large objects at a high rate pays that for each one.
+
+Most of the instructions in the last two rows, before and after, are `memset` and
+`memcpy`, which in the simulator's binary are byte loops (`docs/TODO.md`).
 
 ---
 
@@ -619,8 +692,8 @@ mirroring `build_str_temps`, and prove the liveness analysis complete — is
 strictly more code with a use-after-free as its failure mode.
 
 Conservative here is much stronger than Boehm-style conservative, because every
-candidate word is validated against our own metadata: it must land in a live
-block, be 16-aligned, and have its object-start bit set. The same lookup resolves
+candidate word is validated against our own metadata: it must land in a mapped
+chunk and in a granule some object occupies. The same lookup resolves
 an *interior* pointer to its object start, which is what makes
 `ref`-into-a-class-property (F6) work with no epoch machinery at all.
 
@@ -888,7 +961,7 @@ coverage, objections) plus violent young churn. Re-marking the stable set every
 collection is the cost to avoid.
 
 - **Sticky mark bits (StickyImmix).** In-place generational: young collections
-  trace from roots plus the remembered set and stop at `OLD_MARKED` objects. The
+  trace from roots plus the remembered set and stop at marked objects. The
   paper introduces this variant explicitly "to support pinning", which is exactly
   the property §5.3 needs. Julia's MMTk configuration defaults to `StickyImmix`
   and Ruby's to Immix with a non-moving nursery; mmtk-core's own default is
@@ -896,16 +969,16 @@ collection is the cost to avoid.
   reachable from this heap organisation without redesign.
 - **Object remembering, not card marking.** This document specified an unconditional
   card store; the implementation is Julia-shaped object remembering, and the change
-  was right. A handle store into a heap object tests the *owner's* header inline —
-  `(gcword & (OLD|LOGGED)) == OLD` — and calls `rt_gc_remember` only on the taken
+  was right. A handle store into a heap object tests the *owner's* metadata byte inline —
+  `(meta & (MARK|LOGGED)) == MARK` — and calls `rt_gc_remember` only on the taken
   edge, which sets `LOGGED` so a hot object costs the call once per cycle rather
-  than once per store. Five IR instructions, cold-weighted, the same idiom as the
+  than once per store. A few IR instructions, cold-weighted, the same idiom as the
   safepoint poll and the null-handle check.
 
   The reason to prefer it here is the one the card-marking argument got backwards. A
   container's payload is not a GC object, so a card keyed on the *store's address*
   marks a card that no collection scans — the mutated container needs its OWNER
-  remembered, and the owner is exactly what the object-header test already has in
+  remembered, and the owner is exactly what the inline test already has in
   hand. `Runtime.h:874-877`'s licence to relocate elements by raw `memcpy` then
   needs no instrumenting either, for a better reason than a range mark: the owner is
   remembered, and tracing the owner walks the container wherever its elements have
@@ -914,9 +987,10 @@ collection is the cost to avoid.
   every collection. In the implementation this is structural rather than
   enumerated: the barrier is emitted from an lvalue field set only by `HandleDeref`,
   so an lvalue rooted in a signal or a frame slot cannot carry an owner to remember.
-- **Per-line age records** (`line_old`) let reclamation protect a line holding an old
-  survivor, re-derived at every full collection. That is what makes a young
-  collection able to skip the stable population without freeing it.
+- **The mark is the generation.** A young collection never frees a marked object
+  and sweeps only blocks allocated from since the last collection, which is what
+  lets it skip the stable population without freeing it. Old garbage accumulates
+  until a full collection clears the marks and sweeps everything.
 
 ### 7.1 Two use-after-free bugs the phase shipped with, and what they teach
 
@@ -961,6 +1035,12 @@ The distinction the code now makes explicitly: `is_marked_word` answers "may thi
 collection free the object", `is_stamped && !spared_by_age` answers "has this
 collection already been here". They are different questions and only the second is a
 dedup guard. One predicate for two questions was the actual mistake.
+
+Neither mechanism exists any more. A mark is one bit that a full collection clears
+before it marks, so there is no parity to go stale, and "old" and "marked" are the
+same bit, so there is one question left to ask of it. The remembered set traces its
+objects by a path of its own (`push_marked`) rather than through the test that
+refuses a marked object.
 
 ---
 
@@ -1034,7 +1114,7 @@ referenced only by its locals die at the next collection — which is also why
 `disable`'s raw-destroy paths must unlink (§5.1).
 
 **Named event handles.** An event object is the second collected family: it has
-this document's GC word and a trace map of its own, which the runtime owns
+metadata as any object has and a trace map of its own, which the runtime owns
 because only the runtime allocates one (`event-handles.md` §3.2, §9). An event
 handle is traced wherever a class handle is. Two things are particular to it:
 
@@ -1291,10 +1371,11 @@ it is four things:
   `-DCLOTHO_SANITIZE=ON`. Turns a latent missing root into a deterministic
   failure. Under evacuation, also *move every movable object at every collection*,
   which is the standard way to shake out stale-pointer bugs.
-- **Heap verify** — after marking, walk every block via the object-start bitmap
-  and assert each live object's descriptor is a known `clotho.classdesc`, its size
-  matches its type, its line marks are consistent, and every handle field points at
-  an allocated object start. Pair-assertion discipline
+- **Heap verify** — after a collection, walk every block through its metadata
+  bytes and assert that they parse as free granules and whole objects, that each
+  object's descriptor is a known `clotho.classdesc`, its extent matches its type,
+  its `FINALIZE` flag matches its class, every handle field points at an
+  object, and no unlogged old object holds a young one. Pair-assertion discipline
   (TigerStyle) applied to the heap. It walks the whole heap after every collection,
   2.3x slower on an allocation-heavy design, so it is built only with
   `CLOTHO_EXTRA_ASSERTS` (Debug and CI); shipped builds keep the per-object

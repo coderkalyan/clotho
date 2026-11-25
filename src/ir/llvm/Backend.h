@@ -1564,15 +1564,12 @@ private:
     // the mirror without renumbering here cannot compile to a plausible-looking
     // wrong offset.
     enum class GcMutField : unsigned {
-        Cursor      = 0,
-        Limit       = 1,
-        BudgetLeft  = 2,
-        BlockIndex  = 3,
-        Request     = 4,
-        BlockBase   = 5,
-        StartBitmap = 6,
-        FinBitmap   = 7,
-        FramesHead  = 8,
+        Cursor     = 0,
+        Limit      = 1,
+        BudgetLeft = 2,
+        Reserved   = 3,
+        Request    = 4,
+        FramesHead = 5,
     };
 
     int32_t gc_mutator_bytes();
@@ -3404,9 +3401,9 @@ private:
 
     bool gc_alloc_is_inline(Ref class_ref);
 
-    void emit_gc_bitmap_set(GcMutField f, llvm::Value* byi, llvm::Value* bit, const char* nm);
+    llvm::Value* emit_gc_meta_ptr(llvm::Value* obj, const char* nm);
 
-    void emit_gc_start_bits(llvm::Value* start, bool fin);
+    llvm::Constant* gc_meta_pattern(uint64_t granules, bool fin);
 
     // `site` is the allocation's rt_alloc_site global for the runtime's located fatal, or
     // null for an allocation that has no statement to name.
