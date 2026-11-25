@@ -2724,23 +2724,34 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     // the driven net is its left().
     const Expression& out =
       conns[0]->kind == ExpressionKind::Assignment ? conns[0]->as<AssignmentExpression>().left() : *conns[0];
-    // The terminal is a net_lvalue (LRM 28.10): a whole net, or a bit- or part-select
-    // of one, which drives its own region like any partial driver.
-    const ValueSymbol* root = lvalue_root(out);
+    // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
+    // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
+    const auto [ds0, ds1] = gi.getDriveStrength();
+    const uint8_t driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
+    lower_pull_terminal(out, up, driven, to_source_loc(gi.location));
+}
+
+// The terminal is a net_lvalue (LRM 28.10): a whole net, a bit- or part-select of one,
+// which drives its own region like any partial driver, or a concatenation of those,
+// whose every element is a net the source places its value on ("place a logic value 1
+// on the nets connected in its terminal list"), so each takes the pull.
+void Lowerer::lower_pull_terminal(const Expression& term, bool up, uint8_t level, ir::SourceLoc l) {
+    const Expression& e = unwrap_conversions(term);
+    if (e.kind == ExpressionKind::Concatenation) {
+        for (const Expression* op : e.as<ConcatenationExpression>().operands()) {
+            lower_pull_terminal(*op, up, level, l);
+        }
+        return;
+    }
+    const ValueSymbol* root = lvalue_root(e);
     if (root == nullptr) {
-        // TODO: pullup/pulldown on a concatenation target.
-        fail("pullup/pulldown on a concatenation target is not supported");
+        fail("pullup/pulldown target must be a net");
     }
     const ValueSymbol& sym = canonical_value_symbol(*root);
     if (sym.kind != SymbolKind::Net) {
         fail("pullup/pulldown target must be a net");
     }
-    // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
-    // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
-    const auto [ds0, ds1] = gi.getDriveStrength();
-    const uint8_t driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
-    emit_pull_driver(sym, is_whole_net_lvalue(out) ? nullptr : &out, up, driven, to_source_loc(gi.location),
-                     /*program_driver=*/false);
+    emit_pull_driver(sym, is_whole_net_lvalue(e) ? nullptr : &e, up, level, l, /*program_driver=*/false);
 }
 
 // A permanent driver of all ones (`up`) or all zeros on a net, or on the bits of it

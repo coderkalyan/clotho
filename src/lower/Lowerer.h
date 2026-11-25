@@ -2290,6 +2290,8 @@ private:
 
     void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up);
 
+    void lower_pull_terminal(const Expression& term, bool up, uint8_t level, ir::SourceLoc l);
+
     // `part` is the bit- or part-select of `net` a pullup / pulldown names, or null
     // for the whole net.
     void emit_pull_driver(const ValueSymbol& net,

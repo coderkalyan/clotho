@@ -662,6 +662,57 @@ TEST_CASE("pullup and pulldown on a bit or part select of a net") {
     CHECK(out == "0z10 0010 1\n0\n1\n");
 }
 
+// The terminal of a pullup / pulldown is a net_lvalue (LRM 28.10), so it may be a
+// concatenation, and each element is a net the source places its value on. Oracle:
+// iverilog 13 for a one-element concatenation and for one in an instance array
+// (`1 0 1 z1zz`, `1 0 011z`); it rejects a wider concatenation on a single instance
+// (width 3 against the terminal's 1), so that form is derived from the clause.
+TEST_CASE("pullup and pulldown on a concatenation of nets") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire a, b, c;
+          wire [3:0] w;
+          pullup ({a});
+          pulldown ({b});
+          pullup (strong1) ({c});
+          pullup ({w[2]});
+          wire a2, b2;
+          wire [3:0] w2;
+          pullup p[2:0] ({a2, w2[2:1]});
+          pulldown q[1:0] ({b2, w2[3]});
+          wire d, e, f;
+          wire [3:0] v;
+          pullup ({d, e});
+          pulldown ({v[1:0], f});
+          initial #1 begin
+            $display("%b %b %b %b", a, b, c, w);
+            $display("%b %b %b", a2, b2, w2);
+            $display("%b %b %b %b", d, e, f, v);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0 1 z1zz\n1 0 011z\n1 1 0 zz00\n");
+}
+
+// Each element of a concatenation takes the pull at its strength, so a stronger driver
+// of one element wins and a weaker one loses. LRM-derived (28.10, 28.11, 28.12):
+// iverilog 13 resolves a pull on a concatenation target against a stronger driver as x.
+TEST_CASE("a pull on a concatenation target folds by strength per element") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire a, b;
+          wire [3:0] w;
+          pullup ({a, w[3]});
+          assign w[3] = 1'b0;
+          assign (weak0, weak1) a = 1'b0;
+          pulldown (weak0) ({b});
+          assign b = 1'b1;
+          initial #1 $display("%b %b %b", a, b, w);
+        endmodule
+    )");
+    CHECK(out == "1 1 0zzz\n");
+}
+
 // A delayed partial driver of a resolved net powers up as x in its own bits and z
 // elsewhere, so the undriven bits fold as z (28.16, 10.3.3). Oracle: iverilog 13
 // (`1 10xx`, `6 1001`; the gate form `1 0x`, `4 01`).
