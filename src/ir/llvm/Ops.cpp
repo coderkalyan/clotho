@@ -1584,36 +1584,10 @@ Plane Backend::lower_agg_eq(const Guarded& lhs, const Guarded& rhs, Ref type, Ag
         return known(bit_plane(bit, bit), true);
     }
     if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
-        const DynElem e = dynarr_elem(type);
-        if (e.is_agg || e.is_handle || e.width > 64 || (cased && e.four_state)) {
-            // The runtime comparator reads one element word from a flat
-            // descriptor, which an aggregate / nested-container element does not
-            // have and a wider-than-a-word element does not fit, so the walk
-            // happens here: sizes must match, then each element pair compares with
-            // this same recursion (which is also what makes a queue of queues
-            // work). A case compare of 4-state elements walks too: the runtime
-            // comparator only answers the X-propagating question.
-            return known(emit_container_eq_loop(lhs, rhs, type, e, mode), true);
-        }
-        // A queue / dynamic-array leaf of scalar elements compares element-wise
-        // at runtime with §11.4.5 x-propagation; the runtime tristate (0 unequal,
-        // 1 equal, 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0,
-        // must = ts == 1, so 2 -> must=0/may=1 = x).
-        const ContainerFmt cf = container_fmt(type);
-        llvm::Value*       ts   = b_.CreateCall(container_eq_fn(),
-                                                { lv_handle_ptr(lhs, HandleUse::Read),
-                                                  lv_handle_ptr(rhs, HandleUse::Read),
-                                                  b_.getInt32(cf.is_queue),
-                                                  b_.getInt32(cf.kind),
-                                                  b_.getInt32(cf.width),
-                                                  b_.getInt32(cf.is_signed),
-                                                  b_.getInt32(cf.four),
-                                                  b_.getInt32(cf.has_z),
-                                                  b_.getInt32(cf.z_off),
-                                                  b_.getInt64(cf.stride) });
-        llvm::Value* may  = b_.CreateICmpNE(ts, b_.getInt8(0));
-        llvm::Value* must = b_.CreateICmpEQ(ts, b_.getInt8(1));
-        return known(bit_plane(must, may), true);
+        // Sizes, then each element pair through this same recursion; the one path
+        // for every element shape (a flat runtime comparator was no faster, so it
+        // is gone).
+        return known(emit_container_eq_loop(lhs, rhs, type, dynarr_elem(type), mode), true);
     }
     if (t.kind == Type::Kind::Assoc) {
         // Equal iff the same (key, value) set: keys exact, values by this same

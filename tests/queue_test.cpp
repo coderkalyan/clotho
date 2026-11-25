@@ -1010,7 +1010,7 @@ TEST_CASE("queue case-equality with a string element (LRM 11.2.2, 11.4.5)") {
 }
 
 // == of an unpacked struct with a queue member walks the member element-wise
-// (the AggEq leaf dispatch reaches rt_container_eq). Verified against verilator.
+// (the AggEq element walk). Verified against verilator.
 TEST_CASE("struct-with-queue-member equality") {
     constexpr std::string_view src = R"(
         module m;

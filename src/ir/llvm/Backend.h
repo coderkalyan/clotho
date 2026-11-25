@@ -1449,9 +1449,9 @@ private:
 
     uint64_t dynarr_stride(const DynElem& e);
 
-    // The %p / == runtime descriptor of a queue / dynamic-array container: the
+    // The %p runtime descriptor of a queue / dynamic-array container: the
     // element format facts (kind 0 int / 1 real / 2 string, plane layout) plus
-    // the container flavor. Shared by rt_container_format_p and rt_container_eq.
+    // the container flavor. Used by rt_container_format_p.
     struct ContainerFmt {
         int32_t  is_queue  = 0;
         int32_t  kind      = 0;

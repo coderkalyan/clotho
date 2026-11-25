@@ -1743,10 +1743,8 @@ TEST_CASE("array query functions (LRM 20.7): a non-integral associative key is r
 // P4a (docs/design/assoc-keys.md): whole-associative-array equality (LRM
 // 11.4.5 / 7.9) used to be silently wrong -- is_assoc was absent from the
 // aggregate-equality dispatch, so `a == b` fell through to the scalar plane
-// path and compared handle words instead of contents. Fixed by reusing the
-// P3 assoc-key canonical serializer (count || sorted (key, value) pairs) on
-// each whole operand and comparing bytes: two maps are equal iff they hold
-// the same set of entries.
+// path and compared handle words instead of contents. Two maps are equal iff
+// they hold the same set of entries (docs/design/aggregate-equality.md).
 TEST_CASE("assoc whole-array equality (P4a)") {
     SUBCASE("integral value: equal, then a value differs, then sizes differ") {
         constexpr std::string_view src = R"(
@@ -1792,8 +1790,8 @@ TEST_CASE("assoc whole-array equality (P4a)") {
                                   "eqempty=0\n"
                                   "botempty=1\n");
     }
-    // Case equality (===) is bit-exact, so it works even for a 4-state value
-    // element -- the flat byte compare IS the case-equality answer.
+    // Case equality (===) compares x/z as values, so it works for a 4-state
+    // value element.
     SUBCASE("case equality with a 4-state value element, including x/z") {
         constexpr std::string_view src = R"(
             module m;
@@ -1830,9 +1828,8 @@ TEST_CASE("assoc whole-array equality (P4a)") {
         )";
         CHECK(run_capture(src) == "num=2\nget=1\n");
     }
-    // Logical equality with a 4-state-capable value element needs
-    // X-propagation a flat byte compare cannot give; refused loudly rather
-    // than silently answering wrong.
+    // Logical equality with a 4-state-capable value element is refused until the
+    // key-set-mismatch x rule is settled (docs/design/aggregate-equality.md).
     SUBCASE("logical equality with a 4-state value element is refused") {
         const LowerResult r = lower_text(R"(
             module m;

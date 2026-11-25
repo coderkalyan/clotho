@@ -1457,13 +1457,6 @@ void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t width, uint32_
                         uint32_t count, const char* const* names, const uint32_t* name_lens,
                         const uint32_t* widths, const uint32_t* signs, const rt_alloc_site* site);
 
-// Logical `==` of two queues / dynamic arrays (LRM 11.4.5): 0 unequal, 1 equal,
-// 2 ambiguous (1'bx). Params mirror rt_container_format_p; `!=` is the caller's
-// negation. Different sizes are a definite inequality.
-uint8_t rt_container_eq(const void* a, const void* b, int32_t is_queue, int32_t kind, uint32_t width,
-                        uint32_t is_signed, uint32_t four_state, uint32_t has_z, uint32_t z_off,
-                        uint64_t stride);
-
 // q.reverse() / q.sort() / q.rsort() (LRM 7.12.2). `kind` / `width` / `rev` match
 // the rt_dynarr_* ordering entry points; operates on the ring's logical order.
 void rt_queue_reverse(rt_queue* h, const rt_elem_ops* ops);

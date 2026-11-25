@@ -811,15 +811,6 @@ llvm::FunctionCallee Backend::tagged_fmt_p_fn() {
                    raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
-// i8 rt_container_eq(const void* a, const void* b, i32 is_queue, i32 kind, i32 width,
-//   i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
-llvm::FunctionCallee Backend::container_eq_fn() {
-    return rt_fn("rt_container_eq", b_.getInt8Ty(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                   b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                   b_.getInt64Ty() });
-}
-
 // -- Associative-array key scratch buffer (docs/design/assoc-keys.md P1) --
 
 // -- Variable-length associative-array key scratch (docs/design/

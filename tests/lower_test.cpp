@@ -743,8 +743,8 @@ TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
 }
 
 TEST_CASE("equality of a struct with a queue member lowers (element-wise walk)") {
-    // The AggEq leaf dispatch now reaches rt_container_eq for the queue member
-    // (runtime behavior pinned in queue_test.cpp); here just confirm it lowers.
+    // The queue member compares through the AggEq element walk (runtime behavior
+    // pinned in queue_test.cpp); here just confirm it lowers.
     const LowerResult r = lower_text(R"(
         module top;
             typedef struct { int q[$]; int x; } t;
