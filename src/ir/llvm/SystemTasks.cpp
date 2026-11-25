@@ -1228,17 +1228,25 @@ void Backend::lower_readmem(Index i) {
                            (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
                            (fname_is_str ? 16u : 0u) | (!s.four_state ? 32u : 0u);
 
-    b_.CreateCall(readmem_fn(),
-                  { path, path_len, mm_base, z_base, b_.getInt32(stride),
-                    b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
-                    b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+    llvm::Value* changed = b_.CreateCall(readmem_fn(),
+                                         { path, path_len, mm_base, z_base, b_.getInt32(stride),
+                                           b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
+                                           b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+    // A whole-memory load has no per-element edge facts: wake the memory's Any-edge
+    // readers when the load changed an element, as lower_fread_mem does.
+    if (!silent_stores_ && signal_has_waiters(info.target)) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* svc  = llvm::BasicBlock::Create(ctx_, "readmem.svc", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "readmem.cont", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(changed, b_.getInt32(0)), svc, cont);
+        b_.SetInsertPoint(svc);
+        service_any_waiters(info.target);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
     if (!silent_stores_) {
         vcd_touch_array(info.target);   // bulk write: mark the array for the dump
     }
-    // TODO: $readmem services no wait queues — a process already waiting on
-    // the memory sleeps through the load (pre-existing gap). rt_readmem would
-    // need a did-write result (it returns void) to gate an Any-edge wake the
-    // way lower_fread_mem does.
 }
 
 // The runtime rt_finishing byte, set once a $finish / $stop has been taken.

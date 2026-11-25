@@ -3583,6 +3583,38 @@ TEST_CASE("$readmemh loads a memory with @address and comments") {
     std::remove(path);
 }
 
+// A $readmem load is a write of the memory, so it wakes the memory's waiters: an
+// always_comb reading an element, an @ on an element and a level wait (LRM 9.4.2).
+// A load that changes nothing wakes nobody. Matches Icarus Verilog.
+TEST_CASE("$readmemh wakes the memory's waiters only when it changes it") {
+    const char* path = "clotho_readmem_wake_test.hex";
+    write_file(path, "11 22 33\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:2];
+            logic [7:0] y;
+            integer at0 = -1, again0 = -1, at2 = -1;
+            always_comb y = mem[1];
+            initial begin
+                @(mem[0]) at0 = $time;
+                @(mem[0]) again0 = $time;
+            end
+            initial begin
+                wait (mem[2] == 8'h33) at2 = $time;
+            end
+            initial begin
+                #5 $readmemh(")") + path + R"(", mem);
+                #1 $display("y=%h at0=%0d at2=%0d", y, at0, at2);
+                $readmemh(")" + path + R"(", mem);
+                #1 $display("again0=%0d", again0);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "y=22 at0=5 at2=5\nagain0=-1\n");
+    std::remove(path);
+}
+
 // $readmemb parses binary digits and x/z; a runtime-string filename (a reg holding
 // packed ASCII, the picorv32 pattern) resolves to the path at run time.
 TEST_CASE("$readmemb parses x/z and a runtime-string filename") {
