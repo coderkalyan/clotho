@@ -49,8 +49,6 @@ Milestones, in order; lower ones unblock higher ones:
   is not produced, so an ambiguous `?:` over an aggregate holding an unpacked union is refused.
 - [ ] **`?:` over a queue, dynamic array or associative array** (11.4.11) — an ambiguous
   condition needs both arms staged in container temps.
-- [ ] **Aggregate `==` over a struct with an associative-array member** — refused, and with it an
-  ambiguous `?:` over such a struct under a 4-state condition.
 - [ ] **`?:` over aggregates of a type distinct from the target's** (11.4.11, 6.22.2) — arms
   equivalent to, but interned differently from, the assignment target need a converting copy.
 
@@ -401,10 +399,8 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Dynamic-array, associative-array and string operations as linked bitcode (performance)**
   (7.5, 7.8, 6.16) — only a queue's push, pop, insert, delete and range append are linked into
   the design; the rest call the runtime through an interpreted element descriptor.
-- [ ] **`===` / `!==` over a container with a 4-state leaf** (11.4.5) — a 4-state integral, `real`
-  or associative-array leaf is refused.
 - [ ] **Logical `==` / `!=` over an associative array with a 4-state value element** (11.4.5) —
-  refused; X propagation differs from a byte compare.
+  refused at any nesting depth until the defining clause and x on a key-set mismatch are settled.
 - [ ] **Associative-array key mixing a class handle with a variable-width component** (7.8) — a
   `string`, queue, dynamic-array or associative-array component beside the handle is refused.
 - [ ] **Wildcard `[*]` index wider than 64 bits** (7.8.1) — an index expression (including a
