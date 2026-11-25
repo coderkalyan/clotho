@@ -267,8 +267,8 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     // they settle from declaration-initialized values. An `always @*` or an
     // explicit `@(...)` list is a plain sensitivity list that runs only when a
     // listed signal changes, matching Verilog, so it is left non-self-starting.
-    const bool self_start = !handle_loop && (sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
-                                             sym.procedureKind == ProceduralBlockKind::AlwaysLatch);
+    const bool self_start =
+      sym.procedureKind == ProceduralBlockKind::AlwaysComb || sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
     ir::Ir body_ir = b.finish();
     // A `final` block is zero-time (LRM 9.2.3): it must not suspend. slang
     // rejects a time-consuming statement in a `final` at elaboration, so this

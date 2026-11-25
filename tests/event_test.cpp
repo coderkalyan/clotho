@@ -2455,3 +2455,24 @@ TEST_CASE("always_comb adds nothing for a class property, handle included") {
     )");
     CHECK(out == "W 0\n");
 }
+
+// The time-zero run of an `always_comb` that reads a virtual-interface member is the
+// one LRM 9.2.2.2 fixes (LRM_NOTES 44), after every initial and always has run to its
+// first suspension -- not in the Inactive region a `#0` stands for. So an initial sees
+// the declaration value (x) before it and the settled one after `#0` and after an
+// `@(y)` armed at time zero, exactly as with an always_comb over a plain signal.
+TEST_CASE("always_comb over a virtual-interface member starts as a plain one does") {
+    const auto design = [](std::string_view decls, std::string_view read) {
+        return std::string("interface ifc; logic a = 1; endinterface\nmodule top;\n") + std::string(decls) +
+               "\n  always_comb y = " + std::string(read) +
+               ";\n  initial begin $display(\"first %b\", y); #0 $display(\"after #0 %b\", y); end\n"
+               "  initial begin @(y) $display(\"event %b at %0t\", y, $time); end\n"
+               "  initial begin @(y) #0 $display(\"event #0 %b\", y); end\n"
+               "endmodule\n";
+    };
+    const std::string vif   = run_capture(design("ifc i(); virtual ifc vif = i; logic y;", "vif.a"));
+    const std::string plain = run_capture(design("logic a = 1; logic y;", "a"));
+    CHECK(vif == plain);
+    CHECK(vif == "first x\nevent 1 at 0\nafter #0 1\nevent #0 1\n");
+}
+

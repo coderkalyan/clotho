@@ -801,12 +801,9 @@ void Lowerer::emit_inferred_park(const Statement& body, SensitivityMode mode, ir
 // that does its own waiting, because the process's static subscription cannot name a
 // member of whichever instance or object a handle names. `@*` waits first and runs
 // the body on each wake (LRM 9.4.2.2); `always_comb` runs it once at time zero and
-// then after each wake (9.2.2.2), the time-zero run following the other processes'
-// starts, which a `#0` gives (an ordinary process starts in source order).
+// then after each wake (9.2.2.2). The process is self-starting and starts late, so the
+// time-zero run is the one note 44 fixes: after every other process has started.
 void Lowerer::lower_inferred_loop(const Statement& body, bool comb, ir::Builder& b, ir::SourceLoc l) {
-    if (comb) {
-        b.unary(ir::Inst::Tag::Delay, b.constant(module_.pool.put_int(make_int_type(64, false), 0), l), l);
-    }
     b.open_region();
     const ir::Index      lpred = true_const(b, l);
     const ir::ExtraSlice lcond = b.close_region();

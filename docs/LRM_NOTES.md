@@ -763,6 +763,6 @@ on neither the member nor `obj`. A virtual interface is not a class object, so
 `always_comb` over `vif.a` waits on the member and on `vif`. A static property is a
 variable of the class, not a reference through an object, and keeps its own signal. A
 body that reads through a handle cannot be statically subscribed, so it waits in its
-own loop and an `always_comb` of that kind takes its time-zero run after a `#0`.
+own loop and an `always_comb` of that kind is self-starting and queued late, so its time-zero run is note 44's.
 
 Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it). No oracle parses these designs.
