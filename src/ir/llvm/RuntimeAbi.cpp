@@ -207,7 +207,7 @@ llvm::FunctionCallee Backend::wide_arith_fn(const char* name) {
 // out = base ** exp of definite operands in whole-word buffers; nonzero when the result is x.
 llvm::FunctionCallee Backend::pow_fn() {
     auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_pow", i32, { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
+    return rt_fn("rt_pow", i32, { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
 }
 
 // -- Null class-handle dereference (LRM 8.4) --
