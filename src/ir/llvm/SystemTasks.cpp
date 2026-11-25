@@ -356,9 +356,17 @@ void Backend::emit_finish_exit() {
             // end of the body does, so the resumer destroys the frame once.
             b_.CreateBr(leave_blocks(0, coro_final_bb_));
         } else {
-            // Thunk-elided process: a plain void body.
-            deinit_body_strings();
-            b_.CreateRetVoid();
+            // Thunk-elided process: a plain void body. A body has one of these
+            // exits per call that could reach a $finish, so they share a block.
+            llvm::Function* const fn = b_.GetInsertBlock()->getParent();
+            if (thunk_finish_bb_ == nullptr || thunk_finish_bb_->getParent() != fn) {
+                const llvm::IRBuilderBase::InsertPointGuard guard(b_);
+                thunk_finish_bb_ = llvm::BasicBlock::Create(ctx_, "finish.exit", fn);
+                b_.SetInsertPoint(thunk_finish_bb_);
+                deinit_body_strings();
+                b_.CreateRetVoid();
+            }
+            b_.CreateBr(thunk_finish_bb_);
         }
         return;
     }
@@ -367,15 +375,10 @@ void Backend::emit_finish_exit() {
         b_.CreateBr(leave_blocks(0, task_epilogue_bb_));
         return;
     }
-    // Function: no shared epilogue, so return here. The result is dead — the
-    // caller tests rt_finishing and leaves without reading it — so a poison
-    // value is the honest thing to hand back.
-    deinit_body_strings();
-    if (fn_->getReturnType()->isVoidTy()) {
-        b_.CreateRetVoid();
-    } else {
-        b_.CreateRet(llvm::PoisonValue::get(fn_->getReturnType()));
-    }
+    // Function: its epilogue past the copy-out (lower_function). The result is
+    // dead — the caller tests rt_finishing and leaves without reading it — so
+    // whatever the result slot holds is the honest thing to hand back.
+    b_.CreateBr(fn_teardown_bb_);
 }
 
 // After a call that could have reached a $finish, leave if it did. Emitted

@@ -664,6 +664,43 @@ TEST_CASE("function output and inout string arguments alongside a return value")
     CHECK(run_capture(src) == "a=[o<in>] b=[B+in] r=4\n");
 }
 
+// The operand of `return` is evaluated where the statement executes, before the
+// output / inout formals are copied back (the reading recorded at lower_ret). It
+// shows for a string, whose copy-out moves it out of the callee: a function
+// returning its own output or inout argument used to return "". Every exit of a
+// function goes through one epilogue, so each `return` here copies out too.
+// Icarus rejects output arguments on functions, so this has no oracle.
+TEST_CASE("a function returns the value of its own output argument") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic string named(output string o, inout string io, input int k);
+                o  = {"out", $sformatf("%0d", k)};
+                io = {io, "+"};
+                if (k == 0) return o;
+                if (k == 1) return io;
+                return {o, "/", io};
+            endfunction
+            function automatic int both(output int o);
+                o = 7;
+                return o + 1;
+            endfunction
+            string r, a, b;
+            int    n, m;
+            initial begin
+                b = "b";
+                for (int k = 0; k < 3; k++) begin
+                    r = named(a, b, k);
+                    $display("r=[%s] a=[%s] b=[%s]", r, a, b);
+                end
+                n = both(m);
+                $display("%0d %0d", n, m);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "r=[out0] a=[out0] b=[b+]\nr=[b++] a=[out1] b=[b++]\nr=[out2/b+++] a=[out2] b=[b+++]\n8 7\n");
+}
+
 // Copy-out re-resolves the actual's lvalue AFTER the call, so any place a string
 // store can name is a legal actual: a queue / dynamic-array / associative-array
 // element, an unpacked-struct member, a fixed-array element and a class property.

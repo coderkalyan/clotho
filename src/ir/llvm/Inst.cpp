@@ -258,6 +258,8 @@ FunctionId Backend::call_func_id(Index i) const {
 // which exists before the body does and is never released.
 void Backend::build_str_temps() {
     str_temp_list_.clear();
+    // A new body: a thunk's shared $finish exit released the previous one's temps.
+    thunk_finish_bb_ = nullptr;
     for (size_t k = 0; k < ir_->inst_count(); ++k) {
         const auto i = static_cast<Index>(k);
         if (ir_->tag(i) == Inst::Tag::InstPath) {

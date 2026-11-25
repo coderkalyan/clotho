@@ -5009,6 +5009,16 @@ private:
     // Ret branches to. The caller-side record slot { ptr parent } for task calls
     // this coroutine makes (a process or a task can be a task caller).
     llvm::BasicBlock*       task_epilogue_bb_ = nullptr;
+    // While lowering a function: its shared epilogue (lower_function). A `return`
+    // branches to the copy-out block, which falls into the teardown block; a
+    // $finish exit branches to the teardown. `fn_result_` is the stack slot a
+    // scalar result waits in, null for a function that is void at the ABI.
+    llvm::BasicBlock*       fn_copyout_bb_  = nullptr;
+    llvm::BasicBlock*       fn_teardown_bb_ = nullptr;
+    llvm::AllocaInst*       fn_result_      = nullptr;
+    // While lowering a thunk-elided process body: the block its $finish exits
+    // share, built by the first of them (emit_finish_exit). Null between bodies.
+    llvm::BasicBlock*       thunk_finish_bb_ = nullptr;
     // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
