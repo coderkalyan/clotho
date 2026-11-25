@@ -843,6 +843,15 @@ struct BlockInfo {
 // lexical `disable` target, so it carries no occupant bookkeeping.
 inline constexpr uint32_t kNoDisableTarget = UINT32_MAX;
 
+// DeferFlush label: the procedure being lowered, flushed by a `disable` of its
+// outermost scope. Never mapped like a target id.
+inline constexpr uint32_t kDisableOwnTarget = UINT32_MAX - 1;
+
+// What a `disable` flush adds to a generation counter: the counter's high 32 bits
+// count disables, the low 32 count resumes and activation starts. A deferred report
+// compares the whole word; a unique/priority violation report only the low half.
+inline constexpr uint64_t kGenDisableBump = uint64_t{ 1 } << 32;
+
 // Extra payload for one arm of a `switch`: the constant case-value keys that
 // select this arm, and the arm's statement body. `keys` is a run of u64 case
 // values (2 words each; decode with Ir::region); several keys share one body
@@ -2015,10 +2024,13 @@ struct Inst {
         // that has to end, and it is the only one no force-wake can reach.
         DisableAbort,
         // Drop a procedure's pending deferred-assertion reports (LRM 16.4.4): bump
-        // its generation counter, exactly as an activation start does (payload:
-        // label -- kNoDisableTarget for the procedure being lowered, else the
-        // `disable` target id whose owning procedure is flushed). Emitted
-        // immediately before a `disable` of that procedure's outermost scope.
+        // its generation counter (payload: label -- kNoDisableTarget for the procedure
+        // being lowered at a resume (LRM 16.4.2), kDisableOwnTarget for the procedure
+        // being lowered at a `disable` of its outermost scope, else the `disable` target
+        // id whose owning procedure is flushed). The disable forms bump the counter's
+        // high half (kGenDisableBump), which a unique/priority violation report ignores
+        // (LRM 12.4.2.1 has no disable flush point). Emitted immediately before a
+        // `disable` of that procedure's outermost scope.
         DeferFlush,
         // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine

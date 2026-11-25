@@ -465,7 +465,9 @@ Ir Ir::rebased(HandleMapper& m) const {
 
     const auto sig = [&](Signal s) { return static_cast<Signal>(m.map(F::Signal, static_cast<uint32_t>(s))); };
     const auto fn = [&](FunctionId f) { return static_cast<FunctionId>(m.map(F::Function, static_cast<uint32_t>(f))); };
-    const auto target = [&](uint32_t id) { return id == kNoDisableTarget ? id : m.map(F::DisableTarget, id); };
+    const auto target = [&](uint32_t id) {
+        return id == kNoDisableTarget || id == kDisableOwnTarget ? id : m.map(F::DisableTarget, id);
+    };
 
     // Records are read from this body and written into the copy, so a record two
     // instructions share is rebased once, not twice.

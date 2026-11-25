@@ -124,8 +124,10 @@ extern "C" void rt_observed_flush() {
     // warning interleaves.
     std::fflush(stdout);
     for (const ObservedCaseViol& r : g_observed_case) {
-        // A report whose process has run since (a flush point, LRM 16.4.2) is dropped.
-        if (r.gen != nullptr && *r.gen != r.gen_val) {
+        // A report whose process has run since (a flush point, LRM 12.4.2.1 / 16.4.2) is dropped.
+        // Only the low half of the counter counts resumes and activation starts; the high half
+        // counts `disable`s, which flush a deferred assertion's report (16.4.4) but not this one.
+        if (r.gen != nullptr && static_cast<uint32_t>(*r.gen ^ r.gen_val) != 0) {
             continue;
         }
         std::string line = r.banner;

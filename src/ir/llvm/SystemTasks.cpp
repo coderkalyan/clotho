@@ -1323,12 +1323,12 @@ void Backend::emit_defer_gen_bump() {
     emit_defer_gen_bump_at(defer_gen_ptr());
 }
 
-void Backend::emit_defer_gen_bump_at(llvm::Value* gen) {
+void Backend::emit_defer_gen_bump_at(llvm::Value* gen, uint64_t delta) {
     if (gen == nullptr) {
         return;
     }
     auto* i64 = b_.getInt64Ty();
-    b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(1)), gen);
+    b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(delta)), gen);
 }
 
 // The ptr global holding the report generation of the running thread. Created at the

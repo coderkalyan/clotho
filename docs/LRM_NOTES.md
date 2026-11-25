@@ -166,10 +166,10 @@ Code: `src/lower/Statements.cpp` (`lower_predicate`), `src/lower/Expr.cpp` (`low
 a violation report flush point first: a resume after suspending on an event control or
 `wait`, or an `always_comb` / `always_latch` resumed by a dependent signal. These are
 the first two flush points of 16.4.2; its third, disabling the process's outermost
-scope, is not one for violation reports. Not yet: a process that also holds a deferred
-assertion shares one generation counter, so there a `disable` of its outermost scope
-drops its violation reports too (`Statements.cpp`, `lower_disable`); a process with
-none keeps them. Clotho queues the report and issues it in the Observed region, and drops it if its thread
+scope, is not one for violation reports: a report whose process is disabled still
+matures in the Observed region, though a deferred assertion's report is dropped there
+(16.4.4). The two share one generation counter per process; a `disable` bumps its
+high half, which a violation report ignores. Clotho queues the report and issues it in the Observed region, and drops it if its thread
 reached a flush point meanwhile: an activation start, or a resume from an
 event control or `wait`, including one inside a task or function-called task the
 thread entered (the generation travels with the call, docs/design/disable.md). So a
