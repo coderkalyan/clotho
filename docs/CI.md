@@ -130,7 +130,7 @@ that tries is rejected outright with no jobs scheduled at all.
 | target | result |
 |---|---|
 | linux-x64, linux-x64-sanitize, linux-arm64, windows-x64, macos-arm64, macos-x64 | pass |
-| windows-arm64 | builds (with `c7978f9d`); 97 of 105 ctest entries pass. Seven segfault, each at the file's first design with an `always_comb` or `always_latch`: `function_test`, `strobe_test`, `llvm_backend_test`, `comb_fusion_test`, `struct_test`, `fork_test`, `severity_test`. In `exe_test`'s `-O --sanitize=bounds` tier, `clotho run` crashes on `alu.v` and `nba.v` and reports a false oscillation on `wait.v`, while the built executables print the right output. Both are the JIT mislink below, fixed but not yet confirmed by a run |
+| windows-arm64 | builds (with `c7978f9d`); 97 of 105 ctest entries pass. Seven segfault, each at the file's first design with an `always_comb` or `always_latch`: `function_test`, `strobe_test`, `llvm_backend_test`, `comb_fusion_test`, `struct_test`, `fork_test`, `severity_test`; that is the JIT mislink below, fixed but not yet confirmed by a run. In `exe_test`'s `-O --sanitize=bounds` tier, `clotho run` crashes on `alu.v` and `nba.v` and reports a false oscillation on `wait.v`, while the built executables print the right output; their `-O` code also has nonzero `PAGEOFFSET_12L` addends, so the same mislink is the likely cause |
 
 Only windows-arm64 is advisory (`continue-on-error`); every other target gates.
 
