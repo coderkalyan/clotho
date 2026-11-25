@@ -51,20 +51,17 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4) and
     // `std::weak_reference` (LRM 8.30) are built-in classes slang synthesizes
     // into the `std` package. Slang builds their *signatures* only -- every
-    // method is a bodyless SubroutineSymbol whose semantics the simulator is
-    // expected to supply -- so lowering one walks into a method with no
-    // statements and no formals to bind, and used to die on an out-of-range
-    // formal index instead of saying anything. Each needs a real runtime: a key
-    // count plus a wait queue for a semaphore, a bounded FIFO with blocking
-    // put/get/peek for a mailbox.
+    // method is a bodyless SubroutineSymbol whose semantics the simulator
+    // supplies. `semaphore` and `mailbox` are ordinary traced class objects with
+    // a synthetic body (lower/BuiltinClasses.cpp,
+    // docs/design/mailbox-and-semaphore.md).
     //
-    // `process` (LRM 9.7) is the one that is implemented: it has its own body
-    // shape and its own method lowering, because a `process` object is not a
-    // user class but a handle onto a thread's control block. See
-    // docs/design/process-class.md.
+    // `process` (LRM 9.7) has its own body shape and its own method lowering,
+    // because a `process` object is not a user class but a handle onto a
+    // thread's control block. See docs/design/process-class.md.
     //
-    // TODO: built-in std classes (semaphore / mailbox / weak_reference) -- need
-    // the runtime support described above.
+    // TODO: `std::weak_reference` (LRM 8.30) -- needs a weak table the
+    // collector clears (docs/design/garbage-collection.md).
     if (const slang::ast::Scope* parent = clt.getParentScope();
         parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
         if (clt.name == "process") {

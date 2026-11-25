@@ -507,8 +507,6 @@ Milestones, in order; lower ones unblock higher ones:
 ### Full object orientation
 
 - [~] **Garbage collection** (8.4) — collector coverage and policy still missing.
-  - [ ] **Collector tracing of event, `mailbox`, `semaphore` and
-    `std::weak_reference` handles** (8.4) — not yet described to the collector.
   - [ ] **Collection trigger does not count an associative array's own storage** (8.4) —
     only its element slots are charged; its key strings and hash buckets are not, so objects
     owning large associative arrays can fill memory before a collection runs.

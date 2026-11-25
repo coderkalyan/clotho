@@ -118,8 +118,9 @@ matching `emit_agg_deinit` call anywhere).
 
 **In scope.** Class bodies; the heap they own through managed properties; the
 `rt_event` sync objects that named-event handles will need
-(`named-events.md:208-271`); `std::mailbox` / `std::semaphore` /
-`std::weak_reference` when they land (`TODO.md`).
+(`named-events.md:208-271`); `std::weak_reference` when it lands (`TODO.md`).
+`std::mailbox` and `std::semaphore` are ordinary traced class bodies
+(`mailbox-and-semaphore.md` §4.4).
 
 A `process` object (LRM 9.7) is scoped as an ordinary traced class body whose
 properties are the thread's control block — status word, activation stack, `await`
@@ -1143,10 +1144,9 @@ parent handle — keeps exactly its 45 live components while 4,000 transactions 
 through the heap, and the dropped-subtree case reclaims. **A real UVM testbench can
 now run collected**, which was this phase's whole point.
 
-The rest of the family — `rt_event` sync objects, `std::mailbox` / `semaphore` /
-`process`, `std::weak_reference` — is blocked on those features existing at all,
-not on the collector. Each should adopt this document's header and trace map when
-it lands.
+The rest of the family — `rt_event` sync objects and `std::weak_reference` — is
+blocked on those features existing at all, not on the collector. `std::mailbox`,
+`semaphore` and `process` have since landed as ordinary traced class bodies.
 
 **Track A — evacuation.** Gated on P3's fragmentation and survival numbers, not on
 taste. Prerequisites in §8: lazy object ids at `emit_key_bytes`, pin-on-`ref`,
@@ -1272,8 +1272,7 @@ validate-on-trace as the canonical pair.
 - Event handles, event arrays, events as class properties — already guarded
   (`src/lower/`); guard stays until P4, and `named-events.md` Option A should
   adopt this document's header and trace map rather than inventing a second.
-- `std::mailbox`, `std::semaphore`, `process`, `std::weak_reference` — already loud
-  (`lower/Classes.cpp, lower_class_type`).
+- `std::weak_reference` — already loud (`lower/Classes.cpp, lower_class_type`).
 - Virtual interfaces (`src/lower/`) — unrelated to GC, but another
   handle-shaped family; whether it becomes GC-managed is that design's question.
 - Compaction of the large-object space; user-visible pinning; `%p` of a handle
