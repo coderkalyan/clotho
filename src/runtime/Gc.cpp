@@ -2254,6 +2254,16 @@ void push_event_roots() {
     rt_internal::event_gc_roots(mark_container_handle);
 }
 
+// What waits on a reachable event object (RuntimeInternal.h, event_gc_waiting). The
+// event a subscription names is held to the standard of push_event_roots. A waiting
+// record is native memory with no map, so it is scanned as a range is; verification
+// only re-checks what a precise walk reaches, as for a range or a frame.
+void push_event_waiting() {
+    void (*const skip)(const uint8_t*, uint64_t) = [](const uint8_t*, uint64_t) {};
+    rt_internal::event_gc_waiting(is_marked_now, mark_container_handle,
+                                  g.verifying != 0 ? skip : scan_conservative);
+}
+
 // -- The native stack, for a collection run from inside an allocation (§6.1) ---
 //
 // Why this is sound is the argument in design §6.1; this is the mechanism. The stack and
@@ -3023,6 +3033,15 @@ void mark_from_roots() {
     // is not a registered structure: the design's own native stack (§6.1).
     push_stack_roots();
     drain();
+    // Reaching an event can make what waits on it reachable, and that can reach another
+    // event. Each pass that goes round again marked an object no pass had, so this ends.
+    for (;;) {
+        push_event_waiting();
+        if (g.worklist.empty() && g.container_work.empty()) {
+            break;
+        }
+        drain();
+    }
 }
 
 // The counters, and the invariants that are claims about the collection as a whole.
@@ -4067,6 +4086,9 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     assert(g.pinned.empty() && "the previous collection left a pin behind");
 
     mark_from_roots();
+    // The marks are complete and nothing is reclaimed yet, which is the one moment a
+    // record of the runtime's can ask whether the event it waits on was reached.
+    rt_internal::event_gc_release_dead(is_marked_now);
 
     // The stack is read, so the words a running activation may be using a buffer through
     // are known: first let go of what an earlier collection kept for them that none of
@@ -4227,6 +4249,7 @@ extern "C" void rt_gc_verify(void) {
     push_container_roots();
     push_nba_roots();
     push_event_roots();
+    push_event_waiting();
     VerifyTally tally;
     for (const Block& blk : g.blocks) {
         // Two claims about every block, kept apart because they are different claims: the

@@ -3278,7 +3278,7 @@ private:
     uint32_t intra_rec_mm_ptr(const SignalSlot& s) const;
     uint32_t intra_rec_z_ptr(const SignalSlot& s) const;
     uint32_t intra_rec_ctx(const SignalSlot& s) const;
-    uint32_t intra_rec_trigs(const SignalSlot& s) const;
+    uint32_t intra_rec_trigs(const SignalSlot& s);
     bool intra_rec_rooted(const SignalSlot& s);
     uint32_t intra_agg_payload(const SignalSlot& s);
 
