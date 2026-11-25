@@ -2527,7 +2527,9 @@ bool keep_large(ChunkRecord* c, bool spare_marked) {
 // fewer than one allocation budget. Without the first a design that allocates at a
 // steady rate would return and re-request the same chunks at every full collection.
 uint64_t block_reserve() {
-    const uint64_t budget = (g.cfg.nursery_bytes + RT_GC_BLOCK_BYTES - 1) / RT_GC_BLOCK_BYTES;
+    // Rounded up without the sum, which wraps for a budget no run can spend.
+    const uint64_t nursery = g.cfg.nursery_bytes;
+    const uint64_t budget  = nursery / RT_GC_BLOCK_BYTES + (nursery % RT_GC_BLOCK_BYTES != 0 ? 1u : 0u);
     return g.young.size() > budget ? g.young.size() : budget;
 }
 
