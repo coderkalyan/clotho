@@ -800,11 +800,8 @@ ir::Index Lowerer::bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceL
     const slang::ast::Type& ct   = t.getCanonicalType();
     const Expression&       bare = unwrap_conversion(e);
     if (ct.isClass()) {
-        // A handle is a value: park it in a cell so the walk reads it like any place.
-        const TempCell  cell = make_temp_cell(lower_type(t), "bits_handle");
-        const ir::Index dst  = cell.lv(b, l);
-        b.binary(ir::Inst::Tag::Store, dst, lower_expr(e, b), l);
-        return bitstream_width(cell.lv(b, l), t, b, l);
+        // TODO: see bitstream_width: the object behind a handle is not measured.
+        fail("$bits of a class handle whose object has dynamically sized members is not supported");
     }
     if (is_struct_lvalue_shape(bare)) {
         return bitstream_width(lower_lvalue(bare, b), t, b, l);
@@ -834,14 +831,7 @@ ir::Index Lowerer::bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceL
 //   associative array         the same over the entries, walked by key (7.9.4)
 //   unpacked struct           the sum over the members, in declaration order
 //   fixed-size array          the same over its elements, when they are dynamic
-//   class handle              the sum over the properties of the object, those of
-//                             base classes first; a null handle streams nothing
-//                             (11.4.14.1: "the expression shall be skipped")
-//
-// A class is measured by its static type: an object of a derived class has more
-// properties than its handle's type names, which this leaves out, as slang's
-// own fold of a class of fixed size does -- the same "without actual evaluation"
-// of the expression's type as everything else in 20.6.2.
+//   class handle              refused (see below)
 ir::Index Lowerer::bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l) {
     using T    = ir::Inst::Tag;
     using Step = ir::Builder::AssocStep;
@@ -884,26 +874,10 @@ ir::Index Lowerer::bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::
         return dynamic ? b.binary(T::Add, *dynamic, count(fixed), l) : count(fixed);
     }
     if (ct.isClass()) {
-        const auto&     cls       = ct.as<slang::ast::ClassType>();
-        const ir::Ref   class_ref = lower_type(t);
-        const TempCell  acc       = make_temp_cell(u64, "bits_acc");
-        zeroed(acc);
-        const ir::Index handle = b.unary(T::Load, lv, l);
-        const ir::Index live   = b.binary(T::Ne, handle, b.constant(module_.pool.put_int(u64, 0), l), l);
-        b.open_region();
-        for (const slang::ast::ClassPropertySymbol& prop : cls.properties()) {
-            if (prop.lifetime == slang::ast::VariableLifetime::Static) {
-                continue; // belongs to the class, not to the object
-            }
-            const slang::ast::Type& pt = prop.getType();
-            add_into(acc, pt.isFixedSize() ? count(pt.getBitstreamWidth())
-                                           : bitstream_width(class_member_lvalue(handle, prop, class_ref, b, l), pt, b, l));
-        }
-        const ir::ExtraSlice present = b.close_region();
-        b.open_region();
-        const ir::ExtraSlice absent = b.close_region();
-        b.cond(live, present, absent, l);
-        return b.unary(T::Load, acc.lv(b, l), l);
+        // TODO: measuring the object a handle refers to (11.4.14.1: the members of the
+        // referenced object, base classes first, a null handle streaming nothing) needs
+        // the walk of that object, which streaming a class handle needs too.
+        fail("$bits of a class handle whose object has dynamically sized members is not supported");
     }
     if (!ct.isUnpackedArray()) {
         fail("internal: $bits of a dynamically sized type that is not a string, struct, class or array");

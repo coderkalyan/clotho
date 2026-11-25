@@ -84,10 +84,10 @@ TEST_CASE("$bits as an elaboration-time constant") {
 
 // $bits of an operand whose size is only known at run time (LRM 20.6.2, 6.24.3): the
 // bits of its stream as it is now, and 0 for a dynamically sized operand that is
-// empty or a null handle (11.4.14.1 skips one). A queue, dynamic array or
+// empty. A queue, dynamic array or
 // associative array is its element count times the element size, a sum over its
-// elements when those have none of their own (a string, a queue); a struct and a
-// class are the sum over their members. iverilog 13 answers 1 for every such
+// elements when those have none of their own (a string, a queue); a struct is the
+// sum over its members. iverilog 13 answers 1 for every such
 // operand, so the expectations are worked out from the clauses: 32 bits per int,
 // 8 per byte, 8 per character.
 TEST_CASE("$bits of a dynamically sized operand") {
@@ -95,7 +95,7 @@ TEST_CASE("$bits of a dynamically sized operand") {
       "int q[$]; byte d[]; int aa[string]; string sq[$]; string sa[3]; int qq[$][2]; int qd[$][$]; int t[$];"
       "string sm[int]; logic [11:0] hx;"
       "typedef struct { int a; string s; int q[$]; } st_t; st_t st;"
-      "class C; int x; string s; int q[$]; endclass C c, nul;",
+      "",
       "$display(\"%0d %0d %0d %0d\", $bits(q), $bits(d), $bits(aa), $bits(sq));"
       "q.push_back(1); q.push_back(2); d = new[3]; aa[\"x\"] = 1; aa[\"y\"] = 2; aa[\"z\"] = 3;"
       "sq.push_back(\"ab\"); sq.push_back(\"cde\");"
@@ -109,10 +109,23 @@ TEST_CASE("$bits of a dynamically sized operand") {
       "$display(\"%0d\", $bits(sm));"
       "st.s = \"hi\"; st.q = '{1, 2, 3};"
       "$display(\"%0d\", $bits(st));"
-      "c = new; c.s = \"xyz\"; c.q.push_back(7);"
-      "$display(\"%0d %0d\", $bits(c), $bits(nul));"
       "$display(\"%0d\", $bits(m.hx));"));
-    CHECK(out == "0 0 0 0\n64 24 96 40\n48\n128 96\n40\n144\n88 0\n12\n");
+    CHECK(out == "0 0 0 0\n64 24 96 40\n48\n128 96\n40\n144\n12\n");
+}
+
+// `$bits` of a class handle whose object has dynamically sized members would have to
+// walk the referenced object (11.4.14.1, 20.6.2), which Clotho cannot yet do; it is
+// refused rather than measured by the handle's static type.
+TEST_CASE("$bits of a class handle with dynamic members is refused") {
+    const LowerResult r = lower_text(R"(
+        module m;
+          class C; int x; string s; endclass
+          C c;
+          initial begin c = new; $display("%0d", $bits(c)); end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.diagnostic_text().find("$bits of a class handle") != std::string::npos, r.diagnostic_text());
 }
 
 // -- $countones -------------------------------------------------------------

@@ -451,7 +451,8 @@ Milestones, in order; lower ones unblock higher ones:
     refused.
   - [ ] **Non-integral leaf or element in a streamed aggregate or container** (11.4.14.1) — a
     string leaf of an unpacked struct or array, a class handle, and a container whose
-    elements are aggregates or containers are refused, packing and unpacking.
+    elements are aggregates or containers are refused, packing and unpacking; so is `$bits`
+    (20.6.2) of a class handle whose object has dynamic members.
   - [ ] **Unpack into a nested `{<<S{...}}` or with a slice size that does not divide the
     target** (11.4.14.3) — refused.
 
