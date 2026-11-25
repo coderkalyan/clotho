@@ -266,8 +266,9 @@ struct StoreNbEventInfo {
 struct StoreNbGatedInfo {
     // Value staged now and committed in the NBA region.
     Index value;
-    // The target's `force_site` state signal, as a bare Signal lvalue. The NBA
-    // region drops the update while it is nonzero.
+    // The target's `force_site` state signal: a Signal lvalue, or for a write
+    // through a virtual interface handle IfaceSignal(handle, the representative's
+    // state). The NBA region drops the update while it is nonzero.
     Index force_site;
     // The target's `assign_site` state signal, likewise, or kNoIndex when the
     // variable is no `assign` target.

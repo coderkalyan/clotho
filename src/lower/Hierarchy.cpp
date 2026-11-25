@@ -570,28 +570,8 @@ std::optional<ir::Signal> Lowerer::vif_member_signal(const slang::ast::Symbol&  
              "' instantiated inside '" + std::string(named->getDefinition().name) +
              "', a separate instance the handle does not name");
     }
-    const std::vector<uint32_t> path = member_ordinal_path(*m, placeholder);
-    for (const VifInstance& inst : vif_defs_->insts) {
-        if (!inst.body->hasSameType(placeholder)) {
-            continue;
-        }
-        // Top-level members resolve by name; anything deeper (a generate block's
-        // signal) by its position, which is identical across instances of one
-        // definition and needs no path rendering.
-        if (path.size() == 1) {
-            if (const auto it = inst.members.find(std::string(m->name)); it != inst.members.end()) {
-                return it->second;
-            }
-        } else if (!path.empty()) {
-            if (const slang::ast::Symbol* rep = symbol_at_path(*inst.body, path)) {
-                if (const auto* vs = rep->as_if<slang::ast::ValueSymbol>()) {
-                    if (const auto it = inst.syms.find(vs); it != inst.syms.end()) {
-                        return it->second;
-                    }
-                }
-            }
-        }
-        break;
+    if (const std::optional<ir::Signal> rep = vif_rep_lookup(*m, placeholder)) {
+        return rep;
     }
     // No elaborated instance of this interface exists anywhere in the design.
     // Nothing can ever be assigned to the handle, so it is null for the whole
@@ -621,6 +601,62 @@ std::optional<ir::Signal> Lowerer::vif_member_signal(const slang::ast::Symbol&  
              std::string(what) + " through it is a run-time fatal",
            to_source_span(cur_range_));
     return std::nullopt;
+}
+
+// The representative of `m`, a member of `placeholder`: the first elaborated
+// instance of that type that has it. Nullopt when none does; the caller says why.
+std::optional<ir::Signal> Lowerer::vif_rep_lookup(const slang::ast::Symbol&             m,
+                                                  const slang::ast::InstanceBodySymbol& placeholder) {
+    const std::vector<uint32_t> path = member_ordinal_path(m, placeholder);
+    for (const VifInstance& inst : vif_defs_->insts) {
+        if (!inst.body->hasSameType(placeholder)) {
+            continue;
+        }
+        // Top-level members resolve by name; anything deeper (a generate block's
+        // signal) by its position, which is identical across instances of one
+        // definition and needs no path rendering.
+        if (path.size() == 1) {
+            if (const auto it = inst.members.find(std::string(m.name)); it != inst.members.end()) {
+                return it->second;
+            }
+        } else if (!path.empty()) {
+            if (const slang::ast::Symbol* rep = symbol_at_path(*inst.body, path)) {
+                if (const auto* vs = rep->as_if<slang::ast::ValueSymbol>()) {
+                    if (const auto it = inst.syms.find(vs); it != inst.syms.end()) {
+                        return it->second;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    return std::nullopt;
+}
+
+// The representative of the member a `vif.m` lvalue writes, without the
+// diagnostics vif_member_signal gives: the write's own lowering reports a member
+// it cannot reach. Nullopt for a clocking-block drive, which is no variable write.
+std::optional<ir::Signal> Lowerer::vif_member_rep_quiet(const MemberAccessExpression& ma) {
+    const slang::ast::Symbol* m = &ma.member;
+    if (const auto* mp = m->as_if<slang::ast::ModportPortSymbol>()) {
+        m = mp->internalSymbol;
+    }
+    if (m == nullptr || m->as_if<slang::ast::ClockVarSymbol>() != nullptr) {
+        return std::nullopt;
+    }
+    const slang::ast::Scope* owner = m->getParentScope();
+    while (owner != nullptr && owner->asSymbol().kind != SymbolKind::InstanceBody) {
+        owner = owner->asSymbol().getParentScope();
+    }
+    if (owner == nullptr) {
+        return std::nullopt;
+    }
+    const auto&                           placeholder = owner->asSymbol().as<slang::ast::InstanceBodySymbol>();
+    const slang::ast::InstanceBodySymbol* named       = vif_named_body(ma.value());
+    if (named != nullptr && !named->hasSameType(placeholder)) {
+        return std::nullopt;
+    }
+    return vif_rep_lookup(*m, placeholder);
 }
 
 // Lower one top instance and its whole hierarchy. Declaration initializers become

@@ -88,8 +88,8 @@ public:
 
     // Nonblocking assignment `lvalue <= value` to a variable a force or procedural
     // `assign` can own: the NBA region drops the update while `force_site`, or
-    // `assign_site` unless it is kNoIndex, is nonzero (LRM 10.6). Both are Signal
-    // lvalues of the target's state signals.
+    // `assign_site` unless it is kNoIndex, is nonzero (LRM 10.6). Both are lvalues
+    // of the target's state signals (Signal, or IfaceSignal through a handle).
     Index store_nb_gated(Index lvalue, Index value, Index force_site, Index assign_site, SourceLoc loc);
 
     // Pack a run of (signal, edge) triggers into the extra buffer for
@@ -719,6 +719,15 @@ public:
         uint32_t scratch;
         uint32_t regions;
     };
+
+    // The tag and payload of an instruction already emitted, for a frontend that
+    // has to look back at an lvalue it built.
+    [[nodiscard]] Inst::Tag tag(Index i) const {
+        return tags_[static_cast<uint32_t>(i)];
+    }
+    [[nodiscard]] const Inst::Payload& payload(Index i) const {
+        return payloads_[static_cast<uint32_t>(i)];
+    }
 
     [[nodiscard]] Mark mark() const {
         return { static_cast<uint32_t>(tags_.size()),

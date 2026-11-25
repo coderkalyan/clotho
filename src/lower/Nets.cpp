@@ -1810,9 +1810,16 @@ ir::Index Lowerer::site_const(uint32_t id, ir::Builder& b, ir::SourceLoc l) {
     return b.constant(module_.pool.put_int(make_int_type(32, false), id), l);
 }
 
+// The lvalue of a force / assign state signal: the signal itself, or, for a write
+// through a virtual interface handle, the same def-local signal of the instance
+// `handle` names (the state is the representative's, see join_pca_targets).
+ir::Index Lowerer::pca_state_lv(ir::Signal state, ir::Index handle, ir::Builder& b, ir::SourceLoc l) {
+    return handle == ir::kNoIndex ? b.signal(state, l) : b.iface_signal(handle, state, l);
+}
+
 // `force_site === id` (CaseEq never yields x; the site is 2-state anyway).
-ir::Index Lowerer::site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l) {
-    const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(site, l), l);
+ir::Index Lowerer::site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l, ir::Index handle) {
+    const ir::Index cur  = b.unary(ir::Inst::Tag::Load, pca_state_lv(site, handle, b, l), l);
     const ir::Index want = site_const(id, b, l);
     return b.binary(ir::Inst::Tag::CaseEq, cur, want, l);
 }
@@ -1820,10 +1827,11 @@ ir::Index Lowerer::site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::Sou
 // `not forced` and, if an assign layer exists, `not assigned` — the predicate
 // that lets an ordinary write / the assign-layer driver through. force > assign
 // > ordinary (LRM 10.6): ordinary is gated on both, the assign driver on force.
-ir::Index Lowerer::not_forced(const ForceInfo& fi, bool also_assign, ir::Builder& b, ir::SourceLoc l) {
-    ir::Index pred = site_is(fi.site, 0, b, l);
+ir::Index Lowerer::not_forced(const ForceInfo& fi, bool also_assign, ir::Builder& b, ir::SourceLoc l,
+                              ir::Index handle) {
+    ir::Index pred = site_is(fi.site, 0, b, l, handle);
     if (also_assign && fi.has_assign) {
-        pred = b.binary(ir::Inst::Tag::Land, pred, site_is(fi.assign_site, 0, b, l), l);
+        pred = b.binary(ir::Inst::Tag::Land, pred, site_is(fi.assign_site, 0, b, l, handle), l);
     }
     return pred;
 }
@@ -1859,10 +1867,77 @@ ir::Index Lowerer::gated_store(const AssignmentExpression& a, const ForceInfo& f
 
 // The force / `assign` site state governing writes to an lvalue, keyed on its
 // root: null when that root is not a procedural-continuous-assignment target
-// anywhere in the design, i.e. when the write needs no gate at all.
+// anywhere in the design, i.e. when the write needs no gate at all. A member
+// written through a virtual interface handle answers with its representative's
+// state, which store_or_gate reads through the handle.
 ForceInfo* Lowerer::pca_info_of_lvalue(const Expression& lhs) {
+    if (const MemberAccessExpression* ma = vif_member_access(lhs)) {
+        const std::optional<ir::Signal> rep = vif_member_rep_quiet(*ma);
+        if (!rep) {
+            return nullptr; // the write's own lowering reports what it cannot reach
+        }
+        const auto fit = pca_->vars.find(static_cast<uint32_t>(*rep));
+        if (fit == pca_->vars.end()) {
+            // A later top that forces the member must know this write is ungated.
+            pca_->vif_ungated.insert(static_cast<uint32_t>(*rep));
+            return nullptr;
+        }
+        return &fit->second;
+    }
     const ValueSymbol* root = lvalue_root(lhs);
     return root == nullptr ? nullptr : force_info_of(*root);
+}
+
+// The member access a `vif.m` lvalue (or a select of one) writes through, or null
+// when the lvalue reaches no member through a handle.
+const MemberAccessExpression* Lowerer::vif_member_access(const Expression& lhs) {
+    const Expression* e = &lhs;
+    while (true) {
+        switch (e->kind) {
+            case ExpressionKind::ElementSelect:
+                e = &e->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                e = &e->as<RangeSelectExpression>().value();
+                break;
+            case ExpressionKind::Conversion:
+                e = &e->as<ConversionExpression>().operand();
+                break;
+            case ExpressionKind::MemberAccess: {
+                const auto& ma = e->as<MemberAccessExpression>();
+                if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+                    return &ma;
+                }
+                e = &ma.value();
+                break;
+            }
+            default:
+                return nullptr;
+        }
+    }
+}
+
+// The handle a lowered lvalue reaches its root through (the op of its IfaceSignal
+// root), or kNoIndex for an lvalue rooted at a signal of its own.
+ir::Index Lowerer::vif_handle_of(ir::Index lv, const ir::Builder& b) {
+    for (;;) {
+        switch (b.tag(lv)) {
+            case ir::Inst::Tag::BitSelect:
+                lv = b.payload(lv).binary.l;
+                break;
+            case ir::Inst::Tag::PartSelect:
+            case ir::Inst::Tag::DynPartSelect:
+            case ir::Inst::Tag::ElemSelect:
+            case ir::Inst::Tag::ArrSlice:
+            case ir::Inst::Tag::MemberSelect:
+                lv = b.payload(lv).op_extra.op;
+                break;
+            case ir::Inst::Tag::IfaceSignal:
+                return b.payload(lv).op_extra.op;
+            default:
+                return ir::kNoIndex;
+        }
+    }
 }
 
 // The update half of an ordinary procedural write: a plain store when the
@@ -1893,12 +1968,14 @@ void Lowerer::store_or_gate(const ForceInfo*     fi,
         fail("intra-assignment timing on a write to a force-target variable "
              "is not supported");
     }
+    // Through a virtual interface handle, the state of the instance it names.
+    const ir::Index handle = vif_handle_of(lv, b);
     if (tag == ir::Inst::Tag::StoreNb) {
-        const ir::Index assign_site = fi->has_assign ? b.signal(fi->assign_site, l) : ir::kNoIndex;
-        b.store_nb_gated(lv, v, b.signal(fi->site, l), assign_site, l);
+        const ir::Index assign_site = fi->has_assign ? pca_state_lv(fi->assign_site, handle, b, l) : ir::kNoIndex;
+        b.store_nb_gated(lv, v, pca_state_lv(fi->site, handle, b, l), assign_site, l);
         return;
     }
-    const ir::Index pred = not_forced(*fi, /*also_assign=*/true, b, l);
+    const ir::Index pred = not_forced(*fi, /*also_assign=*/true, b, l, handle);
     b.open_region();
     b.binary(tag, lv, v, l);
     const ir::ExtraSlice then_r = b.close_region();

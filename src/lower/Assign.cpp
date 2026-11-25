@@ -1768,7 +1768,8 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
     // predicate is "is this lvalue's root a force target?" — the root, not the
     // written shape, carries the site state, so a whole-variable write, a
     // bit/part/element-select of it, a packed struct/union member of it, and a
-    // compound update all take the same gate.
+    // compound update all take the same gate. A member written through a virtual
+    // interface handle is gated by the state of the instance the handle names.
     if (const ValueSymbol* root = lvalue_root(a.left())) {
         if (root->kind == SymbolKind::ClockVar) {
             // A synchronous drive (LRM 14.16), which is neither an ordinary store
@@ -1779,19 +1780,19 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
             lower_clocking_drive(root->as<ClockVarSymbol>(), a, b);
             return ir::Index{};
         }
-        if (ForceInfo* fi = force_info_of(*root)) {
-            if (a.timingControl != nullptr) {
-                // TODO: intra-assignment timing (`x = #5 e` / `x <= @e2 e`) on a
-                // write to a force target. LRM 10.6.2 suppresses the update, which
-                // for a delayed assignment is decided when it commits, not when the
-                // RHS is sampled; the gate here would have to ride the deferred
-                // record (store_nb_delay / store_nb_event have no predicate hook)
-                // and gated_store would otherwise silently drop the timing control.
-                fail("intra-assignment timing on a write to a force-target variable "
-                     "is not supported");
-            }
-            return gated_store(a, *fi, b);
+    }
+    if (ForceInfo* fi = pca_info_of_lvalue(a.left())) {
+        if (a.timingControl != nullptr) {
+            // TODO: intra-assignment timing (`x = #5 e` / `x <= @e2 e`) on a
+            // write to a force target. LRM 10.6.2 suppresses the update, which
+            // for a delayed assignment is decided when it commits, not when the
+            // RHS is sampled; the gate here would have to ride the deferred
+            // record (store_nb_delay / store_nb_event have no predicate hook)
+            // and gated_store would otherwise silently drop the timing control.
+            fail("intra-assignment timing on a write to a force-target variable "
+                 "is not supported");
         }
+        return gated_store(a, *fi, b);
     }
     if (a.left().kind == ExpressionKind::MemberAccess &&
         a.left().as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface() &&

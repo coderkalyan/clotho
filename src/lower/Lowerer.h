@@ -1088,6 +1088,10 @@ public:
                                                 const slang::ast::InstanceBodySymbol* named,
                                                 std::string_view                      what);
 
+    std::optional<ir::Signal> vif_rep_lookup(const slang::ast::Symbol& m, const slang::ast::InstanceBodySymbol& placeholder);
+
+    std::optional<ir::Signal> vif_member_rep_quiet(const MemberAccessExpression& ma);
+
     void lower_top(const InstanceSymbol& top, std::string_view prefix);
 
     void lower_globals(const Compilation& comp, const RootSymbol& root);
@@ -2137,14 +2141,20 @@ private:
 
     void register_net_force_site(const ProceduralAssignStatement& s, const Expression& lhs, const ValueSymbol& root);
 
+    static const MemberAccessExpression* vif_member_access(const Expression& lhs);
+
+    ir::Index vif_handle_of(ir::Index lv, const ir::Builder& b);
+
+    ir::Index pca_state_lv(ir::Signal state, ir::Index handle, ir::Builder& b, ir::SourceLoc l);
 
     std::vector<ir::WaitEvent> with_force_wake(std::vector<ir::WaitEvent> ev, const Expression& lhs);
 
     ir::Index site_const(uint32_t id, ir::Builder& b, ir::SourceLoc l);
 
-    ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l);
+    ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l, ir::Index handle = ir::kNoIndex);
 
-    ir::Index not_forced(const ForceInfo& fi, bool also_assign, ir::Builder& b, ir::SourceLoc l);
+    ir::Index not_forced(const ForceInfo& fi, bool also_assign, ir::Builder& b, ir::SourceLoc l,
+                         ir::Index handle = ir::kNoIndex);
 
     ir::Index gated_store(const AssignmentExpression& a, const ForceInfo& fi, ir::Builder& b);
 

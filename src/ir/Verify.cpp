@@ -144,10 +144,12 @@ private:
                 const auto info = ir_.extra_data<StoreNbGatedInfo>(p.op_extra.extra);
                 check_store(i, p.op_extra.op, info.value);
                 // The commit reads the state signals themselves, so they have to
-                // be bare signals, not any lvalue.
-                if (!valid(info.force_site) || ir_.tag(info.force_site) != Tag::Signal ||
-                    (info.assign_site != kNoIndex &&
-                     (!valid(info.assign_site) || ir_.tag(info.assign_site) != Tag::Signal))) {
+                // be whole signals: the target's own, or through a virtual
+                // interface handle the representative's.
+                const auto state = [&](Index s) {
+                    return valid(s) && (ir_.tag(s) == Tag::Signal || ir_.tag(s) == Tag::IfaceSignal);
+                };
+                if (!state(info.force_site) || (info.assign_site != kNoIndex && !state(info.assign_site))) {
                     report(Rule::OperandKind, i);
                 }
                 return;
