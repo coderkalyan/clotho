@@ -1529,41 +1529,108 @@ void Lowerer::scan_force_targets(const Statement& body) {
     body.visit(v);
 }
 
-// Collect-pass scan: note every whole variable a `force` or procedural `assign` in
-// a procedural block targets. join_pca_targets gives them state once every
-// instance is collected; an unsupported shape is left for the lowering to refuse.
-void Lowerer::record_pca_var_sites(const Statement& body) {
+// Find every variable a `force` or procedural `assign` in a procedural block of
+// the design targets, before anything lowers: a member of an instance body by its
+// position in the body, so join_pca_targets can give every instance of the type
+// its state, and a package / `$unit` / class-static variable by symbol, which
+// alloc_unscoped_pca_states gives its one state. A net, and a shape the lowering
+// refuses, needs none. The scan reads procedural blocks only (docs/TODO.md,
+// "`force` inside a task or function").
+void Lowerer::scan_pca_targets(const RootSymbol& root, PcaTargets& out) {
     struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
-        Lowerer* self;
-        void     handle(const ProceduralAssignStatement& s) {
-            if (s.assignment.kind == ExpressionKind::Assignment) {
-                bool               is_net = false;
-                const ValueSymbol* sym    = self->force_target(s.assignment.as<AssignmentExpression>().left(), &is_net);
-                if (sym != nullptr && !is_net) {
-                    self->pca_var_sites_.push_back({ .sym = sym, .is_force = s.isForce });
-                }
+        PcaTargets* out      = nullptr;
+        bool        in_block = false;
+
+        void handle(const SubroutineSymbol&) {}
+        void handle(const ProceduralBlockSymbol& blk) {
+            in_block = true;
+            visitDefault(blk);
+            in_block = false;
+        }
+        void handle(const ProceduralAssignStatement& s) {
+            if (in_block && s.assignment.kind == ExpressionKind::Assignment) {
+                note(s.assignment.as<AssignmentExpression>().left(), !s.isForce);
             }
             visitDefault(s);
         }
+        void note(const Expression& lhs, bool assign) {
+            if (lhs.kind != ExpressionKind::NamedValue && lhs.kind != ExpressionKind::HierarchicalValue) {
+                return;
+            }
+            const slang::ast::Type& t = lhs.type->getCanonicalType();
+            const ValueSymbol&      v = lhs.as<ValueExpressionBase>().symbol;
+            if ((!t.isIntegral() && !t.isFloating()) || v.kind == SymbolKind::Net) {
+                return;
+            }
+            const Scope* owner = v.getParentScope();
+            while (owner != nullptr && owner->asSymbol().kind != SymbolKind::InstanceBody) {
+                owner = owner->asSymbol().getParentScope();
+            }
+            if (owner == nullptr) {
+                for (auto& [sym, a] : out->unscoped) {
+                    if (sym == &v) {
+                        a = a || assign;
+                        return;
+                    }
+                }
+                out->unscoped.emplace_back(&v, assign);
+                return;
+            }
+            const auto&                 body = owner->asSymbol().as<slang::ast::InstanceBodySymbol>();
+            const std::vector<uint32_t> path = member_ordinal_path(v, body);
+            for (PcaTargets::Member& m : out->members) {
+                if (m.path == path && m.body->hasSameType(body)) {
+                    m.assign = m.assign || assign;
+                    return;
+                }
+            }
+            out->members.push_back({ .body = &body, .path = path, .assign = assign });
+        }
     };
     Scan v;
-    v.self = this;
-    body.visit(v);
+    v.out = &out;
+    root.visit(v);
 }
 
-// A hidden 2-state i32 state signal (`force_site` / `assign_site` / net force
-// `active`) that powers up to 0. A variable's lives in the variable's own
-// instance (`node`) and is named after it, so every instance of a definition
-// names and places its state alike; a net site's lives where its force is.
+// The state of each package, `$unit` and class-static target (PcaTargets::
+// unscoped), owned by the variable's own unit as the variable is, so every top
+// reaches it the way it reaches the variable. Run by the globals Lowerer once the
+// package variables are registered and before any of their writers lowers.
+void Lowerer::alloc_unscoped_pca_states() {
+    for (const auto& [sym, assign] : pca_->unscoped) {
+        const ir::Signal v          = signal_of(*sym);
+        const auto [it, inserted]   = pca_->vars.try_emplace(static_cast<uint32_t>(v));
+        ForceInfo&       fi         = it->second;
+        const auto       state      = [&](const char* tag) {
+            ir::SignalInfo info;
+            info.name = module_.signal(v).name + tag;
+            info.type = make_int_type(32, false);
+            const ir::Signal s = module_.add_signal(std::move(info));
+            own_signal(s, owner_in(sym->getParentScope()));
+            return s;
+        };
+        if (inserted) {
+            fi.site = state("$force_site");
+        }
+        if (assign && !fi.has_assign) {
+            fi.has_assign  = true;
+            fi.assign_site = state("$assign_site");
+        }
+    }
+}
+
+// A hidden 2-state i32 state signal (`force_site` / `assign_site`) of a member
+// of an instance, in that instance (`node`) and named after the member, so every
+// instance of a type names and places its state alike.
 ir::Signal Lowerer::new_pca_state(const char* tag, ir::Signal target, ir::InstanceScope* node) {
     ir::SignalInfo info;
     info.name = module_.signal(target).name + tag;
     info.type = make_int_type(32, false);
-    return node != nullptr ? register_signal_in(*node, std::move(info)) : register_signal(std::move(info));
+    return register_signal_in(*node, std::move(info));
 }
 
-// Route one force statement to the net registration path. A variable target
-// was noted in Collect (record_pca_var_sites).
+// Route one force statement to the net registration path. A variable target was
+// found before anything lowered (scan_pca_targets).
 void Lowerer::register_pca_site(const ProceduralAssignStatement& s) {
     const Expression&  lhs    = s.assignment.as<AssignmentExpression>().left();
     const ValueSymbol* root   = lvalue_root(lhs);
@@ -1654,129 +1721,55 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     }
 }
 
-// Give every variable a `force` / procedural `assign` of this top targets its
-// state, and the same state to the same variable of every instance it shares
-// code with: its specialization, and for an interface every instance of the same
-// type, which a virtual interface handle can name (LRM 25.9). The code is one for
-// all of them, so each gates alike and reads its own instance's state (an
-// unforced instance's stays 0), and a write through a handle finds the state of
-// whichever instance the handle names at the representative's def-local position.
+// Give every instance of this top whose type has a forced or assigned member
+// (PcaTargets::members, found design-wide by scan_pca_targets) that member's
+// state, whether this instance is the one forced or not: the instances of a type
+// share their code, so each gates alike and reads its own state (an unforced
+// instance's stays 0), and a write through a virtual interface handle finds the
+// state of whichever instance it names at the representative's def-local position
+// (LRM 25.9). Every top does the same for its own instances, so the type's
+// instances under every top carry the state.
 //
 // Runs once Collect has registered every instance of the top and before Classify
-// or Emit appends to any, in flat-signal order, so every instance of a
-// specialization takes its state signals in the same order.
+// or Emit appends to any. Members are taken in scan order for every instance, so
+// every instance of a type appends its state signals in the same order.
 void Lowerer::join_pca_targets() {
-    const auto iface_body = [](const slang::ast::InstanceBodySymbol& body) {
-        return body.getDefinition().definitionKind == slang::ast::DefinitionKind::Interface;
-    };
-    // An interface another top gave state to, instantiated under this one too: this
-    // top's instances would lack the state the handle code reads.
-    for (const auto& [body, top] : pca_->iface_bodies) {
-        if (top == top_inst_) {
-            continue;
-        }
-        for (const VifInstance& inst : vif_defs_->insts) {
-            if (find_node(inst.scope) != nullptr && inst.body->hasSameType(*body)) {
-                // TODO: an interface with a forced or assigned member instantiated
-                // under more than one top -- the instances of the type would need
-                // their state allocated before the first top lowers.
-                const slang::SourceLocation at =
-                  inst.body->parentInstance != nullptr ? inst.body->parentInstance->location : inst.body->location;
-                cur_range_ = slang::SourceRange{ at, at };
-                fail("a force or procedural assign of a member of interface '" +
-                     std::string(body->getDefinition().name) + "', which more than one top instantiates, is not "
-                     "supported");
-            }
-        }
-    }
-
-    struct Want {
-        const ValueSymbol* sym    = nullptr;
-        bool               assign = false;
-    };
-    ankerl::unordered_dense::map<uint32_t, Want> want;
-    for (const PcaVarSite& s : pca_var_sites_) {
-        const ValueSymbol& c   = canonical_value_symbol(*s.sym);
-        const auto         sit = sigmap_.find(&c);
-        if (sit == sigmap_.end()) {
-            continue; // a target in another top: lower_proc_assign refuses it (kUnregisteredForce)
-        }
-        Want& w = want[static_cast<uint32_t>(sit->second)];
-        w.sym   = &c;
-        w.assign = w.assign || !s.is_force;
-    }
-    pca_var_sites_.clear();
-    std::vector<uint32_t> order;
-    order.reserve(want.size());
-    for (const auto& [sig, w] : want) {
-        order.push_back(sig);
-    }
-    std::ranges::sort(order);
-
-    for (const uint32_t sig : order) {
-        const Want&              w     = want.at(sig);
-        const slang::ast::Scope* owner = w.sym->getParentScope();
-        while (owner != nullptr && owner->asSymbol().kind != SymbolKind::InstanceBody) {
-            owner = owner->asSymbol().getParentScope();
-        }
-        // (flat signal, its instance) for the target and each twin.
-        std::vector<std::pair<ir::Signal, ir::InstanceScope*>> twins;
-        if (owner == nullptr) {
-            // A package or `$unit` variable: one instance, held at the top.
-            twins.emplace_back(static_cast<ir::Signal>(sig), &top_scope_);
-        } else {
-            const auto& body  = owner->asSymbol().as<slang::ast::InstanceBodySymbol>();
-            const auto  scope = owners_->scopes.find(&body);
-            if (scope == owners_->scopes.end()) {
-                fail("internal: a force target's instance was not collected");
-            }
-            std::vector<const slang::ast::InstanceBodySymbol*> bodies =
-              spec_bodies_[owners_->scope_specs.at(scope->second.index).spec];
-            if (iface_body(body)) {
-                for (const VifInstance& inst : vif_defs_->insts) {
-                    if (inst.body->hasSameType(body) && std::ranges::find(bodies, inst.body) == bodies.end()) {
-                        if (find_node(inst.scope) == nullptr) {
-                            // TODO: see the matching refusal above.
-                            cur_range_ = slang::SourceRange{ w.sym->location, w.sym->location };
-                            fail("a force or procedural assign of a member of interface '" +
-                                 std::string(body.getDefinition().name) +
-                                 "', which more than one top instantiates, is not supported");
-                        }
-                        bodies.push_back(inst.body);
-                    }
+    for (const PcaTargets::Member& m : pca_->members) {
+        for (const auto& [spec, bodies] : spec_bodies_) {
+            for (const slang::ast::InstanceBodySymbol* body : bodies) {
+                if (!body->hasSameType(*m.body)) {
+                    continue;
                 }
-            }
-            const std::vector<uint32_t> path = member_ordinal_path(*w.sym, body);
-            for (const slang::ast::InstanceBodySymbol* other : bodies) {
-                const auto* twin = other == &body ? w.sym : symbol_at_path(*other, path);
+                const auto* twin = symbol_at_path(*body, m.path);
                 const auto* vs   = twin != nullptr ? twin->as_if<ValueSymbol>() : nullptr;
-                const auto  tsig = vs != nullptr ? sigmap_.find(&canonical_value_symbol(*vs)) : sigmap_.end();
-                const auto  tsc  = owners_->scopes.find(other);
-                if (vs == nullptr || vs->name != w.sym->name || tsig == sigmap_.end() || tsc == owners_->scopes.end()) {
-                    fail("internal: an instance of a specialization lacks a force target's twin");
+                if (vs == nullptr) {
+                    fail("internal: an instance of a forced member's type lacks the member");
                 }
-                if (iface_body(body) && pca_->vif_ungated.contains(static_cast<uint32_t>(tsig->second))) {
-                    // TODO: a write through a handle lowered before the top that forces
-                    // the member (a class method another top lowered first).
-                    cur_range_ = slang::SourceRange{ w.sym->location, w.sym->location };
-                    fail("a force or procedural assign of interface member '" + std::string(w.sym->name) +
-                         "', which a virtual interface wrote before this top was lowered, is not supported");
+                // The storage the member names, which a port can alias to its
+                // connection; the state goes with the storage.
+                const ValueSymbol& c = canonical_value_symbol(*vs);
+                if (c.kind == SymbolKind::Net) {
+                    continue;
                 }
-                twins.emplace_back(tsig->second, scope_node(tsc->second.index));
-            }
-            if (iface_body(body)) {
-                pca_->iface_bodies.emplace_back(&body, top_inst_);
-            }
-        }
-        for (const auto& [tsig, node] : twins) {
-            const auto [it, inserted] = pca_->vars.try_emplace(static_cast<uint32_t>(tsig));
-            ForceInfo& fi             = it->second;
-            if (inserted) {
-                fi.site = new_pca_state("$force_site", tsig, node);
-            }
-            if (w.assign && !fi.has_assign) {
-                fi.has_assign  = true;
-                fi.assign_site = new_pca_state("$assign_site", tsig, node);
+                const Scope* home = c.getParentScope();
+                while (home != nullptr && home->asSymbol().kind != SymbolKind::InstanceBody) {
+                    home = home->asSymbol().getParentScope();
+                }
+                const auto scope = home != nullptr ? owners_->scopes.find(home) : owners_->scopes.end();
+                if (scope == owners_->scopes.end()) {
+                    fail("internal: a forced member's instance was not collected");
+                }
+                ir::InstanceScope* node = scope_node(scope->second.index);
+                const ir::Signal   tsig = signal_of(c);
+                const auto [it, inserted] = pca_->vars.try_emplace(static_cast<uint32_t>(tsig));
+                ForceInfo&         fi     = it->second;
+                if (inserted) {
+                    fi.site = new_pca_state("$force_site", tsig, node);
+                }
+                if (m.assign && !fi.has_assign) {
+                    fi.has_assign  = true;
+                    fi.assign_site = new_pca_state("$assign_site", tsig, node);
+                }
             }
         }
     }
@@ -1876,13 +1869,11 @@ ForceInfo* Lowerer::pca_info_of_lvalue(const Expression& lhs) {
         if (!rep) {
             return nullptr; // the write's own lowering reports what it cannot reach
         }
+        // Every instance of a type with a forced member has its state before any
+        // write of it lowers (scan_pca_targets), so the representative answers
+        // for all of them.
         const auto fit = pca_->vars.find(static_cast<uint32_t>(*rep));
-        if (fit == pca_->vars.end()) {
-            // A later top that forces the member must know this write is ungated.
-            pca_->vif_ungated.insert(static_cast<uint32_t>(*rep));
-            return nullptr;
-        }
-        return &fit->second;
+        return fit == pca_->vars.end() ? nullptr : &fit->second;
     }
     const ValueSymbol* root = lvalue_root(lhs);
     return root == nullptr ? nullptr : force_info_of(*root);

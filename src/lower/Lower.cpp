@@ -812,7 +812,10 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     root.visit(wait_prop_scan);
     UnitOwners unit_owners;
     ForeignCalls foreign_calls;
-    PcaTargets   pca_targets;
+    // Every variable a force / procedural assign targets, before anything lowers:
+    // each instance gets its state before any write of it lowers, under any top.
+    PcaTargets pca_targets;
+    Lowerer::scan_pca_targets(root, pca_targets);
     if (root.topInstances.size() > 1) {
         collect_foreign_calls(root, foreign_calls);
     }

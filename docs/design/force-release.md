@@ -56,14 +56,13 @@ conditional / impure-RHS force). We adopt that insight but not the structure:
 
 A pre-pass collects every signal that is a whole-signal `force`/`assign` target. Only
 these carry override state and gated writers. Everything else lowers unchanged. For a
-variable, the Collect walk notes the target of every `force`/`assign` in a procedural
-block (`record_pca_var_sites`), and `join_pca_targets` gives the targets their state
-once every instance of the top is collected, before Classify or Emit appends to any
-instance, so a target named by hierarchy resolves whatever the order of the forcing
-block and the instance. A net site is registered in the Classify walk
-(`scan_force_targets`), which needs the net facts Collect finalizes. Both read
-procedural blocks only, so a `force` inside a task or function is refused on a net,
-and on a variable that no block forces (docs/TODO.md).
+variable, `scan_pca_targets` walks the procedural blocks of the whole design before
+anything lowers, and notes each target: a member of an instance body by the body's
+type and the member's position in it, a package, `$unit` or class-static variable by
+symbol. A net site is registered in the Classify walk (`scan_force_targets`), which
+needs the net facts Collect finalizes. Both read procedural blocks only, so a `force`
+inside a task or function is refused on a net, and on a variable that no block forces
+(docs/TODO.md).
 
 ### Per-forceable-variable state (hidden signals)
 
@@ -71,27 +70,29 @@ and on a variable that no block forces (docs/TODO.md).
 - `assign_site` (2-state i32, 0 = none) — id of the currently-active `assign` site;
   allocated only for variables that are an `assign` target.
 
-The state lives with the variable, not with the force: in the variable's own instance,
-named after it (`<var>$force_site`), and in every instance of the variable's
-specialization, forced or not. For an interface it is also every instance of the same
-type (`hasSameType`), which a virtual interface handle can name. This is what makes the
-state reachable wherever a write of the variable is:
+The state lives with the variable, not with the force. A member's is in the member's
+own instance, named after it (`<var>$force_site`), and in every instance of the same
+type (`hasSameType`) under every top, forced or not: each top's `join_pca_targets`
+gives its own instances theirs, once Collect has registered them and before Classify or
+Emit appends to any. A package, `$unit` or class-static variable's state is owned by
+the variable's own unit (`alloc_unscoped_pca_states`, on the globals Lowerer, before any
+initializer or body lowers), so every top reaches it as it reaches the variable. This is
+what makes the state reachable wherever a write of the variable is:
 
-- The instances of a specialization share their code, so the gate in that code reads
-  each instance's own state, 0 in an instance nothing forces. Forcing `u1.q` leaves
-  `u1` and `u2` alike.
+- The instances of a type share their code, so the gate in that code reads each
+  instance's own state, 0 in an instance nothing forces. Forcing `u1.q` leaves `u1`
+  and `u2` alike.
 - A write through a handle (`vif.q = e`, `vif.q <= e`, a task of the interface called
   through one) cannot know which instance it writes until it runs. The state of the
   member's representative sits at the same def-local position in every instance, so
   `IfaceSignal(handle, representative's force_site)` reads the state of the instance
   the handle names, the same way `IfaceSignal(handle, q)` writes its `q`.
 
-The states are appended in flat-signal order of the targets, to every instance of the
-group at once, so each instance takes them in the same order. The state table
-(`PcaTargets`) is design-wide, because a write through a handle may be lowered on the
-globals Lowerer (a package class method). An interface instantiated under more than one
-top cannot have a forced member: the second top's join would have to add state to the
-first top's instances, which are already lowered, so it is refused (docs/TODO.md).
+Every instance appends its states in the order the scan found the members, so the
+instances of a type, under any top, lay them out alike. Since the scan precedes all
+lowering, every instance has its state before any write of it lowers, whichever top or
+Lowerer the write belongs to; the state table (`PcaTargets`) is design-wide because a
+write through a handle may be lowered on the globals Lowerer (a package class method).
 
 Site ids disambiguate re-force / re-assign (LRM last-wins): each textual force/assign
 site targeting a signal gets a unique per-signal id; a stale site's re-eval process

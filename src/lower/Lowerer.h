@@ -998,9 +998,10 @@ struct VifDefs {
 // (last-force-wins); `release` clears the site and the value holds.
 //
 // The state lives beside the variable, in its own instance, and every instance of
-// the variable's specialization carries it (join_pca_targets): code shared between
-// the instances then gates alike, and a virtual interface handle reaches the state
-// of whichever instance it names at the same def-local position as the member.
+// the variable's type under every top carries it (join_pca_targets): code shared
+// between the instances then gates alike, and a virtual interface handle reaches
+// the state of whichever instance it names at the same def-local position as the
+// member.
 struct ForceInfo {
     ir::Signal site{ 0 };     // force_site, always allocated
     uint32_t   next_site = 0; // ids handed to textual force sites, 1-based
@@ -1012,17 +1013,26 @@ struct ForceInfo {
     uint32_t   next_assign = 0;
 };
 
-// Design-wide force / assign state of variables, keyed by flat signal, shared by
-// every Lowerer: a write through a virtual interface handle may lower on the
-// globals Lowerer (a package class method), which never saw the forcing top.
+// Design-wide force / assign targets and state, shared by every Lowerer. The
+// targets are found before anything lowers (scan_pca_targets), so every instance
+// has its state before any write of it lowers, whichever top or Lowerer that
+// write belongs to: a write through a handle may lower on the globals Lowerer.
 struct PcaTargets {
+    // A member of an instance body some procedural block forces or assigns: every
+    // instance of the body's type (hasSameType) gets state for the member at
+    // `path` (member_ordinal_path). In scan order, so every instance appends its
+    // states in the same order.
+    struct Member {
+        const slang::ast::InstanceBodySymbol* body;
+        std::vector<uint32_t>                 path;
+        bool                                  assign;
+    };
+    std::vector<Member> members;
+    // A package, `$unit` or class-static variable some procedural block forces
+    // or assigns: one instance, state allocated by the globals Lowerer.
+    std::vector<std::pair<const slang::ast::ValueSymbol*, bool>> unscoped;
+    // Flat signal -> its state.
     ankerl::unordered_dense::map<uint32_t, ForceInfo> vars;
-    // Interface bodies with a forced member, by the top whose join gave them state:
-    // an instance of the same type under another top has no state.
-    std::vector<std::pair<const slang::ast::InstanceBodySymbol*, const slang::ast::InstanceSymbol*>> iface_bodies;
-    // Members written through a handle before any of their instances had state, so
-    // the write was lowered ungated.
-    ankerl::unordered_dense::set<uint32_t> vif_ungated;
 };
 
 // Walks the elaborated AST of one top module into an ir::Module.
@@ -1190,6 +1200,10 @@ public:
     void set_pca_targets(PcaTargets* pca) {
         pca_ = pca;
     }
+
+    // Find every variable a `force` / procedural `assign` in a procedural block of
+    // the design targets, before anything lowers (PcaTargets).
+    static void scan_pca_targets(const RootSymbol& root, PcaTargets& out);
 
     // Diagnostics for members this Lowerer recovered past, and whether it did so
     // at all. Drained by lower_compilation once the walk finishes.
@@ -2075,13 +2089,6 @@ private:
     // Nets, bit/part/element-selects and aggregates are guarded loud below.
     PcaTargets  own_pca_;
     PcaTargets* pca_ = &own_pca_;
-    // The variable targets the Collect walk met, as written: canonicalized and
-    // given their state by join_pca_targets once every instance is collected.
-    struct PcaVarSite {
-        const ValueSymbol* sym;
-        bool               is_force;
-    };
-    std::vector<PcaVarSite> pca_var_sites_;
 
     // One `force` of a net (LRM 10.6.2), whole or a constant bit/part-select. A net
     // has no procedural writers to gate; instead each force site contributes a
@@ -2131,7 +2138,7 @@ private:
 
     void scan_force_targets(const Statement& body);
 
-    void record_pca_var_sites(const Statement& body);
+    void alloc_unscoped_pca_states();
 
     void join_pca_targets();
 
