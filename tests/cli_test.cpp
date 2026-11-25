@@ -1030,6 +1030,29 @@ TEST_CASE("cli: -G overrides a parameter of the top-level module") {
         CHECK(r.code == 1);
         CHECK(contains(r.err, "is not a valid form of parameter override"));
     }
+    // slang drops an override that names no top parameter, silently. iverilog's
+    // `-P` reports the same case as an error.
+    SUBCASE("an override naming no parameter of any top is an error") {
+        const Result r = s.run(std::format("run -GNOPE=5 \"{}\"", design.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "-G NOPE: no top-level module has a parameter named 'NOPE'"));
+        CHECK(r.out.empty());
+    }
+    // slang applies a simple-name override to a localparam, which LRM 6.20.4 does
+    // not let a command line change; `-G top.L=9` (the defparam form) is already
+    // refused by slang.
+    SUBCASE("an override of a localparam is an error") {
+        const fs::path local = s.write("local.sv", R"(
+module top;
+    localparam int L = 7;
+    initial $display("L=%0d", L);
+endmodule
+)");
+        const Result r = s.run(std::format("run -GL=9 \"{}\"", local.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "'L' is a localparam of top 'top'"));
+        CHECK(r.out.empty());
+    }
 }
 
 TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup") {

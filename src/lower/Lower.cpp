@@ -694,6 +694,54 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         timings->frontend_ms += ms_since(t_fe);
     }
 
+    // `-G NAME=value`: slang applies a simple-name override to every top with a
+    // parameter of that name and says nothing when none has one, and it does not
+    // skip a localparam, which a command-line override may not change (LRM 6.20.4)
+    // [unverified wording]. Either way the run would not be the design asked for,
+    // so both are errors, as an unknown name is in iverilog (`-P`). A dotted name
+    // is a defparam path, which slang resolves and reports itself.
+    bool bad_override = false;
+    for (const std::string& opt : comp.getOptions().paramOverrides) {
+        const std::string_view whole(opt);
+        const size_t           eq   = whole.find('=');
+        const std::string_view name = whole.substr(0, eq);
+        if (eq == std::string_view::npos || name.empty() || !std::ranges::all_of(name, [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '$';
+            })) {
+            continue;
+        }
+        bool        found = false;
+        std::string local_in;
+        for (const InstanceSymbol* top : root.topInstances) {
+            for (const auto& p : top->getDefinition().parameters) {
+                if (p.name != name) {
+                    continue;
+                }
+                found = true;
+                if (p.isLocalParam && local_in.empty()) {
+                    local_in = std::string(top->name);
+                }
+            }
+        }
+        std::string msg;
+        if (!found) {
+            msg = "-G " + std::string(name) + ": no top-level module has a parameter named '" + std::string(name) + "'";
+        } else if (!local_in.empty()) {
+            msg = "-G " + std::string(name) + ": '" + std::string(name) + "' is a localparam of top '" + local_in +
+                  "', which cannot be overridden (LRM 6.20.4)";
+        }
+        if (!msg.empty()) {
+            bad_override = true;
+            result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                     .origin   = DiagnosticOrigin::Driver,
+                                                     .code     = "bad-param-override",
+                                                     .message  = std::move(msg) });
+        }
+    }
+    if (bad_override) {
+        return result;
+    }
+
     // A compilation unit with no top-level module/interface/program instance
     // (e.g. a package-only file) is not an elaboration error -- LRM
     // elaboration (§23.3) resolves whatever top instances exist; nothing
