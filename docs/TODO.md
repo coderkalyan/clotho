@@ -793,7 +793,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Complete system task / function library
 
-- [ ] **`$bits` over every type** — the remaining query-function operand types.
 - [ ] **Extended VCD** — the `$dumpports` family.
 - [ ] **`$writememh` / `$writememb`** — writing memory contents to a file.
 - [ ] **PLA modeling tasks** — `$async$and$array`, `$sync$nand$plane` and the rest of

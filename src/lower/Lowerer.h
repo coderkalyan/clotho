@@ -3993,6 +3993,10 @@ private:
                               ir::Builder&          b,
                               const ir::SourceLoc   l);
 
+    ir::Index bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l);
+
     void emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l);
 
     void emit_cast_fatal_unless(ir::Index valid, const CallExpression& call, ir::Builder& b, ir::SourceLoc l);
