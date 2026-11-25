@@ -604,6 +604,120 @@ uint8_t* meta_at(const uint8_t* p) {
     return meta_at(reinterpret_cast<uintptr_t>(p));
 }
 
+// -- Scanning metadata --------------------------------------------------------
+//
+// The collector reads metadata eight granules at a time wherever it can: a word that
+// is all zero is free space, and the tests below pick out, in one word, the bytes
+// that are zero, that start an object, or that start a marked or finalizable one.
+// They are the usual word-at-a-time forms and depend on the byte order.
+static_assert(std::endian::native == std::endian::little, "the metadata scans read words little-endian");
+static_assert(RT_GC_META_START == 0x80 && RT_GC_META_MARK == 0x01 && RT_GC_META_FINALIZE == 0x08,
+              "the word tests below shift START onto MARK and onto FINALIZE");
+
+constexpr uint64_t kLowBits  = 0x0101010101010101ull;
+constexpr uint64_t kHighBits = 0x8080808080808080ull;
+
+uint64_t load_word(const uint8_t* p) {
+    uint64_t w;
+    std::memcpy(&w, p, sizeof w);
+    return w;
+}
+
+// The bytes of `w` that start a marked object, as bit 0 of each.
+uint64_t marked_starts(uint64_t w) {
+    return w & (w >> 7) & kLowBits;
+}
+
+// The bytes of `w` that start an object owing a finalizer, as bit 3 of each.
+uint64_t finalizable_starts(uint64_t w) {
+    return w & (w >> 4) & (kLowBits << 3);
+}
+
+// First granule at or after `i` that is not free, or kGranulesPerBlock.
+uint32_t skip_free(const uint8_t* meta, uint32_t i) {
+    for (; i + 8 <= kGranulesPerBlock; i += 8) {
+        const uint64_t w = load_word(meta + i);
+        if (w != 0) {
+            return i + (static_cast<uint32_t>(std::countr_zero(w)) >> 3);
+        }
+    }
+    while (i < kGranulesPerBlock && meta[i] == 0) {
+        ++i;
+    }
+    return i;
+}
+
+// First granule at or after `i` that is free, or kGranulesPerBlock.
+uint32_t skip_used(const uint8_t* meta, uint32_t i) {
+    for (; i + 8 <= kGranulesPerBlock; i += 8) {
+        const uint64_t w = load_word(meta + i);
+        // The high bit of a byte comes out set where the byte is zero. The subtraction
+        // borrows only out of a zero byte, so nothing below the first one is disturbed,
+        // and the first is the one taken.
+        const uint64_t zero = (w - kLowBits) & ~w & kHighBits;
+        if (zero != 0) {
+            return i + (static_cast<uint32_t>(std::countr_zero(zero)) >> 3);
+        }
+    }
+    while (i < kGranulesPerBlock && meta[i] != 0) {
+        ++i;
+    }
+    return i;
+}
+
+// First granule at or after `i` that is free or starts an object, or
+// kGranulesPerBlock: where the object covering granule `i - 1` ends.
+uint32_t skip_object(const uint8_t* meta, uint32_t i) {
+    for (; i + 8 <= kGranulesPerBlock; i += 8) {
+        const uint64_t w = load_word(meta + i);
+        // As in skip_used, with the bytes that have START already set joining the zero ones.
+        const uint64_t edge = ((w - kLowBits) | w) & kHighBits;
+        if (edge != 0) {
+            return i + (static_cast<uint32_t>(std::countr_zero(edge)) >> 3);
+        }
+    }
+    while (i < kGranulesPerBlock && meta[i] != 0 && (meta[i] & RT_GC_META_START) == 0) {
+        ++i;
+    }
+    return i;
+}
+
+// How many objects start in the `n` granules at `meta`.
+uint64_t count_starts(const uint8_t* meta, uint64_t n) {
+    uint64_t count = 0;
+    uint64_t i     = 0;
+    for (; i + 8 <= n; i += 8) {
+        count += static_cast<uint64_t>(std::popcount(load_word(meta + i) & kHighBits));
+    }
+    for (; i < n; ++i) {
+        count += meta[i] >> 7;
+    }
+    return count;
+}
+
+// Zero `n` metadata bytes. Most objects are a few granules, and for those a call
+// costs more than the stores: two stores that may overlap cover up to 16 bytes.
+void zero_run(uint8_t* p, uint32_t n) {
+    assert(n >= 1 && "a run to zero is not empty");
+    if (n >= 16) {
+        std::memset(p, 0, n);
+    } else if (n >= 8) {
+        const uint64_t z = 0;
+        std::memcpy(p, &z, sizeof z);
+        std::memcpy(p + n - sizeof z, &z, sizeof z);
+    } else if (n >= 4) {
+        const uint32_t z = 0;
+        std::memcpy(p, &z, sizeof z);
+        std::memcpy(p + n - sizeof z, &z, sizeof z);
+    } else if (n >= 2) {
+        const uint16_t z = 0;
+        std::memcpy(p, &z, sizeof z);
+        std::memcpy(p + n - sizeof z, &z, sizeof z);
+    } else {
+        p[0] = 0;
+    }
+}
+
 // An object's metadata byte: the byte of its first granule, which holds its flags.
 uint8_t* meta_ptr(void* handle) {
     assert(handle != nullptr);
@@ -766,7 +880,7 @@ bool grow_heap() {
     assert((reinterpret_cast<uintptr_t>(raw) & kChunkMask) == 0 && "aligned allocation honoured");
     // Zero is the initial state of all of it: every granule free, every block
     // kBlockFree with its cursor at 0 and not young.
-    std::memset(raw, 0, kFirstBlockOffset);
+    std::memset(raw, 0, RT_GC_META_OFFSET + (kChunkBytes >> kGranuleShift));
     auto* const c  = static_cast<ChunkRecord*>(raw);
     c->slot        = static_cast<uint32_t>(g.chunks.size());
     c->blocks_free = kBlocksPerChunk;
@@ -825,12 +939,9 @@ void hole_consumed(const rt_gc_mutator* mut, uint64_t* bytes, uint64_t* objects)
     *bytes = static_cast<uint64_t>(mut->cursor - g.hole_start);
     // Every granule of a free run was zero when the run was handed out, so each START
     // over [hole_start, cursor) is an object this run allocated.
-    const uint8_t* const meta = meta_at(g.hole_start);
-    const uint64_t       n    = *bytes >> kGranuleShift;
+    const uint64_t n = *bytes >> kGranuleShift;
     assert(n <= kGranulesPerBlock && "a run lies in one block");
-    for (uint64_t i = 0; i < n; ++i) {
-        *objects += (meta[i] & RT_GC_META_START) != 0 ? 1u : 0u;
-    }
+    *objects = count_starts(meta_at(g.hole_start), n);
 }
 
 // Commit what the run handed out, then forget it. Reached wherever a run stops being
@@ -903,16 +1014,13 @@ bool find_hole(BlockRef b, uint64_t size, uint32_t from, uint32_t* lo_out, uint3
     const uint64_t       need = size >> kGranuleShift;
     uint32_t             i    = from;
     *longest                  = 0;
-    // Both loops advance strictly, so the search is bounded by one pass over the block.
+    // Each turn moves past one free run, so the search is one pass over the block.
     while (i < kGranulesPerBlock) {
-        if (meta[i] != 0) {
-            ++i;
-            continue;
+        i = skip_used(meta, i);
+        if (i == kGranulesPerBlock) {
+            break;
         }
-        uint32_t end = i + 1;
-        while (end < kGranulesPerBlock && meta[end] == 0) {
-            ++end;
-        }
+        const uint32_t end = skip_free(meta, i);
         if (end - i >= need) {
             *lo_out = i;
             *hi_out = end;
@@ -970,11 +1078,14 @@ bool refill_hole(rt_gc_mutator* mut, uint64_t size) {
 // that guarantees one.
 void take_block(rt_gc_mutator* mut, BlockRef b, uint64_t size) {
     BlockInfo& info = b.info();
-    uint32_t   lo      = 0;
-    uint32_t   hi      = 0;
-    uint32_t   longest = 0;
-    [[maybe_unused]] const bool found = find_hole(b, size, info.cursor, &lo, &hi, &longest);
-    assert(found && "a block's list promised a run this long");
+    uint32_t   lo   = 0;
+    uint32_t   hi   = kGranulesPerBlock;
+    // A free block is one run of the whole block, with nothing to search for.
+    if (info.state != kBlockFree) {
+        uint32_t                    longest = 0;
+        [[maybe_unused]] const bool found   = find_hole(b, size, info.cursor, &lo, &hi, &longest);
+        assert(found && "a block's list promised a run this long");
+    }
     info.state = kBlockOwned;
     publish_hole(mut, b, lo, hi);
 }
@@ -1192,7 +1303,9 @@ uint8_t* alloc_large(rt_gc_mutator* mut, uint64_t size, const rt_alloc_site* sit
         oom_fatal(size, site);
     }
     assert((reinterpret_cast<uintptr_t>(raw) & kChunkMask) == 0 && "aligned allocation honoured");
-    std::memset(raw, 0, RT_GC_LARGE_PAYLOAD);
+    // The record only. Of the metadata, a large object uses the byte of its first
+    // granule, which alloc_object assigns.
+    std::memset(raw, 0, sizeof(ChunkRecord));
     auto* const c  = static_cast<ChunkRecord*>(raw);
     c->large_bytes = size;
     c->slot        = static_cast<uint32_t>(g.large.size());
@@ -2251,24 +2364,28 @@ void unpin_all() {
 // that had one the note that it was old (kMetaWasOld). After this a mark means "reached
 // by this collection". A free block has no object and is skipped whole.
 void clear_marks() {
-    const auto clear = [](uint8_t* m) {
-        if ((*m & (RT_GC_META_START | RT_GC_META_MARK)) == (RT_GC_META_START | RT_GC_META_MARK)) {
-            *m = static_cast<uint8_t>((*m & ~RT_GC_META_MARK) | kMetaWasOld);
-        }
-    };
     for (ChunkRecord* c : g.chunks) {
         for (uint32_t i = 0; i < kBlocksPerChunk; ++i) {
             if (c->block[i].state == kBlockFree) {
                 continue;
             }
             uint8_t* const meta = BlockRef{ c, i }.meta();
-            for (uint32_t k = 0; k < kGranulesPerBlock; ++k) {
-                clear(&meta[k]);
+            for (uint32_t k = 0; k < kGranulesPerBlock; k += 8) {
+                uint64_t       w = load_word(meta + k);
+                const uint64_t t = marked_starts(w);
+                if (t != 0) {
+                    // MARK off and kMetaWasOld on, in each byte `t` names.
+                    w = (w & ~t) | (t << 4);
+                    std::memcpy(meta + k, &w, sizeof w);
+                }
             }
         }
     }
     for (ChunkRecord* c : g.large) {
-        clear(meta_at(reinterpret_cast<uint8_t*>(c) + RT_GC_LARGE_PAYLOAD));
+        uint8_t* const m = meta_at(reinterpret_cast<uint8_t*>(c) + RT_GC_LARGE_PAYLOAD);
+        if ((*m & RT_GC_META_MARK) != 0) {
+            *m = static_cast<uint8_t>((*m & ~RT_GC_META_MARK) | kMetaWasOld);
+        }
     }
 }
 
@@ -2281,53 +2398,89 @@ void finalize_object(void* handle) {
     map->finalize(handle);
 }
 
+// Run the finalizers a block owes, every object in it being dead.
+uint64_t finalize_block(BlockRef b) {
+    const uint8_t* const meta = b.meta();
+    uint8_t* const       base = b.base();
+    uint64_t             ran  = 0;
+    for (uint32_t i = 0; i < kGranulesPerBlock; i += 8) {
+        // One bit per object, cleared lowest first, so at most eight turns a word.
+        for (uint64_t f = finalizable_starts(load_word(meta + i)); f != 0; f &= f - 1) {
+            const uint64_t granule = i + (static_cast<uint32_t>(std::countr_zero(f)) >> 3);
+            finalize_object(base + (granule << kGranuleShift));
+            ++ran;
+        }
+    }
+    return ran;
+}
+
 // Sweep one block and bring its record up to date. `spare_marked` is false only at
 // teardown, which frees everything. Returns the finalizers run.
 uint64_t sweep_block(BlockRef b, bool spare_marked) {
-    uint8_t* const meta    = b.meta();
-    uint8_t* const base    = b.base();
-    uint64_t       ran     = 0;
-    uint32_t       used    = 0;
-    uint32_t       run     = 0;  // the free run ending at `i`
-    uint32_t       longest = 0;
-    uint32_t       i       = 0;
+    uint8_t* const meta = b.meta();
+    uint8_t* const base = b.base();
+    BlockInfo&     info = b.info();
+    // First, eight granules at a time: is there an object to keep, and a finalizer to run?
+    uint64_t marked = 0;
+    uint64_t owed   = 0;
+    for (uint32_t i = 0; i < kGranulesPerBlock; i += 8) {
+        const uint64_t w = load_word(meta + i);
+        marked |= marked_starts(w);
+        owed |= finalizable_starts(w);
+    }
+    if (!spare_marked || marked == 0) {
+        // Nothing stays, which is the usual end of a block of short-lived objects: the
+        // whole block is freed at once and no object in it is looked at, but for the
+        // ones that owe a finalizer.
+        const uint64_t ran = owed != 0 ? finalize_block(b) : 0;
+        std::memset(meta, 0, kGranulesPerBlock);
+        info.cursor  = 0;
+        info.used    = 0;
+        info.max_run = kGranulesPerBlock;
+        info.young   = 0;
+        info.state   = kBlockFree;
+        return ran;
+    }
+    uint64_t ran     = 0;
+    uint32_t used    = 0;
+    uint32_t run     = 0;  // the free run ending at `i`
+    uint32_t longest = 0;
+    uint32_t i       = 0;
     // `i` only ever advances, so one pass over the block's metadata bounds the walk.
     while (i < kGranulesPerBlock) {
         const uint8_t m = meta[i];
         if (m == 0) {
-            ++run;
-            ++i;
+            const uint32_t next = skip_free(meta, i);
+            run += next - i;
+            i = next;
             continue;
         }
         assert((m & RT_GC_META_START) != 0 && "the sweep steps from object to object");
-        uint32_t end = i + 1;
-        while (end < kGranulesPerBlock && meta[end] != 0 && (meta[end] & RT_GC_META_START) == 0) {
-            ++end;
-        }
-        if (spare_marked && (m & RT_GC_META_MARK) != 0) {
+        const uint32_t end = skip_object(meta, i + 1);
+        if ((m & RT_GC_META_MARK) != 0) {
             meta[i] = static_cast<uint8_t>(m & ~kMetaWasOld);
             used += end - i;
             longest = run > longest ? run : longest;
             run     = 0;
         } else {
-            assert((!spare_marked || (m & RT_GC_META_PINNED) == 0) && "a pinned object would be marked");
-            assert((!spare_marked || (m & RT_GC_META_LOGGED) == 0) && "a logged object is old, so marked");
+            assert((m & RT_GC_META_PINNED) == 0 && "a pinned object would be marked");
+            assert((m & RT_GC_META_LOGGED) == 0 && "a logged object is old, so marked");
             if ((m & RT_GC_META_FINALIZE) != 0) {
                 finalize_object(base + (static_cast<uint64_t>(i) << kGranuleShift));
                 ++ran;
             }
-            std::memset(meta + i, 0, end - i);
+            zero_run(meta + i, end - i);
             run += end - i;
         }
         i = end;
     }
-    longest         = run > longest ? run : longest;
-    BlockInfo& info = b.info();
-    info.cursor     = 0;
-    info.used       = static_cast<uint16_t>(used);
-    info.max_run    = static_cast<uint16_t>(longest);
-    info.young      = 0;
-    info.state      = used == 0 ? kBlockFree : (used == kGranulesPerBlock ? kBlockFull : kBlockPartial);
+    longest      = run > longest ? run : longest;
+    info.cursor  = 0;
+    info.used    = static_cast<uint16_t>(used);
+    info.max_run = static_cast<uint16_t>(longest);
+    info.young   = 0;
+    info.state   = used == kGranulesPerBlock ? kBlockFull : kBlockPartial;
+    assert(used != 0 && "a block with a marked object is not free");
     return ran;
 }
 
@@ -2372,12 +2525,13 @@ bool keep_large(ChunkRecord* c, bool spare_marked) {
     return true;
 }
 
-// How many wholly free chunks a full collection leaves mapped: what the next budget of
-// allocation will fill, so that a design allocating at a steady rate does not return
-// and re-request the same chunks at every full collection.
-uint64_t chunk_reserve() {
-    const uint64_t payload = static_cast<uint64_t>(kBlocksPerChunk) * RT_GC_BLOCK_BYTES;
-    return (g.cfg.nursery_bytes + payload - 1) / payload;
+// How many free blocks a full collection leaves the heap: as many as were allocated
+// from since the last collection, which the next cycle will want again, and never
+// fewer than one allocation budget. Without the first a design that allocates at a
+// steady rate would return and re-request the same chunks at every full collection.
+uint64_t block_reserve() {
+    const uint64_t budget = (g.cfg.nursery_bytes + RT_GC_BLOCK_BYTES - 1) / RT_GC_BLOCK_BYTES;
+    return g.young.size() > budget ? g.young.size() : budget;
 }
 
 // Give a chunk with no object in it back to the system. The last entry of g.chunks
@@ -2434,16 +2588,21 @@ uint64_t sweep_all(bool spare_marked) {
         }
         g.stats.blocks_free += c->blocks_free;
     }
-    // Release from the back, so the swap that fills a slot never moves an unvisited chunk
-    // into a visited one.
-    uint64_t spare = chunk_reserve();
+    // The free blocks of chunks that still hold an object count toward the reserve,
+    // and whole chunks are kept only until it is met. Released from the back, so the
+    // swap that fills a slot never moves an unvisited chunk into a visited one.
+    const uint64_t want = block_reserve();
+    uint64_t       have = 0;
+    for (const ChunkRecord* c : g.chunks) {
+        have += c->blocks_free != kBlocksPerChunk ? c->blocks_free : 0u;
+    }
     for (size_t n = g.chunks.size(); n > 0; --n) {
         ChunkRecord* const c = g.chunks[n - 1];
         if (c->blocks_free != kBlocksPerChunk) {
             continue;
         }
-        if (spare > 0) {
-            spare -= 1;
+        if (have < want) {
+            have += kBlocksPerChunk;
             continue;
         }
         release_chunk(c);

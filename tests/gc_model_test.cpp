@@ -603,16 +603,21 @@ TEST_CASE("gc heap: empty chunks go back to the system after a full collection")
     CHECK(young.objects_live == 2);
     CHECK(young.blocks_free > grown.blocks_free);
     CHECK(young.heap_bytes == grown.heap_bytes);
-    // A full one keeps the chunks its two objects are in and one more.
+    // A full one, with nothing allocated since, keeps only the chunks its two objects
+    // are in.
     const rt_gc_stats full = heap.collect(RT_GC_KIND_FULL);
     CHECK(full.objects_live == 2);
     CHECK(full.heap_bytes <= 3ull * RT_GC_CHUNK_BYTES);
     CHECK(full.blocks_free < young.blocks_free);
     CHECK(rt_gc_find_object(kept) == kept);
     CHECK(load(kept, kStampOffset) == 7);
-    // And the heap grows again when asked.
+    // The heap grows again when asked, and a full collection right after the burst
+    // keeps the chunks the burst used, which the next burst will want.
     for (uint32_t n = 0; n < kCount; ++n) {
         heap.make(1, kMedium, n);
     }
-    CHECK(Heap::stats().heap_bytes >= grown.heap_bytes);
+    const rt_gc_stats regrown = Heap::stats();
+    CHECK(regrown.heap_bytes >= grown.heap_bytes);
+    CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes == regrown.heap_bytes);
+    CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes <= 3ull * RT_GC_CHUNK_BYTES);
 }
