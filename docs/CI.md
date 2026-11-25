@@ -124,22 +124,30 @@ that tries is rejected outright with no jobs scheduled at all.
 
 ## Platform status
 
-Nightly on `main`, 2026-11-24 (`bbe3b9a1`):
+`main` at `21ed179d` (run 45538123706) and `ci/zig-arm64` at `c7978f9d` (run
+45538123744), 2026-11-25:
 
 | target | result |
 |---|---|
-| linux-x64, linux-x64-sanitize, linux-arm64, windows-x64 | pass |
-| macos-arm64, macos-x64 | one failure since the case was added (`b8baaefe`): `build -j 1` and `build -j 3` link different executables (`cli_test`, "build writes the same executable whatever the number of compile threads"). The test linked the two under different names, which lld hashes into a Mach-O's UUID; fixed in `c785cd1d`, not yet confirmed by a run |
-| windows-arm64 | has not built since Zig entered CI (2026-10-19): the official aarch64-windows zig 0.16.0 crashes (exit `0xC0000005`) on any compile, [zig#31865](https://codeberg.org/ziglang/zig/issues/31865). CI now builds libsva with the x86_64 zig, emulated, targeting arm64 (`CLOTHO_LIBSVA_ZIG_TARGET`); not yet confirmed by a run |
+| linux-x64, linux-x64-sanitize, linux-arm64, windows-x64, macos-arm64, macos-x64 | pass |
+| windows-arm64 | builds (with `c7978f9d`); 97 of 105 ctest entries pass. Seven segfault: `function_test`, `strobe_test`, `llvm_backend_test`, `comb_fusion_test`, `struct_test`, `fork_test`, `severity_test`. `exe_test` "simulates as run does, optimized and bounds-checked" gets a different exit code from the executable than from `run` |
 
 Only windows-arm64 is advisory (`continue-on-error`); every other target gates.
 
-**windows-arm64's last suite run** failed three cases, all value-correctness, not
-crashes: `interface_test:95` and `packed_range_test:226` produced `X` where a
-definite value is expected, and `string_test:415` printed the *third* `$display`
-argument's value for the first. That last one looks like argument marshalling
-rather than arithmetic, and Windows on ARM64 differs from AAPCS64 in how
-variadic and floating-point arguments are passed.
+**windows-arm64 never built libsva** before `c7978f9d`: every run from
+2026-10-19, when Zig entered CI, until then crashed (exit `0xC0000005`) in the
+official aarch64-windows zig 0.16.0, which access-violates on any compile
+([zig#31865](https://codeberg.org/ziglang/zig/issues/31865), worked around in zig
+0.17.0). CI now builds libsva with the x86_64 zig, emulated, targeting arm64
+(`CLOTHO_LIBSVA_ZIG_TARGET`).
+
+**Its suite run before that** (before 2026-08-17, when configuring started to
+need Zig) failed three cases, all value-correctness: `interface_test:95` and
+`packed_range_test:226` produced `X` where a definite value is expected, and
+`string_test:415` printed the *third* `$display` argument's value for the first.
+That last one looks like argument marshalling rather than arithmetic, and Windows
+on ARM64 differs from AAPCS64 in how variadic and floating-point arguments are
+passed. Those three files now pass; the segfaults are new since then.
 
 **The crash that used to halt it after 338 cases** was a JITLink defect, worked
 around in the backend. Every design using `assign #d`, a gate delay, or
