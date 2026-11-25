@@ -142,9 +142,8 @@ llvm::StructType* Backend::slot_type(uint32_t width, bool four_state, bool has_z
 // inside an aggregate landed at whatever offset the preceding field left it (an
 // `int` puts it at +4) and every runtime access to it was misaligned -- UB that
 // UBSan reports on a struct-with-string signal and on a container element alike.
-// The trailing bytes stay a byte array so the empty-string image (whose only
-// non-zero byte is the inline capacity, at the end) is expressible without
-// endianness games.
+// The trailing bytes stay a byte array, which holds the inline characters and the
+// length byte.
 llvm::StructType* Backend::str_slot_ty() {
     if (str_slot_ty_ == nullptr) {
         static_assert(sizeof(rt_string) > 8 && sizeof(rt_string) % 8 == 0);
@@ -155,11 +154,9 @@ llvm::StructType* Backend::str_slot_ty() {
 }
 
 // The empty (owned, inline) rt_string image as a typed constant: all zero bytes
-// but the trailing inline-capacity byte.
+// (runtime/RuntimeInternal.h, the SSO block).
 llvm::Constant* Backend::str_empty_const() {
-    std::vector<uint8_t> bytes(sizeof(rt_string) - 8, 0);
-    bytes[bytes.size() - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-    return llvm::ConstantStruct::get(str_slot_ty(), { b_.getInt64(0), llvm::ConstantDataArray::get(ctx_, bytes) });
+    return llvm::ConstantAggregateZero::get(str_slot_ty());
 }
 
 // Field index of the relocation epoch inside each container's handle slot

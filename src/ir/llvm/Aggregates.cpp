@@ -542,8 +542,8 @@ llvm::Constant* Backend::const_data_init(const SignalSlot& s, Ref const_data) {
 // Power-on constant for one signal's storage. A materialized constant table
 // is its own baked image (nothing ever writes it, so the static initializer
 // IS the value). Other arrays and string arrays are zeroinitialized (filled
-// at runtime by `init_state`); a scalar string is the empty inline handle
-// (`rt_string_init`: byte 31 == str_inline_cap); a scalar plane is X
+// at runtime by `init_state`); a scalar string is the empty inline handle, which
+// is all zero; a scalar plane is X
 // (4-state) or 0 (2-state) with the z word set for an undriven-net may-z seed.
 llvm::Constant* Backend::slot_const(const SignalSlot& s) {
     const Ref const_data = mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data;
@@ -587,9 +587,7 @@ llvm::Constant* Backend::slot_const(const SignalSlot& s) {
         return llvm::ConstantAggregateZero::get(s.storage_ty);
     }
     if (s.is_string) {
-        // Empty inline handle (mirrors rt_string_init): the trailing length-marker
-        // byte holds rt_string_inline_cap for len 0, and byte[0] is the NUL
-        // terminator (already 0 from the zero-fill).
+        // Empty inline handle: all zero, as rt_string_init leaves it.
         return str_empty_const();
     }
     llvm::Constant* mm = s.four_state ? x_mm(s.width) : zero(s.width);

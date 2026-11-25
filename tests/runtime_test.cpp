@@ -231,11 +231,35 @@ TEST_CASE("rt_string keeps the length authoritative with an embedded NUL") {
     CHECK(std::strlen(rt_string_data(&s.s)) == 2);   // C view stops at the embedded NUL
 }
 
+TEST_CASE("32 zero bytes are a constructed empty rt_string") {
+    // Generated code builds an empty string by zeroing its storage, and zeroed
+    // design state holds strings nobody initialized, so the all-zero image has
+    // to behave as rt_string_init's does under every operation.
+    rt_string zeroed;
+    std::memset(&zeroed, 0, sizeof(zeroed));
+    CHECK(rt_string_len(&zeroed) == 0);
+    CHECK(rt_string_data(&zeroed)[0] == '\0');
+
+    Str inited;
+    CHECK(std::memcmp(&zeroed, &inited.s, sizeof(zeroed)) == 0);
+    CHECK(rt_string_cmp(&zeroed, &inited.s) == 0);
+
+    // Writable through both forms, and empty again once released.
+    for (const size_t n : { size_t{ 1 }, size_t{ 30 }, size_t{ 31 }, size_t{ 100 } }) {
+        const std::string v(n, 'x');
+        rt_string_assign_bytes(&zeroed, v.data(), v.size(), &kSite);
+        CHECK(str_bytes(zeroed) == v);
+        rt_string_deinit(&zeroed);
+        CHECK(rt_string_len(&zeroed) == 0);
+        CHECK(rt_string_data(&zeroed)[0] == '\0');
+    }
+}
+
 TEST_CASE("rt_string round-trips byte sequences across the inline/heap boundary") {
     Str s;
     CHECK(rt_string_len(&s.s) == 0);
 
-    // Lengths straddling the 31-byte inline capacity, both growing and shrinking.
+    // Lengths straddling the 30-byte inline capacity, both growing and shrinking.
     for (const size_t n : { size_t{ 0 }, size_t{ 1 }, size_t{ 30 }, size_t{ 31 }, size_t{ 32 }, size_t{ 100 },
                             size_t{ 1000 }, size_t{ 31 }, size_t{ 0 }, size_t{ 500 } }) {
         std::string v;

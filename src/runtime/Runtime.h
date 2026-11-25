@@ -1589,8 +1589,9 @@ void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops);
 // 32-byte caller-owned handle embedded in design state (same ownership model as
 // rt_wheel): small strings are stored inline in the handle, larger ones spill
 // to a heap buffer the handle owns. Copies are eager deep copies; handles never
-// share storage. A handle must be constructed with rt_string_init before any
-// other call and released with rt_string_deinit. Every operation that writes a
+// share storage. A handle must be constructed before any other call, by
+// rt_string_init or by zeroing its 32 bytes (the empty string is all zero), and
+// released with rt_string_deinit. Every operation that writes a
 // destination handle requires it already constructed and reuses its existing
 // capacity, so steady-state reassignment in a loop does not allocate. Every
 // operation only READS its source handles, which is what lets the backend hand
@@ -1601,9 +1602,7 @@ typedef struct rt_string {
 
 // Max inline (SSO) string length. One byte shorter than the 31 free bytes so
 // byte[len] can always hold the NUL terminator (rt_string_data is a valid C
-// string). Shared with the backend, which materializes the power-on empty-string
-// constant — the two MUST agree or that constant corrupts. See the SSO block in
-// runtime/RuntimeInternal.h.
+// string). See the SSO block in runtime/RuntimeInternal.h.
 constexpr uint64_t rt_string_inline_cap = 30;
 
 // The heap form of a handle: `rt_string_heap` fills bytes 0..23 and byte 31 holds
@@ -1622,7 +1621,8 @@ struct rt_string_heap {
     uint64_t cap;
 };
 
-// Construct the empty string "" in caller-owned storage. Never allocates.
+// Construct the empty string "" in caller-owned storage: 32 zero bytes. Never
+// allocates.
 void rt_string_init(rt_string* s);
 
 // Release any heap buffer owned by `s`. The caller still owns the handle

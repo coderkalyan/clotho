@@ -199,14 +199,19 @@ std::string unpack_ascii(const char* buf, uint32_t len);
 
 // -- SystemVerilog string representation --
 //
-// fbstring-style small-string optimization over the 32 opaque bytes of an
-// rt_string (Runtime.h). Two forms, discriminated by the MSB of byte 31:
+// Small-string optimization over the 32 opaque bytes of an rt_string (Runtime.h).
+// Two forms, discriminated by the MSB of byte 31:
 //
 //   inline: bytes[0..29] hold up to 30 characters; byte[len] is a NUL
-//           terminator; byte 31 holds 30 - len, so a full 30-char string stores 0
-//           there and no separate flag byte is spent.
+//           terminator; byte 31 holds len. 32 zero bytes are therefore the empty
+//           string, so zeroed storage is a constructed handle.
 //   heap:   a StrHeap {ptr, len, cap} occupies bytes[0..23]; byte 31 is 0x80. The
 //           buffer is always cap+1 bytes so byte[len] can hold the terminator.
+//
+// NOTE: byte 31 holds the length rather than the remaining capacity (fbstring's
+// form, where a full string's zero marker doubles as its terminator). That form
+// buys a 31st inline character and costs the all-zero empty string; zero-is-empty
+// was chosen (docs/design/kernel.md, Storage).
 //
 // The length is explicit (O(1) str_len) and authoritative; a NUL terminator is
 // ALSO maintained at byte[len] so str_data() is a valid C string (C interop /
@@ -246,7 +251,7 @@ inline void str_set_heap(rt_string* s, const StrHeap& h) {
 }
 
 inline uint64_t str_len(const rt_string* s) {
-    return str_is_heap(s) ? str_heap(s).len : str_inline_cap - s->storage[31];
+    return str_is_heap(s) ? str_heap(s).len : s->storage[31];
 }
 
 inline const char* str_data(const rt_string* s) {
@@ -266,8 +271,8 @@ inline void str_assign(rt_string* s, const char* p, uint64_t n, const rt_alloc_s
             if (n != 0) {
                 std::memmove(s->storage, p, n);
             }
-            s->storage[n]  = 0; // NUL terminator (n <= 30, byte 31 stays the marker)
-            s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
+            s->storage[n]  = 0; // NUL terminator (n <= 30, so never the length byte)
+            s->storage[31] = static_cast<unsigned char>(n);
             return;
         }
         char* buf = static_cast<char*>(rt_alloc_checked(n + 1, site, rt_diag_now()));

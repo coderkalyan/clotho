@@ -20,7 +20,7 @@ void str_reserve(rt_string* s, uint64_t n, const rt_alloc_site* site) {
         if (n <= str_inline_cap) {
             return;
         }
-        const uint64_t len = str_inline_cap - s->storage[31];
+        const uint64_t len = s->storage[31];
         char*          buf = static_cast<char*>(rt_alloc_checked(n + 1, site, rt_diag_now()));
         std::memcpy(buf, s->storage, len);
         buf[len] = 0; // preserve the NUL at byte[len] in the new buffer
@@ -51,7 +51,7 @@ void str_set_len(rt_string* s, uint64_t n) {
         return;
     }
     s->storage[n]  = 0;
-    s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
+    s->storage[31] = static_cast<unsigned char>(n);
 }
 
 char str_ascii_lower(char c) {
@@ -89,8 +89,8 @@ struct StrScratch {
 } // namespace
 
 extern "C" void rt_string_init(rt_string* s) {
-    s->storage[0]  = 0;              // NUL terminator for the empty string
-    s->storage[31] = str_inline_cap; // Inline form, length 0.
+    // The empty string is all zero: byte 0 is its terminator, byte 31 its length.
+    std::memset(s->storage, 0, sizeof(s->storage));
 }
 
 extern "C" void rt_string_deinit(rt_string* s) {
@@ -99,7 +99,7 @@ extern "C" void rt_string_deinit(rt_string* s) {
         buffer_free(h.ptr, h.cap + 1);
     }
     s->storage[0]  = 0;
-    s->storage[31] = str_inline_cap;
+    s->storage[31] = 0;
 }
 
 extern "C" void rt_string_assign(rt_string* dst, const rt_string* src, const rt_alloc_site* site) {

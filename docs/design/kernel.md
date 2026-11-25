@@ -104,6 +104,9 @@ when it does.
 - Aggregate members, container elements and subroutine locals are narrowed per
   object by analysis. **Not yet:** by type, with full-form exceptions.
 - Slot types are named LLVM structs, one per distinct shape.
+- A `string` is a 32-byte slot: up to 30 characters inline with the length in the
+  last byte, or a pointer to a heap buffer. 32 zero bytes are the empty string, so
+  zeroed storage needs no string initialization.
 - Power-on values: scalars in constant initializers; arrays zeroed and filled by
   a startup loop.
 - A runtime-indexed unpacked parameter is an ordinary unpacked array, stored
