@@ -722,3 +722,17 @@ own signedness). `reg [7:0] s = 200` is address 200, not -56; that was also wron
 What a short final element holds is note 34, which the clause does not decide either.
 
 Code: `src/runtime/Io.cpp` (`rt_fread`), `src/runtime/Reports.cpp` (`rt_fread_range_report`), `src/lower/SystemTasks.cpp` (`lower_address_arg`), `src/ir/llvm/SystemTasks.cpp` (`lower_fread_mem`). Tests: `tests/llvm_backend_test.cpp` ("$fread with a start address outside the memory reads nothing and warns", "$fread start and count follow the declared address range", "$fread and $readmem take an unsigned start as an address"). Oracle: iverilog 13 (`ivltests/fread.v`).
+
+## 56. Negative, NaN and infinite real delays (9.4.1, 6.12.1)
+
+9.4.1 reads a negative delay as a two's-complement unsigned time, and a real
+delay is first rounded to the time precision, ties away from zero (6.12.1). Clotho
+applies both in that order, so `#(-1.5)` under a 1ns precision rounds to -2 and
+waits 2**64 - 2 ticks, which never fires, and `#(-0.4)` rounds to 0 and fires at
+once. The LRM says nothing of NaN or infinity. Clotho reads NaN as 0, as LLVM's
+saturating float-to-integer conversion gives, and saturates an infinity, like any
+tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
+`#(-1.0/0.0)` never fire. The rule covers the delay control, intra-assignment
+delays and continuous-assignment delays alike.
+
+Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.

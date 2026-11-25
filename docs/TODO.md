@@ -203,7 +203,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Concurrent fractional-delay timers (performance)** (3.14) — fine-tick periods past
   the wheel window spill to the overflow heap; needs a hierarchical wheel or a coarser tick.
-- [ ] **Negative, NaN or infinite real delay** — not clamped, as for the integer path.
 - [ ] **Time unit of a `$unit`-scope subroutine or class** (3.14.2.2) — with no `timeunit`
   in `$unit`, `#d` and `$time` count raw wheel ticks; needs a fixed default timescale.
 - [ ] **`%c`, `%u` and `%z` of a real argument**.
