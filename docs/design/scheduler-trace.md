@@ -265,21 +265,23 @@ Phase 1 acceptance:
 4. **Cost is stated.** The commit body gives the suite's time with and without
    `CLOTHO_NO_TRACE_CHECK=1`.
 
-## 8. Open questions
+## 8. Decisions (2026-11-25)
 
-1. A persistent `always @(e)` node (S27) stays on the object `e` named at the seed
-   (`event-handles.md`), while R5 resolves L from the variable at each park. After `e = e2`,
-   which object does the always wait on (15.5.5.1)? Until decided, phase 1 reports the
-   difference as an R5 violation.
-2. How much suite time may the checker cost before it turns opt-in like the config matrix?
-   Proposed: 15%. R6b's per-slot hash of a waited memory grows with its size; the choices
-   are to measure first, to skip memories until it is cheaper, or to leave R6b to the suite.
-3. Should `trace_check` default on for `clotho run` in extra-asserts builds, where a Debug
-   run could now end with a violation?
-4. If the checker pushes a long sv-tests case past the harness limit (exit 71), is the case
-   listed, the limit raised, or R6b left off for sv-tests?
-5. R12 enforces Clotho's reading where LRM_NOTES 51 leaves the order undecided, and leaves
-   updates staged at a `$finish` unchecked (`scheduler-rules.md` §6). Are both right?
-6. If the suite shows a real bug when phase 1 lands, is it fixed first, or does phase 1 land
-   with a `bug` entry?
-7. Does step 4 want the trace dump, or will the reference read only IR?
+1. **Merged events.** Decided in code, not open: a persistent `always @(e)` node (S27)
+   exists only when no event variable of the design can be retargeted
+   (`lower/Lower.cpp`, the `events_merge` scan); otherwise the list stays in the body and
+   each pass re-reads the handle (LRM 15.5.5 as cited there: a re-armed wait uses the
+   current object, a parked one stays put). R5 resolves L the same way, so they agree.
+2. **Cost.** The checker stays on in extra-asserts builds while it costs the suite at most
+   15%; past that it turns opt-in like the config matrix.
+3. **`clotho run`.** On by default in extra-asserts builds, so a Debug run can end with a
+   violation. Shipped builds never have it: `CLOTHO_EXTRA_ASSERTS` is off outside Debug
+   unless asked for (`CMakeLists.txt`), and without it no checker code is compiled.
+4. **sv-tests past the harness limit.** Undecided until phase 3 adds R6b; measure first.
+5. **R12.** Enforces Clotho's reading where LRM_NOTES 51 leaves the order open; updates
+   staged at a `$finish` stay unchecked.
+6. **Bugs the checker finds.** Fixed before the phase lands, unless the fix is large; then
+   a `bug` entry in `tests/trace-check-known.txt` and a `scheduler-rules.md` §4 row.
+7. **Step 4 input.** The reference reads Clotho IR only, never this trace: a reference
+   that consumes the implementation's own trace inherits its blind spots. Step 4 compares
+   observable output (and later its own trace) against Clotho's.
