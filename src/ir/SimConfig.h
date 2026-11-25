@@ -129,8 +129,9 @@ struct SimulationConfig {
     bool z_elision = true;
     // Opt-in aggressive tier: replace the tier-0 coroutine pipeline with
     // LLVM's default<O3> module pipeline (which includes the coro passes) and
-    // raise machine codegen from None/FastISel to Aggressive. Costs compile
-    // time; wins simulation time on long traces (docs/design/TIERING.md).
+    // raise machine codegen from None (FastISel, greedy allocator) to Aggressive.
+    // Costs compile time; wins simulation time on long traces
+    // (docs/design/TIERING.md, select_codegen_tier).
     bool o3 = false;
     // Fuse always-processes with identical canonical sensitivity into one
     // coroutine (see compute_fusion_groups in ir/llvm/Analyses.cpp). Disable for

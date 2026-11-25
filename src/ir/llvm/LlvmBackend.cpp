@@ -14,6 +14,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/ThreadPool.h>
@@ -137,12 +138,12 @@ void clamp_unproven_align(llvm::Module& m) {
     }
 }
 
-// Tier-0 code generation (FastISel, the fast register allocator) folds an address
-// computation into the load or store that uses it only inside one basic block. An
-// address EarlyCSE computed once for several blocks is a value live across them:
-// the allocator spills it where it is made and reloads it in each block that uses
-// it, a store and a load a constant displacement on the base would have cost
-// nothing. A GEP with constant indices is free to compute where it is used, so
+// Tier-0 instruction selection (FastISel) folds an address computation into the
+// load or store that uses it only inside one basic block. An address EarlyCSE
+// computed once for several blocks is a value live across them: it holds a
+// register through all of them or is spilled where it is made and reloaded in
+// each block that uses it, where a constant displacement on the base would have
+// cost nothing. A GEP with constant indices is free to compute where it is used, so
 // give each block that uses one its own copy and let the access fold it. The
 // base is then what each block reloads, once, however many fields it touches --
 // the whole difference between code addressed through an instance record
@@ -289,6 +290,43 @@ bool optimize_module(llvm::Module& m, bool o3) {
         mpm.addPass(llvm::createModuleToFunctionPassAdaptor(BlockLayoutPass()));
     }
     mpm.run(m, mam);
+    return true;
+}
+
+bool select_codegen_tier(bool o3) {
+    // NOTE: LLVM picks the register-allocation pipeline from the target machine's
+    // optimization level alone; the only way to have tier 0's -O0 code generation
+    // (FastISel) feed the greedy allocator is LLVM's own command-line options,
+    // which are process-global. They are set as an `llc` command line would set
+    // them, and every one is reset to LLVM's default under -O, so a process that
+    // compiles at both tiers in turn gets each tier exactly. Two compilations at
+    // different tiers must not overlap in one process.
+    //
+    // The greedy allocator and the coalescer cut the instructions hazard3 executes
+    // by about a quarter for about a tenth more compile time (measurements in the
+    // commit that added this). The other passes the optimized allocation pipeline
+    // brings in -- machine scheduling, LICM and copy propagation -- cost compile
+    // time and bought no instructions, so they stay off.
+    static constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral> kTier0[] = {
+        { "optimize-regalloc", "true" },
+        { "enable-misched", "false" },
+        { "disable-machine-licm", "true" },
+        { "disable-copyprop", "true" },
+    };
+    const auto& options = llvm::cl::getRegisteredOptions();
+    for (const auto& [name, value] : kTier0) {
+        const auto it = options.find(name);
+        if (it == options.end()) {
+            llvm::errs() << "llvm backend: this LLVM has no code generation option '" << name << "'\n";
+            return false;
+        }
+        llvm::cl::Option* const option = it->second;
+        option->reset();
+        if (!o3 && option->addOccurrence(0, name, value)) {
+            llvm::errs() << "llvm backend: cannot set code generation option '" << name << "' to " << value << "\n";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -685,7 +723,10 @@ bool emit_objects(const Module&                             m,
                   const LocResolver&                        resolve) {
     assert(config.lower_coro && "an object needs the coroutines lowered");
     const auto t_llvm = std::chrono::steady_clock::now();
-    auto       layout = object_machine(target, config.o3);
+    if (!select_codegen_tier(config.o3)) {
+        return false;
+    }
+    auto layout = object_machine(target, config.o3);
     if (!layout) {
         llvm::errs() << "llvm backend: " << llvm::toString(layout.takeError()) << "\n";
         return false;
