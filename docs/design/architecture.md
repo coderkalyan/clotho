@@ -99,9 +99,13 @@ them in step.
   address.
 - Suspended frames and the native stack are scanned conservatively until frames
   have explicit stack maps; object fields and design state are scanned precisely.
+- Any process may run on any worker thread, but two run at the same time only
+  when what they may access does not overlap with a write, and a run is
+  reproducible. So values and containers need no protection against concurrent
+  access, and their buffers stay with their one owner. **Not yet:** one thread
+  runs every process.
 - Still open for discussion: heap organization, barriers, triggers, safepoints
-  and threads, and whether buffers stay outside the collected heap once any
-  process may run on any thread.
+  and per-worker collector state.
 
 ## Containers and classes
 
