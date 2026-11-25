@@ -33,6 +33,8 @@ typedef struct rt_arg {
     //        21.2, Table 21-2).
     // Bit 3: the argument is a bare $time / $stime / $realtime call, which
     //        rt_monitor_emit leaves out of its change detection.
+    // Bit 4: with bit 2, the real was a shortreal: only %u / %z tell it from a
+    //        real, since they transfer the representation of the data (32 bits).
     uint32_t flags;
     // Value plane (definitely-1 bits), or an rt_string* / double-bits word per
     // the flags above.

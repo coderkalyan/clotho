@@ -659,11 +659,35 @@ TEST_CASE("a shortreal delay and %t operand widen to real before scaling to tick
     CHECK(same_unit == "3.0000\n3\n");
 }
 
-TEST_CASE("%c of a real is still rejected loudly") {
-    // %h/%o/%b/%x of a real now round-and-format (see the base-conversion case
-    // above), but %c has no defined real operand conversion in Table 21-1, so
-    // it stays guarded rather than silently picking a character code.
-    expect_reject(R"(module m; initial $display("%c", 1.5); endmodule)", "%c with a real argument is not supported");
+// %c of a real prints the low 8 bits of its rounded integer (LRM 6.12.1 rounds half
+// away from zero). Oracle: iverilog 13 ([B][\xBF][B]).
+TEST_CASE("%c of a real is the rounded integer's character code") {
+    CHECK(run_capture(R"(module m; initial $display("[%c][%c][%c]", 65.6, -65.4, 321.5); endmodule)") ==
+          "[B][\xBF][B]\n");
+}
+
+// %u of a real transfers its IEEE 754 representation (LRM 21.2.1.1: the 2-value
+// binary representation of the specified data), native endian, LSB word first:
+// 64 bits for a real, 32 for a shortreal. Only a runtime format reaches it (slang
+// rejects %u of a real in a literal one); iverilog 13 does not support it, so the
+// bytes are the little-endian IEEE patterns the test builds with $bitstoreal.
+TEST_CASE("%u of a real in a runtime format is its IEEE 754 bit pattern") {
+    CHECK(run_capture(R"(
+        module m;
+            string f = "%u";
+            string s;
+            real r;
+            shortreal sr;
+            initial begin
+                r = $bitstoreal(64'h0102030405060708);
+                sr = $bitstoshortreal(32'h0a0b0c0d);
+                s = $sformatf(f, r);
+                $display("%0d %h", s.len(), {s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]});
+                s = $sformatf(f, sr);
+                $display("%0d %h", s.len(), {s[0], s[1], s[2], s[3]});
+            end
+        endmodule
+    )") == "8 0807060504030201\n4 0d0c0b0a\n");
 }
 
 // $timeformat with no arguments returns to the defaults of Table 20-3 (the smallest

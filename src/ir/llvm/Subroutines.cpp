@@ -2727,7 +2727,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
                 fv = b_.CreateFPExt(fv, b_.getDoubleTy());
             }
             store_field(sty, elt, 0, b_.getInt32(64));
-            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag));
+            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag | (t.width == 32 ? 0b10000u : 0u)));
             store_field(sty, elt, 2, put(b_.CreateBitCast(fv, i64), 1));
             store_field(sty, elt, 3, null);
             store_field(sty, elt, 4, null);

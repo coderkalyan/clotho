@@ -2686,25 +2686,35 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                     case 'x': // check_specifier keeps %x/%X as a hex alias
                     case 'o':
                     case 'b':
-                        // A real under %d/%h/%x/%o/%b prints its rounded
+                    case 'c':
+                        // A real under %d/%h/%x/%o/%b/%c prints its rounded
                         // integer value in the requested base: Table 21-1
                         // gives these specifiers a common integral operand,
-                        // and LRM 21.2.1.2 converts a real argument to that
-                        // operand by the LRM 6.12.1 real-to-integer rule
-                        // (round half away from zero). Only the base
-                        // differs, so width/zero-padding/sign stay on the
-                        // shared integer path below. Signed 64-bit keeps
+                        // and a real argument converts to that operand by the
+                        // LRM 6.12.1 real-to-integer rule (round half away
+                        // from zero). Only the base differs, so width/zero-padding/sign stay on
+                        // the shared integer path below, and %c takes the low
+                        // 8 bits as it does of any integer. Signed 64-bit keeps
                         // negatives printing as two's complement (matches
-                        // iverilog: -3.7 under %h is fffffffffffffffc).
+                        // iverilog: -3.7 under %h is fffffffffffffffc, 65.6
+                        // under %c is B).
                         v        = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false), al);
                         v_signed = true;
                         break;
                     case 't':
                         break; // scale_to_ticks below has the real path
+                    case 'u':
+                    case 'z': {
+                        // LRM 21.2.1.1: %u / %z transfer the 2-value / 4-value
+                        // binary representation of the specified data, which
+                        // for a real is its IEEE 754 bit pattern (64 bits, 32
+                        // for a shortreal) with no unknown bits.
+                        const uint32_t bits = arg->type->getBitWidth();
+                        v                   = b.float_cvt(ir::Inst::Tag::FBitcast, v, make_int_type(bits, false), al);
+                        v_signed            = false;
+                        break;
+                    }
                     default:
-                        // TODO: %c of a real (would need the rounded integer
-                        // truncated to a character code), and %u / %z of a
-                        // real (unformatted raw bits, LRM 21.2.1.3).
                         fail(std::string("%") + conv + " with a real argument is not supported");
                 }
             } else if (!fl && real_conv) {

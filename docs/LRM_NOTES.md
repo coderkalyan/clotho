@@ -761,3 +761,12 @@ like an unsized literal (5.7.1), at least 32 bits, signed for `%d`, wider when i
 digits need it, with x and z digits read as 0. So `"-5"` under `%d` is the four
 characters FF FF FF FB, the same string as `string'(-5)`, and 16706 is "AB". iverilog
 13 asserts on this case.
+
+## 58. A real under `%c`, `%u` and `%z` (21.2.1.1)
+
+21.2.1.1 lets the integer specifiers take integral data, and `%u` / `%z` transfer the
+2-value / 4-value "binary representation of the specified data". For a real argument
+Clotho takes `%c` of its rounded integer (6.12.1, ties away from zero), whose low 8
+bits are the character, as iverilog does, and `%u` / `%z` of its IEEE 754 bit pattern,
+64 bits for a real and 32 for a shortreal, with no unknown bits. slang rejects `%u` and
+`%z` of a real in a literal format, so only a runtime format reaches it.
