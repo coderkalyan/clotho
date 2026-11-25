@@ -1736,10 +1736,11 @@ private:
     // the activation lives (Gc.h:239-241).
     //
     // Add and Remove share one walk, so they visit the same containers in the same
-    // order and the pairing is structural. Statically a body may emit several Removes
-    // for one Add -- deinit_body_strings runs at every `ret` -- but only one exit
-    // executes, so dynamically each add is matched exactly once, which is the same
-    // discipline the emit_handle_delete calls beside it already rely on.
+    // order and the pairing is structural. Statically a body may emit two Removes
+    // for one Add -- a thunk-elided process runs deinit_body_strings at its normal
+    // end and again in its $finish exit -- but only one exit executes, so
+    // dynamically each add is matched exactly once, which is the same discipline
+    // the emit_handle_delete calls beside it already rely on.
     enum class GcRootOp : uint8_t { Add, Remove };
     void emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base,
                                  llvm::Type* storage);

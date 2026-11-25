@@ -1917,8 +1917,9 @@ void Backend::emit_copyin(const Function& f) {
 }
 
 // Copy each output / inout formal's frame Local back through its caller pointer
-// (LRM 13.5 copy-out at completion). For a task this runs once in the completion
-// epilogue; for a function it runs before every `ret` (each return point).
+// (LRM 13.5 copy-out at completion). Runs once per body: in a task's completion
+// epilogue, and in a function's (lower_function), after any `return` has
+// delivered its result.
 void Backend::emit_copyout(const Function& f) {
     for (uint32_t k = 0; k < f.param_types.size(); ++k) {
         // In needs no copy-out; a ref formal is live (aliased), never copied back.
@@ -1947,9 +1948,9 @@ void Backend::emit_copyout(const Function& f) {
         // caller's (the single passed pointer): rt_string_move releases the
         // caller's old buffer, takes the frame slot's image whole, and re-inits
         // the frame slot. Legal here — and cheaper than a deep copy — because
-        // copy-out is immediately followed by deinit_body_strings on every exit
-        // path (function ret, task completion epilogue), so nothing reads the
-        // frame slot again and its own deinit finds an empty string.
+        // copy-out is immediately followed by deinit_body_strings in both
+        // epilogues, and a function's result was read out before it, so nothing
+        // reads the frame slot again and its own deinit finds an empty string.
         if (is_string_type(f.param_types[k])) {
             b_.CreateCall(str_move_fn(), { fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k) });
             continue;
