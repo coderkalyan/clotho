@@ -1396,14 +1396,16 @@ llvm::Value* Backend::gc_mutator_cur() {
 // collection re-arms it, so this same poll fires at every safepoint
 // (Gc.h:144-149).
 //
-// A collection here is the one that clears weak references, and it pends the
-// notifier of each one it clears that a wait reads get() of (LRM 8.30.3;
-// runtime/Gc.cpp, clear_weak_referents). Those are fired as soon as it returns:
-// every process is parked at this edge, so the waiters woken are the ones that were
-// waiting when the reference was cleared, and they run in the time step that is
-// about to begin. The chain holds nothing else, since the NBA region emptied it
-// before time moved. Only a design with such a wait has the code, on the cold side
-// of the poll.
+// A collection here is the one that clears weak references, and it puts the
+// notifier of each one it clears that a wait reads get() of on the pending chain
+// (LRM 8.30.3; runtime/Gc.cpp, clear_weak_referents). Those are fired as soon as it
+// returns: every process is parked at this edge, so the waiters woken are the ones
+// that were waiting when the reference was cleared, and they run in the time step
+// that is about to begin. The chain holds nothing else, since the NBA region
+// emptied it before time moved. The trigger is an immediate one, as a store's
+// notification is, not the update event of a `->>` (which belongs to an NBA pass);
+// the order among the notifiers of one collection means nothing. Only a design with
+// such a wait has the code, on the cold side of the poll.
 void Backend::emit_gc_safepoint(llvm::Value* wheel) {
     llvm::Function* fn = b_.GetInsertBlock()->getParent();
     // Every poll site is scheduler-level (emit_active_run, lowered into
@@ -1423,11 +1425,36 @@ void Backend::emit_gc_safepoint(llvm::Value* wheel) {
 
     b_.SetInsertPoint(collect);
     b_.CreateCall(gc_safepoint_slow_fn(), {});
-    for (const WeakClass& weak : mod_.weak_classes()) {
-        if (mod_.change_notify(weak.class_ref, weak.referent_field) != nullptr) {
-            emit_event_pend_drain(wheel);
-            break;
-        }
+    const bool weak_waits = std::ranges::any_of(mod_.weak_classes(), [&](const WeakClass& weak) {
+        return mod_.change_notify(weak.class_ref, weak.referent_field) != nullptr;
+    });
+    if (weak_waits) {
+        auto*        ptr   = llvm::PointerType::getUnqual(ctx_);
+        auto*        null  = llvm::ConstantPointerNull::get(ptr);
+        auto*        walk  = llvm::BasicBlock::Create(ctx_, "gc.weak.walk", fn);
+        auto*        fire  = llvm::BasicBlock::Create(ctx_, "gc.weak.fire", fn);
+        auto*        fired = llvm::BasicBlock::Create(ctx_, "gc.weak.fired", fn);
+        llvm::Value* headp = sym(event_pend_head_gv_);
+        llvm::Value* first = b_.CreateLoad(ptr, headp);
+        b_.CreateStore(null, headp);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(walk);
+        llvm::PHINode* n = b_.CreatePHI(ptr, 2);
+        n->addIncoming(first, entry);
+        b_.CreateCondBr(b_.CreateICmpNE(n, null), fire, fired);
+
+        // The link is read before the fire, as emit_event_pend_drain reads it.
+        b_.SetInsertPoint(fire);
+        llvm::Value* next = b_.CreateLoad(ptr, event_field(n, kEventNextPend));
+        b_.CreateStore(null, event_field(n, kEventNextPend));
+        b_.CreateStore(b_.getInt8(0), event_field(n, kEventPending));
+        emit_event_fire(n, wheel, RT_TRACE_TRIGGER_NOW);
+        n->addIncoming(next, b_.GetInsertBlock());
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(fired);
     }
     b_.CreateBr(done);
     b_.SetInsertPoint(done);
