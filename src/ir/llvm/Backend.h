@@ -2200,8 +2200,42 @@ private:
         llvm::Value* x;
         llvm::Value* name;
         uint32_t     edge;
+        // The rt_trace_shape of the storage (null: the checker reads nothing there).
+        llvm::Value* shape;
     };
     TraceEntry trace_entry(const WaitEdge& e);
+
+    // How the checker reads the bytes of signal `sig`'s storage (rt_trace_shape), as a constant of
+    // module `m`, or a null pointer for storage it does not read: an event, a string, a container,
+    // an aggregate, or one past a size that keeps the park's copy small.
+    llvm::Constant* trace_shape(llvm::Module& m, Signal sig);
+
+    // What a bracket saw of one write: i1 values, null where the bracket did not compute or
+    // read one (S19 skips what no waiter consumes).
+    struct TraceSeen {
+        llvm::Value* old_must = nullptr;
+        llvm::Value* old_may  = nullptr;
+        llvm::Value* new_must = nullptr;
+        llvm::Value* new_may  = nullptr;
+        llvm::Value* diff     = nullptr; // a must or may bit differs
+        llvm::Value* zdiff    = nullptr; // the z word differs
+        llvm::Value* pos      = nullptr; // the facts the code computed
+        llvm::Value* neg      = nullptr;
+        llvm::Value* any      = nullptr;
+        bool         four     = false;
+        bool         has_z    = false;
+        // A write the code does not classify: it wakes every level waiter.
+        bool         level    = false;
+    };
+
+    // The bits of a write from the words before and after: bit 0 of the planes, whether they
+    // differ and whether the z word does.
+    TraceSeen trace_seen_words(llvm::Value* old_mm, llvm::Value* new_mm, llvm::Value* old_z, llvm::Value* new_z,
+                               uint32_t width, bool four, bool has_z);
+
+    // Report a write of the storage `x` (null: no waiter names it) before its wakes
+    // (rt_trace_change); `path` is RT_TRACE_CHG_*.
+    void emit_trace_change(uint32_t path, std::optional<Signal> sig, llvm::Value* x, const TraceSeen& seen);
 
     // A new activation: `a` is the handle its ramp returned, `parent` the creator's (null: none).
     void emit_trace_spawn(llvm::IRBuilder<>& b, llvm::Value* a, uint32_t origin, const std::string& where,
@@ -2798,7 +2832,7 @@ private:
                              llvm::Value* new_may, bool need_pos, bool need_neg);
 
     void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm,
-                            llvm::Value* old_z, llvm::Value* new_z);
+                            llvm::Value* old_z, llvm::Value* new_z, uint32_t path = RT_TRACE_CHG_STORE);
 
     // Fire the buckets a transition's facts select.
     void service_wake_buckets(Signal sig, const EdgeFacts& f);
@@ -5306,6 +5340,11 @@ private:
     // plane widths.
     std::map<std::tuple<const llvm::Module*, std::string, const llvm::Constant*, uint32_t, uint32_t, uint32_t>, llvm::Constant*>
       trace_nba_sites_;
+    // The records of the brackets' writes (by module, location, name and path) and the shape of each
+    // signal's storage, per module.
+    std::map<std::tuple<const llvm::Module*, std::string, const llvm::Constant*, uint32_t>, llvm::Constant*>
+      trace_change_sites_;
+    std::map<std::pair<const llvm::Module*, uint32_t>, llvm::Constant*> trace_shapes_;
 #endif
     llvm::Value*           frame_ = nullptr;
     std::vector<FrameSlot> frame_slots_;

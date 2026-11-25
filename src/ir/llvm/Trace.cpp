@@ -125,22 +125,180 @@ llvm::Constant* Backend::trace_signal_name(Signal sig) {
 // reached through one), or the object an event control names now.
 Backend::TraceEntry Backend::trace_entry(const WaitEdge& e) {
 #ifdef CLOTHO_EXTRA_ASSERTS
-    auto* const none = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    auto* const    none = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    llvm::Module&  m    = *b_.GetInsertBlock()->getModule();
     if (e.inst != kNoWaitHandle) {
         llvm::Value* ctx = b_.CreateIntToPtr(must_of(e.inst), raw_ptr_ty());
         CtxOverride  ov(*this, ctx, slot_of(e.signal).anchor);
-        return { storage_ptr(slot_of(e.signal)), trace_signal_name(e.signal), e.edge };
+        return { storage_ptr(slot_of(e.signal)), trace_signal_name(e.signal), e.edge, trace_shape(m, e.signal) };
     }
     if (e.handle != kNoWaitHandle) {
-        return { event_obj_of(must_of(e.handle)), none, RT_TRACE_OBJ };
+        return { event_obj_of(must_of(e.handle)), none, RT_TRACE_OBJ, none };
     }
     if (mod_.signal(e.signal).is_event) {
-        return { event_obj_for(e.signal), trace_signal_name(e.signal), RT_TRACE_OBJ };
+        return { event_obj_for(e.signal), trace_signal_name(e.signal), RT_TRACE_OBJ, none };
     }
-    return { storage_ptr(slot_of(e.signal)), trace_signal_name(e.signal), e.edge };
+    return { storage_ptr(slot_of(e.signal)), trace_signal_name(e.signal), e.edge, trace_shape(m, e.signal) };
 #else
     (void)e;
     return {};
+#endif
+}
+
+llvm::Constant* Backend::trace_shape(llvm::Module& m, Signal sig) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    auto* const none = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    if (!trace_on() || mod_.signal(sig).is_event) {
+        return none;
+    }
+    const SignalSlot& s = slot_of(sig);
+    if (s.slot_ty == nullptr || s.is_agg || s.is_string || s.is_dynarr || s.is_queue || s.is_assoc) {
+        return none;
+    }
+    const auto key = std::make_pair(static_cast<const llvm::Module*>(&m), static_cast<uint32_t>(sig));
+    if (const auto it = trace_shapes_.find(key); it != trace_shapes_.end()) {
+        return it->second;
+    }
+    const llvm::DataLayout& dl     = env_->llmod.getDataLayout();
+    const uint64_t          stride = dl.getTypeAllocSize(s.slot_ty);
+    const uint64_t          count  = s.is_array ? s.elem_count : 1;
+    // The park copies these bytes and the slot poll reads them: a storage past this size is not
+    // read (a large memory), which R6b says it skips.
+    constexpr uint64_t max_bytes = 2048;
+    llvm::Constant*    result    = none;
+    if (stride * count <= max_bytes) {
+        const uint32_t bits0 = s.four_state ? 2 * s.width : s.width;
+        const uint32_t bits1 = s.four_state && s.has_z ? s.width : 0;
+        const uint32_t z_off = bits1 != 0 ? static_cast<uint32_t>(dl.getStructLayout(s.slot_ty)->getElementOffset(1)) : 0;
+        auto* const    i32   = llvm::Type::getInt32Ty(ctx_);
+        auto* const    ty    = llvm::StructType::get(ctx_, { i32, i32, i32, i32, i32, i32 });
+        auto* const    init  = llvm::ConstantStruct::get(
+          ty, { llvm::ConstantInt::get(i32, s.width), llvm::ConstantInt::get(i32, bits0), llvm::ConstantInt::get(i32, bits1),
+                llvm::ConstantInt::get(i32, z_off), llvm::ConstantInt::get(i32, static_cast<uint32_t>(stride)),
+                llvm::ConstantInt::get(i32, static_cast<uint32_t>(count)) });
+        auto* gv = new llvm::GlobalVariable(m, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init,
+                                            "clotho.trace.shape");
+        gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        result = gv;
+    }
+    trace_shapes_.emplace(key, result);
+    return result;
+#else
+    (void)m;
+    (void)sig;
+    return nullptr;
+#endif
+}
+
+Backend::TraceSeen Backend::trace_seen_words(llvm::Value* old_mm, llvm::Value* new_mm, llvm::Value* old_z,
+                                             llvm::Value* new_z, uint32_t width, bool four, bool has_z) {
+    TraceSeen t;
+#ifdef CLOTHO_EXTRA_ASSERTS
+    auto* const i1 = b_.getInt1Ty();
+    t.four         = four;
+    t.has_z        = has_z;
+    t.old_must     = b_.CreateTrunc(old_mm, i1);
+    t.new_must     = b_.CreateTrunc(new_mm, i1);
+    if (four) {
+        auto* const sh = llvm::ConstantInt::get(old_mm->getType(), width);
+        t.old_may      = b_.CreateTrunc(b_.CreateLShr(old_mm, sh), i1);
+        t.new_may      = b_.CreateTrunc(b_.CreateLShr(new_mm, sh), i1);
+    }
+    t.diff = b_.CreateICmpNE(old_mm, new_mm);
+    if (old_z != nullptr && new_z != nullptr) {
+        t.zdiff = b_.CreateICmpNE(old_z, new_z);
+    }
+#else
+    (void)old_mm;
+    (void)new_mm;
+    (void)old_z;
+    (void)new_z;
+    (void)width;
+    (void)four;
+    (void)has_z;
+#endif
+    return t;
+}
+
+void Backend::emit_trace_change(uint32_t path, std::optional<Signal> sig, llvm::Value* x, const TraceSeen& t) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const    ptr   = llvm::PointerType::getUnqual(ctx_);
+    auto* const    i32   = b_.getInt32Ty();
+    llvm::Module&  m     = *b_.GetInsertBlock()->getModule();
+    llvm::Constant* name = sig.has_value() ? trace_signal_name(*sig) : llvm::ConstantPointerNull::get(ptr);
+    const std::string where = trace_here();
+    const auto        key   = std::make_tuple(static_cast<const llvm::Module*>(&m), where, static_cast<const llvm::Constant*>(name), path);
+    llvm::Constant*   site  = nullptr;
+    if (const auto it = trace_change_sites_.find(key); it != trace_change_sites_.end()) {
+        site = it->second;
+    } else {
+        auto* const ty   = llvm::StructType::get(ctx_, { ptr, ptr, i32 });
+        auto* const init = llvm::ConstantStruct::get(ty, { trace_string(m, where), name, llvm::ConstantInt::get(i32, path) });
+        auto*       gv   = new llvm::GlobalVariable(m, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init,
+                                                    "clotho.trace.chg");
+        gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        trace_change_sites_.emplace(key, gv);
+        site = gv;
+    }
+    uint32_t     flags = 0;
+    llvm::Value* dyn   = nullptr;
+    const auto   add   = [&](llvm::Value* v, uint32_t bit) {
+        llvm::Value* bitv = b_.CreateShl(b_.CreateZExt(v, i32), bit);
+        dyn               = dyn != nullptr ? b_.CreateOr(dyn, bitv) : bitv;
+    };
+    if (t.four) {
+        flags |= RT_TRACE_SEEN_FOUR;
+    }
+    if (t.has_z) {
+        flags |= RT_TRACE_SEEN_HAS_Z;
+    }
+    if (t.level) {
+        flags |= RT_TRACE_SEEN_LEVEL;
+    } else {
+        if (t.old_must != nullptr && t.new_must != nullptr) {
+            flags |= RT_TRACE_SEEN_BIT0;
+            add(t.old_must, 0);
+            add(t.new_must, 3);
+            if (t.four) {
+                add(t.old_may, 1);
+                add(t.new_may, 4);
+            }
+        }
+        if (t.diff != nullptr) {
+            flags |= RT_TRACE_SEEN_DIFF_KNOWN;
+            add(t.diff, 10);
+        }
+        if (t.zdiff != nullptr) {
+            flags |= RT_TRACE_SEEN_ZDIFF_KNOWN;
+            add(t.zdiff, 12);
+        }
+        if (t.pos != nullptr) {
+            flags |= RT_TRACE_SEEN_POS_KNOWN;
+            add(t.pos, 16);
+        }
+        if (t.neg != nullptr) {
+            flags |= RT_TRACE_SEEN_NEG_KNOWN;
+            add(t.neg, 17);
+        }
+        if (t.any != nullptr) {
+            flags |= RT_TRACE_SEEN_ANY_KNOWN;
+            add(t.any, 18);
+        }
+    }
+    llvm::Value* seen = b_.getInt32(flags);
+    if (dyn != nullptr) {
+        seen = b_.CreateOr(seen, dyn);
+    }
+    b_.CreateCall(rt_fn("rt_trace_change", b_.getVoidTy(), { ptr, ptr, i32 }),
+                  { site, x != nullptr ? x : llvm::ConstantPointerNull::get(ptr), seen });
+#else
+    (void)path;
+    (void)sig;
+    (void)x;
+    (void)t;
 #endif
 }
 
@@ -173,8 +331,8 @@ llvm::Constant* Backend::emit_trace_park(const TracePark& park) {
     llvm::Constant* ctl = trace_control(*b_.GetInsertBlock()->getModule(), park.kind, trace_where(park));
     for (const WaitEdge& e : park.edges) {
         const TraceEntry t = trace_entry(e);
-        b_.CreateCall(rt_fn("rt_trace_waits_for", b_.getVoidTy(), { ptr, ptr, ptr, i64 }),
-                      { hdl_, t.x, t.name, b_.getInt64(t.edge) });
+        b_.CreateCall(rt_fn("rt_trace_waits_for", b_.getVoidTy(), { ptr, ptr, ptr, i64, ptr }),
+                      { hdl_, t.x, t.name, b_.getInt64(t.edge), t.shape });
     }
     b_.CreateCall(rt_fn("rt_trace_park", b_.getVoidTy(), { ptr, ptr, i64 }),
                   { hdl_, ctl, park.delay != nullptr ? park.delay : b_.getInt64(0) });

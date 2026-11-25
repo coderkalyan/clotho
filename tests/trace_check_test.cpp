@@ -97,7 +97,8 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
     for (const char* name : { "rt_trace_begin", "rt_trace_spawn", "rt_trace_park", "rt_trace_wake", "rt_trace_dispatch",
                               "rt_trace_resume", "rt_trace_end", "rt_trace_slot", "rt_trace_halted", "rt_trace_region",
                               "rt_trace_nba_create", "rt_trace_nba_stage", "rt_trace_nba_release", "rt_trace_nba_pass",
-                              "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish" }) {
+                              "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
+                              "rt_trace_change" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -120,6 +121,14 @@ const rt_trace_control kDelay{ "design.sv:7:5", RT_TRACE_CTL_DELAY };
 const rt_trace_control kJoin{ "design.sv:9:5", RT_TRACE_CTL_JOIN };
 const rt_trace_control kCall{ "design.sv:11:5", RT_TRACE_CTL_CALL };
 
+// A bracket's report of a write, before the wakes it makes (rt_trace_change): a posedge of `x` as
+// far as the code's facts say.
+const rt_trace_change_site kStore{ "design.sv:8:3", "clk", RT_TRACE_CHG_STORE };
+
+void wrote_posedge(const void* x) {
+    rt_trace_change(&kStore, x, RT_TRACE_SEEN_POS_KNOWN | RT_TRACE_SEEN_POS);
+}
+
 // Signal storage and activations, by address.
 int  clk, done;
 char proc_a, proc_b, proc_c;
@@ -136,12 +145,12 @@ bool has(std::string_view text, std::string_view part) {
 // The always of scheduler-rules.md §4 as the scheduler runs it with the B51 fix: it waits at its
 // head for `clk` as a dynamic waiter, and parks mid-body at `@(posedge done)`.
 void head_wait(void* a) {
-    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS, nullptr);
     rt_trace_park(a, &kHead, 0);
 }
 
 void body_wait(void* a) {
-    rt_trace_waits_for(a, &done, "done", RT_TRACE_POS);
+    rt_trace_waits_for(a, &done, "done", RT_TRACE_POS, nullptr);
     rt_trace_park(a, &kWait, 0);
 }
 
@@ -156,6 +165,7 @@ TEST_CASE("trace check: an always that waits at its head and parks mid-body brea
     head_wait(a);
 
     rt_trace_slot(1);
+    wrote_posedge(&clk);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
     CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
     rt_trace_resume(a, &kHead);
@@ -164,6 +174,7 @@ TEST_CASE("trace check: an always that waits at its head and parks mid-body brea
     // The second posedge of clk finds no entry: the body is not waiting for clk.
     rt_trace_slot(3);
     rt_trace_slot(4);
+    wrote_posedge(&done);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &done, RT_TRACE_POS);
     CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
     rt_trace_resume(a, &kWait);
@@ -178,12 +189,13 @@ TEST_CASE("trace check: an always that waits at its head and parks mid-body brea
 TEST_CASE("trace check: a static subscription that wakes an activation parked mid-body is flagged (B51)") {
     rt_trace_begin();
     void*                 a     = &proc_a;
-    const rt_trace_entry  sub[] = { { &clk, "clk", RT_TRACE_POS } };
+    const rt_trace_entry  sub[] = { { &clk, "clk", RT_TRACE_POS, nullptr } };
     rt_trace_spawn(a, &kProcess, nullptr);
     rt_trace_subscribe(a, sub, 1);
     rt_trace_park(a, &kStatic, 0);
 
     rt_trace_slot(1);
+    wrote_posedge(&clk);
     rt_trace_wake(a, RT_TRACE_STATIC, &clk, RT_TRACE_POS);
     CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
     body_wait(a);
@@ -213,13 +225,14 @@ TEST_CASE("trace check: a static subscription that wakes an activation parked mi
 TEST_CASE("trace check: a static wake of an activation parked at an event control is flagged even when it lists the signal") {
     rt_trace_begin();
     void*                a     = &proc_a;
-    const rt_trace_entry sub[] = { { &clk, "clk", RT_TRACE_POS } };
+    const rt_trace_entry sub[] = { { &clk, "clk", RT_TRACE_POS, nullptr } };
     rt_trace_spawn(a, &kProcess, nullptr);
     rt_trace_subscribe(a, sub, 1);
     rt_trace_park(a, &kStatic, 0);
+    wrote_posedge(&clk);
     rt_trace_wake(a, RT_TRACE_STATIC, &clk, RT_TRACE_POS);
     CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
-    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS, nullptr);
     rt_trace_park(a, &kWait, 0);
 
     rt_trace_wake(a, RT_TRACE_STATIC, &clk, RT_TRACE_POS);
@@ -234,6 +247,7 @@ TEST_CASE("trace check: a wake of a queued activation is flagged (B3, B44)") {
     rt_trace_spawn(a, &kProcess, nullptr);
     rt_trace_dispatch(a, RT_TRACE_INLINE);
     head_wait(a);
+    wrote_posedge(&clk);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
     CHECK(rt_trace_halted() == 0);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
@@ -366,7 +380,7 @@ TEST_CASE("trace check: a posedge wakes an edge, a change and a posedge entry, a
     void* a = &proc_a;
     rt_trace_spawn(a, &kProcess, nullptr);
     rt_trace_dispatch(a, RT_TRACE_INLINE);
-    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_NEG);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_NEG, nullptr);
     rt_trace_park(a, &kWait, 0);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
     CHECK(rule() == "R5.1");
@@ -374,15 +388,16 @@ TEST_CASE("trace check: a posedge wakes an edge, a change and a posedge entry, a
     rt_trace_begin();
     rt_trace_spawn(a, &kProcess, nullptr);
     rt_trace_dispatch(a, RT_TRACE_INLINE);
-    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_ANY);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_ANY, nullptr);
     rt_trace_park(a, &kWait, 0);
+    wrote_posedge(&clk);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
     CHECK(rt_trace_halted() == 0);
 
     rt_trace_begin();
     rt_trace_spawn(a, &kProcess, nullptr);
     rt_trace_dispatch(a, RT_TRACE_INLINE);
-    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS, nullptr);
     rt_trace_park(a, &kWait, 0);
     rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_ANY);
     CHECK(rule() == "R5.1");
@@ -895,6 +910,7 @@ TEST_CASE("trace check: after $finish an activation queued before it is not disp
     parked(woken);
     rt_trace_spawn(finishing, &kProcess, nullptr);
     rt_trace_dispatch(finishing, RT_TRACE_INLINE);
+    wrote_posedge(&clk);
     rt_trace_wake(woken, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
     rt_trace_finish();
     CHECK(rt_trace_halted() == 0);
@@ -935,7 +951,10 @@ TEST_CASE("trace check: after $finish nothing stores, stages, triggers or wakes 
         rt_trace_finish();
         event();
     };
-    after_finish([] { rt_trace_wake(&proc_b, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS); });
+    after_finish([] {
+        wrote_posedge(&clk);
+        rt_trace_wake(&proc_b, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    });
     CHECK(rule() == "R24.1");
     after_finish([] { nba_put(kBlock, &q, 1); });
     CHECK(rule() == "R24.1");
@@ -1244,5 +1263,292 @@ TEST_CASE("trace check: the scheduler's own events say nothing of a run whose co
     CHECK(rt_trace_halted() == 0);
 }
 #endif
+
+// ---- Writes and waiters (R6, R7) ----
+//
+// A write is a `change` before its wakes; each sequence below is what the brackets and the scheduler
+// report for the bugs the rules exist for (docs/design/scheduler-rules.md §4), with the bytes of the
+// storage a waiter lists changed by hand where the bug was a store no bracket saw.
+
+namespace {
+
+// A 32-bit 2-state signal, and a 1-bit 4-state one with a z word: its must|may word of two bits
+// (value 0: 00, 1: 11, x or z: 10) and then its z word.
+uint32_t             word32;
+const rt_trace_shape kWord{ 32, 32, 0, 0, 4, 1 };
+struct Bit4 {
+    uint8_t mm;
+    uint8_t z;
+} bit4;
+const rt_trace_shape kBit4{ 1, 2, 1, 1, 2, 1 };
+
+// What a bracket saw of bit 0 going from `o` to `n` (0, 1, 2 = x or z), with the facts the code
+// computed as Table 9-2 gives them; `zd` is a z word that differs.
+uint32_t seen_for(int o, int n, bool zd) {
+    const auto rank = [](int s) { return s == 1 ? 2 : (s == 2 ? 1 : 0); };
+    uint32_t   s    = RT_TRACE_SEEN_FOUR | RT_TRACE_SEEN_HAS_Z | RT_TRACE_SEEN_BIT0 | RT_TRACE_SEEN_DIFF_KNOWN |
+                RT_TRACE_SEEN_ZDIFF_KNOWN | RT_TRACE_SEEN_POS_KNOWN | RT_TRACE_SEEN_NEG_KNOWN | RT_TRACE_SEEN_ANY_KNOWN;
+    s |= o == 1 ? RT_TRACE_SEEN_OLD_MUST : 0;
+    s |= o != 0 ? RT_TRACE_SEEN_OLD_MAY : 0;
+    s |= n == 1 ? RT_TRACE_SEEN_NEW_MUST : 0;
+    s |= n != 0 ? RT_TRACE_SEEN_NEW_MAY : 0;
+    s |= o != n ? RT_TRACE_SEEN_DIFF : 0;
+    s |= zd ? RT_TRACE_SEEN_ZDIFF : 0;
+    s |= rank(n) > rank(o) ? RT_TRACE_SEEN_POS : 0;
+    s |= rank(n) < rank(o) ? RT_TRACE_SEEN_NEG : 0;
+    s |= (o != n || zd) ? RT_TRACE_SEEN_ANY : 0;
+    return s;
+}
+
+// An activation parked at an event control that lists one entry.
+void park_on(void* a, const void* x, const char* name, uint64_t edge, const rt_trace_shape* shape) {
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_waits_for(a, x, name, edge, shape);
+    rt_trace_park(a, &kWait, 0);
+}
+
+} // namespace
+
+// B5: edge facts that ignored x and z. Every move of bit 0 has the facts Table 9-2 gives; a fact the
+// code computed otherwise is named.
+TEST_CASE("trace check: the facts of a write are Table 9-2's on the ranks 0 < x = z < 1 (B5)") {
+    for (int o = 0; o < 3; ++o) {
+        for (int n = 0; n < 3; ++n) {
+            rt_trace_begin();
+            rt_trace_change(&kStore, &bit4, seen_for(o, n, false));
+            CHECK_MESSAGE(rt_trace_halted() == 0, o << " -> " << n);
+        }
+    }
+    // 0 -> x is a posedge: the code that took bit 0 of the must plane alone saw none.
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, seen_for(0, 2, false) & ~RT_TRACE_SEEN_POS);
+    CHECK(rule() == "R7.1");
+    CHECK(has(rt_trace_report(), "posedge fact"));
+    // x -> 1 likewise, and 1 -> x is a negedge.
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, seen_for(2, 1, false) & ~RT_TRACE_SEEN_POS);
+    CHECK(rule() == "R7.1");
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, seen_for(1, 2, false) & ~RT_TRACE_SEEN_NEG);
+    CHECK(rule() == "R7.1");
+    // x <-> z is a change and no edge: an edge fact there is wrong.
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, seen_for(2, 2, true) | RT_TRACE_SEEN_POS);
+    CHECK(rule() == "R7.1");
+    // A z-only change is a change; `changed` that compared the planes alone missed it.
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, seen_for(2, 2, true));
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_change(&kStore, &bit4, seen_for(2, 2, true) & ~RT_TRACE_SEEN_ANY);
+    CHECK(rule() == "R7.2");
+    // A write that changed nothing did not change.
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, seen_for(1, 1, false) | RT_TRACE_SEEN_ANY);
+    CHECK(rule() == "R7.2");
+    // A z word the bracket did not read: `changed` may be true only where a plane differs, and a
+    // plane that differs must make it true.
+    const uint32_t no_z = (seen_for(0, 1, false) & ~(RT_TRACE_SEEN_ZDIFF_KNOWN | RT_TRACE_SEEN_ZDIFF));
+    rt_trace_begin();
+    rt_trace_change(&kStore, &bit4, no_z);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_change(&kStore, &bit4, no_z & ~RT_TRACE_SEEN_ANY);
+    CHECK(rule() == "R7.2");
+    // A 2-state slot has two states: 0 -> 1 is a posedge and 1 -> 0 a negedge.
+    const uint32_t two = RT_TRACE_SEEN_BIT0 | RT_TRACE_SEEN_POS_KNOWN | RT_TRACE_SEEN_NEG_KNOWN;
+    rt_trace_begin();
+    rt_trace_change(&kStore, &word32, two | RT_TRACE_SEEN_NEW_MUST | RT_TRACE_SEEN_POS);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_change(&kStore, &word32, two | RT_TRACE_SEEN_OLD_MUST | RT_TRACE_SEEN_NEG);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_change(&kStore, &word32, two | RT_TRACE_SEEN_OLD_MUST | RT_TRACE_SEEN_POS);
+    CHECK(rule() == "R7.1");
+}
+
+// B12's wake half and B8: a write was seen and a waiter whose entry it satisfies was not woken.
+TEST_CASE("trace check: every activation a write satisfies is woken before the next dispatch, park or region (B8, B12)") {
+    void* a = &proc_a;
+    // Woken: nothing is owed.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // Not woken: the next dispatch, park, region and the end of the slot each find it.
+    for (int point = 0; point < 4; ++point) {
+        rt_trace_begin();
+        park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+        rt_trace_spawn(&proc_b, &kProcess, nullptr);
+        rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+        CHECK(rt_trace_halted() == 0);
+        switch (point) {
+            case 0: rt_trace_dispatch(&proc_b, RT_TRACE_INLINE); break;
+            case 1:
+                rt_trace_waits_for(&proc_b, &done, "done", RT_TRACE_POS, nullptr);
+                rt_trace_park(&proc_b, &kWait, 0);
+                break;
+            case 2: rt_trace_region(RT_TRACE_REG_INACTIVE); break;
+            default: rt_trace_slot_end(); break;
+        }
+        CHECK_MESSAGE(rule() == "R6.1", point);
+        CHECK(has(rt_trace_report(), "was not woken"));
+    }
+
+    // The entries a write does not satisfy are owed nothing: a negedge entry on a posedge, an edge on
+    // x <-> z, and a change entry on a write that changed nothing.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_NEG, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(2, 2, true));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_ANY, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(1, 1, false));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    // ... but a change entry is owed a z-only change, and a level wake that the code does not
+    // classify is owed to every change entry and to no edge entry.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_ANY, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(2, 2, true));
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.1");
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_ANY, nullptr);
+    rt_trace_change(&kStore, &clk, RT_TRACE_SEEN_LEVEL);
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.1");
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_change(&kStore, &clk, RT_TRACE_SEEN_LEVEL);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A trigger is owed to every activation parked on the event.
+    rt_trace_begin();
+    park_on(a, &ev1, "e", RT_TRACE_OBJ, nullptr);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.1");
+    rt_trace_begin();
+    park_on(a, &ev1, "e", RT_TRACE_OBJ, nullptr);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_wake(a, RT_TRACE_EVENT, &ev1, RT_TRACE_OBJ);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+// A wake by a store needs a write that satisfies it in the same bracket.
+TEST_CASE("trace check: a store's wake follows a write that changed the way the wake says") {
+    void* a = &proc_a;
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    CHECK(rule() == "R6.2");
+    CHECK(has(rt_trace_report(), "no bracket reported"));
+
+    // A write that changed nothing wakes nobody.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(1, 1, false));
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    CHECK(rule() == "R6.2");
+
+    // A negedge entry woken by a write that was a posedge.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_NEG, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_NEG);
+    CHECK(rule() == "R6.2");
+
+    // The write of an earlier step does not excuse a wake made after the activation ran and parked.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_park(a, &kWait, 0);
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    CHECK(rule() == "R6.2");
+
+    // A level write is a change to every level entry.
+    rt_trace_begin();
+    park_on(a, &clk, "clk", RT_TRACE_ANY, nullptr);
+    rt_trace_change(&kStore, &clk, RT_TRACE_SEEN_LEVEL);
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_ANY);
+    CHECK(rt_trace_halted() == 0);
+}
+
+// B7, B25: a store that no bracket serviced. The bytes of what a parked activation waits for read
+// differently at the end of the slot, and nothing woke it.
+TEST_CASE("trace check: a value that changed under a parked waiter with no wake is found at the end of the slot (B7, B25)") {
+    void* a = &proc_a;
+    word32  = 0;
+    rt_trace_begin();
+    park_on(a, &word32, "word", RT_TRACE_ANY, &kWord);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    word32 = 5;
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.3");
+    CHECK(has(rt_trace_report(), "0x00000000 when the activation parked and are 0x00000005 now"));
+
+    // A change that reverts before the slot ends is not a change of its bytes.
+    word32 = 0;
+    rt_trace_begin();
+    park_on(a, &word32, "word", RT_TRACE_ANY, &kWord);
+    word32 = 5;
+    word32 = 0;
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A waiter that was woken is no longer owed.
+    rt_trace_begin();
+    park_on(a, &word32, "word", RT_TRACE_ANY, &kWord);
+    word32 = 7;
+    rt_trace_change(&kStore, &word32, RT_TRACE_SEEN_LEVEL);
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &word32, RT_TRACE_ANY);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // An edge entry reads bit 0 of the planes: 0 -> x is a posedge, x -> z (the z word alone) is none.
+    bit4 = { 0, 0 };
+    rt_trace_begin();
+    park_on(a, &bit4, "b", RT_TRACE_POS, &kBit4);
+    bit4 = { 2, 1 };
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.3");
+    bit4 = { 2, 0 };
+    rt_trace_begin();
+    park_on(a, &bit4, "b", RT_TRACE_POS, &kBit4);
+    bit4.z = 1;
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    park_on(&proc_b, &bit4, "b", RT_TRACE_ANY, &kBit4);
+    bit4.z = 0;
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.3");
+
+    // A static subscription is read the same way: an activation that waits at its static control
+    // for an edge is parked there between runs.
+    word32 = 0;
+    rt_trace_begin();
+    const rt_trace_entry sub[] = { { &word32, "word", RT_TRACE_ANY, &kWord } };
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_subscribe(a, sub, 1);
+    rt_trace_park(a, &kStatic, 0);
+    word32 = 1;
+    rt_trace_slot_end();
+    CHECK(rule() == "R6.3");
+}
 
 #endif // CLOTHO_EXTRA_ASSERTS

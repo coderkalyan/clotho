@@ -875,6 +875,14 @@ void Backend::service_after_write(const Guarded& g, ServiceSnapshot old) {
             llvm::Value* new_z  = old.z != nullptr ? load_lv_z(lv) : nullptr;
             const EdgeFacts f   = emit_edge_facts(old.mm, new_mm, lv.store_width, lv.four_state, old.z,
                                                   new_z, true, true, true);
+            if (trace_on()) {
+                // The callee's own bits; the call's thunk reports the write to the actual's waiters.
+                TraceSeen t = trace_seen_words(old.mm, new_mm, old.z, new_z, lv.store_width, lv.four_state, lv.has_z);
+                t.pos       = f.pos;
+                t.neg       = f.neg;
+                t.any       = f.changed;
+                emit_trace_change(RT_TRACE_CHG_REF, std::nullopt, nullptr, t);
+            }
             emit_ref_wake_call(old.ref_fn, old.ref_ctx, f.changed, f.pos, f.neg);
         } else if (old.str != nullptr) {
             str_chg_after(lv, old.str);
@@ -1079,6 +1087,35 @@ void Backend::service_wide_window(const LValue& lv, const WideWindow& old) {
         f.pos = e.pos;
         f.neg = e.neg;
     }
+    if (trace_on()) {
+        // Bit 0 from the two words that hold it, the planes from the window the store can touch.
+        TraceSeen t;
+        t.four  = old.four;
+        t.has_z = lv.has_z;
+        if (old.need_edge) {
+            auto*        i1 = b_.getInt1Ty();
+            t.old_must      = b_.CreateTrunc(old.lsb_mm, i1);
+            t.new_must      = b_.CreateTrunc(now.lsb_mm, i1);
+            if (old.four) {
+                auto* sh   = llvm::ConstantInt::get(b_.getInt64Ty(), old.width & 63);
+                t.old_may  = b_.CreateTrunc(b_.CreateLShr(old.lsb_may, sh), i1);
+                t.new_may  = b_.CreateTrunc(b_.CreateLShr(now.lsb_may, sh), i1);
+            }
+        }
+        if (old.need_any) {
+            t.diff = b_.CreateICmpNE(old.mm, now.mm);
+            if (old.may != nullptr) {
+                t.diff = b_.CreateOr(t.diff, b_.CreateICmpNE(old.may, now.may));
+            }
+            if (old.z != nullptr) {
+                t.zdiff = b_.CreateICmpNE(old.z, now.z);
+            }
+        }
+        t.pos = f.pos;
+        t.neg = f.neg;
+        t.any = f.changed;
+        emit_trace_change(RT_TRACE_CHG_WINDOW, lv.sig, storage_ptr(slot_of(lv.sig)), t);
+    }
     service_wake_buckets(lv.sig, f);
 }
 
@@ -1095,7 +1132,8 @@ void Backend::service_wait_queue(Signal       sig,
                                  llvm::Value* old_mm,
                                  llvm::Value* new_mm,
                                  llvm::Value* old_z,
-                                 llvm::Value* new_z) {
+                                 llvm::Value* new_z,
+                                 uint32_t     path) {
     if (!signal_has_waiters(sig)) {
         return;
     }
@@ -1104,6 +1142,13 @@ void Backend::service_wait_queue(Signal       sig,
       emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
                       signal_has_bucket(sig, Edge::Positive), signal_has_bucket(sig, Edge::Negative),
                       signal_has_bucket(sig, Edge::Any));
+    if (trace_on()) {
+        TraceSeen t = trace_seen_words(old_mm, new_mm, old_z, new_z, slot.width, slot.four_state, slot.has_z);
+        t.pos       = f.pos;
+        t.neg       = f.neg;
+        t.any       = f.changed;
+        emit_trace_change(path, sig, storage_ptr(slot), t);
+    }
     service_wake_buckets(sig, f);
 }
 
@@ -1182,6 +1227,13 @@ void Backend::service_change_notify(const LValue& lv,
                                                                                    have(Edge::Positive),
                                                                                    have(Edge::Negative),
                                                                                    have(Edge::Any));
+    if (trace_on()) {
+        TraceSeen t = trace_seen_words(old_mm, new_mm, old_z, new_z, lv.store_width, lv.four_state, lv.has_z);
+        t.pos       = f.pos;
+        t.neg       = f.neg;
+        t.any       = f.changed;
+        emit_trace_change(RT_TRACE_CHG_PROPERTY, std::nullopt, lv_mm_ptr(lv), t);
+    }
     const std::array<std::pair<Edge, llvm::Value*>, 3> notifiers = {
         std::make_pair(Edge::Any, f.changed),
         std::make_pair(Edge::Positive, f.pos),
@@ -1885,6 +1937,11 @@ void Backend::emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const
 void Backend::service_any_waiters(Signal sig) {
     const auto i = static_cast<uint32_t>(sig);
     const auto e = static_cast<uint32_t>(Edge::Any);
+    if (trace_on()) {
+        TraceSeen t;
+        t.level = true;
+        emit_trace_change(RT_TRACE_CHG_LEVEL, sig, storage_ptr(slot_of(sig)), t);
+    }
     if (wait_sta_gv_[i][e] != nullptr) {
         service_static_queue(sig, e);
     }
@@ -1988,6 +2045,14 @@ llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
             f.changed = signal_has_bucket(sig, Edge::Any) ? changed : nullptr;
             f.pos     = signal_has_bucket(sig, Edge::Positive) ? pos : nullptr;
             f.neg     = signal_has_bucket(sig, Edge::Negative) ? neg : nullptr;
+            if (trace_on()) {
+                // The callee classified its own write: only its facts are known here.
+                TraceSeen t;
+                t.pos = f.pos;
+                t.neg = f.neg;
+                t.any = f.changed;
+                emit_trace_change(RT_TRACE_CHG_REF, sig, storage_ptr(slot_of(sig)), t);
+            }
             service_wake_buckets(sig, f);
             if (slot_of(sig).is_array) {
                 vcd_touch_array(sig);

@@ -104,8 +104,11 @@ VCD, not only what a test prints.
   parked activation waiting for its cause, a dispatch a queued one, a resume the control
   it parked at, nothing touches an ended one), R12 (each NBA pass leaves its targets as
   the updates give in creation order, and none is left over), R20 (a `->>` triggers inside
-  an NBA pass, in the order they were pended) and R24 (past a `$finish` only the exit that
-  follows it runs). It is on by default in such a build, for the suite and for
+  an NBA pass, in the order they were pended), R24 (past a `$finish` only the exit that
+  follows it runs), R6 (every write a parked waiter lists wakes it, no write that changed
+  nothing wakes anyone, and a parked waiter's value read from design memory has not changed
+  at the end of a slot without a wake) and R7 (the edge and change facts of each write are
+  Table 9-2's). It is on by default in such a build, for the suite and for
   `clotho run`; `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status
   99, `clotho: scheduler trace violation:` and a report naming the rule, the time, the
   target or activation, and the cause) and fails the test that ran the design, unless
