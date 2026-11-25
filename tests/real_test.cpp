@@ -666,6 +666,28 @@ TEST_CASE("%c of a real is still rejected loudly") {
     expect_reject(R"(module m; initial $display("%c", 1.5); endmodule)", "%c with a real argument is not supported");
 }
 
+// $timeformat with no arguments returns to the defaults of Table 20-3 (the smallest
+// precision, precision 0, no suffix, width 20), and its suffix may be a string
+// variable. Oracle: iverilog 13.
+TEST_CASE("$timeformat: no arguments reset the format, and the suffix may be a variable") {
+    CHECK(run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+            string sfx = " ps";
+            initial begin
+                $timeformat(-9, 2, " ns", 10);
+                #1 $display("[%t]", $realtime);
+                $timeformat;
+                $display("[%t]", $realtime);
+                $timeformat(-12, 0, sfx, 8);
+                $display("[%t]", $realtime);
+                $timeformat();
+                $display("[%t]", $realtime);
+            end
+        endmodule
+    )") == "[   1.00 ns]\n[                1000]\n[ 1000 ps]\n[                1000]\n");
+}
+
 // A runtime format with an operand wider than 64 bits under %f converts the whole
 // value with one rounding (iverilog 13 agrees: 2**70; the third rounds the
 // 53-bit boundary up where two roundings would not).

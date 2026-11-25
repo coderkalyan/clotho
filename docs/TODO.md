@@ -214,8 +214,6 @@ Milestones, in order; lower ones unblock higher ones:
   one `$var` per leaf.
 - [ ] **VCD of a container or class-handle signal** — a dump over a queue, dynamic array,
   associative array or class handle is refused.
-- [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
-  string-literal suffix is accepted.
 - [ ] **Freeing a finished simulation** — frames and allocations of processes still
   suspended when a simulation ends are not freed, so a host running several leaks them.
 - [ ] **Debugger breakpoints and stepping** — the DAP adapter refuses every stop-shaped

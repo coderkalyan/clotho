@@ -299,19 +299,6 @@ TEST_CASE("redefining a name in the same scope is an error") {
     CHECK(r.diagnostic_text().find("redefinition of") != std::string::npos);
 }
 
-TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
-    // The suffix must be a compile-time string literal; a string parameter
-    // reference has no runtime string representation yet, so it is rejected.
-    const LowerResult r = lower_text(R"(
-        module m;
-            parameter string S = " ns";
-            initial $timeformat(-9, 2, S, 10);
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("suffix must be a string literal") != std::string::npos);
-}
-
 // A `final` block lowers to a run-once end-of-sim process (LRM 9.2.3), scheduled
 // separately from initial/always (the backend runs it on the exit paths).
 TEST_CASE("final block lowers to a Final-activation process") {

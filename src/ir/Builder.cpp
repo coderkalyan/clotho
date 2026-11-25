@@ -1105,8 +1105,15 @@ Index Builder::timeformat(Index units, Index precision, std::string_view suffix,
     // Order in the extra buffer: suffix bytes, then the TimeFormatInfo record
     // pointing at them. The three operands are plain SSA indices in the record.
     const ExtraIndex suffix_at = add_bytes(suffix);
+    const ExtraIndex extra     = add_extra(TimeFormatInfo{
+      units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()), kNoFormatValue });
+
+    return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::timeformat(Index units, Index precision, Index suffix_value, Index min_width, SourceLoc loc) {
     const ExtraIndex extra =
-      add_extra(TimeFormatInfo{ units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()) });
+      add_extra(TimeFormatInfo{ units, precision, min_width, add_bytes(std::string_view()), 0, suffix_value });
 
     return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::extra, extra) }, loc);
 }

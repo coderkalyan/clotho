@@ -159,13 +159,17 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             return { scratch.data(), 1 };
 
         case Inst::PayloadKind::TimeFormat: {
-            // timeformat: units / precision / min_width are SSA operands; the
-            // suffix bytes are not.
+            // timeformat: units / precision / min_width are SSA operands, and so is
+            // a runtime suffix; a literal suffix's bytes are not.
             const auto info = extra_data<TimeFormatInfo>(p.extra);
             scratch[0]      = info.units;
             scratch[1]      = info.precision;
             scratch[2]      = info.min_width;
-            return { scratch.data(), 3 };
+            if (info.suffix_value == kNoFormatValue) {
+                return { scratch.data(), 3 };
+            }
+            scratch[3] = info.suffix_value;
+            return { scratch.data(), 4 };
         }
 
         case Inst::PayloadKind::OpExtra:

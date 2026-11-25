@@ -141,35 +141,43 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
 }
 
 // $timeformat(units, precision, suffix, min_width): set the %t format for all
-// later %t specifiers (LRM §20.4.3). units / precision / min_width are general
-// runtime rvalues; the suffix must be a string literal.
+// later %t specifiers (LRM §20.4.3). units / precision / min_width and the suffix
+// are general runtime rvalues; a literal suffix travels as bytes. With no
+// arguments the format returns to the defaults of Table 20-3: the smallest time
+// precision of the design (the unit the runtime seeds at startup), precision 0, a
+// null suffix and a field width of 20.
 void Lowerer::lower_timeformat(const CallExpression& call, ir::Builder& b) {
-    const auto args = call.arguments();
-    // The no-argument form resets to the defaults; slang accepts it but
-    // Clotho's runtime default is already seeded at startup, so it is unused
-    // in practice. Require the full four-argument form for now.
-    // TODO: the zero-argument $timeformat resets to the LRM default values.
+    const auto          args = call.arguments();
+    const ir::SourceLoc l    = loc(call);
+    if (args.empty()) {
+        const ir::Ref i32 = make_int_type(32, true);
+        b.timeformat(iconst(i32, static_cast<uint64_t>(static_cast<int64_t>(module_.timeformat_units)), b, l),
+                     iconst(i32, 0, b, l),
+                     std::string_view(),
+                     iconst(i32, 20, b, l),
+                     l);
+        return;
+    }
     if (args.size() != 4) {
-        fail("$timeformat requires four arguments (units, precision, suffix, min_width)");
-    }
-
-    // The suffix must be a literal string: dynamic string values have no
-    // runtime representation yet, so only a compile-time literal is passed to
-    // the runtime as (ptr, len).
-    // TODO: a non-literal suffix (a string variable / expression) needs full
-    // dynamic string support, which Clotho lacks.
-    const Expression* suffix = args[2];
-    while (suffix->kind == ExpressionKind::Conversion) {
-        suffix = &suffix->as<ConversionExpression>().operand();
-    }
-    if (suffix->kind != ExpressionKind::StringLiteral) {
-        fail("$timeformat suffix must be a string literal");
+        fail("$timeformat takes four arguments (units, precision, suffix, min_width) or none (LRM 20.4.3)");
     }
 
     const ir::Index units     = lower_expr(*args[0], b);
     const ir::Index precision = lower_expr(*args[1], b);
-    const ir::Index min_width = lower_expr(*args[3], b);
-    b.timeformat(units, precision, suffix->as<StringLiteral>().getValue(), min_width, loc(call));
+    const Expression* suffix = args[2];
+    while (suffix->kind == ExpressionKind::Conversion) {
+        suffix = &suffix->as<ConversionExpression>().operand();
+    }
+    if (suffix->kind == ExpressionKind::StringLiteral) {
+        const ir::Index min_width = lower_expr(*args[3], b);
+        b.timeformat(units, precision, suffix->as<StringLiteral>().getValue(), min_width, l);
+        return;
+    }
+    // The suffix is a string object (slang converts an integral one), whose bytes
+    // the runtime copies.
+    const ir::Index suffix_value = lower_expr(*args[2], b);
+    const ir::Index min_width    = lower_expr(*args[3], b);
+    b.timeformat(units, precision, suffix_value, min_width, l);
 }
 
 // $printtimescale [hier]: print "Time scale of (<path>) is <unit> / <prec>"

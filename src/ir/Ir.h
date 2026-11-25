@@ -1209,8 +1209,9 @@ struct ValuePlusArgsInfo {
 
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
-// suffix string is appended after the formatted number and lives packed
-// little-endian (4 chars per u32 word) at `suffix` for `suffix_len` bytes.
+// suffix string is appended after the formatted number. It is a literal packed
+// little-endian (4 chars per u32 word) at `suffix` for `suffix_len` bytes, unless
+// `suffix_value` is not kNoFormatValue: then it is that string value operand.
 struct TimeFormatInfo {
     // Time-unit exponent operand (10^units seconds).
     Index units;
@@ -1222,6 +1223,8 @@ struct TimeFormatInfo {
     ExtraIndex suffix;
     // Suffix length in bytes.
     uint32_t suffix_len;
+    // A string operand holding the suffix, or kNoFormatValue for the literal.
+    Index suffix_value;
 };
 
 // Extra payload for `str_putc`: s[i] = c / s.putc(i, c). The string lvalue is

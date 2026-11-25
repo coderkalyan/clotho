@@ -110,10 +110,20 @@ void Backend::lower_timeformat(Index i) {
     llvm::Value* prec  = cast(must_of(info.precision), 32, true);
     llvm::Value* width = cast(must_of(info.min_width), 32, true);
 
-    const std::string suffix  = ir_->extra_bytes(info.suffix, info.suffix_len);
-    llvm::Value*      sfx_ptr = b_.CreateGlobalString(suffix);
-    b_.CreateCall(timeformat_set_fn(),
-                  { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
+    // A runtime suffix is a string object: the runtime copies its bytes, so its
+    // data pointer and length go where the literal's would.
+    llvm::Value* sfx_ptr = nullptr;
+    llvm::Value* sfx_len = nullptr;
+    if (info.suffix_value != kNoFormatValue) {
+        llvm::Value* handle = str_of(info.suffix_value);
+        sfx_ptr             = b_.CreateCall(str_data_fn(), { handle });
+        sfx_len             = b_.CreateTrunc(b_.CreateCall(str_len_fn(), { handle }), b_.getInt32Ty());
+    } else {
+        const std::string suffix = ir_->extra_bytes(info.suffix, info.suffix_len);
+        sfx_ptr                  = b_.CreateGlobalString(suffix);
+        sfx_len                  = b_.getInt32(static_cast<uint32_t>(suffix.size()));
+    }
+    b_.CreateCall(timeformat_set_fn(), { units, prec, sfx_ptr, sfx_len, width });
 }
 
 // Lower a `strobe_pend`: ramp the target zero-formal deferred-print task

@@ -635,6 +635,8 @@ public:
     // already-lowered value operands; `suffix` is a literal string appended after
     // the formatted number.
     Index timeformat(Index units, Index precision, std::string_view suffix, Index min_width, SourceLoc loc);
+    // The same with a string value operand for the suffix.
+    Index timeformat(Index units, Index precision, Index suffix_value, Index min_width, SourceLoc loc);
 
     // -- Value-change dump (VCD; see docs/VCD.md) --
     // $dumpfile: set the output path to the `filename` value.
