@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -4344,19 +4345,43 @@ private:
 
     ir::Index lower_compound_assign(const AssignmentExpression& a, ir::Builder& b);
 
+    // A read-modify-write target with no single lvalue to Load and Store through
+    // (a concatenation, a string character): `read` yields the target's current
+    // value, `write` stores a new one, and both go through lvalues bound once when
+    // the place was made, so a compound assignment or `++`/`--` evaluates its
+    // target's index expressions exactly once (LRM 11.4.1, 11.4.2).
+    using CompoundRead  = std::function<ir::Index(ir::Builder&, ir::SourceLoc)>;
+    using CompoundWrite = std::function<void(ir::Index, ir::Builder&, ir::SourceLoc)>;
+
+    struct RmwPlace {
+        CompoundRead  read;
+        CompoundWrite write;
+    };
+
+    // Null for an ordinary single-lvalue target.
+    std::optional<RmwPlace> bind_rmw_place(const Expression& target, ir::Builder& b);
+
+    ir::Index lower_compound_rhs(const AssignmentExpression& a, const CompoundRead& read, ir::Builder& b);
+
+    // The lvalue each leaf operand of an lvalue concatenation evaluated to, bound
+    // ahead of a scatter that must not evaluate them again.
+    using ConcatLvalues = ankerl::unordered_dense::map<const Expression*, ir::Index>;
+
     void store_concat(const ConcatenationExpression& cc,
                       ir::Index                      rhs,
                       ir::Inst::Tag                  tag,
                       ir::Builder&                   b,
                       ir::SourceLoc                  l,
-                      const IntraNbTiming*           nbt = nullptr);
+                      const IntraNbTiming*           nbt   = nullptr,
+                      const ConcatLvalues*           bound = nullptr);
 
     void store_concat_ops(std::span<const Expression* const> ops,
                           ir::Index                          rhs,
                           ir::Inst::Tag                      tag,
                           ir::Builder&                       b,
                           ir::SourceLoc                      l,
-                          const IntraNbTiming*               nbt = nullptr);
+                          const IntraNbTiming*               nbt   = nullptr,
+                          const ConcatLvalues*               bound = nullptr);
 
     [[noreturn]] void fail_keyed_pattern_lvalue();
 
@@ -6176,10 +6201,11 @@ private:
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
-    // The LHS lvalue of the compound assignment currently being lowered, read by
-    // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
-    // outside a compound assignment.
-    std::optional<ir::Index> compound_lv_;
+    // How the LValueReferenceExpression slang embeds in a compound assignment's
+    // rewritten RHS reads its target: through the lvalue lower_compound_rhs bound,
+    // or through a read-modify-write place. Null outside a compound assignment;
+    // scoped by Restore, never assigned bare.
+    const CompoundRead* compound_read_ = nullptr;
     // The value an output port's connection assigns, read by the EmptyArgument
     // slang leaves for it in the connection's right-hand side (lower_port_output).
     // Nullopt outside one; scoped by Restore, never assigned bare.

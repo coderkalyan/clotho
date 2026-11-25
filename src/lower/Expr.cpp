@@ -112,12 +112,13 @@ ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
         case ExpressionKind::LValueReference: {
             // slang rewrites a compound assignment's RHS into
             // `BinaryExpression(LValueReference, rhs, op)`; the reference
-            // stands for the LHS already lowered once by lower_compound_assign
-            // (LRM 11.4.1 single-evaluation).
-            if (!compound_lv_.has_value()) {
+            // stands for the LHS already bound once by lower_compound_assign
+            // (LRM 11.4.1 single-evaluation), read through whatever place that
+            // bound: an lvalue, a concatenation, a string character.
+            if (compound_read_ == nullptr) {
                 fail("LValueReference outside a compound assignment");
             }
-            const ir::Index v = b.unary(ir::Inst::Tag::Load, *compound_lv_, l);
+            const ir::Index v = (*compound_read_)(b, l);
             // A no-op for every lvalue shape except a struct member
             // narrower than its struct's own physical domain (see the
             // MemberAccess case above) — cheap enough to apply generically
@@ -414,6 +415,18 @@ ir::Index Lowerer::lower_unary(const UnaryExpression& u, ir::Builder& b) {
         u.op == U::Postdecrement) {
         const bool      inc = u.op == U::Preincrement || u.op == U::Postincrement;
         const bool      pre = u.op == U::Preincrement || u.op == U::Predecrement;
+        if (const std::optional<RmwPlace> place = bind_rmw_place(u.operand(), b)) {
+            // A concatenation or a string character: no single lvalue to load and
+            // store through, so the place binds its pieces once (LRM 11.4.2 is
+            // `i = i +/- 1` with the target evaluated once) and the value moves
+            // through its read and write. A force on one piece is gated by the
+            // concatenation scatter itself.
+            const ir::Index cur = narrow_to_declared(place->read(b, l), *u.operand().type, b, l);
+            const ir::Index one = b.constant(module_.pool.put_int(lower_type(*u.operand().type), 1), l);
+            const ir::Index nv  = b.binary(inc ? T::Add : T::Sub, cur, one, l);
+            place->write(nv, b, l);
+            return pre ? nv : cur;
+        }
         const ir::Index lv  = lower_lvalue(u.operand(), b);
         const ir::Index cur = b.unary(T::Load, lv, l);
         // `i++` is the read-modify-write `i = i + 1`, so a forced/assigned

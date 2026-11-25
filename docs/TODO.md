@@ -445,8 +445,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Operators & expressions
 
-- [ ] **Concatenation as a compound-assignment target** — `{a, b} += x` is refused.
-- [ ] **String element as a compound-assignment target** — `s[i] += c` is refused.
 - [~] **`inside` operator** (11.4.13) — missing set-member and range forms:
   - [ ] **Associative-array set member** — needs the first/next key walk (7.9.4) rather
     than an index loop.
