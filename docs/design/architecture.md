@@ -87,7 +87,10 @@ them in step.
 - Every built-in handle kind (fork capture boxes, semaphores, mailboxes, process
   objects, events, covergroup instances) follows one discipline: a collected
   object, with a finalizer for any native resource it owns. **Not yet:** events
-  are never freed.
+  are never freed, and covergroup instances live until the run ends.
+- A covergroup instance's results outlive it: its finalizer folds them into the
+  type's record, and an instance with its own sampling event stays reachable
+  while that event can fire (tentative until read against clause 19).
 - Collection is generational: an object is old once a collection has marked it.
   That bit is the only generation state; it is kept beside the heap, not in the
   object, and a full collection clears it first. **Not yet:** marks are an epoch
@@ -153,8 +156,18 @@ them in step.
   unmarked. Collection timing is then visible to a design, so a collection
   happens at a point that is a function of the run, never of thread timing.
   **Not yet:** the class is refused.
-- Still open for discussion: how the collector is verified, the lifetime of
-  covergroup instances, and where an object's identity number is kept.
+- An object's identity number (`weak_reference::get_id`, the order of an
+  associative array keyed by a class handle) is assigned on first request and
+  kept in a table beside the heap, so objects that never ask pay nothing; the
+  pass that clears weak references drops a dead object's entry. **Not yet:** no
+  such number.
+- The collector is checked three ways: each test design runs at three collection
+  cadences (never, ordinary, stress) on one code path and its output must not
+  change; a heap verifier runs after each collection in extra-assertion builds;
+  and a model-based test drives the collector's C interface with random graphs,
+  stores and collections against a shadow reachability model. A design that uses
+  a weak reference is left out of the cadence comparison. **Not yet:** there is
+  no never cadence and no model-based test.
 
 ## Containers and classes
 
