@@ -396,9 +396,6 @@ Milestones, in order; lower ones unblock higher ones:
   the design; the rest call the runtime through an interpreted element descriptor.
 - [ ] **Logical `==` / `!=` over an associative array with a 4-state value element** (11.4.5) —
   refused at any nesting depth until the defining clause and x on a key-set mismatch are settled.
-- [ ] **Associative-array key mixing a class handle or an event with a variable-width component**
-  (7.8) — a `string`, queue, dynamic-array or associative-array component beside the handle is
-  refused.
 - [ ] **Wildcard `[*]` index wider than 64 bits** (7.8.1) — an index expression (including a
   string literal of more than 8 characters) wider than 64 bits is refused.
 - [ ] **Assignment-pattern lvalue over a container or handle** (10.9) — a queue, dynamic-array or

@@ -338,10 +338,10 @@ struct NbaQueue {
 
 // One pending handle-bearing container. `ops` is the descriptor of the CONTAINER
 // type -- kind rt_elem_dynarr / rt_elem_queue / rt_elem_assoc -- so `ops->inner` is
-// the element descriptor and `ops->keyhandles` names the class handles inside one
-// normalized associative KEY span (Runtime.h:919-927). That is what makes a registered
+// the element descriptor and `ops->keyshape` says where the handles are inside one
+// normalized associative KEY span (Runtime.h, rt_key_*). That is what makes a registered
 // root, a class-body leaf and a nested container element the same triple, and it keeps
-// the key table off the element descriptor, which the backend memoizes by element TYPE
+// the key shape off the element descriptor, which the backend memoizes by element TYPE
 // and would therefore share between an `int m[C]` and an `int d[]`. `kind` is the ABI's
 // own copy of ops->kind, kept so the two can be asserted equal at both ends of the
 // worklist.
@@ -1621,13 +1621,13 @@ void assert_elem_ops([[maybe_unused]] const rt_elem_ops* ops) {
     assert((ops->nleaves == 0 || ops->leaves != nullptr) && "nleaves implies a leaf table");
     assert((!is_container_kind(ops->kind) || ops->inner != nullptr) &&
            "a container descriptor names its element descriptor");
-    // The key table and its count are one fact stated twice (Runtime.h:919-927), and
-    // `nkeyhandles != 0` is the SINGLE source of truth for "this array's keys carry a
-    // handle" -- the same question the backend's barrier answers off the same table
-    // (ir/llvm/AssocArrays.cpp, assoc_key_handle_offsets), so the barrier and the tracer cannot disagree.
-    assert((ops->nkeyhandles == 0) == (ops->keyhandles == nullptr) &&
-           "nkeyhandles implies a key table, and a key table implies a count");
-    assert((ops->nkeyhandles == 0 || ops->kind == rt_elem_assoc) &&
+    // The key shape and its length are one fact stated twice (Runtime.h, rt_key_*), and
+    // `nkeyshape != 0` is the SINGLE source of truth for "this array's keys carry a
+    // handle" -- the same question the backend's barrier answers off the same program
+    // (ir/llvm/AssocArrays.cpp, assoc_key_shape), so the barrier and the tracer cannot disagree.
+    assert((ops->nkeyshape == 0) == (ops->keyshape == nullptr) &&
+           "nkeyshape implies a key shape, and a key shape implies a length");
+    assert((ops->nkeyshape == 0 || ops->kind == rt_elem_assoc) &&
            "only an associative array has key bytes to decode");
 }
 
@@ -1751,32 +1751,183 @@ void walk_queue(const rt_queue* h, const rt_elem_ops* cops) {
     }
 }
 
-// The class handle encoded in the 8 key bytes at `key + off`.
+// One normalized key span being walked. Every read is checked against the end of the
+// span and ends the run if it would pass it: the shape and the bytes come from two
+// places (the backend's descriptor, the serializer's output), and a disagreement must
+// not become a read of whatever follows the key.
+struct KeyCursor {
+    const uint8_t* at;
+    const uint8_t* end;
+};
+
+void key_need(const KeyCursor& c, uint64_t bytes) {
+    assert(c.at <= c.end && "a key cursor stays inside its span");
+    if (static_cast<uint64_t>(c.end - c.at) < bytes) {
+        gc_fatal("an associative array key is shorter than its shape says",
+                 "the collector's key shape and the key serializer disagree");
+    }
+}
+
+// A big-endian count or length, as emit_key_bytes wrote it.
+uint32_t key_u32(KeyCursor& c) {
+    key_need(c, sizeof(uint32_t));
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < sizeof(uint32_t); ++i) {
+        v = (v << 8) | c.at[i];
+    }
+    c.at += sizeof(uint32_t);
+    return v;
+}
+
+// The handle in the next 8 key bytes.
 //
 // The ONE place the key byte order is undone. emit_key_bytes writes byte 0 as the most
-// significant and applies no sign flip, a class handle being unsigned
-// (ir/llvm/AssocArrays.cpp, docs/design/assoc-keys.md:85), so the word is reassembled
+// significant and applies no sign flip, a handle being unsigned
+// (ir/llvm/AssocArrays.cpp, docs/design/assoc-keys.md §2), so the word is reassembled
 // MSB-first -- a memcpy would read it byte-reversed on this host and trace an address
-// that is not an object.
-//
-// Byte-wise rather than one 64-bit load, and that is not a style choice: a key offset is
-// a SERIALIZED offset, not a storage one. An aggregate key is concatenated leaf by leaf
-// with no padding (assoc-keys.md:88), so `struct { int i; Cell c; }` puts its handle at
-// offset 4 and nothing about a key handle is 8-aligned. Hence no alignment assertion
-// here, unlike visit_elem_image's storage words.
-void* decode_key_handle(const uint8_t* key, [[maybe_unused]] uint32_t klen, uint32_t off) {
-    assert(key != nullptr && "a decoded key has bytes");
-    assert(off + sizeof(uint64_t) <= klen && "a key handle lies inside the normalized span");
+// that is not an object. Byte-wise also because nothing about a key handle is aligned:
+// the span is serialized leaf by leaf with no padding.
+void* key_handle(KeyCursor& c) {
+    key_need(c, sizeof(uint64_t));
     uint64_t bits = 0;
     for (uint32_t i = 0; i < sizeof(uint64_t); ++i) {
-        bits = (bits << 8) | key[off + i];
+        bits = (bits << 8) | c.at[i];
     }
+    c.at += sizeof(uint64_t);
     return reinterpret_cast<void*>(static_cast<uintptr_t>(bits));
+}
+
+// One level of a key walk in progress.
+//   Run:  the words [pc, end) once. A nested key also has to end exactly at `stop`.
+//   Loop: `body` .. `body + words`, `left` more times.
+//   Map:  `left` more entries, each a length, a key and a value.
+struct KeyFrame {
+    enum class Kind : uint8_t { Run, Loop, Map };
+    Kind            kind;
+    uint32_t        left;
+    const uint32_t* pc;
+    const uint32_t* end;
+    const uint8_t*  stop;
+    const uint32_t* key;
+    uint32_t        key_words;
+};
+
+// Nesting of containers and arrays inside one key type. A key type is finite, and no
+// design nests one this deep; the bound makes a corrupt shape a fatal instead of a
+// walk off the stack (TigerStyle).
+constexpr uint32_t kKeyDepthMax = 64;
+
+// Mark every handle in one normalized key span, by walking it as its shape says
+// (Runtime.h, rt_key_*). An explicit stack and never recursion: a key may be a queue
+// of structs of associative arrays, to any depth the type system allows.
+void walk_key(const uint32_t* shape, uint32_t words, const uint8_t* key, uint32_t klen) {
+    assert(shape != nullptr && words > 0 && "a key walk needs a shape");
+    assert(key != nullptr && "a key walk needs the key bytes");
+    KeyCursor c{ key, key + klen };
+    KeyFrame  stack[kKeyDepthMax];
+    uint32_t  depth = 0;
+    const auto push  = [&](const KeyFrame& f) {
+        if (depth == kKeyDepthMax) {
+            gc_fatal("an associative array key nests deeper than the collector walks",
+                     "the key shape is corrupt, or the key type nests more than 64 levels");
+        }
+        stack[depth++] = f;
+    };
+    const auto run = [&](const uint32_t* pc, const uint32_t* end, const uint8_t* stop) {
+        push(KeyFrame{ KeyFrame::Kind::Run, 0, pc, end, stop, nullptr, 0 });
+    };
+    // An element or an entry is at least one byte, so a count beyond the bytes that are
+    // left is a wrong shape. This is also what bounds every loop below.
+    const auto counted = [&]() {
+        const uint32_t n = key_u32(c);
+        key_need(c, n);
+        return n;
+    };
+    run(shape, shape + words, c.end);
+    while (depth > 0) {
+        KeyFrame& f = stack[depth - 1];
+        if (f.kind == KeyFrame::Kind::Loop) {
+            if (f.left == 0) {
+                --depth;
+                continue;
+            }
+            f.left -= 1;
+            run(f.pc, f.end, nullptr);
+            continue;
+        }
+        if (f.kind == KeyFrame::Kind::Map) {
+            if (f.left == 0) {
+                --depth;
+                continue;
+            }
+            f.left -= 1;
+            const uint32_t        key_bytes = counted();
+            const uint8_t* const  key_end   = c.at + key_bytes;
+            const KeyFrame        entry     = f;  // `push` may not be handed a reference into the stack
+            run(entry.pc, entry.end, nullptr);
+            if (entry.key_words == 0) {
+                c.at = key_end;
+            } else {
+                run(entry.key, entry.key + entry.key_words, key_end);
+            }
+            continue;
+        }
+        if (f.pc == f.end) {
+            if (f.stop != nullptr && c.at != f.stop) {
+                gc_fatal("an associative array key does not end where its shape does",
+                         "the collector's key shape and the key serializer disagree");
+            }
+            --depth;
+            continue;
+        }
+        const uint32_t* const pc = f.pc;
+        switch (pc[0]) {
+            case rt_key_skip:
+                key_need(c, pc[1]);
+                c.at += pc[1];
+                f.pc = pc + 2;
+                break;
+            case rt_key_handle:
+                // Resolution of the decoded handle is asserted by mark_container_handle,
+                // which is the pair half of this decode: a key handle read out of the
+                // wrong bytes names no object, and one the collector fails to read at all
+                // is a use-after-free that surfaces on the next `m.first(k)`.
+                mark_container_handle(key_handle(c));
+                f.pc = pc + 1;
+                break;
+            case rt_key_string:
+                c.at += counted();
+                f.pc = pc + 1;
+                break;
+            case rt_key_seq: {
+                const uint32_t count = counted();
+                f.pc                 = pc + 2 + pc[1];
+                push(KeyFrame{ KeyFrame::Kind::Loop, count, pc + 2, pc + 2 + pc[1], nullptr, nullptr, 0 });
+                break;
+            }
+            case rt_key_rep:
+                f.pc = pc + 3 + pc[2];
+                push(KeyFrame{ KeyFrame::Kind::Loop, pc[1], pc + 3, pc + 3 + pc[2], nullptr, nullptr, 0 });
+                break;
+            case rt_key_map: {
+                const uint32_t        count = counted();
+                const uint32_t* const kprog = pc + 3;
+                const uint32_t* const vprog = kprog + pc[1];
+                f.pc                        = vprog + pc[2];
+                push(KeyFrame{ KeyFrame::Kind::Map, count, vprog, vprog + pc[2], nullptr, kprog, pc[1] });
+                break;
+            }
+            default:
+                gc_fatal("an associative array key shape holds an unknown word",
+                         "the backend and the runtime disagree about rt_key_*");
+        }
+    }
+    assert(c.at == c.end && "the outermost run checks that the shape consumed the key");
 }
 
 // The context the associative walk carries through the C callback: the descriptor of
 // the ARRAY, so the callback can read both `inner` (the value element) and
-// `keyhandles` (where the class handles are inside one normalized key span).
+// `keyshape` (where the handles are inside one normalized key span).
 struct AssocWalk {
     const rt_elem_ops* cops;
 };
@@ -1786,42 +1937,21 @@ struct AssocWalk {
 // reading any absent index yields it, so a handle inside it is a strong reference
 // (design §9, "a handle in a live element of a traced container").
 //
-// A handle-valued KEY is a strong reference for the same reason and one the collector
+// A handle inside a KEY is a strong reference for the same reason and one the collector
 // has to decode: the key bytes are the only copy of the handle, so `m[obj] = 1` keeps
 // `obj` alive and `m.first(k)` hands it back for dereference
-// (docs/design/garbage-collection.md:365). Which bytes those are comes from an offset
-// TABLE rather than a flag, because an aggregate key is serialized leaf by leaf and a
-// struct can carry several handles at offsets no flag could name (Runtime.h:919-927). A
-// bare `int m[C]` is the ONE-ENTRY case of this same loop, `{ 0 }`, and not a path of
-// its own (ir/llvm/AssocArrays.cpp, assoc_key_handle_offsets).
+// (docs/design/garbage-collection.md §3.3a). A bare `int m[C]` is the one-word case of
+// the same walk and not a path of its own (ir/llvm/AssocArrays.cpp, assoc_key_shape).
 void assoc_visit_image(void* elem, const uint8_t* key, uint32_t klen, void* ctx) {
     assert(elem != nullptr && "a visited element image has an address");
     assert(ctx != nullptr && "the associative walk carries its descriptor");
     const rt_elem_ops* cops = static_cast<const AssocWalk*>(ctx)->cops;
     visit_elem_image(static_cast<uint8_t*>(elem), cops->inner);
-    if (cops->nkeyhandles == 0 || key == nullptr) {
+    if (cops->nkeyshape == 0 || key == nullptr) {
         return;
     }
     assert(cops->kind == rt_elem_assoc && "only an associative array is keyed");
-    assert(klen > 0 && "a present key has bytes");
-    [[maybe_unused]] uint32_t prev = 0;
-    for (uint32_t i = 0; i < cops->nkeyhandles; ++i) {
-        const uint32_t off = cops->keyhandles[i];
-        // Strictly ascending and disjoint -- the runtime half of the emitter's
-        // `is_sorted` (ir/llvm/AssocArrays.cpp, assoc_key_handle_offsets): the offsets come from a walk of the span in
-        // serialization order in which every class leaf consumes exactly 8 bytes,
-        // so no two can overlap. Alignment is deliberately NOT asserted
-        // (decode_key_handle). This is also what bounds the loop: with the in-span check
-        // in the decode, nkeyhandles <= klen / 8 follows.
-        assert((i == 0 || off >= prev + sizeof(uint64_t)) &&
-               "the key handle offsets are ascending and disjoint");
-        prev = off;
-        // Resolution of the decoded handle is asserted by mark_container_handle, which is
-        // the pair half of this decode: a key handle read out of the wrong bytes names no
-        // object, and one the collector fails to read at all is a use-after-free that
-        // surfaces on the next `m.first(k)`.
-        mark_container_handle(decode_key_handle(key, klen, off));
-    }
+    walk_key(cops->keyshape, cops->nkeyshape, key, klen);
 }
 
 // One associative array. rt_assoc_visit is the only way in: the map is an

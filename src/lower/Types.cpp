@@ -55,82 +55,6 @@ void Lowerer::guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
     }
 }
 
-// True if `type`'s normalized key span has no compile-time bound: itself a
-// string / queue / dynamic array / associative array, or (through struct /
-// fixed-array nesting) any leaf is. Mirrors ir/llvm/AssocArrays.cpp's
-// key_type_is_variable exactly -- kept as a second, independent walk (like
-// agg_key_bytes / emit_agg_key_bytes / agg_key_handle_offsets already are)
-// rather than exposed across the frontend/backend boundary.
-bool Lowerer::key_type_is_variable(ir::Ref type) const {
-    const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-    switch (t.kind) {
-        case ir::Type::Kind::String:
-        case ir::Type::Kind::Queue:
-        case ir::Type::Kind::DynArray:
-        case ir::Type::Kind::Assoc:
-            return true;
-        case ir::Type::Kind::Struct:
-            if (t.is_packed) {
-                return false;
-            }
-            for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
-                if (key_type_is_variable(f.type)) {
-                    return true;
-                }
-            }
-            return false;
-        case ir::Type::Kind::UnpackedArray:
-            return key_type_is_variable(t.element);
-        default:
-            return false;
-    }
-}
-
-// True if a class or event handle -- a reference the collector must trace -- is
-// reachable anywhere inside `type`.
-bool Lowerer::key_type_has_class_handle(ir::Ref type) const {
-    const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-    switch (t.kind) {
-        case ir::Type::Kind::Class:
-        case ir::Type::Kind::Event:
-            return true;
-        case ir::Type::Kind::Struct:
-            for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
-                if (key_type_has_class_handle(f.type)) {
-                    return true;
-                }
-            }
-            return false;
-        case ir::Type::Kind::UnpackedArray:
-        case ir::Type::Kind::Queue:
-        case ir::Type::Kind::DynArray:
-            return key_type_has_class_handle(t.element);
-        case ir::Type::Kind::Assoc:
-            return key_type_has_class_handle(t.element) ||
-                   (t.right == 0 && key_type_has_class_handle(static_cast<ir::Ref>(t.fields_id)));
-        default:
-            return false;
-    }
-}
-
-// A class or event handle anywhere inside a VARIABLE key is refused: the collector's
-// key-handle trace (assoc_key_handle_offsets, ir/llvm/AssocArrays.cpp) is a
-// compile-time STATIC offset table, correct only for a FIXED key -- a
-// variable key's byte offsets depend on runtime data (a string's length, a
-// container's element count), so a handle anywhere in one could land at a
-// different offset on every entry, or after a sibling variable component
-// that precedes it in declaration order. A runtime decode walk the collector
-// could use instead is not yet built. A handle in an otherwise-FIXED key
-// (P0's bare class-handle / chandle-shaped keys, or one nested only through
-// fixed struct/array members) is unaffected: its static offset already works.
-void Lowerer::guard_key_no_handle_in_variable(ir::Ref key_ty) {
-    if (!key_type_is_variable(key_ty) || !key_type_has_class_handle(key_ty)) {
-        return;
-    }
-    fail("associative array key type combining a class handle or an event with a string / "
-         "queue / dynamic-array member is not supported");
-}
-
 // The element types a dynamic array / queue admits, with a loud refusal for the
 // rest. Both share DynElem and the rt_elem_ops descriptor, so their element
 // capability is identical by construction; `what` only names the container in
@@ -301,7 +225,6 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
                 kt.as_if<slang::ast::DynamicArrayType>() != nullptr ||
                 kt.as_if<slang::ast::AssociativeArrayType>() != nullptr) {
                 guard_agg_key_leaves(*aa->indexType, kr);
-                guard_key_no_handle_in_variable(kr);
             }
             // Typed integral keys of any width normalize via the backend's
             // per-byte big-endian emit (wide keys included). String keys pass

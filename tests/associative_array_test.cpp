@@ -451,40 +451,48 @@ TEST_CASE("assoc struct-keyed deep copy independence") {
                               "a1=1 c1=111\n");
 }
 
+// A handle beside a variable-length member in one key: two keys are the same entry
+// exactly when the handles are identical and the strings equal, a null handle is a
+// key like any other, and traversal hands the handle back usable.
+TEST_CASE("assoc: a struct key holding a class handle and a string") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; int x; endclass
+            typedef struct { C h; string s; } k_t;
+            int a [k_t];
+            initial begin
+                C   p, q;
+                k_t k;
+                int sum;
+                p = new; p.x = 10;
+                q = new; q.x = 20;
+                k.h = p; k.s = "one";   a[k] = 1;
+                k.h = p; k.s = "two";   a[k] = 2;
+                k.h = q; k.s = "one";   a[k] = 3;
+                k.h = p; k.s = "one";   a[k] = a[k] + 100;
+                k.h = null; k.s = "one"; a[k] = 4;
+                $display("num=%0d", a.num());
+                k.h = p; k.s = "one";
+                $display("p-one=%0d", a[k]);
+                k.h = q; k.s = "two";
+                $display("q-two exists=%0d", a.exists(k));
+                sum = 0;
+                if (a.first(k)) begin
+                    do sum = sum + (k.h == null ? 0 : k.h.x) * a[k]; while (a.next(k));
+                end
+                $display("sum=%0d", sum);
+                k.h = p; k.s = "two";
+                a.delete(k);
+                $display("num=%0d", a.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=4\np-one=101\nq-two exists=0\nsum=1090\nnum=3\n");
+}
+
 // docs/design/assoc-keys.md's P0-P3 phases admit every LRM 7.8.5 index type;
-// what remains here is a deliberate GC-safety scope boundary (a class handle
-// combined with a variable component) and one non-lvalue-expression corner.
+// what remains here is one non-lvalue-expression corner.
 TEST_CASE("assoc key types Clotho still refuses loudly") {
-    // A class handle's key-handle offset (for GC tracing) is a compile-time
-    // constant, correct only for a FIXED key; a variable key's byte offsets are
-    // runtime-dependent, so a handle anywhere inside one is refused rather than
-    // risking an untraced (or wrongly offset) reference.
-    SUBCASE("struct key combining a class handle with a string member") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                class C; int x; endclass
-                typedef struct { C h; string s; } k_t;
-                int a [k_t];
-                k_t k;
-                initial a[k] = 1;
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("combining a class handle") != std::string::npos);
-    }
-    // An event handle is traced the same way, so it is refused the same way.
-    SUBCASE("struct key combining an event with a string member") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                typedef struct { event e; string s; } k_t;
-                int a [k_t];
-                k_t k;
-                initial a[k] = 1;
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("or an event with a string") != std::string::npos);
-    }
     SUBCASE("dynamic-array key from a non-lvalue expression") {
         const LowerResult r = lower_text(R"(
             module m;

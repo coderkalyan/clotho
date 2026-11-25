@@ -492,8 +492,8 @@ struct LValueInfo {
     // The invariant, which every propagation site preserves: non-null implies a class
     // handle can land at or under this place, inside that owner.
     llvm::Value* gc_owner = nullptr;
-    // This assoc's key CONTAINS a class handle (rt_elem_ops carries its key-handle
-    // offsets, `assoc_key_handle_offsets`), so creating an entry stores a handle into
+    // This assoc's key CONTAINS a class or event handle (rt_elem_ops carries its key
+    // shape, `assoc_key_shape`), so creating an entry stores a handle into
     // the map's key storage -- a reference the owner acquires even when the VALUE is an
     // int, and one that no further member selection is party to. Lifted onto the assoc
     // lvalue at AssocSelect and consumed by assoc_elem_lvalue's put_ptr path, which is
@@ -1552,9 +1552,9 @@ private:
     llvm::Constant* gc_offsets_global(const std::vector<uint32_t>& offsets,
                                       const std::string&           nm);
 
-    void agg_key_handle_offsets(Ref type, uint32_t base, std::vector<uint32_t>& out);
+    bool key_shape(Ref type, std::vector<uint32_t>& out, size_t& last_skip);
 
-    std::vector<uint32_t> assoc_key_handle_offsets(Ref assoc_type);
+    std::vector<uint32_t> assoc_key_shape(Ref assoc_type);
 
     bool assoc_key_is_class_handle(Ref assoc_type);
 
