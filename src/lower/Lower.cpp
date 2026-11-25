@@ -17,6 +17,16 @@ TwinCheck g_twin_check;
 TwinStats g_twin_stats;
 bool      g_in_twin = false;
 
+// Config-matrix mode's check (Lower.h), called by the public entry points that can
+// replay their inputs.
+DesignCheck g_design_check;
+
+void check_design(const LowerResult& result, const LowerInputs& inputs) {
+    if (g_design_check) {
+        g_design_check(result, inputs);
+    }
+}
+
 void twin_check_design(slang::ast::Compilation& comp, ir::SystemAccess allow_system, bool allow_port_coercion);
 
 // Map slang's severity scale onto Clotho's. slang's Ignored never reaches here (an
@@ -1238,7 +1248,13 @@ LowerResult lower_files(std::span<const std::string_view> paths,
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
+    LowerResult result = lower_compilation(comp, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
+    check_design(result,
+                 LowerInputs{ .entry               = LowerInputs::Entry::Files,
+                              .args                = paths,
+                              .allow_system        = allow_system,
+                              .allow_port_coercion = allow_port_coercion });
+    return result;
 }
 
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
@@ -1343,7 +1359,13 @@ LowerResult lower_sources(std::span<const std::string_view> args,
                                                  .reported = true });
         return result;
     }
-    return lower_driver(std::move(driver), timings, allow_system, {}, allow_port_coercion);
+    LowerResult result = lower_driver(std::move(driver), timings, allow_system, {}, allow_port_coercion);
+    check_design(result,
+                 LowerInputs{ .entry               = LowerInputs::Entry::Sources,
+                              .args                = args,
+                              .allow_system        = allow_system,
+                              .allow_port_coercion = allow_port_coercion });
+    return result;
 }
 
 LowerResult lower_text(std::string_view source,
@@ -1365,7 +1387,13 @@ LowerResult lower_text(std::string_view source,
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(cr, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
+    LowerResult result = lower_compilation(cr, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
+    check_design(result,
+                 LowerInputs{ .entry               = LowerInputs::Entry::Text,
+                              .text                = source,
+                              .allow_system        = allow_system,
+                              .allow_port_coercion = allow_port_coercion });
+    return result;
 }
 
 LowerResult lower_buffer(std::string_view path,
@@ -1433,6 +1461,10 @@ void set_twin_check(TwinCheck check) {
 
 const TwinStats& twin_stats() {
     return g_twin_stats;
+}
+
+void set_design_check(DesignCheck check) {
+    g_design_check = std::move(check);
 }
 
 } // namespace clotho
