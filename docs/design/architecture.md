@@ -89,8 +89,9 @@ them in step.
   object, with a finalizer for any native resource it owns. **Not yet:**
   covergroup instances live until the run ends.
 - A covergroup instance's results outlive it: its finalizer folds them into the
-  type's record, and an instance with its own sampling event stays reachable
-  while that event can fire (tentative until read against clause 19).
+  type's record, an instance with `option.per_instance` set keeps its own record
+  as well (LRM 19.7 requires that one in the report), and an instance with its own
+  sampling event stays reachable while that event can fire.
 - Collection is generational: an object is old once a collection has marked it.
   That bit is the only generation state; it is kept beside the heap, not in the
   object, and a full collection clears it first.
