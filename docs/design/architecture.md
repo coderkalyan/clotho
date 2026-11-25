@@ -147,8 +147,14 @@ them in step.
 - The metadata is laid out so that stopped workers can mark in parallel; the
   marker itself stays single-threaded until a workload needs more.
 - Finalizers run in the collection that finds their object dead.
-- Still open for discussion: how the collector is verified, weak references and
-  the lifetime of covergroup instances.
+- `std::weak_reference` is weak by its class, not by a mark on the pointer: the
+  class's trace map leaves the referent out, and after marking the collector
+  clears the referent of each weak reference it reached whose referent is
+  unmarked. Collection timing is then visible to a design, so a collection
+  happens at a point that is a function of the run, never of thread timing.
+  **Not yet:** the class is refused.
+- Still open for discussion: how the collector is verified, the lifetime of
+  covergroup instances, and where an object's identity number is kept.
 
 ## Containers and classes
 
