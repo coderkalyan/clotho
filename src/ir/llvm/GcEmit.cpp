@@ -1280,12 +1280,15 @@ llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site) {
     const uint64_t granules = size / RT_GC_ALIGN;
     b_.CreateMemCpy(emit_gc_meta_ptr(cur, "gc.meta"), llvm::MaybeAlign(1), gc_meta_pattern(granules, fin),
                     llvm::MaybeAlign(1), b_.getInt64(granules));
-    // The whole object: exactly the bytes rt_gc_alloc zeroes, padding included.
-    // 2-state leaves and handle properties power on 0 / null (LRM Table 7-1) and
-    // these bytes are recycled heap, so this is required rather than merely tidy. A
-    // constant size lowers to stores. The handle is the object's first byte, on a
-    // granule boundary.
-    b_.CreateMemSet(cur, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(RT_GC_ALIGN));
+    // The body. 2-state leaves and handle properties power on 0 / null (LRM Table
+    // 7-1) and these bytes are recycled heap, so this is required rather than merely
+    // tidy. The padding that rounds the object up to a granule is left as it is:
+    // nothing reads it, and rt_gc_alloc zeroing it too changes nothing a program or
+    // the collector can see. The handle is the object's first byte, on a granule
+    // boundary.
+    const uint64_t body = env_->llmod.getDataLayout().getTypeAllocSize(class_body_ty(class_ref));
+    assert(body <= size && size - body < RT_GC_ALIGN && "an object is its body rounded up to a granule");
+    b_.CreateMemSet(cur, b_.getInt8(0), b_.getInt64(body), llvm::MaybeAlign(RT_GC_ALIGN));
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(slow);
