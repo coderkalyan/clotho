@@ -5557,6 +5557,27 @@ private:
     // of the enclosing object, and `new` for an embedded covergroup is required to
     // sit in the enclosing class's constructor (LRM 19.4).
 
+    // A covergroup's own instance / type options, as far as this phase resolves
+    // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
+    // type set. `weight` is option.weight; `type_weight` is a covergroup's
+    // type_option.weight, which only weights the group in $get_coverage (19.11.3).
+    // `name` is the covergroup's option.name, and `comment` / `type_comment` are the
+    // option.comment / type_option.comment of whichever level the setters belong to.
+    struct CoverOpts {
+        uint32_t                   weight         = 1;
+        uint32_t                   type_weight    = 1;
+        uint32_t                   goal           = 100;
+        uint32_t                   at_least       = 1;
+        uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default
+        bool                       per_instance   = false;
+        bool                       detect_overlap = false;
+        // Read back by `h.option.get_inst_coverage`; it changes no number.
+        bool                       get_inst_coverage = false;
+        std::optional<std::string> name;
+        std::string                comment;
+        std::string                type_comment;
+    };
+
     // What one lowered covergroup declaration owns.
     struct CoverDecl {
         // Index into module_.cover_types.
@@ -5567,26 +5588,37 @@ private:
         // The coverpoints in model order: the position a coverpoint-level method
         // (`h.cp.get_inst_coverage()`, `cg::cp::get_coverage()`) names its coverpoint by.
         std::vector<const slang::ast::CoverpointSymbol*> points;
+        // The options the definition resolved to, for the covergroup and each coverpoint,
+        // which the ones nothing assigns at run time are read back from.
+        CoverOpts              group;
+        std::vector<CoverOpts> point_opts;
     };
 
-    // A covergroup's own instance / type options, as far as this phase resolves
-    // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
-    // type set. `weight` is option.weight; `type_weight` is a covergroup's
-    // type_option.weight, which only weights the group in $get_coverage (19.11.3).
-    // `name` is the covergroup's option.name, and `comment` / `type_comment` are the
-    // option.comment / type_option.comment of whichever level the setters belong to.
-    struct CoverOpts {
-        uint32_t                   weight       = 1;
-        uint32_t                   type_weight  = 1;
-        uint32_t                   goal         = 100;
-        uint32_t                   at_least     = 1;
-        uint32_t                   auto_bin_max = 64; // LRM Table 19-1's default
-        bool                       per_instance = false;
-        bool                       detect_overlap = false;
-        std::optional<std::string> name;
-        std::string                comment;
-        std::string                type_comment;
+    // Option ids and the covergroup-level point, mirroring src/runtime/Coverage.h.
+    static constexpr uint32_t kCoverOptGroup   = 0xFFFFFFFFu;
+    static constexpr uint32_t kCoverOptWeight  = 0;
+    static constexpr uint32_t kCoverOptGoal    = 1;
+    static constexpr uint32_t kCoverOptAtLeast = 2;
+    static constexpr uint32_t kCoverOptCrossNumPrintMissing = 3;
+    static constexpr uint32_t kCoverOptComment = 4;
+    static constexpr uint32_t kCoverOptName    = 5;
+
+    // `h.option.f` / `h.cp.option.f` (LRM 19.7, 19.10): the covergroup handle, the
+    // coverpoint (or the covergroup's own options) and the field.
+    struct CoverOptRef {
+        const Expression*                 handle = nullptr;
+        const slang::ast::CovergroupType* cgt    = nullptr;
+        uint32_t                          point  = kCoverOptGroup;
+        bool                              is_type  = false;
+        bool                              on_cross = false;
+        std::string_view                  field;
     };
+
+    std::optional<CoverOptRef> cover_option_ref(const Expression& e);
+
+    ir::Index lower_cover_option_read(const MemberAccessExpression& ma, const CoverOptRef& r, ir::Builder& b);
+
+    ir::Index lower_cover_option_write(const AssignmentExpression& a, const CoverOptRef& r, ir::Builder& b);
 
     // The value space a coverpoint's bins live in: what `$` means, and how many
     // automatic bins 19.5.3 would create.
@@ -5632,7 +5664,8 @@ private:
 
     uint32_t cover_type_of(const slang::ast::CovergroupType& cgt);
 
-    ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts);
+    ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts,
+                                     CoverOpts& resolved);
 
     void cover_report_overlaps(const std::vector<const slang::ast::CoverageBinSymbol*>& sources,
                                const CoverSpace&                                      space,

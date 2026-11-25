@@ -426,9 +426,10 @@ void Lowerer::cover_apply_option(const slang::ast::CoverageOptionSetter& set, Co
         // equal the value returned by get_coverage". merge_instances is refused below,
         // so type coverage is always the weighted average of the instances, every
         // instance's own counters are always kept, and get_inst_coverage always
-        // answers for its instance: the option changes nothing here, and is
-        // validated and dropped. It is the consumer merge_instances will need.
-        as_u32("coverage option 'get_inst_coverage'");
+        // answers for its instance: the option changes no number here. It is kept so
+        // that `h.option.get_inst_coverage` reads back what the definition set, and
+        // is the consumer merge_instances will need.
+        opts.get_inst_coverage = as_u32("coverage option 'get_inst_coverage'") != 0;
         return;
     }
     // TODO: the remaining options of LRM Table 19-1 / 19-3. `cross_*` belong with
@@ -481,6 +482,7 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
     ct.inst_name    = gopts.name;
     ct.inst_comment = gopts.comment;
     ct.type_comment = gopts.type_comment;
+    ct.at_least     = gopts.at_least;
 
     std::vector<const slang::ast::CoverpointSymbol*> points;
     for (const Symbol& m : body.members()) {
@@ -508,8 +510,11 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
         // denominator, which is legal and scores 0.0 (or 100.0 at weight 0).
         // Nothing to refuse -- the runtime implements that table.
     }
+    std::vector<CoverOpts> point_opts;
     for (const slang::ast::CoverpointSymbol* cp : points) {
-        ct.points.push_back(cover_point_model(*cp, gopts));
+        CoverOpts resolved;
+        ct.points.push_back(cover_point_model(*cp, gopts, resolved));
+        point_opts.push_back(std::move(resolved));
     }
 
     const uint32_t idx = static_cast<uint32_t>(module_.cover_types.size());
@@ -519,7 +524,12 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
     // reach this covergroup, but the body build reads cover_decls_ for the
     // index, and an exception from it must not leave a half-built entry that a
     // later `new` of the same type would reuse.
-    cover_decls_.emplace(&cgt, CoverDecl{ .type_idx = idx, .sample = ir::FunctionId{}, .points = points });
+    cover_decls_.emplace(&cgt,
+                         CoverDecl{ .type_idx   = idx,
+                                    .sample     = ir::FunctionId{},
+                                    .points     = points,
+                                    .group      = gopts,
+                                    .point_opts = std::move(point_opts) });
     const ir::FunctionId sid  = build_cover_sample(cgt, idx, points);
     cover_decls_[&cgt].sample = sid;
     cover_event_process(cgt, idx, sid);
@@ -529,7 +539,8 @@ uint32_t Lowerer::cover_type_of(const slang::ast::CovergroupType& cgt) {
 // One coverpoint's model. The coverage expression's own type decides the value
 // space (LRM 19.5: the inferred type is the self-determined type of the
 // expression, or the declared coverpoint type when one is given).
-ir::CoverPoint Lowerer::cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts) {
+ir::CoverPoint Lowerer::cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts,
+                                          CoverOpts& resolved) {
     ir::CoverPoint out;
     out.name   = cp.name.empty() ? "cp" : std::string(cp.name);
     out.banner = banner_at(cp.location);
@@ -557,6 +568,7 @@ ir::CoverPoint Lowerer::cover_point_model(const slang::ast::CoverpointSymbol& cp
     out.at_least     = opts.at_least;
     out.inst_comment = opts.comment;
     out.type_comment = opts.type_comment;
+    resolved         = opts;
 
     // LRM 19.5.3: automatic bins happen when the coverpoint defines no bins
     // EXCEPT ignore / illegal ones, so those are expanded either way.
@@ -1128,4 +1140,150 @@ const slang::ast::CovergroupType& Lowerer::cover_type_owning(const slang::ast::S
     return type->asSymbol().as<slang::ast::CovergroupType>();
 }
 
+
+// `h.option.f`, `h.cp.option.f` and the `type_option` forms (LRM 19.7, 19.7.1, 19.10): the
+// options are implicit structs on the covergroup, each coverpoint and each cross.
+std::optional<Lowerer::CoverOptRef> Lowerer::cover_option_ref(const Expression& e) {
+    if (e.kind != ExpressionKind::MemberAccess) {
+        return std::nullopt;
+    }
+    const auto& outer = e.as<slang::ast::MemberAccessExpression>();
+    if (outer.member.kind != SymbolKind::Field || outer.value().kind != ExpressionKind::MemberAccess) {
+        return std::nullopt;
+    }
+    const auto& inner = outer.value().as<slang::ast::MemberAccessExpression>();
+    const auto* prop  = inner.member.as_if<slang::ast::ClassPropertySymbol>();
+    if (prop == nullptr || (prop->name != "option" && prop->name != "type_option")) {
+        return std::nullopt;
+    }
+    const slang::ast::Scope* owner = prop->getParentScope();
+    if (owner == nullptr) {
+        return std::nullopt;
+    }
+    const SymbolKind where = owner->asSymbol().kind;
+    if (where != SymbolKind::CovergroupBody && where != SymbolKind::Coverpoint && where != SymbolKind::CoverCross) {
+        return std::nullopt;
+    }
+    CoverOptRef r;
+    r.is_type  = prop->name == "type_option";
+    r.on_cross = where == SymbolKind::CoverCross;
+    r.field    = outer.member.name;
+    r.cgt      = &cover_type_owning(*owner);
+    const Expression& x = inner.value();
+    if (where == SymbolKind::CovergroupBody) {
+        r.handle = x.type->getCanonicalType().isCovergroup() ? &x : nullptr;
+    } else if (x.kind == ExpressionKind::MemberAccess) {
+        r.handle = &x.as<slang::ast::MemberAccessExpression>().value();
+    }
+    if (where == SymbolKind::Coverpoint && !r.is_type) {
+        cover_type_of(*r.cgt);
+        const auto& points = cover_decls_.at(r.cgt).points;
+        const auto  it     = std::ranges::find(points, &owner->asSymbol().as<slang::ast::CoverpointSymbol>());
+        if (it == points.end()) {
+            fail("internal: coverpoint '" + std::string(owner->asSymbol().name) + "' is not in its covergroup's model");
+        }
+        r.point = static_cast<uint32_t>(it - points.begin());
+    }
+    return r;
+}
+
+// A read of an instance option. The ones nothing can assign after the definition are
+// constants of the type; weight, goal, at_least and the strings live in the instance.
+ir::Index Lowerer::lower_cover_option_read(const slang::ast::MemberAccessExpression& ma, const CoverOptRef& r,
+                                           ir::Builder& b) {
+    const ir::SourceLoc l = loc(ma);
+    if (r.on_cross) {
+        fail("cross coverage (LRM 19.6) is not supported");
+    }
+    if (r.is_type || r.handle == nullptr) {
+        fail("a covergroup type option (type_option) in a procedural expression is not supported");
+    }
+    const uint32_t   idx   = cover_type_of(*r.cgt);
+    const CoverDecl& decl  = cover_decls_.at(r.cgt);
+    const bool       group = r.point == kCoverOptGroup;
+    const CoverOpts& o     = group ? decl.group : decl.point_opts[r.point];
+    const ir::Ref    ty    = lower_type(*ma.type);
+    const ir::Ref    i64   = make_int_type(64, true);
+    const auto       konst = [&](uint64_t v) { return b.constant(module_.pool.put_int(ty, v), l); };
+    const auto       which = [&](uint32_t id) { return int_const(id, 32, b, l); };
+    const std::string_view f = r.field;
+
+    if (f == "auto_bin_max") {
+        return konst(o.auto_bin_max);
+    }
+    if (f == "detect_overlap") {
+        return konst(o.detect_overlap ? 1 : 0);
+    }
+    if (group && f == "per_instance") {
+        return konst(o.per_instance ? 1 : 0);
+    }
+    if (group && f == "get_inst_coverage") {
+        return konst(o.get_inst_coverage ? 1 : 0);
+    }
+    if (group && f == "cross_retain_auto_bins") {
+        return konst(1);
+    }
+    const ir::Index h  = lower_expr(*r.handle, b);
+    uint32_t        id = 0;
+    if (f == "weight") {
+        id = kCoverOptWeight;
+    } else if (f == "goal") {
+        id = kCoverOptGoal;
+    } else if (f == "at_least") {
+        id = kCoverOptAtLeast;
+    } else if (group && f == "cross_num_print_missing") {
+        id = kCoverOptCrossNumPrintMissing;
+    } else if (f == "comment" || (group && f == "name")) {
+        return b.cover_query(ir::CoverOp::OptGetStr, { { h, which(f == "name" ? kCoverOptName : kCoverOptComment) } },
+                             module_.pool.string_type, idx, r.point, l);
+    } else {
+        fail("coverage option '" + std::string(f) + "' cannot be read here");
+    }
+    const ir::Index v = b.cover_query(ir::CoverOp::OptGet, { { h, which(id) } }, i64, idx, r.point, l);
+    return b.convert(v, ty, true, l);
+}
+
+// `h.option.f = e` and `h.cp.option.f = e` (LRM 19.7: "Other instance-specific options can
+// be assigned procedurally after a covergroup has been instantiated"). Only a blocking
+// assignment: a coverage option is runtime state of the instance, not a signal, so there is
+// nothing to stage in the NBA region, and a compound update has no lvalue to read back.
+ir::Index Lowerer::lower_cover_option_write(const AssignmentExpression& a, const CoverOptRef& r, ir::Builder& b) {
+    const ir::SourceLoc l = loc(a);
+    if (r.on_cross) {
+        fail("cross coverage (LRM 19.6) is not supported");
+    }
+    if (r.is_type || r.handle == nullptr) {
+        fail("assigning a covergroup type option (type_option) procedurally is not supported");
+    }
+    if (a.isNonBlocking() || a.op.has_value()) {
+        fail("only a plain blocking assignment to a coverage option is supported");
+    }
+    const uint32_t         idx   = cover_type_of(*r.cgt);
+    const bool             group = r.point == kCoverOptGroup;
+    const std::string_view f     = r.field;
+    const auto             which = [&](uint32_t id) { return int_const(id, 32, b, l); };
+    uint32_t               id    = 0;
+    bool                   text  = false;
+    if (f == "weight") {
+        id = kCoverOptWeight;
+    } else if (f == "goal") {
+        id = kCoverOptGoal;
+    } else if (f == "at_least") {
+        id = kCoverOptAtLeast;
+    } else if (group && f == "cross_num_print_missing") {
+        id = kCoverOptCrossNumPrintMissing;
+    } else if (f == "comment") {
+        id   = kCoverOptComment;
+        text = true;
+    } else if (group && f == "name") {
+        id   = kCoverOptName;
+        text = true;
+    } else {
+        fail("coverage option '" + std::string(f) + "' may only be set in the covergroup definition (LRM 19.7)");
+    }
+    const ir::Index h = lower_expr(*r.handle, b);
+    const ir::Index v = lower_expr(a.right(), b);
+    b.cover_ctl(text ? ir::CoverOp::OptSetStr : ir::CoverOp::OptSet, { { h, which(id), v } }, idx, r.point, l);
+    return v;
+}
 } // namespace clotho::lower

@@ -375,6 +375,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_cover_type_point_coverage", &rt_cover_type_point_coverage);
     expose("rt_cover_type_point_covered", &rt_cover_type_point_covered);
     expose("rt_cover_type_point_total", &rt_cover_type_point_total);
+    expose("rt_cover_opt_set", &rt_cover_opt_set);
+    expose("rt_cover_opt_get", &rt_cover_opt_get);
+    expose("rt_cover_opt_set_str", &rt_cover_opt_set_str);
+    expose("rt_cover_opt_get_str", &rt_cover_opt_get_str);
     expose("rt_cover_design_coverage", &rt_cover_design_coverage);
     expose("rt_run_init", &rt_run_init);
     expose("rt_event_new", &rt_event_new);

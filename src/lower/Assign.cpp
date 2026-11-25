@@ -1779,6 +1779,10 @@ void Lowerer::check_subroutine_nba_target(const Expression& lhs) {
 // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
 // Statement callers discard the return.
 ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+    // `h.option.f = e` (LRM 19.7): runtime state of a covergroup instance, not a variable.
+    if (const auto opt = cover_option_ref(a.left())) {
+        return lower_cover_option_write(a, *opt, b);
+    }
     // Gate ordinary writes to a forced/assigned variable (LRM 10.6.2). The write
     // predicate is "is this lvalue's root a force target?" — the root, not the
     // written shape, carries the site state, so a whole-variable write, a

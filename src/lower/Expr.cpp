@@ -260,6 +260,9 @@ ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
             // narrow_to_declared's string/real skip never triggers here —
             // used anyway for uniformity with its ElementSelect/RangeSelect
             // siblings above).
+            if (const auto opt = cover_option_ref(expr)) {
+                return lower_cover_option_read(expr.as<MemberAccessExpression>(), *opt, b);
+            }
             if (auto c = try_lower_constant_select(expr, b, l)) {
                 return *c;
             }

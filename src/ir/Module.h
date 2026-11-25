@@ -902,6 +902,8 @@ struct CoverType {
     uint32_t                type_weight  = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
+    // option.at_least of the covergroup: the default its coverpoints took.
+    uint32_t                at_least     = 1;
     // option.name (LRM 19.7, Table 19-1): the name each instance starts with, unset
     // when the group leaves it to the tool.
     std::optional<std::string> inst_name;

@@ -100,6 +100,8 @@ typedef struct rt_cover_type {
     uint32_t type_weight;
     uint32_t goal;
     uint32_t per_instance;
+    // option.at_least of the covergroup, the default its coverpoints took.
+    uint32_t at_least;
     // option.name: the name every instance starts with (LRM 19.7, Table 19-1), or
     // null when the group leaves it unset and each instance gets a generated one.
     const char* inst_name;
@@ -183,6 +185,24 @@ void rt_cover_start_point(uint64_t h, uint32_t point, int32_t on);
 
 // `set_inst_name(string)` (LRM 19.8). Copies the bytes.
 void rt_cover_set_inst_name(uint64_t h, const char* name, uint64_t len);
+
+// -- Options assigned after construction (LRM 19.7) ---------------------------
+//
+// `point` is the coverpoint index, or RT_COVER_OPT_GROUP for the covergroup's own.
+// Weight, goal and at_least are integers; comment and name are strings (name is the
+// covergroup's only).
+#define RT_COVER_OPT_GROUP                0xFFFFFFFFu
+#define RT_COVER_OPT_WEIGHT                0u
+#define RT_COVER_OPT_GOAL                  1u
+#define RT_COVER_OPT_AT_LEAST              2u
+#define RT_COVER_OPT_CROSS_NUM_PRINT_MISSING 3u
+#define RT_COVER_OPT_COMMENT               4u
+#define RT_COVER_OPT_NAME                  5u
+void    rt_cover_opt_set(uint64_t h, uint32_t point, uint32_t which, int64_t value);
+int64_t rt_cover_opt_get(uint64_t h, uint32_t point, uint32_t which);
+void    rt_cover_opt_set_str(uint64_t h, uint32_t point, uint32_t which, const char* s, uint64_t len);
+void    rt_cover_opt_get_str(struct rt_string* dst, uint64_t h, uint32_t point, uint32_t which,
+                             const struct rt_alloc_site* site);
 
 // -- Queries (LRM 19.8, 19.11) ------------------------------------------------
 //

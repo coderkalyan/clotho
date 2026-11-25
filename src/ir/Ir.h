@@ -677,11 +677,18 @@ enum class CoverOp : uint32_t {
     TypePointCovered,
     TypePointTotal,
     DesignCoverage, // $get_coverage() (LRM 19.9)
+    // An option of an instance read back (LRM 19.7): operands (handle, option id), the
+    // coverpoint index in CoverInfo::point or RT_COVER_OPT_GROUP for the covergroup's own.
+    OptGet,    // an integer option -> 64-bit signed
+    OptGetStr, // a string option (comment, name) -> string
     // CoverCtl.
     Hit,        // one coverpoint's sampled value: match bins and count
     Start,      // h.start() / h.stop()
     StartPoint, // h.cp.start() / h.cp.stop()
     SetName,    // h.set_inst_name(s)
+    // An option assigned after construction: operands (handle, option id, value).
+    OptSet,    // an integer option
+    OptSetStr, // a string option
 };
 
 // Extra payload for the two coverage tags.
@@ -744,6 +751,10 @@ constexpr bool cover_op_names_type(CoverOp op) {
         case CoverOp::Start:
         case CoverOp::StartPoint:
         case CoverOp::SetName:
+        case CoverOp::OptGet:
+        case CoverOp::OptGetStr:
+        case CoverOp::OptSet:
+        case CoverOp::OptSetStr:
             return false;
     }
     return false;

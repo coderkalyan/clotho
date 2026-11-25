@@ -178,6 +178,7 @@ bool Backend::produces_string_temp(Index i) {
             return true;
         // `p.get_randstate()` renders a fresh string (LRM 9.7); every other
         // process query yields a word.
+        case Inst::Tag::CoverQuery:
         case Inst::Tag::ProcQuery:
             return type_of(i).is_string;
         case Inst::Tag::Constant:
