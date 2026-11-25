@@ -3,6 +3,7 @@
 #include "lower/Lowerer.h"
 
 #include <slang/diagnostics/AllDiags.h>
+#include <slang/diagnostics/JsonDiagnosticClient.h>
 
 #include "ir/Verify.h"
 namespace clotho {
@@ -202,8 +203,8 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // config parameter set through every module and using the subset each needs
     // IS the idiom -- so the check reports a pattern rather than a problem, at a
     // volume that buries the three findings that matter. Not a semantic question,
-    // hence here rather than in the policy below. NOTE: `-W` options do not
-    // reach this engine (see main.cpp), so it cannot be re-enabled per design.
+    // hence here rather than in the policy below. NOTE: this runs after the
+    // user's `-W` options (style_of), so it holds against `-Wunused-parameter`.
     engine.setSeverity(slang::diag::UnusedParameter, slang::DiagnosticSeverity::Ignored);
     engine.setSeverity(slang::diag::UnusedPackageParameter, slang::DiagnosticSeverity::Ignored);
 
@@ -963,6 +964,17 @@ struct DiagStyle {
     // Whether a Clotho item names its code, as slang names a warning's option
     // (`--diag-option`).
     bool show_code = true;
+    // The Driver's own engine, which `processOptions` configured with `-W`, `-Werror`,
+    // `--error-limit`, `--suppress-warnings` and `--waiver-file`; the design's
+    // diagnostics go through it so those options reach them. Null: a fresh engine, for an
+    // entry that has no Driver.
+    slang::DiagnosticEngine* engine = nullptr;
+    // The Driver's `--diag-json` client, or null. slang's own items reach it through
+    // `engine`; Clotho's are reported into it by hand (render_through_client).
+    slang::DiagnosticClient* json = nullptr;
+    // What the `-W` options themselves drew (an unknown warning name), to be shown with
+    // the design's diagnostics.
+    slang::Diagnostics option_diags;
 };
 
 // Whether the Driver's text client colours what it formats. The decision is
@@ -1004,6 +1016,22 @@ DiagStyle style_of(slang::driver::Driver& dr) {
     c.showHierarchyInstance(o.diagHierarchy.value_or(slang::ShowHierarchyPathOption::Auto));
     style.show_code = o.diagOptionName.value_or(true);
 
+    // Every warning shows unless the user says otherwise, as when Clotho had an engine
+    // of its own: `-Weverything` goes first, so the user's `-W` options narrow it, and
+    // `-Werror` and `--suppress-warnings` apply on top. A fresh engine had no error
+    // limit, so the Driver's default of 20 is lifted unless `--error-limit` asks for one.
+    // setWarningOptions rebuilds the severity table from the current one, and Clotho's
+    // own severity policy is applied after this (apply_severity_policy), so no `-W`
+    // option can demote a promotion it makes.
+    std::vector<std::string> warning_options{ "everything" };
+    warning_options.insert(warning_options.end(), o.warningOptions.begin(), o.warningOptions.end());
+    style.option_diags = dr.diagEngine.setWarningOptions(warning_options);
+    if (!o.errorLimit.has_value()) {
+        dr.diagEngine.setErrorLimit(0);
+    }
+    style.engine = &dr.diagEngine;
+    style.json   = dr.jsonDiagClient.get();
+
     return style;
 }
 
@@ -1027,6 +1055,7 @@ void render_through_client(const Diagnostic&           d,
                            const slang::SourceManager& sm,
                            slang::TextDiagnosticClient& client,
                            bool                         show_code,
+                           slang::DiagnosticClient*     json,
                            std::string&                 out) {
     std::string message = d.message;
     if (show_code && !d.code.empty()) {
@@ -1058,9 +1087,12 @@ void render_through_client(const Diagnostic&           d,
     client.report(reported);
     out += client.getString();
     client.clear();
+    if (json != nullptr) {
+        json->report(reported);
+    }
 
     for (const Diagnostic& note : d.notes) {
-        render_through_client(note, sm, client, show_code, out);
+        render_through_client(note, sm, client, show_code, json, out);
     }
 }
 
@@ -1090,13 +1122,27 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         return bare;
     }
 
-    slang::DiagnosticEngine engine(*sm);
+    slang::DiagnosticEngine own_engine(*sm);
+    slang::DiagnosticEngine& engine = style.engine != nullptr ? *style.engine : own_engine;
     if (style.client == nullptr) {
         style.client = std::make_shared<slang::TextDiagnosticClient>();
     }
     engine.addClient(style.client);
+    // What the options themselves drew comes first, as the Driver's would.
+    std::vector<Diagnostic> option_items;
+    for (const slang::Diagnostic& d : style.option_diags) {
+        style.client->clear();
+        engine.issue(d);
+        if (!style.client->empty()) {
+            Diagnostic item = from_slang(engine, d);
+            item.rendered   = style.client->getString();
+            option_items.push_back(std::move(item));
+        }
+    }
     LowerResult result =
       lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion, stats);
+    result.diagnostics.insert(result.diagnostics.begin(), std::make_move_iterator(option_items.begin()),
+                              std::make_move_iterator(option_items.end()));
     assert_well_typed(result);
 
     // slang's own items arrive rendered (lower_design harvests them one by one).
@@ -1104,7 +1150,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     // driver notices. Items the driver already printed are not rendered again.
     for (Diagnostic& d : result.diagnostics) {
         if (d.rendered.empty() && !d.reported) {
-            render_through_client(d, *sm, *style.client, style.show_code, d.rendered);
+            render_through_client(d, *sm, *style.client, style.show_code, style.json, d.rendered);
         }
     }
 
@@ -1325,8 +1371,16 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // The design's diagnostics are rendered the way the Driver renders its own, so
     // colour and `--diag-source`, `--diag-column`, `--diag-location`, ... apply to
     // them alike.
-    return lower_compilation(
+    result = lower_compilation(
       cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr), allow_port_coercion, stats);
+    // `--diag-json`: the Driver closes the array and writes the file, or prints it to
+    // stdout for `-`. Its own text client has collected the same items a second time;
+    // emptied, so the Driver prints none of it and the caller's rendering is the text.
+    if (dr.options.diagJson.has_value()) {
+        dr.textDiagClient->clear();
+        (void)dr.reportDiagnostics(/*quiet=*/true);
+    }
+    return result;
 }
 
 LowerResult lower_sources(std::span<const std::string_view> args,
