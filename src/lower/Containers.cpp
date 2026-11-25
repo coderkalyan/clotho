@@ -922,7 +922,13 @@ ir::Index Lowerer::materialize_queue_rvalue(const Expression& expr, ir::Builder&
         e.kind == ExpressionKind::ElementSelect || e.kind == ExpressionKind::MemberAccess) {
         return lower_lvalue(e, b);
     }
-    const ir::Ref   qty = lower_type(*expr.type);
+    // The temp holds the expression's whole value, so its type is unbounded even where
+    // slang types the expression with a bounded target's type: the consumer that stores
+    // it applies its own bound, once, and reports an overflow once with the full count
+    // (docs/LRM_NOTES.md, note 6).
+    ir::Type temp_ty = std::get<ir::Type>(module_.pool.get(lower_type(*expr.type)));
+    temp_ty.left     = 0;
+    const ir::Ref   qty = module_.pool.put(ir::Item{ temp_ty });
     const ir::Index tmp = make_arg_temp(qty, b, l);
     b.queue_delete(tmp, tmp, /*has_idx=*/false, qty, l);
     append_queue_pieces(tmp, e, qty, b, l);

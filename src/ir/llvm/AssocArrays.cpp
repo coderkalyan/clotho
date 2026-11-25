@@ -678,7 +678,8 @@ void Backend::denormalize_variable_agg_key(Ref            type,
             b_.CreateCall(dynarr_move_fn(), { dst, tmp, ops });
         } else {
             b_.CreateCall(queue_assign_dynarr_fn(),
-                         { dst, tmp, ops, alloc_site_global(loc_text(at), "assoc key traversal") });
+                         { dst, tmp, ops, b_.getInt64(t.left),
+                           alloc_site_global(loc_text(at), "assoc key traversal") });
             b_.CreateCall(dynarr_delete_fn(), { tmp, ops });
         }
         off = b_.CreateLoad(b_.getInt32Ty(), eoff_a);

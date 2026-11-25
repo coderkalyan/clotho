@@ -133,9 +133,12 @@ TYPE, lowered on demand at the first `new` of it, so a declaration nothing
 instantiates is inert wherever it sits, which is exactly what LRM 19.4 says of an
 embedded covergroup left unconstructed.
 
-### 3.3 The precedent that is already silently wrong
+### 3.3 The precedent that was silently wrong
 
-Immediate `cover (expr);` (LRM 16.3) compiles, runs, and counts nothing.
+(Closed: see "Cover statements" in section 9. What follows is the state this work
+started from.)
+
+Immediate `cover (expr);` (LRM 16.3) compiled, ran, and counted nothing.
 `lower_immediate_assertion` in `src/lower/Assertions.cpp` lowers it to one `Cond` whose
 false-region is opened and closed empty; the true region runs the user's action
 block if written. So:
@@ -620,7 +623,11 @@ database tasks.** Specifically:
   report reflects the last committed state.
 - Ordered by (type index, instance creation order), never by hash or pointer
   order, so two runs of one design diff cleanly.
-- Content per instance: the instance name (`<scope><type>`, the scope being the
+- Per-instance lines appear only for a covergroup whose `option.per_instance` is 1
+  (LRM 19.7: instance data is saved only then [unverified wording]). With the default 0
+  the report lists the type line alone (coverage, bins, instance count), and no bin hit
+  counts; `get_inst_coverage()` still answers, because the counters are kept either way.
+- Content per instance (per_instance = 1): the instance name (`<scope><type>`, the scope being the
   constructing instance's prefix of §6.2, or whatever
   `set_inst_name` replaced it with), its percentage, then per coverpoint the
   percentage and covered/total, then one line per bin with its LRM name and hit
@@ -642,6 +649,32 @@ path is baked into the emitted coverage model, exactly like `--gc-stats` is bake
 into `clotho.gc.config`; a build and the run of what it built must be given the
 same file. Sampling and `get_coverage()` are never gated on the flag — they are
 design-visible semantics, and a reporting option must not change them.
+
+### Cover statements
+
+`cover (expr)`, `cover #0` / `cover final`, `cover property` and `cover sequence` are
+counted per site and per instance and listed in the same `--coverage` file, after the
+covergroups, as a section `cover statements`: one line per site in the order the sites'
+Final processes ran (declaration order within an instance, instances in design order),
+naming kind, hierarchical name (what `%m` prints there, assertion label included),
+`file:line` and the counts.
+
+- **Immediate:** `hits`, bumped in the true branch. A hidden 64-bit signal of the instance
+  holds it, so every instance of a shared body counts its own, and a design with no
+  `cover` has none of it.
+- **Deferred (`#0`, `final`):** `hits`, counted when the report matures
+  (`rt_defer_report`'s queue, LRM 16.4.2's flush), so a transient true that a later
+  activation of the process supersedes is not a hit.
+- **`cover property` / `cover sequence`:** `attempts` and `matches`. A match is what the
+  monitor already tallied (one per attempt for `property`, one per match for `sequence`,
+  LRM_NOTES 23); an attempt is a clocking edge on which the property was not disabled
+  (`disable iff`, `$assertkill`) or turned off (`$assertoff`).
+
+Each site files its counts at the end of the run with a Final process that executes an
+`ir::Severity::Cover` report: the instance path, scope text and location a report carries
+are the site's name, and the runtime keeps the records instead of printing them
+(`cover_file` in `Reports.cpp`). The model is published for the report, as for a
+covergroup, only when `--coverage` is given.
 
 ---
 
@@ -854,10 +887,6 @@ IEEE 1800-2023 addition gated on the language version.
 
 ## 14. Open questions
 
-- **`option.per_instance = 0`** lets an implementation not save instance data
-  (19.7 Table 19-1). Does clotho's report then omit the instance entirely, or
-  print it without bin detail? The LRM permits either; the second is more useful
-  and costs nothing since the counters exist regardless.
 - **Bin-count explosion.** `coverpoint a` on a 32-bit `a` with
   `auto_bin_max = 64` is 64 bins, fine; `bins b[] = {[0:$]}` on the same
   coverpoint is 2^32 bins, and the LRM sets no limit. A cap plus a loud refusal

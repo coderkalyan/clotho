@@ -816,6 +816,9 @@ llvm::Function* Backend::declare_function(FunctionId id) {
             // signature never depends on how any of them binds the formal.
             params.push_back(ptr); // &actual storage
             params.push_back(ptr); // witness chain, or null
+            if (is_queue_type(pt)) {
+                params.push_back(b_.getInt64Ty()); // the actual's bound
+            }
             if (design_ref_wake_) {
                 params.push_back(ptr); // wake thunk, or null
                 params.push_back(ptr); // its context
@@ -897,6 +900,9 @@ llvm::Function* Backend::declare_task(FunctionId id) {
             // The same shape declare_function builds.
             params.push_back(ptr); // &actual storage
             params.push_back(ptr); // witness chain, or null
+            if (is_queue_type(f.param_types[k])) {
+                params.push_back(b_.getInt64Ty()); // the actual's bound
+            }
             if (design_ref_wake_) {
                 params.push_back(ptr); // wake thunk, or null
                 params.push_back(ptr); // its context
@@ -1030,7 +1036,8 @@ void Backend::reserve_export_records() {
 }
 
 // How many LLVM parameters formal k occupies:
-//   2 — a `ref`: the aliased storage pointer and the witness chain
+//   2 — a `ref`: the aliased storage pointer and the witness chain, and a queue's
+//       actual's bound as a third (i64)
 //   1 — an aggregate storage pointer, a container handle pointer, a string
 //       handle (each one pointer in every direction), or a 2-state scalar (one
 //       iW, or the one pointer to its slot for an out / inout)
@@ -1038,7 +1045,9 @@ void Backend::reserve_export_records() {
 //       out / inout pointer pair
 uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-        return design_ref_wake_ ? 4 : 2;
+        // A queue also carries its actual's bound (ref_queue_bound), and a design
+        // with ref wakes passes the wake thunk and its context after it.
+        return 2 + (is_queue_type(f.param_types[k]) ? 1 : 0) + (design_ref_wake_ ? 2 : 0);
     }
     // An aggregate is one storage pointer, in every direction (function or task).
     if (is_agg_abi(f.param_types[k])) {
@@ -1939,9 +1948,13 @@ void Backend::bind_ref_formals(const Function& f) {
         const uint32_t p  = param_llvm_index_[k];
         ref_ptr_[k].slot  = fn_->getArg(p);
         ref_ptr_[k].chain = fn_->getArg(p + 1);
+        uint32_t next     = p + 2;
+        if (is_queue_type(f.param_types[k])) {
+            ref_ptr_[k].bound = fn_->getArg(next++);
+        }
         if (design_ref_wake_) {
-            ref_ptr_[k].wake_fn  = fn_->getArg(p + 2);
-            ref_ptr_[k].wake_ctx = fn_->getArg(p + 3);
+            ref_ptr_[k].wake_fn  = fn_->getArg(next);
+            ref_ptr_[k].wake_ctx = fn_->getArg(next + 1);
         }
         // `formal` names the binding in a staleness report. It is a property of
         // the CALLEE, so it is held here rather than shipped per call.
@@ -1972,8 +1985,11 @@ void Backend::emit_copyin(const Function& f) {
             // keeps the empty frame — it is filled by the body, copied out at
             // return.
             if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Inout) {
-                emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
-                                   f.param_types[k]);
+                // A bounded formal truncates what the actual holds. No call site is in
+                // scope in a prologue, so the report points at the subroutine.
+                emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base), f.param_types[k],
+                                   resolve_ ? resolve_(f.span) : SourceText{ .where = "<unknown>" },
+                                   f.name + " argument " + std::to_string(k + 1));
             }
             continue;
         }
@@ -2104,8 +2120,8 @@ void Backend::lower_ret(Index value) {
         // handles (the value may be a frame local or a call result temp). Resolved
         // through lv_handle_ptr so returning a struct member, class property
         // or container element copies THAT handle, not its parent's root.
-        emit_handle_assign(
-          fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read), cur_fn_->return_type);
+        emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read),
+                           cur_fn_->return_type, loc_text(value), cur_fn_->name + " result");
         b_.CreateBr(fn_copyout_bb_);
         return;
     }
@@ -2265,6 +2281,9 @@ void Backend::lower_call_common(Index               i,
             const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
+            if (is_queue_type(f.param_types[k])) {
+                argv.push_back(ref_queue_bound(lv, a));
+            }
             const bool woken = push_ref_wake(argv, lv, f.param_types[k]);
             if (woken) {
                 // The callee wakes at each write.
@@ -2520,6 +2539,9 @@ void Backend::lower_task_call_inst(Index i) {
             const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
+            if (is_queue_type(tf.param_types[k])) {
+                argv.push_back(ref_queue_bound(lv, args[k]));
+            }
             const bool woken = push_ref_wake(argv, lv, tf.param_types[k]);
             if (woken) {
                 // The callee wakes at each write, not at this call's return.

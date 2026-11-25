@@ -15,7 +15,8 @@ constexpr unsigned kFieldInner   = 4;
 constexpr unsigned kFieldLeaves  = 5;
 constexpr unsigned kFieldCopy    = 10;
 constexpr unsigned kFieldDestroy = 11;
-constexpr unsigned kFieldCount   = 12;
+constexpr unsigned kFieldBound   = 12;
+constexpr unsigned kFieldCount   = 13;
 
 // An aggregate element with more heap leaves than this is copied and destroyed by a
 // loop over its leaf table, not by one statement per leaf: a kernel's size then
@@ -37,6 +38,8 @@ struct ElemOpsView {
     uint32_t              kind    = 0;
     uint32_t              nleaves = 0;
     uint64_t              stride  = 0;
+    // A queue element's own `[$:N]` max index; 0 for everything else.
+    uint64_t              bound   = 0;
     llvm::GlobalVariable* proto   = nullptr;
     // The descriptor of a container element's own element; null otherwise.
     llvm::GlobalVariable* inner = nullptr;
@@ -72,6 +75,7 @@ ElemOpsView view_of(const llvm::Constant* ops) {
     v.kind    = static_cast<uint32_t>(llvm::cast<llvm::ConstantInt>(init->getOperand(kFieldKind))->getZExtValue());
     v.nleaves = static_cast<uint32_t>(llvm::cast<llvm::ConstantInt>(init->getOperand(kFieldNleaves))->getZExtValue());
     v.stride  = llvm::cast<llvm::ConstantInt>(init->getOperand(kFieldStride))->getZExtValue();
+    v.bound   = llvm::cast<llvm::ConstantInt>(init->getOperand(kFieldBound))->getZExtValue();
     v.proto   = llvm::cast<llvm::GlobalVariable>(init->getOperand(kFieldProto));
     v.inner   = llvm::dyn_cast<llvm::GlobalVariable>(init->getOperand(kFieldInner));
     if (const auto* table = llvm::dyn_cast<llvm::GlobalVariable>(init->getOperand(kFieldLeaves))) {
@@ -321,7 +325,7 @@ void Backend::emit_elem_copy(const llvm::Constant* ops, llvm::Value* dst, llvm::
             b_.CreateCall(dynarr_assign_fn(), { dst, src, v.inner, site });
             return;
         case rt_elem_queue:
-            b_.CreateCall(queue_assign_fn(), { dst, src, v.inner, site });
+            b_.CreateCall(queue_assign_fn(), { dst, src, v.inner, b_.getInt64(v.bound), site });
             return;
         case rt_elem_assoc:
             b_.CreateCall(assoc_assign_fn(), { dst, src, v.inner, site });

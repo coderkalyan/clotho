@@ -375,6 +375,39 @@ extern std::vector<ObservedCaseViol> g_observed_case;
 extern std::vector<std::unique_ptr<uint64_t>> g_gen_cells;
 extern std::vector<uint64_t*>                 g_gen_free;
 
+// ---- Cover statements (docs/design/functional-coverage.md) ----
+//
+// A `cover` site files its counts with an rt_severity of level Cover, which prints nothing:
+// `fmt` is "<op>\x1f<kind>\x1f<ordinal>\x1f<file:line>" and the site's name is what the
+// banner, the instance path and the scope text after it spell. Op 'r' files the counts it
+// carries (one: hits; two: attempts then matches; none: declares the site), op 'h' is one
+// matured hit of a deferred cover. The sites are listed by rt_cover_report in the order they
+// were first filed, which is the order the Final processes ran, so a design reports the same
+// way every time.
+struct CoverSite {
+    std::string kind;
+    std::string where;
+    std::string name;
+    uint64_t    attempts     = 0;
+    uint64_t    matches      = 0;
+    bool        has_attempts = false;
+};
+
+// What a record says of its site, resolved while the banner and path still exist: a
+// deferred one is held until it matures.
+struct CoverRef {
+    char        op = 'r';
+    std::string kind;
+    std::string where;
+    std::string name;
+};
+
+CoverRef cover_ref(const char* banner, const rt_string* path, const char* tail, const char* fmt);
+void     cover_file(const CoverRef& ref, uint32_t argc, const rt_arg* argv);
+// Write the sites filed so far to `f` (the `--coverage` report; null writes nothing), then
+// forget them: a report is one run's.
+void cover_sites_write(std::FILE* f);
+
 // Set by a fatal severity report: rt_sim_run folds it into the exit status.
 inline bool g_fatal_seen = false;
 

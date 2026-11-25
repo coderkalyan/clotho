@@ -851,6 +851,12 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     }
 
     const MonitorState  st = alloc_monitor_state(mon, id, ctl);
+    if (mon.kind == ir::AssertionKind::Cover) {
+        // Filed at the end of the run for the `--coverage` report; nothing at run time but the two tallies.
+        const std::string        kind = mon.cover_matches ? "cover sequence" : "cover property";
+        const ir::Signal         tally[] = { st.attempts, st.covered };
+        add_cover_report(mon.banner, cover_site_fmt('r', kind, mon.banner, next_temp_id()), tally, mon.span);
+    }
     const ir::SourceLoc l  = mon.span.start;
     ir::Builder         b(module_);
 
@@ -1515,9 +1521,10 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
         // failed (docs/LRM_NOTES.md, note 23).
         ir::Index count = load_signal(st.covered, b, l);
         for (const ir::Index bit : hits) {
-            count = b.binary(ir::Inst::Tag::Add, count, b.convert(bit, mask_type(32), false, l), l);
+            count = b.binary(ir::Inst::Tag::Add, count, b.convert(bit, mask_type(counter_bits), false, l), l);
         }
-        store_gated(st.covered, count, active, edge, 32, b, l);
+        store_gated(st.covered, count, active, edge, counter_bits, b, l);
+        emit_cover_attempt(st, active, edge, b, l);
     } else if (verdicts) {
         emit_action_pends(report_fail,
                           *fail_body,
@@ -1604,6 +1611,25 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
     }
 
     return { st.expect_req, st.expect_busy };
+}
+
+// One attempt of a cover directive, counted on every clocking edge it can start on: not
+// disabled (LRM 16.15) and not turned off by $assertoff (LRM 20.12), which is the gate
+// bare_seed_gate gives a bare sequence's seed.
+void Lowerer::emit_cover_attempt(const MonitorState& st,
+                                 ir::Index           active,
+                                 ir::Index           edge,
+                                 ir::Builder&        b,
+                                 ir::SourceLoc       l) {
+    ir::Index tried = active;
+    if (st.ctl != nullptr) {
+        tried = b.binary(ir::Inst::Tag::Band, active, bit_not(load_signal(st.ctl->off, b, l), b, l), l);
+    }
+    const ir::Index count = b.binary(ir::Inst::Tag::Add,
+                                     load_signal(st.attempts, b, l),
+                                     b.convert(tried, mask_type(counter_bits), false, l),
+                                     l);
+    store_gated(st.attempts, count, active, edge, counter_bits, b, l);
 }
 
 // A counted monitor's whole per-cycle step, plus the process it lives in.
@@ -2023,9 +2049,10 @@ void Lowerer::emit_counted_step(const ir::AssertionMonitor& mon,
         // the grouping a counted monitor does not have -- so there is one
         // reading available and both spellings get it.
         const ir::Index covered = load_signal(st.covered, b, l);
-        const ir::Index wide    = b.convert(matches, mask_type(32), false, l);
+        const ir::Index wide    = b.convert(matches, mask_type(counter_bits), false, l);
         const ir::Index count   = b.binary(ir::Inst::Tag::Add, covered, wide, l);
-        store_gated(st.covered, count, active, edge, 32, b, l);
+        store_gated(st.covered, count, active, edge, counter_bits, b, l);
+        emit_cover_attempt(st, active, edge, b, l);
     } else if (verdicts) {
         emit_counted_pends(failures, *fail_body, active, st.ctl != nullptr ? &st.ctl->foff : nullptr, b, l);
     }

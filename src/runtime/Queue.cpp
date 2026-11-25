@@ -79,24 +79,23 @@ void q_reserve(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site*
     }
 }
 
-// Keep the first `bound + 1` elements of a bounded queue (LRM 7.10.4); bound == 0
+// Keep the first `bound + 1` elements of a bounded queue (LRM 7.10.5); bound == 0
 // is unbounded. Only the test is here; dropping is rt_queue_drop_tail's.
-void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
+void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const rt_alloc_site* site) {
     if (bound != 0 && h->len > bound + 1) [[unlikely]] {
-        rt_queue_drop_tail(h, ops, bound);
+        rt_queue_drop_tail(h, ops, bound, site);
     }
 }
 
-// Append one element at the tail WITHOUT touching the epoch. The bump is left to
-// the caller so that appending a whole range costs one epoch step instead of one
-// per element: rt_queue_push_back bumps once, rt_queue_append_range bumps once
-// for the range it appended.
-void q_push_back_raw(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem, const rt_alloc_site* site) {
+// Append one element at the tail WITHOUT touching the epoch or the bound. The bump
+// is left to the caller so that appending a whole range costs one epoch step
+// instead of one per element, and so does the bound: an overflowing range append is
+// one operation and reports once.
+void q_push_back_raw(rt_queue* h, const rt_elem_ops* ops, const void* elem, const rt_alloc_site* site) {
     const uint64_t stride = ops->stride;
     q_reserve(h, stride, h->len + 1, site);
     q_copy_elem(ops, q_elem(h, stride, h->len), elem, site);
     h->len += 1;
-    q_apply_bound_ops(h, ops, bound);
 }
 
 } // namespace
@@ -106,7 +105,8 @@ extern "C" void rt_queue_push_back(rt_queue*            h,
                                    uint64_t             bound,
                                    const void*          elem,
                                    const rt_alloc_site* site) {
-    q_push_back_raw(h, ops, bound, elem, site);
+    q_push_back_raw(h, ops, elem, site);
+    q_apply_bound_ops(h, ops, bound, site);
     // Bumped even when the ring did not have to grow: `len` changed, so q[$]
     // names a different element than it did before.
     ++h->epoch;
@@ -122,7 +122,7 @@ extern "C" void rt_queue_push_front(rt_queue*            h,
     h->head = h->head == 0 ? h->cap - 1 : h->head - 1;
     q_copy_elem(ops, q_elem(h, stride, 0), elem, site);
     h->len += 1;
-    q_apply_bound_ops(h, ops, bound);
+    q_apply_bound_ops(h, ops, bound, site);
     // Every live element's logical index shifted up by one, so this reindexes
     // the whole queue even when the ring did not move.
     ++h->epoch;
@@ -170,7 +170,7 @@ extern "C" void rt_queue_insert(rt_queue*            h,
     }
     q_copy_elem(ops, q_elem(h, stride, i), elem, site);
     h->len += 1;
-    q_apply_bound_ops(h, ops, bound);
+    q_apply_bound_ops(h, ops, bound, site);
     ++h->epoch;
 }
 
@@ -215,8 +215,9 @@ extern "C" void rt_queue_append_range(rt_queue*            dst,
     // cannot relocate src's buffer mid-loop. The raw form is used so the whole
     // append advances the epoch once rather than once per element.
     for (int64_t i = lo; i <= hi; ++i) {
-        q_push_back_raw(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)), site);
+        q_push_back_raw(dst, ops, q_elem(src, ops->stride, static_cast<uint64_t>(i)), site);
     }
+    q_apply_bound_ops(dst, ops, bound, site);
     if (lo <= hi) {
         ++dst->epoch;
     }
@@ -249,10 +250,11 @@ extern "C" void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const
 //   - push_back puts the new element at logical len, so what gets dropped is the
 //     element just pushed, and the push has no visible effect.
 // Both fall out of "keep the first bound + 1"; neither direction is special-
-// cased below. LRM 7.10.4 does not pin the choice (docs/LRM_NOTES.md, note 6).
-extern "C" void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
+// cased below. LRM 7.10.5 does not pin the choice (docs/LRM_NOTES.md, note 6).
+extern "C" void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const rt_alloc_site* site) {
     assert(bound != 0 && "an unbounded queue drops nothing");
     assert(h->len > bound + 1 && "only a queue past its bound drops its tail");
+    rt_queue_overflow_report(site, bound, h->len, rt_diag_now());
     for (uint64_t i = bound + 1; i < h->len; ++i) {
         q_destroy_elem(ops, q_elem(h, ops->stride, i));
     }

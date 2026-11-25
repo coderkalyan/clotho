@@ -46,13 +46,20 @@ every position invalid, so the read is all default and the write does nothing.
 
 Code: `src/lower/Expr.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slice`). Tests: `tests/assign_pattern_test.cpp` ("an out-of-range indexed slice reads the element default per position", "an x/z indexed slice base is an invalid index (LRM 7.4.5)").
 
-## 6. Overflowing a bounded queue (7.10.4)
+## 6. Overflowing a bounded queue (7.10.5)
 
-7.10.4 does not say which end an overflowing push gives up. Clotho always keeps
-the first `bound + 1` elements, so `push_front` drops the old tail, `push_back`
-onto a full queue has no effect, and `insert` follows the same rule.
+7.10.5 does not say which end an overflowing write gives up [unverified wording; the
+LRM PDF was not at hand for the section number]. Clotho always keeps the first
+`bound + 1` elements, on every write: whole assignment (from a queue, a dynamic or
+fixed array, a slice, a concatenation or pattern, a function result, a task output
+copied back, a nonblocking assignment, an input formal's copy-in, an element of a
+container of bounded queues), `push_back`, `push_front` and `insert`. So `push_front`
+drops the old tail, `push_back` onto a full queue has no effect, and `insert` follows
+the same rule. Every overflowing operation prints one run-time warning on stderr, never
+suppressed, naming the queue (when it is a design variable) and giving the element count
+it could not hold; Icarus Verilog also warns on each.
 
-Code: `src/runtime/Containers.cpp` (`q_apply_bound_ops`). Tests: `tests/queue_test.cpp` ("queue bounded push drops excess", "queue slice/concat into a bounded queue drops the tail").
+Code: `src/runtime/Queue.cpp` (`q_apply_bound_ops`, `rt_queue_drop_tail`), `src/runtime/Containers.cpp` (`rt_queue_assign`, `rt_queue_assign_dynarr`), `src/runtime/Reports.cpp` (`rt_queue_overflow_report`). Tests: `tests/queue_test.cpp` ("queue bounded push drops excess", "queue slice/concat into a bounded queue drops the tail", "a bounded queue keeps its first N+1 elements on every write path").
 
 ## 7. Unknown elements in `min` and `max` (7.12.1)
 
@@ -186,10 +193,14 @@ Code: `src/ir/llvm/Subroutines.cpp` (`emit_copyin`), `src/ir/llvm/Containers.cpp
 ## 21. Immediate `cover` (16.3)
 
 An immediate `cover` runs its pass action when its expression is true and does
-nothing when it is false. Deviation: Clotho keeps no hit count and prints no
-coverage report for it. Not gated.
+nothing when it is false. The LRM gives it no statistics format, so Clotho counts the
+hits (the expression found true) of each site, per instance, and lists them in the
+`--coverage` report; a deferred `cover #0` / `cover final` counts at maturation, so a
+hit a later activation of its process supersedes is not one. `cover property` and
+`cover sequence` list attempts and matches. The report layout is Clotho's. Without
+`--coverage` nothing is printed.
 
-Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"). Design: `docs/design/functional-coverage.md` (The precedent that is already silently wrong).
+Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`, `lower_deferred_assertion`, `add_cover_report`), `src/lower/SvaMonitor.cpp` (`emit_cover_attempt`), `src/runtime/Reports.cpp` (`cover_file`, `cover_sites_write`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"), `tests/coverage_test.cpp` ("coverage: an immediate cover counts its hits ..."). Design: `docs/design/functional-coverage.md` (Cover statements).
 
 ## 22. `disable` of a procedure's outermost block (16.4.4)
 

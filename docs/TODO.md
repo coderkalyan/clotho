@@ -208,8 +208,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Located backend refusals outside instruction lowering** — refusals from the
   program-region pre-passes, DPI and class-descriptor emission, and VCD variable
   emission name their subject but carry no source location.
-- [ ] **`-W` and `--diag-json` for design diagnostics** — both are accepted, but `-W`
-  does not change what a design reports and nothing writes the JSON.
 - [ ] **Selective VCD dump** — `$dumpvars` scope-subset and sparse selection; only a
   whole-design dump is produced.
 - [ ] **VCD of a string signal** (21.7.2) — the format has no `string` var type; needs a
@@ -501,8 +499,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Assertions (immediate)
 
-- [ ] **Immediate `cover` statistics** (16.3) — no per-statement coverage count and no
-  end-of-simulation report.
 - [~] **Deferred immediate assertions** (16.4) — missing pieces:
   - [ ] **Subroutine-call action block** — a user task or void function as the action is
     refused.
@@ -703,9 +699,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Coverage database tasks** (19.9) — `$set_coverage_db_name`, `$load_coverage_db`,
   `$coverage_merge`, `$coverage_save`, `$coverage_control`, `$coverage_get` and
   `$coverage_get_max`; the LRM defines no database format.
-- [ ] **Immediate `cover` hit count** — nothing is counted or reported, and nothing is
-  refused.
-- [ ] **`cover property` hit report** — hit counts are kept but never reported.
 - [ ] **Coverpoint, bin bound or enum value wider than 64 bits** (19.5) — a sampled value
   crosses the runtime ABI as one word.
 - [ ] **Tolerance range in a coverage bin** (19.5.1, 11.4.13) — `[c +/- d]` and `[c +%- d]`.

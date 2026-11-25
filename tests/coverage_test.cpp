@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Lower.h"
 #include "PosixIo.h"
@@ -841,7 +842,7 @@ TEST_CASE("the report names each covergroup instance by its module instance's pa
     const std::string report = report_of(R"(
         module leaf;
           bit [1:0] v = 0;
-          covergroup cg; coverpoint v; endgroup
+          covergroup cg; option.per_instance = 1; coverpoint v; endgroup
           cg c;
           initial begin c = new; c.sample(); end
         endmodule
@@ -860,7 +861,7 @@ TEST_CASE("the report names a covergroup by an instance path of any shape") {
     const std::string report = report_of(R"(
         module leaf;
           bit [1:0] v = 0;
-          covergroup cg; coverpoint v; endgroup
+          covergroup cg; option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           initial c.sample();
         endmodule
@@ -880,7 +881,7 @@ TEST_CASE("a covergroup built by a declaration initializer is named and counted 
     const std::string report = report_of(R"(
         module leaf(input bit [1:0] seed);
           bit [1:0] v = 0;
-          covergroup cg; coverpoint v; endgroup
+          covergroup cg; option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           initial #1 begin v = seed; c.sample(); end
         endmodule
@@ -910,7 +911,7 @@ TEST_CASE("a covergroup with a coverage event, built by a declaration initialize
     const std::string report = report_of(R"(
         module leaf(input bit clk);
           bit [1:0] v = 0;
-          covergroup cg @(posedge clk); coverpoint v; endgroup
+          covergroup cg @(posedge clk); option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           always @(negedge clk) v <= v + 1;
         endmodule
@@ -947,12 +948,12 @@ TEST_CASE("the report names a covergroup in a generate block by the block too") 
         module leaf;
           bit [1:0] v = 0;
           if (1) begin : g
-            covergroup cg; coverpoint v; endgroup
+            covergroup cg; option.per_instance = 1; coverpoint v; endgroup
             cg c;
             initial begin c = new; c.sample(); end
           end
           for (genvar i = 0; i < 2; i++) begin : arr
-            covergroup cg2; coverpoint v; endgroup
+            covergroup cg2; option.per_instance = 1; coverpoint v; endgroup
             cg2 c2 = new;
             initial c2.sample();
           end
@@ -978,7 +979,7 @@ TEST_CASE("a package covergroup is named by the instance that builds it, if any"
     const std::string report = report_of(R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
           pcg pc = new;
         endpackage
         module leaf;
@@ -1002,7 +1003,7 @@ TEST_CASE("a package covergroup built by two instances is one type named by each
     const std::string report = report_of(R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
         endpackage
         module leaf(input bit [1:0] hit);
           import p::*;
@@ -1035,7 +1036,7 @@ TEST_CASE("a package covergroup built by the package and by two instances") {
     const std::string report = report_of(R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
           pcg pc = new;
         endpackage
         module leaf;
@@ -1079,4 +1080,166 @@ TEST_CASE("twin instances keep their own covergroup types") {
         endmodule
     )");
     CHECK(out == "t.m0 inst=25.000000 type=12.500000\nt.m1 inst=25.000000 type=25.000000\n");
+}
+
+namespace {
+
+// The lines of a report's "cover statements" section, in the order it lists them.
+std::vector<std::string> cover_lines(const std::string& report) {
+    std::vector<std::string> lines;
+    const size_t             head = report.find("cover statements");
+    if (head == std::string::npos) {
+        return lines;
+    }
+    size_t at = report.find('\n', head);
+    while (at != std::string::npos && at + 1 < report.size()) {
+        const size_t eol = report.find('\n', at + 1);
+        lines.push_back(report.substr(at + 1, eol == std::string::npos ? eol : eol - at - 1));
+        at = eol;
+    }
+    return lines;
+}
+
+bool ends_with(const std::string& s, std::string_view tail) {
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+} // namespace
+
+// An immediate `cover` (LRM 16.3) counts each evaluation that finds its expression
+// true, and `--coverage` lists every site with its hits, in declaration order, the
+// never-hit one too. The counts are the loop's: `a` is true for i = 0, 3, 6, 9 (four
+// hits), `i == 5` once, `i > 100` never. Oracle: derived by hand from the source (no
+// other simulator here counts immediate covers in a report).
+TEST_CASE("coverage: an immediate cover counts its hits and the report lists every site") {
+    constexpr std::string_view src = R"(
+        module top;
+            logic a;
+            int i;
+            initial begin
+                for (i = 0; i < 10; i++) begin
+                    a = (i % 3 == 0);
+                    c1: cover (a);
+                    cover (i == 5);
+                    cover (i > 100);
+                end
+            end
+        endmodule
+    )";
+    const std::vector<std::string> lines = cover_lines(report_of(src));
+    REQUIRE(lines.size() == 3);
+    CHECK(lines[0].starts_with("  cover top.c1 "));
+    CHECK(ends_with(lines[0], "hits 4"));
+    CHECK(ends_with(lines[1], "hits 1"));
+    CHECK(ends_with(lines[2], "hits 0"));
+}
+
+// A site is counted per instance: one module instantiated twice reports twice, named by
+// instance, with each instance's own count (u1's enable is on for 2 of 4 passes, u2's for 3).
+TEST_CASE("coverage: a cover in two instances reports each") {
+    constexpr std::string_view src = R"(
+        module m #(parameter int N = 0) ();
+            int i;
+            initial for (i = 0; i < 4; i++) cover (i < N);
+        endmodule
+        module top;
+            m #(2) u1 ();
+            m #(3) u2 ();
+        endmodule
+    )";
+    const std::vector<std::string> lines = cover_lines(report_of(src));
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("  cover top.u1 "));
+    CHECK(ends_with(lines[0], "hits 2"));
+    CHECK(lines[1].starts_with("  cover top.u2 "));
+    CHECK(ends_with(lines[1], "hits 3"));
+}
+
+// `cover property` reports attempts and matches. Posedges of `clk` fall at 5, 15, ..., 95
+// (ten before the $finish at 100). `a` is updated by a nonblocking assignment at each
+// edge, so the value sampled at edge k is 0 for odd k and 1 for even k: ten attempts, five
+// matches. The pass action runs on each match (LRM 16.14.3), and agrees: five lines.
+TEST_CASE("coverage: cover property reports attempts and matches") {
+    constexpr std::string_view src = R"(
+        module top;
+            logic clk = 0;
+            logic a = 0;
+            int n = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                n <= n + 1;
+                a <= (n % 2 == 0);
+            end
+            cp: cover property (@(posedge clk) a) $display("hit");
+            initial #100 $finish;
+        endmodule
+    )";
+    const std::string report = report_of(src);
+    const std::vector<std::string> lines = cover_lines(report);
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0].starts_with("  cover property top.cp "));
+    CHECK(lines[0].find("attempts 10  matches 5") != std::string::npos);
+    CHECK(run_capture(src) == "hit\nhit\nhit\nhit\nhit\n");
+}
+
+// A deferred cover counts at maturation: the same five hits, and a site that matures
+// nothing still lists.
+TEST_CASE("coverage: a deferred cover counts what matures") {
+    constexpr std::string_view src = R"(
+        module top;
+            logic clk = 0;
+            logic a = 0;
+            int n = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                dc: cover #0 (a);
+                nc: cover #0 (n > 1000);
+                n <= n + 1;
+                a <= (n % 2 == 0);
+            end
+            initial #100 $finish;
+        endmodule
+    )";
+    const std::vector<std::string> lines = cover_lines(report_of(src));
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("  cover #0 top.dc "));
+    CHECK(ends_with(lines[0], "hits 5"));
+    CHECK(ends_with(lines[1], "hits 0"));
+}
+
+// Nothing is printed or changed without `--coverage`: the design's own output is all
+// that comes out, and the pass action still runs.
+TEST_CASE("coverage: cover statements print nothing without --coverage") {
+    constexpr std::string_view src = R"(
+        module top;
+            int i;
+            initial for (i = 0; i < 3; i++) cover (i != 1) $display("pass %0d", i);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "pass 0\npass 2\n");
+}
+
+// With the default `option.per_instance = 0` the report lists a covergroup's type line
+// alone (LRM 19.7: instance data is saved only when per_instance is 1 [unverified
+// wording]); get_inst_coverage() still answers. With 1, the instance lines appear.
+TEST_CASE("coverage: per-instance lines appear only when option.per_instance is 1") {
+    constexpr std::string_view src = R"(
+        module top;
+          int v;
+          covergroup off_cg; coverpoint v { bins a = {0}; bins b = {1}; } endgroup
+          covergroup on_cg; option.per_instance = 1; coverpoint v { bins a = {0}; bins b = {1}; } endgroup
+          off_cg o = new;
+          on_cg  n = new;
+          initial begin
+            v = 0; o.sample(); n.sample();
+            $display("%0f %0f", o.get_inst_coverage(), n.get_inst_coverage());
+          end
+        endmodule
+    )";
+    const std::string report = report_of(src);
+    CHECK(report.find("instance top.off_cg ") == std::string::npos);
+    CHECK(report.find("instance top.on_cg ") != std::string::npos);
+    CHECK(report.find("type off_cg  coverage  50.00%") != std::string::npos);
+    CHECK(report.find("type on_cg  coverage  50.00%") != std::string::npos);
+    CHECK(run_capture(src) == "50.000000 50.000000\n");
 }

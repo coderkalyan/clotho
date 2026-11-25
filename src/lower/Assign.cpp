@@ -961,9 +961,24 @@ void Lowerer::emit_handle_literal_init(ir::Index                          lhs,
         }
         return;
     }
-    b.queue_delete(lhs, lhs, /*has_idx*/ false, type, l);
+    // A literal longer than a bounded queue holds is built whole in an unbounded temp and
+    // assigned once, so it reports one overflow with its full count (docs/LRM_NOTES.md,
+    // note 6) rather than one per element past the bound.
+    const bool overflows = t.left != 0 && count > static_cast<uint32_t>(t.left) + 1;
+    ir::Ref    build_ty  = type;
+    ir::Index  build     = lhs;
+    if (overflows) {
+        ir::Type unbounded = t;
+        unbounded.left     = 0;
+        build_ty           = module_.pool.put(ir::Item{ unbounded });
+        build              = make_arg_temp(build_ty, b, l);
+    }
+    b.queue_delete(build, build, /*has_idx*/ false, build_ty, l);
     for (uint32_t k = 0; k < count; ++k) {
-        b.queue_push(lhs, lower_container_element_value(*elems[k % n], type, b, l), /*front*/ false, type, l);
+        b.queue_push(build, lower_container_element_value(*elems[k % n], build_ty, b, l), /*front*/ false, build_ty, l);
+    }
+    if (overflows) {
+        b.queue_copy(lhs, build, type, l);
     }
 }
 

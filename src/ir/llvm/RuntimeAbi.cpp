@@ -299,12 +299,12 @@ llvm::FunctionCallee Backend::tagged_access_fn() {
 // -- Checked heap allocation --
 
 // The rt_alloc_site record (Runtime.h): { ptr where, ptr line, ptr what,
-// i32 line_no, i32 column, i32 end_column }. Field order and types mirror
+// i32 line_no, i32 column, i32 end_column, ptr name }. Field order and types mirror
 // the C struct exactly, so the two change together.
 llvm::StructType* Backend::alloc_site_ty() {
     auto* i32 = b_.getInt32Ty();
     return llvm::StructType::get(ctx_,
-                                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+                                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
 }
 
 // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
@@ -597,7 +597,7 @@ llvm::FunctionCallee Backend::nba_arr_reset_fn() {
 
 // The rt_elem_ops mirror type (Runtime.h:947-958):
 // { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves,
-//   i32 nhandles, i32 nkeyshape, ptr handles, ptr keyshape, ptr copy, ptr destroy }.
+//   i32 nhandles, i32 nkeyshape, ptr handles, ptr keyshape, ptr copy, ptr destroy, i64 bound }.
 // Must match the runtime struct exactly.
 //
 // The last four fields are the collector's (docs/design/garbage-collection.md
@@ -608,7 +608,8 @@ llvm::StructType* Backend::elem_ops_ty() {
         elem_ops_ty_ = llvm::StructType::create(
           ctx_,
           { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty(),
-            raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() },
+            raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(),
+            b_.getInt64Ty() },
           "clotho.elemops");
     }
     return elem_ops_ty_;
@@ -744,17 +745,18 @@ llvm::FunctionCallee Backend::queue_delete_all_fn() {
     return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
-// void rt_queue_assign_dynarr(rt_queue*, const rt_dynarr*, const rt_elem_ops*,
+// void rt_queue_assign_dynarr(rt_queue*, const rt_dynarr*, const rt_elem_ops*, u64 bound,
 //                             const rt_alloc_site*)
 llvm::FunctionCallee Backend::queue_assign_dynarr_fn() {
     return rt_fn("rt_queue_assign_dynarr", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
 }
 
-// void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*, const rt_alloc_site*)
+// void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*, u64 bound,
+//                      const rt_alloc_site*)
 llvm::FunctionCallee Backend::queue_assign_fn() {
     return rt_fn("rt_queue_assign", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
 }
 
 // void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops*)

@@ -394,6 +394,11 @@ struct LValueInfo {
     // and its out-of-range sink. Only set for a container ELEMENT; a handle leaf
     // inside an aggregate leaves it invalid.
     Ref handle_type{};
+    // A queue reached through a `ref` formal: the max index of the queue the ACTUAL is
+    // (i64, 0 unbounded), passed beside the reference, since the formal's own type says
+    // nothing of it (slang does not make the bound part of a queue's type). Null for any
+    // other queue, whose bound is its type's.
+    llvm::Value* queue_bound = nullptr;
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
     // GEP index vector from `base` to the current sub-object (a leaf slot once a
@@ -1269,6 +1274,8 @@ struct RefActual {
 struct RefBinding {
     llvm::Value* slot  = nullptr;
     llvm::Value* chain = nullptr;
+    // A queue formal's actual's bound, passed as a third word; null for any other.
+    llvm::Value* bound = nullptr;
     std::string  formal;
     // The wake thunk and context the call passed (design_ref_wake_ only).
     llvm::Value* wake_fn  = nullptr;
@@ -1654,7 +1661,8 @@ private:
 
     bool is_handle_type(Ref type) const;
     llvm::StructType* handle_slot_ty(Ref type);
-    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type);
+    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type,
+                            const SourceText& at = SourceText{ .where = "<unknown>" }, std::string_view name = {});
     void emit_handle_delete(llvm::Value* handle, Ref type);
     llvm::Value* handle_sink_global(Ref elem_type);
 
@@ -1976,6 +1984,14 @@ private:
 
     llvm::Value* ref_witness_chain(const RefActual& ra);
 
+    // The bound word a queue `ref` formal is passed: the actual's own (a ref formal passed
+    // on keeps the one it was given), else its declared type's.
+    llvm::Value* ref_queue_bound(const Guarded& actual, Index actual_ix);
+
+    // The max index a queue operation on `lv` enforces: the bound a `ref` formal was passed
+    // if `lv` is one, else `type_bound`, its declared type's.
+    llvm::Value* queue_bound_of(const LValueInfo& lv, uint64_t type_bound);
+
     llvm::Value* ref_actual_ptr(const Guarded& lv, Ref type);
 
     llvm::Value* lv_mm_ptr(const LValue& lv);
@@ -2199,6 +2215,10 @@ private:
     void emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
     bool has_preponed() const;
+
+    // Whether the design files a `cover` site's counts (ir::Severity::Cover), which is what
+    // makes a `--coverage` report worth publishing a model for with no covergroup.
+    bool has_cover_sites() const;
 
     bool has_observed() const;
 
@@ -4005,6 +4025,11 @@ private:
 
     std::string bounds_name(const LValueInfo& lv) const;
 
+    // The name a bounded-queue overflow report gives the queue `lv` addresses: its
+    // signal's, or empty for a queue with none to give (a frame local), and always empty
+    // for an unbounded queue, which never reports.
+    std::string queue_site_name(const LValueInfo& lv, uint64_t bound) const;
+
     void add_elem_bounds_check(LValueInfo& target, Index at, const LValueInfo& named, Index idx_expr,
                                llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent,
                                int32_t left = 0, int32_t right = 0);
@@ -4052,7 +4077,7 @@ private:
 
     llvm::Constant* tagged_site_global(const SourceText& at, const TaggedCheckInfo& info);
 
-    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what);
+    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what, std::string_view name = {});
 
     void lower_severity(Index i);
 

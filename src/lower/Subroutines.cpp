@@ -2271,6 +2271,22 @@ std::vector<ir::Index> Lowerer::build_call_args(std::span<const FormalArgumentSy
             if (actual->kind == ExpressionKind::Assignment) {
                 actual = &actual->as<AssignmentExpression>().left();
             }
+            const ir::Ref actual_ty = lower_type(*actual->type);
+            const auto&   at        = std::get<ir::Type>(module_.pool.get(actual_ty));
+            if (dir != slang::ast::ArgumentDirection::In && at.kind == ir::Type::Kind::Queue && at.left != 0) {
+                // The callee copies its formal back through whatever handle it is given,
+                // and knows only its own type's bound. Hand it a temp and assign the temp
+                // to the actual after the call (LRM 13.5: copy-out is an assignment).
+                const ir::Index temp = make_arg_temp(pty, b, l);
+                if (dir == slang::ast::ArgumentDirection::InOut) {
+                    b.queue_copy(temp, lower_lvalue(*actual, b), pty, l);
+                }
+                args.push_back(temp);
+                CopyOutArg oc{ temp, actual, actual_ty, &formals[i]->getType() };
+                oc.is_bounded_queue = true;
+                outs.push_back(oc);
+                continue;
+            }
             args.push_back(lower_lvalue(*actual, b));
             continue;
         }
@@ -2359,6 +2375,10 @@ void Lowerer::emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builde
             continue;
         }
         const ir::Index dst = lower_lvalue(*oc.actual, b);
+        if (oc.is_bounded_queue) {
+            b.queue_copy(dst, oc.temp, oc.actual_ty, l);
+            continue;
+        }
         if (oc.is_agg) {
             // A whole-array output / inout: copy the callee-written temp back
             // into the actual element-wise (layout-converting), the reverse of

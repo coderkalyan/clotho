@@ -920,6 +920,9 @@ struct DeferReport {
     const uint64_t* gen;      // owning process's generation counter
     uint64_t        gen_val;  // generation at queue time
     bool            is_final; // final (Postponed) vs observed (#0, Observed)
+    // A deferred `cover`'s hit, filed when it matures instead of printed; `line` is empty.
+    bool     is_cover = false;
+    CoverRef cover;
 };
 std::vector<DeferReport> g_defer;
 
@@ -929,6 +932,11 @@ extern "C" void rt_defer_report(int32_t level, uint64_t is_final, const void* ge
                                 const char* banner, const rt_string* path, const char* tail, const char* fmt,
                                 uint32_t argc, const rt_arg* argv) {
     io_ensure_init();
+    if (level == 4) { // ir::Severity::Cover: a hit to count once it matures, nothing to print
+        g_defer.push_back({ {}, static_cast<const uint64_t*>(gen), gen_val, is_final != 0, true,
+                            cover_ref(banner, path, tail, fmt) });
+        return;
+    }
     // Rendered, and stamped with the time, now: the arguments are sampled at the
     // point the assertion executes, and maturation is in the same instant.
     std::string line = severity_line(level, banner, path, tail, fmt, argc, argv);
@@ -952,6 +960,10 @@ static void defer_mature(bool final_pass) {
             continue;
         }
         if (r.gen == nullptr || *r.gen == r.gen_val) {
+            if (r.is_cover) {
+                cover_file(r.cover, 0, nullptr);
+                continue;
+            }
             std::fputs(r.line.c_str(), stderr);
             wrote = true;
         }

@@ -2688,6 +2688,7 @@ LValue Backend::local_lvalue(uint32_t index) {
     }
     LValue lv;
     lv.base        = base;
+    lv.queue_bound = s.is_ref ? ref_ptr_[index].bound : nullptr;
     lv.slot_ty     = s.slot_ty;
     lv.four_state  = s.four_state;
     lv.has_z       = s.four_state;
