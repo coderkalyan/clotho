@@ -1862,8 +1862,8 @@ private:
     static constexpr uint32_t no_bind = ~0u;
     uint32_t                  binding_of(const SignalSlot& s);
 
-    // One fixed field (see fixed_field_load) of the own instance's record,
-    // whatever instance context is installed for another instance's signals.
+    // One field of the own instance's record, whatever instance context is
+    // installed for another instance's signals.
     llvm::Value* own_field(uint32_t field, llvm::Type* ty);
 
     // The constant address of a signal's storage, as a binding is filled with.
@@ -1911,15 +1911,6 @@ private:
 
     llvm::GlobalVariable* ensure_ctx(Anchor& a);
 
-    // A load of an instance-record field that fill_instance_records gives its
-    // value at compile time, as the initializer of the record's global: every
-    // field but the wake words and the defer counters. No code stores to one, so
-    // at tier 0 the load is `!invariant.load` and stays available across the
-    // stores between two reads of it.
-    llvm::LoadInst* fixed_field_load(llvm::Type* ty, llvm::Value* ptr);
-
-    // A fixed field (see fixed_field_load) of the record the body being emitted
-    // reaches for `a`. Never a wake word or a defer counter.
     llvm::Value* ctx_field(Anchor& a, uint32_t field, llvm::Type* ty);
 
     // The address of a field of the instance record ctx_field reads.

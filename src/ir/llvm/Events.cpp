@@ -182,7 +182,7 @@ void Backend::emit_dynamic_register(Signal sig, uint32_t edge) {
     // port instead of baking it.
     llvm::Value* cap =
       port_reachable(s) && binding_of(s) != no_bind
-        ? static_cast<llvm::Value*>(fixed_field_load(i32, port_elem_ptr(s, port_of(s)->dyn[edge].cap)))
+        ? static_cast<llvm::Value*>(b_.CreateLoad(i32, port_elem_ptr(s, port_of(s)->dyn[edge].cap)))
         : b_.getInt32(static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()));
     emit_len_full_check(b_, len, cap, kRingWaitDynamic);
     emit_entry(q, len, parked_handle(b_, hdl_), sched_ptr_);
@@ -1292,7 +1292,7 @@ llvm::Value* Backend::wait_base(WaitPart part, Signal sig, uint32_t edge) {
         const uint32_t    elem = part == WaitPart::Static    ? pl.sta[edge].base
                                  : part == WaitPart::Dynamic ? pl.dyn[edge].base
                                                              : pl.dyn[edge].len;
-        return fixed_field_load(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
     }
     if (s.anchor != SignalSlot::no_anchor) {
         taint("names a wait bucket of one instance");
@@ -1314,7 +1314,7 @@ llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
     const auto        i = static_cast<uint32_t>(sig);
     const SignalSlot& s = slots_[i];
     if (s.anchor != SignalSlot::no_anchor && wait_sta_gv_[i][edge] != nullptr) {
-        return fixed_field_load(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
+        return b_.CreateLoad(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
     }
     if (wait_sta_trig_gv_[i][edge] != nullptr) {
         return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
@@ -1346,7 +1346,7 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
     // The bucket's edge is the fact the writer's scan knows: the entries wake for this change.
     const TraceCause why{ .kind = RT_TRACE_STATIC, .sig = sig, .fact = edge };
     if (port_reachable(s)) {
-        emit_static_scan_rt(base, fixed_field_load(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
+        emit_static_scan_rt(base, b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap)), false,
                             static_trig_bits(sig, edge), why);
         return;
     }
