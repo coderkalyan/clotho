@@ -858,6 +858,9 @@ LValue Backend::dyn_agg_elem_lvalue(const LValueInfo& container,
 Guarded Backend::element_select(const LValue& el, const LValueInfo& named, Index at, Index idx_expr,
                                 llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent) {
     Guarded g(el);
+    // A write through a ref to the container wakes at the write, whichever element it reaches.
+    g.ref_wake_fn  = named.ref_wake_fn;
+    g.ref_wake_ctx = named.ref_wake_ctx;
     g.require(b_, inrange);
     add_elem_bounds_check(g, at, named, idx_expr, inrange, unknown, extent);
     return g;
