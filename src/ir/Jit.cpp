@@ -101,9 +101,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
 
     const unsigned n_jobs = llvm::hardware_concurrency(config.compile_jobs).compute_thread_count();
 
-    // Machine-code generation matches the IR tier: -O0/FastISel for tier 0
-    // (the backend pipeline already did the cheap cleanup; codegen quality is
-    // deliberately traded for compile speed) and Aggressive under -O.
+    // Machine-code generation matches the IR tier: -O0 for tier 0 (the backend
+    // pipeline already did the cheap cleanup; FastISel trades code quality for
+    // compile speed, the greedy allocator wins most of it back) and Aggressive
+    // under -O.
+    if (!select_codegen_tier(config.o3)) {
+        return -1;
+    }
     jtmb->setCodeGenOptLevel(config.o3 ? llvm::CodeGenOptLevel::Aggressive
                                        : llvm::CodeGenOptLevel::None);
 
