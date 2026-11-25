@@ -8,8 +8,8 @@ namespace clotho::lower {
 // runs the optional pass action. `assert`/`assume` (which check identically
 // for simulation, LRM 16.4.3) additionally run the `else` action on a false
 // condition, or emit the default failure report (error severity) when there
-// is none. `cover` has no fail action — a false condition does nothing; its
-// coverage count/report is deliberately unimplemented (docs/LRM_NOTES.md, note 21).
+// is none. `cover` has no fail action — a false condition does nothing; it
+// counts its hits for the `--coverage` report (docs/LRM_NOTES.md, note 21).
 // Emit one deferred assertion action (LRM 16.4): a single severity system
 // task ($error / $warning / $info), or the default $error when `action` is
 // null on a failing assert/assume. The report is rendered as a Severity node
@@ -92,6 +92,16 @@ void Lowerer::lower_deferred_assertion(const ImmediateAssertionStatement& a, ir:
     const ir::Index pred       = lower_predicate(a.cond, b);
 
     b.open_region();
+    if (is_cover) {
+        // Counted where the pass action would mature, so a hit a later activation of the
+        // process supersedes (LRM 16.4.2) is not one. The site itself is declared at the
+        // end of the run, so one that never matured still lists, with no hits.
+        const std::string banner = banner_at(a.sourceRange.start());
+        const std::string kind   = a.isFinal ? "cover final" : "cover #0";
+        const uint32_t    ord    = next_temp_id();
+        add_cover_report(banner, cover_site_fmt('r', kind, banner, ord), {}, to_source_span(a.sourceRange));
+        emit_cover_record(banner, cover_site_fmt('h', kind, banner, ord), {}, loc(a), defer_mode, b);
+    }
     emit_deferred_action(a.ifTrue, defer_mode, /*is_fail=*/false, a.sourceRange.start(), b);
     const ir::ExtraSlice then_region = b.close_region();
 
@@ -1814,6 +1824,66 @@ ir::FunctionId Lowerer::build_default_fail_body(const ir::AssertionMonitor& mon)
     return id;
 }
 
+// A hidden 64-bit hit counter of the instance the cover statement is in (or the one a
+// subroutine's statics live in), powering up to 0.
+ir::Signal Lowerer::new_cover_counter(ir::SourceLoc l) {
+    ir::SignalInfo info;
+    info.name = prefix_ + "__cover" + std::to_string(next_temp_id());
+    info.loc  = l;
+    info.type = mask_type(counter_bits);
+    info.dir  = ir::SignalInfo::Direction::Internal;
+
+    return register_declared_signal(home_of(scope_), std::move(info));
+}
+
+void Lowerer::bump_cover_counter(ir::Signal counter, ir::Builder& b, ir::SourceLoc l) {
+    const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+    const ir::Index next = b.binary(ir::Inst::Tag::Add, cur, int_const(1, counter_bits, b, l), l);
+    b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
+}
+
+// What the runtime is told of a site: `op` ('r' files the counts it is given, 'h' is one
+// matured hit of a deferred cover), the kind, an ordinal that tells two sites on one line
+// apart (per instance, so every instance of a specialization says the same), and the
+// "<file>:<line>" the banner starts with.
+std::string Lowerer::cover_site_fmt(char op, std::string_view kind, const std::string& banner, uint32_t ordinal) const {
+    const std::string where = banner.substr(0, banner.size() >= 2 ? banner.size() - 2 : 0);
+    return std::string(1, op) + '\x1f' + std::string(kind) + '\x1f' + std::to_string(ordinal) + '\x1f' + where;
+}
+
+// One cover record: a Severity of level Cover, which the runtime files rather than
+// prints. A site's name is the report's own: banner, then the instance path and the scope
+// text after it (assertion label, subroutine, blocks), so it reads as `%m` does.
+void Lowerer::emit_cover_record(const std::string&         banner,
+                                const std::string&         fmt,
+                                std::span<const ir::Signal> counters,
+                                ir::SourceLoc              l,
+                                uint32_t                   defer,
+                                ir::Builder&               b) {
+    std::vector<ir::FmtArg> args;
+    for (const ir::Signal c : counters) {
+        args.push_back(ir::FmtArg{ .value = b.unary(ir::Inst::Tag::Load, b.signal(c, l), l) });
+    }
+    const auto      level = static_cast<uint32_t>(ir::Severity::Cover);
+    const ScopeName scope = hier_name();
+    if (!scope.in_instance) {
+        b.severity(level, banner + scope.text, fmt, args, l, defer);
+        return;
+    }
+    b.severity(level, banner, fmt, args, l, defer, b.inst_path(l), scope.text);
+}
+
+// The Final process that files a site's counts when the run ends.
+void Lowerer::add_cover_report(const std::string&         banner,
+                               const std::string&         fmt,
+                               std::span<const ir::Signal> counters,
+                               ir::SourceSpan             span) {
+    ir::Builder b(module_);
+    emit_cover_record(banner, fmt, counters, span.start, 0, b);
+    add_process(
+      ir::Process{ .activation = ir::Activation::Final, .span = span, .ir = b.finish(), .scope = cur_scope_id() });
+}
+
 void Lowerer::lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
     if (a.isDeferred || a.isFinal) {
         lower_deferred_assertion(a, b);
@@ -1829,6 +1899,13 @@ void Lowerer::lower_immediate_assertion(const ImmediateAssertionStatement& a, ir
     const ir::Index pred = lower_predicate(a.cond, b);
 
     b.open_region();
+    if (is_cover) {
+        const std::string banner = banner_at(a.sourceRange.start());
+        const ir::Signal  hits   = new_cover_counter(loc(a));
+        add_cover_report(banner, cover_site_fmt('r', "cover", banner, next_temp_id()), std::span(&hits, 1),
+                         to_source_span(a.sourceRange));
+        bump_cover_counter(hits, b, loc(a));
+    }
     if (a.ifTrue != nullptr) {
         lower_stmt(*a.ifTrue, b);
     }

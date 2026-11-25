@@ -208,6 +208,23 @@ bool Backend::has_preponed() const {
     return false;
 }
 
+// Whether any Final process files a `cover` site's counts. Only asked with `--coverage` on.
+bool Backend::has_cover_sites() const {
+    for (const Process& p : mod_.processes()) {
+        if (p.activation != Activation::Final) {
+            continue;
+        }
+        for (size_t i = 0; i < p.ir.inst_count(); ++i) {
+            const auto at = static_cast<Index>(i);
+            if (p.ir.tag(at) == Inst::Tag::Severity &&
+                p.ir.extra_data<SeverityInfo>(p.ir.payload(at).extra).level == static_cast<uint32_t>(Severity::Cover)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Whether any process runs in the Observed region. A design with no
 // concurrent assertions must pay nothing for the region existing.
 bool Backend::has_observed() const {
@@ -776,10 +793,10 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     // (Runtime.h:1472).
     b_.CreateCall(run_init_fn(), { sym(event_pend_head_gv_) });
     // The coverage model (LRM 19), before any `new` can register an instance
-    // against it. Only for a design that has a covergroup: rt_cover_init would
-    // otherwise be a declaration nothing needs, and the runtime treats an
-    // uninitialized model as an empty one anyway.
-    if (!mod_.cover_types.empty()) {
+    // against it. Only for a design that has a covergroup, or `cover` statements under
+    // `--coverage` (whose report needs the path): rt_cover_init would otherwise be a
+    // declaration nothing needs, and the runtime treats an uninitialized model as an empty one.
+    if (!mod_.cover_types.empty() || (!config_.coverage_report.empty() && has_cover_sites())) {
         b_.CreateCall(cover_init_fn(), { cover_config_global() });
     }
     emit_gc_root_tables();

@@ -188,10 +188,14 @@ Code: `src/ir/llvm/Subroutines.cpp` (`emit_copyin`), `src/ir/llvm/Containers.cpp
 ## 21. Immediate `cover` (16.3)
 
 An immediate `cover` runs its pass action when its expression is true and does
-nothing when it is false. Deviation: Clotho keeps no hit count and prints no
-coverage report for it. Not gated.
+nothing when it is false. The LRM gives it no statistics format, so Clotho counts the
+hits (the expression found true) of each site, per instance, and lists them in the
+`--coverage` report; a deferred `cover #0` / `cover final` counts at maturation, so a
+hit a later activation of its process supersedes is not one. `cover property` and
+`cover sequence` list attempts and matches. The report layout is Clotho's. Without
+`--coverage` nothing is printed.
 
-Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"). Design: `docs/design/functional-coverage.md` (The precedent that is already silently wrong).
+Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`, `lower_deferred_assertion`, `add_cover_report`), `src/lower/SvaMonitor.cpp` (`emit_cover_attempt`), `src/runtime/Reports.cpp` (`cover_file`, `cover_sites_write`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"), `tests/coverage_test.cpp` ("coverage: an immediate cover counts its hits ..."). Design: `docs/design/functional-coverage.md` (Cover statements).
 
 ## 22. `disable` of a procedure's outermost block (16.4.4)
 

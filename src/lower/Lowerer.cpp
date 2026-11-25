@@ -534,7 +534,8 @@ Lowerer::MonitorState Lowerer::alloc_monitor_state(const ir::AssertionMonitor& m
     if (mon.kind == ir::AssertionKind::Cover) {
         // Unsigned: a tally is never negative, and sign-extending the 1-bit match
         // flag would make it -1.
-        st.covered = new_monitor_state(base + "cov", mask_type(32), l);
+        st.covered  = new_monitor_state(base + "cov", mask_type(counter_bits), l);
+        st.attempts = new_monitor_state(base + "att", mask_type(counter_bits), l);
     }
     if (mon.kind == ir::AssertionKind::Expect) {
         // Written from the process that executes the statement, in the Active

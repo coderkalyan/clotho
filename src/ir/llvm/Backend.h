@@ -2184,6 +2184,10 @@ private:
 
     bool has_preponed() const;
 
+    // Whether the design files a `cover` site's counts (ir::Severity::Cover), which is what
+    // makes a `--coverage` report worth publishing a model for with no covergroup.
+    bool has_cover_sites() const;
+
     bool has_observed() const;
 
     bool has_program() const;

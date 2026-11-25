@@ -87,13 +87,17 @@ extern "C" void rt_observed_flush() {
 }
 namespace {
 
-// ir::Severity::Fatal, the one level that changes how the run ends.
+// ir::Severity::Fatal, the one level that changes how the run ends, and ir::Severity::Cover,
+// which is no report: it files a cover site's counts (rt_internal::cover_file).
 constexpr int32_t kSeverityFatal = 3;
+constexpr int32_t kSeverityCover = 4;
 
 } // namespace
 namespace rt_internal {
 
 std::vector<ObservedCaseViol>                    g_observed_case;
+std::vector<CoverSite>                           g_cover_sites;
+ankerl::unordered_dense::map<std::string, size_t> g_cover_index;
 ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
 ankerl::unordered_dense::set<const void*>        g_ref_stale_seen;
 
@@ -142,8 +146,82 @@ std::string severity_line(int32_t           level,
 
 } // namespace rt_internal
 
+namespace rt_internal {
+
+CoverRef cover_ref(const char* banner, const rt_string* path, const char* tail, const char* fmt) {
+    // "<op>\x1f<kind>\x1f<ordinal>\x1f<file:line>": the ordinal only tells two sites on a
+    // line apart, and is part of the key, not of the report.
+    CoverRef    ref;
+    std::string parts[4];
+    size_t      n = 0;
+    for (const char* p = fmt; *p != '\0'; ++p) {
+        if (*p == '\x1f' && n < 3) {
+            ++n;
+        } else {
+            parts[n] += *p;
+        }
+    }
+    ref.op    = parts[0].empty() ? 'r' : parts[0][0];
+    ref.kind  = parts[1];
+    ref.where = parts[3];
+    // The banner starts with "<file:line>: ", and a site outside an instance carries its
+    // scope text after that; inside one the text is the path and the tail.
+    const std::string_view head = banner;
+    ref.name                    = std::string(head.substr(std::min(head.size(), ref.where.size() + 2)));
+    if (path != nullptr) {
+        ref.name.append(str_data(path), str_len(path));
+    }
+    if (tail != nullptr) {
+        ref.name += tail;
+    }
+    ref.kind += '\x1f' + parts[2];
+    return ref;
+}
+
+void cover_file(const CoverRef& ref, uint32_t argc, const rt_arg* argv) {
+    const std::string key = ref.kind + '\x1f' + ref.where + '\x1f' + ref.name;
+    auto [it, fresh]      = g_cover_index.try_emplace(key, g_cover_sites.size());
+    if (fresh) {
+        const size_t sep = ref.kind.find('\x1f');
+        g_cover_sites.push_back(CoverSite{ .kind = ref.kind.substr(0, sep), .where = ref.where, .name = ref.name });
+    }
+    CoverSite& site = g_cover_sites[it->second];
+    if (ref.op == 'h') {
+        ++site.matches;
+    } else if (argc == 1) {
+        site.matches = argv[0].val[0];
+    } else if (argc == 2) {
+        site.has_attempts = true;
+        site.attempts     = argv[0].val[0];
+        site.matches      = argv[1].val[0];
+    }
+}
+
+void cover_sites_write(std::FILE* f) {
+    if (f != nullptr && !g_cover_sites.empty()) {
+        std::fprintf(f, "\ncover statements (LRM 16.3, 16.12)\n");
+        for (const CoverSite& s : g_cover_sites) {
+            const char* name = s.name.empty() ? "<unnamed>" : s.name.c_str();
+            if (s.has_attempts) {
+                std::fprintf(f, "  %s %s  %s  attempts %" PRIu64 "  matches %" PRIu64 "\n", s.kind.c_str(), name,
+                             s.where.c_str(), s.attempts, s.matches);
+            } else {
+                std::fprintf(f, "  %s %s  %s  hits %" PRIu64 "\n", s.kind.c_str(), name, s.where.c_str(), s.matches);
+            }
+        }
+    }
+    g_cover_sites.clear();
+    g_cover_index.clear();
+}
+
+} // namespace rt_internal
+
 extern "C" void rt_severity(int32_t level, const char* banner, const rt_string* path, const char* tail,
                             const char* fmt, uint32_t argc, const rt_arg* argv) {
+    if (level == kSeverityCover) {
+        cover_file(cover_ref(banner, path, tail, fmt), argc, argv);
+        return;
+    }
     // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
     // default failure (LRM 16.3). A simulator diagnostic, not design output, so
     // it goes to stderr like the $finish / case-violation banners; flush stdout

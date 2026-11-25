@@ -566,7 +566,7 @@ endmodule
     // A cover has no failure verdict (LRM 16.12.6): it tallies matches, and with
     // no action block it schedules nothing into the Reactive region at all.
     CHECK(find_signal(cm, "sva.0.cov") != nullptr);
-    CHECK(state_width(cm, "sva.0.cov") == 32);
+    CHECK(state_width(cm, "sva.0.cov") == 64);
     CHECK_FALSE(has_tag(monitor_process(cm), ir::Inst::Tag::ReactivePend));
 
     LowerResult       as;

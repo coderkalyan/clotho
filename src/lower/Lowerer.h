@@ -2704,6 +2704,9 @@ private:
         ir::Signal passing{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
+        // Attempt tally, for the same: the clocking edges an evaluation of the
+        // property started on (not disabled, not $assertoff).
+        ir::Signal attempts{ 0 };
         // -- `expect` only (LRM 16.17), both absent for every other directive. --
         //
         // The pending REQUEST: a process executing the statement sets it, and the
@@ -3076,7 +3079,29 @@ private:
 
     void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st, const AssertionActions& act);
 
+    void emit_cover_attempt(const MonitorState& st, ir::Index active, ir::Index edge, ir::Builder& b, ir::SourceLoc l);
+
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b);
+
+    // -- Cover statistics (docs/design/functional-coverage.md, "Cover statements") --
+    //
+    // A `cover` site keeps its counts in hidden signals of its instance and files them at
+    // the end of the run as an ir::Severity::Cover record (a Final process), which is
+    // what the `--coverage` report lists. `fmt` names the site to the runtime: the
+    // record's operation, its kind, an ordinal per instance, and its source location.
+    ir::Signal  new_cover_counter(ir::SourceLoc l);
+    void        bump_cover_counter(ir::Signal counter, ir::Builder& b, ir::SourceLoc l);
+    std::string cover_site_fmt(char op, std::string_view kind, const std::string& banner, uint32_t ordinal) const;
+    void        emit_cover_record(const std::string&         banner,
+                                  const std::string&         fmt,
+                                  std::span<const ir::Signal> counters,
+                                  ir::SourceLoc              l,
+                                  uint32_t                   defer,
+                                  ir::Builder&               b);
+    void        add_cover_report(const std::string&         banner,
+                                 const std::string&         fmt,
+                                 std::span<const ir::Signal> counters,
+                                 ir::SourceSpan             span);
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b);
 
