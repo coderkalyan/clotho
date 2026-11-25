@@ -116,8 +116,7 @@ void Backend::run() {
     std::map<std::tuple<uint32_t, uint32_t, std::vector<uint64_t>>, SharedGroup> once;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t ua = group_unit_anchor_[g];
-        env_ = config_.split && ua != SignalSlot::no_anchor ? &unit_env(anchors_[ua])
-                                                            : root_env_.get();
+        env_ = home_env(ua);
         const bool candidate = config_.dedup && ua != SignalSlot::no_anchor &&
                                anchors_[ua].unit != InstanceScope::no_unit;
         if (!candidate) {
@@ -256,7 +255,7 @@ llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
         // is part of the module's text. An unsized declaration only tells LLVM
         // less (what is dereferenceable), never more.
         llvm::Type* type = g->getValueType();
-        if (env_ != root_env_.get()) {
+        if (!env_->is_root) {
             if (g == state_global_) {
                 type = llvm::ArrayType::get(b_.getInt8Ty(), 0);
             } else if (auto* arr = llvm::dyn_cast<llvm::ArrayType>(type)) {
@@ -462,6 +461,11 @@ void Backend::note_blocks(SharedSubroutine& s, uint32_t block_lo, size_t fill_lo
     s.block_hi = static_cast<uint32_t>(block_commits_.size());
     s.fill_lo  = fill_lo;
     s.fill_hi  = ctx_blk_fills_.size();
+}
+
+// The module of an anchor's code: see home_env.
+ModuleEnv* Backend::home_env(uint32_t a) {
+    return config_.split && a != SignalSlot::no_anchor ? &unit_env(anchors_[a]) : root_env_.get();
 }
 
 // The unit's env for an anchored scope, created (with its llvm::Module) on first

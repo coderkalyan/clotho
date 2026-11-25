@@ -70,11 +70,7 @@ inline constexpr Variant kVariants[] = {
     { "thunk=false", [](ir::SimulationConfig& c) { c.thunk = false; } },
     { "regions=false", [](ir::SimulationConfig& c) { c.regions = false; } },
     { "dedup=false", [](ir::SimulationConfig& c) { c.dedup = false; } },
-    // FIXME: split=false is left out. At 26fade75 it fails the LLVM verifier on every
-    // design ("Global is referenced in a different module!", exit 255), so it differs
-    // for all of them and no known entry can list a bug that wide. Restore the line
-    // when the gate works:
-    //     { "split=false", [](ir::SimulationConfig& c) { c.split = false; } },
+    { "split=false", [](ir::SimulationConfig& c) { c.split = false; } },
     { "z_elision=false", [](ir::SimulationConfig& c) { c.z_elision = false; } },
     { "o3=true", [](ir::SimulationConfig& c) { c.o3 = true; } },
     { "gc_stress=true", [](ir::SimulationConfig& c) { c.gc_stress = true; } },

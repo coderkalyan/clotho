@@ -294,7 +294,7 @@ into `clotho.proc_sched` for a process and a frame alloca for a task
 | Subscriber | Node lives in | Linked | Unlinked |
 |---|---|---|---|
 | `always @(e)`, top-level sensitivity | a contiguous `clotho.event_nodes` array in module state, one slot per static subscription (countable by the existing `wait_counts()` walk over `group_events_`) | once, in the elaboration seed loop, in `sub_order_` | never |
-| intra-body `@(e)`, `wait(...)`, `wait_order` | the waiting coroutine's **own frame** | on suspend | on resume, or on `disable` |
+| intra-body `@(e)`, `wait(...)`, `wait_order`; and `@(e)` of an `always` whose body parks at one of those or at another control that arms the wake word (`always @(e) begin @(posedge done); ... end`, scheduler-rules.md S1) | the waiting coroutine's **own frame** | on suspend | on resume, or on `disable` |
 
 Both are the same node type on the same list, so there is **one** scan mechanism —
 the two-engine outcome the old design doc warned against is avoided. Putting the
@@ -439,11 +439,25 @@ it, exhaustively:
 | A parked waiter | Its frame-resident node records the object it is linked onto, and frames are scanned conservatively. This is what keeps the object while `@(e)` is parked and `e` is reassigned, and the unlink on resume or `disable` stores into the object |
 | A pending `->> e` | The NBA pending chain, walked from its head |
 | A `->> #d e` timer | The runtime's list of unexpired timers |
-| A `->> @(x) e` subscription | The runtime's subscription records |
+| A `->> @(x) e` subscription on a signal | The runtime's subscription records |
+| A `->> @(c) e` subscription on an event `c` | The records on `c`, while `c` itself is reachable |
 | A dump | The object a dumped variable named at `$dumpvars` is kept for the run (§12) |
 
-The last four are the runtime's own records, enumerated by
-`rt_internal::event_gc_roots` (`src/runtime/Scheduler.cpp`) at every collection.
+The pending chain, the timers, the subscriptions on a signal and the dump are the
+runtime's own records, enumerated by `rt_internal::event_gc_roots`
+(`src/runtime/Scheduler.cpp`) at every collection.
+
+What waits on an event object is different: only that event can release it, so
+it is reachable exactly while the event is. This covers the event a
+`->> @(c) e` would trigger and the value a `x <= @(c) v` staged (when the
+assignment waits on events alone; one that also waits on a signal edge is a
+root, since a signal can always change). The collector marks from the roots,
+then asks `rt_internal::event_gc_waiting` for what waits on each control it
+reached, and repeats until a pass marks nothing: reaching `e` can reach what
+waits on `e` in turn. A staged value that names its own control therefore does
+not keep itself. Once marking is complete, `event_gc_release_dead` drops what
+waits on a control that was not reached, frees its records and returns its
+trigger id for the next event that becomes a control.
 
 A persistent `always @(e)` node does not name its object. If the variable is
 reassigned and nothing else names the old object, the object is reclaimed with
@@ -453,9 +467,6 @@ node is never unlinked, so the node is never read again.
 A store of an event handle into a class object runs the write barrier, as a
 store of a class handle does. `->> e` writes the chain link into an event object
 without one, because every object on the chain is a root.
-
-Open: the records a `<= @e` or `->> @(e) f` registers on an event's trigger id
-stay until the run ends if that event is reclaimed first (`docs/TODO.md`).
 
 ---
 

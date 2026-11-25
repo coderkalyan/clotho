@@ -96,8 +96,8 @@ TEST_CASE("config matrix: each variant flips exactly one gate of the default con
         CHECK(diff == (v.name == "default" ? 0 : 1));
         CHECK(cm::find_variant(v.name) == &v);
     }
-    // split is not a variant yet (ConfigMatrix.h): eight gates, not nine.
-    CHECK(flipped.size() == base.size() - 1);
+    // Every gate is a variant.
+    CHECK(flipped.size() == base.size());
     CHECK(cm::find_variant("selftest=differ") != nullptr);
     CHECK(cm::find_variant("fuse=true") == nullptr);
 }

@@ -260,7 +260,7 @@ void Backend::lower_expect_wait(Index i) {
     // Armed for the same reason a `wait` arms: while parked here this process
     // sits in no other queue, so the flag must say "not scheduled" or a later
     // event wake would be dropped as a duplicate.
-    b_.CreateStore(b_.getInt64(0), sched_ptr_);
+    emit_arm_wake_word();
     emit_suspend("expect.resume");
 
     // Past the resume point, so this thread is now running in the Reactive

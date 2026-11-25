@@ -476,9 +476,21 @@ size_t shortest_double(char* out, double d);
 // ---- Event objects the runtime keeps alive (Scheduler.cpp) ----
 //
 // Calls `visit` on every event handle held where the collector does not scan: the
-// NBA pending chain, the `->> #d e` timers, the `->> @(x) e` subscriptions and
-// the events a dump watches. The collector marks each as a root.
+// NBA pending chain, the `->> #d e` timers, the `->> @(x) e` subscriptions on a
+// signal and the events a dump watches. The collector marks each as a root.
 void event_gc_roots(void (*visit)(void* handle));
+
+// What waits on an event object is reachable only while that event is: the event a
+// `->> @(e) f` would trigger, and the value a `x <= @(e) v` staged. For every
+// control event `reached` accepts, calls `visit` on the first and `scan` on the
+// record of the second. Marking one of them can make another control reachable, so
+// the collector repeats this until it marks nothing.
+void event_gc_waiting(bool (*reached)(void* handle), void (*visit)(void* handle),
+                      void (*scan)(const uint8_t* base, uint64_t bytes));
+
+// Called once marking is complete: drops what waits on a control event `reached`
+// rejects, which nothing can trigger again.
+void event_gc_release_dead(bool (*reached)(void* handle));
 
 // Keep `e` alive for the rest of the run. The dump points at its trigger tick.
 void event_keep(rt_event* e);

@@ -1332,6 +1332,35 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     CHECK(emit_raw(src, { .thunk = false }).find("always.loop") != std::string::npos);
 }
 
+TEST_CASE("an always whose body parks at an event control waits at its head; a plain one stays subscribed") {
+    // `n` has no park of its own: it is one thunk, subscribed once to clk's static posedge
+    // bucket (S1). `m` parks at an intra-body @(posedge done), which arms its wake word, so
+    // its leading control cannot be a static entry that would wake it there (B51): it waits for
+    // clk at the top of its loop, a dynamic waiter like its wait on done.
+    constexpr std::string_view src = R"(
+        module w;
+            reg clk = 0, done = 0; reg [3:0] n = 0, m = 0;
+            always @(posedge clk) n = n + 1;
+            always @(posedge clk) begin @(posedge done); m = m + 1; end
+            initial begin #1 clk = 1; #1 done = 1; end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    CHECK(ir.find("@clotho.wait.clk.sta.pos = internal global [1 x { ptr, ptr }]") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.clk.dyn.pos = internal global [1 x { ptr, ptr }]") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.done.dyn.pos = internal global [1 x { ptr, ptr }]") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.done.sta.pos") == std::string::npos);
+    const std::string raw = emit_raw(src);
+    CHECK(raw.find("always.head") != std::string::npos);
+    CHECK(count_substr(raw, ".entry(ptr %wake") == 1);
+    CHECK(raw.find("always.loop") == std::string::npos);
+    // Without thunks the plain one is a subscribed coroutine with a body-first loop; the other
+    // does not change.
+    const std::string coro = emit_raw(src, { .thunk = false });
+    CHECK(coro.find("always.loop") != std::string::npos);
+    CHECK(coro.find("always.head") != std::string::npos);
+}
+
 TEST_CASE("bare initial @(event) blocks; it does not run at time zero") {
     // A top-level event control on an `initial` is a one-shot wait, not process
     // sensitivity (LRM 9.4): with no driver ever producing the edge the body
@@ -2330,6 +2359,56 @@ TEST_CASE("a group spanning instances dispatches whatever its size and layout") 
         // own record.
         CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == 1);
     }
+}
+
+// A group of one row in an instance runs through an entry emitted beside its row
+// (emit_unit_entry). Unsplit, the row is in root, so the entry must be too: it was
+// emitted into a unit module whatever the gate said, and called root's row from
+// there, which the verifier rejects on every such design. Oracle: the gate's
+// contract (SimConfig.h), the same output split or not; the lines are LRM 10.4.2
+// (the NBA lands after the posedge, `always @(n)` sees each new value once).
+TEST_CASE("unsplit emission keeps the entry of an instance's group in the one module") {
+    constexpr std::string_view src = R"(
+        module leaf(input logic clk);
+            int n = 0;
+            always @(posedge clk) n <= n + 1;
+            always @(n) $display("n=%0d", n);
+        endmodule
+        module top;
+            logic clk = 0;
+            leaf u(clk);
+            initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 $finish; end
+        endmodule
+    )";
+    const std::string expected = "n=1\nn=2\n";
+    CHECK(run_capture(src) == expected);
+    CHECK(run_capture(src, { .split = false }) == expected);
+}
+
+// The shared-code verification lowers a group again for its own instance into a
+// scratch module and compares. Unsplit, the shared code is root's, so the scratch
+// must lower as root does: a root-only form (the ring mask as an immediate, not a
+// load of the global) was taken in one and not the other, and the verification
+// reported an internal error on every design with two instances of a unit that
+// stages a nonblocking write. Oracle: the gate's contract, the same output; the
+// values are LRM 10.4.2 (`q` takes the `n` before this posedge's update).
+TEST_CASE("unsplit emission verifies the code instances share against root's forms") {
+    constexpr std::string_view src = R"(
+        module leaf(input logic clk, output int q);
+            int n = 0;
+            always @(posedge clk) begin n <= n + 1; q <= n; end
+        endmodule
+        module top;
+            logic clk = 0;
+            int q0, q1;
+            leaf u0(clk, q0);
+            leaf u1(clk, q1);
+            initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 $display("%0d %0d", q0, q1); $finish; end
+        endmodule
+    )";
+    const std::string expected = "1 1\n";
+    CHECK(run_capture(src, { .verify_shared_code = true }) == expected);
+    CHECK(run_capture(src, { .verify_shared_code = true, .split = false }) == expected);
 }
 
 // SimulationConfig::verify_shared_code lowers each group again for every

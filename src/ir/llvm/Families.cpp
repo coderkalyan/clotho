@@ -119,7 +119,7 @@ void Backend::plan_subroutines() {
 ModuleEnv* Backend::subroutine_env(FunctionId id) {
     const Function& f = mod_.function(id);
     const uint32_t  a = subroutine_anchor(f);
-    return config_.split && a != SignalSlot::no_anchor && !f.is_dpi ? &unit_env(anchors_[a]) : root_env_.get();
+    return f.is_dpi ? root_env_.get() : home_env(a);
 }
 
 // The unit's key and the subroutine's own name, so a symbol says whose it is in

@@ -374,6 +374,12 @@ std::string Backend::root_added_since(const RootMark& mark) const {
     return out;
 }
 
+ModuleEnv& Backend::scratch_env(llvm::Module& scratch, const ModuleEnv& real) {
+    ModuleEnv& env = *verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch));
+    env.is_root    = real.is_root;
+    return env;
+}
+
 // Lower group `g` for its own instance into a scratch module and take back out
 // of the backend what lowering registers outside it. The function stays in the
 // scratch module (see verify_modules_).
@@ -383,7 +389,7 @@ Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
     scratch.setTargetTriple(root_env_->llmod.getTargetTriple());
     scratch.setDataLayout(root_env_->llmod.getDataLayout());
     ModuleEnv* const           real_env = env_;
-    env_                                = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
+    env_                                = &scratch_env(scratch, *real_env);
     const auto                 block_lo = static_cast<std::ptrdiff_t>(block_commits_.size());
     const auto                 fill_lo  = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
     const std::vector<uint8_t> bound    = a.bind_used;
@@ -523,7 +529,7 @@ void Backend::verify_shared_subroutine(uint32_t f, SharedSubroutine& rep) {
     const std::vector<uint8_t> fbound    = a.fbind_used;
     const auto                 block_lo  = static_cast<std::ptrdiff_t>(block_commits_.size());
     const auto                 fill_lo   = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
-    env_                                 = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
+    env_                                 = &scratch_env(scratch, *real_env);
     verifying_                           = true;
     share_active_                        = true;
     taint_why_                           = nullptr;

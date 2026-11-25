@@ -96,6 +96,9 @@ struct IntraSite {
     // put there, from index `batch_start`. See intra_ready_push.
     size_t   batch_start  = 0;
     uint32_t batch_moment = 0;
+    // Whether the site's records stage a handle and are conservative roots while they
+    // wait (rt_intra_alloc_rooted). The type's, so every record of the site agrees.
+    bool rooted = false;
 };
 
 std::vector<IntraSite> intra_sites; // indexed by dense intra-nba id
@@ -133,6 +136,9 @@ struct IntraPending {
     void*           rec;
     const uint32_t* ids;
     uint32_t        n;
+    // The record gave up its conservative root to wait (intra_wait_weakly): the
+    // collector reaches it from this list's event while that event is reachable.
+    bool weak;
 };
 
 // Pending lists by trigger id. A dense (signal, edge) id indexes `intra_event_pending`;
@@ -177,6 +183,43 @@ void intra_event_drop(uint32_t trig_id, const void* rec) {
     list->resize(w);
 }
 
+// Whether `rec` waits on any trigger of `ids` other than `skip`.
+bool intra_listed_elsewhere(const void* rec, const uint32_t* ids, uint32_t n, uint32_t skip) {
+    for (uint32_t k = 0; k < n; ++k) {
+        const std::vector<IntraPending>* list = ids[k] == skip ? nullptr : intra_list_find(ids[k]);
+        if (list == nullptr) {
+            continue;
+        }
+        for (const IntraPending& e : *list) {
+            if (e.rec == rec) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// A record that stages a handle is a conservative root from the moment it is
+// allocated (rt_intra_alloc_rooted). One that waits on event objects alone can only
+// be released through one of them, so it is reachable exactly while one of them is.
+// Its root is given up here and the collector reaches it from its reachable controls
+// instead (event_gc_waiting); kept as a root, a record whose value leads back to its
+// own control would hold both for the rest of the run. A record that also waits on a
+// signal stays a root: a signal can always change. Returns whether the root was
+// given up.
+bool intra_wait_weakly(void* rec, const uint32_t* ids, uint32_t n) {
+    if (!intra_sites[static_cast<rt_intra_rec*>(rec)->idx].rooted) {
+        return false;
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+        if ((ids[k] & RT_TRIG_EVENT) == 0) {
+            return false;
+        }
+    }
+    rt_gc_range_remove(rec);
+    return true;
+}
+
 // Move a record whose delay or event just completed onto its target's ready list. The
 // list is in the order its updates were created (LRM 4.6 b), 15.5.1; docs/LRM_NOTES.md,
 // note 51): the records one release moment puts there are a batch, and a batch goes
@@ -210,6 +253,7 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
         intra_sites.resize(idx + 1);
     }
     IntraSite& site = intra_sites[idx];
+    site.rooted     = false;
     if (site.stride != stride) {
         // A different design (or a differently monomorphized signal) now owns this
         // dense id: its records are a different size, so nothing pooled here can be
@@ -378,10 +422,12 @@ extern "C" uint64_t rt_event_detach_ready(uint32_t i) {
 }
 
 extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
-    intra_list_get(trig_id).push_back(IntraPending{ rec, nullptr, 0 });
+    const bool weak = intra_wait_weakly(rec, &trig_id, 1);
+    intra_list_get(trig_id).push_back(IntraPending{ rec, nullptr, 0, weak });
 }
 
 extern "C" void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, void* rec) {
+    const bool weak = intra_wait_weakly(rec, ids, n);
     for (uint32_t k = 0; k < n; ++k) {
         // Two listed events can be the SAME object (LRM 15.5.5.1: `event b = a;`, or
         // `b = a`), and one occurrence must count the record down once, not once per
@@ -392,7 +438,7 @@ extern "C" void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, v
             seen = seen || ids[j] == ids[k];
         }
         if (!seen) {
-            intra_list_get(ids[k]).push_back(IntraPending{ rec, ids, n });
+            intra_list_get(ids[k]).push_back(IntraPending{ rec, ids, n, weak });
         }
     }
 }
@@ -412,6 +458,11 @@ extern "C" void rt_intra_event_fire(uint32_t trig_id) {
         if (--rec->count != 0) {
             (*intra_list_find(trig_id))[w++] = e; // more edges to wait for
             continue;
+        }
+        // Released: a root again until its commit (rt_intra_release_rooted), which no
+        // event has to stay reachable for.
+        if (e.weak) {
+            rt_gc_range_add(rec, intra_sites[rec->idx].stride);
         }
         intra_ready_push(rec); // last awaited edge -> commit this instant
         // First fire wins: this record is done, so take it off every OTHER trigger
@@ -466,12 +517,14 @@ extern "C" void rt_intra_release(uint32_t idx, uint32_t n) {
 // handle leaf, LRM 9.4.5). Until its delay elapses a record may hold the ONLY reference to
 // the object it carries -- the program can drop every other one in between -- and a record
 // is native memory no root table describes, so from alloc to release it is a conservative
-// GC root. Everything else is rt_intra_alloc / rt_intra_release.
+// GC root -- except while it waits on event objects alone, when it is reached from them
+// instead (intra_wait_weakly). Everything else is rt_intra_alloc / rt_intra_release.
 //
 // A record still in flight when the run ends is never released here; its range goes with
 // the rest of the heap's registrations at rt_gc_shutdown (Gc.cpp, release_heap).
 extern "C" void* rt_intra_alloc_rooted(uint32_t idx, uint32_t stride) {
     void* rec = rt_intra_alloc(idx, stride);
+    intra_sites[idx].rooted = true;
     rt_gc_range_add(rec, stride);
     return rec;
 }
@@ -1127,8 +1180,11 @@ const void*            g_event_vptr = nullptr;
 
 // The address of the design's NBA pending-chain head; null before the first run.
 void** g_event_pend_head = nullptr;
-// Trigger ids handed out this run (rt_event::trig). 0 means "never a control".
-uint32_t g_event_trig_last = 0;
+// The events that are a control, by trigger id (rt_event::trig). Weak: the collector
+// clears the entry of an event it did not reach and hands the id out again
+// (event_gc_release_dead). Entry 0 is never used: id 0 means "never a control".
+std::vector<rt_event*> g_event_controls;
+std::vector<uint32_t>  g_event_trig_free;
 // The events a dump watches, kept for the run (event_keep).
 std::vector<void*> g_event_kept;
 
@@ -1163,20 +1219,33 @@ extern "C" uint64_t rt_event_new_elem(void) {
     return reinterpret_cast<uint64_t>(event_init(rt_gc_alloc_held(kEventMap.size, &kEventMap)));
 }
 
+// The collector retires the id of an event it did not reach, so the caller must
+// register on the id before anything allocates from the collector. Both callers
+// do: the id is the last thing they compute (ir/llvm/Inst.cpp, StoreNbEvent and
+// EventDetach).
 extern "C" uint32_t rt_event_trig_id(void* obj) {
     auto* e = static_cast<rt_event*>(obj);
     if (e->trig == 0) {
-        // TODO: the records registered on an id outlive the object: an event that
-        // dies while a `<= @e` or `->> @(e) f` still waits on it leaves them (and
-        // the event `f` a subscription names) until the run ends. They can never
-        // fire, so this is a leak, not a wrong result.
-        g_event_trig_last += 1;
-        if ((g_event_trig_last & RT_TRIG_EVENT) != 0) {
-            format_fatal("more than 2^31 events were used as the control of an assignment or a trigger");
+        assert(!g_event_controls.empty() && "rt_run_init reserves id 0 before any event exists");
+        if (g_event_trig_free.empty()) {
+            if ((g_event_controls.size() & RT_TRIG_EVENT) != 0) {
+                format_fatal("more than 2^31 events are the control of an assignment or a trigger at once");
+            }
+            g_event_trig_free.push_back(static_cast<uint32_t>(g_event_controls.size()));
+            g_event_controls.push_back(nullptr);
         }
-        e->trig = g_event_trig_last;
+        e->trig = g_event_trig_free.back();
+        g_event_trig_free.pop_back();
+        assert(e->trig != 0 && g_event_controls[e->trig] == nullptr && "a free trigger id names no event");
+        g_event_controls[e->trig] = e;
     }
     return RT_TRIG_EVENT | e->trig;
+}
+
+extern "C" uint32_t rt_event_control_count(void) {
+    return g_event_controls.empty()
+             ? 0
+             : static_cast<uint32_t>(g_event_controls.size() - 1 - g_event_trig_free.size());
 }
 
 extern "C" void* rt_event_timer_new(uint64_t handle) {
@@ -1224,11 +1293,11 @@ void event_gc_roots(void (*visit)(void* handle)) {
     for (const EventTimer* t = g_event_timers; t != nullptr; t = t->next) {
         visit_word(t->handle);
     }
-    for (const auto* lists : { &event_detach_pending, &event_detach_pending_obj }) {
-        for (const std::vector<EventDetach>& list : *lists) {
-            for (const EventDetach& d : list) {
-                visit_word(d.handle);
-            }
+    // The subscriptions on a signal. Those on an event object are reached from that
+    // event (event_gc_waiting).
+    for (const std::vector<EventDetach>& list : event_detach_pending) {
+        for (const EventDetach& d : list) {
+            visit_word(d.handle);
         }
     }
     // Matured by rt_event_detach_fire and not yet read back by the caller's loop.
@@ -1237,6 +1306,57 @@ void event_gc_roots(void (*visit)(void* handle)) {
     }
     for (void* e : g_event_kept) {
         visit(e);
+    }
+}
+
+void event_gc_waiting(bool (*reached)(void* handle), void (*visit)(void* handle),
+                      void (*scan)(const uint8_t* base, uint64_t bytes)) {
+    for (uint32_t trig = 1; trig < g_event_controls.size(); ++trig) {
+        if (g_event_controls[trig] == nullptr || !reached(g_event_controls[trig])) {
+            continue;
+        }
+        if (trig < event_detach_pending_obj.size()) {
+            for (const EventDetach& d : event_detach_pending_obj[trig]) {
+                visit(reinterpret_cast<void*>(d.handle));
+            }
+        }
+        if (trig < intra_event_pending_obj.size()) {
+            for (const IntraPending& p : intra_event_pending_obj[trig]) {
+                if (p.weak) {
+                    const uint32_t idx = static_cast<const rt_intra_rec*>(p.rec)->idx;
+                    scan(static_cast<const uint8_t*>(p.rec), intra_sites[idx].stride);
+                }
+            }
+        }
+    }
+}
+
+void event_gc_release_dead(bool (*reached)(void* handle)) {
+    for (uint32_t trig = 1; trig < g_event_controls.size(); ++trig) {
+        if (g_event_controls[trig] == nullptr || reached(g_event_controls[trig])) {
+            continue;
+        }
+        // Nothing can trigger this event again, so nothing waiting on it alone can be
+        // released. A subscription lets go of the event it would have triggered.
+        if (trig < event_detach_pending_obj.size()) {
+            event_detach_pending_obj[trig].clear();
+        }
+        if (trig < intra_event_pending_obj.size()) {
+            // Emptied first: a record on several dead events is freed by the last of
+            // them, which is the one that finds it on no other list.
+            const std::vector<IntraPending> waiting = std::move(intra_event_pending_obj[trig]);
+            intra_event_pending_obj[trig].clear();
+            for (const IntraPending& p : waiting) {
+                if (intra_listed_elsewhere(p.rec, p.ids, p.n, RT_TRIG_EVENT | trig)) {
+                    continue;
+                }
+                IntraSite& site = intra_sites[static_cast<const rt_intra_rec*>(p.rec)->idx];
+                assert((p.weak || !site.rooted) && "a record that is still a root waits on a signal too");
+                site.freelist.push_back(p.rec);
+            }
+        }
+        g_event_controls[trig] = nullptr;
+        g_event_trig_free.push_back(trig);
     }
 }
 
@@ -1364,7 +1484,8 @@ extern "C" void rt_run_init(void* event_pend_head) {
     std::memcpy(g_event_desc, &map, sizeof(map));
     g_event_vptr      = g_event_desc + map_off;
     g_event_pend_head = static_cast<void**>(event_pend_head);
-    g_event_trig_last = 0;
+    g_event_controls.assign(1, nullptr);
+    g_event_trig_free.clear();
     g_event_kept.clear();
     while (g_event_timers != nullptr) {
         EventTimer* next = g_event_timers->next;

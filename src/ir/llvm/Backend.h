@@ -1279,6 +1279,11 @@ struct BackendError {
 // unit and swaps the active one between emission passes.
 struct ModuleEnv {
     llvm::Module& llmod;
+    // Whether this is root's: the module that defines every design-wide global, so
+    // a use of one is local and a fact fixed at emission (the ring's mask) is an
+    // immediate. A scratch env of the verification is root's when the env it
+    // stands in for is.
+    bool is_root = false;
     // Defining GlobalValue -> this module's declaration of it. Identity
     // mappings are not stored (sym returns the definition directly).
     ankerl::unordered_dense::map<llvm::GlobalValue*, llvm::GlobalValue*> decls;
@@ -1324,7 +1329,9 @@ public:
       , env_(root_env_.get())
       , b_(ctx)
       , config_(config)
-      , resolve_(resolve) {}
+      , resolve_(resolve) {
+        root_env_->is_root = true;
+    }
 
     std::vector<std::unique_ptr<llvm::Module>> take_unit_modules();
 
@@ -1382,6 +1389,16 @@ private:
     void assign_id_fields();
 
     ModuleEnv& unit_env(const Anchor& a);
+
+    // The module the code of anchor `a` is emitted into: its unit's when emission
+    // is split, root's when it is not or when `a` is no instance. Every site that
+    // decides where an instance's group, subroutine or entry goes asks here, so
+    // what calls a row and the row agree on the module.
+    ModuleEnv* home_env(uint32_t a);
+
+    // A scratch env over `scratch` for the verification, standing in for `real`:
+    // code lowered into it is the code `real` would get (see ModuleEnv::is_root).
+    ModuleEnv& scratch_env(llvm::Module& scratch, const ModuleEnv& real);
 
     // Makes root the active module for its scope: what is created for every unit
     // to share (a singleton global, a trampoline) is defined in root whichever
@@ -2125,6 +2142,22 @@ private:
     void emit_wait_suspend();
 
     void lower_wait(ExtraIndex info);
+
+    // The events of an intra-body wait, from a Wait op (lower_wait) or, for a process that
+    // waits at its head (waits_at_head), from its leading list.
+    void lower_wait_edges(std::span<const WaitEdge> events);
+
+    // The one place a body arms its process's wake word before a park (TagInfo::arms_wake).
+    void emit_arm_wake_word();
+
+    // How always process `k` waits for its leading list (S1 of docs/design/scheduler-rules.md).
+    // Subscribed statically: the seed subscribes it once and the body runs body-first in a
+    // forever loop. Waits at its head: its body holds a park that arms its wake word, so
+    // the static entry would wake it there (B51); it is started by the seed and waits for the
+    // list as an ordinary intra-body control, each time round its loop. Neither for an
+    // always with no list, which loops in its body, nor for any other process.
+    bool subscribed_statically(uint32_t k) const;
+    bool waits_at_head(uint32_t k) const;
 
     // -- Root from tables (RootTables.cpp) --
     //
@@ -3245,7 +3278,7 @@ private:
     uint32_t intra_rec_mm_ptr(const SignalSlot& s) const;
     uint32_t intra_rec_z_ptr(const SignalSlot& s) const;
     uint32_t intra_rec_ctx(const SignalSlot& s) const;
-    uint32_t intra_rec_trigs(const SignalSlot& s) const;
+    uint32_t intra_rec_trigs(const SignalSlot& s);
     bool intra_rec_rooted(const SignalSlot& s);
     uint32_t intra_agg_payload(const SignalSlot& s);
 
@@ -4551,6 +4584,10 @@ private:
 
     static bool tag_suspends(Inst::Tag t);
 
+    // The polls after a park (a `disable` or `kill` that landed while parked), as lower_region
+    // emits them after an op for which tag_suspends holds.
+    void emit_resume_polls();
+
     llvm::Value* emit_abort_pending();
 
     void emit_wait_abort_exit(llvm::BasicBlock* leave);
@@ -5163,6 +5200,9 @@ private:
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
     llvm::Value*        sched_ptr_       = nullptr;
+    // Whether the body currently lowering is subscribed statically (subscribed_statically).
+    // emit_arm_wake_word asserts it is not: its entry would wake the body at the park.
+    bool                static_sub_body_ = false;
     // The body's runtime home-region slot (home_ptr), an i8 alloca spilled into
     // the coroutine frame. Null unless body_home_is_runtime_ -- almost every body
     // folds its home at lowering time instead.

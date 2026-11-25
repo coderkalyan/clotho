@@ -1116,6 +1116,9 @@ llvm::StructType* Backend::intra_rec_ty(const SignalSlot& s) {
         if (s.intra_masked) {
             f.push_back(bytes);
         }
+        if (s.intra_trigs > 1) {
+            f.push_back(llvm::ArrayType::get(i32, s.intra_trigs)); // see below
+        }
         return llvm::StructType::get(ctx_, f);
     }
     f.push_back(int_ty(s.four_state ? 2 * s.width : s.width));
@@ -1170,7 +1173,10 @@ uint32_t Backend::intra_rec_ctx(const SignalSlot& s) const {
 }
 
 // Index of the trailing `[intra_trigs x i32]`; only when s.intra_trigs > 1.
-uint32_t Backend::intra_rec_trigs(const SignalSlot& s) const {
+uint32_t Backend::intra_rec_trigs(const SignalSlot& s) {
+    if (s.is_agg) {
+        return intra_agg_payload(s) + (s.intra_masked ? 2 : 1);
+    }
     uint32_t i = intra_rec_mm_ptr(s);
     if (s.is_array || s.intra_ptr) {
         i += s.has_z ? 2 : 1;
