@@ -44,8 +44,8 @@ llvm::Type* Backend::agg_storage_ty(Ref type) {
 
 // Power-on the properties of a freshly-allocated class object body (LRM 8.8):
 // the caller has already zeroed the block (2-state leaves and class-handle
-// properties power on 0 / null), so this writes X into 4-state leaves and
-// initializes string leaves, per-property, reusing emit_agg_init.
+// properties power on 0 / null, string leaves empty), so this writes X into
+// 4-state leaves, per-property, reusing emit_agg_init.
 void Backend::emit_class_body_init(Ref class_ref, llvm::Value* body_ptr) {
     const Type&               t       = std::get<Type>(mod_.pool.get(class_ref));
     llvm::Type*               root_ty = class_body_ty(class_ref);
@@ -226,9 +226,11 @@ Guarded Backend::agg_elem(Guarded lv, Ref array_type, uint32_t pos) {
     return lv;
 }
 
-// Recursive power-on fill for an aggregate signal: X into every 4-state leaf
-// and rt_string_init on every string leaf. 2-state / real leaves are already
-// zero from the state global's zeroinitializer. Array dimensions become
+// Recursive power-on fill for an aggregate whose storage is already zero: X into
+// every 4-state leaf. 2-state / real leaves and string leaves (an empty string is
+// all zero) are what the zeroed storage already holds: a signal's is the state
+// global's zeroinitializer, a frame slot's is init_frame's memset, a class
+// body's is the allocator's. Array dimensions become
 // runtime loops (keeping init O(size) in emitted instructions), struct fields
 // straight-line GEPs. `root_ty` is the aggregate's storage type; `path`
 // accumulates GEP indices from its root.
@@ -266,7 +268,7 @@ void Backend::emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value
         return;
     }
     // Leaf: GEP through the path to the slot, then init only if it needs a
-    // non-zero power-on (4-state -> X, string -> handle).
+    // non-zero power-on (4-state -> X).
     std::vector<llvm::Value*> idx;
     idx.reserve(path.size() + 2);
     idx.push_back(b_.getInt32(0));
@@ -284,7 +286,6 @@ void Backend::emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value
         return;
     }
     if (t.kind == Type::Kind::String) {
-        b_.CreateCall(str_init_fn(), { b_.CreateInBoundsGEP(root_ty, base, idx) });
         return;
     }
     if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
@@ -542,8 +543,8 @@ llvm::Constant* Backend::const_data_init(const SignalSlot& s, Ref const_data) {
 // Power-on constant for one signal's storage. A materialized constant table
 // is its own baked image (nothing ever writes it, so the static initializer
 // IS the value). Other arrays and string arrays are zeroinitialized (filled
-// at runtime by `init_state`); a scalar string is the empty inline handle
-// (`rt_string_init`: byte 31 == str_inline_cap); a scalar plane is X
+// at runtime by `init_state`); a scalar string is the empty inline handle, which
+// is all zero; a scalar plane is X
 // (4-state) or 0 (2-state) with the z word set for an undriven-net may-z seed.
 llvm::Constant* Backend::slot_const(const SignalSlot& s) {
     const Ref const_data = mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data;
@@ -570,8 +571,9 @@ llvm::Constant* Backend::slot_const(const SignalSlot& s) {
         return llvm::ConstantStruct::get(s.slot_ty, fields);
     }
     if (s.is_array || s.is_agg) {
-        // Zeroinitialized; the runtime fill (init_state -> emit_array_init /
-        // emit_agg_init) writes X into 4-state leaves and inits string leaves.
+        // Zeroinitialized, which is every string leaf's empty value; the runtime
+        // fill (init_state -> emit_array_init / emit_agg_init) writes X into
+        // 4-state leaves.
         return llvm::ConstantAggregateZero::get(s.storage_ty);
     }
     if (s.is_dynarr) {
@@ -587,9 +589,7 @@ llvm::Constant* Backend::slot_const(const SignalSlot& s) {
         return llvm::ConstantAggregateZero::get(s.storage_ty);
     }
     if (s.is_string) {
-        // Empty inline handle (mirrors rt_string_init): the trailing length-marker
-        // byte holds rt_string_inline_cap for len 0, and byte[0] is the NUL
-        // terminator (already 0 from the zero-fill).
+        // Empty inline handle: all zero, as rt_string_init leaves it.
         return str_empty_const();
     }
     llvm::Constant* mm = s.four_state ? x_mm(s.width) : zero(s.width);
@@ -600,9 +600,9 @@ llvm::Constant* Backend::slot_const(const SignalSlot& s) {
     return llvm::ConstantStruct::get(s.slot_ty, fields);
 }
 
-// Apply `callee` (rt_string_init / rt_string_deinit) to a string signal's
-// handle, or to every element handle of an array-of-string signal (a runtime
-// loop, like emit_array_init).
+// Apply `callee` (rt_string_deinit) to a string signal's handle, or to every
+// element handle of an array-of-string signal (a runtime loop, like
+// emit_array_init).
 void Backend::emit_string_slot_op(const SignalSlot& s, llvm::FunctionCallee callee) {
     llvm::Value* base = storage_ptr(s);
     if (!s.is_array) {

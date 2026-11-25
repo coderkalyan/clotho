@@ -664,6 +664,43 @@ TEST_CASE("function output and inout string arguments alongside a return value")
     CHECK(run_capture(src) == "a=[o<in>] b=[B+in] r=4\n");
 }
 
+// The operand of `return` is evaluated where the statement executes, before the
+// output / inout formals are copied back (the reading recorded at lower_ret). It
+// shows for a string, whose copy-out moves it out of the callee: a function
+// returning its own output or inout argument used to return "". Every exit of a
+// function goes through one epilogue, so each `return` here copies out too.
+// Icarus rejects output arguments on functions, so this has no oracle.
+TEST_CASE("a function returns the value of its own output argument") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic string named(output string o, inout string io, input int k);
+                o  = {"out", $sformatf("%0d", k)};
+                io = {io, "+"};
+                if (k == 0) return o;
+                if (k == 1) return io;
+                return {o, "/", io};
+            endfunction
+            function automatic int both(output int o);
+                o = 7;
+                return o + 1;
+            endfunction
+            string r, a, b;
+            int    n, m;
+            initial begin
+                b = "b";
+                for (int k = 0; k < 3; k++) begin
+                    r = named(a, b, k);
+                    $display("r=[%s] a=[%s] b=[%s]", r, a, b);
+                end
+                n = both(m);
+                $display("%0d %0d", n, m);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "r=[out0] a=[out0] b=[b+]\nr=[b++] a=[out1] b=[b++]\nr=[out2/b+++] a=[out2] b=[b+++]\n8 7\n");
+}
+
 // Copy-out re-resolves the actual's lvalue AFTER the call, so any place a string
 // store can name is a legal actual: a queue / dynamic-array / associative-array
 // element, an unpacked-struct member, a fixed-array element and a class property.
@@ -1254,6 +1291,33 @@ TEST_CASE("string-element array as a subroutine local, recursively") {
         endmodule
     )";
     CHECK(run_capture(src) == "45\n");
+}
+
+// Nothing constructs a string by calling the runtime: generated code zeroes a
+// frame slot at each activation, and module state is zero to begin with. So an
+// automatic local must read empty on every entry, including after an earlier
+// activation left a heap-form handle in the same stack bytes, and a string
+// array or struct member of a module must read empty with no startup fill.
+TEST_CASE("a string nothing has written is empty in a frame and in module state") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { string f; int n; } S;
+            function automatic string once(int k);
+                string unwritten;
+                string r;
+                r = {unwritten, "|"};
+                unwritten = "0123456789012345678901234567890123456789";
+                return {r, $sformatf("%0d.%0d", k, unwritten.len())};
+            endfunction
+            string arr[3];
+            S      st;
+            initial begin
+                for (int i = 0; i < 3; i++) $display("[%s]", once(i));
+                $display("[%s][%s] %0d %0d", arr[2], st.f, arr[0].len(), st.f.len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[|0.40]\n[|1.40]\n[|2.40]\n[][] 0 0\n");
 }
 
 // The by-value copy of a container leaf is a deep copy too, so a queue member of a

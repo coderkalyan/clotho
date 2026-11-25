@@ -1130,7 +1130,7 @@ void Backend::init_frame() {
             continue;
         }
         if (s.is_string) {
-            b_.CreateCall(str_init_fn(), { slot });
+            emit_str_init(slot);
             continue;
         }
         if (s.is_dynarr || s.is_queue || s.is_assoc) {
@@ -1157,20 +1157,54 @@ void Backend::init_frame() {
 }
 
 // Release every string owned by the current body: frame-local string slots
-// plus the string rvalue temporaries. Emitted before each function `ret`, in
-// a task's completion epilogue, and before a process's final suspend.
+// plus the string rvalue temporaries. Emitted once per body, in the epilogue
+// every exit of it goes through: a function's (lower_function), a task's
+// completion epilogue, a process's final suspend.
+//
+// The strings are tested together: their flag bytes are OR-ed and one branch
+// skips the releases when none of them owns a buffer, which is nearly every
+// activation (a UVM sequence loop made 438 rt_string_deinit calls per item, under
+// 1% of them on a string with a buffer). Sound because every caller is about to
+// drop the storage, so nothing reads a string this leaves un-reset. The slot
+// addresses are formed again in the release block rather than carried into it:
+// tier-0 code generation spills a value that lives across blocks.
 void Backend::deinit_body_strings() {
+    const auto each_string = [&](const auto& visit) {
+        for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            // A ref formal owns nothing: it borrows the actual's storage, which the
+            // caller still owns and will release itself. Freeing through it would
+            // destroy a live caller value.
+            if (frame_slots_[i].is_string && !frame_slots_[i].is_ref) {
+                visit(b_.CreateStructGEP(frame_ty_, frame_, i));
+            }
+        }
+        for (llvm::Value* temp : str_temp_list_) {
+            visit(temp);
+        }
+    };
+    auto* const  i8  = b_.getInt8Ty();
+    llvm::Value* any = nullptr;
+    each_string([&](llvm::Value* slot) {
+        llvm::Value* flag = b_.CreateLoad(i8, b_.CreateConstInBoundsGEP1_64(i8, slot, sizeof(rt_string) - 1));
+        any               = any == nullptr ? flag : b_.CreateOr(any, flag);
+    });
+    if (any != nullptr) {
+        auto* fn      = b_.GetInsertBlock()->getParent();
+        auto* release = llvm::BasicBlock::Create(ctx_, "str.release", fn);
+        auto* done    = llvm::BasicBlock::Create(ctx_, "str.done", fn);
+        auto* owns    = b_.CreateICmpNE(b_.CreateAnd(any, b_.getInt8(rt_string_heap_flag)), b_.getInt8(0));
+        auto* br      = b_.CreateCondBr(owns, release, done);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+        b_.SetInsertPoint(release);
+        each_string([&](llvm::Value* slot) { b_.CreateCall(str_deinit_fn(), { slot }); });
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+    }
     for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
-        // A ref formal owns nothing: it borrows the actual's storage, which the
-        // caller still owns and will release itself. Freeing through it would
-        // destroy a live caller value.
         if (frame_slots_[i].is_ref) {
             continue;
         }
-        if (frame_slots_[i].is_string) {
-            b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
-        } else if (frame_slots_[i].is_dynarr || frame_slots_[i].is_queue ||
-                   frame_slots_[i].is_assoc) {
+        if (frame_slots_[i].is_dynarr || frame_slots_[i].is_queue || frame_slots_[i].is_assoc) {
             // A dynamic-array / queue / associative-array local owns its heap
             // storage (value semantics): free it at every body exit. Unregister
             // BEFORE the free, or the collector holds an entry naming a released
@@ -1189,9 +1223,6 @@ void Backend::deinit_body_strings() {
             std::vector<llvm::Value*> path;
             emit_agg_deinit(frame_slots_[i].ir_type, slot, path, frame_slots_[i].storage_ty);
         }
-    }
-    for (llvm::Value* temp : str_temp_list_) {
-        b_.CreateCall(str_deinit_fn(), { temp });
     }
     for (const auto& [temp, type] : dynarr_temp_list_) {
         emit_gc_container_roots(GcRootOp::Remove, type, temp, handle_slot_ty(type));
@@ -1219,7 +1250,16 @@ void Backend::deinit_body_strings() {
 
 // Lower a function body into its (already declared) LLVM function. Reuses the
 // shared instruction lowering — Arg reads a parameter, Local addresses the
-// frame, Ret is a real return, Call invokes another function.
+// frame, Call invokes another function.
+//
+// Every way out of the body goes through one epilogue, emitted here after the
+// body: `fn.copyout` copies output / inout formals back (LRM 13.5) and falls
+// into `fn.teardown`, which releases the body and returns. A `return` delivers
+// its result and branches to the first; a $finish exit branches to the second,
+// since it has no caller left to copy anything out to. One epilogue rather than
+// one per exit because a body has many exits -- every `return`, and every call
+// that could reach a $finish -- and a copy of the teardown at each was a quarter
+// of a UVM design's code.
 void Backend::lower_function(FunctionId id) {
     const Function& f = mod_.function(id);
     // A subroutine reached through a virtual interface handle addresses its
@@ -1304,6 +1344,12 @@ void Backend::lower_function(FunctionId id) {
     wheel_ = wheel_gv_ != nullptr ? sym(wheel_gv_) : nullptr;
 
     frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
+    // A scalar result waits here for the epilogue to return it. Any other kind is
+    // delivered straight into the caller's out-param at the `return`.
+    fn_result_      = fn_->getReturnType()->isVoidTy() ? nullptr
+                                                       : b_.CreateAlloca(fn_->getReturnType(), nullptr, "result");
+    fn_copyout_bb_  = llvm::BasicBlock::Create(ctx_, "fn.copyout");
+    fn_teardown_bb_ = llvm::BasicBlock::Create(ctx_, "fn.teardown");
     // Ref formals bind FIRST: they emit no code, but build_str_temps resolves
     // local lvalues (to forward a concat straight into its target handle), and
     // a ref local's address is the passed pointer rather than a frame field.
@@ -1321,15 +1367,34 @@ void Backend::lower_function(FunctionId id) {
     // guard defensively in case a body lowered to nothing (an implicit return
     // still copies output / inout formals back).
     if (b_.GetInsertBlock()->getTerminator() == nullptr) {
-        emit_copyout(f);
-        deinit_body_strings();
-        // Check the LLVM return type, not the IR one: a string / dynamic-array
-        // result is void at the ABI (it returns through a trailing out-param).
-        if (fn_->getReturnType()->isVoidTy()) {
-            b_.CreateRetVoid();
-        } else {
-            b_.CreateRet(llvm::Constant::getNullValue(fn_->getReturnType()));
+        if (fn_result_ != nullptr) {
+            b_.CreateStore(llvm::Constant::getNullValue(fn_->getReturnType()), fn_result_);
         }
+        b_.CreateBr(fn_copyout_bb_);
+    }
+
+    fn_copyout_bb_->insertInto(fn_);
+    b_.SetInsertPoint(fn_copyout_bb_);
+    emit_copyout(f);
+    b_.CreateBr(fn_teardown_bb_);
+    fn_teardown_bb_->insertInto(fn_);
+    b_.SetInsertPoint(fn_teardown_bb_);
+    deinit_body_strings();
+    if (fn_result_ == nullptr) {
+        // Checked on the LLVM return type, not the IR one: a string / aggregate /
+        // handle result is void at the ABI (it returns through a trailing out-param).
+        b_.CreateRetVoid();
+    } else if (auto* rty = llvm::dyn_cast<llvm::StructType>(fn_->getReturnType())) {
+        // A 4-state result's two planes, loaded one at a time: tier-0 code
+        // generation has no fast path for a load of the whole struct.
+        llvm::Value* agg = llvm::UndefValue::get(rty);
+        for (unsigned plane = 0; plane < 2; ++plane) {
+            llvm::Value* v = b_.CreateLoad(rty->getElementType(plane), b_.CreateStructGEP(rty, fn_result_, plane));
+            agg            = b_.CreateInsertValue(agg, v, { plane });
+        }
+        b_.CreateRet(agg);
+    } else {
+        b_.CreateRet(b_.CreateLoad(fn_->getReturnType(), fn_result_));
     }
 
     cur_fn_ = nullptr;
@@ -1339,6 +1404,9 @@ void Backend::lower_function(FunctionId id) {
     home_ptr_ = nullptr;
     home_arg_             = nullptr;
     frame_  = nullptr;
+    fn_result_      = nullptr;
+    fn_copyout_bb_  = nullptr;
+    fn_teardown_bb_ = nullptr;
     own_anchor_ = SignalSlot::no_anchor;
     own_ctx_    = nullptr;
 }
@@ -1849,8 +1917,9 @@ void Backend::emit_copyin(const Function& f) {
 }
 
 // Copy each output / inout formal's frame Local back through its caller pointer
-// (LRM 13.5 copy-out at completion). For a task this runs once in the completion
-// epilogue; for a function it runs before every `ret` (each return point).
+// (LRM 13.5 copy-out at completion). Runs once per body: in a task's completion
+// epilogue, and in a function's (lower_function), after any `return` has
+// delivered its result.
 void Backend::emit_copyout(const Function& f) {
     for (uint32_t k = 0; k < f.param_types.size(); ++k) {
         // In needs no copy-out; a ref formal is live (aliased), never copied back.
@@ -1879,9 +1948,9 @@ void Backend::emit_copyout(const Function& f) {
         // caller's (the single passed pointer): rt_string_move releases the
         // caller's old buffer, takes the frame slot's image whole, and re-inits
         // the frame slot. Legal here — and cheaper than a deep copy — because
-        // copy-out is immediately followed by deinit_body_strings on every exit
-        // path (function ret, task completion epilogue), so nothing reads the
-        // frame slot again and its own deinit finds an empty string.
+        // copy-out is immediately followed by deinit_body_strings in both
+        // epilogues, and a function's result was read out before it, so nothing
+        // reads the frame slot again and its own deinit finds an empty string.
         if (is_string_type(f.param_types[k])) {
             b_.CreateCall(str_move_fn(), { fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k) });
             continue;
@@ -1895,34 +1964,38 @@ void Backend::emit_copyout(const Function& f) {
 }
 
 // Lower a void `return` (no operand): a task branches to its copy-out +
-// caller-resume epilogue; a void function copies out formals, releases the
-// body's strings, and returns void.
+// caller-resume epilogue, a void function to its own (lower_function).
 void Backend::lower_ret_void() {
     if (cur_is_task_) {
         b_.CreateBr(leave_blocks(0, task_epilogue_bb_));
         return;
     }
-    emit_copyout(*cur_fn_);
-    deinit_body_strings();
-    b_.CreateRetVoid();
+    b_.CreateBr(fn_copyout_bb_);
 }
 
-// Lower a non-void function `return`: a real `ret`, so it terminates the
-// block and any instructions after it in the region are unreachable
-// (lower_region stops). A 2-state result returns as one iW, a 4-state one packed
-// into the `{ i(2W), iW }` return struct (string / aggregate / handle results
-// copy out through the trailing out-param instead).
+// Lower a non-void function `return`: deliver the result, then leave through the
+// function's epilogue (lower_function). The branch terminates the block, so any
+// instructions after it in the region are unreachable (lower_region stops). A
+// 2-state result is one iW and a 4-state one the `{ i(2W), iW }` return struct,
+// both stored for the epilogue to return; a string / aggregate / handle result
+// is copied out through the trailing out-param here.
+//
+// The result is delivered BEFORE the epilogue copies output / inout formals
+// back: the operand of `return` is evaluated where the statement executes. It is
+// also what makes `return o;` of a string output `o` work, since the copy-out
+// moves the string out of the frame.
+//
+// TODO: check that order against the LRM text (13.5, and the clause on function
+// return values). It is the maintainer's reading, written without the text at
+// hand, and Icarus rejects output arguments on functions, so nothing has
+// confirmed it. tests/string_test.cpp, "a function returns the value of its own
+// output argument", pins it.
 void Backend::lower_ret(Index value) {
-    // A function copies output / inout formals back through their pointers at
-    // each return point (LRM 13.5), before releasing the body and returning.
-    emit_copyout(*cur_fn_);
     if (is_string_type(cur_fn_->return_type) && !is_agg_abi(cur_fn_->return_type)) {
-        // Copy the result out through the trailing out-param handle BEFORE
-        // releasing the body's strings (the value may be one of them).
+        // The value may be one of the body's strings, which the epilogue releases.
         b_.CreateCall(str_assign_fn(), { fn_->getArg(fn_->arg_size() - 1), str_of(value),
                                          alloc_site_global(loc_text(value), "string") });
-        deinit_body_strings();
-        b_.CreateRetVoid();
+        b_.CreateBr(fn_copyout_bb_);
         return;
     }
     if (is_agg_abi(cur_fn_->return_type)) {
@@ -1930,20 +2003,18 @@ void Backend::lower_ret(Index value) {
         // the trailing storage-pointer out-param the caller owns.
         emit_agg_ret_copy(fn_->getArg(fn_->arg_size() - 1), lvalue_of(value),
                           cur_fn_->return_type);
-        deinit_body_strings();
-        b_.CreateRetVoid();
+        b_.CreateBr(fn_copyout_bb_);
         return;
     }
     if (is_handle_type(cur_fn_->return_type)) {
         // Deep-copy the returned handle (an lvalue) into the caller's result
-        // handle (the trailing out-param), before freeing the body's handles
-        // (the value may be a frame local or a call result temp). Resolved
+        // handle (the trailing out-param), before the epilogue frees the body's
+        // handles (the value may be a frame local or a call result temp). Resolved
         // through lv_handle_ptr so returning a struct member, class property
         // or container element copies THAT handle, not its parent's root.
         emit_handle_assign(
           fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value), HandleUse::Read), cur_fn_->return_type);
-        deinit_body_strings();
-        b_.CreateRetVoid();
+        b_.CreateBr(fn_copyout_bb_);
         return;
     }
     // A scalar result crosses by domain: one iW for a 2-state value, the
@@ -1955,16 +2026,13 @@ void Backend::lower_ret(Index value) {
     }
     emit_encoding_check(pl, abi_four_state(cur_fn_->return_type), cur_inst_);
     if (!abi_four_state(cur_fn_->return_type)) {
-        deinit_body_strings();
-        b_.CreateRet(pl.mm);
-        return;
+        b_.CreateStore(pl.mm, fn_result_);
+    } else {
+        auto* rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
+        b_.CreateStore(pl.mm, b_.CreateStructGEP(rty, fn_result_, 0));
+        b_.CreateStore(pl.z, b_.CreateStructGEP(rty, fn_result_, 1));
     }
-    auto* rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
-    llvm::Value* agg = llvm::UndefValue::get(rty);
-    agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
-    agg              = b_.CreateInsertValue(agg, pl.z, { 1 });
-    deinit_body_strings();
-    b_.CreateRet(agg);
+    b_.CreateBr(fn_copyout_bb_);
 }
 
 // Lower a `call`: pass the state pointer plus each scalar argument in its

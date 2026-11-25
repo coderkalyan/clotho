@@ -170,7 +170,7 @@ so the string path is a branch in `StoreNb`, not a new IR tag.
 array, aggregate and container), `{ ptr dest, rt_string staged }`:
 
 - **Active region** (`emit_string_whole_nba`): reserve the record, store the
-  destination handle's pointer, **`rt_string_init` the staged handle**, then
+  destination handle's pointer, **zero the staged handle** (the empty string), then
   `rt_string_assign` the RHS into it. The staged handle owns its value from here.
 - **NBA region** (`emit_string_whole_commit`): `rt_string_move(dest, staged)` per
   record, in push order. The move releases what the destination held, so a target
@@ -178,15 +178,11 @@ array, aggregate and container), `{ ptr dest, rt_string staged }`:
   exactly once; it also re-inits the staged handle, so the record's retained
   capacity is a valid empty string for the next instant.
 
-**Two deliberate differences from the container recipe.**
-
-1. **`init`, not `memset`.** Every container handle's empty image is all-zero; an
-   empty `rt_string` is not (byte 31 holds the inline capacity). A memset here
-   would make `rt_string_assign` read a bogus capacity out of the record.
-2. **No wake, no VCD touch.** A string is refused from sensitivity lists and event
-   controls in the frontend, so no process can be waiting on one, and a string has
-   no `$var` form. The container commit's `service_any_waiters` / `rt_vcd_touch`
-   have no counterpart.
+**One deliberate difference from the container recipe: no wake, no VCD touch.** A
+string is refused from sensitivity lists and event controls in the frontend, so no
+process can be waiting on one, and a string has no `$var` form. The container
+commit's `service_any_waiters` / `rt_vcd_touch` have no counterpart. The staged
+handle is constructed the way a container's is: its empty image is all zero.
 
 **Leaves come free.** The record carries the destination *pointer*, not a signal
 identity, so a string member of an unpacked struct and a string element of a fixed

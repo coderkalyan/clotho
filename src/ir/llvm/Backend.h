@@ -1417,6 +1417,8 @@ private:
 
     llvm::Constant* str_empty_const();
 
+    void emit_str_init(llvm::Value* slot);
+
     uint32_t handle_epoch_field(Ref type) const;
 
     bool is_dynarr_type(Ref type) const;
@@ -1734,10 +1736,11 @@ private:
     // the activation lives (Gc.h:239-241).
     //
     // Add and Remove share one walk, so they visit the same containers in the same
-    // order and the pairing is structural. Statically a body may emit several Removes
-    // for one Add -- deinit_body_strings runs at every `ret` -- but only one exit
-    // executes, so dynamically each add is matched exactly once, which is the same
-    // discipline the emit_handle_delete calls beside it already rely on.
+    // order and the pairing is structural. Statically a body may emit two Removes
+    // for one Add -- a thunk-elided process runs deinit_body_strings at its normal
+    // end and again in its $finish exit -- but only one exit executes, so
+    // dynamically each add is matched exactly once, which is the same discipline
+    // the emit_handle_delete calls beside it already rely on.
     enum class GcRootOp : uint8_t { Add, Remove };
     void emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base,
                                  llvm::Type* storage);
@@ -3047,7 +3050,6 @@ private:
     llvm::FunctionCallee assoc_assign_fn();
     llvm::FunctionCallee assoc_move_fn();
 
-    llvm::FunctionCallee str_init_fn();
     llvm::FunctionCallee str_deinit_fn();
     llvm::FunctionCallee str_assign_fn();
     llvm::FunctionCallee str_move_fn();
@@ -5009,6 +5011,16 @@ private:
     // Ret branches to. The caller-side record slot { ptr parent } for task calls
     // this coroutine makes (a process or a task can be a task caller).
     llvm::BasicBlock*       task_epilogue_bb_ = nullptr;
+    // While lowering a function: its shared epilogue (lower_function). A `return`
+    // branches to the copy-out block, which falls into the teardown block; a
+    // $finish exit branches to the teardown. `fn_result_` is the stack slot a
+    // scalar result waits in, null for a function that is void at the ABI.
+    llvm::BasicBlock*       fn_copyout_bb_  = nullptr;
+    llvm::BasicBlock*       fn_teardown_bb_ = nullptr;
+    llvm::AllocaInst*       fn_result_      = nullptr;
+    // While lowering a thunk-elided process body: the block its $finish exits
+    // share, built by the first of them (emit_finish_exit). Null between bodies.
+    llvm::BasicBlock*       thunk_finish_bb_ = nullptr;
     // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;

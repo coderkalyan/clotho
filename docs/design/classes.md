@@ -757,7 +757,7 @@ So a string property is **bracketed**: `str_chg_snapshot` copies the old CONTENT
 into a scratch handle before the write, and `str_chg_after` compares it with
 `rt_string_cmp` after, firing the any-change notifier only on a difference. The
 scratch is an entry-block alloca so a bracket inside a loop reuses one slot, and its
-`rt_string_init` / `rt_string_deinit` pair is balanced across the bracket. The copy
+construction (a zero fill) and `rt_string_deinit` are balanced across the bracket. The copy
 costs a malloc, paid only for a property something waits on.
 
 ### The string write surface, and why the list is closed

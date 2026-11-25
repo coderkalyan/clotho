@@ -735,7 +735,7 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
 
         if (ct == DpiCType::String) { // input only (guarded)
             auto* h = entry_alloca(str_slot_ty(), "dpi.exp.str");
-            b_.CreateCall(str_init_fn(), { h });
+            emit_str_init(h);
             // h receives a copy of the C const char*. The export thunk is
             // emitted per exported subroutine rather than from a lowered
             // instruction, so no Index locates this copy.

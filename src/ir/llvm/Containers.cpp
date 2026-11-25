@@ -555,7 +555,7 @@ llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
     auto* snap = entry_alloca(str_slot_ty(), "chg.str");
     snap->setAlignment(llvm::Align(alignof(rt_string)));
     ++str_chg_open_;
-    b_.CreateCall(str_init_fn(), { snap });
+    emit_str_init(snap);
     b_.CreateCall(str_assign_fn(),
                   { snap, lv_string_ptr(lv, StringUse::Read),
                     alloc_site_global(SourceText{ .where = "<change notifier>" }, "string") });
@@ -958,7 +958,7 @@ void Backend::lower_queue_pop(Index i, bool front) {
         // leaves the empty string, the Table 7-1 default).
         llvm::Value* out = str_of(i);
         b_.CreateCall(str_deinit_fn(), { out });
-        b_.CreateCall(str_init_fn(), { out });
+        emit_str_init(out);
         queue_engine_call(queue_pop_fn(front), { handle, ops, out });
         return;
     }
