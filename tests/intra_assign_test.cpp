@@ -501,6 +501,41 @@ TEST_CASE("nonblocking intra-assignment concat target with a multi-signal trigge
     CHECK(run_capture_finish(src) == "t=3 p=5 q=c\nt=5 p=0 q=0\n");
 }
 
+// An unpacked struct target under a multi-trigger control: one record per leaf, each
+// carrying the trigger list it must be taken off. The schedule is the scalar one
+// above, leaf by leaf: the first edge commits, the other edge commits nothing more,
+// `repeat (2)` counts an occurrence of either event, and a field target under an
+// event and a signal edge takes the edge.
+TEST_CASE("nonblocking intra-assignment to a struct with a multi-trigger control") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { logic [7:0] lo; int hi; } rec_t;
+            logic a, b;
+            rec_t x, y;
+            event e1, e2;
+            initial begin
+                a = 0; b = 0; x = '{0, 0}; y = '{8'h33, 7};
+                #1 x <= @(posedge a or posedge b) y;
+                #1 a = 1;
+                #1 $display("t=%0t x=%h %0d", $time, x.lo, x.hi);
+                y = '{8'h77, 9}; x = '{0, 0};
+                #1 b = 1;
+                #1 $display("t=%0t x=%h %0d", $time, x.lo, x.hi);
+                x <= repeat (2) @(e1 or e2) y;
+                #1 -> e2;
+                #1 $display("t=%0t x=%h %0d", $time, x.lo, x.hi);
+                -> e1;
+                #1 $display("t=%0t x=%h %0d", $time, x.lo, x.hi);
+                a = 0;
+                x.hi <= @(e1 or posedge a) 5;
+                #1 a = 1;
+                #1 $display("t=%0t x=%h %0d", $time, x.lo, x.hi);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=3 x=33 7\nt=5 x=00 0\nt=7 x=00 0\nt=8 x=77 9\nt=10 x=77 5\n");
+}
+
 // A multi-signal trigger inside a module instantiated TWICE. A dense trigger id
 // is a per-instance id (a record field) while twin instances share
 // the emitted code, so the id list the record registers on -- and is removed from
