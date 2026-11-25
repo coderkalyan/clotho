@@ -2862,3 +2862,30 @@ TEST_CASE("a folded initializer longer than a bounded queue warns once and trunc
     CHECK(count_of_text(c.err, "5 elements do not fit, it holds at most 3 ([$:2])") == 2);
     CHECK(count_of_text(c.err, "warning: bounded queue") == 2);
 }
+
+// A bounded queue class property passed by `ref` keeps its bound: the call site takes it
+// from the property's declared type, as for any other place (note 6).
+TEST_CASE("a ref formal bound to a bounded queue class property enforces the property's bound") {
+    constexpr std::string_view src = R"(
+        class C;
+            int q[$:2];
+            int u[$];
+        endclass
+        module m;
+            typedef int iq_t[$];
+            task automatic fill(ref iq_t x);
+                x.push_back(1); x.push_back(2); x.push_back(3); x.push_back(4);
+            endtask
+            C c;
+            initial begin
+                c = new;
+                fill(c.q);
+                fill(c.u);
+                $display("%0d %0d", c.q.size(), c.u.size());
+            end
+        endmodule
+    )";
+    const Captured r = run_capture_both(src);
+    CHECK(r.out == "3 4\n");
+    CHECK(count_of_text(r.err, "warning: bounded queue") == 1);
+}
