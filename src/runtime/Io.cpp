@@ -165,6 +165,42 @@ void wide_negate(uint64_t* a, uint32_t words) {
     }
 }
 
+// The string a numeric conversion into a `string` stores: the converted value cast
+// to string (LRM 6.16), sized like an unsized literal (LRM 5.7.1: at least 32 bits,
+// signed for a decimal, wider when its digits need it; docs/LRM_NOTES.md). `must`
+// is the value plane over `words` words, already negated for a negative decimal,
+// with a free top bit above the magnitude; unknown digits are 0 in it. A decimal
+// is as wide as its two's complement needs, a based value as its digits (`digit_width`
+// bits). The cast zero-fills to whole bytes, writes them most significant first and
+// drops every 0 byte ("\0" never belongs to a string).
+std::string numeric_to_string(const uint64_t* must, uint32_t words, bool decimal, uint32_t digit_width) {
+    uint32_t width = digit_width;
+    if (decimal) {
+        const bool negative = (must[words - 1] >> 63) != 0;
+        uint32_t   bits     = 0;
+        for (uint32_t k = words; k-- > 0 && bits == 0;) {
+            const uint64_t w = negative ? ~must[k] : must[k];
+            if (w != 0) {
+                bits = k * 64 + 64 - static_cast<uint32_t>(__builtin_clzll(w));
+            }
+        }
+        width = bits + 1;
+    }
+    width                  = std::max<uint32_t>(width, 32);
+    const uint32_t nbytes = (width + 7) / 8;
+    std::string    out;
+    for (uint32_t j = nbytes; j-- > 0;) {
+        auto byte = static_cast<uint8_t>(must[j / 8] >> (8 * (j % 8)));
+        if (j == nbytes - 1 && width % 8 != 0) {
+            byte = static_cast<uint8_t>(byte & ((1u << (width % 8)) - 1));
+        }
+        if (byte != 0) {
+            out.push_back(static_cast<char>(byte));
+        }
+    }
+    return out;
+}
+
 // Wide sibling of write_word_planes: the value planes are little-endian word
 // arrays (`words` = plane_words(width)). Masks each to `width`, then writes the
 // packed must|may vector (must low, may above) and the z word, matching the
@@ -686,6 +722,11 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
         std::fill(may.begin(), may.end(), 0);
         std::fill(z.begin(), z.end(), 0);
         bool ok = false;
+        // A numeric conversion into a `string` destination converts the value to a
+        // string (numeric_to_string); its digits may outgrow the planes, which are
+        // sized to the packed targets, so they grow as the digits arrive.
+        const bool str_dest   = !suppress && ai < argc && (args[ai].flags & 2u) != 0;
+        uint32_t   digit_bits = 0;
         // The %s token bytes, kept verbatim past the plane packing: a string-object
         // destination stores these, not the planes.
         std::vector<uint8_t> tok;
@@ -747,6 +788,13 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             }
             const uint64_t dmask = bits != 0 ? static_cast<uint64_t>((1u << bits) - 1) : 0;
             while (c != EOF) {
+                if (str_dest && (must[words - 1] >> 60) != 0) {
+                    // Keeps a free top bit above the magnitude for the sign.
+                    ++words;
+                    must.resize(words);
+                    may.resize(words);
+                    z.resize(words);
+                }
                 if (maxw != 0 && used >= maxw) {
                     break;
                 }
@@ -789,6 +837,7 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
                 ++used;
                 c = src.get();
             }
+            digit_bits = used * static_cast<uint32_t>(bits);
             src.unget(c);
             if (!ok && c == EOF) {
                 input_failed = true;
@@ -810,14 +859,17 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             }
             const rt_scan_arg& a = args[ai++];
             if ((a.flags & 2u) != 0) {
-                // A `string` object destination: the token IS the value, assigned
-                // verbatim with no width cap, right-justification or padding (LRM
-                // 21.3.4.3 sanctions only %s here; the frontend refuses the rest).
-                assert(conv == 's' && "a string destination pairs only with %s");
+                // A `string` object destination (LRM 21.3.4.3): %s assigns the token
+                // verbatim, with no width cap, right-justification or padding; any
+                // other conversion stores its value cast to string.
                 assert(a.str != nullptr && "a string destination carries its handle");
-                assert(!tok.empty() && "an empty %s token is an input failure, not a store");
-                rt_string_assign_bytes(a.str, reinterpret_cast<const char*>(tok.data()),
-                                       tok.size(), a.site);
+                if (conv == 's') {
+                    assert(!tok.empty() && "an empty %s token is an input failure, not a store");
+                    rt_string_assign_bytes(a.str, reinterpret_cast<const char*>(tok.data()), tok.size(), a.site);
+                } else {
+                    const std::string s = numeric_to_string(must.data(), words, conv == 'd', digit_bits);
+                    rt_string_assign_bytes(a.str, s.data(), s.size(), a.site);
+                }
             } else {
                 const bool narrow = (a.flags & 1u) != 0;
                 if (a.width > 64) {
@@ -1334,18 +1386,33 @@ rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const 
     return 1;
 }
 
-extern "C" int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, rt_string* dst,
+extern "C" int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, uint32_t conv, rt_string* dst,
                                          const rt_alloc_site* site) {
     const std::string* pa = find_plusarg(std::string_view(prefix, prefix_len));
     if (pa == nullptr) {
         return 0; // LRM §21.6: no match leaves the variable alone and returns 0.
     }
-    // "%s -- string (no conversion)": the remainder IS the value, verbatim. No
-    // right-justification and no width cap, unlike the packed-vector form above --
-    // a `string` grows to whatever the command line supplied. An empty remainder
-    // stores the empty string, which is the clause's stated result.
     assert(pa->size() >= prefix_len);
-    rt_string_assign_bytes(dst, pa->data() + prefix_len, pa->size() - prefix_len, site);
+    const std::string_view rem(pa->data() + prefix_len, pa->size() - prefix_len);
+    const char             c = static_cast<char>(conv);
+    if (c == 's') {
+        // "%s -- string (no conversion)": the remainder IS the value, verbatim. No
+        // right-justification and no width cap, unlike the packed-vector form above --
+        // a `string` grows to whatever the command line supplied. An empty remainder
+        // stores the empty string, which is the clause's stated result.
+        rt_string_assign_bytes(dst, rem.data(), rem.size(), site);
+        return 1;
+    }
+    // A numeric conversion stores the converted value cast to string
+    // (numeric_to_string); the planes hold every digit, with a word to spare.
+    const uint32_t        digit_bits = (c == 'o' ? 3u : c == 'b' ? 1u : 4u);
+    const auto            words      = static_cast<uint32_t>(rem.size() * digit_bits / 64) + 2;
+    std::vector<uint64_t> must(words);
+    std::vector<uint64_t> may(words);
+    value_plusargs_numeric(rem, c, must.data(), may.data(), words);
+    const std::string s =
+      numeric_to_string(must.data(), words, c == 'd', static_cast<uint32_t>(rem.size()) * digit_bits);
+    rt_string_assign_bytes(dst, s.data(), s.size(), site);
     return 1;
 }
 

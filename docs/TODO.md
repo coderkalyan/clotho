@@ -257,8 +257,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Part-select destination** — refused for every conversion.
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination** — needs an ASCII-to-real
     scan and a real write-back.
-  - [ ] **Numeric conversion into a `string` destination** — `%d` and friends must store the
-    converted value as an integral-to-string assignment (6.16).
   - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
 - [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
   returned to power-on between designs in one process (docs/design/cooperative-finish.md).

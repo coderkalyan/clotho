@@ -476,16 +476,12 @@ ir::Index Lowerer::lower_scanf(const CallExpression& call, bool is_sscanf, ir::B
         if (a->type->isFloating()) {
             fail("$fscanf / $sscanf into a real variable is not supported");
         }
-        // A `string` object destination is sanctioned for %s alone (LRM
+        // A `string` object destination: %s assigns the token verbatim (LRM
         // 21.3.4.3: "The string format specifier %s (or %S) may be used to
         // read into a variable of integral, unpacked array of byte, or string
-        // data types" -- the integer specifiers list integral types only). The
-        // scan engine's string store relies on this pairing: it assigns the %s
-        // token verbatim and never converts.
-        if (a->type->getCanonicalType().isString() && convs[k] != 's') {
-            fail(std::string("$fscanf / $sscanf %") + convs[k] +
-                 " into a string object is not supported");
-        }
+        // data types"), and any other conversion stores its value as an
+        // integral-to-string assignment (LRM 6.16), sized like an unsized literal
+        // (docs/LRM_NOTES.md): the scan engine does both.
         // An unpacked aggregate destination. The integer specifiers "shall not
         // be used with any unpacked aggregate data type" (LRM 21.3.4.3), and
         // the flat plane store the engine does would land a %s token

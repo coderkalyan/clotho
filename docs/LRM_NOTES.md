@@ -750,3 +750,14 @@ tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
 delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
+
+## 57. Numeric conversion into a `string` destination (21.3.4.3, 21.6, 6.16, 5.7.1)
+
+`$fscanf`, `$sscanf` and `$value$plusargs` store a `%d`, `%h`, `%o`, `%b` or `%c`
+value into a `string` as an integral-to-string assignment (6.16): the value is cast
+to string, each successive 8 bits a character, and every "\0" is dropped. No clause
+gives the value's width, and the cast needs it. Decided reading: the value is sized
+like an unsized literal (5.7.1), at least 32 bits, signed for `%d`, wider when its
+digits need it, with x and z digits read as 0. So `"-5"` under `%d` is the four
+characters FF FF FF FB, the same string as `string'(-5)`, and 16706 is "AB". iverilog
+13 asserts on this case.

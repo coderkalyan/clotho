@@ -958,9 +958,9 @@ void Backend::lower_scanf(Index i) {
             if (lv.is_string) {
                 // A `string` object destination (flags bit1): the descriptor
                 // carries the rt_string handle and its alloc site instead of
-                // plane pointers, and the engine assigns the %s token verbatim.
-                // Only %s pairs with a string (the frontend refuses the other
-                // conversions per LRM 21.3.4.3), and a `%5s` field width caps
+                // plane pointers, and the engine assigns a %s token verbatim or
+                // stores another conversion's value cast to string, and a `%5s`
+                // field width caps
                 // the token like any other %s. The snapshot must open before
                 // the Write-use handle is taken (str_chg bracket).
                 olds[k] = service_snapshot(lv);
@@ -1042,20 +1042,10 @@ void Backend::lower_value_plusargs(Index i) {
 
     const Guarded lv = write_dest(dst);
     if (lv.is_string) {
-        if (info.conv != 's') {
-            // TODO: a numeric conversion into a `string` object. LRM §21.6 stores
-            // the CONVERTED value, so this is LRM 6.16's integral-to-string
-            // assignment of it -- a one-byte string holding a character code, which
-            // is a separate question from the "%s -- string (no conversion)" form
-            // the clause's examples and UVM actually use.
-            throw BackendError{ std::string("$value$plusargs %") +
-                                static_cast<char>(info.conv) +
-                                " into a string object is not supported" };
-        }
         llvm::Value* snap = str_chg_snapshot(lv);
         llvm::Value* r    = b_.CreateCall(
           value_plusargs_str_fn(),
-          { prefix_ptr, prefix_len, lv_string_ptr(lv, StringUse::Write),
+          { prefix_ptr, prefix_len, b_.getInt32(info.conv), lv_string_ptr(lv, StringUse::Write),
             alloc_site_global(loc_text(i), "string") });
         str_chg_after(lv, snap);
         set_value(i, two_val(r));

@@ -4409,20 +4409,24 @@ TEST_CASE("$fscanf %s into a string object from a file") {
     std::remove(path);
 }
 
-// A string destination is sanctioned for %s alone: the integer specifiers "may
-// be used to read into any of the integral data types" (LRM 21.3.4.3), which a
-// string object is not, and storing them would need 6.16's integral-to-string
-// conversion the scan engine does not do. Loud frontend refusal, per specifier.
-TEST_CASE("a non-%s conversion into a string destination is rejected") {
-    for (const char* conv : { "%d", "%h", "%c" }) {
-        const LowerResult r = lower_text(
-          std::string("module m; string s; int n; initial n = $sscanf(\"A\", \"") + conv +
-          "\", s); endmodule");
-        CHECK(!r.ok);
-        CHECK(r.diagnostic_text().find(std::string("$fscanf / $sscanf ") + conv +
-                                       " into a string object is not supported") !=
-              std::string::npos);
-    }
+// A numeric conversion into a string destination stores its value cast to string
+// (LRM 6.16), sized like an unsized literal (docs/LRM_NOTES.md): at least 32 bits,
+// signed for %d. LRM-derived (iverilog 13 asserts on this): 16706 is 0x4142, "AB";
+// %c of 'A' is "A"; -5 is FF FF FF FB.
+TEST_CASE("a non-%s conversion into a string destination stores the value cast to string") {
+    CHECK(run_capture(R"(
+        module m;
+            string a, b, c, d;
+            int n;
+            initial begin
+                n = $sscanf("16706", "%d", a);
+                n = $sscanf("4142", "%h", b);
+                n = $sscanf("A", "%c", c);
+                n = $sscanf("-5", "%d", d);
+                $display("[%s] [%s] [%s] %0d %h", a, b, c, d.len(), {d[0], d[1], d[2], d[3]});
+            end
+        endmodule
+    )") == "[AB] [AB] [A] 4 fffffffb\n");
 }
 
 // An unpacked aggregate destination: the integer specifiers "shall not be used

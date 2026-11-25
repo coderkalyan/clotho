@@ -855,9 +855,9 @@ int32_t rt_ferror_str(int32_t fd, struct rt_string* dst, const rt_alloc_site* si
 // `width` bits are written (x/z parsed digits drop to 0 per LRM 6.3.1) and `z`
 // is null.
 // `flags` bit1: the destination is a `string` object. `str` / `site` are set and
-// the plane fields are null / 0 — the scanned %s token is assigned to the handle
-// verbatim (LRM 21.3.4.3 sanctions only %s into a string; the frontend refuses
-// every other conversion, so the engine never pairs one with this variant).
+// the plane fields are null / 0 — a scanned %s token is assigned to the handle
+// verbatim, and any other conversion stores its value cast to string (LRM 6.16,
+// sized like an unsized literal; docs/LRM_NOTES.md).
 typedef struct rt_scan_arg {
     uint8_t* mm;
     uint8_t* z;
@@ -1097,14 +1097,17 @@ int32_t rt_test_plusargs(const char* s, uint32_t len);
 // returns 0.
 int32_t rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg);
 
-// $value$plusargs(user_string, var) with a `string`-typed var (LRM §21.6). Only
-// the clause's "%s -- string (no conversion)" form reaches here: the remainder
-// is the value, so there is no width to pad or truncate to and no illegal
-// character to reject. On a match the remainder is assigned to `dst` (empty
-// when the plusarg has none, which is the clause's "empty string value") and
-// the function returns nonzero; on no match `dst` is left untouched and it
-// returns 0. `site` locates the assignment for an allocation-failure report.
-int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, struct rt_string* dst,
+// $value$plusargs(user_string, var) with a `string`-typed var (LRM §21.6). For
+// `conv` 's', the clause's "%s -- string (no conversion)" form, the remainder is
+// the value, so there is no width to pad or truncate to and no illegal
+// character to reject. For a numeric `conv` the remainder converts as in
+// rt_value_plusargs and the value is stored cast to string (LRM 6.16), sized like
+// an unsized literal (docs/LRM_NOTES.md). On a match the result is assigned to
+// `dst` (empty when the plusarg has no remainder, which is the clause's "empty
+// string value") and the function returns nonzero; on no match `dst` is left
+// untouched and it returns 0. `site` locates the assignment for an
+// allocation-failure report.
+int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, uint32_t conv, struct rt_string* dst,
                               const rt_alloc_site* site);
 
 // -- Deferred nonblocking writes to unpacked-array elements --

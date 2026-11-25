@@ -560,11 +560,12 @@ llvm::FunctionCallee Backend::value_plusargs_fn() {
     return env_->llmod.getOrInsertFunction("rt_value_plusargs", fnty);
 }
 
-// i32 rt_value_plusargs_str(const char* prefix, i32 prefix_len, rt_string* dst,
+// i32 rt_value_plusargs_str(const char* prefix, i32 prefix_len, i32 conv, rt_string* dst,
 //                           const rt_alloc_site*)
 llvm::FunctionCallee Backend::value_plusargs_str_fn() {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* fnty = llvm::FunctionType::get(b_.getInt32Ty(), { ptr, b_.getInt32Ty(), ptr, ptr }, false);
+    auto* i32  = b_.getInt32Ty();
+    auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr, ptr }, false);
     return env_->llmod.getOrInsertFunction("rt_value_plusargs_str", fnty);
 }
 
