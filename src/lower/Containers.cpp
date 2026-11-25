@@ -968,8 +968,9 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
             lo = lower_expr(rs.left(), b);
             hi = lower_expr(rs.right(), b);
         } else {
-            // Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 11.5.1,
-            // extended to queues by 7.10.4). Unlike the fixed/packed-array
+            // Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 7.4.5 and 7.4.6 give
+            // a slice `A[i+:c]` a constant width `c`; 7.10.1 lets a queue slice's
+            // bounds be non-constant). So unlike the fixed/packed-array
             // form, a queue's width `n` need NOT be a compile-time constant
             // (confirmed against slang: it applies no such check when the
             // base is a queue) -- both `i` and `n` are ordinary runtime

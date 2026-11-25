@@ -331,7 +331,7 @@ TEST_CASE("a queue element select has no remainder in its address") {
     CHECK(ir.find("udiv") == std::string::npos);
 }
 
-// A bounded queue `q[$:N]` holds at most N+1 elements (LRM 7.10.4). A push onto
+// A bounded queue `q[$:N]` holds at most N+1 elements (LRM 7.10.1, 7.10.5). A push onto
 // a full queue keeps the first N+1 elements: push_back drops the just-pushed
 // element, push_front drops the old tail. Oracle-matched vs iverilog.
 TEST_CASE("queue bounded push drops excess") {
@@ -782,7 +782,7 @@ TEST_CASE("queue declaration initializer from a fixed-size array or a dynamic ar
                               "dynarr s=4 4 7\n");
 }
 
-// A queue slice `q[a:b]` (LRM 7.10.4) yields a new queue. Bounds clamp to
+// A queue slice `q[a:b]` (LRM 7.10.1) yields a new queue. Bounds clamp to
 // [0, size-1]; a>b is empty. A self-slice `q = q[a:b]` is alias-safe. Verified
 // against verilator.
 TEST_CASE("queue slice") {
@@ -859,8 +859,9 @@ TEST_CASE("queue $ slice bound and empty-literal clear") {
           "emptysrc s=0\n");
 }
 
-// Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 11.5.1, extended to
-// queues by 7.10.4). Unlike a fixed/packed array, a queue's width `n` need
+// Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 7.4.5 and 7.4.6 give a
+// slice `A[i+:c]` a constant width `c`; 7.10.1 lets a queue slice's bounds be
+// non-constant). Unlike a fixed/packed array, a queue's width `n` need
 // not be a compile-time constant. Both bounds clamp against the queue's
 // actual length exactly like the `a:b` form (`queue slice`, above), and the
 // base index may itself spell `$` (the last valid index). No iverilog
@@ -907,7 +908,7 @@ TEST_CASE("queue indexed part-select slice") {
 }
 
 // A bounded queue built from a too-long concatenation keeps the first N+1
-// elements (LRM 7.10.4). No verilator oracle (it miscompiles bounded-queue
+// elements (LRM 10.10, 7.10.5). No verilator oracle (it miscompiles bounded-queue
 // concat); hand-checked against the LRM.
 TEST_CASE("queue slice/concat into a bounded queue drops the tail") {
     constexpr std::string_view src = R"(

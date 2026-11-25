@@ -1209,7 +1209,7 @@ struct rt_elem_ops {
     void (*destroy)(void* slot);
     // rt_elem_queue only: the `[$:N]` max index N of the queue the element IS (0 is
     // unbounded), so copying one over another truncates to what the destination
-    // holds (LRM 7.10.5 [unverified wording]). Appended, like the GC fields.
+    // holds (LRM 7.10.5). Appended, like the GC fields.
     uint64_t bound;
 };
 
@@ -1399,7 +1399,7 @@ static inline uint64_t rt_queue_slot(const rt_queue* h, uint64_t i) {
 void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site* site);
 
 // Destroy the elements of a bounded queue past its limit and keep the first
-// `bound + 1` (LRM 7.10.5 [unverified wording]), then report the overflow at `site`
+// `bound + 1` (LRM 7.10.5: elements beyond the bound are discarded), then report the overflow at `site`
 // (rt_queue_overflow_report). Called only when `bound != 0 && h->len > bound + 1`, for
 // the same reason as rt_queue_grow: the engine tests that itself, and an overflow
 // does not belong in the code a design inlines.
@@ -1411,7 +1411,7 @@ void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, con
 void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_t wanted, uint64_t now);
 
 // Bounded-queue max size argument for the push helpers: `bound` is the `[$:N]`
-// maximum index (max size N+1); 0 means unbounded (LRM §7.10.5 [unverified wording]).
+// maximum index (max size N+1); 0 means unbounded (LRM 7.10.1, 7.10.5).
 //
 // An overflowing push keeps the first `bound + 1` elements, i.e. it always drops
 // from the TAIL. The two directions therefore lose different elements, and the
@@ -1420,8 +1420,9 @@ void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_
 //     old tail -- the end opposite the push.
 //   - push_back lands the new element at the tail, so the dropped one is the
 //     element just pushed: pushing onto a full bounded queue has no effect.
-// The same rule governs insert(). LRM 7.10.5 does not pin which end an
-// overflowing push sacrifices (docs/LRM_NOTES.md, note 6).
+// The same rule governs insert(). LRM 7.10.5 discards the elements beyond the bound
+// after any write, and 7.10.3 names the highest-numbered element for insert and
+// push_front, so the tail is the end the LRM gives up (docs/LRM_NOTES.md, note 6).
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
 // to the tail / head, growing the ring as needed. `site` is the push's source

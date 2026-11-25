@@ -962,8 +962,8 @@ public:
     // covergroup: a covergroup declared in a module instantiated twice covers two
     // different sets of signals and reports as two types.
     std::vector<CoverType> cover_types;
-    // The first top instance's name (LRM 35.5.3). Every top gets its own DPI
-    // svScope, registered from `tops()`; this is only the fallback name for a
+    // The first top instance's name. Every top gets its own DPI svScope (LRM 35.5.3),
+    // registered from `tops()`; this is only the fallback name for a
     // design with no top instances at all, and the default `name` for a multi-top
     // module.
     std::string top_name;

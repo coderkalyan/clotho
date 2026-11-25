@@ -48,12 +48,15 @@ Code: `src/lower/Expr.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slic
 
 ## 6. Overflowing a bounded queue (7.10.5)
 
-7.10.5 does not say which end an overflowing write gives up [unverified wording; the
-LRM PDF was not at hand for the section number]. Clotho always keeps the first
-`bound + 1` elements, on every write: whole assignment (from a queue, a dynamic or
-fixed array, a slice, a concatenation or pattern, a function result, a task output
-copied back, a nonblocking assignment, an input formal's copy-in, an element of a
-container of bounded queues), `push_back`, `push_front` and `insert`. So `push_front`
+7.10.5 says a write to a bounded queue behaves "exactly as if the queue were unbounded
+except that if, after any operation that writes to a bounded queue variable, that
+variable has any elements beyond its bound, then all such out-of-bounds elements shall be
+discarded and a warning shall be issued", and 7.10.3 says `insert` or `push_front` on a
+bounded queue deletes "the highest-numbered element" when the new size exceeds the bound.
+Clotho keeps the first `bound + 1` elements, on every write: whole assignment (from a
+queue, a dynamic or fixed array, a slice, a concatenation or pattern, a function result,
+a task output copied back, a nonblocking assignment, an input formal's copy-in, an element
+of a container of bounded queues), `push_back`, `push_front` and `insert`. So `push_front`
 drops the old tail, `push_back` onto a full queue has no effect, and `insert` follows
 the same rule. Every overflowing operation prints one run-time warning on stderr, never
 suppressed, naming the queue (when it is a design variable) and giving the element count
@@ -159,9 +162,15 @@ Code: `src/lower/Statements.cpp` (`lower_predicate`), `src/lower/Expr.cpp` (`low
 ## 18. `unique` and `priority` violation reports (12.4.2, 12.5.3)
 
 12.4.2 and 12.5.3 defer a violation report to the Observed region, and 12.4.2.1
-clears a pending report when its process reaches a flush point first. Clotho
-queues the report and issues it in the Observed region, and drops it if its thread
-reached a flush point of 16.4.2 meanwhile: an activation start, or a resume from an
+(which 12.5.3.1 applies to `case`) discards a pending report when its process reaches
+a violation report flush point first: a resume after suspending on an event control or
+`wait`, or an `always_comb` / `always_latch` resumed by a dependent signal. These are
+the first two flush points of 16.4.2; its third, disabling the process's outermost
+scope, is not one for violation reports. Not yet: a process that also holds a deferred
+assertion shares one generation counter, so there a `disable` of its outermost scope
+drops its violation reports too (`Statements.cpp`, `lower_disable`); a process with
+none keeps them. Clotho queues the report and issues it in the Observed region, and drops it if its thread
+reached a flush point meanwhile: an activation start, or a resume from an
 event control or `wait`, including one inside a task or function-called task the
 thread entered (the generation travels with the call, docs/design/disable.md). So a
 zero-delay glitch of the condition reports nothing, as a deferred assertion's does.
@@ -739,9 +748,10 @@ Code: `src/runtime/Io.cpp` (`rt_fread`), `src/runtime/Reports.cpp` (`rt_fread_ra
 
 ## 56. Negative, NaN and infinite real delays (9.4.1, 6.12.1)
 
-9.4.1 reads a negative delay as a two's-complement unsigned time, and a real
-delay is first rounded to the time precision, ties away from zero (6.12.1). Clotho
-applies both in that order, so `#(-1.5)` under a 1ns precision rounds to -2 and
+9.4.1 reads a negative delay as a two's-complement unsigned time, and 3.14.1 rounds a
+delay to the time precision before use but does not say how a tie rounds, so Clotho
+takes 6.12.1's rule for a real converted to an integer, away from zero. It rounds
+first and then applies 9.4.1, so `#(-1.5)` under a 1ns precision rounds to -2 and
 waits 2**64 - 2 ticks, which never fires, and `#(-0.4)` rounds to 0 and fires at
 once. The LRM says nothing of NaN or infinity. Clotho reads NaN as 0, as LLVM's
 saturating float-to-integer conversion gives, and saturates an infinity, like any
