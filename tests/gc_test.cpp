@@ -4208,7 +4208,7 @@ TEST_CASE("gc: handles held by a clocking block's drive and sample state survive
           Junk sink;
           function automatic C make(int v); C c = new; c.v = v; c.tag = $sformatf("kept%0d", v); return c; endfunction
           task automatic churn();
-            for (int i = 0; i < 3000; i++) begin
+            for (int i = 0; i < 6000; i++) begin
               sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
             end
           endtask

@@ -3450,14 +3450,14 @@ TEST_CASE("an inherited scalar property's notifier keeps the base's field index"
 
 // -- Wide properties on collected objects (alignment regression) ---------------
 //
-// A collected object's handle sits RT_GC_HEADER_BYTES past a 16-aligned cell
-// (Gc.h:54-59), so it is 8 mod 16 -- while IRBuilder's default load/store claim
-// is the value type's ABI alignment, 16 for the i128 plane of a 33..64-bit
-// 4-state (or any >=128-bit) slot. x86-64 lowers a wide equality compare of such
-// loads to an ALIGNED vector move (vmovdqa, #GP on a misaligned address), so the
-// over-claim was a silent SIGSEGV, first hit by UVM's waited-on wide properties.
-// clamp_unproven_align (ir/llvm/LlvmBackend.cpp) now clamps every claim the pointer
-// cannot prove. Both cases assert the VALUE, not just survival.
+// IRBuilder's default load/store claim is the value type's ABI alignment, 16 for
+// the i128 plane of a 33..64-bit 4-state (or any >=128-bit) slot, and x86-64
+// lowers a wide equality compare of such loads to an ALIGNED vector move
+// (vmovdqa, #GP on a misaligned address). A claim the pointer cannot back up is
+// then a silent SIGSEGV, first hit by UVM's waited-on wide properties through a
+// handle that was 8 mod 16. clamp_unproven_align (ir/llvm/LlvmBackend.cpp) clamps
+// every claim the pointer cannot prove. Both cases assert the VALUE, not just
+// survival.
 
 // The UVM shape: a store to a waited-on `logic [63:0]` property emits the
 // change-notifier's full-plane old/new compare (i128 loads off the handle).

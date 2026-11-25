@@ -81,19 +81,19 @@ void report_backend_error(const BackendError& e, const LocResolver& resolve) {
 // -- and the aggregate-copy memcpys claim the aggregate's ABI alignment the
 // same way. On x86-64 a claim of 16 makes codegen select the ALIGNED vector
 // move (vmovdqa, #GP on a misaligned address; the wide-compare PTEST lowering
-// is where it first bit). The claim is a lie through a class handle: a
-// collected object's handle sits RT_GC_HEADER_BYTES past a 16-aligned cell
-// (Gc.h:54-59), so it is 8 mod 16 permanently, and a field the DataLayout
-// placed at a 16-aligned offset lands on an 8-mod-16 address.
+// is where it first bit). The claim is only as good as the pointer under it, and
+// the builder cannot see where a pointer came from: a place reached through a
+// `ref` formal or inside a container payload is laid out by its own rules, and
+// a claim taken from the value type says nothing about them.
 //
 // The proof rule: a claim getKnownAlignment can re-derive from the pointer is
 // kept -- an alloca (its own align), a global plus constant offset (the
 // align-64 state global's fields), an argument or call carrying an align
-// attribute. Everything else -- a GC object body (never 16-aligned, by
-// construction), a malloc'd container payload, a ref formal -- is clamped to
-// 8, the floor every storage base and every slot layout does guarantee (GC
-// handle 8, malloc >= 16, rt_alloc 64; i64-and-wider leaves sit at 8-aligned
-// offsets). The later pipeline only re-raises an alignment it can re-prove the
+// attribute. Everything else -- a GC object body, a malloc'd container payload,
+// a ref formal -- is clamped to 8, the floor every storage base and every slot
+// layout does guarantee (GC handle 16, malloc >= 16, rt_alloc 64; i64-and-wider
+// leaves sit at 8-aligned offsets). The later pipeline only re-raises an
+// alignment it can re-prove the
 // same way, so the clamp survives instcombine. Cost: an unprovable-but-true 16
 // (a malloc'd payload) loses the aligned-vector encoding; on this
 // microarchitecture the unaligned encodings are penalty-free on aligned data.

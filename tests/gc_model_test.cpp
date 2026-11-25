@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -89,8 +90,8 @@ struct Shape {
         for (uint32_t k = 0; k < nhandles; ++k) {
             offsets[k] = kFieldsOffset + 8 * k;
         }
-        // The one place this file knows how an object is laid out beside its body.
-        map.size     = (RT_GC_HEADER_BYTES + body_bytes() + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
+        // The one place this file knows how an object's size follows from its body.
+        map.size     = (body_bytes() + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
         map.nhandles = nhandles;
         map.nleaves  = 0;
         map.handles  = nhandles != 0 ? offsets : nullptr;
@@ -104,11 +105,12 @@ struct Shape {
     }
 };
 
-// From one grain to larger than a block. The last two are above the large-object
-// threshold, and the last does not fit in a block at all.
+// From one grain to larger than a block. The last two do not fit in a block and get
+// a mapping of their own; the two before them are found from an interior address
+// in more than one step back.
 Shape g_shapes[] = {
-    { 0, 0, false },   { 1, 1, false },   { 2, 0, true },     { 4, 3, false },
-    { 3, 40, true },   { 1, 300, false }, { 2, 1500, true },  { 0, 5000, false },
+    { 0, 0, false },   { 1, 1, false },   { 2, 0, true },    { 4, 3, false },   { 3, 40, true },
+    { 1, 300, false }, { 2, 1500, true }, { 2, 5000, false }, { 1, 6000, true },
 };
 constexpr uint32_t kShapes = sizeof g_shapes / sizeof g_shapes[0];
 
@@ -262,7 +264,7 @@ struct Model {
 
     void allocate() {
         // Small shapes mostly; a large object now and then.
-        const uint32_t shape = below(16) == 0 ? 6 + below(2) : below(6);
+        const uint32_t shape = below(16) == 0 ? 6 + below(3) : below(6);
         Shape&         s     = g_shapes[shape];
         void* const    h     = rt_gc_alloc(rt_gc_mutator_current(), s.map.size, &s.map, nullptr);
         REQUIRE(h != nullptr);
@@ -438,10 +440,179 @@ void run_model(int32_t full_every) {
     }
 }
 
+// A heap with one table of precise roots and nothing else, for claims about where
+// objects are put and what the heap gives back. Nothing here polls, so a collection
+// runs only where a test asks for one.
+struct Heap {
+    std::vector<uint64_t> words;
+    std::vector<uint32_t> offsets;
+    rt_gc_roots           table{};
+    void*                 pend_head = nullptr;
+
+    explicit Heap(uint32_t slots) : words(slots, 0), offsets(slots) {
+        for (Shape& s : g_shapes) {
+            s.build();
+        }
+        rt_gc_config cfg{};
+        cfg.nursery_bytes   = RT_GC_BLOCK_BYTES;
+        cfg.map_vptr_offset = rt_gc_map_vptr_offset();
+        cfg.request_offset  = static_cast<int32_t>(rt_gc_mutator_request_offset());
+        cfg.mutator_bytes   = static_cast<int32_t>(rt_gc_mutator_bytes());
+        rt_gc_init(&cfg);
+        rt_run_init(&pend_head);
+        for (uint32_t k = 0; k < slots; ++k) {
+            offsets[k] = 8 * k;
+        }
+        table.base     = words.data();
+        table.nhandles = slots;
+        table.offsets  = offsets.data();
+        rt_gc_roots_add(&table);
+    }
+
+    ~Heap() { rt_gc_shutdown(); }
+
+    // A fresh object of a shape without a finalizer, stamped with `stamp` and held by
+    // root `slot`.
+    void* make(uint32_t slot, uint32_t shape, uint64_t stamp) {
+        Shape& s = g_shapes[shape];
+        REQUIRE(!s.finalizable);
+        void* const h = rt_gc_alloc(rt_gc_mutator_current(), s.map.size, &s.map, nullptr);
+        REQUIRE(h != nullptr);
+        store(h, 0, reinterpret_cast<uint64_t>(s.vptr));
+        store(h, kStampOffset, stamp);
+        words[slot] = reinterpret_cast<uint64_t>(h);
+        return h;
+    }
+
+    rt_gc_stats collect(uint32_t kind) {
+        rt_gc_collect_kind(RT_GC_REASON_EXPLICIT, kind);
+        return stats();
+    }
+
+    static rt_gc_stats stats() {
+        rt_gc_stats st{};
+        rt_gc_get_stats(&st);
+        return st;
+    }
+};
+
+// Every other one of a run of small objects dies, leaving free space only in pieces
+// the size of one object, each between two survivors. `kind` is the collection that
+// finds them dead: a young one when the objects have never been collected, a full
+// one when they are old.
+void check_granule_reuse(uint32_t kind) {
+    constexpr uint32_t kCount = 4096;
+    constexpr uint32_t kSmall = 0;
+    Heap               heap(kCount);
+    std::vector<void*> first(kCount);
+    for (uint32_t k = 0; k < kCount; ++k) {
+        first[k] = heap.make(k, kSmall, k);
+    }
+    if (kind == RT_GC_KIND_FULL) {
+        heap.collect(RT_GC_KIND_FULL);
+    }
+    std::vector<void*> freed;
+    for (uint32_t k = 1; k < kCount; k += 2) {
+        heap.words[k] = 0;
+        freed.push_back(first[k]);
+    }
+    const rt_gc_stats after = heap.collect(kind);
+    CHECK(after.objects_live == kCount / 2);
+    for (uint32_t k = 0; k < kCount; ++k) {
+        REQUIRE((rt_gc_find_object(first[k]) == first[k]) == (k % 2 == 0));
+    }
+    // As many again: each lands where a dead one was, so the heap takes no new block.
+    std::vector<void*> second;
+    for (uint32_t k = 1; k < kCount; k += 2) {
+        second.push_back(heap.make(k, kSmall, kCount + k));
+    }
+    std::sort(freed.begin(), freed.end());
+    std::sort(second.begin(), second.end());
+    CHECK(second == freed);
+    const rt_gc_stats reused = Heap::stats();
+    CHECK(reused.blocks_total == after.blocks_total);
+    CHECK(reused.blocks_free == after.blocks_free);
+    for (uint32_t k = 0; k < kCount; ++k) {
+        void* const h = reinterpret_cast<void*>(heap.words[k]);
+        REQUIRE(rt_gc_find_object(h) == h);
+        REQUIRE(load(h, kStampOffset) == (k % 2 == 0 ? k : kCount + k));
+    }
+}
+
 } // namespace
 
 TEST_CASE("gc model: the collector keeps exactly what a model of the heap says") {
     SUBCASE("the collector chooses young or full") { run_model(0); }
     SUBCASE("every collection is full") { run_model(1); }
     SUBCASE("one collection in four is full") { run_model(4); }
+}
+
+TEST_CASE("gc heap: a freed object's granules are the next allocation's") {
+    SUBCASE("freed by a young collection") { check_granule_reuse(RT_GC_KIND_YOUNG); }
+    SUBCASE("freed by a full collection") { check_granule_reuse(RT_GC_KIND_FULL); }
+}
+
+TEST_CASE("gc heap: an object larger than a block has a mapping of its own") {
+    constexpr uint32_t kLarge = 7;
+    Heap               heap(2);
+    const uint64_t     size = g_shapes[kLarge].map.size;
+    REQUIRE(size > RT_GC_BLOCK_BYTES);
+    const rt_gc_stats empty = Heap::stats();
+    uint8_t* const    h     = static_cast<uint8_t*>(heap.make(0, kLarge, 11));
+    const rt_gc_stats held  = Heap::stats();
+    CHECK(held.blocks_total == empty.blocks_total);
+    CHECK(held.heap_bytes >= empty.heap_bytes + size);
+    CHECK(reinterpret_cast<uintptr_t>(h) % RT_GC_ALIGN == 0);
+    // Every byte of it resolves to it, and the bytes around it to nothing.
+    CHECK(rt_gc_find_object(h) == h);
+    CHECK(rt_gc_find_object(h + size / 2) == h);
+    CHECK(rt_gc_find_object(h + size - 1) == h);
+    CHECK(rt_gc_find_object(h + size) == nullptr);
+    CHECK(rt_gc_find_object(h - 1) == nullptr);
+
+    heap.collect(RT_GC_KIND_YOUNG);
+    heap.collect(RT_GC_KIND_FULL);
+    CHECK(rt_gc_find_object(h) == h);
+    CHECK(load(h, kStampOffset) == 11);
+    // Old and unreachable: a young collection leaves it, a full one frees it and
+    // its mapping goes back.
+    heap.words[0] = 0;
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).heap_bytes == held.heap_bytes);
+    CHECK(rt_gc_find_object(h) == h);
+    CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes == empty.heap_bytes);
+    CHECK(rt_gc_find_object(h) == nullptr);
+    // Young and unreachable: a young collection is enough.
+    uint8_t* const y = static_cast<uint8_t*>(heap.make(1, kLarge, 12));
+    heap.words[1]    = 0;
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).heap_bytes == empty.heap_bytes);
+    CHECK(rt_gc_find_object(y) == nullptr);
+}
+
+TEST_CASE("gc heap: empty chunks go back to the system after a full collection") {
+    constexpr uint32_t kMedium = 5;
+    constexpr uint32_t kCount  = 7000;
+    Heap               heap(2);
+    void* const        kept = heap.make(0, kMedium, 7);
+    for (uint32_t n = 0; n < kCount; ++n) {
+        heap.make(1, kMedium, n);
+    }
+    const rt_gc_stats grown = Heap::stats();
+    REQUIRE(grown.heap_bytes >= 4ull * RT_GC_CHUNK_BYTES);
+    // A young collection frees the objects and keeps the chunks.
+    const rt_gc_stats young = heap.collect(RT_GC_KIND_YOUNG);
+    CHECK(young.objects_live == 2);
+    CHECK(young.blocks_free > grown.blocks_free);
+    CHECK(young.heap_bytes == grown.heap_bytes);
+    // A full one keeps the chunks its two objects are in and one more.
+    const rt_gc_stats full = heap.collect(RT_GC_KIND_FULL);
+    CHECK(full.objects_live == 2);
+    CHECK(full.heap_bytes <= 3ull * RT_GC_CHUNK_BYTES);
+    CHECK(full.blocks_free < young.blocks_free);
+    CHECK(rt_gc_find_object(kept) == kept);
+    CHECK(load(kept, kStampOffset) == 7);
+    // And the heap grows again when asked.
+    for (uint32_t n = 0; n < kCount; ++n) {
+        heap.make(1, kMedium, n);
+    }
+    CHECK(Heap::stats().heap_bytes >= grown.heap_bytes);
 }
