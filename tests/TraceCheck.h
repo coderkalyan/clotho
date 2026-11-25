@@ -189,10 +189,12 @@ inline int finish() {
     }
     rt_trace_counts t{};
     rt_trace_totals(&t);
-    std::fprintf(stderr, "trace check: %llu runs, %llu events, %llu parks, %llu wakes, %llu violations (%llu known)\n",
+    std::fprintf(stderr,
+                 "trace check: %llu runs, %llu events, %llu parks, %llu wakes, %llu writes, %llu violations (%llu known)\n",
                  static_cast<unsigned long long>(t.runs), static_cast<unsigned long long>(t.events),
                  static_cast<unsigned long long>(t.parks), static_cast<unsigned long long>(t.wakes),
-                 static_cast<unsigned long long>(suite->violations()), static_cast<unsigned long long>(suite->known_hits()));
+                 static_cast<unsigned long long>(t.changes), static_cast<unsigned long long>(suite->violations()),
+                 static_cast<unsigned long long>(suite->known_hits()));
     std::fprintf(stderr,
                  "trace check: NBA updates created: %llu block, %llu array, %llu aggregate, %llu zero-delay, %llu timer, "
                  "%llu event; %llu NBA passes, %llu pends, %llu triggers, %llu finishes\n",

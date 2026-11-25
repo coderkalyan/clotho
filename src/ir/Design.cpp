@@ -706,6 +706,9 @@ private:
                 }
             }
         }
+        for (const WeakClass& w : d_.weak_classes) {
+            m_.set_weak_class(w.class_ref, w.referent_field);
+        }
         for (const UnitId u : d_.vif_units) {
             for (const uint32_t ii : instances_of_[static_cast<uint32_t>(u)]) {
                 m_.vif_scopes.push_back(insts_[ii].scope);

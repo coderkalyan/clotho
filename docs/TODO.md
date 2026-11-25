@@ -131,6 +131,11 @@ Milestones, in order; lower ones unblock higher ones:
     (9.4.3) — needs a whole-aggregate change compare.
   - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
     needs DPI.
+  - [ ] **`wait` on a method call that reads properties** (9.4.2) — what the method
+    reads is not waited on, so the condition is not tested again when it changes.
+  - [ ] **`@` over a method call or a compound expression of properties** (9.4.2) —
+    `@(c.get())`, `@(c.v == 3)` and `@(w.get() == null)` are not woken by a change
+    of the property, and are a fatal when the handle is null as the process starts.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
 - [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
@@ -573,7 +578,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Typeless mailbox** (15.4.9) — `dynamic_type` needs a dynamically typed element and a
   run-time type identity for the `get` check and `try_get`'s negative return.
 - [ ] **Class derived from `semaphore` or `mailbox`** — extending a built-in class.
-- [ ] **`std::weak_reference`** (8.30) — the class is refused.
 - [~] **Clocking blocks** (14) — open pieces of clocking-block support.
   - [ ] **Input skew other than `#1step`/`#0`, output skew other than `#0`** — needs a
     per-clockvar history keyed by time; an edge skew needs a second event per block.

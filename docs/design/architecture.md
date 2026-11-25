@@ -89,8 +89,9 @@ them in step.
   object, with a finalizer for any native resource it owns. **Not yet:**
   covergroup instances live until the run ends.
 - A covergroup instance's results outlive it: its finalizer folds them into the
-  type's record, and an instance with its own sampling event stays reachable
-  while that event can fire (tentative until read against clause 19).
+  type's record, an instance with `option.per_instance` set keeps its own record
+  as well (LRM 19.7 requires that one in the report), and an instance with its own
+  sampling event stays reachable while that event can fire.
 - Collection is generational: an object is old once a collection has marked it.
   That bit is the only generation state; it is kept beside the heap, not in the
   object, and a full collection clears it first.
@@ -156,7 +157,6 @@ them in step.
   clears the referent of each weak reference it reached whose referent is
   unmarked. Collection timing is then visible to a design, so a collection
   happens at a point that is a function of the run, never of thread timing.
-  **Not yet:** the class is refused.
 - An object's identity number (`weak_reference::get_id`, the order of an
   associative array keyed by a class handle) is assigned on first request and
   kept in a table beside the heap, so objects that never ask pay nothing; the
@@ -166,8 +166,8 @@ them in step.
   output must not change; a heap verifier runs after each collection in
   extra-assertion builds; and a model-based test drives the collector's C
   interface with random graphs, stores and collections against a shadow
-  reachability model. A design that uses a weak reference is left out of the
-  cadence comparison.
+  reachability model. A design in which the collector can clear a weak reference
+  states its output for each cadence instead.
 
 ## Containers and classes
 

@@ -1361,15 +1361,21 @@ llvm::StructType* Backend::rt_svopen_ty() {
 
 // -- Garbage collector struct mirrors and entry points (src/runtime/Gc.h) --
 
-// rt_gc_map (Gc.h:85-92):
-// { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize }.
+// rt_gc_map (Gc.h):
+// { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize,
+//   i32 weak_referent, i32 weak_notify }.
 llvm::StructType* Backend::gc_map_ty() {
     if (gc_map_ty_ == nullptr) {
-        gc_map_ty_ = llvm::StructType::create(
-          ctx_,
-          { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(),
-            raw_ptr_ty() },
-          "clotho.gcmap");
+        gc_map_ty_ = llvm::StructType::create(ctx_,
+                                              { b_.getInt64Ty(),
+                                                b_.getInt32Ty(),
+                                                b_.getInt32Ty(),
+                                                raw_ptr_ty(),
+                                                raw_ptr_ty(),
+                                                raw_ptr_ty(),
+                                                b_.getInt32Ty(),
+                                                b_.getInt32Ty() },
+                                              "clotho.gcmap");
     }
     return gc_map_ty_;
 }

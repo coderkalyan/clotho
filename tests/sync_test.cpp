@@ -792,12 +792,3 @@ TEST_CASE("mailbox: an event message is the handle that was put") {
     )");
     CHECK(out == "same=1 num=0\nwoke=1\n");
 }
-
-// -- what is still refused ------------------------------------------------------
-
-// `mailbox` (LRM 15.4) and `std::weak_reference` (LRM 8.30) keep the std-package
-// guard, each by its own name, now that `semaphore` no longer does.
-TEST_CASE("built-in std classes: weak_reference keeps the std-package guard") {
-    CHECK(fails("module m; std::weak_reference #(int) w; initial w = null; endmodule")
-            .find("not supported") != std::string::npos);
-}

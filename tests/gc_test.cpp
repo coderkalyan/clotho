@@ -1812,7 +1812,9 @@ TEST_CASE("gc: several objects held only in the SAME struct assoc KEY survive") 
     // a: 81..84 (330); b: 181..184 (730); `i` leaves and values both 0..3 (6 each).
     const std::string expected = "4 1072 key-a key-b\n";
     check_cadences(src, expected);
-    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    // Every collection full, so the count below is of the whole heap whichever
+    // collection came last.
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress, nursery_bytes_small, 1);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
     // Eight key-only objects, not four: a table truncated to one entry would keep
@@ -1983,7 +1985,8 @@ TEST_CASE("gc: an assoc KEY holding a fixed array of handles keeps every element
     // pair[0]: 91..94 (370); pair[1]: 141..144 (570); tag_ids 0/3/6/9 (18); values 6.
     const std::string expected = "4 964 91 pair-b\n";
     check_cadences(src, expected);
-    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    // Every collection full, as above.
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress, nursery_bytes_small, 1);
     CHECK(st.collections > 0u);
     CHECK(st.objects_allocated >= 512u);
     CHECK(st.objects_live >= 8u);

@@ -1142,6 +1142,7 @@ set(CLOTHO_TEST_SOURCES
   tests/class_test.cpp
   tests/gc_test.cpp
   tests/gc_model_test.cpp
+  tests/weak_reference_test.cpp
   tests/unbased_test.cpp
   tests/preprocess_test.cpp
   tests/interface_test.cpp

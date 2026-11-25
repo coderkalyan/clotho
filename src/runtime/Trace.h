@@ -160,6 +160,88 @@ enum {
     RT_TRACE_TRIGGER_NB = 1,
 };
 
+// The bracket that reported a change (rt_trace_change_site::path): the write paths of
+// scheduler-rules.md R6 each reach one of them.
+enum {
+    // A store's snapshot and its compare (service_after_write): a blocking store, a runtime
+    // write-back ($fgets, $sscanf, $fread, ...), a call's output or `ref` bracket at its return.
+    RT_TRACE_CHG_STORE = 0,
+    // The commit of an NBA: a block's shadow, an array element or interface member record, a
+    // timed record (emit_block_commit_body, emit_array_commit, emit_intra_commit).
+    RT_TRACE_CHG_COMMIT = 1,
+    // A store through the wide-select path, which compares the words around its offset.
+    RT_TRACE_CHG_WINDOW = 2,
+    // A store to a waited-on class property, which fires the property's notifiers.
+    RT_TRACE_CHG_PROPERTY = 3,
+    // A write through a `ref` formal, which the wake thunk of the call services.
+    RT_TRACE_CHG_REF = 4,
+    // A string's content compare.
+    RT_TRACE_CHG_STRING = 5,
+    // A write the code does not classify, which wakes every level waiter: the commit of an
+    // array's or an aggregate's records, `$readmem` and `$fread` into a memory, a container
+    // mutation.
+    RT_TRACE_CHG_LEVEL = 6,
+};
+
+// What a bracket saw of one write (rt_trace_change's `seen`): bit 0 of the must, may and z
+// planes before and after, whether a plane and the z word differ, the facts the code computed,
+// and which of these the bracket knows.
+enum {
+    RT_TRACE_SEEN_OLD_MUST = 1u << 0,
+    RT_TRACE_SEEN_OLD_MAY  = 1u << 1,
+    RT_TRACE_SEEN_OLD_Z    = 1u << 2,
+    RT_TRACE_SEEN_NEW_MUST = 1u << 3,
+    RT_TRACE_SEEN_NEW_MAY  = 1u << 4,
+    RT_TRACE_SEEN_NEW_Z    = 1u << 5,
+    // A 4-state slot: its may plane is read (a 2-state slot is its must plane alone).
+    RT_TRACE_SEEN_FOUR = 1u << 6,
+    // The slot has a z word.
+    RT_TRACE_SEEN_HAS_Z = 1u << 7,
+    // Bit 0 of the must and may planes is known, before and after; bit 0 of the z word too.
+    RT_TRACE_SEEN_BIT0 = 1u << 8,
+    RT_TRACE_SEEN_ZBIT = 1u << 9,
+    // A must or may bit differs, and whether that is known; the same for the z word.
+    RT_TRACE_SEEN_DIFF       = 1u << 10,
+    RT_TRACE_SEEN_DIFF_KNOWN = 1u << 11,
+    RT_TRACE_SEEN_ZDIFF       = 1u << 12,
+    RT_TRACE_SEEN_ZDIFF_KNOWN = 1u << 13,
+    // The facts the code computed (Table 9-2's posedge and negedge, and `changed`), and which
+    // it computed: a fact no waiter kind of the signal reads is not computed (S19).
+    RT_TRACE_SEEN_POS       = 1u << 16,
+    RT_TRACE_SEEN_NEG       = 1u << 17,
+    RT_TRACE_SEEN_ANY       = 1u << 18,
+    RT_TRACE_SEEN_POS_KNOWN = 1u << 19,
+    RT_TRACE_SEEN_NEG_KNOWN = 1u << 20,
+    RT_TRACE_SEEN_ANY_KNOWN = 1u << 21,
+    // A write the code does not classify (RT_TRACE_CHG_LEVEL): it wakes every level waiter, and
+    // nothing of its bits is known.
+    RT_TRACE_SEEN_LEVEL = 1u << 24,
+};
+
+// How the checker reads the value a signal's storage holds (R6.2): `count` elements `stride`
+// bytes apart, each a must|may word of `bits0` bits at its start (the value alone for a 2-state
+// slot, so `bits0` is `width`; `2 * width` for a 4-state one, the may plane from bit `width`)
+// and, when `bits1` is not zero, a z word of `bits1` bits at byte `z_off`. Only these bits are
+// the value: the bytes around them are padding.
+typedef struct rt_trace_shape {
+    uint32_t width;
+    uint32_t bits0;
+    uint32_t bits1;
+    uint32_t z_off;
+    uint32_t stride;
+    uint32_t count;
+} rt_trace_shape;
+
+// A bracket that reports changes, constant per site.
+typedef struct rt_trace_change_site {
+    // "<file>:<line>:<col>" of the statement, "<unknown>" without a resolver.
+    const char* where;
+    // The written signal's declared name, or null where the code is shared by instances that
+    // bind it differently, or the write is not to a signal.
+    const char* name;
+    uint32_t    path; // RT_TRACE_CHG_*
+} rt_trace_change_site;
+
 // One park site, or the origin of an activation: a constant the backend emits per
 // site. Two lowerings of one site may emit two records, which are one control when
 // the kind and the location agree.
@@ -172,10 +254,13 @@ typedef struct rt_trace_control {
 // One entry of a list: the address of a signal's storage in its own instance and the
 // edge, or an event object and RT_TRACE_OBJ. `name` is the signal's declared name, or
 // null where the code that names it is shared by instances that bind it differently.
+// `shape` says how to read the value at `x` (null: the checker reads nothing there: an
+// event, a string, a container or an aggregate).
 typedef struct rt_trace_entry {
-    const void* x;
-    const char* name;
-    uint64_t    edge;
+    const void*           x;
+    const char*           name;
+    uint64_t              edge;
+    const rt_trace_shape* shape;
 } rt_trace_entry;
 
 // What a nonblocking statement says of its updates, constant per statement. The update's
@@ -208,6 +293,8 @@ typedef struct rt_trace_counts {
     uint64_t pends;
     uint64_t triggers;
     uint64_t finishes;
+    // Writes the brackets reported (rt_trace_change).
+    uint64_t changes;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -233,8 +320,12 @@ void rt_trace_subscribe(void* a, const rt_trace_entry* list, uint32_t n);
 void rt_trace_subscribe_event(void* a, const void* obj, const char* name);
 
 // Add one entry to the list of the park that follows, at a RT_TRACE_CTL_EVENT control: the
-// activation `a` waits for `x`.
-void rt_trace_waits_for(void* a, const void* x, const char* name, uint64_t edge);
+// activation `a` waits for `x` (`shape`: as rt_trace_entry's).
+void rt_trace_waits_for(void* a, const void* x, const char* name, uint64_t edge, const rt_trace_shape* shape);
+
+// A write to the storage at `x` (a signal's own, or null where no waiter names it) was seen by
+// a bracket, which says what it saw (RT_TRACE_SEEN_*). It precedes the wakes the write makes.
+void rt_trace_change(const rt_trace_change_site* site, const void* x, uint32_t seen);
 
 // `a` parks at control `c`: a delay control waits `delay` ticks (0: the `#0` region).
 void rt_trace_park(void* a, const rt_trace_control* c, uint64_t delay);

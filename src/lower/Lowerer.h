@@ -177,6 +177,21 @@ const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e
 
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e);
 
+// Whether `clt` is `std::weak_reference #(T)` itself (LRM 8.30), and the weak
+// reference class in `clt`'s inheritance chain, itself included, or null.
+bool is_weak_reference_class(const slang::ast::ClassType& clt);
+
+const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt);
+
+// Whether `sub` is one of weak_reference's four built-in methods.
+bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
+
+// `e` as a call of `weak_reference::get()` (LRM 8.30.3), or null. An event control
+// treats such a call as a read of the weak reference's referent, which is what it
+// is, so `wait (w.get() == null)` parks on the referent's change notifier: 8.30.3
+// names that wait as the way to learn that a weak reference has been cleared.
+const CallExpression* weak_get_call(const Expression& e);
+
 // Every class-property reference in an expression, whether or not it is notifiable.
 // `wait` needs both halves: the notifiable ones become sensitivity, and the mere
 // PRESENCE of a non-notifiable one is what turns an otherwise empty sensitivity
@@ -193,12 +208,16 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     // OBJECT the property names -- the thing `-> e` fires -- not on a notifier;
     // prop_notify_kind mints none for an event on purpose.
     std::vector<const Expression*> event_props;
+    // Calls of `weak_reference::get()`, in source order. Each is a read of that weak
+    // reference's referent and parks on its change notifier (weak_get_call).
+    std::vector<const CallExpression*> weak_gets;
 
     void take(const Expression& e);
 
     void handle(const slang::ast::NamedValueExpression& e);
     void handle(const slang::ast::HierarchicalValueExpression& e);
     void handle(const MemberAccessExpression& ma);
+    void handle(const CallExpression& call);
 };
 
 bool box_can_notify(const slang::ast::Type& ty);
@@ -233,8 +252,13 @@ struct WaitedProps {
     // of the symbols that end up boxed -- signals and class properties land here too
     // and are simply never asked about.
     ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> locals;
+    // The `std::weak_reference` specializations whose `get()` some `@` or `wait`
+    // reads. Each lays out a change notifier beside its referent.
+    ankerl::unordered_dense::set<const slang::ast::ClassType*> weak_classes;
 
     bool waits_local(const slang::ast::ValueSymbol& vs) const;
+
+    bool waits_weak(const slang::ast::ClassType& weak) const;
 
     void add(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge);
 
@@ -1437,6 +1461,22 @@ private:
     static bool is_sync_class(const slang::ast::ClassType& clt);
 
     ir::Ref lower_mailbox_class(const slang::ast::ClassType& clt);
+
+    ir::Ref lower_weak_class(const slang::ast::ClassType& clt);
+
+    uint32_t weak_body_fields(const slang::ast::ClassType& weak) const;
+
+    void push_weak_body(const slang::ast::ClassType& weak, ir::Ref class_ref, std::vector<ir::FieldRow>& fields);
+
+    void emit_weak_ctor(std::span<const Expression* const> actuals,
+                        ir::Index                          handle,
+                        ir::Ref                            class_ref,
+                        ir::Builder&                       b,
+                        ir::SourceLoc                      l);
+
+    std::pair<ir::Index, ir::Ref> weak_receiver(const CallExpression& call, ir::Builder& b);
+
+    ir::Index weak_notifier_handle(const CallExpression& get, ir::Builder& b);
 
     static bool is_process_method(const slang::ast::SubroutineSymbol& sub);
 
@@ -5450,6 +5490,8 @@ private:
                                                   const SubroutineSymbol& sub,
                                                   ir::Builder&            b);
 
+    std::optional<ir::Index> lower_weak_method(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b);
+
     void emit_mbx_message_arrived(ir::Index get_head, ir::Index get_tail, ir::Index peek_head,
                                   ir::Index peek_tail, ir::Builder& b, ir::SourceLoc l);
 
@@ -6092,6 +6134,14 @@ private:
     static constexpr uint32_t         kSemKeys      = 0;
     static constexpr uint32_t         kSemQHead     = 1;
     static constexpr uint32_t         kSemQTail     = 2;
+    // The built-in `std::weak_reference #(T)` class (LRM 8.30): the referent, and
+    // after it the referent's change notifier when some `@` or `wait` in the design
+    // reads `get()`. The notifier takes the `$chg.` prefix every change notifier
+    // has, which is what keeps a shallow copy from sharing it.
+    static constexpr std::string_view kWeakReferentField = "$referent";
+    static constexpr std::string_view kWeakNotifyField   = "$chg.$referent";
+    static constexpr uint32_t         kWeakReferent      = 0;
+    static constexpr uint32_t         kWeakNotify        = 1;
     // The built-in `mailbox #(T)` class (LRM 15.4): the bound, the message FIFO,
     // and the three wait queues -- consuming `get` waiters, space-waiting `put`
     // waiters, and non-consuming `peek` waiters, which are woken as a set.

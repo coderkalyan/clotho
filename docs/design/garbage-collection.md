@@ -119,7 +119,7 @@ its own heap too (`emit_class_body_init`, `ir/llvm/Aggregates.cpp`, has no
 matching `emit_agg_deinit` call anywhere).
 
 **In scope.** Class bodies; the heap they own through managed properties; event
-objects (`event-handles.md` §9); `std::weak_reference` when it lands (`TODO.md`).
+objects (`event-handles.md` §9); `std::weak_reference` (§7a).
 `std::mailbox` and `std::semaphore` are ordinary traced class bodies
 (`mailbox-and-semaphore.md` §4.4).
 
@@ -1074,6 +1074,60 @@ refuses a marked object.
 
 ---
 
+## 7a. Weak references (LRM 8.30)
+
+`std::weak_reference #(T)` is an ordinary class with a synthetic body
+(`lower/BuiltinClasses.cpp`, `lower_weak_class`): one property of type `T`, the
+referent. `new` stores it, `get()` loads it, `clear()` stores null, a shallow copy
+copies it, and a user class may extend the class. One fact makes it weak, and it is
+a fact about the class: the trace map leaves the referent's offset out of `handles`
+and gives it as `rt_gc_map::weak_referent` (`ir::WeakClass`, `class_gc_map_global`).
+
+The collector records each weak reference it marks. When marking is complete it
+stores null into the referent of each recorded one whose referent is unmarked
+(`clear_weak_referents`), before anything is finalized or swept. Every weak
+reference to one referent is cleared in that one pass, which is the atomicity
+8.30.1 asks for.
+
+A young collection examines only the weak references it marked, which are the young
+ones and the logged ones. That is enough: a weak reference's referent is written
+when the weak reference is made and by `clear()`, and never otherwise, so a weak
+reference that has survived a collection names an object that collection marked, or
+null. An old weak reference therefore names an old object, which a young collection
+does not free. `tests/gc_model_test.cpp` has weak objects in its random graphs and
+holds every collection to this; its mutator also takes a referent back out of a
+weak reference whose referent nothing else reaches and no collection has freed yet.
+
+**Only a collection at the scheduler's safepoint clears.** A collection run from
+inside an allocation (§6.1) is in the middle of some process's statement, at a
+point the heap's size chose. It marks every referent instead
+(`keep_weak_referents`), so a referent it would have found unreachable survives it
+and waits for the next full collection at the safepoint. Every process is parked at
+the safepoint, so a design sees a weak reference change only between time steps.
+
+**Waiting on `get()`** (8.30.3, `wait (w.get() == null)`). A specialization that
+some `wait` or `@` reads `get()` of carries a second field, the referent's change
+notifier, the event object a waited-on property has (`ir::ChangeNotify`). `clear()`
+is a store and fires it as any store to a waited-on property does. The collector
+puts it on the chain `->>` pends events on (`rt_internal::event_pend`), and the
+safepoint fires that chain as soon as the collection returns
+(`emit_gc_safepoint`), on the cold side of its poll. The waiters woken are exactly
+those waiting when the reference was cleared, and they run in the active region of
+the time step that is beginning.
+
+The scheduler edge at which the wheel is idle is not a safepoint
+(`ir/llvm/Scheduler.cpp`). The run ends there, so a collection would free what
+teardown is about to free, and a waiter it woke would have no time step to run in.
+
+`get_id` (8.30.5) is the identity number of §3 (`rt_gc_identity`): 0 for null, the
+object's own whatever the handle's type, and never handed out twice.
+
+What a design sees of a weak reference depends on when collections run, which
+`--gc-nursery`, `--gc-full-every` and `--gc-stress` change. `tests/weak_reference_test.cpp`
+says what each cadence must do; a cadence that never collects never clears.
+
+---
+
 ## 8. Evacuation: what it costs and what it buys
 
 Immix's opportunistic defragmentation picks candidate blocks from hole-count
@@ -1158,9 +1212,7 @@ handle is traced wherever a class handle is. Two things are particular to it:
    `x <= @(c) v`) is reachable only while `c` is, and is dropped with it
    (`event-handles.md` §9).
 
-**`std::weak_reference` (LRM 8.30)** becomes implementable: a weak table cleared
-after marking, before sweeping. `TODO.md` already notes it presupposes a
-collector.
+**`std::weak_reference` (LRM 8.30)** is §7a.
 
 **Unchanged**: `null` is all-zero; `==` is one `icmp`; the null-deref fatal path
 (`emit_null_handle_check`) is untouched; `$cast` still reads field 0; the
@@ -1306,9 +1358,9 @@ parent handle — keeps exactly its 45 live components while 4,000 transactions 
 through the heap, and the dropped-subtree case reclaims. **A real UVM testbench can
 now run collected**, which was this phase's whole point.
 
-The rest of the family — `rt_event` sync objects and `std::weak_reference` — is
-blocked on those features existing at all, not on the collector. `std::mailbox`,
-`semaphore` and `process` have since landed as ordinary traced class bodies.
+The rest of the family has since landed: `std::mailbox`, `semaphore` and `process`
+as ordinary traced class bodies, event objects (`event-handles.md` §9), and
+`std::weak_reference` (§7a).
 
 **Track A — evacuation.** Gated on P3's fragmentation and survival numbers, not on
 taste. Prerequisites in §8: pin-on-`ref`, `rt_ref_names` discipline, `data-model.md`
@@ -1436,7 +1488,6 @@ validate-on-trace as the canonical pair.
   leaves (P4, §3.3), and an associative-array key containing a class handle (§3.3a).
 - Event handles are traced like class handles (`types::is_object_handle`), in every
   place one can sit, a variable-length associative key included (§3.3a).
-- `std::weak_reference` — already loud (`lower/Classes.cpp, lower_class_type`).
 - Virtual interfaces (`src/lower/`) — unrelated to GC, but another
   handle-shaped family; whether it becomes GC-managed is that design's question.
 - Compaction of the large-object space; user-visible pinning; `%p` of a handle

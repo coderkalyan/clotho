@@ -114,6 +114,33 @@ TEST_CASE("null and handle identity") {
     CHECK(run_capture(src) == "1 1 1 0\n");
 }
 
+// The object a method is called on is read by the call, so an always_comb block
+// (LRM 9.2.2.2.1) and a wait (9.4.3) that call a method are sensitive to the handle
+// variable: pointing it at another object runs them again.
+TEST_CASE("a method call is sensitive to the handle it is called on") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int v;
+                function new(int v); this.v = v; endfunction
+                function int get(); return v; endfunction
+            endclass
+            C a = new(1), b = new(5), c = a;
+            int x;
+            always_comb x = c.get() + 1;
+            initial begin
+                fork
+                    begin wait (c.get() == 5); $display("wait %0t", $time); end
+                join_none
+                #1 $display("x=%0d", x);
+                c = b;
+                #1 $display("x=%0d", x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "x=2\nwait 1\nx=6\n");
+}
+
 // Self-referential property (a handle to the enclosing class) + nested member path
 // (LRM 8.4). Reference semantics make the cycle trivial (a property is a pointer).
 // iverilog rejects both the self-reference and `a.next.val`.
@@ -1685,20 +1712,6 @@ TEST_CASE("virtual dispatch through a null handle is a located fatal") {
     CHECK(test::design_exit_code(run) != 0);
     CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
     CHECK(run.err.find("10 |         $display(\"%0d\", b.tag());\n") != std::string::npos);
-}
-
-// The `std` package's built-in classes are synthesized by slang with signatures but
-// no bodies -- the simulator supplies the semantics -- so the guard in
-// lower_class_type is keyed by class name and each name is either implemented or
-// refused. `process` (LRM 9.7), `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM
-// 15.4) are implemented (tests/process_test.cpp, tests/sync_test.cpp). What is left
-// is `std::weak_reference` (LRM 8.30), which still has no runtime, and the TYPELESS
-// mailbox (15.4.9), which is refused by its own message because it needs run-time
-// type identity -- covered in tests/sync_test.cpp.
-TEST_CASE("built-in std classes are refused in the frontend") {
-    // A declaration is enough: the type lowers before any method is reached.
-    CHECK(fails("module m; std::weak_reference #(int) w; initial w = null; endmodule")
-            .find("not supported") != std::string::npos);
 }
 
 // -- shallow copy, `dst = new src` (LRM 8.12) ---------------------------------

@@ -780,7 +780,7 @@ void Backend::emit_block_commit_body(uint32_t id) {
         // Mark a dumped scalar target dirty in the VCD set. Commit is
         // unconditional, so a no-change commit over-touches; the flush diff
         // suppresses it.
-        if (!service_wait_queue(bs.sig, old_mm, new_mm, old_z, new_z, fold)) {
+        if (!service_wait_queue(bs.sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT, fold)) {
             vcd_touch_signal(bs.sig);
         }
         if (after_hold != nullptr) {
@@ -2558,7 +2558,7 @@ void Backend::emit_intra_commit(Signal sig) {
         llvm::Value* new_z   = s.has_z ? b_.CreateAlignedLoad(zty, dst_z, z_al) : nullptr;
         llvm::Value* rec_ctx = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_ctx(s)), a1);
         CtxOverride  ov(*this, rec_ctx, s.anchor);
-        service_wait_queue(sig, rec_old_mm, new_mm, rec_old_z, new_z);
+        service_wait_queue(sig, rec_old_mm, new_mm, rec_old_z, new_z, RT_TRACE_CHG_COMMIT);
         vcd_touch_signal(sig);
     }
     i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
@@ -2585,7 +2585,7 @@ void Backend::emit_intra_commit(Signal sig) {
         if (signal_has_waiters(sig)) {
             llvm::Value* new_mm = b_.CreateAlignedLoad(mmty, live_mm, mm_al);
             llvm::Value* new_z  = s.has_z ? b_.CreateAlignedLoad(zty, live_z, z_al) : nullptr;
-            service_wait_queue(sig, old_mm, new_mm, old_z, new_z);
+            service_wait_queue(sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT);
         }
         vcd_touch_signal(sig);
     }
@@ -2780,7 +2780,7 @@ void Backend::emit_array_commit(Signal sig, llvm::Value* state) {
         }
         llvm::Value* rec_ctx = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_ctx(s)));
         CtxOverride  ov(*this, rec_ctx, s.anchor);
-        service_wait_queue(sig, old_mm, new_mm, old_z, new_z);
+        service_wait_queue(sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT);
         vcd_touch_signal(sig);
     }
     if (next != nullptr) {

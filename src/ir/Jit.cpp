@@ -541,6 +541,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_trace_subscribe", &rt_trace_subscribe);
     expose("rt_trace_subscribe_event", &rt_trace_subscribe_event);
     expose("rt_trace_waits_for", &rt_trace_waits_for);
+    expose("rt_trace_change", &rt_trace_change);
     expose("rt_trace_park", &rt_trace_park);
     expose("rt_trace_wake", &rt_trace_wake);
     expose("rt_trace_dispatch", &rt_trace_dispatch);

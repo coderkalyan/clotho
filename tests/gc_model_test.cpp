@@ -74,15 +74,25 @@ void on_finalize(void* body) {
 
 // A class as the collector sees one: a trace map, and a descriptor whose only content
 // is the map pointer at the offset below the vptr where the collector looks for it.
+//
+// A weak shape is a weak reference class: its first filler word is the referent, which
+// the map names and leaves out of the handles. A notified one keeps the handle of its
+// notifier in its first handle field.
 struct Shape {
     uint32_t nhandles;
     uint32_t filler_words;
     bool     finalizable;
+    bool     weak     = false;
+    bool     notified = false;
 
     rt_gc_map   map{};
     uint32_t    offsets[kFieldsMax]{};
     const void* vptr = nullptr;
     alignas(void*) uint8_t desc[128]{};
+
+    uint64_t referent_offset() const {
+        return kFieldsOffset + 8ull * nhandles;
+    }
 
     uint64_t body_bytes() const { return kFieldsOffset + 8ull * nhandles + 8ull * filler_words; }
 
@@ -97,6 +107,10 @@ struct Shape {
         map.handles  = nhandles != 0 ? offsets : nullptr;
         map.leaves   = nullptr;
         map.finalize = finalizable ? on_finalize : nullptr;
+        REQUIRE((!weak || filler_words != 0));
+        REQUIRE((!notified || (weak && nhandles != 0)));
+        map.weak_referent            = weak ? static_cast<uint32_t>(referent_offset()) : 0;
+        map.weak_notify              = notified ? kFieldsOffset : 0;
         const auto            below = static_cast<size_t>(-rt_gc_map_vptr_offset());
         const rt_gc_map* const m     = &map;
         REQUIRE(below + sizeof(void*) <= sizeof desc);
@@ -105,14 +119,31 @@ struct Shape {
     }
 };
 
-// From one grain to larger than a block. The last three do not fit in a block and
-// get a mapping of their own; the two before them are found from an interior address
-// in more than one step back. The model allocates all but the last.
+// From one grain to larger than a block. Of the first ten the last three do not fit in
+// a block and get a mapping of their own; the two before them are found from an
+// interior address in more than one step back. The model allocates all of those but
+// the last, and the two weak shapes after them. The last two are for the notifier's
+// test: a weak reference with one, and an object the size of an event object.
 Shape g_shapes[] = {
-    { 0, 0, false },   { 1, 1, false },   { 2, 0, true },     { 4, 3, false },   { 3, 40, true },
-    { 1, 300, false }, { 2, 1500, true }, { 2, 5000, false }, { 1, 6000, true }, { 0, 7000, false },
+    { 0, 0, false },
+    { 1, 1, false },
+    { 2, 0, true },
+    { 4, 3, false },
+    { 3, 40, true },
+    { 1, 300, false },
+    { 2, 1500, true },
+    { 2, 5000, false },
+    { 1, 6000, true },
+    { 0, 7000, false },
+    { 1, 2, false, true },
+    { 0, 1, true, true },
+    { 1, 1, false, true, true },
+    { 0, 4, false },
 };
-constexpr uint32_t kShapes = sizeof g_shapes / sizeof g_shapes[0];
+constexpr uint32_t kShapes        = sizeof g_shapes / sizeof g_shapes[0];
+constexpr uint32_t kWeakShapes    = 10;
+constexpr uint32_t kNotifiedShape = 12;
+constexpr uint32_t kEventShape    = 13;
 
 struct Model {
     static constexpr uint32_t kRoots = 24;
@@ -125,6 +156,7 @@ struct Model {
         int32_t  field[kFieldsMax];
         bool     finalized;
         uint64_t number;  // its identity number, 0 until asked
+        int32_t  weak;    // a weak shape's referent
     };
 
     std::vector<Obj>       objs;
@@ -147,6 +179,8 @@ struct Model {
     uint64_t rng;
     uint64_t collections_checked = 0;
     uint64_t full_checked        = 0;
+    uint64_t weak_cleared        = 0;
+    uint64_t weak_retaken        = 0;
 
     std::vector<uint8_t>  reach;
     std::vector<int32_t>  reach_list;
@@ -225,6 +259,17 @@ struct Model {
         return reach_list.empty() ? kNone : reach_list[below(static_cast<uint32_t>(reach_list.size()))];
     }
 
+    int32_t pick_reachable_weak() {
+        compute_reach();
+        work.clear();
+        for (const int32_t i : reach_list) {
+            if (g_shapes[objs[static_cast<size_t>(i)].shape].weak) {
+                work.push_back(i);
+            }
+        }
+        return work.empty() ? kNone : work[below(static_cast<uint32_t>(work.size()))];
+    }
+
     void* handle_of(int32_t i) const { return i == kNone ? nullptr : objs[static_cast<size_t>(i)].handle; }
 
     // Put a reference to `i` (or null) somewhere the collector will find it.
@@ -263,8 +308,9 @@ struct Model {
     }
 
     void allocate() {
-        // Small shapes mostly; a large object now and then.
-        const uint32_t shape = below(16) == 0 ? 6 + below(3) : below(6);
+        // Small shapes mostly; a large object now and then, and a weak reference.
+        const uint32_t pick  = below(16);
+        const uint32_t shape = pick == 0 ? 6 + below(3) : pick <= 2 ? kWeakShapes + below(2) : below(6);
         Shape&         s     = g_shapes[shape];
         void* const    h     = rt_gc_alloc(rt_gc_mutator_current(), s.map.size, &s.map, nullptr);
         REQUIRE(h != nullptr);
@@ -275,10 +321,16 @@ struct Model {
         store(h, 0, reinterpret_cast<uint64_t>(s.vptr));
         store(h, kIndexOffset, index);
         store(h, kStampOffset, mix(index));
-        for (uint32_t w = 0; w < s.filler_words; ++w) {
+        for (uint32_t w = s.weak ? 1 : 0; w < s.filler_words; ++w) {
             store(h, kFieldsOffset + 8ull * s.nhandles + 8ull * w, mix(index * 0x100 + w));
         }
-        Obj o{ h, shape, { kNone, kNone, kNone, kNone }, false, 0 };
+        Obj o{ h, shape, { kNone, kNone, kNone, kNone }, false, 0, kNone };
+        if (s.weak) {
+            // Made of a referent, or of null (LRM 8.30.2). The store is to an object
+            // no collection has seen, as the constructor's is.
+            o.weak = below(4) == 0 ? kNone : pick_reachable();
+            store(h, s.referent_offset(), reinterpret_cast<uint64_t>(handle_of(o.weak)));
+        }
         objs.push_back(o);
         attach(static_cast<int32_t>(index));
     }
@@ -306,8 +358,27 @@ struct Model {
                 frame_obj[k]     = kNone;
                 frame_words[k]   = below(2) == 0 ? below(4096) : reinterpret_cast<uint64_t>(&op);
             }
-        } else if (op < 92) {
+        } else if (op < 88) {
             attach(pick_reachable());
+        } else if (op < 92) {
+            // Through a weak reference: clear it, or take its referent and hold it.
+            // The referent may be one nothing else reaches that no collection has
+            // freed yet, and from here on it is reachable again.
+            const int32_t i = pick_reachable_weak();
+            if (i != kNone) {
+                Obj&           o   = objs[static_cast<size_t>(i)];
+                const uint64_t off = g_shapes[o.shape].referent_offset();
+                sync_weak(o);
+                REQUIRE(load(o.handle, off) == reinterpret_cast<uint64_t>(handle_of(o.weak)));
+                if (below(3) == 0) {
+                    o.weak = kNone;
+                    store(o.handle, off, 0);
+                    rt_gc_remember(o.handle);
+                } else if (o.weak != kNone) {
+                    weak_retaken += reach[static_cast<size_t>(o.weak)] == 0 ? 1 : 0;
+                    attach(o.weak);
+                }
+            }
         } else {
             // Ask for an identity number. A new one is larger than every earlier one.
             const int32_t i = pick_reachable();
@@ -335,7 +406,7 @@ struct Model {
         for (uint32_t k = 0; k < s.nhandles; ++k) {
             REQUIRE(load(o.handle, kFieldsOffset + 8ull * k) == reinterpret_cast<uint64_t>(handle_of(o.field[k])));
         }
-        for (uint32_t w = 0; w < s.filler_words; ++w) {
+        for (uint32_t w = s.weak ? 1 : 0; w < s.filler_words; ++w) {
             REQUIRE(load(o.handle, kFieldsOffset + 8ull * s.nhandles + 8ull * w) ==
                     mix(static_cast<uint64_t>(i) * 0x100 + w));
         }
@@ -349,6 +420,12 @@ struct Model {
 
     // Collect, and hold the collector to the model.
     void collect(int32_t kind) {
+        compute_reach();
+        for (const int32_t i : reach_list) {
+            if (g_shapes[objs[static_cast<size_t>(i)].shape].weak) {
+                sync_weak(objs[static_cast<size_t>(i)]);
+            }
+        }
         rt_gc_stats before{};
         rt_gc_get_stats(&before);
         if (kind < 0) {
@@ -376,6 +453,7 @@ struct Model {
             o.finalized = true;
         }
         REQUIRE(st.finalized == finalized.size());
+        check_weak(full, st.weak_cleared - before.weak_cleared);
         REQUIRE(rt_gc_find_object(&st) == nullptr);
         collections_checked += 1;
         if (!full) {
@@ -398,6 +476,59 @@ struct Model {
             }
         }
         full_checked += 1;
+    }
+
+    // A weak reference the model had lost sight of may have been cleared meanwhile: a
+    // young collection keeps an unreachable object that an old, logged one names, and
+    // clears it as it clears any other. Its referent was freed then and is not seen
+    // again. Called with `reach` current, before the model reads through `o`.
+    void sync_weak(Obj& o) {
+        if (o.weak != kNone && load(o.handle, g_shapes[o.shape].referent_offset()) == 0) {
+            REQUIRE(reach[static_cast<size_t>(o.weak)] == 0);
+            o.weak = kNone;
+        }
+    }
+
+    // Every weak reference the model reaches, against its referent. A referent that
+    // is reachable is still there. One that is not is gone after a full collection;
+    // a young collection frees it only if it is young, which the model does not
+    // track, so either answer is taken, but the same answer from every weak reference
+    // to it (LRM 8.30.1), and an object that was kept is whole. A full collection
+    // clears these and no others; a young one may also clear weak references it kept
+    // that the model does not reach.
+    void check_weak(bool full, uint64_t cleared_by_collector) {
+        std::vector<int8_t> kept(objs.size(), -1);
+        uint64_t            cleared = 0;
+        for (const int32_t i : reach_list) {
+            Obj&         o = objs[static_cast<size_t>(i)];
+            const Shape& s = g_shapes[o.shape];
+            if (!s.weak) {
+                continue;
+            }
+            const uint64_t actual = load(o.handle, s.referent_offset());
+            if (o.weak == kNone) {
+                REQUIRE(actual == 0);
+                continue;
+            }
+            const auto referent = static_cast<size_t>(o.weak);
+            if (reach[referent] != 0) {
+                REQUIRE(actual == reinterpret_cast<uint64_t>(handle_of(o.weak)));
+                continue;
+            }
+            const int8_t now = actual != 0 ? 1 : 0;
+            REQUIRE((kept[referent] == -1 || kept[referent] == now));
+            kept[referent] = now;
+            if (now == 0) {
+                o.weak = kNone;
+                cleared += 1;
+                continue;
+            }
+            REQUIRE(!full);
+            REQUIRE(actual == reinterpret_cast<uint64_t>(handle_of(o.weak)));
+            check_object(o.weak);
+        }
+        REQUIRE((full ? cleared_by_collector == cleared : cleared_by_collector >= cleared));
+        weak_cleared += cleared;
     }
 
     void run(uint32_t steps) {
@@ -437,6 +568,8 @@ void run_model(int32_t full_every) {
         CHECK(m.full_checked > 0u);
         CHECK(m.objs.size() > 1000u);
         CHECK(m.finalized.size() > 100u);
+        CHECK(m.weak_cleared > 10u);
+        CHECK(m.weak_retaken >= 5u);
     }
 }
 
@@ -693,4 +826,72 @@ TEST_CASE("gc heap: empty chunks go back to the system after a full collection")
     CHECK(regrown.heap_bytes >= grown.heap_bytes);
     CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes == regrown.heap_bytes);
     CHECK(heap.collect(RT_GC_KIND_FULL).heap_bytes <= 3ull * RT_GC_CHUNK_BYTES);
+}
+
+// A weak reference with a notifier: the collector pends the notifier when it clears
+// the referent and at no other time. The chain is the one `->>` pends events on,
+// which the NBA region drains; here the test does.
+TEST_CASE("gc: the collector pends the notifier of a weak reference it clears") {
+    constexpr uint32_t kSmall = 0;
+    Heap               heap(4);
+    const Shape&       shape    = g_shapes[kNotifiedShape];
+    void* const        referent = heap.make(0, kSmall, 1);
+    void* const        notifier = heap.make(1, kEventShape, 0);
+    void* const        weak     = heap.make(2, kNotifiedShape, 3);
+    store(weak, shape.referent_offset(), reinterpret_cast<uint64_t>(referent));
+    store(weak, kFieldsOffset, reinterpret_cast<uint64_t>(notifier));
+    // The weak reference alone holds its notifier, as a class object holds a
+    // property's.
+    heap.words[1]       = 0;
+    auto* const event   = static_cast<rt_event*>(notifier);
+    const auto  drained = [&] {
+        REQUIRE(heap.pend_head == notifier);
+        REQUIRE(event->pending == 1);
+        REQUIRE(event->next_pend == nullptr);
+        heap.pend_head = nullptr;
+        event->pending = 0;
+    };
+
+    // Held: nothing is cleared and nothing is pended.
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).weak_cleared == 0);
+    CHECK(heap.collect(RT_GC_KIND_FULL).weak_cleared == 0);
+    CHECK(load(weak, shape.referent_offset()) == reinterpret_cast<uint64_t>(referent));
+    CHECK(heap.pend_head == nullptr);
+
+    // Dropped, and old by now: a young collection does not free it, so the weak
+    // reference still names it.
+    heap.words[0] = 0;
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).weak_cleared == 0);
+    CHECK(load(weak, shape.referent_offset()) == reinterpret_cast<uint64_t>(referent));
+    CHECK(rt_gc_find_object(referent) == referent);
+    CHECK(heap.pend_head == nullptr);
+
+    // Nor does a full collection run from inside an allocation, which keeps every
+    // referent: weak references are cleared at the scheduler's safepoint only.
+    rt_gc_collect_kind(RT_GC_REASON_EMERGENCY, RT_GC_KIND_FULL);
+    CHECK(Heap::stats().weak_cleared == 0);
+    CHECK(load(weak, shape.referent_offset()) == reinterpret_cast<uint64_t>(referent));
+    CHECK(rt_gc_find_object(referent) == referent);
+    CHECK(load(referent, kStampOffset) == 1);
+    CHECK(heap.pend_head == nullptr);
+
+    // A full collection at the safepoint finds it unreachable.
+    CHECK(heap.collect(RT_GC_KIND_FULL).weak_cleared == 1);
+    CHECK(load(weak, shape.referent_offset()) == 0);
+    CHECK(rt_gc_find_object(referent) == nullptr);
+    drained();
+    CHECK(heap.collect(RT_GC_KIND_FULL).weak_cleared == 1);
+    CHECK(heap.pend_head == nullptr);
+
+    // A young weak reference to a young referent that nothing holds: the young
+    // collection clears it. Its notifier is the first one's.
+    void* const second    = heap.make(3, kNotifiedShape, 4);
+    void* const referent2 = heap.make(0, kSmall, 5);
+    store(second, shape.referent_offset(), reinterpret_cast<uint64_t>(referent2));
+    store(second, kFieldsOffset, reinterpret_cast<uint64_t>(notifier));
+    heap.words[0] = 0;
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).weak_cleared == 2);
+    CHECK(load(second, shape.referent_offset()) == 0);
+    CHECK(rt_gc_find_object(referent2) == nullptr);
+    drained();
 }
