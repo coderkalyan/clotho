@@ -2332,6 +2332,56 @@ TEST_CASE("a group spanning instances dispatches whatever its size and layout") 
     }
 }
 
+// A group of one row in an instance runs through an entry emitted beside its row
+// (emit_unit_entry). Unsplit, the row is in root, so the entry must be too: it was
+// emitted into a unit module whatever the gate said, and called root's row from
+// there, which the verifier rejects on every such design. Oracle: the gate's
+// contract (SimConfig.h), the same output split or not; the lines are LRM 10.4.2
+// (the NBA lands after the posedge, `always @(n)` sees each new value once).
+TEST_CASE("unsplit emission keeps the entry of an instance's group in the one module") {
+    constexpr std::string_view src = R"(
+        module leaf(input logic clk);
+            int n = 0;
+            always @(posedge clk) n <= n + 1;
+            always @(n) $display("n=%0d", n);
+        endmodule
+        module top;
+            logic clk = 0;
+            leaf u(clk);
+            initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 $finish; end
+        endmodule
+    )";
+    const std::string expected = "n=1\nn=2\n";
+    CHECK(run_capture(src) == expected);
+    CHECK(run_capture(src, { .split = false }) == expected);
+}
+
+// The shared-code verification lowers a group again for its own instance into a
+// scratch module and compares. Unsplit, the shared code is root's, so the scratch
+// must lower as root does: a root-only form (the ring mask as an immediate, not a
+// load of the global) was taken in one and not the other, and the verification
+// reported an internal error on every design with two instances of a unit that
+// stages a nonblocking write. Oracle: the gate's contract, the same output; the
+// values are LRM 10.4.2 (`q` takes the `n` before this posedge's update).
+TEST_CASE("unsplit emission verifies the code instances share against root's forms") {
+    constexpr std::string_view src = R"(
+        module leaf(input logic clk, output int q);
+            int n = 0;
+            always @(posedge clk) begin n <= n + 1; q <= n; end
+        endmodule
+        module top;
+            logic clk = 0;
+            int q0, q1;
+            leaf u0(clk, q0);
+            leaf u1(clk, q1);
+            initial begin #1 clk = 1; #1 clk = 0; #1 clk = 1; #1 $display("%0d %0d", q0, q1); $finish; end
+        endmodule
+    )";
+    const std::string expected = "1 1\n";
+    CHECK(run_capture(src, { .verify_shared_code = true }) == expected);
+    CHECK(run_capture(src, { .verify_shared_code = true, .split = false }) == expected);
+}
+
 // SimulationConfig::verify_shared_code lowers each group again for every
 // instance that shares it, into scratch modules, and must leave nothing behind:
 // the emitted modules and the run are the same with it on and off. The design
