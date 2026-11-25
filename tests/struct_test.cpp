@@ -749,6 +749,177 @@ TEST_CASE("unique / unique0 if accepts a pattern condition (LRM 12.4.2 + 12.6.2)
     )") == "v 5\ninv\nsmall 5\n");
 }
 
+// `&&&` joins the conditions of a cond_predicate (LRM 12.4, 12.6) and evaluates
+// them left to right, stopping at the first false one, like `&&` (LRM 11.3.5).
+// The oracle is that short-circuit, as lower_short_circuit records it; iverilog
+// has no `&&&`, so the observable evidence is a skipped trap or a skipped call.
+TEST_CASE("&&& guards a null class handle in an if (LRM 12.4)") {
+    // `h.x` on a null handle is a located fatal, so it must not run once the
+    // first conjunct is false.
+    CHECK(run_capture(R"(
+        module m;
+            class C; int x; endclass
+            C h;
+            initial begin
+                h = null;
+                if (h != null &&& h.x == 1) $display("yes"); else $display("no");
+                h = new; h.x = 1;
+                if (h != null &&& h.x == 1) $display("yes"); else $display("no");
+            end
+        endmodule
+    )") == "no\nyes\n");
+}
+
+TEST_CASE("&&& guards a null class handle in ?: (LRM 12.4, 11.4.11)") {
+    CHECK(run_capture(R"(
+        module m;
+            class C; int x; endclass
+            C h;
+            int r;
+            initial begin
+                h = null;
+                r = h != null &&& h.x == 1 ? 10 : 20; $display("r=%0d", r);
+                h = new; h.x = 1;
+                r = h != null &&& h.x == 1 ? 10 : 20; $display("r=%0d", r);
+            end
+        endmodule
+    )") == "r=20\nr=10\n");
+}
+
+TEST_CASE("&&& filter of a case ... matches item runs only after its pattern matched (LRM 12.6)") {
+    // The filter dereferences a null handle; it is reached only for the Valid
+    // subject. The `unique case` form evaluates every item's predicate up front
+    // (LRM 12.5.3 overlap check), and each filter must still be lazy inside it.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            class C; int x; endclass
+            C h;
+            task automatic show(opt_t u);
+                case (u) matches
+                    tagged Valid .n &&& (h.x == n): $display("hit %0d", n);
+                    default                       : $display("miss");
+                endcase
+                unique case (u) matches
+                    tagged Valid .n &&& (h.x == n): $display("uhit %0d", n);
+                    tagged Invalid                : $display("uinv");
+                    default                       : $display("umiss");
+                endcase
+            endtask
+            initial begin
+                h = null;
+                show(tagged Invalid);
+                h = new; h.x = 7;
+                show(tagged Valid (7));
+                show(tagged Valid (8));
+            end
+        endmodule
+    )") == "miss\nuinv\nhit 7\nuhit 7\nmiss\numiss\n");
+}
+
+TEST_CASE("&&& skips a side-effecting conjunct after a false one, runs it on x (LRM 12.4)") {
+    // `f` counts its calls: a call after a definite 0 must not happen. An x
+    // conjunct decides nothing, so the next one still runs, exactly as `&&` does
+    // (function_test.cpp: "&& and || evaluate the right operand on an x/z left").
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            int cnt;
+            function automatic bit f(int v);
+                cnt++;
+                return v != 0;
+            endfunction
+            opt_t u;
+            bit a;
+            logic lx;
+            int r;
+            initial begin
+                a = 0;
+                if (a &&& f(1)) $display("t"); else $display("e");
+                $display("cnt=%0d", cnt);
+                a = 1;
+                if (a &&& f(1) &&& f(0) &&& f(1)) $display("t"); else $display("e");
+                $display("cnt=%0d", cnt);
+                lx = 1'bx;
+                if (lx &&& f(1)) $display("t"); else $display("e");
+                $display("cnt=%0d", cnt);
+                r = lx &&& f(0) ? 1 : 2; $display("r=%0d cnt=%0d", r, cnt);
+                a = 0;
+                r = a &&& f(1) ? 1 : 2; $display("r=%0d cnt=%0d", r, cnt);
+                unique if (a &&& f(1)) $display("t"); else $display("e");
+                $display("cnt=%0d", cnt);
+            end
+        endmodule
+    )") == "e\ncnt=0\ne\ncnt=2\ne\ncnt=3\nr=2 cnt=4\nr=2 cnt=4\ne\ncnt=4\n");
+}
+
+TEST_CASE("&&& chains see pattern bindings only where reached (LRM 12.6.2)") {
+    // A later conjunct reads the variable an earlier pattern bound; a pattern
+    // conjunct after a false conjunct is skipped with its subject expression.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            class C; opt_t u; endclass
+            C h;
+            opt_t u;
+            int cnt;
+            function automatic bit f(int v);
+                cnt++;
+                return v != 0;
+            endfunction
+            function automatic opt_t g();
+                cnt++;
+                return tagged Valid (3);
+            endfunction
+            bit a;
+            int r;
+            initial begin
+                u = tagged Invalid;
+                if (u matches tagged Valid .n &&& f(n)) $display("t"); else $display("e");
+                $display("cnt=%0d", cnt);
+                u = tagged Valid (5);
+                if (u matches tagged Valid .n &&& (n > 0) &&& f(n - 5)) $display("t %0d", n); else $display("e");
+                $display("cnt=%0d", cnt);
+                if (u matches tagged Valid .n &&& (n > 9) &&& f(n)) $display("t %0d", n); else $display("e");
+                $display("cnt=%0d", cnt);
+                if (u matches tagged Valid .n &&& (n > 0) &&& f(n)) $display("t %0d", n); else $display("e");
+                $display("cnt=%0d", cnt);
+                r = u matches tagged Valid .n &&& (n > 3) ? n : 0; $display("r=%0d", r);
+                h = null;
+                if (h != null &&& h.u matches tagged Valid .n) $display("v %0d", n); else $display("none");
+                h = new; h.u = tagged Valid (4);
+                if (h != null &&& h.u matches tagged Valid .n) $display("v %0d", n); else $display("none");
+                cnt = 0;
+                a = 0;
+                if (a &&& g() matches tagged Valid .k) $display("k %0d", k); else $display("nk");
+                $display("cnt=%0d", cnt);
+                a = 1;
+                if (a &&& g() matches tagged Valid .k &&& (k == 3)) $display("k %0d", k); else $display("nk");
+                $display("cnt=%0d", cnt);
+            end
+        endmodule
+    )") == "e\ncnt=0\ne\ncnt=1\ne\ncnt=1\nt 5\ncnt=2\nr=5\nnone\nv 4\nnk\ncnt=0\nk 3\ncnt=1\n");
+}
+
+TEST_CASE("unique if keeps each arm's &&& chain lazy (LRM 12.4.2)") {
+    // Every arm's predicate is evaluated up front, but the null guard inside an
+    // arm still protects its own later conjunct.
+    CHECK(run_capture(R"(
+        module m;
+            class C; int x; endclass
+            C h;
+            initial begin
+                h = null;
+                unique if (h != null &&& h.x == 1) $display("one");
+                else if (h == null) $display("null");
+                h = new; h.x = 1;
+                unique if (h != null &&& h.x == 1) $display("one");
+                else if (h == null) $display("null");
+            end
+        endmodule
+    )") == "null\none\n");
+}
+
 TEST_CASE("%p of a queue of tagged unions names the tag") {
     // LRM 21.2.1.6 requires `tag:value` for a tagged union, which the flat runtime
     // container descriptor cannot express (it carries no member names). Such a

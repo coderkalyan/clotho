@@ -1777,7 +1777,10 @@ void Lowerer::lower_pattern_case(const slang::ast::PatternCaseStatement& c, ir::
 }
 
 // Compute a pattern item's match predicate (tag/field tests) AND-ed with its
-// optional `&&& filter`, binding the pattern's variables as a side effect.
+// optional `&&& filter`, binding the pattern's variables as a side effect. The
+// filter is evaluated only when the pattern has not already failed (LRM 12.4's
+// left-to-right `&&&` short-circuit, lower_cond_and), so a guard in the pattern
+// protects a filter that would trap on a non-matching subject.
 ir::Index Lowerer::lower_pattern_item_pred(const slang::ast::PatternCaseStatement&            c,
                                            const slang::ast::PatternCaseStatement::ItemGroup& item,
                                            ir::Index                                          subject,
@@ -1787,7 +1790,7 @@ ir::Index Lowerer::lower_pattern_item_pred(const slang::ast::PatternCaseStatemen
       lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(), pattern_cmp(c.condition), b, l);
     if (item.filter != nullptr) {
         // `&&& filter` — evaluated after the pattern's bindings are in scope.
-        pred = b.binary(ir::Inst::Tag::Land, pred, lower_predicate(*item.filter, b), l);
+        pred = lower_cond_and(pred, [&] { return lower_predicate(*item.filter, b); }, b, l);
     }
     return pred;
 }

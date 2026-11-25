@@ -4683,32 +4683,62 @@ private:
 
     static ir::Inst::Tag pattern_cmp(CaseStatementCondition cond);
 
+    // One `&&&` step of a cond_predicate (LRM 12.4 / 12.6): `acc &&& next`.
+    // Conjuncts are evaluated left to right and stop at the first false one,
+    // the short-circuit `&&` has (lower_short_circuit): `next` is lowered only
+    // in a SelectLazy branch taken unless `acc` is a definite 0, so a guard such
+    // as `h != null &&& h.x` never dereferences a null `h`. An x/z `acc` does
+    // not decide the result, so `next` still runs and the 3-valued Land merges
+    // the two. A pattern conjunct binds its variables by slot stores, so a
+    // binding made inside the branch runs only when its conjunct is reached and
+    // is still visible to later conjuncts and to the guarded body.
+    template<typename LowerNext>
+    ir::Index lower_cond_and(ir::Index acc, LowerNext&& lower_next, ir::Builder& b, ir::SourceLoc l) {
+        using T = ir::Inst::Tag;
+        // Every conjunct predicate is 1 bit; case-equality against 0 is a
+        // definite bit even for an x/z `acc`, so the backend branches on it.
+        const ir::Index zero = b.constant(module_.pool.put_int(make_int_type(1, b.type_of(acc).four_state), 0), l);
+        const ir::Index pred = b.unary(T::Lnot, b.binary(T::CaseEq, acc, zero, l), l);
+
+        b.open_region();
+        const ir::Index      combined    = b.binary(T::Land, acc, lower_next(), l);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        // The skipped branch's 0 has the domain of the combined value.
+        const ir::Index dom = b.constant(module_.pool.put_int(make_int_type(1, b.type_of(combined).four_state), 0), l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        return b.select_lazy(pred, then_region, combined, else_region, dom, l);
+    }
+
     // AND-reduce the predicates of a cond_predicate's conditions (LRM 12.4 /
-    // 12.6): each condition is either a plain boolean expression or an
-    // `expr matches pattern`. Pattern variables bound by an earlier condition are
-    // visible to later conditions (the `&&&` filter form) and the guarded body,
-    // so bindings are emitted left to right into the current region.
+    // 12.6), short-circuiting at the first false one (lower_cond_and): each
+    // condition is either a plain boolean expression or an `expr matches
+    // pattern`. Pattern variables bound by an earlier condition are visible to
+    // later conditions (the `&&&` filter form) and the guarded body.
     // Templated over the Condition type: ConditionalStatement::Condition and
     // ConditionalExpression::Condition are distinct nested structs with the same
     // { expr, pattern } shape (the `if` and `?:` forms), so one body serves both.
     template<typename Cond>
     ir::Index lower_conditions(std::span<const Cond> conds, ir::Builder& b, ir::SourceLoc l) {
-        ir::Index acc  = ir::Index{};
-        bool      have = false;
-        for (const auto& cond : conds) {
-            ir::Index p;
+        const auto lower_one = [&](const Cond& cond) {
             if (cond.pattern != nullptr) {
-                p = lower_pattern(*cond.pattern,
-                                  lower_expr(*cond.expr, b),
-                                  cond.expr->type->getCanonicalType(),
-                                  ir::Inst::Tag::CaseEq,
-                                  b,
-                                  l);
-            } else {
-                p = lower_predicate(*cond.expr, b);
+                return lower_pattern(*cond.pattern,
+                                     lower_expr(*cond.expr, b),
+                                     cond.expr->type->getCanonicalType(),
+                                     ir::Inst::Tag::CaseEq,
+                                     b,
+                                     l);
             }
-            acc  = have ? b.binary(ir::Inst::Tag::Land, acc, p, l) : p;
-            have = true;
+            return lower_predicate(*cond.expr, b);
+        };
+        if (conds.empty()) {
+            fail("internal: empty cond_predicate"); // slang guarantees at least one condition.
+        }
+        ir::Index acc = lower_one(conds.front());
+        for (const auto& cond : conds.subspan(1)) {
+            acc = lower_cond_and(acc, [&] { return lower_one(cond); }, b, l);
         }
         return acc;
     }
