@@ -750,3 +750,19 @@ tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
 delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
+
+## 57. Inferred sensitivity through a handle (9.4.2.2, 9.2.2.2.1, 25.9)
+
+9.4.2.2 adds "all nets and variables that are read by the statement" to `@*`, so a
+class property read through a handle (`obj.x`) and a virtual-interface member
+(`vif.a`) wake an `@*` on a change of the member and on a change of the handle, which
+is itself a variable read. 9.2.2.2.1 says "References to class objects and method calls
+of class objects do not add anything to the sensitivity list of an always_comb, except
+for any contributions from argument expressions", so `always_comb` over `obj.x` waits
+on neither the member nor `obj`. A virtual interface is not a class object, so
+`always_comb` over `vif.a` waits on the member and on `vif`. A static property is a
+variable of the class, not a reference through an object, and keeps its own signal. A
+body that reads through a handle cannot be statically subscribed, so it waits in its
+own loop and an `always_comb` of that kind takes its time-zero run after a `#0`.
+
+Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it). No oracle parses these designs.

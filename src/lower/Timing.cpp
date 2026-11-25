@@ -147,12 +147,16 @@ void Lowerer::collect_wait_events_impl(const TimingControl&        tc,
 // may legally write (@* permits multiple drivers).
 void Lowerer::collect_inferred_sensitivity(const Statement&            body,
                                            SensitivityMode             mode,
-                                           std::vector<ir::WaitEvent>& out) {
+                                           std::vector<ir::WaitEvent>& out,
+                                           HandleReads*                handles) {
     const auto declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
         return declare_static_prop(p);
     };
     SensitivityCollector c(sigmap_, mode, declare_static);
     body.visit(c);
+    if (handles != nullptr) {
+        *handles = std::move(c.handles);
+    }
     for (const ir::Signal s : c.reads) {
         if (mode == SensitivityMode::Comb && c.written.contains(static_cast<uint32_t>(s))) {
             continue;
@@ -759,15 +763,69 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
 // @*` over such a body never runs and `wait (0)` parks (iverilog 13 agrees: "@*
 // found no sensitivities so it will never trigger").
 void Lowerer::lower_implicit_event_wait(const Statement& body, ir::Builder& b, ir::SourceLoc l) {
+    emit_inferred_park(body, SensitivityMode::ImplicitEvent, b, l);
+    flush_deferred_on_resume(b, l);
+}
+
+// The wait of an inferred sensitivity: the signals the statement reads, then each
+// virtual-interface member and class property it reads through a handle, parked on
+// where the handle points right now (the handle is evaluated here, so a re-pointed
+// one is re-read on every pass, as for `wait`). The handle itself is among the
+// signals, so re-pointing it wakes the wait too.
+void Lowerer::emit_inferred_park(const Statement& body, SensitivityMode mode, ir::Builder& b, ir::SourceLoc l) {
     std::vector<ir::WaitEvent> events;
-    collect_inferred_sensitivity(body, SensitivityMode::ImplicitEvent, events);
+    HandleReads                handles;
+    collect_inferred_sensitivity(body, mode, events, &handles);
     std::vector<ir::WaitEdge> edges;
-    edges.reserve(events.size());
+    edges.reserve(events.size() + handles.vif.size() + handles.props.size());
     for (const ir::WaitEvent& e : events) {
         edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
     }
+    for (const MemberAccessExpression* ma : handles.vif) {
+        const std::optional<ir::Signal> rep =
+          vif_member_signal(ma->member, vif_named_body(ma->value()), "'" + std::string(ma->member.name) + "'");
+        const ir::Index inst = lower_expr(ma->value(), b);
+        if (rep) {
+            edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any), ir::kNoWaitHandle, inst });
+        }
+    }
+    for (const Expression* pe : handles.props) {
+        edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                      static_cast<uint32_t>(ir::Edge::Any),
+                                      prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
+    }
     b.wait(edges, l);
-    flush_deferred_on_resume(b, l);
+}
+
+// The body of an `always @*` or `always_comb` that reads through a handle, as a loop
+// that does its own waiting, because the process's static subscription cannot name a
+// member of whichever instance or object a handle names. `@*` waits first and runs
+// the body on each wake (LRM 9.4.2.2); `always_comb` runs it once at time zero and
+// then after each wake (9.2.2.2), the time-zero run following the other processes'
+// starts, which a `#0` gives (an ordinary process starts in source order).
+void Lowerer::lower_inferred_loop(const Statement& body, bool comb, ir::Builder& b, ir::SourceLoc l) {
+    if (comb) {
+        b.unary(ir::Inst::Tag::Delay, b.constant(module_.pool.put_int(make_int_type(64, false), 0), l), l);
+    }
+    b.open_region();
+    const ir::Index      lpred = true_const(b, l);
+    const ir::ExtraSlice lcond = b.close_region();
+
+    b.open_region();
+    if (comb) {
+        lower_stmt(body, b);
+        emit_inferred_park(body, SensitivityMode::Comb, b, l);
+    } else {
+        emit_inferred_park(body, SensitivityMode::ImplicitEvent, b, l);
+        flush_deferred_on_resume(b, l);
+        lower_stmt(body, b);
+    }
+    const ir::ExtraSlice loop_body = b.close_region();
+
+    b.open_region();
+    const ir::ExtraSlice step = b.close_region();
+
+    b.loop(lcond, lpred, loop_body, step, /*bottom_test*/ false, l);
 }
 
 // Lower `wait_order(a, b, c) pass; else fail;` (LRM 15.5.4): suspend until every

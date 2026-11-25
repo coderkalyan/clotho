@@ -229,10 +229,24 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     // own body. A body with no internal timing control is a legal but
     // pathological zero-delay infinite loop (it hangs at time zero);
     // we lower it faithfully rather than reject it.
+    // An inferred sensitivity that reads a virtual-interface member or a class
+    // property cannot be a static subscription (it would have to name the instance or
+    // object a handle names at each wake), so such a body waits in its own loop; see
+    // lower_inferred_loop. A design that reads none keeps the static list.
+    bool handle_loop = false;
+    if (infer) {
+        HandleReads                handles;
+        std::vector<ir::WaitEvent> unused;
+        collect_inferred_sensitivity(*body, comb ? SensitivityMode::Comb : SensitivityMode::ImplicitEvent, unused, &handles);
+        handle_loop = handles.any();
+        infer       = infer && !handle_loop;
+    }
     const bool looping = activation == ir::Activation::Always && !infer && wait_events.empty();
 
     ir::Builder b(module_);
-    if (looping) {
+    if (handle_loop) {
+        lower_inferred_loop(*body, comb, b, to_source_loc(sym.location));
+    } else if (looping) {
         lower_forever(*body, b);
     } else if (iff_guard != nullptr) {
         // `always @(ev iff C) BODY` — wake on `ev`, run the body only when the
@@ -253,8 +267,8 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     // they settle from declaration-initialized values. An `always @*` or an
     // explicit `@(...)` list is a plain sensitivity list that runs only when a
     // listed signal changes, matching Verilog, so it is left non-self-starting.
-    const bool self_start =
-      sym.procedureKind == ProceduralBlockKind::AlwaysComb || sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+    const bool self_start = !handle_loop && (sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
+                                             sym.procedureKind == ProceduralBlockKind::AlwaysLatch);
     ir::Ir body_ir = b.finish();
     // A `final` block is zero-time (LRM 9.2.3): it must not suspend. slang
     // rejects a time-consuming statement in a `final` at elaboration, so this

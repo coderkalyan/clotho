@@ -385,6 +385,25 @@ void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
     visitDefault(w);
 }
 
+// An implicit `@*` before a statement reads the class properties that statement reads
+// (LRM 9.4.2.2), so their object bodies must carry change notifiers before any class
+// is laid out, as for a `wait`.
+void WaitPropScan::handle(const slang::ast::TimedStatement& t) {
+    if (t.timing.kind == slang::ast::TimingControlKind::ImplicitEvent) {
+        ClassPropReadScan scan;
+        t.stmt.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
+        }
+    }
+    visitDefault(t);
+}
+
 // Every class declared under `scope`, appended to `out`. This is what makes static
 // property initialization eager (LRM 6.21 / 8.9): the initializers must run once at
 // the beginning of simulation whether or not anything ever names the property, so
@@ -771,6 +790,16 @@ void SensitivityCollector::record_write(const Expression& lhs) {
             }
             break;
         }
+        case ExpressionKind::MemberAccess: {
+            // The member written is not read; the handle it goes through is.
+            const auto& ma = lhs.as<MemberAccessExpression>();
+            if (ma.value().type->getCanonicalType().isVirtualInterface() || instance_class_prop(ma) != nullptr) {
+                read_object(ma.value());
+                break;
+            }
+            lhs.visit(*this);
+            break;
+        }
         case ExpressionKind::Conversion:
             record_write(lhs.as<ConversionExpression>().operand());
             break;
@@ -865,6 +894,57 @@ void SensitivityCollector::handle(const CallExpression& c) {
     if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function && entered.insert(sub).second) {
         sub->getBody().visit(*this);
     }
+}
+
+void SensitivityCollector::read_object(const Expression& obj) {
+    if (mode != SensitivityMode::Comb) {
+        obj.visit(*this);
+        return;
+    }
+    switch (obj.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue:
+            return;
+        case ExpressionKind::ElementSelect: {
+            const auto& es = obj.as<ElementSelectExpression>();
+            read_object(es.value());
+            es.selector().visit(*this);
+            return;
+        }
+        case ExpressionKind::MemberAccess:
+            read_object(obj.as<MemberAccessExpression>().value());
+            return;
+        default:
+            obj.visit(*this);
+            return;
+    }
+}
+
+// A member reached through a handle. A virtual-interface member is a signal of the
+// instance the handle names (LRM 25.9): it joins the sensitivity beside the handle
+// itself, in `always @*` (9.4.2.2: every variable the statement reads) and in
+// `always_comb` (9.2.2.2.1's exemption is for class objects only). A non-static class
+// property joins it in `always @*` the same way, and adds nothing at all to an
+// `always_comb`, handle included.
+void SensitivityCollector::handle(const MemberAccessExpression& ma) {
+    if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+        if (!ma.type->isEvent() &&
+            std::ranges::none_of(handles.vif, [&](const MemberAccessExpression* h) { return &h->member == &ma.member; })) {
+            handles.vif.push_back(&ma);
+        }
+        visitDefault(ma);
+        return;
+    }
+    if (instance_class_prop(ma) != nullptr) {
+        if (mode == SensitivityMode::Comb) {
+            read_object(ma.value());
+            return;
+        }
+        if (level_waited_prop(ma) != nullptr) {
+            handles.props.push_back(&ma);
+        }
+    }
+    visitDefault(ma);
 }
 
 // Whether this node, ignoring its children, is safe to evaluate eagerly.

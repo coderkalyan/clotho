@@ -2375,3 +2375,83 @@ TEST_CASE("implicit @* nested in an always @*") {
     )");
     CHECK(out == "outer 1 1\ninner 2 1\nouter 3 0\n");
 }
+
+// Inferred sensitivity through a handle (LRM 9.4.2.2, 9.2.2.2.1). `always @*` and an
+// `@*` before a statement read every variable the statement reads, so a class property
+// or a virtual-interface member read through a handle wakes on a change of the member
+// and on a change of the handle (re-armed on the object the handle then names).
+// `always_comb` adds the same for a virtual-interface member, but "references to class
+// objects ... do not add anything to the sensitivity list of an always_comb", so a
+// class property read adds neither member nor handle. No oracle parses a class or a
+// virtual interface here; the expectations are the clauses'. Each `W` is a run of the body.
+TEST_CASE("always @* wakes on a class property and on its handle") {
+    const std::string out = run_capture(R"(
+        class C; int x; endclass
+        module top;
+          C obj = new, other = new; int y;
+          always @* begin $display("W %0t", $time); y = obj.x; end
+          initial begin #1 obj.x = 5; #1 obj = other; #1 other.x = 7; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("always @* wakes on a virtual-interface member and on its handle") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0; endinterface
+        module top;
+          ifc i1(), i2(); virtual ifc vif = i1; logic y;
+          always @* begin $display("W %0t", $time); y = vif.a; end
+          initial begin #1 i1.a = 1; #1 vif = i2; #1 i2.a = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("implicit @* before a statement wakes on a class property and on its handle") {
+    const std::string out = run_capture(R"(
+        class C; int x; endclass
+        module top;
+          C obj = new, other = new; int y;
+          initial forever @* begin $display("W %0t", $time); y = obj.x; end
+          initial begin #1 obj.x = 5; #1 obj = other; #1 other.x = 7; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("implicit @* before a statement wakes on a virtual-interface member and on its handle") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0; endinterface
+        module top;
+          ifc i1(), i2(); virtual ifc vif = i1; logic y;
+          initial forever @* begin $display("W %0t", $time); y = vif.a; end
+          initial begin #1 i1.a = 1; #1 vif = i2; #1 i2.a = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("always_comb wakes on a virtual-interface member and on its handle") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0; endinterface
+        module top;
+          ifc i1(), i2(); virtual ifc vif = i1; logic y;
+          always_comb begin $display("W %0t", $time); y = vif.a; end
+          initial begin #1 i1.a = 1; #1 vif = i2; #1 i2.a = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 0\nW 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("always_comb adds nothing for a class property, handle included") {
+    const std::string out = run_capture(R"(
+        class C; int x; endclass
+        module top;
+          C obj = new, other = new; int y;
+          always_comb begin $display("W %0t", $time); y = obj.x; end
+          initial begin #1 obj.x = 5; #1 obj = other; #1 other.x = 7; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 0\n");
+}

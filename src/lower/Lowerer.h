@@ -256,6 +256,8 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
     void handle(const slang::ast::SignalEventControl& ev);
 
     void handle(const slang::ast::WaitStatement& w);
+
+    void handle(const slang::ast::TimedStatement& t);
 };
 
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out);
@@ -316,6 +318,20 @@ enum class SensitivityMode : uint8_t {
     ImplicitEvent,
 };
 
+// What an inferred sensitivity reads that is not a signal of the module: members
+// of a virtual interface (LRM 25.9, a signal of whichever instance the handle names)
+// and non-static class properties (heap storage with a change notifier). A process's
+// static subscription cannot name either, so a body that reads one waits in its own
+// code (Lowerer::emit_inferred_park).
+struct HandleReads {
+    std::vector<const MemberAccessExpression*> vif;
+    std::vector<const Expression*>             props;
+
+    bool any() const {
+        return !vif.empty() || !props.empty();
+    }
+};
+
 // Collects the reads and writes that build a process's inferred sensitivity
 // (an `always_comb`, `always_latch`, `always @*`, or continuous assign): the
 // signals the body reads to compute a result, and the ones it writes. Whether
@@ -343,6 +359,8 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // User functions already descended into, so a function called from several
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
+    // Members read through a handle; see HandleReads.
+    HandleReads handles;
 
     // Creates a STATIC class property's module-signal storage and returns it
     // (Lowerer::declare_static_prop). That storage is minted LAZILY -- at the first
@@ -387,6 +405,14 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     void handle(const ForLoopStatement& f);
 
     void handle(const CallExpression& c);
+
+    void handle(const MemberAccessExpression& ma);
+
+    // The object expression of a member read or written through a handle: a plain read
+    // of the handle, except that `always_comb` adds nothing for a class object
+    // (LRM 9.2.2.2.1: "References to class objects and method calls of class objects
+    // do not add anything to the sensitivity list of an always_comb").
+    void read_object(const Expression& obj);
 };
 
 // Whether an expression may be evaluated even when its value turns out not to
@@ -2335,7 +2361,10 @@ private:
                                   const Expression*&          iff,
                                   uint32_t&                   n_events);
 
-    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode, std::vector<ir::WaitEvent>& out);
+    void collect_inferred_sensitivity(const Statement&            body,
+                                      SensitivityMode             mode,
+                                      std::vector<ir::WaitEvent>& out,
+                                      HandleReads*                handles = nullptr);
 
     static ir::Edge to_edge(slang::ast::EdgeKind edge);
 
@@ -2389,6 +2418,10 @@ private:
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
 
     void lower_implicit_event_wait(const Statement& body, ir::Builder& b, ir::SourceLoc l);
+
+    void emit_inferred_park(const Statement& body, SensitivityMode mode, ir::Builder& b, ir::SourceLoc l);
+
+    void lower_inferred_loop(const Statement& body, bool comb, ir::Builder& b, ir::SourceLoc l);
 
     void lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b);
 
