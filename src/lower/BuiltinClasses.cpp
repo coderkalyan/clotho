@@ -622,9 +622,66 @@ std::optional<ir::Index> Lowerer::lower_builtin_class_method(const CallExpressio
         fail("constraint_mode is not supported");
     }
     if (sub.name == "get_randstate" || sub.name == "set_randstate") {
-        // TODO: the object randstate codec (LRM 18.13.4/18.13.5) — two runtime
-        // helpers formatting the four state words as a string.
-        fail("get_randstate / set_randstate are not supported");
+        // LRM 18.13.4 / 18.13.5 on an object. Its generator state sits in the rand block,
+        // whose offset only the object's own class knows, so the state crosses the
+        // `$randops` slot a word at a time into a caller-side copy, and the copy is
+        // rendered to / parsed from the string by the same runtime entries
+        // `process::get_randstate` uses (RngStateFormat / RngStateParse).
+        const bool is_get = sub.name == "get_randstate";
+        if (args.size() != (is_get ? 0u : 1u)) {
+            fail("built-in class method '" + std::string(sub.name) + "' takes " + (is_get ? "no" : "one") +
+                 " argument");
+        }
+        const auto [self, clt] = call.thisClass() != nullptr
+                                   ? std::pair<ir::Index, const slang::ast::ClassType*>{
+                                       lower_expr(*call.thisClass(), b),
+                                       &call.thisClass()->type->getCanonicalType().as<slang::ast::ClassType>() }
+                                   : implicit_this(b, l);
+        // set_randstate's string is an argument, so it is evaluated before the call
+        // acts on anything.
+        const ir::Index str = is_get ? ir::Index{} : lower_expr(*args[0], b);
+        const auto      op  = [&](uint64_t which) { return b.constant(module_.pool.put_int(u64, which), l); };
+        const ir::Index zero = op(0);
+
+        // An object owns a generator only when its class has a rand property
+        // (docs/design/constrained-randomization.md section 5.1); for any other the
+        // state has nowhere to live, and inventing one would answer a different
+        // question than the LRM asks, so it is a run-time fatal rather than a value.
+        // The class is the object's own, not the handle's: a base-class handle may
+        // name a derived class that has one.
+        const ir::Index has = emit_randops_dispatch(*clt, self, op(kRandOpHasState), zero, b, l);
+        b.open_region();
+        {
+            const std::string banner = banner_at(call.sourceRange.start());
+            emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(call.sourceRange.start()),
+                        std::string(sub.name) + "() of an object whose class has no rand property is not supported", {},
+                        l);
+            b.finish(banner + "$fatal", 1, l);
+        }
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region();
+        b.cond(b.binary(ir::Inst::Tag::Eq, has, zero, l), then_r, else_r, l, /*unlikely=*/true);
+
+        const ir::Ref   state_ty = rng_state_type();
+        const ir::Index state    = make_canonical_agg_temp(state_ty, b, l);
+        const ir::Ref   idx_ty   = make_int_type(32, false);
+        const auto      word_lv  = [&](uint32_t k) {
+            return b.elem_select(state, b.constant(module_.pool.put_int(idx_ty, k), l), state_ty, l, /*for_write=*/true);
+        };
+        if (is_get) {
+            for (uint32_t k = 0; k < 4; ++k) {
+                const ir::Index word = emit_randops_dispatch(*clt, self, op(kRandOpStateGet + k), zero, b, l);
+                b.binary(ir::Inst::Tag::Store, word_lv(k), word, l);
+            }
+            return b.proc_query(ir::ProcOp::StateFormat, std::array<ir::Index, 1>{ state }, module_.pool.string_type, l);
+        }
+        b.proc_ctl(ir::ProcOp::StateParse, std::array<ir::Index, 2>{ state, str }, l);
+        for (uint32_t k = 0; k < 4; ++k) {
+            emit_randops_dispatch(*clt, self, op(kRandOpStateSet + k), b.unary(ir::Inst::Tag::Load, word_lv(k), l), b,
+                                  l);
+        }
+        return std::nullopt;
     }
     fail("unsupported built-in class method '" + std::string(sub.name) + "'");
 }

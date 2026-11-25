@@ -1723,8 +1723,9 @@ ir::Index Lowerer::emit_rand_enum(const slang::ast::EnumType& et,
 
 // Build `clt`'s `$randops(this, op, arg) -> longint`: the per-object built-ins
 // whose target layout is only known to the object's own class — `srandom`
-// (LRM 18.13.3) and both `rand_mode` forms (LRM 18.8). One slot with an opcode
-// rather than four slots: these are rare calls, and the vtable is per class.
+// (LRM 18.13.3), both `rand_mode` forms (LRM 18.8) and the randstate pair (LRM
+// 18.13.4, 18.13.5), whose words it hands over one at a time. One slot with an
+// opcode rather than four slots: these are rare calls, and the vtable is per class.
 void Lowerer::build_randops_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
     // The declaring scope, not whichever one this Lowerer reached the class from: a
     // package class's body names no instance, a module class's names its own.
@@ -1743,6 +1744,22 @@ void Lowerer::build_randops_body(const slang::ast::ClassType& clt, ir::Ref class
         const auto      mode_lv = [&] { return b.member_select(body, rd.mode_field, class_ref, l); };
         const auto      is_op   = [&](uint64_t which) {
             return b.binary(ir::Inst::Tag::Eq, op, b.constant(module_.pool.put_int(u64, which), l), l);
+        // A class with a rand block owns a generator; the others answer 0 to HasState
+        // below, which is what the call site tests before it reads or writes a word.
+        arm(kRandOpHasState, [&] { b.unary(ir::Inst::Tag::Ret, one, l); });
+        for (uint32_t k = 0; k < 4; ++k) {
+            // Declared-range index k of the state array, the coordinate the call
+            // site's copy uses too, so a state read here and restored there lands in
+            // the same word.
+            const auto word_lv = [&] {
+                return b.elem_select(b.member_select(body, rd.rng_field, class_ref, l),
+                                     b.constant(module_.pool.put_int(make_int_type(32, false), k), l),
+                                     rng_state_type(),
+                                     l);
+            };
+            arm(kRandOpStateGet + k, [&] { b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, word_lv(), l), l); });
+            arm(kRandOpStateSet + k, [&] { b.binary(ir::Inst::Tag::Store, word_lv(), arg, l); });
+        }
         };
         const auto arm = [&](uint64_t which, auto&& emit) {
             b.open_region();

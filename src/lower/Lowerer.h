@@ -6065,6 +6065,13 @@ private:
     // the point its holder is being laid out.
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> randomize_fn_;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> randops_fn_;
+    // The randstate pair (LRM 18.13.4, 18.13.5). The state is four 64-bit words and the
+    // call returns one i64, so it crosses a word at a time: HasState says whether the
+    // class owns an object RNG at all, StateGet + k returns word k of it, and StateSet + k
+    // stores `arg` into word k.
+    static constexpr uint64_t kRandOpHasState = 4;
+    static constexpr uint64_t kRandOpStateGet = 8;
+    static constexpr uint64_t kRandOpStateSet = 12;
     std::vector<std::pair<const slang::ast::ClassType*, ir::Ref>>              rand_pending_;
     // Depth of the lower_class_type recursion; the outermost frame drains the list.
     uint32_t class_depth_ = 0;

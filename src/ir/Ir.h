@@ -617,12 +617,18 @@ enum class ProcOp : uint32_t {
     Self,         // process::self() -> a handle on the calling thread
     Status,       // p.status() -> the `state` enum value
     RandstateGet, // p.get_randstate() -> string
+    // A caller-side copy of an OBJECT's four-word generator state (operand: its lvalue, a
+    // 4-element unpacked array of `bit [63:0]`) rendered as that same string; the object's own
+    // words reach the copy through its class's `$randops`.
+    StateFormat,
     // ProcCtl.
     Kill,         // p.kill(): end p and every descendant
     Suspend,      // p.suspend()
     Resume,       // p.resume()
     Srandom,      // p.srandom(seed)
     RandstateSet, // p.set_randstate(s)
+    // The inverse for an object: parse the string (args: state lvalue, string) into the copy.
+    StateParse,
     DisableFork,  // `disable fork` (LRM 9.6.3): kill every descendant of self
     // ProcWait.
     Await,        // p.await(): park until p completes

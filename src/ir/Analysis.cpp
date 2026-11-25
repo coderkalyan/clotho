@@ -970,7 +970,12 @@ struct Structural {
                     // the calling thread's block, and the status stores at every park.
                     // A design that never mentions `process` emits none of it
                     // (docs/design/process-class.md §9).
-                    uses.process = true;
+                    // The object state codec reads no control block, so it alone does not
+                    // turn the machinery on.
+                    if (const ProcOp o = ir.extra_data<ProcCtlInfo>(p.extra).op;
+                        o != ProcOp::StateFormat && o != ProcOp::StateParse) {
+                        uses.process = true;
+                    }
                     if (const ProcOp op = ir.extra_data<ProcCtlInfo>(p.extra).op;
                         op == ProcOp::Srandom || op == ProcOp::RandstateGet ||
                         op == ProcOp::RandstateSet) {

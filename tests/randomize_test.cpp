@@ -869,32 +869,56 @@ TEST_CASE("unimplemented rand forms are refused, each by its own message") {
         CHECK(s.err.find("rand properties of this type are not supported") != std::string::npos);
         CHECK(s.out.find("unreachable") == std::string::npos);
     }
+}
 
-    CHECK(lower_error(R"(
+// LRM 18.13.4 / 18.13.5 on an object: a state captured and restored replays the same
+// draws, an object seeded alike draws alike, and the string is the 64 hex digits the
+// process form gives. Also through a base handle to a derived class. Oracle: the LRM
+// contract (the string's format is implementation-defined); iverilog 13 has no classes
+// with randomize.
+TEST_CASE("object randstate round-trips") {
+    constexpr std::string_view src = R"(
         module m;
-            class C;
-                rand bit [3:0] x;
-            endclass
+            class C; rand bit [31:0] v; endclass
+            class D extends C; rand bit [7:0] w; endclass
             initial begin
-                automatic C c = new();
-                string s;
+                C c = new();
+                C b;
+                D d = new();
+                string s, t;
+                bit [31:0] x, y, z;
                 s = c.get_randstate();
+                void'(c.randomize()); x = c.v;
+                c.set_randstate(s);
+                void'(c.randomize()); y = c.v;
+                b = d;
+                t = b.get_randstate();
+                void'(b.randomize()); z = d.v;
+                b.set_randstate(t);
+                void'(b.randomize());
+                $display("%0d %0d %0d", s.len(), x == y, z == d.v);
             end
         endmodule
-    )")
-            .find("get_randstate / set_randstate are not supported")
-          != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "64 1 1\n");
+}
 
-    CHECK(lower_error(R"(
+// A class with no rand property has no object generator to read, so the pair is a
+// located run-time fatal there, not an invented state.
+TEST_CASE("object randstate of a class with no rand property is a run-time fatal") {
+    const Streams s = run_streams(R"(
         module m;
-            class C;
-                rand bit [3:0] x;
-            endclass
-            initial begin automatic C c = new(); c.set_randstate("z"); end
+            class C; int x; endclass
+            initial begin
+                C c = new();
+                string st;
+                st = c.get_randstate();
+                $display("unreachable");
+            end
         endmodule
-    )")
-            .find("get_randstate / set_randstate are not supported")
-          != std::string::npos);
+    )");
+    CHECK(s.err.find("get_randstate() of an object whose class has no rand property") != std::string::npos);
+    CHECK(s.out.find("unreachable") == std::string::npos);
 }
 
 // srandom on a class with no rand property is a no-op rather than a refusal: the
