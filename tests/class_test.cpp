@@ -114,6 +114,33 @@ TEST_CASE("null and handle identity") {
     CHECK(run_capture(src) == "1 1 1 0\n");
 }
 
+// The object a method is called on is read by the call, so an always_comb block
+// (LRM 9.2.2.2.1) and a wait (9.4.3) that call a method are sensitive to the handle
+// variable: pointing it at another object runs them again.
+TEST_CASE("a method call is sensitive to the handle it is called on") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int v;
+                function new(int v); this.v = v; endfunction
+                function int get(); return v; endfunction
+            endclass
+            C a = new(1), b = new(5), c = a;
+            int x;
+            always_comb x = c.get() + 1;
+            initial begin
+                fork
+                    begin wait (c.get() == 5); $display("wait %0t", $time); end
+                join_none
+                #1 $display("x=%0d", x);
+                c = b;
+                #1 $display("x=%0d", x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "x=2\nwait 1\nx=6\n");
+}
+
 // Self-referential property (a handle to the enclosing class) + nested member path
 // (LRM 8.4). Reference semantics make the cycle trivial (a property is a pointer).
 // iverilog rejects both the self-reference and `a.next.val`.

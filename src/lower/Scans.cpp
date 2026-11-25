@@ -257,6 +257,15 @@ void ClassPropReadScan::take(const Expression& e) {
     }
 }
 
+void ClassPropReadScan::handle(const CallExpression& call) {
+    if (weak_get_call(call) != nullptr) {
+        weak_gets.push_back(&call);
+    }
+    // Descended into: the receiver of `obj.w.get()` reads a property itself, and
+    // any call's arguments can.
+    visitDefault(call);
+}
+
 void ClassPropReadScan::handle(const slang::ast::NamedValueExpression& e) {
     take(e);
     visitDefault(e);
@@ -846,15 +855,20 @@ void SensitivityCollector::handle(const ForLoopStatement& f) {
     visitDefault(f);
 }
 
-// A called subroutine's argument expressions are always sensitive. Its body
-// contributes only for a *function* under Comb rules (9.2.2.2.1): a function
-// may reference module signals directly, not only through its arguments, so
-// descend once into the callee body — the callee's formals / locals are not
-// module signals (not in sigmap), so they are ignored, while module signals
-// it reads / writes are recorded as usual. Task bodies never contribute
+// A called subroutine's argument expressions are always sensitive, and so is the
+// object a method is called on, which the call reads as it reads an argument
+// (`wait (w.get() == null)` is tested again when `w` is pointed at another
+// object). Its body contributes only for a *function* under Comb rules
+// (9.2.2.2.1): a function may reference module signals directly, not only through
+// its arguments, so descend once into the callee body — the callee's formals /
+// locals are not module signals (not in sigmap), so they are ignored, while module
+// signals it reads / writes are recorded as usual. Task bodies never contribute
 // (9.2.2.2.1: "the contents of the tasks do not add anything"), and under
 // ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
 void SensitivityCollector::handle(const CallExpression& c) {
+    if (const Expression* receiver = c.thisClass(); receiver != nullptr) {
+        receiver->visit(*this);
+    }
     for (const Expression* arg : c.arguments()) {
         arg->visit(*this);
     }
