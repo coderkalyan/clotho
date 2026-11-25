@@ -2241,6 +2241,47 @@ private:
     // One event the seed links a persistent waiter onto joins the static list of the group `h`.
     void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
 
+    // A nonblocking update as the checker is told of it (rt_trace_nba_create): the planes of its
+    // target and the bits and mask the statement writes into them, positioned at the target's bit
+    // offset, as word buffers of the planes' width rounded up to 64-bit words (a null mask is every
+    // bit). Nothing is emitted when `on` is false.
+    struct TraceNba {
+        bool            on    = false;
+        llvm::Value*    dst0  = nullptr;
+        llvm::Value*    dst1  = nullptr;
+        llvm::Value*    val0  = nullptr;
+        llvm::Value*    mask0 = nullptr;
+        llvm::Value*    val1  = nullptr;
+        llvm::Value*    mask1 = nullptr;
+        uint32_t        bits0 = 0;
+        uint32_t        bits1 = 0;
+        // RT_TRACE_NBA_GATED, RT_TRACE_NBA_OPAQUE.
+        uint32_t        flags = 0;
+        llvm::Constant* name  = nullptr;
+    };
+
+    // The update the store `lv <= rhs` creates, computed from the lvalue and the value the way the
+    // staging code computes the bits it writes, whichever path stages it. `gated`: a force or assign
+    // can drop it at its commit.
+    TraceNba trace_nba_of(const LValue& lv, Plane rhs, bool gated);
+
+    // The statement's constant record (rt_trace_nba_site) in module `m`, once per statement.
+    llvm::Constant* trace_nba_site(llvm::Module& m, const TraceNba& t, uint32_t path);
+
+    // Report the update: created now (`rec` null, `path` RT_TRACE_NBA_BLOCK ... RT_TRACE_NBA_ZERO), or
+    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT).
+    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path);
+
+    // The scheduler enters `region` (RT_TRACE_REG_*).
+    void emit_trace_region(uint32_t region);
+
+    // The NBA or Re-NBA commit begins or ends.
+    void emit_trace_nba_pass(bool begin, uint32_t region);
+
+    // A `->>` links event object `obj` onto the pend chain, or `obj` triggers (RT_TRACE_TRIGGER_*).
+    void emit_trace_pend(llvm::Value* obj);
+    void emit_trace_trigger(llvm::Value* obj, uint32_t kind);
+
     // Every park of a coroutine goes through here, and says what it parks for.
     void emit_suspend(const char* label, const TracePark& park);
 
@@ -2805,9 +2846,10 @@ private:
 
     void emit_event_pend_drain(llvm::Value* wheel);
 
-    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel);
+    // `trigger` is RT_TRACE_TRIGGER_NOW for `-> e` and RT_TRACE_TRIGGER_NB for every form of `->>`.
+    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel, uint32_t trigger);
 
-    void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel);
+    void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel, uint32_t trigger);
 
     void emit_event_wake_list(llvm::Value* obj, const TraceCause& why);
 
@@ -3068,7 +3110,8 @@ private:
 
     llvm::Value* emit_nba_any_staged();
 
-    void emit_nba_commit(llvm::Value* state, llvm::Value* wheel);
+    // `region` is RT_TRACE_REG_NBA or RT_TRACE_REG_RE_NBA, the pass the commit is.
+    void emit_nba_commit(llvm::Value* state, llvm::Value* wheel, uint32_t region);
 
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
 
@@ -3859,7 +3902,8 @@ private:
 
     void fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructType* rt, llvm::Value* rec);
 
-    void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
+    // `restates`: the arm copies a plain NBA that already created its update (emit_intra_nba_ordered).
+    void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks, bool restates);
 
     void emit_intra_nba_ordered(const LValue& lv, Plane rhs);
 
@@ -5267,6 +5311,10 @@ private:
     // its text.
     std::map<std::tuple<const llvm::Module*, uint32_t, std::string>, llvm::Constant*> trace_controls_;
     std::map<std::pair<const llvm::Module*, std::string>, llvm::Constant*>            trace_strings_;
+    // The nonblocking statements' records: by module, location, target name, flags, and the two
+    // plane widths.
+    std::map<std::tuple<const llvm::Module*, std::string, const llvm::Constant*, uint32_t, uint32_t, uint32_t>, llvm::Constant*>
+      trace_nba_sites_;
 #endif
     llvm::Value*           frame_ = nullptr;
     std::vector<FrameSlot> frame_slots_;

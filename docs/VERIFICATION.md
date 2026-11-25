@@ -98,14 +98,17 @@ VCD, not only what a test prints.
   and `CLOTHO_CONFIG_MATRIX_LOG` (one line per design) tune it. It costs a process
   per variant per design, so it is not in CI.
 - **Scheduler trace check.** A build with `CLOTHO_EXTRA_ASSERTS` makes the generated
-  code and the scheduler report each spawn, park, wake, dispatch, resume and end to
-  `src/runtime/TraceCheck.cpp`, which tests the rules of docs/design/scheduler-rules.md
-  R5 online (a wake needs a parked activation waiting for its cause, a dispatch a
-  queued one, a resume the control it parked at, nothing touches an ended one). It is
-  on by default in such a build, for the suite and for `clotho run`;
-  `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status 99,
-  `clotho: scheduler trace violation:` and a report naming the rule, the activation,
-  its control, the time and the cause) and fails the test that ran the design, unless
+  code and the scheduler report each spawn, park, wake, dispatch, resume, end, region,
+  NBA update and pass, `->>` pend and trigger, and `$finish` to `src/runtime/TraceCheck.cpp`,
+  which tests the rules of docs/design/scheduler-rules.md online: R5 (a wake needs a
+  parked activation waiting for its cause, a dispatch a queued one, a resume the control
+  it parked at, nothing touches an ended one), R12 (each NBA pass leaves its targets as
+  the updates give in creation order, and none is left over), R20 (a `->>` triggers inside
+  an NBA pass, in the order they were pended) and R24 (past a `$finish` only the exit that
+  follows it runs). It is on by default in such a build, for the suite and for
+  `clotho run`; `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status
+  99, `clotho: scheduler trace violation:` and a report naming the rule, the time, the
+  target or activation, and the cause) and fails the test that ran the design, unless
   `tests/trace-check-known.txt` lists it as `bug` or `rule`; an entry whose test no
   longer violates fails the run. The sv-tests summary classifies the marker as `trace`.
   A shipped build emits no call and links no checker (`trace_check_test.cpp`).

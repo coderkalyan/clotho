@@ -1553,6 +1553,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     auto* wcheck  = llvm::BasicBlock::Create(ctx_, "wheel.check", fn);
     auto* wtick   = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
     auto* wdone   = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
+    // The Active region is entered from its own entry edges. The loop that takes each activation back
+    // to `check` is not one, so the trace sees a `region` event each time control returns to it.
+    auto* active_in = trace_on() ? llvm::BasicBlock::Create(ctx_, "active.enter", fn) : check;
     // Any thunk group present means the active queue can carry tagged thunk
     // pointers, so the drain must discriminate; a coro-only design keeps the
     // straight resume path (no per-pop tag test).
@@ -1574,7 +1577,12 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // and inactive iterate until both settle, then NBA, then the wheel.
     auto* icheck   = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.check", fn) : ncheck;
     auto* ipromote = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.promote", fn) : nullptr;
-    b_.CreateBr(check);
+    b_.CreateBr(active_in);
+    if (trace_on()) {
+        b_.SetInsertPoint(active_in);
+        emit_trace_region(RT_TRACE_REG_ACTIVE);
+        b_.CreateBr(check);
+    }
 
     // Drain the active ring: while head != tail, pop active[head++ & mask]
     // and resume it.
@@ -1676,6 +1684,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         auto* pbody = llvm::BasicBlock::Create(ctx_, "inactive.copy.body", fn);
         auto* pdone = llvm::BasicBlock::Create(ctx_, "inactive.copy.done", fn);
         b_.SetInsertPoint(ipromote);
+        emit_trace_region(RT_TRACE_REG_INACTIVE);
         b_.CreateBr(phead);
 
         b_.SetInsertPoint(phead);
@@ -1696,7 +1705,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateStore(b_.getInt32(0), sym(active_head_gv_));
         b_.CreateStore(n, sym(active_tail_gv_));
         b_.CreateStore(b_.getInt32(0), sym(inactive_top_gv_));
-        b_.CreateBr(check);
+        b_.CreateBr(active_in);
     }
 
     if (has_nba) {
@@ -1708,12 +1717,16 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateCondBr(any, ncommit, wcheck);
 
         b_.SetInsertPoint(ncommit);
-        emit_nba_commit(state, wheel);
-        b_.CreateBr(check);
+        emit_nba_commit(state, wheel, RT_TRACE_REG_NBA);
+        b_.CreateBr(active_in);
     }
 
     // Queue empty: this instant has fully settled.
     b_.SetInsertPoint(wcheck);
+    // The Observed region has code of its own: a body, or a report to flush.
+    if (has_observed() || design_uses_observed_ || design_uses_defer_) {
+        emit_trace_region(RT_TRACE_REG_OBSERVED);
+    }
     // Observed region (LRM 4.4.2.5): run the processes that evaluate property
     // expressions, ahead of the flushes below that mature this instant's
     // reports. Run like the Preponed ones and for the same reason -- an
@@ -1742,7 +1755,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         auto*        settled = llvm::BasicBlock::Create(ctx_, "observed.settled", fn);
         llvm::Value* ohd     = b_.CreateLoad(i32, sym(active_head_gv_));
         llvm::Value* otl     = b_.CreateLoad(i32, sym(active_tail_gv_));
-        b_.CreateCondBr(b_.CreateICmpNE(ohd, otl), check, settled);
+        b_.CreateCondBr(b_.CreateICmpNE(ohd, otl), active_in, settled);
         b_.SetInsertPoint(settled);
     }
     // Observed region (LRM 4.4.2.4): emit every report queued while the
@@ -1781,7 +1794,15 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         // what makes the update region the next non-empty one.
         auto* richeck   = has_re_inactive
           ? llvm::BasicBlock::Create(ctx_, "re_inactive.check", fn) : rncheck;
-        b_.CreateBr(rcheck);
+        // The Reactive region is entered from its entry edges as the Active one is, not from the loop
+        // that takes each activation back to `rcheck`.
+        auto* reactive_in = trace_on() ? llvm::BasicBlock::Create(ctx_, "reactive.enter", fn) : rcheck;
+        b_.CreateBr(reactive_in);
+        if (trace_on()) {
+            b_.SetInsertPoint(reactive_in);
+            emit_trace_region(RT_TRACE_REG_REACTIVE);
+            b_.CreateBr(rcheck);
+        }
 
         b_.SetInsertPoint(rcheck);
         llvm::Value* rhd = b_.CreateLoad(i32, sym(reactive_head_gv_));
@@ -1892,6 +1913,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             auto* rpbody = llvm::BasicBlock::Create(ctx_, "re_inactive.copy.body", fn);
             auto* rpdone = llvm::BasicBlock::Create(ctx_, "re_inactive.copy.done", fn);
             b_.SetInsertPoint(ripromote);
+            emit_trace_region(RT_TRACE_REG_RE_INACTIVE);
             b_.CreateBr(rphead);
 
             b_.SetInsertPoint(rphead);
@@ -1912,7 +1934,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             b_.CreateStore(b_.getInt32(0), sym(reactive_head_gv_));
             b_.CreateStore(rn, sym(reactive_tail_gv_));
             b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
-            b_.CreateBr(rcheck);
+            b_.CreateBr(reactive_in);
         }
 
         if (has_nba || has_renba()) {
@@ -1949,8 +1971,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
                 b_.CreateCondBr(emit_nba_any_staged(), rncommit, rdone);
 
                 b_.SetInsertPoint(rncommit);
-                emit_nba_commit(state, wheel);
-                b_.CreateBr(rcheck);
+                emit_nba_commit(state, wheel, RT_TRACE_REG_RE_NBA);
+                b_.CreateBr(reactive_in);
             } else {
                 b_.CreateBr(rdone);
             }
@@ -1970,13 +1992,16 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         auto*        rsettled = llvm::BasicBlock::Create(ctx_, "reactive.settled", fn);
         llvm::Value* rahd     = b_.CreateLoad(i32, sym(active_head_gv_));
         llvm::Value* ratl     = b_.CreateLoad(i32, sym(active_tail_gv_));
-        b_.CreateCondBr(b_.CreateICmpNE(rahd, ratl), check, rsettled);
+        b_.CreateCondBr(b_.CreateICmpNE(rahd, ratl), active_in, rsettled);
         b_.SetInsertPoint(rsettled);
     }
     // Postponed region (LRM §21.7): final (`assert final`) deferred assertion
     // reports mature here (LRM 16.4), and the VCD dump samples the current
     // time before the wheel advances, so each variable's final settled value
     // is recorded once per instant.
+    if (design_uses_defer_ || uses_vcd || design_uses_strobe_ || design_uses_monitor_) {
+        emit_trace_region(RT_TRACE_REG_POSTPONED);
+    }
     if (design_uses_defer_) {
         b_.CreateCall(defer_flush_final_fn(), {});
     }
@@ -2095,6 +2120,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         auto* post_tick = llvm::BasicBlock::Create(ctx_, "wheel.posttick", fn);
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), post_tick, wdone);
         b_.SetInsertPoint(post_tick);
+        emit_trace_region(RT_TRACE_REG_PREPONED);
         if (preponed) {
             // Preponed (LRM 4.4.2.1): run once at the top of a new time step -- after the
             // wheel has fired its timers, which only enqueues handles, and before any body
@@ -2104,9 +2130,9 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         for (const Signal sig : inertial_sigs_) {
             emit_intra_commit(sig);
         }
-        b_.CreateBr(check);
+        b_.CreateBr(active_in);
     } else {
-        b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
+        b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), active_in, wdone);
     }
 
     b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid

@@ -1440,6 +1440,7 @@ void Backend::emit_event_pend(llvm::Value* obj) {
     llvm::Value* headp = sym(event_pend_head_gv_);
     b_.CreateStore(b_.CreateLoad(ptr, headp), event_field(obj, kEventNextPend));
     b_.CreateStore(obj, headp);
+    emit_trace_pend(obj);
     b_.CreateBr(done);
     b_.SetInsertPoint(done);
     (void)null;
@@ -1495,7 +1496,7 @@ void Backend::emit_event_pend_drain(llvm::Value* wheel) {
     llvm::Value* next = b_.CreateLoad(ptr, event_field(n, kEventNextPend));
     b_.CreateStore(null, event_field(n, kEventNextPend));
     b_.CreateStore(b_.getInt8(0), event_field(n, kEventPending));
-    emit_event_fire(n, wheel);
+    emit_event_fire(n, wheel, RT_TRACE_TRIGGER_NB);
     n->addIncoming(next, b_.GetInsertBlock());
     b_.CreateBr(head);
 
@@ -1506,7 +1507,8 @@ void Backend::emit_event_pend_drain(llvm::Value* wheel) {
 // list. Shared by `-> e` in a process body (wheel_) and the NBA-region `->> e`
 // service (the drain's local wheel — wheel_ is stale there, so it must be passed
 // in).
-void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
+void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, uint32_t trigger) {
+    emit_trace_trigger(obj, trigger);
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
     emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
@@ -1535,13 +1537,13 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
 // trigger. Skipping the whole fire -- rather than letting it land on the null
 // object -- is what keeps `null.triggered` reading 0 afterwards, since a stamp
 // there would otherwise be observable through any null handle.
-void Backend::emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel) {
+void Backend::emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel, uint32_t trigger) {
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* fire = llvm::BasicBlock::Create(ctx_, "ev.fire", fn);
     auto* skip = llvm::BasicBlock::Create(ctx_, "ev.null", fn);
     b_.CreateCondBr(b_.CreateICmpNE(handle, b_.getInt64(0)), fire, skip);
     b_.SetInsertPoint(fire);
-    emit_event_fire(event_obj_live(handle), wheel);
+    emit_event_fire(event_obj_live(handle), wheel, trigger);
     b_.CreateBr(skip);
     b_.SetInsertPoint(skip);
 }

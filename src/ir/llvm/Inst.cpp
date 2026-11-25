@@ -1220,7 +1220,7 @@ void Backend::lower_inst(Index i) {
             // out-of-bounds destination pointer that the NBA region dereferences
             // unconditionally when it replays -- and for a scalar select, an
             // unrestricted mask.
-            lv.when_valid(b_, [&](const LValue& v) { emit_intra_nba_arm(v, rhs, ticks); });
+            lv.when_valid(b_, [&](const LValue& v) { emit_intra_nba_arm(v, rhs, ticks, /*restates=*/false); });
             return;
         }
 
@@ -2028,7 +2028,7 @@ void Backend::lower_inst(Index i) {
             // `-> e` (LRM 15.5.2): resolve the handle, stamp the trigger time and
             // wake every waiter now. Zero-time — the current process does not
             // suspend, so it does not end the NBA segment.
-            emit_event_fire_guarded(must_of(p.unary), wheel_);
+            emit_event_fire_guarded(must_of(p.unary), wheel_, RT_TRACE_TRIGGER_NOW);
             return;
 
         case Inst::Tag::EventTriggerNb:
