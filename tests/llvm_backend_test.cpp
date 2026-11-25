@@ -286,11 +286,20 @@ TEST_CASE("alu emits verifiable llvm ir") {
 
     // Signal access via constant typed GEPs off a base the instance's record
     // holds, def-relative (%alu.state): a unit's code names no instance's state
-    // global (asserted on raw IR; instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("%alu.state, ptr %") != std::string::npos);
-#ifndef CLOTHO_EXTRA_ASSERTS // the root's trace table names each instance's storage by its global
-    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
-#endif
+    // global (asserted on raw IR; instcombine canonicalizes GEP shapes). The root's trace
+    // tables (extra asserts) name each instance's storage by its global on purpose, so the
+    // search leaves out the `@clotho.trace.*` definitions.
+    std::string unit_code;
+    for (size_t at = 0; at < raw.size();) {
+        const size_t end  = std::min(raw.find('\n', at), raw.size());
+        const auto   line = std::string_view(raw).substr(at, end - at);
+        if (!line.starts_with("@clotho.trace.")) {
+            unit_code.append(line).push_back('\n');
+        }
+        at = end + 1;
+    }
+    CHECK(unit_code.find("%alu.state, ptr %") != std::string::npos);
+    CHECK(unit_code.find("%alu.state, ptr @clotho.inst.alu.state") == std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
