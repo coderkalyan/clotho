@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <string_view>
+#include <vector>
 
 #include "Lower.h"
 #include "ir/Analysis.h"
@@ -76,6 +77,54 @@ TEST_CASE("tag_info keeps the whitelist and blacklist polarities apart") {
     // where the stream lives, not that both are random.
     CHECK_FALSE(ir::tag_info(ir::Inst::Tag::Random).blocks_thunk);
     CHECK(ir::tag_info(ir::Inst::Tag::Urandom).blocks_thunk);
+}
+
+// The park that arms the wake word is a property of the opcode, and it is what takes an always
+// out of the static subscription of its leading list (docs/design/scheduler-rules.md S1, B51). A
+// park that leaves the word set does not arm it, and nor does anything that does not park.
+TEST_CASE("tag_info names the parks that arm the wake word") {
+    for (const ir::Inst::Tag t : { ir::Inst::Tag::Wait,
+                                   ir::Inst::Tag::ExpectWait,
+                                   ir::Inst::Tag::ProcWait,
+                                   ir::Inst::Tag::SyncWait }) {
+        CHECK(ir::tag_info(t).arms_wake);
+        CHECK(ir::tag_info(t).blocks_thunk);
+    }
+    for (const ir::Inst::Tag t : { ir::Inst::Tag::Delay,
+                                   ir::Inst::Tag::TaskCall,
+                                   ir::Inst::Tag::TaskCallVirtual,
+                                   ir::Inst::Tag::Fork,
+                                   ir::Inst::Tag::ExpectWake,
+                                   ir::Inst::Tag::SyncCtl,
+                                   ir::Inst::Tag::Store,
+                                   ir::Inst::Tag::Add }) {
+        CHECK_FALSE(ir::tag_info(t).arms_wake);
+    }
+}
+
+TEST_CASE("an always arms its wake word only where its body parks at a control that does") {
+    const Analyzed a = run(R"(
+        module top;
+          logic clk = 0, d = 0; int x = 0, y = 0, z = 0, w = 0;
+          task automatic wait_d; @(posedge d); endtask
+          always @(posedge clk) x = x + 1;
+          always @(posedge clk) begin @(posedge d); y = y + 1; end
+          always @(posedge clk) begin #3 z = z + 1; end
+          always @(posedge clk) begin wait_d; w = w + 1; end
+          always @(posedge clk) begin wait (d); x = x + 2; end
+          initial #10 $finish;
+        endmodule
+    )");
+    // The always blocks, in source order: plain, an event control, a delay, a task that waits
+    // (the task parks on a wake word of its own), a `wait` statement.
+    std::vector<bool> arms;
+    for (size_t k = 0; k < a.mod().processes().size(); ++k) {
+        const ir::Process& p = a.mod().processes()[k];
+        if (p.activation == ir::Activation::Always && !p.wait_events.empty()) {
+            arms.push_back(a.facts.processes[k].arms_wake);
+        }
+    }
+    CHECK(arms == std::vector<bool>{ false, true, false, false, true });
 }
 
 TEST_CASE("undriven nets are found and partially-driven nets get a bit mask") {

@@ -294,7 +294,7 @@ into `clotho.proc_sched` for a process and a frame alloca for a task
 | Subscriber | Node lives in | Linked | Unlinked |
 |---|---|---|---|
 | `always @(e)`, top-level sensitivity | a contiguous `clotho.event_nodes` array in module state, one slot per static subscription (countable by the existing `wait_counts()` walk over `group_events_`) | once, in the elaboration seed loop, in `sub_order_` | never |
-| intra-body `@(e)`, `wait(...)`, `wait_order` | the waiting coroutine's **own frame** | on suspend | on resume, or on `disable` |
+| intra-body `@(e)`, `wait(...)`, `wait_order`; and `@(e)` of an `always` whose body parks at one of those or at another control that arms the wake word (`always @(e) begin @(posedge done); ... end`, scheduler-rules.md S1) | the waiting coroutine's **own frame** | on suspend | on resume, or on `disable` |
 
 Both are the same node type on the same list, so there is **one** scan mechanism —
 the two-engine outcome the old design doc warned against is avoided. Putting the

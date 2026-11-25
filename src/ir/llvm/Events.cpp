@@ -204,7 +204,11 @@ void Backend::emit_wait_suspend() {
 // that bucket's length); the scheduler resumes us in the fresh resume block.
 //
 // Flag arming: service_dynamic_queue now reads the flag, so we must store 0 to
-// our &proc_sched slot before suspending or we would never be woken again.
+// our &proc_sched slot before suspending or we would never be woken again
+// (emit_arm_wake_word). That store is also why a process with a static
+// subscription cannot park here: its entry reads the same flag, finds it armed
+// and resumes the process at this wait (B51), so a process whose body holds a
+// Wait is not subscribed (waits_at_head).
 //
 // Eager removal (multi-signal only): when we resume, the bucket that fired is
 // already cleared, but the OTHER buckets still hold our stale entry. Left in
@@ -213,7 +217,12 @@ void Backend::emit_wait_suspend() {
 // bucket on resume. A single-signal wait is in exactly one bucket, cleared on
 // fire, so it needs no removal.
 void Backend::lower_wait(ExtraIndex info) {
-    const auto events = ir_->wait_edges(info);
+    lower_wait_edges(ir_->wait_edges(info));
+}
+
+// A process that waits at its head (waits_at_head) calls this with its leading list,
+// at the top of its loop.
+void Backend::lower_wait_edges(std::span<const WaitEdge> events) {
     // An event waiter links a frame-resident node onto the event object's list;
     // a signal waiter appends to the (signal, edge) dynamic bucket. A mixed
     // `@(e or clk)` does both -- they are independent registrations before one
@@ -243,8 +252,8 @@ void Backend::lower_wait(ExtraIndex info) {
             emit_dynamic_register(e.signal, e.edge);
         }
     }
-    b_.CreateStore(b_.getInt64(0), sched_ptr_); // arm: ready to be woken
-    emit_wait_suspend();                        // park until any event fires
+    emit_arm_wake_word(); // ready to be woken
+    emit_wait_suspend();  // park until any event fires
     // A remote `disable` is a second way to be resumed here, and it neither
     // fires nor clears the bucket we are in -- so with one in the design a
     // single-signal wait has to compact itself out too, or its stale entry would
@@ -274,6 +283,21 @@ void Backend::lower_wait(ExtraIndex info) {
     }
 }
 
+// Arm the wake word: store 0, so that it reads "not queued" and a waker of the queue the
+// process is about to park in pushes it (a waker pushes only if the word is 0, and sets it: S2).
+// Every park that joins a queue of its own arms here -- an event control or `wait`, `expect`,
+// a sync queue, `wait fork`, `await` -- and each of those is a TagInfo::arms_wake op.
+//
+// A statically subscribed body must never get here. Its static entry tests this word, so
+// armed here it would wake the body at this park for an event the park does not name (B51).
+// subscribed_statically excludes the bodies that hold such an op, so reaching this in one is
+// an arming op that TagInfo does not name.
+void Backend::emit_arm_wake_word() {
+    assert(!static_sub_body_ && "a statically subscribed body parks where its own static entry wakes it (B51): "
+                                "the op is missing TagInfo::arms_wake");
+    b_.CreateStore(b_.getInt64(0), sched_ptr_);
+}
+
 // A handle-carrying wait edge names no signal (it parks on an object the body
 // computes), so it must never be counted into a signal's bucket -- signal 0's,
 // in particular, which its zero placeholder would otherwise inflate.
@@ -296,12 +320,26 @@ Backend::WaitCounts Backend::wait_counts() const {
             c.sta[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)]++;
         }
     }
-    for (const Process& p : mod_.processes()) {
+    const auto procs = mod_.processes();
+    for (uint32_t k = 0; k < procs.size(); ++k) {
+        const Process& p = procs[k];
         // Gather the distinct (signal, edge) pairs this process intra-body
         // waits on, across every Wait's event list. A process is a single
         // coroutine suspended at one wait at a time, so it holds at most one
         // dynamic slot per (signal, edge) — count each distinct pair once.
         std::vector<std::pair<Signal, uint32_t>> seen;
+        // A process that waits at its head waits there for its leading list, as a
+        // dynamic waiter like any other: those pairs come first, and a Wait on one of
+        // them in its body costs no further slot.
+        if (waits_at_head(k)) {
+            for (const WaitEvent& w : p.wait_events) {
+                const std::pair<Signal, uint32_t> key{ w.signal, static_cast<uint32_t>(w.edge) };
+                if (!std::ranges::contains(seen, key)) {
+                    seen.push_back(key);
+                    c.dyn[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)]++;
+                }
+            }
+        }
         for (size_t i = 0; i < p.ir.inst_count(); ++i) {
             const auto idx = static_cast<Index>(i);
             if (p.ir.tag(idx) != Inst::Tag::Wait) {

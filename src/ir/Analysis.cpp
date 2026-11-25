@@ -18,6 +18,8 @@ TagInfo tag_info(Inst::Tag tag) {
     constexpr TagInfo none{};
     constexpr TagInfo pure{ .pure = true };
     constexpr TagInfo blocks{ .blocks_thunk = true };
+    // `arms` is `blocks` plus a park that arms the process's wake word (TagInfo::arms_wake).
+    constexpr TagInfo arms{ .blocks_thunk = true, .arms_wake = true };
     // `synth` is pure + maps to hardware, the common case for dataflow ops.
     // `hw` is synthesizable but not pure (the stores).
     constexpr TagInfo synth{ .pure = true, .synthesizable = true };
@@ -132,7 +134,6 @@ TagInfo tag_info(Inst::Tag tag) {
         // wakes waiters and `.triggered` reads per-event state, both outside the
         // pure-function-of-signal-reads model thunk elision assumes.
         case Inst::Tag::Delay:
-        case Inst::Tag::Wait:
         case Inst::Tag::TaskCall:
         case Inst::Tag::TaskCallVirtual:
         case Inst::Tag::EventNew:
@@ -164,25 +165,22 @@ TagInfo tag_info(Inst::Tag tag) {
         // same way.
         case Inst::Tag::StrobePend:
         case Inst::Tag::ReactivePend:
-        // An `expect` is a suspension point (ExpectWait) and its wake pushes onto
-        // the reactive ring from an Observed body (ExpectWake) -- neither is a pure
-        // function of the signals a thunk reads.
-        case Inst::Tag::ExpectWait:
+        // An `expect`'s wake pushes onto the reactive ring from an Observed body
+        // (ExpectWake), which is not a pure function of the signals a thunk reads.
         case Inst::Tag::ExpectWake:
         // Process control (LRM 9.7). Every one of these needs the calling thread's
         // control block, which a thunk-elided group does not have (no frame, no
-        // handle -- docs/design/process-class.md §4.3), and ProcWait is a suspension
-        // point besides. So the whole family forces a real coroutine rather than
-        // testing the payload: a body that mentions `process` at all is testbench
-        // code, never the sensitivity-driven RTL shape thunk elision targets.
+        // handle -- docs/design/process-class.md §4.3). So the whole family forces a
+        // real coroutine rather than testing the payload: a body that mentions
+        // `process` at all is testbench code, never the sensitivity-driven RTL shape
+        // thunk elision targets. ProcWait, which parks, is in the group below.
         case Inst::Tag::ProcQuery:
         case Inst::Tag::ProcCtl:
-        case Inst::Tag::ProcWait:
         // The wait queue of a built-in `semaphore` / `mailbox` (LRM 15.3, 15.4).
-        // SyncWait parks, and both need the frame the waiter node lives in, so
-        // neither can appear in a thunk-elided group either
-        // (docs/design/mailbox-and-semaphore.md §5.1).
-        case Inst::Tag::SyncWait:
+        // SyncCtl leaves or wakes a queue, and both need the frame the waiter node
+        // lives in, so neither can appear in a thunk-elided group either
+        // (docs/design/mailbox-and-semaphore.md §5.1). SyncWait, which parks, is in
+        // the group below.
         case Inst::Tag::SyncCtl:
         // Functional coverage (LRM 19). Sampling calls into the coverage runtime and
         // is testbench code by construction, never the sensitivity-driven RTL shape
@@ -191,6 +189,21 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::CoverQuery:
         case Inst::Tag::CoverCtl:
             return blocks;
+
+        // -- Blocks thunk elision, and arms the wake word. --
+        // Each parks the process in a queue of its own and stores 0 into its wake word
+        // first (TagInfo::arms_wake). A `#delay`, a join and a task call also suspend,
+        // but leave the word set, so they stay in the group above.
+        //   Wait: an event control, or a `wait` (a loop around one).
+        //   ExpectWait: an `expect` (LRM 16.17), in the queue of its monitor.
+        //   ProcWait: `wait fork` and `await` (LRM 9.6.1, 9.7), whose waiters are lists
+        //     of the thread control block.
+        //   SyncWait: the wait queue of a built-in `semaphore` / `mailbox`.
+        case Inst::Tag::Wait:
+        case Inst::Tag::ExpectWait:
+        case Inst::Tag::ProcWait:
+        case Inst::Tag::SyncWait:
+            return arms;
 
         // -- Synthesizable but not pure: the assignments, and the aggregate
         // accessors they assign through. --
@@ -1826,6 +1839,20 @@ struct ValueSweep {
     }
 };
 
+// Whether a body holds a park that arms its process's wake word. A flat scan of the
+// instruction column: the region tree is irrelevant, only whether such an op occurs at all
+// (a dead branch counts, which costs a process its static subscription, never a wrong
+// answer). See TagInfo::arms_wake.
+bool body_arms_wake(const Ir& ir) {
+    for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+        if (tag_info(ir.tag(static_cast<Index>(k))).arms_wake) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Shape eligible for coroutine elision. A BLACKLIST: `tag_info().blocks_thunk`
 // covers the unconditional disqualifiers, and the two payload-dependent ones are
 // spelled out here. Note the polarity -- an unclassified opcode stays eligible,
@@ -2057,6 +2084,7 @@ DesignFacts analyze(const Module& m) {
     for (size_t k = 0; k < nproc; ++k) {
         const Process& p                 = m.processes()[k];
         facts.processes[k].simple_always = is_simple_always(p);
+        facts.processes[k].arms_wake     = body_arms_wake(p.ir);
         facts.processes[k].comb_fuse     = comb_fuse_verdict(p, facts.processes[k], body_verdict[k]);
     }
 

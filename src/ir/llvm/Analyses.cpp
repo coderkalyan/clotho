@@ -845,7 +845,9 @@ void Backend::compute_subscription_order() {
         fn_state[f] = 2;
     };
 
-    // Readers: processes statically subscribed to each signal (any edge).
+    // Readers: processes woken by each signal (any edge). One that waits at its head
+    // (waits_at_head) counts like a statically subscribed one: the same writes wake it,
+    // and the order only ranks.
     std::vector<std::vector<uint32_t>> readers(nsigs);
     for (uint32_t k = 0; k < nprocs; ++k) {
         if (all[k].activation != Activation::Always) {

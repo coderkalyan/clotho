@@ -151,6 +151,26 @@ std::vector<uint32_t> dag_levels(uint32_t n, const std::vector<std::vector<uint3
 
 } // namespace
 
+// S1: how an always process waits for its leading list. The list is a wait at the top of
+// the process's forever loop (LRM 9.2.2, 9.4.2). A process whose body cannot arm its wake
+// word (TagInfo::arms_wake) has that wait done once by the seed, as entries in the buckets
+// and on the event objects of the list (subscribed_statically): the entries stay live, and
+// they are inert whenever the process is elsewhere, because the word is held set from the
+// wake to the re-arm before the next park (S2). A body that does arm it parks at a wait
+// where the word reads "not queued", so there the entries are not inert, and the process
+// waits at the top of its loop as a dynamic waiter instead (waits_at_head).
+bool Backend::subscribed_statically(uint32_t k) const {
+    const Process& p = mod_.processes()[k];
+
+    return p.activation == Activation::Always && !p.wait_events.empty() && !facts_.processes[k].arms_wake;
+}
+
+bool Backend::waits_at_head(uint32_t k) const {
+    const Process& p = mod_.processes()[k];
+
+    return p.activation == Activation::Always && !p.wait_events.empty() && facts_.processes[k].arms_wake;
+}
+
 // Fusion groups. A group is ONE function lowered from a unit's code and run
 // with an instance's record, so which processes fuse, in what order, and whether
 // the group is a thunk are decided on the unit, never on an instance's context:
@@ -581,14 +601,15 @@ void Backend::compute_fusion_groups() {
     group_events_.resize(groups_.size());
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         if (groups_[g].size() == 1) {
-            // Only an Always group subscribes (the seed loop in emit_active_run).
-            // A Preponed or Observed process may still carry wait_events naming
-            // the edge its own body tests for, but it is run explicitly and never
-            // woken. wait_counts sizes the static buckets from this list, and the
-            // scan walks every slot up to that capacity, so leaving those events
-            // here would reserve a slot nothing ever fills and the scan would
-            // read a null flag pointer out of it.
-            if (all[groups_[g].front()].activation == Activation::Always) {
+            // Only a statically subscribed group subscribes (the seed loop in
+            // emit_active_run). A Preponed or Observed process may still carry
+            // wait_events naming the edge its own body tests for, but it is run
+            // explicitly and never woken; a process that waits at its head is woken
+            // through the dynamic buckets (wait_counts). wait_counts sizes the
+            // static buckets from this list, and the scan walks every slot up to
+            // that capacity, so leaving those events here would reserve a slot
+            // nothing ever fills and the scan would read a null flag ptr.
+            if (subscribed_statically(groups_[g].front())) {
                 group_events_[g] = all[groups_[g].front()].wait_events;
             }
             continue;
