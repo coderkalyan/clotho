@@ -795,13 +795,19 @@ void assert_map([[maybe_unused]] const rt_gc_map* map) {
     // class emit clotho.classfini, so a leaf table without a finalizer means the two
     // emissions disagree.
     assert((map->nleaves == 0 || map->finalize != nullptr) && "managed leaves imply a finalizer");
-    // Offset 0 is the vptr, so 0 can mean "not a weak reference" and "no notifier".
-    assert((map->weak_referent == 0 ||
-            (map->weak_referent % sizeof(void*) == 0 && map->weak_referent + sizeof(void*) <= map->size)) &&
+}
+
+// The two weak fields of a weak reference's map. Checked where a weak reference is
+// met and not in assert_map(), which every object passes through several times in
+// a collection, in builds that ship with assertions on. Offset 0 is the vptr, so 0
+// can mean "no notifier".
+void assert_weak_map([[maybe_unused]] const rt_gc_map* map) {
+    assert(map->weak_referent != 0 && "only a weak reference has a referent");
+    assert(map->weak_referent % sizeof(void*) == 0 && map->weak_referent + sizeof(void*) <= map->size &&
            "a weak referent is an aligned word of the body");
-    assert((map->weak_notify == 0 || (map->weak_referent != 0 && map->weak_notify % sizeof(void*) == 0 &&
-                                      map->weak_notify + sizeof(void*) <= map->size)) &&
-           "a weak notifier is an aligned word of a weak reference's body");
+    assert((map->weak_notify == 0 ||
+            (map->weak_notify % sizeof(void*) == 0 && map->weak_notify + sizeof(void*) <= map->size)) &&
+           "a weak notifier is an aligned word of the body");
 }
 
 // The two loads generated code does (Gc.h:70-73): the vptr at handle[0], then the
@@ -1476,6 +1482,7 @@ void push_marked(void* handle) {
     g.worklist.push_back(handle);
     assert(g.worklist.size() <= g.stats.objects_allocated && "the mark stack outgrew the heap");
     if (map->weak_referent != 0) {
+        assert_weak_map(map);
         g.weak_reached.push_back(handle);
     }
 }
@@ -3217,7 +3224,8 @@ void verify_object(void* h, uint64_t granules, VerifyTally* t) {
     }
     // A weak reference's referent is an object or null, whether or not either is
     // marked: the collection that frees a referent clears every weak reference to it
-    // first (clear_weak_referents).
+    // first (clear_weak_referents). Only a weak reference has a notifier.
+    assert((map->weak_referent != 0 || map->weak_notify == 0) && "a notifier without a weak referent");
     if (map->weak_referent != 0) {
         void* const referent = *reinterpret_cast<void**>(static_cast<uint8_t*>(h) + map->weak_referent);
         assert((referent == nullptr || rt_gc_find_object(referent) == referent) &&
