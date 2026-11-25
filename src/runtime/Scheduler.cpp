@@ -1250,7 +1250,7 @@ void* alloc_pool_chunk(size_t bytes) {
 // not follow the link and `->> e` needs no write barrier.
 
 constexpr uint64_t kEventBytes = (sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
-constexpr rt_gc_map kEventMap = { kEventBytes, 0, 0, nullptr, nullptr, nullptr };
+constexpr rt_gc_map kEventMap   = { kEventBytes, 0, 0, nullptr, nullptr, nullptr, 0, 0 };
 
 // The descriptor: the map pointer, then the bytes that separate it from the word
 // an object's vptr names (rt_gc_map_vptr_offset). Filled by rt_run_init.
@@ -1437,6 +1437,18 @@ void event_gc_release_dead(bool (*reached)(void* handle)) {
         g_event_controls[trig] = nullptr;
         g_event_trig_free.push_back(trig);
     }
+}
+
+void event_pend(void* handle) {
+    assert(handle != nullptr && "an event object is pended, not null");
+    assert(g_event_pend_head != nullptr && "an event is pended during a run");
+    auto* const e = static_cast<rt_event*>(handle);
+    if (e->pending != 0) {
+        return; // already on the chain, which holds an event once
+    }
+    e->pending         = 1;
+    e->next_pend       = *g_event_pend_head;
+    *g_event_pend_head = e;
 }
 
 void event_keep(rt_event* e) {

@@ -2055,6 +2055,13 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // iff it fired something (an idle wheel ends the sim). The tick ctx is the
     // wheel; the generated on-expiry callbacks do not read it.
     llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
+    // An idle wheel ends the run: nothing follows but the final procedures and the
+    // teardown, which frees every object. So that edge is not a safepoint. A
+    // collection there would free what is about to be freed anyway, and a wait it
+    // woke by clearing a weak reference would have no time step to run in.
+    auto* live = llvm::BasicBlock::Create(ctx_, "wheel.ticked", fn);
+    b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), live, wdone);
+    b_.SetInsertPoint(live);
     // THE safepoint (docs/design/garbage-collection.md §2, F1). This is the
     // drain loop's quiescent edge: the active ring, the inactive queue, the
     // NBA region and the reactive ring have all drained to reach here, so
@@ -2074,40 +2081,31 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // and a cold not-taken branch, because the out-of-line call this
     // replaced cost real simulate time on designs that never allocate
     // (Gc.h:144-149).
-    emit_gc_safepoint();
+    emit_gc_safepoint(wheel);
     // Time advanced: a new instant begins, so reset the oscillation counter.
     b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
-    const bool preponed = has_preponed();
-    if (preponed || !inertial_sigs_.empty()) {
-        // Preponed (LRM 4.4.2.1) and inertial continuous-assignment delay
-        // (LRM 10.3.3) both belong at the top of a new time step, ahead of the
-        // active drain, and in that order: sampling precedes every update of
-        // the step it names, including a CA release.
-        //
-        // Inertial continuous-assignment delay (LRM 10.3.3): a CA updates its net
-        // in the ACTIVE region, so a store that fired on this wheel tick must be
-        // visible to same-instant processes the tick also resumed. Commit those
-        // records here, ahead of the active drain, unlike a procedural `<= #d`
-        // (nonblocking) which the NBA region commits after the active drain. The
-        // NBA-region intra loop still runs (below), but only sees records armed
-        // during this instant's active region (a `#0` continuous assign), the
-        // wheel-fired ones already released here.
-        auto* post_tick = llvm::BasicBlock::Create(ctx_, "wheel.posttick", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), post_tick, wdone);
-        b_.SetInsertPoint(post_tick);
-        if (preponed) {
-            // Preponed (LRM 4.4.2.1): run once at the top of a new time step -- after the
-            // wheel has fired its timers, which only enqueues handles, and before any body
-            // of that step executes -- and once from the seed so time zero is sampled too.
-            emit_run_once(Activation::Preponed, wheel, procs);
-        }
-        for (const Signal sig : inertial_sigs_) {
-            emit_intra_commit(sig);
-        }
-        b_.CreateBr(check);
-    } else {
-        b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
+    // Preponed (LRM 4.4.2.1) and inertial continuous-assignment delay
+    // (LRM 10.3.3) both belong at the top of a new time step, ahead of the
+    // active drain, and in that order: sampling precedes every update of
+    // the step it names, including a CA release.
+    if (has_preponed()) {
+        // Preponed (LRM 4.4.2.1): run once at the top of a new time step -- after the
+        // wheel has fired its timers, which only enqueues handles, and before any body
+        // of that step executes -- and once from the seed so time zero is sampled too.
+        emit_run_once(Activation::Preponed, wheel, procs);
     }
+    // Inertial continuous-assignment delay (LRM 10.3.3): a CA updates its net
+    // in the ACTIVE region, so a store that fired on this wheel tick must be
+    // visible to same-instant processes the tick also resumed. Commit those
+    // records here, ahead of the active drain, unlike a procedural `<= #d`
+    // (nonblocking) which the NBA region commits after the active drain. The
+    // NBA-region intra loop still runs (below), but only sees records armed
+    // during this instant's active region (a `#0` continuous assign), the
+    // wheel-fired ones already released here.
+    for (const Signal sig : inertial_sigs_) {
+        emit_intra_commit(sig);
+    }
+    b_.CreateBr(check);
 
     b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
     b_.CreateBr(wdone);

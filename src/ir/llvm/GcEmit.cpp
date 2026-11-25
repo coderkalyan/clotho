@@ -457,9 +457,15 @@ std::vector<uint32_t> Backend::class_handle_offsets(Ref class_ref) {
     const auto*           bl   = env_->llmod.getDataLayout().getStructLayout(body);
     const uint32_t        hdr  = class_header_words(class_ref);
     std::vector<uint32_t> out;
-    uint32_t              f = 0;
+    // The referent of a weak reference (LRM 8.30) is handle-typed like any property,
+    // and left out here: not being in this table is what makes it weak. The map
+    // names it separately (rt_gc_map::weak_referent) so the collector can clear it.
+    const WeakClass* weak = mod_.weak_class(class_ref);
+    uint32_t         f    = 0;
     for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-        collect_class_handles(fld.type, bl->getElementOffset(hdr + f), body->getElementType(hdr + f), out);
+        if (weak == nullptr || weak->referent_field != f) {
+            collect_class_handles(fld.type, bl->getElementOffset(hdr + f), body->getElementType(hdr + f), out);
+        }
         ++f;
     }
     // Ascending, so the collector's scan is a forward walk and so the table is
@@ -617,11 +623,33 @@ llvm::Constant* Backend::class_gc_map_global(Ref class_ref) {
     assert((leaves.empty() == llvm::isa<llvm::ConstantPointerNull>(leaf_arr)) &&
            "a zero leaf count pairs with a null leaf pointer");
     const uint64_t size = gc_object_bytes(class_ref);
-    auto* init = llvm::ConstantStruct::get(
-      gc_map_ty(), { b_.getInt64(size), b_.getInt32(static_cast<uint32_t>(offsets.size())),
-                     b_.getInt32(static_cast<uint32_t>(leaves.size())),
-                     gc_offsets_global(offsets, nm + ".handles"), leaf_arr,
-                     class_finalizer_fn(class_ref) });
+    // A weak reference (LRM 8.30): where its referent is, and where the event is
+    // that a wait on `get()` parks on, if the design has such a wait. The referent
+    // is a plain word, so class_handle_offsets left it out, which is the whole of
+    // what makes the reference weak; naming it here is what lets the collector
+    // clear it. Offset 0 is the vptr, so 0 says "none" for both.
+    uint32_t weak_referent = 0;
+    uint32_t weak_notify   = 0;
+    if (const WeakClass* weak = mod_.weak_class(class_ref); weak != nullptr) {
+        const auto*    sl      = env_->llmod.getDataLayout().getStructLayout(class_body_ty(class_ref));
+        const uint32_t hdr     = class_header_words(class_ref);
+        weak_referent          = static_cast<uint32_t>(sl->getElementOffset(hdr + weak->referent_field));
+        const ChangeNotify* cn = mod_.change_notify(class_ref, weak->referent_field);
+        if (cn != nullptr && cn->field[static_cast<uint32_t>(Edge::Any)] != kNoNotify) {
+            weak_notify =
+              static_cast<uint32_t>(sl->getElementOffset(hdr + cn->field[static_cast<uint32_t>(Edge::Any)]));
+        }
+        assert(weak_referent != 0 && "the referent follows the vptr");
+    }
+    auto* init = llvm::ConstantStruct::get(gc_map_ty(),
+                                           { b_.getInt64(size),
+                                             b_.getInt32(static_cast<uint32_t>(offsets.size())),
+                                             b_.getInt32(static_cast<uint32_t>(leaves.size())),
+                                             gc_offsets_global(offsets, nm + ".handles"),
+                                             leaf_arr,
+                                             class_finalizer_fn(class_ref),
+                                             b_.getInt32(weak_referent),
+                                             b_.getInt32(weak_notify) });
     return new llvm::GlobalVariable(env_->llmod, gc_map_ty(), /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init, nm);
 }
@@ -1367,7 +1395,16 @@ llvm::Value* Backend::gc_mutator_cur() {
 // Stress mode needs nothing extra here: rt_gc_init arms `request` and every
 // collection re-arms it, so this same poll fires at every safepoint
 // (Gc.h:144-149).
-void Backend::emit_gc_safepoint() {
+//
+// A collection here is the one that clears weak references, and it pends the
+// notifier of each one it clears that a wait reads get() of (LRM 8.30.3;
+// runtime/Gc.cpp, clear_weak_referents). Those are fired as soon as it returns:
+// every process is parked at this edge, so the waiters woken are the ones that were
+// waiting when the reference was cleared, and they run in the time step that is
+// about to begin. The chain holds nothing else, since the NBA region emptied it
+// before time moved. Only a design with such a wait has the code, on the cold side
+// of the poll.
+void Backend::emit_gc_safepoint(llvm::Value* wheel) {
     llvm::Function* fn = b_.GetInsertBlock()->getParent();
     // Every poll site is scheduler-level (emit_active_run, lowered into
     // sim_drain), never inside a body. gc_mutator_cur() serves coroutines too now
@@ -1386,6 +1423,12 @@ void Backend::emit_gc_safepoint() {
 
     b_.SetInsertPoint(collect);
     b_.CreateCall(gc_safepoint_slow_fn(), {});
+    for (const WeakClass& weak : mod_.weak_classes()) {
+        if (mod_.change_notify(weak.class_ref, weak.referent_field) != nullptr) {
+            emit_event_pend_drain(wheel);
+            break;
+        }
+    }
     b_.CreateBr(done);
     b_.SetInsertPoint(done);
 }
