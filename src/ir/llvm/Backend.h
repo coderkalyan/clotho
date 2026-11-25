@@ -4053,8 +4053,7 @@ private:
     bool design_uses_vcd() const;
 
     // Any StrobePend instruction anywhere in the design (a process body, or a
-    // task body it calls — $strobe is legal in either, never in a plain
-    // function)? Scans functions too.
+    // task or function it calls)? Scans functions too.
 
     // Any Observed-region report source in the design? Gates the per-instant
     // Observed-region flush (see emit_active_run). Currently a unique/priority

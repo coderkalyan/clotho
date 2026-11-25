@@ -2784,15 +2784,6 @@ void Lowerer::lower_display(const CallExpression& call, bool newline, ir::Builde
 // occurred for that simulation time, just before simulation time is
 // advanced"). The call site just pends that task.
 void Lowerer::lower_strobe(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
-    if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-        // The deferred body is ramped through the caller's task-call record
-        // slot, and record_slot() anchors on coro_begin_ -- a plain function
-        // is not a coroutine and has neither. (The clock itself is reachable
-        // here: the wheel is a global, so $time in a function works.)
-        // TODO: a record slot for a non-coroutine body would lift this.
-        fail("$strobe inside a function is not supported (no record slot to ramp "
-             "the deferred body)");
-    }
     const ir::FunctionId fid =
       build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/false);
     b.strobe_pend(fid, loc(call));
@@ -2805,10 +2796,6 @@ void Lowerer::lower_strobe(const CallExpression& call, ir::Builder& b, char defa
 // (runtime change-detection, rt_monitor_emit). A new
 // $monitor replaces the previous; $monitoron/$monitoroff enable/disable.
 void Lowerer::lower_monitor(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
-    if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-        fail("$monitor inside a function is not supported (no record slot to ramp "
-             "the deferred body)");
-    }
     const ir::FunctionId fid =
       build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/true);
     b.monitor_set(fid, loc(call));

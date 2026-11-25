@@ -190,11 +190,12 @@ TEST_CASE("$strobe inside a task") {
     )") == "in task v=7\n");
 }
 
-// $strobe is rejected inside a plain (non-task) function: the deferred body is
-// ramped through the caller's task-call record slot, which only a coroutine has.
-// (Reading the clock there is fine -- $time in a function works.)
-TEST_CASE("$strobe inside a plain function is rejected") {
-    check_rejected(R"(
+// $strobe inside a plain (non-task) function: the pended body is ramped with the
+// shared null record (pend_record_slot), not a record of the caller, so the
+// function needs no coroutine state of its own. The strobe still prints at the
+// end of the time step, after the caller's own $display. Oracle: Icarus Verilog 13.
+TEST_CASE("$strobe inside a plain function") {
+    CHECK(run_capture(R"(
         module m;
             int g;
             function automatic int f();
@@ -206,8 +207,56 @@ TEST_CASE("$strobe inside a plain function is rejected") {
                 $display("%0d", f());
             end
         endmodule
-    )",
-                   "$strobe inside a function is not supported");
+    )") == "0\ng=9\n");
+}
+
+// A function that pends a $strobe, called from an always_comb: it runs at time
+// zero and again each time its inputs change, and each run pends one print.
+// Oracle: Icarus Verilog 13 (it warns that $strobe is not synthesizable there).
+TEST_CASE("$strobe inside a function called from always_comb") {
+    CHECK(run_capture(R"(
+        module m;
+            int x = 0;
+            int y;
+            function void f();
+                $strobe("t=%0t strobe x=%0d", $time, x);
+            endfunction
+            always_comb begin
+                y = x + 1;
+                f();
+            end
+            initial begin
+                #1 x = 5;
+                #1 x = 5;
+                #1 x = 7;
+                #1 $finish;
+            end
+        endmodule
+    )") == "t=0 strobe x=0\nt=1 strobe x=5\nt=3 strobe x=7\n");
+}
+
+// Two instances of one module share one function body; each pends its own
+// print and reads its own instance's variable. The instances call at different
+// times so the output order is not a race. Oracle: Icarus Verilog 13.
+TEST_CASE("$strobe inside a function of a module with two instances") {
+    CHECK(run_capture(R"(
+        module leaf #(parameter int seed = 0, parameter int d = 1);
+            int v;
+            function void f();
+                $strobe("%m v=%0d", v);
+            endfunction
+            initial begin
+                v = seed;
+                #d f();
+                v = seed + 1;
+            end
+        endmodule
+        module top;
+            leaf #(10, 1) a();
+            leaf #(20, 2) b();
+            initial #4 $finish;
+        endmodule
+    )") == "top.a.f v=11\ntop.b.f v=21\n");
 }
 
 // An automatic-lifetime argument cannot be re-evaluated by the deferred body
@@ -376,16 +425,27 @@ TEST_CASE("$fmonitor ignores a changing $time argument") {
     )") == "t=0 a=0\nt=1 a=1\nt=4 a=2\n");
 }
 
-// $monitor pends its body the same way $strobe does, so it needs the same record
-// slot a plain function has not got; guard loud (like $strobe).
-TEST_CASE("$monitor in a function is rejected") {
-    check_rejected(R"(
+// $monitor in a function arms the same persistent monitor a task or process
+// does: the registration carries a pointer, not a record of the caller. Oracle:
+// Icarus Verilog 13 prints the same three lines.
+TEST_CASE("$monitor inside a function") {
+    CHECK(run_capture(R"(
         module m;
-          function void f(); $monitor("x"); endfunction
-          initial f();
+          int v = 1;
+          function int arm();
+            $monitor("mon v=%0d", v);
+            return 0;
+          endfunction
+          initial begin
+            v = 2;
+            void'(arm());
+            #1 v = 3;
+            #2 v = 3;
+            #1 v = 4;
+            #1 $finish;
+          end
         endmodule
-    )",
-                   "$monitor inside a function is not supported");
+    )") == "mon v=2\nmon v=3\nmon v=4\n");
 }
 
 // Each `initial` pends its $strobe and runs off its end in the same time step, so

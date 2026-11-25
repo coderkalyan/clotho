@@ -2163,8 +2163,9 @@ struct Inst {
         // whole point of $strobe is that evaluation itself is deferred to the
         // end of the time step, not merely the print, so nothing here is
         // re-evaluated later. A process containing this tag is forced to a
-        // coroutine (see is_simple_always) so its call site can ramp `func`'s
-        // coroutine frame through the task-call record ABI.
+        // coroutine (see is_simple_always). The body is ramped with the shared null
+        // record (Backend::pend_record_slot), not a record of the caller, so the
+        // tag is as legal in a plain function as in a task.
         StrobePend,
         // Schedule the compiler-synthesized zero-formal task `func` (payload:
         // extra -> StrobePendInfo) into the Reactive region of the current time
