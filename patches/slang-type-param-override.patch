@@ -1,0 +1,80 @@
+diff --git a/source/ast/Compilation.cpp b/source/ast/Compilation.cpp
+index d896c834e..9caafef76 100644
+--- a/source/ast/Compilation.cpp
++++ b/source/ast/Compilation.cpp
+@@ -318,8 +318,7 @@ const RootSymbol& Compilation::getRoot(bool skipDefParamsAndBinds) {
+     auto isValidTop = [&](auto& definition) {
+         // All parameters must have defaults.
+         for (auto& param : definition.parameters) {
+-            if (!param.hasDefault() &&
+-                (param.isTypeParam || cliOverrides.find(param.name) == cliOverrides.end())) {
++            if (!param.hasDefault() && cliOverrides.find(param.name) == cliOverrides.end()) {
+                 return false;
+             }
+         }
+@@ -511,11 +510,17 @@ const RootSymbol& Compilation::getRoot(bool skipDefParamsAndBinds) {
+         for (auto [result, _] : topDefs) {
+             auto& def = result.definition->as<DefinitionSymbol>();
+             for (auto& param : def.parameters) {
+-                if (!param.isTypeParam && param.hasSyntax) {
++                if (param.hasSyntax) {
+                     auto it = cliOverrides.find(param.name);
+                     if (it != cliOverrides.end()) {
++                        // A type parameter is keyed by its declarator, as ParameterBuilder
++                        // looks it up.
++                        const syntax::SyntaxNode* key = param.isTypeParam
++                                                            ? static_cast<const syntax::SyntaxNode*>(
++                                                                  param.typeDecl)
++                                                            : param.valueDecl;
+                         hierarchyOverrides.childNodes[*def.getSyntax()].paramOverrides.emplace(
+-                            param.valueDecl, it->second);
++                            key, it->second);
+                     }
+                 }
+             }
+@@ -1850,6 +1855,26 @@ void Compilation::parseParamOverrides(
+                                                       &treeRoot.as<ExpressionSyntax>(), nullptr});
+                             continue;
+                         }
++
++                        // Not an expression: a value that names a type, which only a type
++                        // parameter takes (IEEE 1800-2023 6.20.3, 23.10.2). Parse it as the
++                        // default of a type parameter, which is what it replaces.
++                        auto typeTree = SyntaxTree::fromText(
++                            fmt::format("parameter type __cli_t = {};", value), *sourceManager,
++                            "<command-line>"sv);
++                        if (typeTree->diagnostics().empty() &&
++                            typeTree->root().kind == SyntaxKind::ParameterDeclarationStatement) {
++                            auto& decl = typeTree->root()
++                                             .as<ParameterDeclarationStatementSyntax>()
++                                             .parameter->as<TypeParameterDeclarationSyntax>();
++                            if (decl.declarators.size() == 1 && decl.declarators[0]->assignment) {
++                                auto& type = *decl.declarators[0]->assignment->type;
++                                paramOverrideTrees.push_back(std::move(typeTree));
++                                results.emplace(name, HierarchyOverrideNode::ParamOverride{
++                                                          ConstantValue{}, &type, nullptr});
++                                continue;
++                            }
++                        }
+                     }
+                 }
+                 else {
+diff --git a/source/ast/symbols/ParameterBuilder.cpp b/source/ast/symbols/ParameterBuilder.cpp
+index 3da437a37..51f241087 100644
+--- a/source/ast/symbols/ParameterBuilder.cpp
++++ b/source/ast/symbols/ParameterBuilder.cpp
+@@ -177,6 +177,14 @@ const ParameterSymbolBase& ParameterBuilder::createParam(
+         }
+ 
+         auto& tt = param->targetType;
++        // A command-line override (-G) of a top-level type parameter rides in the
++        // hierarchy override node, keyed by the declarator, like a value parameter's.
++        if (!newInitializer && decl.typeDecl && overrideNode && !isFromConfig) {
++            if (auto it = overrideNode->paramOverrides.find(decl.typeDecl);
++                it != overrideNode->paramOverrides.end() && it->second.expr) {
++                newInitializer = it->second.expr;
++            }
++        }
+         if (newInitializer) {
+             // If this is a NameSyntax, the parser didn't know we were assigning to
+             // a type parameter, so fix it up into a NamedTypeSyntax to get a type from it.

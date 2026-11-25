@@ -296,6 +296,12 @@ FetchContent_Declare(
   # two-bit vector. A built-in system function cannot be replaced from outside:
   # Compilation::addSystemSubroutine keeps the subroutine already registered under
   # a name. Not upstream.
+  #
+  # slang-type-param-override: `-G T=<type>` on a top-level type parameter was dropped
+  # silently: slang's cli overrides skipped `isTypeParam` and parsed every value as an
+  # expression. The value now parses as a data type when it is no expression, and the
+  # override reaches the type parameter's builder through the hierarchy override node,
+  # keyed by its declarator like a value parameter's (LRM 6.20.3, 23.10.2). Not upstream.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  "-DPATCH_SET_HASH=${clotho_slang_patch_hash}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
