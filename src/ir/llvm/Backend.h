@@ -394,6 +394,11 @@ struct LValueInfo {
     // and its out-of-range sink. Only set for a container ELEMENT; a handle leaf
     // inside an aggregate leaves it invalid.
     Ref handle_type{};
+    // A queue reached through a `ref` formal: the max index of the queue the ACTUAL is
+    // (i64, 0 unbounded), passed beside the reference, since the formal's own type says
+    // nothing of it (slang does not make the bound part of a queue's type). Null for any
+    // other queue, whose bound is its type's.
+    llvm::Value* queue_bound = nullptr;
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
     // GEP index vector from `base` to the current sub-object (a leaf slot once a
@@ -1255,6 +1260,8 @@ struct RefActual {
 struct RefBinding {
     llvm::Value* slot  = nullptr;
     llvm::Value* chain = nullptr;
+    // A queue formal's actual's bound, passed as a third word; null for any other.
+    llvm::Value* bound = nullptr;
     std::string  formal;
 };
 
@@ -1959,6 +1966,14 @@ private:
     RefActual ref_actual_arg(const Guarded& raw, Ref type);
 
     llvm::Value* ref_witness_chain(const RefActual& ra);
+
+    // The bound word a queue `ref` formal is passed: the actual's own (a ref formal passed
+    // on keeps the one it was given), else its declared type's.
+    llvm::Value* ref_queue_bound(const Guarded& actual, Index actual_ix);
+
+    // The max index a queue operation on `lv` enforces: the bound a `ref` formal was passed
+    // if `lv` is one, else `type_bound`, its declared type's.
+    llvm::Value* queue_bound_of(const LValueInfo& lv, uint64_t type_bound);
 
     llvm::Value* ref_actual_ptr(const Guarded& lv, Ref type);
 

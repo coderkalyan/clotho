@@ -5579,7 +5579,8 @@ TEST_CASE("a ref to a whole container handle passes no witness chain") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(call_arity(ir, ".fn.f") == 6);
+    // state, rng, proc, home, slot, chain and the actual's queue bound.
+    CHECK(call_arity(ir, ".fn.f") == 7);
     CHECK(ir.find("%ref.epoch.at.call") == std::string::npos);
 }
 

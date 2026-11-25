@@ -1118,6 +1118,45 @@ RefActual Backend::ref_actual_arg(const Guarded& raw, Ref type) {
 // checks), else a caller-frame array of (&epoch, expected epoch) pairs, outermost
 // first, ended by a pair whose epoch is null. One shape whatever the actual, so
 // the formal's signature does not depend on any caller.
+llvm::Value* Backend::ref_queue_bound(const Guarded& actual, Index actual_ix) {
+    // A ref formal passed on keeps the bound it was given.
+    if (actual.queue_bound != nullptr) {
+        return actual.queue_bound;
+    }
+    // Otherwise the declared type of the place the actual names. The shapes with no
+    // single declared type (a class property reached through a handle) pass 0.
+    const Inst::Payload& p = ir_->payload(actual_ix);
+    std::optional<Ref>   declared;
+    switch (ir_->tag(actual_ix)) {
+        case Inst::Tag::Signal:
+            declared = mod_.signal(p.signal).type;
+            break;
+        case Inst::Tag::IfaceSignal:
+            declared = mod_.signal(ir_->extra_data<IfaceMember>(p.op_extra.extra).signal).type;
+            break;
+        case Inst::Tag::Local:
+            declared = p.local.type;
+            break;
+        case Inst::Tag::ElemSelect:
+            declared = std::get<Type>(mod_.pool.get(ir_->extra_data<ElemSelect>(p.op_extra.extra).array_type)).element;
+            break;
+        case Inst::Tag::MemberSelect: {
+            const auto  ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+            const Type& st = std::get<Type>(mod_.pool.get(ms.struct_type));
+            declared       = mod_.pool.struct_fields(st.fields_id)[ms.field_index].type;
+            break;
+        }
+        default:
+            break;
+    }
+    const uint64_t bound = declared && is_queue_type(*declared) ? std::get<Type>(mod_.pool.get(*declared)).left : 0;
+    return b_.getInt64(bound);
+}
+
+llvm::Value* Backend::queue_bound_of(const LValueInfo& lv, uint64_t type_bound) {
+    return lv.queue_bound != nullptr ? lv.queue_bound : b_.getInt64(type_bound);
+}
+
 llvm::Value* Backend::ref_witness_chain(const RefActual& ra) {
     auto* const ptr = llvm::PointerType::getUnqual(ctx_);
     if (ra.epochs.empty()) {

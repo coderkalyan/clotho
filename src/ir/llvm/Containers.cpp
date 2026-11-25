@@ -899,7 +899,7 @@ void Backend::lower_queue_push(Index i, bool front) {
     const DynElem e     = dynarr_elem(qa.queue_type);
     llvm::Value*  ops   = elem_ops_global(qa.queue_type);
     const uint64_t bound_v = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
-    llvm::Value*  bound = b_.getInt64(bound_v);
+    llvm::Value*  bound = queue_bound_of(lvalue_of(p.op), bound_v);
     // The write barrier for a container mutation reached through a class property
     // (§7). The barrier goes on the OWNING OBJECT rather than on the container,
     // because the container ABI carries no owner identity -- rt_queue_push_back
@@ -1033,8 +1033,8 @@ void Backend::lower_queue_insert(Index i) {
     llvm::Value*  ops   = elem_ops_global(qi.queue_type);
     llvm::Value*  idx   = cast(must_of(qi.idx), 64, false);
     const uint64_t bound_v = std::get<Type>(mod_.pool.get(qi.queue_type)).left;
-    llvm::Value*  bound = b_.getInt64(bound_v);
     const Guarded& qlv  = lvalue_of(p.op);
+    llvm::Value*  bound = queue_bound_of(qlv, bound_v);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     // A new element, so a new reference. See lower_queue_push.
     emit_gc_barrier_for(qlv);
@@ -1084,7 +1084,7 @@ void Backend::lower_queue_copy(Index i) {
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read),
                     elem_ops_global(qa.queue_type),
-                    b_.getInt64(bound),
+                    queue_bound_of(lvalue_of(p.op), bound),
                     alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound)) });
 }
 
@@ -1100,7 +1100,7 @@ void Backend::lower_queue_copy_dynarr(Index i) {
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read),
                     elem_ops_global(qa.queue_type),
-                    b_.getInt64(bound),
+                    queue_bound_of(lvalue_of(p.op), bound),
                     alloc_site_global(loc_text(i), "queue", queue_site_name(lvalue_of(p.op), bound)) });
 }
 
@@ -1108,7 +1108,7 @@ void Backend::lower_queue_append_range(Index i) {
     const auto& p     = ir_->payload(i).op_extra;
     const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
     const uint64_t bound_v = std::get<Type>(mod_.pool.get(qs.queue_type)).left;
-    llvm::Value* bound = b_.getInt64(bound_v);
+    llvm::Value* bound = queue_bound_of(lvalue_of(p.op), bound_v);
     // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
     llvm::Value* lo = cast(must_of(qs.lo), 64, /*sign=*/true);
     llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
