@@ -1650,7 +1650,15 @@ void Lowerer::lower_for_step(const Expression& e, ir::Builder& b) {
         lower_unary(e.as<UnaryExpression>(), b);
         return;
     }
-    fail("unsupported for-step expression (only assignment and ++/-- are supported)");
+    if (e.kind == ExpressionKind::Call) {
+        // `function_subroutine_call` in the step list (12.7.1): called as an
+        // expression statement is, its value, if any, discarded. A task here may
+        // suspend, which the step region carries like any other.
+        lower_call(e.as<CallExpression>(), b);
+        return;
+    }
+    // slang binds a step only as one of the three forms above.
+    fail("internal: unhandled for-step expression");
 }
 
 // `(* full_case *)` / `(* parallel_case *)`: a designer claim about the case

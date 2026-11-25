@@ -93,9 +93,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Thousands of straight-line statements over wide values** — LLVM's type legalizer
   recurses once per store of a value above 128 bits (a 4-state vector above 64 bits) in one
   block and overflows the compile thread's stack, so the JIT dies with SIGSEGV.
-- [ ] **Subroutine call as a `for` step** (12.7.1) — a `function_subroutine_call` in the step
-  list is refused.
-
 ## M2 — Icarus Verilog parity
 
 ### Time-consuming procedural code
