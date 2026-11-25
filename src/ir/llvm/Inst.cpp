@@ -807,12 +807,12 @@ void Backend::lower_inst(Index i) {
             // 4-state leaves, init its string leaves, and yield the handle as an
             // i64 (reference semantics: the pointer is the value).
             //
-            // The allocator returns the HANDLE -- the body base, one word above
-            // the GC header -- with the body already zeroed (2-state and handle
-            // leaves power on 0 / null) and the GC word already written, so no
-            // memset is emitted here. The header sits BELOW the handle precisely
-            // so that every property offset and the vptr store are plain
-            // non-negative offsets off the value a program holds (Gc.h:41-46).
+            // The allocator returns the HANDLE, which is the object's first byte, with
+            // the body already zeroed (2-state and handle leaves power on 0 / null)
+            // and the object's metadata written beside the heap, so no memset is
+            // emitted here. Nothing precedes the body, so every property offset and
+            // the vptr store are plain non-negative offsets off the value a program
+            // holds (Gc.h).
             //
             // The common case emits NO call at all: the bump sequence is inlined
             // (emit_gc_alloc_fast, design §4.3) and reaches rt_gc_alloc_slow only
@@ -872,8 +872,9 @@ void Backend::lower_inst(Index i) {
             //
             // The one exemption is the same fact the null check just used: a handle
             // straight out of ClassNew names an object the allocator returned a few
-            // instructions ago, whose GC word has mark bits 0 and OLD clear (Gc.cpp,
-            // alloc_object), so the barrier's test would not fire and the store needs none.
+            // instructions ago, which no collection has marked and which is therefore not
+            // old (Gc.cpp, alloc_object), so the barrier's test would not fire and the
+            // store needs none.
             //
             // That used to hold because nothing could collect between the `new` and the
             // store. An allocation can now (design §6.1): a property initializer or a
