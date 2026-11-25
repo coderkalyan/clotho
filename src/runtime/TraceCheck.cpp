@@ -61,12 +61,17 @@ enum class Ev : uint8_t {
     Pend,
     Trigger,
     Finish,
+    Change,
 };
 
 struct Entry {
-    const void* x;
-    const char* name;
-    uint64_t    edge;
+    const void*           x;
+    const char*           name;
+    uint64_t              edge;
+    // How to read the value at `x`, and the bytes it held at the park (R6b); null and empty for
+    // an event or a storage the checker does not read.
+    const rt_trace_shape* shape = nullptr;
+    std::vector<uint8_t>  snap;
 };
 
 struct Act {
@@ -87,6 +92,8 @@ struct Act {
     std::vector<Entry>      list;
     // The entries reported for the park that has not been reported yet.
     std::vector<Entry>      pending;
+    // Counts the parks, so that a wake owed to one park is not owed to the next.
+    uint64_t                park_seq = 0;
 };
 
 // A table from an address to a value, by open addressing: an activation per frame
@@ -136,6 +143,16 @@ public:
             vals_.assign(vals_.size(), V{});
         }
         count_ = 0;
+    }
+
+    // Calls `f(key, value)` for every entry.
+    template <typename F>
+    void for_each(F&& f) {
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            if (keys_[i] != 0) {
+                f(keys_[i], vals_[i]);
+            }
+        }
     }
 
 private:
@@ -225,6 +242,24 @@ struct Pend {
     uint32_t  region;
 };
 
+// What the last write of a storage did, by the checker's own reading of its bits (R7), and in which
+// step of the run it was made: a wake by a store follows its change with no dispatch, park or region
+// between (R6.2).
+struct ChgFacts {
+    uint64_t step = 0;
+    bool     pos  = false;
+    bool     neg  = false;
+    bool     any  = false;
+};
+
+// A wake that a change owes to an activation parked as it was at that moment (R6.1).
+struct Owed {
+    uintptr_t act;
+    uint64_t  seq;
+    uintptr_t x;
+    uint64_t  edge;
+};
+
 struct Checker {
     AddrMap<Act>         acts;
     AddrMap<const char*> names;
@@ -264,6 +299,12 @@ struct Checker {
     // The word buffers of retired updates, so that a design that stages an update every cycle
     // allocates none.
     std::vector<std::vector<uint64_t>> spare;
+    // R6: the activations that list a storage or an event object, by its address (stale ones
+    // are dropped as they are found), the last write of each storage, and the wakes owed.
+    AddrMap<std::vector<uintptr_t>> watch;
+    AddrMap<ChgFacts>               chg;
+    std::vector<Owed>               owed;
+    uint64_t                        step = 0;
 };
 
 Checker g;
@@ -357,6 +398,7 @@ const char* ev_name(Ev ev) {
         case Ev::Pend: return "pend";
         case Ev::Trigger: return "trigger";
         case Ev::Finish: return "finish";
+        case Ev::Change: return "change";
     }
     return "?";
 }
@@ -402,6 +444,19 @@ const char* path_name(uint32_t p) {
     return "?";
 }
 
+const char* chg_path_name(uint32_t p) {
+    switch (p) {
+        case RT_TRACE_CHG_STORE: return "store";
+        case RT_TRACE_CHG_COMMIT: return "NBA commit";
+        case RT_TRACE_CHG_WINDOW: return "wide-select store";
+        case RT_TRACE_CHG_PROPERTY: return "class property store";
+        case RT_TRACE_CHG_REF: return "ref write";
+        case RT_TRACE_CHG_STRING: return "string compare";
+        case RT_TRACE_CHG_LEVEL: return "level wake";
+    }
+    return "?";
+}
+
 // What a rule's id names, for the first line of a report.
 const char* rule_title(const char* rule) {
     static const struct {
@@ -412,6 +467,11 @@ const char* rule_title(const char* rule) {
         { "R5.2", "dispatch" },
         { "R5.3", "resume" },
         { "R5.4", "end" },
+        { "R6.1", "wake owed" },
+        { "R6.2", "wake without a change" },
+        { "R6.3", "change not woken" },
+        { "R7.1", "edge fact" },
+        { "R7.2", "change fact" },
         { "R12.1", "nba order" },
         { "R12.2", "nba left unapplied" },
         { "R12.3", "nba pass" },
@@ -524,6 +584,9 @@ std::string rec_text(const Rec& r) {
         case Ev::Trigger:
             out += std::string(r.cause == RT_TRACE_TRIGGER_NB ? " ->> " : " -> ") + "event " +
                    signal_text(reinterpret_cast<const void*>(r.a));
+            break;
+        case Ev::Change:
+            out += " of " + signal_text(reinterpret_cast<const void*>(r.a)) + " (" + chg_path_name(r.cause) + ")";
             break;
         default: break;
     }
@@ -685,7 +748,7 @@ std::string cause_text(uint32_t cause, const void* x, uint32_t fact) {
 
 void add_entries(std::vector<Entry>& to, const rt_trace_entry* list, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i) {
-        to.push_back(Entry{ list[i].x, list[i].name, list[i].edge });
+        to.push_back(Entry{ list[i].x, list[i].name, list[i].edge, list[i].shape, {} });
         if (list[i].name != nullptr) {
             g.names.at(reinterpret_cast<uintptr_t>(list[i].x)) = list[i].name;
         }
@@ -1087,6 +1150,202 @@ bool closure(const char* what, bool active_only) {
     return false;
 }
 
+// -- Waiters, writes and design memory (R6, R7) --
+
+uint32_t rank_of(bool must, bool may) {
+    return must ? 2 : (may ? 1 : 0);
+}
+
+const char* rank_name(uint32_t rank) {
+    return rank == 2 ? "1" : (rank == 1 ? "x or z" : "0");
+}
+
+// The value bits at `x`, as the shape says: for each element the must|may word then the z word,
+// the bytes past the last bit cleared.
+void read_value(const void* x, const rt_trace_shape* s, std::vector<uint8_t>& out) {
+    out.clear();
+    const uint32_t n0 = (s->bits0 + 7) / 8;
+    const uint32_t n1 = (s->bits1 + 7) / 8;
+    const auto     put = [&](const uint8_t* p, uint32_t bits, uint32_t n) {
+        const size_t at = out.size();
+        out.insert(out.end(), p, p + n);
+        if (n != 0 && bits % 8 != 0) {
+            out[at + n - 1] &= static_cast<uint8_t>((1u << (bits % 8)) - 1);
+        }
+    };
+    for (uint32_t e = 0; e < s->count; ++e) {
+        const uint8_t* p = static_cast<const uint8_t*>(x) + static_cast<size_t>(e) * s->stride;
+        put(p, s->bits0, n0);
+        if (n1 != 0) {
+            put(p + s->z_off, s->bits1, n1);
+        }
+    }
+}
+
+// The rank of bit 0 of the first element of a value read_value took.
+uint32_t snap_rank(const rt_trace_shape* s, const std::vector<uint8_t>& v) {
+    if (v.empty()) {
+        return 0;
+    }
+    const bool must = (v[0] & 1) != 0;
+    bool       may  = false;
+    if (s->bits0 > s->width) {
+        may = ((v[s->width / 8] >> (s->width % 8)) & 1) != 0;
+    }
+    return rank_of(must, may);
+}
+
+// Whether the change from the bytes an entry saw at its park to `now` satisfies its edge.
+bool satisfied(const Entry& e, const std::vector<uint8_t>& now) {
+    if (e.edge == RT_TRACE_ANY) {
+        return e.snap != now;
+    }
+    if (e.edge != RT_TRACE_POS && e.edge != RT_TRACE_NEG) {
+        return false;
+    }
+    const uint32_t ro = snap_rank(e.shape, e.snap);
+    const uint32_t rn = snap_rank(e.shape, now);
+    return e.edge == RT_TRACE_POS ? rn > ro : rn < ro;
+}
+
+std::string bytes_text(const std::vector<uint8_t>& v) {
+    std::string out = "0x";
+    char        buf[4];
+    for (size_t i = 0; i < v.size() && i < 16; ++i) {
+        std::snprintf(buf, sizeof(buf), "%02x", v[v.size() - 1 - i]);
+        out += buf;
+    }
+    return v.size() > 16 ? out + "..." : out;
+}
+
+void snapshot_entry(Entry& e) {
+    if (e.shape != nullptr) {
+        read_value(e.x, e.shape, e.snap);
+    } else {
+        e.snap.clear();
+    }
+}
+
+// Whether the activation still has a reason to be woken by `x`: its static list names it, or it is
+// parked at an event control that does.
+bool lists_x(const Act& act, uintptr_t x) {
+    for (const Entry& e : act.stat) {
+        if (reinterpret_cast<uintptr_t>(e.x) == x) {
+            return true;
+        }
+    }
+    if (act.state == State::Parked && act.park != nullptr && act.park->kind == RT_TRACE_CTL_EVENT) {
+        for (const Entry& e : act.list) {
+            if (reinterpret_cast<uintptr_t>(e.x) == x) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void watch_add(const void* x_, uintptr_t a) {
+    const uintptr_t x = reinterpret_cast<uintptr_t>(x_);
+    if (x == 0) {
+        return;
+    }
+    std::vector<uintptr_t>& v = g.watch.at(x);
+    if (!v.empty() && v.back() == a) {
+        return;
+    }
+    const size_t n = v.size();
+    if (n >= 16 && (n & (n - 1)) == 0) {
+        size_t kept = 0;
+        for (const uintptr_t w : v) {
+            const Act* act = g.acts.find(w);
+            if (act != nullptr && lists_x(*act, x)) {
+                v[kept++] = w;
+            }
+        }
+        v.resize(kept);
+    }
+    v.push_back(a);
+}
+
+// A write (or, for `obj`, a trigger) of `x`: each activation parked at a control that lists an
+// entry the change satisfies is owed a wake before the next dispatch, park or region.
+void owe(const void* x_, bool pos, bool neg, bool any, bool obj) {
+    const uintptr_t x = reinterpret_cast<uintptr_t>(x_);
+    const auto*     v = x != 0 ? g.watch.find(x) : nullptr;
+    if (v == nullptr) {
+        return;
+    }
+    for (const uintptr_t a : *v) {
+        const Act* act = g.acts.find(a);
+        if (act == nullptr || act->state != State::Parked || act->park == nullptr) {
+            continue;
+        }
+        const uint32_t kind = act->park->kind;
+        if (kind != RT_TRACE_CTL_STATIC && kind != RT_TRACE_CTL_EVENT) {
+            continue;
+        }
+        for (const Entry& e : kind == RT_TRACE_CTL_STATIC ? act->stat : act->list) {
+            if (reinterpret_cast<uintptr_t>(e.x) != x) {
+                continue;
+            }
+            const bool hit = obj ? e.edge == RT_TRACE_OBJ
+                                 : ((e.edge == RT_TRACE_ANY && any) || (e.edge == RT_TRACE_POS && pos) ||
+                                    (e.edge == RT_TRACE_NEG && neg));
+            if (hit) {
+                g.owed.push_back(Owed{ a, act->park_seq, x, e.edge });
+                break;
+            }
+        }
+    }
+}
+
+// The point a write's wakes must have been made by: every activation still parked as it was is a
+// violation.
+void settle_owed() {
+    if (g.owed.empty()) {
+        return;
+    }
+    for (const Owed& o : g.owed) {
+        const Act* act = g.acts.find(o.act);
+        if (act != nullptr && act->state == State::Parked && act->park_seq == o.seq) {
+            std::string cause = std::string(edge_name(o.edge)) + " " + signal_text(reinterpret_cast<const void*>(o.x)) +
+                                " changed, and the activation was still parked when the next dispatch, park or region came";
+            fail("R6.1", "an activation parked on a change that happened was not woken", o.act, cause);
+            break;
+        }
+    }
+    g.owed.clear();
+}
+
+// R6b: at the end of a slot, an activation still parked whose entry the change from its bytes at the
+// park to its bytes now satisfies was never woken, by a store no bracket reported or one it skipped.
+void poll_waiters() {
+    std::vector<uint8_t> now;
+    bool                 bad = false;
+    g.acts.for_each([&](uintptr_t a, Act& act) {
+        if (bad || act.state != State::Parked || act.park == nullptr) {
+            return;
+        }
+        const uint32_t kind = act.park->kind;
+        if (kind != RT_TRACE_CTL_STATIC && kind != RT_TRACE_CTL_EVENT) {
+            return;
+        }
+        for (const Entry& e : kind == RT_TRACE_CTL_STATIC ? act.stat : act.list) {
+            if (e.shape == nullptr || e.snap.empty()) {
+                continue;
+            }
+            read_value(e.x, e.shape, now);
+            if (satisfied(e, now)) {
+                const std::string cause = std::string(edge_name(e.edge)) + " " + signal_text(e.x) + ": its bytes were " +
+                                          bytes_text(e.snap) + " when the activation parked and are " + bytes_text(now) + " now";
+                fail("R6.3", "the value an activation waits on changed while it was parked, and no wake came", a, cause);
+                bad = true;
+                return;
+            }
+        }
+    });
+}
+
 } // namespace
 
 extern "C" void rt_trace_begin(void) {
@@ -1116,6 +1375,10 @@ extern "C" void rt_trace_begin(void) {
     g.sorted_keys = 0;
     g.arm_seq     = 0;
     g.pends.clear();
+    g.watch.clear();
+    g.chg.clear();
+    g.owed.clear();
+    g.step = 0;
 }
 
 extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* parent) {
@@ -1149,6 +1412,9 @@ extern "C" void rt_trace_subscribe(void* a_, const rt_trace_entry* list, uint32_
     }
     if (Act* act = find("R5.3", norm(a_), "subscription"); act != nullptr) {
         add_entries(act->stat, list, n);
+        for (uint32_t i = 0; i < n; ++i) {
+            watch_add(list[i].x, norm(a_));
+        }
     }
 }
 
@@ -1157,22 +1423,27 @@ extern "C" void rt_trace_subscribe_event(void* a_, const void* obj, const char* 
         return;
     }
     if (Act* act = find("R5.3", norm(a_), "subscription"); act != nullptr) {
-        const rt_trace_entry e{ obj, name, RT_TRACE_OBJ };
+        const rt_trace_entry e{ obj, name, RT_TRACE_OBJ, nullptr };
         add_entries(act->stat, &e, 1);
+        watch_add(obj, norm(a_));
     }
 }
 
-extern "C" void rt_trace_waits_for(void* a_, const void* x, const char* name, uint64_t edge) {
+extern "C" void rt_trace_waits_for(void* a_, const void* x, const char* name, uint64_t edge, const rt_trace_shape* shape) {
     if (g.halted) {
         return;
     }
     if (Act* act = find("R5.3", norm(a_), "park list"); act != nullptr) {
-        const rt_trace_entry e{ x, name, edge };
+        const rt_trace_entry e{ x, name, edge, shape };
         add_entries(act->pending, &e, 1);
     }
 }
 
 extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t delay) {
+    if (g.halted) {
+        return;
+    }
+    settle_owed();
     if (g.halted) {
         return;
     }
@@ -1200,6 +1471,18 @@ extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t dela
         act->list.swap(act->pending);
     }
     act->pending.clear();
+    ++act->park_seq;
+    ++g.step;
+    if (c != nullptr && c->kind == RT_TRACE_CTL_EVENT) {
+        for (Entry& e : act->list) {
+            snapshot_entry(e);
+            watch_add(e.x, a);
+        }
+    } else if (c != nullptr && c->kind == RT_TRACE_CTL_STATIC) {
+        for (Entry& e : act->stat) {
+            snapshot_entry(e);
+        }
+    }
     act->zero     = delay == 0;
     act->deadline = delay > UINT64_MAX - g.now ? UINT64_MAX : g.now + delay;
     record(Ev::Park, a, delay, c, 0, 0);
@@ -1248,6 +1531,17 @@ extern "C" void rt_trace_wake(void* a_, uint32_t cause, const void* x, uint32_t 
             break;
         }
     }
+    // A wake by a store follows a write of that storage that the facts of the checker's own
+    // reading say satisfies the wake (R6.2).
+    if (cause == RT_TRACE_STATIC || cause == RT_TRACE_DYNAMIC || cause == RT_TRACE_VIF) {
+        const ChgFacts* c  = g.chg.find(reinterpret_cast<uintptr_t>(x));
+        const bool      ok = c != nullptr && c->step == g.step &&
+                        (fact == RT_TRACE_POS ? c->pos : (fact == RT_TRACE_NEG ? c->neg : c->any));
+        if (!ok) {
+            fail("R6.2", "a wake by a store of a value that no bracket reported changing that way", a, cause_text(cause, x, fact));
+            return;
+        }
+    }
     // Past a `$finish` only the completions that make each frame leave wake anything (R24).
     if (g.finished && !completion_cause(cause)) {
         fail("R24.1", "wake after $finish: code of the finishing thread, or of something it woke, ran on", a,
@@ -1263,6 +1557,11 @@ extern "C" int32_t rt_trace_dispatch(void* a_, uint32_t how) {
     if (g.halted) {
         return 0;
     }
+    settle_owed();
+    if (g.halted) {
+        return 0;
+    }
+    ++g.step;
     const uintptr_t a = norm(a_);
     ++g.run.dispatches;
     ++g.total.dispatches;
@@ -1351,6 +1650,11 @@ extern "C" void rt_trace_slot(uint64_t now) {
     if (g.halted) {
         return;
     }
+    settle_owed();
+    if (g.halted) {
+        return;
+    }
+    ++g.step;
     g.now    = now;
     g.region = RT_TRACE_REG_PREPONED;
     ++g.slot_no;
@@ -1362,11 +1666,18 @@ extern "C" void rt_trace_slot_end(void) {
         return;
     }
     record(Ev::SlotEnd, 0, 0, nullptr, 0, 0);
+    settle_owed();
+    if (g.halted) {
+        return;
+    }
     if (g.in_pass) {
         fail("R12.3", "the slot ends inside an NBA pass", 0, "");
         return;
     }
-    closure("the slot ends", false);
+    if (closure("the slot ends", false)) {
+        return;
+    }
+    poll_waiters();
 }
 
 extern "C" void rt_trace_finish(void) {
@@ -1394,6 +1705,11 @@ extern "C" void rt_trace_region(uint32_t region) {
     if (g.halted || (region == RT_TRACE_REG_FINAL && !g.counted)) {
         return;
     }
+    settle_owed();
+    if (g.halted) {
+        return;
+    }
+    ++g.step;
     if (region != RT_TRACE_REG_FINAL) {
         touch_run();
     }
@@ -1619,6 +1935,7 @@ extern "C" void rt_trace_trigger(const void* obj, uint32_t kind) {
              "event " + signal_text(obj));
         return;
     }
+    owe(obj, false, false, false, true);
     if (kind != RT_TRACE_TRIGGER_NB) {
         return;
     }
@@ -1639,6 +1956,82 @@ extern "C" void rt_trace_trigger(const void* obj, uint32_t kind) {
         return;
     }
     g.pends.pop_front();
+}
+
+extern "C" void rt_trace_change(const rt_trace_change_site* site, const void* x, uint32_t seen) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.changes;
+    ++g.total.changes;
+    record(Ev::Change, reinterpret_cast<uintptr_t>(x), seen, nullptr, static_cast<uint8_t>(site->path), 0);
+    if (site->name != nullptr && x != nullptr) {
+        g.names.at(reinterpret_cast<uintptr_t>(x)) = site->name;
+    }
+    const auto has_seen = [&](uint32_t f) { return (seen & f) != 0; };
+    bool       pos = false;
+    bool       neg = false;
+    bool       any = false;
+    if (has_seen(RT_TRACE_SEEN_LEVEL)) {
+        any = true;
+    } else {
+        const bool     four = has_seen(RT_TRACE_SEEN_FOUR);
+        const uint32_t ro   = rank_of(has_seen(RT_TRACE_SEEN_OLD_MUST), four && has_seen(RT_TRACE_SEEN_OLD_MAY));
+        const uint32_t rn   = rank_of(has_seen(RT_TRACE_SEEN_NEW_MUST), four && has_seen(RT_TRACE_SEEN_NEW_MAY));
+        const bool     bit0 = has_seen(RT_TRACE_SEEN_BIT0);
+        if (bit0) {
+            pos = rn > ro;
+            neg = rn < ro;
+            const struct {
+                uint32_t known;
+                uint32_t value;
+                bool     expected;
+                const char* name;
+            } facts[] = { { RT_TRACE_SEEN_POS_KNOWN, RT_TRACE_SEEN_POS, pos, "posedge" },
+                          { RT_TRACE_SEEN_NEG_KNOWN, RT_TRACE_SEEN_NEG, neg, "negedge" } };
+            for (const auto& f : facts) {
+                if (has_seen(f.known) && has_seen(f.value) != f.expected) {
+                    std::string cause = std::string("bit 0 went from ") + rank_name(ro) + " to " + rank_name(rn) +
+                                        " (Table 9-2: 0 < x = z < 1), so the " + f.name + " fact must be " +
+                                        (f.expected ? "true" : "false") + " and the code computed " +
+                                        (f.expected ? "false" : "true") + "; write of " +
+                                        signal_text(x) + " at " + (site->where != nullptr ? site->where : "<unknown>");
+                    fail("R7.1", std::string("the ") + f.name + " fact of a write disagrees with Table 9-2", 0, cause);
+                    return;
+                }
+            }
+        } else {
+            pos = has_seen(RT_TRACE_SEEN_POS_KNOWN) && has_seen(RT_TRACE_SEEN_POS);
+            neg = has_seen(RT_TRACE_SEEN_NEG_KNOWN) && has_seen(RT_TRACE_SEEN_NEG);
+        }
+        if (has_seen(RT_TRACE_SEEN_DIFF_KNOWN)) {
+            const bool diff  = has_seen(RT_TRACE_SEEN_DIFF);
+            const bool zdiff = has_seen(RT_TRACE_SEEN_ZDIFF_KNOWN) && has_seen(RT_TRACE_SEEN_ZDIFF);
+            // A z word the bracket did not read (no level waiter consumes it) leaves `changed` known
+            // only to be true when a plane differs.
+            const bool exact = !has_seen(RT_TRACE_SEEN_HAS_Z) || has_seen(RT_TRACE_SEEN_ZDIFF_KNOWN);
+            if (has_seen(RT_TRACE_SEEN_ANY_KNOWN)) {
+                const bool code = has_seen(RT_TRACE_SEEN_ANY);
+                if ((exact && code != (diff || zdiff)) || (!exact && diff && !code)) {
+                    std::string cause = std::string("the planes ") + (diff ? "differ" : "are equal") + ", the z word " +
+                                        (has_seen(RT_TRACE_SEEN_ZDIFF_KNOWN) ? (zdiff ? "differs" : "is equal") : "was not read") +
+                                        ", and the code computed `changed` = " + (code ? "true" : "false") + "; write of " +
+                                        signal_text(x) + " at " + (site->where != nullptr ? site->where : "<unknown>");
+                    fail("R7.2", "the `changed` fact of a write disagrees with the planes it wrote", 0, cause);
+                    return;
+                }
+            }
+            any = diff || zdiff;
+        } else if (has_seen(RT_TRACE_SEEN_ANY_KNOWN)) {
+            any = has_seen(RT_TRACE_SEEN_ANY);
+        }
+        any = any || pos || neg;
+    }
+    if (x != nullptr) {
+        g.chg.at(reinterpret_cast<uintptr_t>(x)) = ChgFacts{ g.step, pos, neg, any };
+        owe(x, pos, neg, any, false);
+    }
 }
 
 extern "C" int32_t rt_trace_halted(void) {

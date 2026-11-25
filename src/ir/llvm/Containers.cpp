@@ -521,6 +521,11 @@ void Backend::notify_container_mutation(const LValueInfo& lv) {
 void Backend::service_signal_container_mutation(Signal sig) {
     const auto i = static_cast<uint32_t>(sig);
     const auto e = static_cast<uint32_t>(Edge::Any);
+    if (trace_on()) {
+        TraceSeen t;
+        t.level = true;
+        emit_trace_change(RT_TRACE_CHG_LEVEL, sig, storage_ptr(slot_of(sig)), t);
+    }
     if (wait_sta_gv_[i][e] != nullptr) {
         service_static_queue(sig, e);
     }

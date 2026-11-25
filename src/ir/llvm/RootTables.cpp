@@ -417,7 +417,7 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
     };
     std::vector<TraceRow>                     trace_rows;
     std::vector<std::vector<llvm::Constant*>> trace_entries(procs.size());
-    auto* const                               trace_entry_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i64 });
+    auto* const                               trace_entry_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i64, ptr_ty });
 
     // Schedule groups with an always_comb / always_latch member start after every other
     // body. A fused group is ONE body, so a continuous assignment fused with such a
@@ -582,7 +582,8 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
                 if (trace_on()) {
                     trace_entries[g].push_back(llvm::ConstantStruct::get(
                       trace_entry_ty,
-                      { storage_address(slot_of(w.signal)), name, b_.getInt64(static_cast<uint32_t>(w.edge)) }));
+                      { storage_address(slot_of(w.signal)), name, b_.getInt64(static_cast<uint32_t>(w.edge)),
+                        trace_shape(root_env_->llmod, w.signal) }));
                 }
             }
         }
