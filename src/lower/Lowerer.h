@@ -1806,6 +1806,25 @@ private:
 
     void finalize_sim_nets();
 
+    // A net's own net delay (LRM 28.16): its single delay-value expression and the
+    // multipliers of the time unit of the module that declares the net (LRM 3.14.1),
+    // as time_mul_ / prec_over_tick_ hold them while that module is lowered.
+    // emit_wire_resolvers lowers the delay after the whole top is walked, when the
+    // unit of no one instance is current.
+    struct NetDelay {
+        const Expression* expr;
+        uint64_t          time_mul;
+        uint64_t          prec_over_tick;
+    };
+
+    // fail()'s text for a net delay of rise / fall / turn-off values.
+    static constexpr std::string_view kNetDelayTriple =
+      "net delay rise/fall/turn-off triples (wire #(a,b,c)) are not supported";
+
+    NetDelay net_delay_of(const NetSymbol& net);
+
+    ir::Index scaled_net_delay(const NetDelay& d, ir::Builder& b);
+
     static bool is_modeled_net_kind(NetType::NetKind kind);
 
     // fail()'s text for a net type is_modeled_net_kind refuses.
@@ -5919,12 +5938,12 @@ private:
     };
     ankerl::unordered_dense::map<uint32_t, PullInfo> net_pull_;
     // Nets declared with a plain net delay (`wire #5 w;`, no net_decl_assignment
-    // — LRM 28.16), keyed by signal id: the single delay-value expression,
-    // lowered lazily by emit_wire_resolvers once every driver has registered
-    // its slot. Distinct from a delay embedded in a net-declaration ASSIGNMENT
-    // (`wire #5 w = expr;`), which LRM 10.3.3 treats as that one driver's own
-    // continuous-assign delay instead and lowers through lower_net_initializer.
-    ankerl::unordered_dense::map<uint32_t, const Expression*> net_delay_;
+    // — LRM 28.16), keyed by signal id, lowered lazily by emit_wire_resolvers once
+    // every driver has registered its slot. Distinct from a delay embedded in a
+    // net-declaration ASSIGNMENT (`wire #5 w = expr;`), which LRM 10.3.3 treats as
+    // that one driver's own continuous-assign delay instead and lowers through
+    // lower_net_initializer.
+    ankerl::unordered_dense::map<uint32_t, NetDelay> net_delay_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.

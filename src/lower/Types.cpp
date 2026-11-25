@@ -1348,8 +1348,7 @@ void Lowerer::collect_scope_signals(
                             // TODO: rise/fall/turn-off net delay
                             // (`wire #(a,b,c) w;`), LRM 28.16 — same gap as
                             // the continuous-assign / gate delay triple.
-                            fail("net delay rise/fall/turn-off triples (wire #(a,b,c)) are "
-                                 "not supported");
+                            fail(std::string(kNetDelayTriple));
                         }
                         if (is_aggregate(vs.getType()) || vs.getType().getCanonicalType().isUnpackedArray()) {
                             // TODO: net delay on an unpacked array or aggregate
@@ -1405,7 +1404,7 @@ void Lowerer::collect_scope_signals(
                     // WireRes, so a delayed wand/wor net still resolves by
                     // value instead of by the wrong reducer.
                     if (nsym.getDelay() != nullptr && nsym.getInitializer() == nullptr) {
-                        net_delay_[static_cast<uint32_t>(sig)] = single_delay_expr(*nsym.getDelay());
+                        net_delay_[static_cast<uint32_t>(sig)] = net_delay_of(nsym);
                         if (resolved_nets_.insert(static_cast<uint32_t>(sig)).second) {
                             net_resolve_op_[static_cast<uint32_t>(sig)] = net_resolve_tag(nk);
                         }

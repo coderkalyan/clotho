@@ -229,17 +229,44 @@ void Lowerer::finalize_sim_nets() {
             net_resolve_op_[net_u] = net_resolve_tag(kind);
         }
         // "The simulated net shall take the delay specified for the dominating
-        // net": the owner's delay goes when another net dominates it.
+        // net": the owner's delay goes when another net dominates it, and the
+        // dominating net's own takes its place, in the time unit of the module
+        // that declares it (net_delay_of), which is not the owner's.
         if (sim.dominating != sim.owner) {
             net_delay_.erase(net_u);
             if (dominating.getDelay() != nullptr && dominating.getInitializer() == nullptr) {
-                // TODO: the net delay of a collapsed net that dominates its owner.
-                // net_delay_ lowers in the owner's context, which is not this
-                // net's module (its time unit).
-                fail("a net delay on a net that dominates the net its inout port connects to is not supported");
+                net_delay_.emplace(net_u, net_delay_of(dominating));
+                if (resolved_nets_.insert(net_u).second) {
+                    net_resolve_op_[net_u] = net_resolve_tag(kind);
+                }
             }
         }
     }
+}
+
+// The delay of a net declared with one (LRM 28.16) and the multipliers of its time
+// unit. The unit is the declaring module's (LRM 3.14.1), read from the net itself:
+// the delay is lowered once the whole top is walked, and a net that dominates an
+// inout port's net (LRM 23.3.3.7) is declared in an instance other than the owner's.
+Lowerer::NetDelay Lowerer::net_delay_of(const NetSymbol& net) {
+    const Expression* expr = single_delay_expr(*net.getDelay());
+    if (expr == nullptr) {
+        fail(std::string(kNetDelayTriple));
+    }
+    NetDelay d{ expr, 1, 1 };
+    if (tick_fs_ != 0) {
+        if (const auto ts = effective_time_scale(*net.getParentScope(), true)) {
+            d.time_mul       = tsv_to_fs(ts->base) / tick_fs_;
+            d.prec_over_tick = tsv_to_fs(ts->precision) / tick_fs_;
+        }
+    }
+    return d;
+}
+
+ir::Index Lowerer::scaled_net_delay(const NetDelay& d, ir::Builder& b) {
+    const Restore<uint64_t> mul(time_mul_, d.time_mul);
+    const Restore<uint64_t> prec(prec_over_tick_, d.prec_over_tick);
+    return scaled_delay(*d.expr, b);
 }
 
 // Input and output ports against LRM 23.3.3.7.
@@ -1229,13 +1256,13 @@ void Lowerer::emit_wire_resolvers() {
         if (delayed && forced) {
             const NetDelayShadow& sh    = sh_it->second;
             const ir::Index       dst   = b.signal(sh.delayed, l);
-            const ir::Index       ticks = scaled_delay(*nd_it->second, b);
+            const ir::Index       ticks = scaled_net_delay(nd_it->second, b);
             b.binary(ir::Inst::Tag::Store, b.signal(sh.fold, l), acc, l);
             b.store_inertial_delay(dst, acc, ticks, l);
             value = b.unary(ir::Inst::Tag::Load, b.signal(sh.delayed, l), l);
         } else if (delayed) {
             const ir::Index dst   = b.signal(net, l);
-            const ir::Index ticks = scaled_delay(*nd_it->second, b);
+            const ir::Index ticks = scaled_net_delay(nd_it->second, b);
             b.store_inertial_delay(dst, acc, ticks, l);
         }
         if (forced) {

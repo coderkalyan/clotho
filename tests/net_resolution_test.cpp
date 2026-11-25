@@ -684,6 +684,54 @@ TEST_CASE("a delay on a partial driver of a resolved net") {
     )");
     CHECK(out == "1 10xx 0x\n4 10xx 01\n6 1001 01\n");
 }
+// The net delay of the net that dominates an inout port's net is the simulated net's
+// (23.3.3.7), in the time unit of the module that declares it (3.14.1). iverilog 13
+// has no net delays, so the oracle is the LRM text: the child's wand #3 dominates
+// the wire, so a change of the driver reaches it 3 later.
+TEST_CASE("a net delay on an inout port net that dominates its owner") {
+    const std::string out = run_capture(R"(
+        module c(io);
+          inout io;
+          wand #3 io;
+        endmodule
+        module top;
+          wire w;
+          logic a = 0;
+          assign w = a;
+          c u(w);
+          initial begin
+            #10 $display("t=%0d w=%b", $time, w);
+            a = 1; #1 $display("t=%0d w=%b", $time, w);
+            #3 $display("t=%0d w=%b", $time, w);
+          end
+        endmodule
+    )");
+    CHECK(out == "t=10 w=0\nt=11 w=0\nt=14 w=1\n");
+}
+
+// A net delay is in the time unit of the module that declares the net, not of the
+// top that is walked last: the child's #5 is 5 ns although the top counts in ps.
+// LRM 3.14.1 and 28.16; no iverilog oracle (no net delays).
+TEST_CASE("a net delay takes the time unit of its own module") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module child;
+          wire #5 w;
+          reg dd = 0;
+          assign w = dd;
+          initial begin
+            #1 dd = 1;
+            #3 $display("%0t %b", $realtime, w);
+            #3 $display("%0t %b", $realtime, w);
+          end
+        endmodule
+        `timescale 1ps/1ps
+        module t;
+          child c();
+        endmodule
+    )");
+    CHECK(out == "4000 x\n7000 1\n");
+}
 
 // supply0 / supply1 nets (LRM 6.6.5): a permanent Supply-strength (level 4)
 // driver of 0 / 1 that beats even a Strong driver.
@@ -1639,21 +1687,6 @@ TEST_CASE("the delay of an external net that an inout port dominates is dropped"
     CHECK(undelayed == through_port);
 }
 
-// A net delay on the net that dominates cannot be lowered in the owner's context.
-TEST_CASE("a net delay on an inout port net that dominates its owner fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module c(io);
-          inout io;
-          wand #3 io;
-        endmodule
-        module top;
-          wire w;
-          c u(w);
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("a net delay on a net that dominates") != std::string::npos);
-}
 
 // A `warn` cell: external wand, internal tri1 (neither dominates). The external
 // type is used, so there is no pull, and slang reports the connection.
