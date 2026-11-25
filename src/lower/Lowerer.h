@@ -4853,10 +4853,14 @@ private:
         // controls and $time are allowed.
         bool is_task = false;
         // The subroutine this body belongs to, or null for a synthetic body (a fork
-        // child, an action block, a print thunk). Read by lower_disable to spot LRM
-        // 9.6.2 example 4: a task naming ITSELF as the disable target, and by
-        // hier_name for the classes a method's %m passes through.
+        // child, an action block, a print thunk). Read by hier_name for the classes a
+        // method's %m passes through.
         const SubroutineSymbol* sym = nullptr;
+        // The `disable` target id of the task this body is, or is a fork child of,
+        // when some `disable` names that task. A fork child is an activation of the
+        // task's target (LRM 9.6.2), and lower_disable tests it to spot LRM 9.6.2
+        // example 4: a task, or a child it forked, naming the task as the target.
+        uint32_t disable_target = ir::kNoDisableTarget;
         // Class method context (valid iff has_this): `this` is spliced as frame
         // Local 0, `this_class` is its Kind::Class handle type. A bare property
         // reference inside the body roots at this handle (value_lvalue -> this_handle).

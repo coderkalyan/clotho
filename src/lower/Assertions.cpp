@@ -589,10 +589,12 @@ void Lowerer::register_disable_target(const Symbol* t, bool remote) {
     if (is_task) {
         // A task target is always "remote" in the sense that matters: it ends
         // every activation, never just the one running. Its parks are checked
-        // against the task's own body.
+        // against the task's own body. A fork directly in it parks the activation at
+        // the join, but its children are activations of the target too
+        // (build_fork_child) and end with it, releasing the join.
         const auto& sub = t->as<SubroutineSymbol>();
         disable_remote_.insert(t);
-        if (hard_park(sub.getBody())) {
+        if (hard_park(sub.getBody(), /*forked_children_are_occupants=*/true)) {
             disable_hard_.insert(t);
         }
         return;
@@ -715,15 +717,17 @@ bool Lowerer::design_virtual_parks(slang::ast::Compilation& comp) {
 }
 
 // Whether a block's body can park in a way an abort cannot yet neutralize, which
-// is what decides whether the REMOTE form may name it. A `#delay` and an
+// is what decides whether the REMOTE form may name it. A `#delay`, a `#0` and an
 // `@event` wait are fine: a `disable` claims the delay's park record, so the
-// timer that fires later wakes nobody, and the wait compacts itself out of its
-// buckets on resume. The rest are not, each for its own reason -- a `#0` parks
-// in the inactive batch, which has no per-entry claim; a TIME-CONSUMING task call
-// or a fork parks the process behind ANOTHER activation's completion, which
-// would resume it
-// a second time; an `expect` parks on a reactive verdict. Refused rather than
-// silently double-woken.
+// timer that fires later wakes nobody, the wait compacts itself out of its
+// buckets on resume, and a `#0`'s batch entry is the one wake it will get. The
+// rest are not, each for its own reason -- a TIME-CONSUMING task call parks the
+// process behind ANOTHER activation's completion, which would resume it a second
+// time, and so does a fork that is not the body's own (a callee's); an `expect`
+// parks on a reactive verdict. A fork in the body itself parks it only behind
+// children that are activations of the target, so it is hard only when
+// `forked_children_are_occupants` is false. Refused rather than silently
+// double-woken.
 bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupants) {
     struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
         Lowerer* self         = nullptr;

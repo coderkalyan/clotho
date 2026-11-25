@@ -1306,6 +1306,11 @@ void Lowerer::build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
     ctx.name_prefix = std::string(sub.name) + ".";
     ctx.is_task     = true;
     ctx.sym         = &sub;
+    // A `disable` naming this task ends every activation, so each links itself onto the
+    // target's list (LRM 9.6.2), and so does each child it forks (build_fork_child).
+    if (const auto tgt = disable_targets_.find(&sub); tgt != disable_targets_.end()) {
+        ctx.disable_target = tgt->second;
+    }
     // A body may be lowered lazily from inside a property initializer or a
     // default-argument expression, where `ctor_this_` / `default_arg_this_`
     // name an object as an ir::Index of the CALLER's builder. Inside this body
@@ -1353,7 +1358,7 @@ void Lowerer::build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
     const ir::SourceLoc el = to_source_loc(sub.location);
     b.ret_void(el);
 
-    const auto tgt = disable_targets_.find(&sub);
+    const uint32_t disable_target = ctx.disable_target;
     module_.set_function(id,
                          ir::Function{ .name            = std::string(sub.name),
                                        .return_type     = module_.pool.void_type,
@@ -1363,11 +1368,9 @@ void Lowerer::build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
                                        .takes_iface_ctx = ctx_member.has_value(),
                                        .ctx_member      = ctx_member.value_or(ir::Signal{ 0 }),
                                        .is_task         = true,
-                                       // A `disable` naming this task ends every
-                                       // activation, so each links itself onto the
-                                       // target's list (LRM 9.6.2).
-                                       .disable_target =
-                                         tgt != disable_targets_.end() ? tgt->second : ir::kNoDisableTarget,
+                                       // The activation links itself onto the target's list
+                                       // on entry (LRM 9.6.2).
+                                       .disable_target = disable_target,
                                        .span        = span_of(sub),
                                        .ir          = b.finish() });
 }
@@ -1393,10 +1396,17 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
                                          const std::vector<OpenBlock>&       enclosing) {
     const ir::FunctionId id = module_.reserve_function(module_.pool.void_type);
 
+    // The enclosing task's target, read before the child's own context replaces the
+    // parent's. A fork directly in a task body, and any fork nested in a child of
+    // one, spawns activity enabled within the task, which a `disable` of the task ends
+    // along with it (LRM 9.6.2).
+    const uint32_t task_target = fn_ctx_ != nullptr ? fn_ctx_->disable_target : ir::kNoDisableTarget;
+
     FnCtx ctx;
     ctx.name_prefix = "fork.child.";
     ctx.invoking_scope = hier_name();
     ctx.is_task     = true;
+    ctx.disable_target = task_target;
     const FnScope fn_scope(*this, &ctx);
     // The child is an activation of every targeted block it was forked inside (LRM
     // 9.6.2), so a `disable` of one can find and end it, and its own `disable` of one
@@ -1404,7 +1414,10 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
     // marked inherited, so they do not repeat the parent's names in %m.
     named_blocks_ = enclosing;
     std::vector<uint32_t> fork_targets;
-    fork_targets.reserve(enclosing.size());
+    fork_targets.reserve(enclosing.size() + 1);
+    if (task_target != ir::kNoDisableTarget) {
+        fork_targets.push_back(task_target);
+    }
     for (const OpenBlock& ob : enclosing) {
         fork_targets.push_back(ob.label);
     }
