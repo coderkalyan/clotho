@@ -265,6 +265,29 @@ TEST_CASE("duplicate call label keeps its side effect") {
     CHECK(run_capture(src) == "n=2\n");
 }
 
+// Oracle: LRM 12.5. Case items are compared in source order and the search stops
+// at the first match, so labels after it are never evaluated.
+TEST_CASE("labels after the first match are not evaluated") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer n = 0;
+            function automatic logic [3:0] f(logic [3:0] k);
+                n = n + 1;
+                return k;
+            endfunction
+            initial begin
+                case (4'd1)
+                    f(4'd1): $display("one");
+                    f(4'd2): $display("two");
+                    f(4'd3): $display("three");
+                endcase
+                $display("n=%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "one\nn=1\n");
+}
+
 // casez: two identical wildcard labels -- the later is dead (identical label
 // yields an identical match predicate).
 TEST_CASE("duplicate casez wildcard label is dead") {
@@ -861,7 +884,7 @@ TEST_CASE("unique case: non-constant labels overlap at runtime") {
 
 // -- priority if (LRM 12.4.2) --
 // Execution is ordered first-match (identical to a plain if); only the no-match
-// report is added. unique/unique0 if overlap is still TODO.
+// report is added.
 
 // A default-less priority-if chain with no true condition reports a no-match.
 TEST_CASE("priority if: no true condition, no else reports a violation") {
@@ -929,6 +952,47 @@ TEST_CASE("priority if: single arm, condition false, reports") {
     )";
     CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
     CHECK(run_capture(src).empty());
+}
+
+// Oracle: LRM 12.4.2. A priority-if evaluates like a plain if-else-if, so the
+// conditions after the first true one are never evaluated. unique-if differs: it
+// must keep evaluating to detect overlap.
+TEST_CASE("priority if: conditions after the first true one are not evaluated") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer n = 0;
+            function automatic bit f(bit b);
+                n = n + 1;
+                return b;
+            endfunction
+            initial begin
+                priority if (f(1)) $display("a");
+                else if (f(1)) $display("b");
+                $display("n=%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a\nn=1\n");
+}
+
+// Oracle: LRM 12.4.2, "The implementation shall continue the evaluations and
+// comparisons after finding a matching condition."
+TEST_CASE("unique if: conditions after the first true one are still evaluated") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer n = 0;
+            function automatic bit f(bit b);
+                n = n + 1;
+                return b;
+            endfunction
+            initial begin
+                unique if (f(1)) $display("a");
+                else if (f(0)) $display("b");
+                $display("n=%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a\nn=2\n");
 }
 
 // A plain (unqualified) if never reports, even with no match and no else.

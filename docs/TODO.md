@@ -55,16 +55,11 @@ Milestones, in order; lower ones unblock higher ones:
   equivalent to, but interned differently from, the assignment target need a converting copy.
 - [ ] **Short-circuit `&&&` conjuncts** (12.4) — every conjunct of a `cond_predicate` is
   evaluated, so `if (h != null &&& h.x)` fatals on a null `h`.
-- [ ] **In-order `case` item comparison** (12.5) — all item-label predicates are evaluated
-  before dispatch, so a trapping later label fatals even when an earlier one matches.
-- [ ] **Lazy `unique` / `unique0` / `priority` `if` conditions** (12.4.2) — every arm condition
-  is evaluated up front, so a trapping arm fatals even when an earlier arm is taken.
 
 ### Subroutines
 
 - [ ] **DPI export from a shared library** (35) — a `--dpi-lib` `.so`, loaded by dlopen, cannot
   resolve the design's exported SV subroutines.
-- [ ] **Class-method call in a function** — a function body cannot call a class method.
 - [ ] **Nonblocking assignment to a function frame local** (13.4.4) — refused.
 - [ ] **Automatic-lifetime `event` local** (6.21, Table 6-7) — each activation needs a fresh
   event object.
