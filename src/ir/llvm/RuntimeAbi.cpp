@@ -587,7 +587,7 @@ llvm::FunctionCallee Backend::nba_arr_reset_fn() {
 
 // The rt_elem_ops mirror type (Runtime.h:947-958):
 // { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves,
-//   i32 nhandles, i32 nkeyhandles, ptr handles, ptr keyhandles, ptr copy, ptr destroy }.
+//   i32 nhandles, i32 nkeyshape, ptr handles, ptr keyshape, ptr copy, ptr destroy }.
 // Must match the runtime struct exactly.
 //
 // The last four fields are the collector's (docs/design/garbage-collection.md

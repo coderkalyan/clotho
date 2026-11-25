@@ -221,7 +221,7 @@ std::vector<uint32_t> Backend::elem_handle_offsets(Ref elem_type, const DynElem&
 //   event              -> nhandles 1, handles { 0 }, like a class handle; its kind
 //                         differs only because it is constructed per slot
 //
-// and, for an associative array, its key-handle offsets in `keyhandles`.
+// and, for an associative array, the shape of its key bytes in `keyshape`.
 llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
     if (const auto it = env_->elem_ops_inits.find(static_cast<uint32_t>(elem_type)); it != env_->elem_ops_inits.end()) {
         return it->second;
@@ -231,7 +231,7 @@ llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
     llvm::Constant* inner = llvm::Constant::getNullValue(raw_ptr_ty());
     llvm::Constant* leaves  = llvm::Constant::getNullValue(raw_ptr_ty());
     uint32_t        nleaves = 0;
-    std::vector<uint32_t> key_handle_offs;
+    std::vector<uint32_t> key_shape_words;
     if (std::get<Type>(mod_.pool.get(elem_type)).kind == Type::Kind::Event) {
         // An event element is a 64-bit handle word like a class handle, but
         // unlike one it needs per-slot CONSTRUCTION: LRM Table 6-7 binds every
@@ -253,7 +253,7 @@ llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
         const Type& et = std::get<Type>(mod_.pool.get(elem_type));
         kind           = gc_container_kind(elem_type);
         if (et.kind == Type::Kind::Assoc) {
-            key_handle_offs = assoc_key_handle_offsets(elem_type);
+            key_shape_words = assoc_key_shape(elem_type);
         }
         inner = elem_ops_global(elem_type);
     } else if (e.is_agg && (has_heap_leaf(elem_type) || types::has_ctor_leaf(mod_.pool, elem_type))) {
@@ -280,9 +280,9 @@ llvm::ConstantStruct* Backend::elem_ops_init(Ref elem_type) {
       elem_ops_ty(),
       { b_.getInt32(kind), b_.getInt32(nleaves), b_.getInt64(dynarr_stride(e)), proto, inner,
         leaves, b_.getInt32(static_cast<uint32_t>(handle_offs.size())),
-        b_.getInt32(static_cast<uint32_t>(key_handle_offs.size())),
+        b_.getInt32(static_cast<uint32_t>(key_shape_words.size())),
         gc_offsets_global(handle_offs, "clotho.elem.handles"),
-        gc_offsets_global(key_handle_offs, "clotho.elem.keyhandles"),
+        gc_offsets_global(key_shape_words, "clotho.elem.keyshape"),
         llvm::Constant::getNullValue(raw_ptr_ty()), llvm::Constant::getNullValue(raw_ptr_ty()) }));
     env_->elem_ops_inits.emplace(static_cast<uint32_t>(elem_type), init);
     return init;

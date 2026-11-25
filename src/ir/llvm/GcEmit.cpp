@@ -91,46 +91,98 @@ llvm::Constant* Backend::gc_offsets_global(const std::vector<uint32_t>& offsets,
                                     llvm::ConstantArray::get(arr_ty, words), nm);
 }
 
-// The byte offsets, inside a NORMALIZED KEY span, of the class-handle leaves of an
-// aggregate key. Appended to `out` starting at `base`.
+// The shape of the bytes one value of `type` serializes to inside a normalized key
+// span, as rt_key_* words (Runtime.h) appended to `out`. Returns whether those
+// bytes can hold a class or event handle.
 //
 // This walk exists because a key is a strong reference: an entry keyed by an object
 // keeps that object alive (LRM 7.8.3), and the handle exists ONLY in the key bytes,
 // so the collector has to decode it back out of them.
 //
-// It is the third walk over the same shape, and deliberately so: `agg_key_bytes`
-// (:17080) sizes the span and `emit_agg_key_bytes` (:17158) writes it, both as
-// struct fields in declaration order, then array elements in order, then
-// `ceil(W/8)` bytes per leaf with no padding (assoc-keys.md §2). Keeping the same
-// three-arm shape is what makes these offsets provably the ones the serializer
-// produces. The offsets are SERIALIZED, not storage: a storage walk would place a
-// handle after a struct's padding and read the wrong bytes, which is exactly the
-// mistake a `getStructLayout` shortcut would make here.
-void Backend::agg_key_handle_offsets(Ref type, uint32_t base, std::vector<uint32_t>& out) {
+// It follows the serializers arm for arm, and deliberately so: `agg_key_bytes`
+// sizes a fixed span, `emit_agg_key_bytes` writes one and
+// `emit_variable_agg_key_bytes` writes a variable one, all as struct fields in
+// declaration order, then array elements in order, a length before a string, a
+// count before a container's elements, and `ceil(W/8)` bytes per scalar leaf with
+// no padding (assoc-keys.md §4). Keeping the same shape is what makes this program
+// provably the one the bytes were written by. The layout is SERIALIZED, not
+// storage: a storage walk would place a handle after a struct's padding.
+//
+// `last_skip` is the index in `out` of the skip node this level ended with, or npos,
+// so that neighbouring handle-free leaves become one node.
+bool Backend::key_shape(Ref type, std::vector<uint32_t>& out, size_t& last_skip) {
+    static constexpr size_t npos = ~size_t{ 0 };
+    const auto skip = [&](uint32_t bytes) {
+        if (last_skip != npos) {
+            out[last_skip + 1] += bytes;
+            return;
+        }
+        last_skip = out.size();
+        out.push_back(rt_key_skip);
+        out.push_back(bytes);
+    };
+    const auto body_of = [&](Ref inner, std::vector<uint32_t>& body) {
+        size_t none = npos;
+        return key_shape(inner, body, none);
+    };
+    const auto words = [](const std::vector<uint32_t>& v) { return static_cast<uint32_t>(v.size()); };
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::Struct && !t.is_packed) {
-        uint32_t off = base;
+        bool handle = false;
         for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
-            agg_key_handle_offsets(f.type, off, out);
-            off += agg_key_bytes(f.type);
+            handle = key_shape(f.type, out, last_skip) || handle;
         }
-        assert(off == base + agg_key_bytes(type) && "the field walk covered the span");
-        return;
+        return handle;
     }
     if (t.kind == Type::Kind::UnpackedArray) {
-        const uint32_t n      = array_dim(t);
-        const uint32_t stride = agg_key_bytes(t.element);
-        for (uint32_t k = 0; k < n; ++k) {
-            agg_key_handle_offsets(t.element, base + k * stride, out);
+        std::vector<uint32_t> body;
+        const bool            handle = body_of(t.element, body);
+        if (body.size() == 2 && body[0] == rt_key_skip) {
+            // Elements of one fixed handle-free size are one run of bytes.
+            skip(array_dim(t) * body[1]);
+            return false;
         }
-        return;
+        out.insert(out.end(), { rt_key_rep, array_dim(t), words(body) });
+        out.insert(out.end(), body.begin(), body.end());
+        last_skip = npos;
+        return handle;
+    }
+    if (t.kind == Type::Kind::String) {
+        out.push_back(rt_key_string);
+        last_skip = npos;
+        return false;
+    }
+    if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
+        std::vector<uint32_t> body;
+        const bool            handle = body_of(t.element, body);
+        out.insert(out.end(), { rt_key_seq, words(body) });
+        out.insert(out.end(), body.begin(), body.end());
+        last_skip = npos;
+        return handle;
+    }
+    if (t.kind == Type::Kind::Assoc) {
+        // Each entry carries the nested array's own key bytes behind their length,
+        // so a nested key that holds no handle needs no shape (and a bare string
+        // key, which is not self-delimiting, could not have one).
+        const std::vector<uint32_t> key = assoc_key_shape(type);
+        std::vector<uint32_t>       value;
+        const bool                  handle = body_of(t.element, value);
+        out.insert(out.end(), { rt_key_map, words(key), words(value) });
+        out.insert(out.end(), key.begin(), key.end());
+        out.insert(out.end(), value.begin(), value.end());
+        last_skip = npos;
+        return handle || !key.empty();
     }
     if (types::is_object_handle(mod_.pool, type)) {
-        // 64-bit unsigned (InternPool.cpp:177-182), so emit_key_bytes writes exactly
-        // 8 big-endian bytes here with no sign flip for the collector to undo.
+        // 64-bit unsigned (InternPool.cpp), so emit_key_bytes writes exactly 8
+        // big-endian bytes here with no sign flip for the collector to undo.
         assert(agg_key_bytes(type) == 8 && "a handle normalizes to 8 key bytes");
-        out.push_back(base);
+        out.push_back(rt_key_handle);
+        last_skip = npos;
+        return true;
     }
+    skip(agg_key_bytes(type));
+    return false;
 }
 
 // The heap object-body LLVM type of a class (LRM 8.3): a StructType mirroring

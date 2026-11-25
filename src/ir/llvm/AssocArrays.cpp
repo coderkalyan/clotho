@@ -4,53 +4,44 @@
 
 namespace clotho::ir::backend {
 
-// rt_elem_ops::keyhandles for an ASSOCIATIVE ARRAY descriptor: where the class
-// handles are in one normalized key span, ascending. Empty for a key that
-// cannot contain one.
+// rt_elem_ops::keyshape for an ASSOCIATIVE ARRAY descriptor: how the collector
+// walks one normalized key span to the handles in it (Runtime.h, rt_key_*). Empty
+// for a key that cannot contain one.
 //
-// A bare class-handle key is the ONE-ENTRY case, `{ 0 }`, rather than a
+// A bare class-handle key is the one-word case, `{ handle }`, rather than a
 // separate path: assoc_key_info reduces it to the integral case at width 64,
 // and emit_key_bytes writes it at offset 0. A wildcard `[*]` key is never a
 // handle -- its key type interns as a canonical unsigned integral placeholder
-// -- and a `string` key holds no handle either.
-//
-// A VARIABLE key (info.is_variable) never reaches agg_key_handle_offsets: its
-// offsets are compile-time constants only for a FIXED key, and the frontend
-// refuses a class handle anywhere inside a variable one precisely so this
-// table never has to describe a runtime-dependent offset (lower/Types.cpp
-// guard_key_no_handle_in_variable).
-std::vector<uint32_t> Backend::assoc_key_handle_offsets(Ref assoc_type) {
+// -- and a bare `string` key holds no handle either. A fixed key and a variable
+// one are the same walk: key_shape follows whichever serializer wrote the bytes.
+std::vector<uint32_t> Backend::assoc_key_shape(Ref assoc_type) {
     assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&
            "only an associative array has a key");
     std::vector<uint32_t> out;
     const AssocKeyInfo info = assoc_key_info(assoc_type);
-    if (info.wildcard || info.is_string || info.is_variable) {
+    if (info.wildcard || info.is_string) {
         return out;
     }
-    if (info.is_agg) {
-        agg_key_handle_offsets(info.key_ty, 0, out);
-    } else if (types::is_object_handle(mod_.pool, info.key_ty)) {
-        out.push_back(0);
+    size_t last_skip = ~size_t{ 0 };
+    if (!key_shape(info.key_ty, out, last_skip)) {
+        out.clear();
     }
-    assert(std::ranges::is_sorted(out) && "the key offsets are ascending");
-    assert(out.empty() || out.back() + 8 <= assoc_key_bytes(info) &&
-           "a key handle lies inside its span");
     return out;
 }
 
-// Whether creating an entry in this assoc stores a CLASS HANDLE into its key
-// storage. That is a reference the OWNING object acquires, which is why a write to
-// an `int m[Cell]` -- or an `int m[struct{Cell c; int i;}]` -- held in a class
+// Whether creating an entry in this assoc stores a CLASS OR EVENT HANDLE into its
+// key storage. That is a reference the OWNING object acquires, which is why a write
+// to an `int m[Cell]` -- or an `int m[struct{Cell c; int i;}]` -- held in a class
 // property needs the write barrier even though the value it writes is an int (§7).
 //
-// One question, one answer: this reads the same table the collector decodes keys
+// One question, one answer: this reads the same shape the collector decodes keys
 // with, so the barrier and the tracer cannot disagree about which associative
-// arrays have handle keys. `nkeyhandles != 0` is the single source of truth; there
+// arrays have handle keys. `nkeyshape != 0` is the single source of truth; there
 // is deliberately no flag bit saying the same thing a second time.
 bool Backend::assoc_key_is_class_handle(Ref assoc_type) {
     assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&
            "only an associative array has a key");
-    return !assoc_key_handle_offsets(assoc_type).empty();
+    return !assoc_key_shape(assoc_type).empty();
 }
 
 // True when `type`'s normalized form needs the variable-length rt_keybuf_*
