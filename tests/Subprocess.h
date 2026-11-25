@@ -21,17 +21,35 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <thread>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#else
+// Declared by <unistd.h> only under _GNU_SOURCE; redeclaring is harmless, and a
+// block-scope declaration inside the namespace below would name another variable.
+extern char** environ;
+#endif
 #endif
 
 namespace clotho::test {
@@ -45,16 +63,24 @@ inline constexpr std::string_view run_design_flag = "--clotho-run-design";
 // an internal error -- so the report is tested at the function.
 inline constexpr std::string_view encoding_violation_flag = "--clotho-encoding-violation";
 
+// The argument that puts the test binary into config-matrix child mode: lower one
+// design and simulate it under the configuration variant its next argument names
+// (ConfigMatrix.h spawns it, test_main.cpp implements it).
+inline constexpr std::string_view run_variant_flag = "--clotho-run-variant";
+
 // Absolute path of the running test binary, captured by main() so a child can
 // be spawned from any working directory.
 inline std::string self_exe;
 
 // Everything one design run produced. `status` is the raw std::system() return
-// value; read an exit code out of it with design_exit_code.
+// value; read an exit code out of it with design_exit_code. `timed_out` and
+// `seconds` are set by run_self_bounded alone.
 struct DesignRun {
     std::string out;
     std::string err;
-    int         status = -1;
+    int         status    = -1;
+    bool        timed_out = false;
+    double      seconds   = 0;
 };
 
 namespace detail {
@@ -172,5 +198,79 @@ inline int design_exit_code(const DesignRun& run) {
     return WIFEXITED(run.status) ? WEXITSTATUS(run.status) : -1;
 #endif
 }
+
+#if !defined(_WIN32)
+// Run the test binary itself with `args` in a process of its own, stdin from
+// /dev/null and both output streams captured, and kill it once `limit` has passed
+// (`timed_out`, with what it had written by then). For a run that may never end: a
+// free-running design, or one a configuration gate makes slow. Throws when the
+// process cannot be spawned at all, because an empty result would read as a design
+// that printed nothing.
+inline DesignRun run_self_bounded(const std::vector<std::string>& args, std::chrono::milliseconds limit) {
+    namespace fs = std::filesystem;
+
+    const std::string stem = detail::unique_stem();
+    const fs::path    dir  = fs::temp_directory_path();
+    const fs::path    out  = dir / (stem + ".out");
+    const fs::path    err  = dir / (stem + ".err");
+
+    std::vector<std::string> owned;
+    owned.push_back(self_exe);
+    owned.insert(owned.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    for (std::string& arg : owned) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+#if defined(__APPLE__)
+    char** const environment = *_NSGetEnviron();
+#else
+    char** const environment = ::environ;
+#endif
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const auto start = std::chrono::steady_clock::now();
+    pid_t      pid   = 0;
+    const int  rc    = posix_spawn(&pid, self_exe.c_str(), &actions, nullptr, argv.data(), environment);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) {
+        throw std::runtime_error("cannot spawn '" + self_exe + "': " + std::strerror(rc));
+    }
+
+    DesignRun run;
+    for (std::chrono::milliseconds nap{ 1 };;) {
+        const pid_t done = waitpid(pid, &run.status, WNOHANG);
+        if (done == pid) {
+            break;
+        }
+        if (done < 0 && errno != EINTR) {
+            throw std::runtime_error(std::string("cannot wait for the child: ") + std::strerror(errno));
+        }
+        if (std::chrono::steady_clock::now() - start >= limit) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &run.status, 0);
+            run.timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(nap);
+        nap = std::min(nap * 2, std::chrono::milliseconds{ 20 });
+    }
+    run.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    run.out = detail::read_file(out);
+    run.err = detail::read_file(err);
+    std::error_code ec;
+    fs::remove(out, ec);
+    fs::remove(err, ec);
+    return run;
+}
+#endif
 
 } // namespace clotho::test

@@ -78,6 +78,23 @@ VCD, not only what a test prints.
   (a design-wide id, a dump-var index, another instance's record) taints the
   lowering instead of baking it, and a verifying re-lowering must leave root as it
   found it: a global it makes there is reported as a difference.
+- **Config matrix.** Self-consistency, run over the suite. With
+  `CLOTHO_CONFIG_MATRIX=1`, every design a test lowers (`lower_text`, `lower_files`,
+  `lower_sources`; hook: `set_design_check`, Lower.h) is run in child processes of
+  the test binary under the default `SimulationConfig` and under each
+  semantics-preserving backend gate flipped on its own (`fuse`, `comb_fuse`, `thunk`,
+  `regions`, `dedup`, `split`, `z_elision`, `o3`, `gc_stress`), each bounded by a
+  stop time and a wall-clock limit. Exit status, stdout and stderr must equal the
+  default run's; otherwise the lowering throws, so the test that lowered the design
+  fails and names the variant, the first differing line and a command that replays
+  it. A design that reaches outside the process (files, `$system`, DPI-C, plusargs,
+  VCD) or whose default run does not repeat is skipped and counted by reason. A
+  difference is legitimate only where the LRM leaves the order open (4.7): such
+  test cases, and known bugs, are listed by name in
+  `tests/config-matrix-known.txt` as `race` or `bug`, and an entry whose test no
+  longer differs fails the run. `CLOTHO_CONFIG_MATRIX_TIMEOUT` (seconds per child)
+  and `CLOTHO_CONFIG_MATRIX_LOG` (one line per design) tune it. It costs a process
+  per variant per design, so it is not in CI.
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.
 - **sv-tests.** Outcomes are classified as pass, refused, crash or fail; the
   crash count is zero. A pass there means only that nothing failed, not that

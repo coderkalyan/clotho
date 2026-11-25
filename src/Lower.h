@@ -177,6 +177,31 @@ struct TwinStats {
 };
 const TwinStats& twin_stats();
 
+// Config-matrix mode (docs/VERIFICATION.md, "Detectors"). With a design check
+// installed, `lower_text`, `lower_files` and `lower_sources` hand it every design
+// they lower, refused ones included, together with the inputs that lowered it, so
+// the check can lower and run the same design again in another process
+// (tests/ConfigMatrix.h does, under each backend gate). A throw propagates out of
+// the entry point, so the test that lowered the design fails. `lower_driver` (its
+// Driver cannot be replayed) and `lower_buffer` (a partial design) do not call it,
+// and neither does twin mode's second lowering.
+struct LowerInputs {
+    enum class Entry : uint8_t {
+        Text,    // lower_text: `text` is the source
+        Files,   // lower_files: `args` are the paths
+        Sources, // lower_sources: `args` are the slang arguments
+    };
+    Entry                             entry = Entry::Text;
+    std::string_view                  text;
+    std::span<const std::string_view> args;
+    ir::SystemAccess                  allow_system        = ir::SystemAccess::Off;
+    bool                              allow_port_coercion = false;
+};
+using DesignCheck = std::function<void(const LowerResult& result, const LowerInputs& inputs)>;
+
+// Install `check` for every lowering that follows, or none with an empty one.
+void set_design_check(DesignCheck check);
+
 // Decode a source extent for whoever needs one: the IR dump's headers, and the
 // snippet a runtime diagnostic bakes into its report. Everything comes from the
 // SourceManager lowering handed back, so the returned resolver borrows `result`
