@@ -2638,12 +2638,14 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     // the driven net is its left().
     const Expression& out =
       conns[0]->kind == ExpressionKind::Assignment ? conns[0]->as<AssignmentExpression>().left() : *conns[0];
-    // A pull source has no single canonical net for a bit/part-select target.
-    if (out.kind != ExpressionKind::NamedValue && out.kind != ExpressionKind::HierarchicalValue) {
-        // TODO: pullup/pulldown on a bit/part-select or concat target.
-        fail("pullup/pulldown on a non-whole-net target is not supported");
+    // The terminal is a net_lvalue (LRM 28.10): a whole net, or a bit- or part-select
+    // of one, which drives its own region like any partial driver.
+    const ValueSymbol* root = lvalue_root(out);
+    if (root == nullptr) {
+        // TODO: pullup/pulldown on a concatenation target.
+        fail("pullup/pulldown on a concatenation target is not supported");
     }
-    const ValueSymbol& sym = canonical_value_symbol(out.as<ValueExpressionBase>().symbol);
+    const ValueSymbol& sym = canonical_value_symbol(*root);
     if (sym.kind != SymbolKind::Net) {
         fail("pullup/pulldown target must be a net");
     }
@@ -2651,17 +2653,24 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
     const auto [ds0, ds1] = gi.getDriveStrength();
     const uint8_t driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
-    emit_pull_driver(sym, up, driven, to_source_loc(gi.location), /*program_driver=*/false);
+    emit_pull_driver(sym, is_whole_net_lvalue(out) ? nullptr : &out, up, driven, to_source_loc(gi.location),
+                     /*program_driver=*/false);
 }
 
-// A permanent driver of all ones (`up`) or all zeros on a whole net at drive
-// strength `level`, lowered as a strength driver slot so it folds against any
-// real driver: a stronger driver wins, else the net holds the pull value. The
-// source a pullup / pulldown primitive (LRM 28.5) is, and an unconnected input
-// port under `unconnected_drive (LRM 22.9) is.
-void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, ir::SourceLoc l, bool program_driver) {
+// A permanent driver of all ones (`up`) or all zeros on a net, or on the bits of it
+// `part` selects, at drive strength `level`, lowered as a strength driver slot so it
+// folds against any real driver: a stronger driver wins, else the net holds the
+// pull value. The source a pullup / pulldown primitive (LRM 28.5) is, and an
+// unconnected input port under `unconnected_drive (LRM 22.9) is.
+void Lowerer::emit_pull_driver(
+  const ValueSymbol& sym, const Expression* part, bool up, uint8_t level, ir::SourceLoc l, bool program_driver) {
     if (cur_pass_ == Pass::Classify) {
-        record_net_driver_whole(sym);
+        if (part != nullptr) {
+            const ValueSymbol* root = lvalue_root(*part);
+            record_net_driver_region(*root, contribution_port(*part) != nullptr ? kWholeNet : net_region_of(*part, *root));
+        } else {
+            record_net_driver_whole(sym);
+        }
         force_net_resolved(signal_of(sym));
         if (level != 4) {
             weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(sym)));
@@ -2676,12 +2685,22 @@ void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, i
     // (highz0, level1) for a pull up, (level0, highz1) for a pull down.
     const uint16_t   strength = up ? static_cast<uint16_t>(level) : static_cast<uint16_t>(level << 8);
     ir::Builder      b(module_);
-    // A pull on a net the instance reaches through an inout port drives it through
-    // a contribution, like any other driver of such a net (contribute).
-    const ir::Signal slot = driver_slot_via(contribution_port(sym), net, l, strength, program_driver);
-    const ir::Index  dst  = b.signal(slot, l);
-    const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
-    b.binary(ir::Inst::Tag::Store, dst, val, l);
+    ir::Signal       slot;
+    ir::Index        val;
+    if (part == nullptr) {
+        // A pull on a net the instance reaches through an inout port drives it through
+        // a contribution, like any other driver of such a net (contribute).
+        slot = driver_slot_via(contribution_port(sym), net, l, strength, program_driver);
+        val  = b.constant(def_constant_ref(w, up), l);
+    } else {
+        // The pull fills the bits it selects, as a pull on a whole vector fills all
+        // of it. build_driver_slot_value refuses a region it cannot slot.
+        const NetRegion reg  = net_region_of(*part, *lvalue_root(*part));
+        const uint32_t  fill = reg.bit_hi == UINT32_MAX ? 1 : reg.bit_hi - reg.bit_lo + 1;
+        val                  = build_driver_slot_value(net, *part, b.constant(def_constant_ref(fill, up), l), b, l);
+        slot                 = driver_slot(net, *part, l, strength, program_driver);
+    }
+    b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
     // A permanent source: self-starting, never re-evaluated (empty sensitivity).
     add_continuous_process({}, l, b, program_driver);
 }
@@ -2705,7 +2724,7 @@ void Lowerer::lower_unconnected_drive(const PortSymbol& p, bool up, bool program
         fail("`unconnected_drive on an unconnected input port that is not a whole packed net is not "
              "supported");
     }
-    emit_pull_driver(sym, up, /*level=*/2, to_source_loc(p.location), program_driver);
+    emit_pull_driver(sym, nullptr, up, /*level=*/2, to_source_loc(p.location), program_driver);
 }
 
 // A cmos / rcmos switch (LRM 28.9). The LRM defines it purely by

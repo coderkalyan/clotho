@@ -633,6 +633,35 @@ TEST_CASE("pullup and pulldown compete on strength") {
     CHECK(out == "10\n00\n11\n");
 }
 
+// pullup / pulldown on a bit-select or a part-select (an instance array, LRM
+// 28.3.6) drive that region like any partial driver (LRM 28.10): the other bits
+// stay z, a stronger driver of the bit wins, and a z driver leaves the pull.
+// Oracle: iverilog 13 (0z10 and 0010; the bit that is driven reads the driver).
+TEST_CASE("pullup and pulldown on a bit or part select of a net") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [3:0] w;
+          pullup (w[1]);
+          pulldown (w[3]);
+          assign w[0] = 1'b0;
+          wire [3:0] v;
+          pulldown pd[1:0] (v[3:2]);
+          pullup (v[1]);
+          assign v[0] = 1'b0;
+          wire [1:0] u;
+          logic en = 0, d = 0;
+          pullup (u[0]);
+          assign u[0] = en ? d : 1'bz;
+          initial begin
+            #1 $display("%b %b %b", w, v, u[0]);
+            en = 1; #1 $display("%b", u[0]);
+            d = 1; #1 $display("%b", u[0]);
+          end
+        endmodule
+    )");
+    CHECK(out == "0z10 0010 1\n0\n1\n");
+}
+
 // supply0 / supply1 nets (LRM 6.6.5): a permanent Supply-strength (level 4)
 // driver of 0 / 1 that beats even a Strong driver.
 TEST_CASE("supply0/supply1 nets hold their value and beat strong drivers") {

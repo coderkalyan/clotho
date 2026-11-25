@@ -2265,7 +2265,14 @@ private:
 
     void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up);
 
-    void emit_pull_driver(const ValueSymbol& net, bool up, uint8_t level, ir::SourceLoc l, bool program_driver);
+    // `part` is the bit- or part-select of `net` a pullup / pulldown names, or null
+    // for the whole net.
+    void emit_pull_driver(const ValueSymbol& net,
+                          const Expression*  part,
+                          bool               up,
+                          uint8_t            level,
+                          ir::SourceLoc      l,
+                          bool               program_driver);
 
     void lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver);
 

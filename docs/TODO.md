@@ -303,7 +303,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Concatenation-operand driver** — needs a split into per-net stores.
 - [~] **Drive strengths** — missing pieces:
   - [ ] **Drive strength on `wand` / `wor` nets**.
-  - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
   - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the
     r-variants do not reduce it; refused when the output net is resolved against a
     driver or weak pull and the strengths do not order as strong (LRM_NOTES note 38).
