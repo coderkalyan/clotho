@@ -2305,14 +2305,13 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
              " is not supported: a capture box of this type has no change notifier");
     }
     if (deps.unwakeable) {
-        // The condition reads a class property that can carry no notifier -- a covergroup
-        // handle -- and nothing else that can wake this process. Lowering it anyway is what used to
-        // happen, and it produced a suspend with an EMPTY event list: a permanent park
-        // with no diagnostic, in a design whose author had every reason to expect
-        // a working wait. `wait(0)` still parks silently, because that one reads
-        // nothing at all and is the documented LRM 9.4.3 behaviour.
-        fail("wait on a class property of a type with no change notifier is not "
-             "supported (a covergroup handle property cannot be waited on)");
+        // The condition reads a class property of a type with no notifier and nothing else
+        // that can wake this process: a suspend with an EMPTY event list, a permanent park
+        // with no diagnostic. Every property type carries a notifier (prop_can_notify), so
+        // this is a disagreement between the pre-pass and the lowering, not a user error.
+        // `wait(0)` still parks silently, because that one reads nothing at all and is
+        // the documented LRM 9.4.3 behaviour.
+        fail("internal: wait on a class property of a type with no change notifier");
     }
 
     const auto park = [&] {

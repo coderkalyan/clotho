@@ -1493,3 +1493,28 @@ TEST_CASE("coverage: a definition-only option cannot be assigned procedurally") 
     )");
     CHECK_FALSE(r.ok);
 }
+
+// A covergroup handle is a class property like any other (LRM 9.4.2, 9.4.3): a store of a new
+// handle changes it, and `wait` and `@` over it wake. The expressions also name the object
+// handle `c`, a module variable, which is what once let the wait through unnoticed.
+// No oracle: iverilog 13 has no covergroup; the expected lines apply the clause.
+TEST_CASE("wait and @ on a covergroup-handle class property wake when it is assigned") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x;
+          covergroup cgt; coverpoint x; endgroup
+          class K;
+            cgt h;
+            task mk(); h = new; endtask
+          endclass
+          K c = new, d = new;
+          initial begin
+            #5  c.mk();
+            #5  d.mk();
+            #5  $display("done %0t", $time);
+          end
+          initial begin wait (c.h != null); $display("wait %0t", $time); end
+          initial begin @(d.h); $display("at %0t", $time); end
+        endmodule
+    )") == "wait 5\nat 10\ndone 15\n");
+}
