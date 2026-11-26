@@ -971,7 +971,7 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
             // Indexed part-select `q[i +: n]` / `q[i -: n]`. DELIBERATE DEVIATION from LRM 7.4.5,
             // "The size of the part-select or slice shall be constant" (7.4.6 writes `A[i+:c]` with a
             // constant `c`); 7.10.1 exempts only a queue's `Q[a:b]`. A queue's width `n` need NOT be a
-            // compile-time constant here (docs/LRM_NOTES.md, note 57): the slice is well defined for any
+            // compile-time constant here (docs/LRM_NOTES.md, note 60): the slice is well defined for any
             // `n`, and rejecting it would break designs that run
             // (confirmed against slang: it applies no such check when the
             // base is a queue) -- both `i` and `n` are ordinary runtime

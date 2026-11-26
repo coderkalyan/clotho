@@ -761,7 +761,7 @@ delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
 
-## 57. A runtime width on an indexed queue slice (7.4.5, 7.10.1)
+## 60. A runtime width on an indexed queue slice (7.4.5, 7.10.1)
 
 Deliberate deviation. 7.4.5 says "The size of the part-select or slice shall be constant, but the
 position can be variable", and 7.4.6 writes the slice `A[i+:c]` with a constant `c`. 7.10.1 exempts a
