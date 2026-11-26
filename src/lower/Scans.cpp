@@ -282,6 +282,70 @@ bool event_reads_props(const Expression& e) {
     return !scan.notifiable.empty() && !scan.any_container;
 }
 
+bool reads_vif(const Expression& e) {
+    struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const MemberAccessExpression& ma) {
+            found = found || ma.value().type->getCanonicalType().isVirtualInterface();
+            visitDefault(ma);
+        }
+    };
+    Scan scan;
+    e.visit(scan);
+    return scan.found;
+}
+
+// A virtual-interface member by itself: `vif.a`, not `vif.s.f` or `vif.a & vif.b`.
+static bool is_vif_member(const Expression& e) {
+    return e.kind == ExpressionKind::MemberAccess &&
+           e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface();
+}
+
+// An event is woken through its own object, so a handle or an index in the expression that
+// names it is no operand to wait on: `@(ev[vif.i])` parks on the event it names right now
+// (LRM 15.5.5), whatever the expression reads.
+bool event_term_needs_loop(const Expression& e) {
+    if (e.type->isEvent()) {
+        return false;
+    }
+    return event_reads_props(e) || (reads_vif(e) && !is_vif_member(e));
+}
+
+void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out) {
+    switch (tc.kind) {
+        case TimingControlKind::SignalEvent:
+            out.push_back(&tc.as<SignalEventControl>());
+            return;
+        case TimingControlKind::EventList:
+            for (const TimingControl* t : tc.as<EventListControl>().events) {
+                event_terms(*t, out);
+            }
+            return;
+        default:
+            // An implicit @* names no term of its own, and no other control is a list member.
+            return;
+    }
+}
+
+bool control_needs_loop(const TimingControl& tc) {
+    std::vector<const SignalEventControl*> terms;
+    event_terms(tc, terms);
+    return std::ranges::any_of(terms, [](const SignalEventControl* t) { return event_term_needs_loop(t->expr); });
+}
+
+bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b) {
+    if (&a.member != &b.member) {
+        return false;
+    }
+    const auto variable = [](const Expression& h) {
+        return h.kind == ExpressionKind::NamedValue || h.kind == ExpressionKind::HierarchicalValue;
+    };
+    const Expression& ha = a.value();
+    const Expression& hb = b.value();
+    return variable(ha) && variable(hb) &&
+           &ha.as<ValueExpressionBase>().symbol == &hb.as<ValueExpressionBase>().symbol;
+}
+
 void ClassPropReadScan::take(const Expression& e) {
     if (const auto* p = instance_class_prop(e);
         p != nullptr && p->getType().getCanonicalType().isEvent()) {
@@ -436,6 +500,31 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
         }
     }
     visitDefault(ev);
+}
+
+// An event list with a term that waits in a loop of its own (Lowerer::lower_expr_wait)
+// parks on the any-change notifier of every property any of its terms reads, a property
+// named by itself included: its edge notifier alone would not wake the loop. The leaves
+// are not visited, so such a term mints no edge notifier nothing will use.
+void WaitPropScan::handle(const slang::ast::EventListControl& list) {
+    if (!control_needs_loop(list)) {
+        visitDefault(list);
+        return;
+    }
+    std::vector<const SignalEventControl*> terms;
+    event_terms(list, terms);
+    for (const SignalEventControl* term : terms) {
+        ClassPropReadScan scan;
+        term->expr.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
+        }
+    }
 }
 
 void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
@@ -1035,7 +1124,7 @@ void SensitivityCollector::read_object(const Expression& obj) {
 void SensitivityCollector::handle(const MemberAccessExpression& ma) {
     if (ma.value().type->getCanonicalType().isVirtualInterface()) {
         if (!ma.type->isEvent() &&
-            std::ranges::none_of(handles.vif, [&](const MemberAccessExpression* h) { return &h->member == &ma.member; })) {
+            std::ranges::none_of(handles.vif, [&](const MemberAccessExpression* h) { return same_member_read(*h, ma); })) {
             handles.vif.push_back(&ma);
         }
         visitDefault(ma);

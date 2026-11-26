@@ -185,6 +185,22 @@ const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e);
 
 bool event_reads_props(const Expression& e);
 
+// Whether an expression reaches through a virtual interface handle anywhere. Such a place
+// names an instance chosen at run time, which the signal-keyed wait engine cannot subscribe to.
+bool reads_vif(const Expression& e);
+
+// Whether an event term waits in a loop of its own (Lowerer::lower_expr_wait) rather than on
+// one wait source: a compound over class properties or virtual-interface members. A member of
+// a virtual interface by itself (`vif.a`), a class property by itself, an event and a plain
+// signal expression each have a wait source of their own.
+bool event_term_needs_loop(const Expression& e);
+
+// The same for a whole event control: true when any term of it, in a list or alone, does.
+bool control_needs_loop(const TimingControl& tc);
+
+// The terms of an event control in source order: its one term, or every term of its list.
+void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out);
+
 // Every class-property reference in an expression, whether or not it is notifiable.
 // `wait` needs both halves: the notifiable ones become sensitivity, and the mere
 // PRESENCE of a non-notifiable one is what turns an otherwise empty sensitivity
@@ -267,6 +283,8 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
 
     void handle(const slang::ast::SignalEventControl& ev);
 
+    void handle(const slang::ast::EventListControl& list);
+
     void handle(const slang::ast::WaitStatement& w);
 
     void handle(const slang::ast::TimedStatement& t);
@@ -329,6 +347,12 @@ enum class SensitivityMode : uint8_t {
     Comb,
     ImplicitEvent,
 };
+
+// Whether two reads of a member through a handle name the same storage whatever the
+// handle holds: the same member through the same handle variable. Any other pair of
+// handle expressions (`vifs[i].a`, `get().a`) counts as two, which costs at most a
+// second park; counting `v0.a` and `v1.a` as one parked on one instance only.
+bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b);
 
 // What an inferred sensitivity reads that is not a signal of the module: members
 // of a virtual interface (LRM 25.9, a signal of whichever instance the handle names)
@@ -2411,8 +2435,6 @@ private:
     // empty event list is complete rather than malformed (lower_event_wait).
     bool wait_dead_ = false;
 
-    static bool reads_vif(const Expression& e);
-
     static std::vector<const MemberAccessExpression*> vif_member_reads(const Expression& e);
 
     ir::Signal event_signal(const Expression& e);
@@ -2421,7 +2443,7 @@ private:
 
     uint32_t anon_local(ir::Ref type);
 
-    void lower_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
+    void lower_expr_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
 
     ir::Index lsb_edge_fired(ir::Index old_v, ir::Index new_v, slang::ast::EdgeKind edge, ir::Builder& b, ir::SourceLoc l);
 

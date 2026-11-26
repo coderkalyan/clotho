@@ -2561,3 +2561,234 @@ TEST_CASE("always @* over a property of a null handle waits on the handle") {
     CHECK(out.find("wait f at 2") != std::string::npos);
     CHECK(out.find("y=1 at 3") != std::string::npos);
 }
+
+// An event list is the OR of its terms (LRM 9.4.2.1), and a term over a class property wakes
+// it, in either position, on a change of the term's value only (9.4.2): a write to a sibling
+// member and a write of the value it already holds are no event. A method names the property
+// through the implicit this, and `always @(list)` re-arms on every term. Before: the property
+// term never woke, and in a method the lowering crashed. No oracle parses classes or unpacked
+// structs; the expectations are the clauses'.
+TEST_CASE("an event list with a class property term wakes on each of its terms") {
+    SUBCASE("a process, the term in either position") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; int g; } s_t;
+            class C; s_t s; endclass
+            module top;
+              C obj = new;
+              logic b = 0;
+              string fb, bf;
+              initial begin
+                fork
+                  forever begin @(obj.s.f or b) fb = {fb, $sformatf("%0t ", $time)}; end
+                  forever begin @(b or obj.s.f) bf = {bf, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.s.g = 1;
+                #1 obj.s.f = 5;
+                #1 b = 1;
+                #1 obj.s.f = 5;
+                #1 b = 1;
+                #1 obj.s.f = 6;
+                #1 b = 0;
+                #1 $display("fb: %s", fb);
+                $display("bf: %s", bf);
+              end
+            endmodule
+        )");
+        CHECK(out == "fb: 2 3 6 7 \nbf: 2 3 6 7 \n");
+    }
+    SUBCASE("a method") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C;
+              s_t s; logic flag;
+              task automatic watch(int id);
+                @(s.f or flag) $display("w%0d at %0t", id, $time);
+              endtask
+            endclass
+            module top;
+              C obj = new;
+              initial begin
+                fork obj.watch(1); join_none
+                #1 obj.flag = 1;
+                fork obj.watch(2); join_none
+                #1 obj.s.f = 3;
+                #1 $finish;
+              end
+            endmodule
+        )");
+        CHECK(out == "w1 at 1\nw2 at 2\n");
+    }
+    SUBCASE("a process's sensitivity list") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; endclass
+            module top;
+              C obj = new;
+              logic b = 0;
+              int n = 0;
+              always @(obj.s.f or b) n++;
+              initial begin
+                #1 obj.s.f = 1;
+                #1 b = 1;
+                #1 obj.s.f = 1;
+                #1 b = 1;
+                #1 $display("n=%0d", n);
+              end
+            endmodule
+        )");
+        CHECK(out == "n=2\n");
+    }
+}
+
+// An edge on a term is the edge of its least significant bit (Table 9-2), here through an
+// index that is itself a variable the wait watches, and `iff` gates its own term, evaluated
+// when the term changes (9.4.2.3: "evaluated when a changes and not when enable changes").
+// The plain-signal analog of the edge design gave `1 3 4 9` on iverilog 13; the `iff` list
+// is LRM-derived, iverilog does not parse it. Before: the first never woke on the property,
+// and the second was refused (iff on a multi-event control).
+TEST_CASE("an event list over class property terms follows Table 9-2 and iff") {
+    SUBCASE("edges") {
+        const std::string out = run_capture(R"(
+            class C; logic [1:0] a [2]; endclass
+            module top;
+              C obj = new;
+              int i = 1;
+              logic c = 1;
+              string log;
+              initial begin
+                obj.a[0] = 2'b00; obj.a[1] = 2'b00;
+                fork
+                  forever begin @(posedge obj.a[i] or negedge c) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.a[1] = 2'b01;
+                #1 obj.a[1] = 2'b10;
+                #1 obj.a[1] = 2'b11;
+                #1 c = 0;
+                #1 c = 1;
+                #1 obj.a[0] = 2'b01;
+                #1 i = 0;
+                #1 obj.a[0] = 2'b00;
+                #1 obj.a[0] = 2'b01;
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "1 3 4 9 \n");
+    }
+    SUBCASE("iff on each term") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; endclass
+            module top;
+              C obj = new;
+              logic b = 0, en = 0, en2 = 0;
+              string log;
+              initial begin
+                fork
+                  forever begin @(obj.s.f iff en or posedge b iff en2) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.s.f = 1;
+                #1 en = 1;
+                #1 obj.s.f = 2;
+                #1 b = 1;
+                #1 b = 0;
+                #1 en2 = 1;
+                #1 b = 1;
+                #1 obj.s.f = 2;
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "3 7 \n");
+    }
+}
+
+// A list mixes terms of every kind: a compound over a property, a real and a string property
+// named by themselves (a real by its bit pattern, a string by its content, so a write of the
+// same value is no event), and a named event, which wakes it on a trigger in a later step
+// too. The same terms in a task, whose samples live in its frame. Before: the compound
+// never woke. LRM-derived; no oracle parses classes.
+TEST_CASE("an event list with a real, a string and an event term") {
+    SUBCASE("a process") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; real r; string t; endclass
+            module top;
+              C obj = new;
+              event ev;
+              string log;
+              initial begin
+                obj.r = 1.0; obj.t = "a";
+                fork
+                  forever begin @(obj.s.f or obj.r or obj.t or ev) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.s.f = 1;
+                #1 obj.r = 1.0;
+                #1 obj.r = 2.5;
+                #1 obj.t = "b";
+                #1 -> ev;
+                #1 -> ev;
+                #1 obj.t = "b";
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "1 3 4 5 6 \n");
+    }
+    SUBCASE("a task") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C;
+              s_t s; real r; string t;
+              task automatic watch(int id);
+                @(s.f or r or t) $display("w%0d at %0t f=%0d r=%0f t=%s", id, $time, s.f, r, t);
+              endtask
+            endclass
+            module top;
+              C obj = new;
+              initial begin
+                obj.r = 1.0; obj.t = "a";
+                fork obj.watch(1); join_none
+                #1 obj.t = "a";
+                #1 obj.t = "b";
+                fork obj.watch(2); join_none
+                #1 obj.r = 1.0;
+                #1 obj.r = 3.5;
+                fork obj.watch(3); join_none
+                #1 obj.s.f = 9;
+                #1 $finish;
+              end
+            endmodule
+        )");
+        CHECK(out == "w1 at 2 f=0 r=1.000000 t=b\nw2 at 4 f=0 r=3.500000 t=b\nw3 at 5 f=9 r=3.500000 t=b\n");
+    }
+}
+
+// An explicit control evaluates its expression where the wait begins, so a null class handle
+// in a term of a list, or in a lone compound term, is the located fatal of LRM 8.4 that
+// `@(obj.x)` already gives, at the time the wait is reached (1 s), not at time zero. An
+// inferred `@*` parks on the handle instead (LRM_NOTES 57, 58). Before: the list fataled at
+// time zero, from the net its term was synthesized into, ahead of the first statement. Out of
+// process because the report ends the run.
+TEST_CASE("an event list or compound term over a property of a null handle is a located fatal") {
+    for (const char* control : { "@(obj.s.f or b)", "@(b or obj.s.f)", "@(obj.s.f)" }) {
+        const std::string src = std::string(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; endclass
+            module top;
+              C obj; logic b;
+              initial begin
+                $display("before");
+                #1 )") + control + R"(;
+                $display("UNREACHABLE");
+              end
+            endmodule
+        )";
+        const test::DesignRun run = test::run_design_captured(src);
+        INFO(control);
+        CHECK(run.out == "before\n");
+        CHECK(test::design_exit_code(run) != 0);
+        CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+        CHECK(run.err.find("the handle holds no object at 1 s") != std::string::npos);
+    }
+}

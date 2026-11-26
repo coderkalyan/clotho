@@ -766,3 +766,31 @@ body that reads through a handle cannot be statically subscribed, so it waits in
 own loop and an `always_comb` of that kind is self-starting and queued late, so its time-zero run is note 44's.
 
 Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it). No oracle parses these designs.
+
+## 58. Event control over a handle's members, in a list (9.4.2, 9.4.2.1, 9.4.2.3, 8.4, 25.9)
+
+9.4.2: "A non-edge implicit event shall be detected on any change in the value of the
+expression. However, an edge event shall be detected only on the LSB of the expression."
+9.4.2.1 makes a list the logical OR of its events, and 9.4.2.3 gates a term with `iff`:
+"This type of expression is evaluated when a changes and not when enable changes." A term
+that reaches a class property or a virtual-interface member names its storage only once its
+handle is read, so the wait cannot be a static subscription or a net driven from time zero.
+Clotho waits in a loop that samples every term of the list, parks on everything the terms
+read (a member's waiter list in the instance a handle names, a property's any-change
+notifier in the object, a signal's bucket, an event's object) and, on each wake, compares
+every term with its sample: a change of value, or for `posedge`, `negedge` and `edge` the
+Table 9-2 edge of bit 0, with the term's own `iff` evaluated at that point. The list resumes
+when any term fires. A wake does not say which source woke it, so the terms that could be
+waited on exactly are tested the same way, and a change that reverts before the waiter runs
+is missed (docs/design/scheduler-rules.md R9; R8 for a plain signal's edge). An event term
+counts `e.triggered` against the tick of the last trigger it counted, so a trigger earlier
+in the step the wait began in is no occurrence of it and a second one in that step is missed.
+
+8.4 makes an access through a null object handle illegal, with an indeterminate result that
+"implementations may issue an error", and 25.9 says "Attempting to use a null virtual
+interface shall result in a fatal run-time error". An explicit control evaluates its
+expression where the wait begins, so a null handle in any term of a list, or in a lone
+compound term, is a located fatal at the wait, as for `@(obj.x)`. An inferred `@*` is
+different (note 57): it reads nothing until its body runs, so it waits on the handle.
+
+Code: `src/lower/Timing.cpp` (`lower_expr_wait`), `src/lower/Scans.cpp` (`control_needs_loop`, `WaitPropScan::handle(EventListControl)`). Tests: `tests/event_test.cpp` ("an event list with a class property term wakes on each of its terms" and the three after it), `tests/interface_test.cpp` ("virtual interface: an event list over member expressions" and the four after it). No oracle parses these designs; the plain-signal analogs of the edge and list traces agree with iverilog 13.

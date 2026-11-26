@@ -724,8 +724,9 @@ Milestones, in order; lower ones unblock higher ones:
     names** (`vif.i.d`) — the context record does not carry its children's.
   - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
     — refused.
-  - [ ] **Composite expression of members outside a lone procedural event control** —
-    e.g. one operand of an event list, `@(vif.a & vif.b or c)`.
+  - [ ] **Virtual-interface expression as a clock or a nonblocking event control** — the
+    clock of a clocking block, covergroup or assertion, and `->> @(vif.a)` or `x <= @(vif.a) y`
+    (14.3, 19.4, 15.5.1, 9.4.5, 25.9).
   - [ ] **Parameter or other member with no signal storage** — `vif.P`, or a clockvar the
     interface's instances do not provide.
   - [ ] **Modport expression port** (25.5.4) — reached through a modport-qualified handle.

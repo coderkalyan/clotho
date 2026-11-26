@@ -369,8 +369,11 @@ bool Lowerer::sensitivity_needs_handle(const TimingControl& tc) {
             const Expression& e = tc.as<SignalEventControl>().expr;
             // A class property's notifier is reached through the object handle, so
             // `always @(c.p)` has to stay in the body too -- the seed loop that
-            // issues a static subscription cannot evaluate `c`.
-            return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr || event_reads_props(e);
+            // issues a static subscription cannot evaluate `c`. A member of a virtual
+            // interface names an instance only once its handle is read, so the same goes
+            // for it and for a compound over either (lower_expr_wait).
+            return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr || event_reads_props(e) ||
+                   reads_vif(e);
         }
         case TimingControlKind::EventList:
             for (const TimingControl* e : tc.as<EventListControl>().events) {
@@ -384,32 +387,16 @@ bool Lowerer::sensitivity_needs_handle(const TimingControl& tc) {
     }
 }
 
-// Whether an expression reaches through a virtual interface handle anywhere.
-// Such a place names an instance chosen at run time, which the signal-keyed
-// wait engine cannot subscribe to.
-bool Lowerer::reads_vif(const Expression& e) {
-    struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
-        bool found = false;
-        void handle(const MemberAccessExpression& ma) {
-            found = found || ma.value().type->getCanonicalType().isVirtualInterface();
-            visitDefault(ma);
-        }
-    };
-    Scan scan;
-    e.visit(scan);
-    return scan.found;
-}
-
-// Every `vif.member` read in an expression, in source order and deduplicated by
-// member symbol: one wait entry per distinct member is enough, and a repeated
-// read of the same one would otherwise park twice on the same list.
+// Every `vif.member` read in an expression, in source order. A repeated read of the same
+// member through the same handle variable counts once, since parking twice on one list buys
+// nothing; the same member through another handle is another instance, so it counts again.
 std::vector<const MemberAccessExpression*> Lowerer::vif_member_reads(const Expression& e) {
     struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
         std::vector<const MemberAccessExpression*> hits;
         void handle(const MemberAccessExpression& ma) {
             if (ma.value().type->getCanonicalType().isVirtualInterface() &&
                 std::ranges::none_of(hits, [&](const MemberAccessExpression* h) {
-                    return &h->member == &ma.member;
+                    return same_member_read(*h, ma);
                 })) {
                 hits.push_back(&ma);
             }
@@ -423,15 +410,19 @@ std::vector<const MemberAccessExpression*> Lowerer::vif_member_reads(const Expre
 
 ir::Signal Lowerer::event_signal(const Expression& e) {
     if (reads_vif(e)) {
-        // A direct `@(edge vif.sig)` never reaches here: collect_wait_events
-        // parks it on the member's waiter list in the instance the handle
-        // names. What is left is a COMPOSITE expression over one (`@(vif.a &
-        // vif.b)`), which the temp-net path would answer by dereferencing the
-        // handle from a continuous process -- before it is assigned, and then
-        // frozen onto whichever instance was bound at time zero.
+        // An event control in a body or in a process's sensitivity list never reaches here
+        // with one: a member by itself parks on the member's waiter list in the instance
+        // the handle names (collect_wait_events), and a compound waits in a loop that
+        // re-reads the handle (lower_expr_wait). What does is the clock of a clocking block,
+        // a covergroup or a concurrent assertion, and the control of an event-controlled
+        // nonblocking trigger. The temp-net path would answer them by dereferencing the
+        // handle from a continuous process -- before it is assigned, and then frozen onto
+        // whichever instance was bound at time zero.
         //
-        // TODO: an event control on an expression over virtual interface
-        // members (LRM 25.9) — needs the synthesized net to re-read the handle.
+        // TODO: an expression through a virtual interface as the clock of a clocking block,
+        // covergroup or concurrent assertion, or in an event-controlled nonblocking trigger
+        // (LRM 14.3, 19.4, 16.5, 15.5.1, 25.9) -- needs the synthesized net to re-read the
+        // handle.
         fail("an event control on an expression through a virtual interface is not supported");
     }
     if (is_string_expr(e)) {
@@ -579,48 +570,163 @@ ir::Index Lowerer::lsb_edge_fired(ir::Index               old_v,
     fail("internal: an edge test for a control with no edge");
 }
 
-// `@([edge] <expression over virtual interface members or class properties> [iff cond])`
-// (LRM 9.4.2 + 25.9, 8.4). The general path synthesizes a net driven by a continuous
-// process, which cannot work through a handle: it would read the handle before it is
-// assigned, and then track whichever instance or object was bound at time zero. So this
-// desugars to exactly what the clause asks for -- wait until the expression's value
-// changes, or until the least significant bit of it makes the edge, and until `cond`
-// holds then -- over the waits that do work: a member's waiter list in the instance a
-// virtual interface handle names, and the any-change notifier of each class property in
-// the object a handle names:
+// `@(t1 or t2 ...)`, or `@(t)`, where a term has no wait source of its own: a compound over
+// virtual-interface members or class properties (LRM 9.4.2, 9.4.2.1, 9.4.2.3, 25.9, 8.4).
+// The general path synthesizes a net driven by a continuous process, which cannot work
+// through a handle: it would read the handle before it is assigned, and then track whichever
+// instance or object was bound at time zero. So this desugars to what the clause asks for --
+// wait until a term's value changes, or until the least significant bit of it makes the edge
+// its qualifier names, and until its `iff` holds then -- over the waits that do work: a
+// member's waiter list in the instance a virtual interface handle names, the any-change
+// notifier of each class property in the object a handle names, the bucket of a plain
+// signal, and the object of an event:
 //
-//   sample = expr;
+//   sample every term;
 //   forever begin
-//     @(each member and property read);
-//     cur = expr; old = sample; sample = cur;
-//     if (cur !== old) [ or: the edge of cur[0] from old[0] ] begin
-//       if (cond) break;
+//     @(everything the terms read);
+//     for each term, in order begin
+//       cur = term; old = sample; sample = cur;
+//       if (cur !== old) [ or: the edge of cur[0] from old[0] ] begin
+//         if (cond) break;
+//       end
 //     end
 //   end
 //
-// `cond` is evaluated when the expression changes, not when it changes (LRM
-// 9.4.2.3), so what it reads is no sensitivity. The sample follows every wake: a
-// change `cond` suppresses is still what the next one is measured from.
+// Every term of the list is tested this way, the ones with a wait source of their own too: a
+// wake does not say which source woke it, and these sources fire on any change of what they
+// cover, not on a change of a term's value. A term's `cond` is evaluated when the term
+// changes, not when its operands do (LRM 9.4.2.3), so what it reads is no sensitivity. The
+// sample follows every wake: a change `cond` suppresses is still what the next one is
+// measured from.
 //
-// NOTE: the expression is evaluated when the loop wakes, not at each update of an
-// operand, so a change that reverts before then is no event. LRM 9.4.2 makes it one
-// (docs/design/scheduler-rules.md R8, R9); a signal's compound expression has the same gap.
+// An event is no value: its sample is the tick of the last trigger the loop has counted, and
+// it fires when `e.triggered` holds and that tick is not now. A trigger earlier in the step
+// the wait began in is no occurrence of it, and a second one in that step is missed.
 //
-// The sample lives in the call frame inside a subroutine (so two activations of
-// one task do not share it) and in module storage in a process body, which is a
-// single coroutine and cannot re-enter its own wait.
-void Lowerer::lower_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l) {
-    const ir::Ref ty = lower_type(*ev.expr.type);
-    // The sample's storage, as a maker so each use re-forms the lvalue.
-    const bool       in_frame = fn_ctx_ != nullptr;
-    const uint32_t   slot     = in_frame ? anon_local(ty) : 0;
-    const ir::Signal tmp      = in_frame ? ir::Signal{ 0 } : declare_temp(ty, "expr_event");
-    const auto       place    = [&](ir::Builder& bb) {
-        return in_frame ? bb.local(slot, ty, l) : bb.signal(tmp, l);
+// NOTE: a term is evaluated when the loop wakes, not at each update of an operand, so a
+// change that reverts before then is no event. LRM 9.4.2 makes it one
+// (docs/design/scheduler-rules.md R8, R9), and a signal's compound expression has the same gap.
+//
+// NOTE: an explicit control evaluates its expression where the wait begins, so a null class
+// handle in a term is the located fatal of LRM 8.4 and a null virtual interface the one of
+// 25.9. An inferred `@*` is different: it reads nothing until its body runs (LRM_NOTES 57).
+//
+// The samples live in the call frame inside a subroutine (so two activations of one task do
+// not share them) and in module storage in a process body, which is a single coroutine and
+// cannot re-enter its own wait.
+void Lowerer::lower_expr_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
+    enum class Kind : uint8_t { Word, Real, String, Event };
+    struct Term {
+        const SignalEventControl* ev   = nullptr;
+        Kind                      kind = Kind::Word;
+        // What the sample holds: the term's value, or for an event the last tick counted.
+        ir::Ref  ty = ir::Ref::Invalid;
+        TempCell cell;
+        // `@(cb)` and `@($global_clock)` (LRM 14.15, 14.14): the toggle the block makes at its
+        // clocking event, which no expression reads.
+        std::optional<ir::Signal> clock;
     };
-    const ir::Index dst = place(b);
-    const ir::Index rhs = b.convert(lower_expr(ev.expr, b), ty, ev.expr.type->isSigned(), l);
-    b.binary(ir::Inst::Tag::Store, dst, rhs, l);
+
+    const ir::Ref                          u64 = make_int_type(64, false);
+    std::vector<const SignalEventControl*> evs;
+    event_terms(tc, evs);
+    std::vector<Term> terms;
+    terms.reserve(evs.size());
+    for (const SignalEventControl* ev : evs) {
+        const Expression& e = ev->expr;
+        Term              t{ .ev = ev };
+        if (e.kind == ExpressionKind::ArbitrarySymbol || global_clock_call(e) != nullptr) {
+            t.clock = event_signal(e);
+            t.ty    = module_.signal(*t.clock).type;
+        } else if (e.type->isEvent()) {
+            t.kind = Kind::Event;
+            t.ty   = u64;
+        } else {
+            refuse_container_event_control(*ev);
+            if (!event_term_needs_loop(e) && fn_ctx_ != nullptr) {
+                // The refusal a signal expression gets from synth_event_net: nothing parks on
+                // an operand held in the frame.
+                LocalRefDetector d;
+                d.locals = &fn_ctx_->localmap;
+                e.visit(d);
+                if (d.found) {
+                    fail("event control on an expression that reads a local variable / "
+                         "formal argument (e.g. a variable bit-select `@(posedge ack[p])` "
+                         "inside a task) is not supported");
+                }
+            }
+            t.kind = e.type->isFloating() ? Kind::Real : (is_string_expr(e) ? Kind::String : Kind::Word);
+            t.ty   = lower_type(*e.type);
+        }
+        t.cell = make_temp_cell(t.ty, "expr_event");
+        terms.push_back(std::move(t));
+    }
+
+    const auto read = [&](const Term& t, ir::Builder& bb) {
+        if (t.clock) {
+            return load_signal(*t.clock, bb, l);
+        }
+        const Expression& e = t.ev->expr;
+        const ir::Index   v = lower_expr(e, bb);
+        return e.type->isIntegral() ? bb.convert(v, t.ty, e.type->isSigned(), l) : v;
+    };
+    const auto load = [&](const Term& t, ir::Builder& bb) {
+        return bb.unary(ir::Inst::Tag::Load, t.cell.lv(bb, l), l);
+    };
+    const auto store = [&](const Term& t, ir::Index v, ir::Builder& bb) {
+        bb.binary(ir::Inst::Tag::Store, t.cell.lv(bb, l), v, l);
+    };
+    // Runs `then` in a region taken when `pred` holds.
+    const auto when = [&](ir::Index pred, auto&& then, ir::Builder& bb) {
+        bb.open_region();
+        then();
+        const ir::ExtraSlice yes = bb.close_region();
+        bb.open_region();
+        const ir::ExtraSlice no = bb.close_region();
+        bb.cond(pred, yes, no, l);
+    };
+    // Leaves the loop, unless the term's `iff` does not hold.
+    const auto resume = [&](const Term& t, ir::Builder& bb) {
+        if (t.ev->iffCondition == nullptr) {
+            bb.break_(l);
+            return;
+        }
+        when(lower_predicate(*t.ev->iffCondition, bb), [&] { bb.break_(l); }, bb);
+    };
+    // Whether a sampled term changed, or made the edge its qualifier names.
+    const auto changed = [&](const Term& t, ir::Index cur, ir::Index old, ir::Builder& bb) {
+        switch (t.kind) {
+            case Kind::Word:
+                return t.ev->edge == slang::ast::EdgeKind::None
+                         ? bb.unary(ir::Inst::Tag::Lnot, bb.binary(ir::Inst::Tag::CaseEq, cur, old, l), l)
+                         : lsb_edge_fired(old, cur, t.ev->edge, bb, l);
+            case Kind::Real: {
+                // The bit patterns, as a real signal's store compares them: a NaN is the
+                // value it was, and +0.0 is not -0.0.
+                const ir::Ref bits = make_int_type(static_cast<uint32_t>(t.ev->expr.type->getBitWidth()), false);
+                const ir::Index now_bits = bb.float_cvt(ir::Inst::Tag::FBitcast, cur, bits, l);
+                const ir::Index was_bits = bb.float_cvt(ir::Inst::Tag::FBitcast, old, bits, l);
+                return bb.binary(ir::Inst::Tag::Ne, now_bits, was_bits, l);
+            }
+            case Kind::String: {
+                const ir::Index order = bb.binary(ir::Inst::Tag::StrCmp, cur, old, l);
+                return bb.binary(ir::Inst::Tag::Ne, order, iconst(make_int_type(32, false), 0, bb, l), l);
+            }
+            case Kind::Event:
+                break;
+        }
+        fail("internal: an event is not a sampled value");
+    };
+
+    for (const Term& t : terms) {
+        if (t.kind != Kind::Event) {
+            store(t, read(t, b), b);
+            continue;
+        }
+        store(t, iconst(u64, ~uint64_t{ 0 }, b, l), b);
+        const ir::Index triggered = b.event_triggered(event_handle(t.ev->expr, b), l);
+        when(triggered, [&] { store(t, b.sim_time(1, l), b); }, b);
+    }
 
     b.open_region();
     const ir::Index      lpred = true_const(b, l);
@@ -628,61 +734,86 @@ void Lowerer::lower_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::
 
     b.open_region();
     {
-        std::vector<ir::WaitEdge> edges;
-        for (const MemberAccessExpression* ma : vif_member_reads(ev.expr)) {
-            const std::optional<ir::Signal> rep =
-              vif_member_signal(ma->member, vif_named_body(ma->value()),
-                                "'" + std::string(ma->member.name) + "'");
-            const ir::Index inst = lower_expr(ma->value(), b);
-            if (rep) {
-                edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
-                                              ir::kNoWaitHandle, inst });
+        // What the loop parks on is read here, inside the body, so a handle that was
+        // re-pointed is followed on every pass.
+        std::vector<ir::WaitEdge>                  edges;
+        ankerl::unordered_dense::set<uint32_t>     signals;
+        std::vector<const MemberAccessExpression*> members;
+        // A signal's bucket holds one entry per waiting process, so it is named once however
+        // many terms read it. A member's list and an event's carry a node per edge, and a
+        // repeat costs only a second node.
+        const auto on_signal = [&](ir::Signal s) {
+            if (signals.insert(static_cast<uint32_t>(s)).second) {
+                edges.push_back(ir::WaitEdge{ s, static_cast<uint32_t>(ir::Edge::Any) });
             }
-        }
-        // Class properties the expression reads: each parks on its any-change notifier,
-        // in the object its handle names right now. A property is one variable, so a
-        // change anywhere in it wakes this loop, and the comparison below decides whether
-        // the expression's own value moved. A container's notifier is a mutation's, which
-        // is no change in value, so none is parked on.
-        ClassPropReadScan props;
-        ev.expr.visit(props);
-        for (const Expression* pe : props.notifiable) {
-            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*pe);
-            if (!is_notified_container(prop.getType().getCanonicalType())) {
-                edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
-                                              static_cast<uint32_t>(ir::Edge::Any),
-                                              prop_notifier_handle(*pe, prop, ir::Edge::Any, b) });
+        };
+        for (const Term& t : terms) {
+            const Expression& e = t.ev->expr;
+            if (t.kind == Kind::Event) {
+                edges.push_back(ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any),
+                                              event_handle(e, b) });
+                continue;
             }
-        }
-        std::vector<ir::WaitEvent> reads;
-        collect_expr_reads(ev.expr, reads);
-        for (const ir::WaitEvent& e : reads) {
-            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+            if (t.clock) {
+                on_signal(*t.clock);
+                continue;
+            }
+            for (const MemberAccessExpression* ma : vif_member_reads(e)) {
+                if (std::ranges::any_of(members, [&](const MemberAccessExpression* m) {
+                        return same_member_read(*m, *ma);
+                    })) {
+                    continue;
+                }
+                members.push_back(ma);
+                const std::optional<ir::Signal> rep =
+                  vif_member_signal(ma->member, vif_named_body(ma->value()),
+                                    "'" + std::string(ma->member.name) + "'");
+                const ir::Index inst = lower_expr(ma->value(), b);
+                if (rep) {
+                    edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
+                                                  ir::kNoWaitHandle, inst });
+                }
+            }
+            // Class properties the term reads: each parks on its any-change notifier, in
+            // the object its handle names right now. A property is one variable, so a change
+            // anywhere in it wakes this loop, and the comparison below decides whether the
+            // term's own value moved. A container's notifier is a mutation's, which is no
+            // change in value, so a term that reads one was refused above.
+            ClassPropReadScan props;
+            e.visit(props);
+            for (const Expression* pe : props.notifiable) {
+                edges.push_back(ir::WaitEdge{
+                  ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any),
+                  prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
+            }
+            std::vector<ir::WaitEvent> reads;
+            collect_expr_reads(e, reads);
+            for (const ir::WaitEvent& r : reads) {
+                on_signal(r.signal);
+            }
         }
         b.wait(edges, l);
-        const ir::Index cur     = b.convert(lower_expr(ev.expr, b), ty, ev.expr.type->isSigned(), l);
-        const ir::Index sampled = b.unary(ir::Inst::Tag::Load, place(b), l);
-        b.binary(ir::Inst::Tag::Store, place(b), cur, l);
-        const ir::Index fired =
-          ev.edge == slang::ast::EdgeKind::None
-            ? b.unary(ir::Inst::Tag::Lnot, b.binary(ir::Inst::Tag::CaseEq, cur, sampled, l), l)
-            : lsb_edge_fired(sampled, cur, ev.edge, b, l);
-        b.open_region();
-        if (ev.iffCondition != nullptr) {
-            const ir::Index gate = lower_predicate(*ev.iffCondition, b);
-            b.open_region();
-            b.break_(l);
-            const ir::ExtraSlice take = b.close_region();
-            b.open_region();
-            const ir::ExtraSlice skip = b.close_region();
-            b.cond(gate, take, skip, l);
-        } else {
-            b.break_(l);
+
+        for (const Term& t : terms) {
+            if (t.kind == Kind::Event) {
+                const ir::Index triggered = b.event_triggered(event_handle(t.ev->expr, b), l);
+                const ir::Index now       = b.sim_time(1, l);
+                when(triggered, [&] {
+                    const ir::Index counted = load(t, b);
+                    const ir::Index fresh   = b.binary(ir::Inst::Tag::Ne, counted, now, l);
+                    store(t, now, b);
+                    when(fresh, [&] { resume(t, b); }, b);
+                }, b);
+                continue;
+            }
+            const ir::Index cur = read(t, b);
+            const ir::Index old = load(t, b);
+            // Compared before the sample is overwritten: a string `old` names the sample's
+            // storage, it does not hold a copy of what the sample was.
+            const ir::Index fired = changed(t, cur, old, b);
+            store(t, cur, b);
+            when(fired, [&] { resume(t, b); }, b);
         }
-        const ir::ExtraSlice then_r = b.close_region();
-        b.open_region();
-        const ir::ExtraSlice else_r = b.close_region();
-        b.cond(fired, then_r, else_r, l);
     }
     const ir::ExtraSlice body = b.close_region();
 
@@ -752,13 +883,10 @@ void Lowerer::flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l) {
 // multi-signal list (@(a or posedge b)) registers the process on every listed
 // (signal, edge) queue at once; it wakes when any of them fires.
 void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
-    if (tc.kind == TimingControlKind::SignalEvent) {
-        const auto& ev = tc.as<SignalEventControl>();
-        if ((reads_vif(ev.expr) && ev.expr.kind != ExpressionKind::MemberAccess) || event_reads_props(ev.expr)) {
-            lower_expr_wait(ev, b, l);
-            flush_deferred_on_resume(b, l);
-            return;
-        }
+    if (control_needs_loop(tc)) {
+        lower_expr_wait(tc, b, l);
+        flush_deferred_on_resume(b, l);
+        return;
     }
     std::vector<ir::WaitEvent> events;
     // Handle expressions in this list lower into `b`, immediately before the

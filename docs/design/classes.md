@@ -866,7 +866,10 @@ wait in `lower_expr_wait` (parked on the notifiers, then compared with a sample)
 misses a change that reverts before the waiter runs (scheduler-rules R8/R9). `@(obj.s)`
 is no legal event expression (9.4.2: singular values). An event member is an event object
 like an event property's (`@`, `wait(.triggered)`, `->`, `->>` reach it); a trigger fires no
-notifier, its siblings' stores do. Not covered: event lists over property parts.
+notifier, its siblings' stores do. An event list with a compound term waits in the same loop,
+every term sampled and compared (LRM_NOTES 58), and each property any of its terms reads, a
+property named by itself included, carries an any-change notifier. A null handle in an
+explicit control is a located fatal where the wait begins (LRM 8.4); only `@*` parks on it.
 
 ## Waiting on an event property (LRM 9.4.2 over 15.5)
 
