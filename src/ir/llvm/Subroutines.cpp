@@ -229,8 +229,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), params, false);
         // Internal: its callers are the entry of its schedule group, in this
-        // module when the group has no other row (where the inliner may fold the
-        // body in), or a dispatcher in root, which promotes it through sym().
+        // module when the group has no other row (where the body is moved into
+        // the entry, emit_sched_entries), or a dispatcher in root, which promotes
+        // it through sym().
         fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
         fn_->getArg(0)->setName("ctx");
         wheel_ = fn_->getArg(1);
