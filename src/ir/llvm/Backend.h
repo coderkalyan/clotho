@@ -4330,11 +4330,12 @@ private:
         bool       container = false;
     };
 
-    MemTarget resolve_mem_target(Index      target,
-                                 Ref        type,
-                                 Ref        base_type,
-                                 uint32_t   slice,
-                                 Index      slice_base,
+    MemTarget resolve_mem_target(Index       target,
+                                 Ref         type,
+                                 Ref         base_type,
+                                 uint32_t    slice,
+                                 Index       slice_base,
+                                 Index       slice_end,
                                  const char* task);
 
     void finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix);

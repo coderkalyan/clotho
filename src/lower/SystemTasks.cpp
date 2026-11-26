@@ -106,8 +106,7 @@ ir::Index Lowerer::lower_address_arg(const Expression& expr, ir::Builder& b) {
 // queue or an associative array; an element of one that is itself an array (a partially
 // indexed multidimensional memory); or a slice of either, with every dimension above the
 // slice indexed. The variable can be a member of an unpacked struct, a property of a class
-// object or a member of the interface a virtual interface handle names (LRM 25.9). A queue
-// slice is a new queue (LRM 7.10.1), not a view of the queue that a load could fill.
+// object or a member of the interface a virtual interface handle names (LRM 25.9).
 bool Lowerer::is_mem_target_shape(const Expression& e) {
     for (const Expression* cur = &e;;) {
         const slang::ast::Type& type = cur->type->getCanonicalType();
@@ -130,14 +129,9 @@ bool Lowerer::is_mem_target_shape(const Expression& e) {
             case ExpressionKind::ElementSelect:
                 cur = &cur->as<ElementSelectExpression>().value();
                 break;
-            case ExpressionKind::RangeSelect: {
-                const Expression& sliced = cur->as<RangeSelectExpression>().value();
-                if (is_queue(sliced)) {
-                    return false;
-                }
-                cur = &sliced;
+            case ExpressionKind::RangeSelect:
+                cur = &cur->as<RangeSelectExpression>().value();
                 break;
-            }
             default:
                 return false;
         }
@@ -154,11 +148,19 @@ bool Lowerer::is_mem_target_shape(const Expression& e) {
 // base is widened by its own signedness, with room for the arithmetic, exactly as
 // emit_indexed_slice_copy does, so an x or z bit and a negative base keep their
 // meaning.
+//
+// A slice of a queue differs in that its bounds are runtime values and clip to the
+// queue (LRM 7.10.1), so it is the queue plus the first and last index it selects, and
+// the backend finds the elements that are left (kMemSliceQueue).
 Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b) {
     MemTarget t;
     t.type = lower_type(*e.type);
     if (e.kind == ExpressionKind::RangeSelect) {
         const RangeSelectExpression& rs = e.as<RangeSelectExpression>();
+        if (is_queue(rs.value())) {
+            lower_queue_slice_target(rs, t, b);
+            return t;
+        }
         guard_indexed_array_slice(rs);
         const auto    w        = std::max(static_cast<uint32_t>(rs.left().type->getBitWidth()), 32u) + 2;
         const ir::Ref extended = make_int_type(w, rs.left().type->isFourState());
@@ -175,6 +177,60 @@ Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b
     }
     t.target = lower_lvalue(e, b, /*is_write=*/true);
     return t;
+}
+
+// A slice of a queue as the array a load fills (LRM 21.4, 7.10.1): the queue `q` and the
+// first and last index the slice selects, `q[a:b]` as written, `q[i +: n]` as `q[i:i+n-1]`
+// and `q[i -: n]` as `q[i-n+1:i]` (11.5.1). The addresses of the load are those indices of
+// `q`, as a slice of a fixed array has its own, and the backend clips the range to the
+// queue and takes none of it for an empty or unknown one (resolve_mem_target). A bound is
+// any integral expression and can spell `$`, the last index of `q`. It widens by its own
+// signedness, with room for the arithmetic of an indexed slice, so that an x or z bit and a
+// negative bound keep their meaning; `$` is a signed `int`.
+void Lowerer::lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b) {
+    const ir::SourceLoc l = loc(rs);
+    t.target              = lower_lvalue(rs.value(), b, /*is_write=*/true);
+    t.base_type           = lower_type(*rs.value().type);
+    t.slice               = ir::kMemSliceQueue;
+    const Restore<std::optional<QueueDollarCtx>> dollar_guard(queue_dollar_, QueueDollarCtx{ t.target, t.base_type });
+
+    struct Operand {
+        ir::Index     value;
+        bool          is_signed;
+        ir::ValueType type;
+    };
+    const auto operand = [&](const Expression& x) {
+        const ir::Index v = lower_expr(x, b);
+        return Operand{ v, x.type->isUnbounded() || x.type->isSigned(), b.type_of(v) };
+    };
+    // Two bits wider than `width`, which is no narrower than an `int`.
+    const auto widen = [&](const Operand& x, uint32_t width, bool four) {
+        return b.convert(x.value, make_int_type(width + 2, four), x.is_signed, l);
+    };
+
+    const Operand  first = operand(rs.left());
+    const Operand  last  = operand(rs.right());
+    if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+        t.slice_base = widen(first, std::max(first.type.width, 32u), first.type.four_state);
+        t.slice_end  = widen(last, std::max(last.type.width, 32u), last.type.four_state);
+        return;
+    }
+    // `i +: n` and `i -: n` span n indices from `i`: both operands are runtime values for a
+    // queue (no constant width as for an array), so the far end is computed here, in a type
+    // that holds the sum of two of them. An x or z bit in either makes the far end unknown.
+    const uint32_t width = std::max({ first.type.width, last.type.width, 32u });
+    const bool     four  = first.type.four_state || last.type.four_state;
+    const ir::Ref  wide  = make_int_type(width + 2, four);
+    const ir::Index base  = widen(first, width, four);
+    const ir::Index count = widen(last, width, four);
+    const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, b.constant(module_.pool.put_int(wide, 1), l), l);
+    if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
+        t.slice_base = base;
+        t.slice_end  = b.binary(ir::Inst::Tag::Add, base, nm1, l);
+    } else {
+        t.slice_base = b.binary(ir::Inst::Tag::Sub, base, nm1, l);
+        t.slice_end  = base;
+    }
 }
 
 // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
@@ -202,9 +258,7 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
     }
     const Expression& mem = *mem_arg;
     if (!is_mem_target_shape(mem)) {
-        // TODO: a slice of a queue as the target.
-        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one, not a "
-             "slice of a queue");
+        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one");
     }
     const ir::Index  filename   = lower_expr(*args[0], b);
     const MemTarget  target     = lower_mem_target(mem, b);
@@ -222,6 +276,7 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
                                 .start      = start,
                                 .finish     = finish,
                                 .slice_base = target.slice_base,
+                                .slice_end  = target.slice_end,
                                 .type       = target.type,
                                 .base_type  = target.base_type,
                                 .hex        = hex ? 1u : 0u,
@@ -1565,9 +1620,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         const Expression& target = *target_arg;
         if (target.type->getCanonicalType().isUnpackedArray()) {
             if (!is_mem_target_shape(target)) {
-                // TODO: a slice of a queue as the target.
-                fail("$fread memory target must be an unpacked array variable, an element of one or a slice of "
-                     "one, not a slice of a queue");
+                fail("$fread memory target must be an unpacked array variable, an element of one or a slice of one");
             }
             // NOTE: 21.4.1 addresses an associative array by an integral index only. slang checks
             // that of a $readmem and not of a $fread, so an index it has no address for stops here.
@@ -1591,6 +1644,7 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
                                          .start      = start,
                                          .count      = cnt,
                                          .slice_base = mem.slice_base,
+                                         .slice_end  = mem.slice_end,
                                          .type       = mem.type,
                                          .base_type  = mem.base_type,
                                          .has_start  = has_start ? 1u : 0u,

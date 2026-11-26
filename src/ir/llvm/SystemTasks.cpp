@@ -1139,6 +1139,13 @@ std::pair<llvm::Value*, uint32_t> Backend::mem_inner_dims(Ref array_type) {
 // of its words. An x or z base leaves none. A slice with constant bounds takes the same
 // form, its base the first of its bounds.
 //
+// A slice of a queue (`slice` is kMemSliceQueue, `slice_base` and `slice_end` its first
+// and last index) is the elements of the queue LRM 7.10.1 gives it: from the first index
+// but not below 0 to the last but not past the end of the queue, none when that range is
+// empty or a bound has an x or z bit. Its words are addressed by their index in the
+// queue, so its range is that of the elements that are left, and its first word is
+// where the ring puts the first of them.
+//
 // Where the leaves are depends on the lvalue. A memory in a module signal is
 // `[N x slot]`, the slot the may-z analysis chose. Every other array has its type's
 // canonical slot: an array inside an aggregate lies one slot after another from the
@@ -1163,6 +1170,7 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
                                                Ref         base_type,
                                                uint32_t    slice,
                                                Index       slice_base,
+                                               Index       slice_end,
                                                const char* task) {
     Guarded g = lvalue_of(target);
     // An entry of an associative array that is itself an array or a container, `aa[k]`, is the
@@ -1182,8 +1190,9 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
     const bool queue     = named_ty.kind == Type::Kind::Queue;
     const bool assoc     = named_ty.kind == Type::Kind::Assoc;
     const bool container = queue || assoc || named_ty.kind == Type::Kind::DynArray;
-    if (queue && slice != kMemSliceNone) {
-        throw BackendError{ "internal: a slice of a queue is a new queue, not a view that a load can fill" };
+    // Only a slice of a queue has runtime bounds, and nothing else is cut by them.
+    if (slice != kMemSliceNone && (slice == kMemSliceQueue) != queue) {
+        throw BackendError{ "internal: a slice of a queue is a queue slice, and no other slice is" };
     }
 
     // The leaf slot. A memory held in a signal has the one the may-z analysis chose; the
@@ -1277,9 +1286,30 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
     llvm::Value*  size  = container ? len : b_.getInt64(dim(named_ty));
     llvm::Value*  count = container && slice == kMemSliceNone ? len : b_.getInt64(words);
     llvm::Value*  lo    = zero;
+    // The bounds of the array the load fills, which its addresses are numbered by.
+    llvm::Value* left_addr  = container && slice == kMemSliceNone ? zero : b_.getInt64(loaded.left);
+    llvm::Value* right_addr = container && slice == kMemSliceNone ? b_.CreateSub(len, b_.getInt64(1))
+                                                                   : b_.getInt64(loaded.right);
     // The leaf of the whole array where the first word that exists starts.
     llvm::Value* first = g.elem_idx != nullptr ? cast(g.elem_idx, 64, false) : zero;
-    if (slice != kMemSliceNone) {
+    // The ring slot of the first word that exists, for a queue.
+    llvm::Value* ring_first = head;
+    if (slice == kMemSliceQueue) {
+        // LRM 7.10.1: the indices from the first bound, but not below 0, to the last, but not
+        // past the end of the queue. They are the addresses of the load, and there are none
+        // when the range is empty or a bound has an x or z bit.
+        llvm::Value* from = select_index(value_of(slice_base), type_of(slice_base));
+        llvm::Value* to   = select_index(value_of(slice_end), type_of(slice_end));
+        left_addr         = smax(from, zero);
+        right_addr        = smin(to, b_.CreateSub(len, b_.getInt64(1)));
+        count             = b_.CreateSelect(b_.CreateICmpSLE(left_addr, right_addr),
+                                            b_.CreateAdd(b_.CreateSub(right_addr, left_addr), b_.getInt64(1)), zero);
+        count = b_.CreateSelect(b_.CreateOr(any_unknown(slice_base), any_unknown(slice_end)), zero, count);
+        // The word at `left_addr` is that many slots on from the head, which wraps once at
+        // most: the head is below the capacity and a word that exists below the length.
+        llvm::Value* at = b_.CreateAdd(head, left_addr);
+        ring_first      = b_.CreateSelect(b_.CreateICmpUGE(at, cap), b_.CreateSub(at, cap), at);
+    } else if (slice != kMemSliceNone) {
         // A dynamic array is always 0-based and ascending (LRM 7.5).
         const bool     ascending   = container || named_ty.left <= named_ty.right;
         const int64_t  left        = container ? 0 : int64_t{ named_ty.left };
@@ -1342,11 +1372,11 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
     t.width      = width;
     t.four_state = four_state;
     t.inner      = mem_inner_dims(type);
-    t.left       = container && slice == kMemSliceNone ? zero : b_.getInt64(loaded.left);
-    t.right      = container && slice == kMemSliceNone ? b_.CreateSub(len, b_.getInt64(1)) : b_.getInt64(loaded.right);
+    t.left       = left_addr;
+    t.right      = right_addr;
     t.lo_word    = lo;
     t.word_count = count;
-    t.ring_head  = queue ? head : zero;
+    t.ring_head  = queue ? ring_first : zero;
     t.ring_cap   = queue ? cap : zero;
     t.place      = static_cast<const LValueInfo&>(g);
     t.container  = container;
@@ -1432,8 +1462,8 @@ void Backend::lower_fread_word(Index i) {
 void Backend::lower_fread_mem(Index i) {
     const Index fdi  = ir_->payload(i).op_extra.op;
     const auto  info = ir_->extra_data<FreadMemInfo>(ir_->payload(i).op_extra.extra);
-    const MemTarget t =
-      resolve_mem_target(info.target, info.type, info.base_type, info.slice, info.slice_base, "$fread");
+    const MemTarget t = resolve_mem_target(
+      info.target, info.type, info.base_type, info.slice, info.slice_base, info.slice_end, "$fread");
 
     llvm::Value*   fd     = cast(must_of(fdi), 32, true);
     const auto     i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
@@ -1479,8 +1509,8 @@ void Backend::lower_fread_mem(Index i) {
 void Backend::lower_readmem(Index i) {
     const auto      info  = ir_->extra_data<ReadMemInfo>(ir_->payload(i).op_extra.extra);
     const Index     fname = ir_->payload(i).op_extra.op;
-    const MemTarget t =
-      resolve_mem_target(info.target, info.type, info.base_type, info.slice, info.slice_base, "$readmem");
+    const MemTarget t = resolve_mem_target(
+      info.target, info.type, info.base_type, info.slice, info.slice_base, info.slice_end, "$readmem");
 
     // A string-object filename (LRM §21.4 allows a string-typed expression) is
     // read straight from its rt_string handle: bytes in natural order, so the

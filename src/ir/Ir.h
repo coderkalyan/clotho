@@ -512,17 +512,23 @@ struct AssocArg {
 // the addresses name. An indexed slice `target[base +: width]` / `[base -: width]`
 // has a runtime position, so it is not an lvalue: `slice` says which form it is, the
 // base value is `slice_base`, `base_type` the type of `target` it selects from, and
-// `type` the slice's own. `start` / `finish` are optional address-bound operands
-// (valid per `has_start` / `has_finish`). `hex` selects hex vs binary digits.
+// `type` the slice's own. A slice of a queue has runtime bounds as well, its first
+// and last indices `slice_base` and `slice_end` (kMemSliceQueue). `start` / `finish`
+// are optional address-bound operands (valid per `has_start` / `has_finish`). `hex`
+// selects hex vs binary digits.
 struct ReadMemInfo {
     // The array lvalue the load names, or the one an indexed slice selects from.
     Index target;
     // Optional first / last address operands, in the loaded array's own bounds.
     Index start;
     Index finish;
-    // The base value of an indexed slice, widened to its own signedness so that it
-    // reads as a signed number; unused unless `slice` is not kMemSliceNone.
+    // The base value of an indexed slice, or the first index of a queue slice, widened
+    // to its own signedness so that it reads as a signed number; unused unless `slice`
+    // is not kMemSliceNone.
     Index slice_base;
+    // The last index of a queue slice, widened as `slice_base` is; unused unless `slice`
+    // is kMemSliceQueue.
+    Index slice_end;
     // The UnpackedArray type of the array the load fills.
     Ref type;
     // The UnpackedArray type of `target` for an indexed slice, else unused.
@@ -532,15 +538,17 @@ struct ReadMemInfo {
     // Whether the start / finish operands are present.
     uint32_t has_start;
     uint32_t has_finish;
-    // kMemSliceNone, kMemSliceUp (`+:`) or kMemSliceDown (`-:`).
+    // kMemSliceNone, kMemSliceUp (`+:`), kMemSliceDown (`-:`) or kMemSliceQueue.
     uint32_t slice;
 };
 
 // How an indexed slice of the array a memory task loads is written (ReadMemInfo,
-// FreadMemInfo).
-inline constexpr uint32_t kMemSliceNone = 0;
-inline constexpr uint32_t kMemSliceUp   = 1;
-inline constexpr uint32_t kMemSliceDown = 2;
+// FreadMemInfo). kMemSliceQueue is a slice of a queue, `q[a:b]` with its runtime first
+// and last indices (LRM 7.10.1).
+inline constexpr uint32_t kMemSliceNone  = 0;
+inline constexpr uint32_t kMemSliceUp    = 1;
+inline constexpr uint32_t kMemSliceDown  = 2;
+inline constexpr uint32_t kMemSliceQueue = 3;
 
 // Extra payload for `call`: the callee plus its already-lowered argument values,
 // in formal-parameter order (each resized to the parameter type by the frontend).
@@ -1188,17 +1196,20 @@ struct ScanfInfo {
 
 // Extra payload for `fread_mem`: $fread(mem, fd[, start[, count]]) reads raw bytes
 // into the unpacked array `mem` names (LRM 21.3.4.4). The fd value is the
-// instruction's `op`; `target`, `type`, `slice_base`, `base_type` and `slice` name
-// the array exactly as ReadMemInfo does, and `start` / `count` are optional address
-// / word-count operands (valid per has_*) over its highest dimension.
+// instruction's `op`; `target`, `type`, `slice_base`, `slice_end`, `base_type` and
+// `slice` name the array exactly as ReadMemInfo does, and `start` / `count` are
+// optional address / word-count operands (valid per has_*) over its highest dimension.
 struct FreadMemInfo {
     // The array lvalue the load names, or the one an indexed slice selects from.
     Index target;
     // Optional first-address and max-word-count operands.
     Index start;
     Index count;
-    // The base value of an indexed slice; unused unless `slice` is not kMemSliceNone.
+    // The base value of an indexed slice, or the first index of a queue slice; unused
+    // unless `slice` is not kMemSliceNone.
     Index slice_base;
+    // The last index of a queue slice; unused unless `slice` is kMemSliceQueue.
+    Index slice_end;
     // The UnpackedArray type of the array the load fills.
     Ref type;
     // The UnpackedArray type of `target` for an indexed slice, else unused.
@@ -1206,7 +1217,7 @@ struct FreadMemInfo {
     // Whether the start / count operands are present.
     uint32_t has_start;
     uint32_t has_count;
-    // kMemSliceNone, kMemSliceUp (`+:`) or kMemSliceDown (`-:`).
+    // kMemSliceNone, kMemSliceUp (`+:`), kMemSliceDown (`-:`) or kMemSliceQueue.
     uint32_t slice;
 };
 
@@ -3204,9 +3215,9 @@ enum class ExtraOperandTail : uint8_t {
     // made in: an InstPath value, read at run time.
     SeverityPath,
     // + ReadMemInfo::slice_base / FreadMemInfo::slice_base: the runtime base of an
-    // indexed slice of the array a memory task loads, when it has one. The span
-    // holds the filename or descriptor, the target lvalue and the optional address
-    // operands.
+    // indexed slice of the array a memory task loads, when it has one, and with
+    // ::slice_end the last index of a slice of a queue. The span holds the filename or
+    // descriptor, the target lvalue and the optional address operands.
     MemSliceBase,
 };
 
@@ -3556,18 +3567,20 @@ public:
                 return;
             }
             case ExtraOperandTail::MemSliceBase: {
-                // The two records agree on which operand that is; the slice only
-                // exists for the form the operand names.
+                // The two records agree on which operands those are; the slice only
+                // exists for the form the operands name.
+                const auto visit = [&](const auto& info) {
+                    if (info.slice != kMemSliceNone) {
+                        fn(info.slice_base);
+                    }
+                    if (info.slice == kMemSliceQueue) {
+                        fn(info.slice_end);
+                    }
+                };
                 if (tag(inst) == Inst::Tag::ReadMem) {
-                    const auto info = extra_data<ReadMemInfo>(p.op_extra.extra);
-                    if (info.slice != kMemSliceNone) {
-                        fn(info.slice_base);
-                    }
+                    visit(extra_data<ReadMemInfo>(p.op_extra.extra));
                 } else {
-                    const auto info = extra_data<FreadMemInfo>(p.op_extra.extra);
-                    if (info.slice != kMemSliceNone) {
-                        fn(info.slice_base);
-                    }
+                    visit(extra_data<FreadMemInfo>(p.op_extra.extra));
                 }
                 return;
             }

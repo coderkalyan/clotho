@@ -839,8 +839,21 @@ warning a memory's last address gives, and no element is created. 21.3.4.4 names
 container, and `$fread` takes the same reading. A dynamic array of fixed arrays is a
 memory of several dimensions whose highest is the array (note 59), and a slice `d[a:b]`
 or `d[i +: n]` of a dynamic array has the addresses and placement note 60 gives a slice of
-a fixed array. A slice of a queue is a new queue (7.10.1), not a view of it, so no load
-fills it and Clotho refuses it.
+a fixed array.
+
+A slice of a queue, `q[a:b]`, `q[i +: n]` or `q[i -: n]`, is the elements 7.10.1 gives it:
+from the first bound, but not below 0, to the last, but not past `$`, and none when that
+range is empty or a bound has an x or z bit (`q[i +: n]` is `q[i:i+n-1]` and `q[i -: n]` is
+`q[i-n+1:i]`, 11.5.1). As a value it is a new queue, but 21.4 lets the memory be written
+"with slice syntax", and the load fills the elements of `q` that the slice selects, as it
+fills those of a slice of a fixed array, never resizing `q` (21.4.1). Decided reading (with
+the user): the addresses are the indices of `q`, so `q[2:$]` of six elements has the
+addresses 2 to 5 and its default start is 2, and `start`, `finish` and the `@` addresses of
+the file name indices of `q` that lie in what is left of the slice once the queue has
+clipped it (`q[3:9]` of six is [3:5], note 62). The indexed slice of an array takes the
+addresses slang gives it, `[0:n-1]` (note 60), because slang types it; a queue slice has no
+declared range, so `q[i +: n]` keeps the addresses of `q[i:i+n-1]`. A slice that selects no
+element names no word, as an empty queue does below: nothing is opened or read.
 
 A dynamic array or queue with no element has `$right` -1, which is no address at all: the
 load names no word, as a slice wholly outside its array does (note 60), so no file is
@@ -853,7 +866,7 @@ iverilog 13 takes neither container as a memory argument ("$readmemh's second ar
 must be a memory"), so the tests take as oracle its load of the fixed memory `[0:n-1]`
 with the same file and arguments, and derive the rest from the clauses above.
 
-Code: `src/lower/SystemTasks.cpp` (`is_mem_target_shape`, `lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `finish_mem_load`), `src/runtime/Io.cpp` (`MemDest`, `rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1", "$fread into a dynamic array or a queue fills the words it holds", "$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements", "$readmemh into a slice of a dynamic array places its words like a fixed memory", "$readmemh into a dynamic array of fixed arrays, an element or a slice of one", "a load into an empty dynamic array or queue does nothing", "a load into a dynamic array or a queue wakes the waiters of its elements", "a load into a dynamic array local to a task"), `tests/runtime_test.cpp` ("rt_readmem walks the words of a queue's ring from its head slot").
+Code: `src/lower/SystemTasks.cpp` (`is_mem_target_shape`, `lower_mem_target`, `lower_queue_slice_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `finish_mem_load`), `src/runtime/Io.cpp` (`MemDest`, `rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1", "$fread into a dynamic array or a queue fills the words it holds", "$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements", "$readmemh into a slice of a dynamic array places its words like a fixed memory", "$readmemh into a slice of a queue loads the elements it selects, by queue index", "$readmemh into a slice of a queue that selects no element does nothing", "$readmemh into a slice of a queue takes start, finish and file addresses inside the slice", "$fread into a slice of a queue fills the elements it selects", "$readmem into a slice of a queue of 4-state, 2-state, wide and array elements", "a load into a slice of a queue wakes the waiters of its elements", "$readmem and $fread into a slice of a queue held by a struct, a class, a ref argument or another container", "$readmemh into a dynamic array of fixed arrays, an element or a slice of one", "a load into an empty dynamic array or queue does nothing", "a load into a dynamic array or a queue wakes the waiters of its elements", "a load into a dynamic array local to a task"), `tests/runtime_test.cpp` ("rt_readmem walks the words of a queue's ring from its head slot").
 
 ## 62. File addresses and word counts against the range a `$readmem*` names (21.4)
 

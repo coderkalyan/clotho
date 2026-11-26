@@ -3967,18 +3967,22 @@ private:
 
     // The array a $readmem / $fread loads (LRM 21.4, 21.3.4.4), as ReadMemInfo and
     // FreadMemInfo name it: `target` the array lvalue, or the one an indexed slice
-    // selects from, and `type` the array the load fills.
+    // selects from, and `type` the array the load fills. `slice_end` is the last index
+    // of a slice of a queue, whose first is `slice_base`.
     struct MemTarget {
         ir::Index target;
         ir::Ref   type;
         ir::Ref   base_type  = ir::Ref::Invalid;
         ir::Index slice_base = ir::Index{ 0 };
+        ir::Index slice_end  = ir::Index{ 0 };
         uint32_t  slice      = ir::kMemSliceNone;
     };
 
     static bool is_mem_target_shape(const Expression& e);
 
     MemTarget lower_mem_target(const Expression& e, ir::Builder& b);
+
+    void lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b);
 
     std::vector<char> scan_conversion_chars(std::string_view fmt);
 
