@@ -1679,6 +1679,8 @@ private:
     // (ir::ChangeNotify::shared): an element of clotho.chg_shared.
     llvm::Constant* chg_shared_slot(uint32_t k);
 
+    bool str_signal_waited(const LValueInfo& lv) const;
+
     llvm::Value* str_chg_snapshot(const Guarded& lv);
 
     void str_chg_after(const Guarded& lv, llvm::Value* snap);
@@ -5003,6 +5005,8 @@ private:
     static constexpr uint32_t kProcSelfPark  = 1u << 11;
     // Parked in `wait fork`, woken when the last live descendant completes.
     static constexpr uint32_t kProcWaitFork  = 1u << 12;
+    // Announced as WAITING to whatever waits on `status()`: the next park is no news.
+    static constexpr uint32_t kProcSeenWait = 1u << 13;
 
     llvm::Value* proc_arg();
 
@@ -5015,6 +5019,12 @@ private:
     llvm::Value* program_root_pcb(llvm::Value* inst);
 
     void emit_proc_state(uint32_t from, uint32_t to);
+
+    uint32_t proc_status_notify() const;
+
+    void emit_proc_status_notify(llvm::Value* pcb);
+
+    void emit_proc_park_notify();
 
     llvm::Value* emit_proc_object(llvm::Value* pcb, Ref class_ref);
 

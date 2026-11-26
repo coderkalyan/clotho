@@ -782,6 +782,70 @@ void Backend::emit_proc_state(uint32_t from, uint32_t to) {
     b_.CreateStore(b_.CreateSelect(is, moved, cur), p);
 }
 
+// The number of the design-wide notifier of `process::status()`, or kNoNotify in a
+// design where no `@` or `wait` reads a status, which is every design the code
+// below emits nothing for. The frontend hangs it on the control-block field of the
+// process class (lower_process_class), which no store ever names.
+uint32_t Backend::proc_status_notify() const {
+    for (const Ref r : mod_.process_classes()) {
+        if (const ChangeNotify* cn = mod_.change_notify(r, 0); cn != nullptr && cn->shared != kNoNotify) {
+            return cn->shared;
+        }
+    }
+    return kNoNotify;
+}
+
+// Wake what waits on a `status()` (LRM 9.7 read in an `@` or a `wait`, 9.4.2,
+// 9.4.3), because the state of the thread `pcb` has changed or is about to before
+// anything woken can run. One notifier serves every thread: a waiter re-evaluates
+// its own expression, so a change of a thread it does not ask about costs it one
+// re-test. A thread nothing holds a handle to has no status anybody can read, and
+// wakes nobody.
+void Backend::emit_proc_status_notify(llvm::Value* pcb) {
+    const uint32_t k = proc_status_notify();
+    if (k == kNoNotify) {
+        return;
+    }
+    auto*        ptr  = llvm::PointerType::getUnqual(ctx_);
+    auto*        fn   = b_.GetInsertBlock()->getParent();
+    auto*        fire = llvm::BasicBlock::Create(ctx_, "status.fire", fn);
+    auto*        cont = llvm::BasicBlock::Create(ctx_, "status.cont", fn);
+    llvm::Value* obj  = b_.CreateLoad(ptr, pcb_field(pcb, kPcbObj));
+    b_.CreateCondBr(b_.CreateICmpNE(obj, llvm::ConstantPointerNull::get(ptr)), fire, cont);
+    b_.SetInsertPoint(fire);
+    llvm::Value* ev = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), chg_shared_slot(k)));
+    emit_event_wake_list(ev, { .kind = RT_TRACE_EVENT, .obj = ev });
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+}
+
+// A park is a change from RUNNING to WAITING only if some other thread could have
+// read RUNNING off this one: before its first park, and after a `resume` that
+// scheduled it. Between two parks nothing else runs, so a thread that was blocked,
+// ran and blocks again was WAITING every time anyone looked. Telling waiters about
+// each park instead would let two threads that wait on each other's status wake
+// each other for ever, each park being the other's wake.
+void Backend::emit_proc_park_notify() {
+    if (pcb_ == nullptr || proc_status_notify() == kNoNotify) {
+        return;
+    }
+    auto*        i32  = b_.getInt32Ty();
+    auto*        fn   = b_.GetInsertBlock()->getParent();
+    auto*        note = llvm::BasicBlock::Create(ctx_, "status.park", fn);
+    auto*        cont = llvm::BasicBlock::Create(ctx_, "status.parked", fn);
+    llvm::Value* ctlp = pcb_field(pcb_, kPcbCtl);
+    llvm::Value* ctl  = b_.CreateLoad(i32, ctlp);
+    b_.CreateCondBr(
+      b_.CreateICmpEQ(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask | kProcSeenWait)), b_.getInt32(kProcWaiting)),
+      note,
+      cont);
+    b_.SetInsertPoint(note);
+    b_.CreateStore(b_.CreateOr(ctl, b_.getInt32(kProcSeenWait)), ctlp);
+    emit_proc_status_notify(pcb_);
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+}
+
 // The `process` object naming `pcb`, created on first demand and memoized in the
 // block. One object per thread is what makes handle identity a pointer compare:
 // `process::self() == process::self()` has to hold, and clotho compares class
@@ -902,6 +966,9 @@ void Backend::emit_proc_complete() {
     // parent's `wait fork`.
     llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
     llvm::Value*      forkw = ab.CreateAlloca(llvm::PointerType::getUnqual(ctx_), nullptr, "fork_waiters");
+    // Before the state is written, which is sound: a woken thread cannot run until
+    // this one has left for good.
+    emit_proc_status_notify(pcb_);
     llvm::Value* waiters    = b_.CreateCall(proc_complete_fn(), { pcb_, forkw });
     emit_proc_wake_waiters(waiters, pcb_);
     emit_proc_wake_waiters(b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), forkw), nullptr);
@@ -1196,6 +1263,7 @@ void Backend::emit_proc_suspend(llvm::Value* pcb) {
     b_.CreateStore(b_.CreateOr(mask, b_.CreateSelect(self, b_.getInt32(kProcSelfPark),
                                                      b_.getInt32(0))),
                    ctlp);
+    emit_proc_status_notify(pcb);
     if (pcb_ != nullptr && hdl_ != nullptr) {
         auto* mine = llvm::BasicBlock::Create(ctx_, "susp.self", fn);
         b_.CreateCondBr(self, mine, skip);
@@ -1232,11 +1300,19 @@ void Backend::emit_proc_resume(llvm::Value* pcb) {
 
     b_.SetInsertPoint(go);
     llvm::Value* pend = b_.CreateAnd(ctl, b_.getInt32(kProcWakePend | kProcSelfPark));
-    b_.CreateStore(b_.CreateOr(b_.CreateAnd(ctl, b_.getInt32(~(kProcStateMask | kProcWakePend |
-                                                              kProcSelfPark))),
-                               b_.getInt32(kProcRunning)),
-                   ctlp);
     llvm::Value* acts = b_.CreateLoad(ptr, pcb_field(pcb, kPcbActs));
+    // LRM 9.7: a thread suspended while it was blocked is resensitized to what it
+    // was blocked on, so unless that has happened meanwhile (or it suspended
+    // itself) it is WAITING again, not RUNNING: it runs nothing until its wake.
+    // Either state is one another thread can read, so the park that follows a
+    // scheduled resume is a change and the block it stays in is not.
+    llvm::Value* runs = b_.CreateOr(b_.CreateICmpNE(pend, b_.getInt32(0)), b_.CreateICmpEQ(acts, null));
+    llvm::Value* rest =
+      b_.CreateAnd(ctl, b_.getInt32(~(kProcStateMask | kProcWakePend | kProcSelfPark | kProcSeenWait)));
+    b_.CreateStore(
+      b_.CreateOr(rest, b_.CreateSelect(runs, b_.getInt32(kProcRunning), b_.getInt32(kProcWaiting | kProcSeenWait))),
+      ctlp);
+    emit_proc_status_notify(pcb);
     b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpNE(pend, b_.getInt32(0)),
                                  b_.CreateICmpNE(acts, null)),
                     push, skip);

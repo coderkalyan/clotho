@@ -1621,6 +1621,15 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, uint32_t tri
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
     emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
+    // Some `@` or `wait` calls a method that reads an event property (LRM 9.4.2).
+    // The method can reach any event of the design through any object, so each
+    // trigger wakes those waiters to re-evaluate. The frontend hangs their notifier
+    // on the event type (Lowerer::declare_shared_notifiers); no other design has one.
+    if (const ChangeNotify* cn = mod_.change_notify(mod_.pool.event_type, 0);
+        cn != nullptr && cn->shared != kNoNotify) {
+        llvm::Value* any = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), chg_shared_slot(cn->shared)));
+        emit_event_wake_list(any, { .kind = RT_TRACE_EVENT, .obj = any });
+    }
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here, and
     // only an object some such statement registered on has an id to fire.

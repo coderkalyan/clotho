@@ -1837,6 +1837,7 @@ ir::Index Lowerer::lower_pattern(const slang::ast::Pattern& pat,
         case PK::Variable: {
             // `.name` — bind the pattern variable to the whole subject.
             const auto& var = pat.as<slang::ast::VariablePattern>().variable;
+            box_if_captured(var, /*force_frame=*/true, b);
             declare_storage(var, /*force_frame*/ true);
             const ir::Index slot = value_lvalue(var, b, l);
             b.binary(ir::Inst::Tag::Store,

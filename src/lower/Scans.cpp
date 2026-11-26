@@ -360,6 +360,14 @@ bool is_sync_builtin_class(const slang::ast::ClassType& clt) {
     return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
 }
 
+bool is_process_class(const slang::ast::ClassType& clt) {
+    if (clt.name != "process") {
+        return false;
+    }
+    const slang::ast::Scope* pkg = clt.getParentScope();
+    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+}
+
 const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt) {
     // Bounded by the inheritance depth, which slang has already found finite.
     for (const slang::ast::ClassType* k = &clt; k != nullptr;) {
@@ -467,16 +475,16 @@ void ClassPropReadScan::handle(const MemberAccessExpression& ma) {
 // whether a `wait` reading one can ever be woken. Exactly the class-property
 // partition, because a capture box IS a one-field class object
 // (docs/design/fork-join.md V4) and its field takes the same notifier machinery:
-// one classified word, a string's content, or a container's mutation surface. An
-// unpacked struct / union / fixed unpacked array carries none, and the wait
-// lowering refuses it by name rather than parking on nothing.
+// one classified word, a string's content, a container's mutation surface, or an
+// aggregate's members. A captured event has none and needs none: it is waited on
+// through the object it holds (Lowerer::expr_wait_deps).
 bool box_can_notify(const slang::ast::Type& ty) {
     const slang::ast::Type& ct = ty.getCanonicalType();
-    return prop_notify_kind(ct) != PropNotify::None || is_notified_container(ct);
+    return prop_notify_kind(ct) != PropNotify::None || is_notified_container(ct) || is_notified_aggregate(ct);
 }
 
 bool prop_can_notify(const slang::ast::Type& ty) {
-    return box_can_notify(ty) || is_notified_aggregate(ty.getCanonicalType());
+    return box_can_notify(ty);
 }
 
 void WaitLocalScan::handle(const slang::ast::NamedValueExpression& e) {
@@ -670,7 +678,10 @@ void CalleeReadScan::handle(const CallExpression& call) {
     // function of the two classes reads the FIFO or the key count.
     const bool sync = is_sync_builtin_class(cls);
     const bool weak = depth != 0 && sub.name == "get" && is_weak_reference_class(cls);
-    if ((sync || weak) && seen.insert(&cls).second) {
+    // A thread's state (LRM 9.7), which nothing stores where a notifier could see
+    // it: the thread's own parks and its end change it.
+    const bool status = sub.name == "status" && is_process_class(cls);
+    if ((sync || weak || status) && seen.insert(&cls).second) {
         out->builtins.push_back(&cls);
     }
 }
@@ -699,12 +710,20 @@ CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides) 
 
 // The design-wide notifiers `e` needs: one per instance property and per built-in
 // class that a subroutine it calls reads.
+//
+// An `event` property has two. Its own fires when another event is stored into it.
+// What a method reads through it (`e.triggered`, LRM 15.5.3) changes when the event
+// it names is triggered, and that may be any event of the design, so the second is
+// one notifier every trigger fires, keyed here on the design root.
 void WaitPropScan::note_callees(const Expression& e) {
     const CalleeReads reads = callee_reads(e, out->overrides);
     for (const slang::ast::ClassPropertySymbol* prop : reads.props) {
-        // A property of a type that has no notifier (an event, a covergroup handle) has
-        // no design-wide one either.
-        if (prop_can_notify(prop->getType())) {
+        // A property of a type that has no notifier (a covergroup handle) has no
+        // design-wide one either.
+        if (prop->getType().getCanonicalType().isEvent()) {
+            out->add_shared(*prop);
+            out->add_shared(prop->getParentScope()->getCompilation().getRoot());
+        } else if (prop_can_notify(prop->getType())) {
             out->add_shared(*prop);
         }
     }
@@ -2256,30 +2275,20 @@ void BoxCandidateScan::handle(const BlockStatement& blk) {
         ValueRefScan rs;
         rs.out           = &candidates;
         rs.implicit_this = &implicit_this;
-        // NEITHER HALF of one of the fork's own declarations is a capture, because
-        // LRM 9.3.2 initializes such a variable "before any processes are spawned":
-        // lower_fork materializes it in the PARENT at the fork and gives it a fresh
-        // box per ENTRY, not the per-activation box install_capture_boxes hands out.
-        // Two consequences, and the clause's example turns on both:
+        // The INITIALIZER of one of the fork's own declarations is no child's
+        // reference: LRM 9.3.2 initializes such a variable "before any processes are
+        // spawned", so lower_fork evaluates it in the parent. That is what makes the
+        // clause's own carve-out implementable -- referring to a formal passed by
+        // reference is legal there even under join_any / join_none, precisely
+        // because no child-side access is involved.
         //
-        //   - the variable itself must not be boxed per activation, or one box
-        //     would be shared by every iteration's children and the clause's
-        //     example would print 333 instead of 123;
-        //   - its INITIALIZER is evaluated in the parent, so what that initializer
-        //     reads is not captured at all. That is what makes the clause's own
-        //     carve-out implementable -- referring to a formal passed by reference
-        //     is legal there even under join_any / join_none, precisely because no
-        //     child-side access is involved.
-        //
-        // A `begin ... end` nested inside the fork is a DIFFERENT block, so its
-        // declarations are none of this and keep the ordinary late path: the
-        // clause's own example says the nested `automatic int m = j` "is 4".
+        // A `begin ... end` nested inside the fork is a DIFFERENT block, a child,
+        // and its declarations are the child's own: the clause's example says the
+        // nested `automatic int m = j` "is 4".
         for_each_fork_stmt(blk, [&](const Statement& s) {
-            if (const auto* d = s.as_if<VariableDeclStatement>()) {
-                fork_scope_decls.insert(&d->symbol);
-                return;
+            if (s.kind != StatementKind::VariableDeclaration) {
+                s.visit(rs);
             }
-            s.visit(rs);
         });
     }
     visitDefault(blk);

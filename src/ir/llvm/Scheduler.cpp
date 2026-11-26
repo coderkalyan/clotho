@@ -178,6 +178,9 @@ void Backend::emit_suspend(const char* label, const TracePark& park) {
     // The same goes for the trace: every park says what it parks for, and the resume below
     // names it, so a park that is not reported fails its resume (docs/design/scheduler-trace.md).
     llvm::Constant* control = emit_trace_park(park);
+    // After the park is on record: the wake this makes can name this thread, when
+    // what it parks in is itself a wait on a status.
+    emit_proc_park_notify();
     auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
     auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
     auto* resume = llvm::BasicBlock::Create(ctx_, label, fn_);

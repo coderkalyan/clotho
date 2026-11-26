@@ -372,18 +372,15 @@ ir::Index Lowerer::this_handle(ir::Builder& b, ir::SourceLoc l) {
     return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
 }
 
-// Allocate a box for every automatic of THIS activation that a detaching fork's
-// children reference, before the body is lowered (docs/design/fork-join.md V4).
+// Find what the body's fork children reference, and box the formals among it, before
+// the body is lowered (docs/design/fork-join.md V4).
 //
-// Entry, not first use: a box has to exist on every path that can reach an access,
-// and first use may sit inside a conditional region. One ClassNew per boxed
-// variable per activation is the cost, paid only by a body that actually spawns a
-// detached child touching its locals.
-//
-// A boxed symbol keeps its localmap entry -- for a formal that is the ABI's
-// copy-in slot, which stays formal k == Local k; for a declared local it is what
-// ForkCaptureDetector matches against, so the child still receives it. value_lvalue
-// consults `boxed` first, so the localmap slot of a boxed local is never read.
+// A formal and `this` are one variable for the activation, so each gets its box
+// here, at entry: one ClassNew per boxed formal per activation, paid only by a body
+// that spawns a child touching it. A boxed formal keeps its localmap entry, the
+// ABI's copy-in slot (formal k == Local k); value_lvalue consults `boxed` first, so
+// that slot is read once, below. An automatic the body declares is boxed where it is
+// declared instead (box_if_captured).
 void Lowerer::install_capture_boxes(const SubroutineSymbol& sub, const Statement& body, ir::Builder& b) {
     BoxCandidateScan scan;
     body.visit(scan);
@@ -394,8 +391,7 @@ void Lowerer::install_capture_boxes(const SubroutineSymbol& sub, const Statement
         return;
     }
     const ir::SourceLoc l = to_source_loc(sub.location);
-    // Formals first, in declaration order, then automatics declared in the body:
-    // a stable order keeps the emitted IR deterministic.
+    // In declaration order: a stable order keeps the emitted IR deterministic.
     for (const FormalArgumentSymbol* fa : sub.getArguments()) {
         if (!scan.candidates.contains(fa)) {
             continue;
@@ -410,33 +406,23 @@ void Lowerer::install_capture_boxes(const SubroutineSymbol& sub, const Statement
                  "' is not supported: capturing an output or inout formal would lose "
                  "the writes made through it");
         }
-        box_one_capture(*fa, /*copy_in=*/true, b, l);
-    }
-    for (const ValueSymbol* vs : body_automatics(sub, body)) {
-        // A fork's OWN block_item_declaration is skipped here: lower_fork gives it
-        // a fresh box per ENTRY to the fork, and a per-activation box would make it
-        // one variable shared by every entry (LRM 9.3.2; the clause's example would
-        // print 333 instead of 123).
-        if (scan.candidates.contains(vs) && !scan.fork_scope_decls.contains(vs)) {
-            box_one_capture(*vs, /*copy_in=*/false, b, l);
-        }
+        box_one_capture(*fa, b, l);
     }
     // `this` last, and only if a child needs it. It is an ordinary automatic of
     // this frame -- slang makes it a VariableSymbol with Automatic lifetime -- but
-    // it is in neither getArguments() nor the body's declarations, so neither loop
-    // above reaches it. `copy_in` is right for the same reason it is right for a
-    // formal: splice_this already gave it Local 0 and the backend's prologue fills
-    // that slot from argument 0. It is also `const`, so the box's only job is
-    // lifetime -- but uniformity is worth more here than saving one indirection in
-    // a method that spawns.
+    // it is not in getArguments(). splice_this already gave it Local 0 and the
+    // backend's prologue fills that slot from argument 0, as for a formal. It is
+    // also `const`, so the box's only job is lifetime -- but uniformity is worth
+    // more here than saving one indirection in a method that spawns.
     if (sub.thisVar != nullptr && (scan.implicit_this || scan.candidates.contains(sub.thisVar))) {
-        box_one_capture(*sub.thisVar, /*copy_in=*/true, b, l);
+        box_one_capture(*sub.thisVar, b, l);
     }
+    fn_ctx_->fork_refs = std::move(scan.candidates);
 }
 
-// One box: a frame slot holding the handle, a ClassNew into it, and for a formal
-// the one store that moves the incoming argument into the box.
-void Lowerer::box_one_capture(const ValueSymbol& vs, bool copy_in, ir::Builder& b, ir::SourceLoc l) {
+// The box of a formal: a frame slot holding the handle, a ClassNew into it, and the
+// one store that moves the incoming argument into the box.
+void Lowerer::box_one_capture(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
     if (fn_ctx_->boxed.contains(&vs)) {
         return;
     }
@@ -447,43 +433,56 @@ void Lowerer::box_one_capture(const ValueSymbol& vs, bool copy_in, ir::Builder& 
     const ir::Index dst = b.local(slot, cls, l);
     const ir::Index obj = b.class_new(cls, l);
     b.binary(ir::Inst::Tag::Store, dst, obj, l);
-    if (copy_in) {
-        // The formal's own Local, which the backend's prologue has filled.
-        const uint32_t  k       = fn_local(vs);
-        const ir::Index box_lv  = boxed_lvalue({ slot, cls }, b, l);
-        const ir::Index arg_val = b.unary(ir::Inst::Tag::Load, b.local(k, inner, l), l);
-        b.binary(ir::Inst::Tag::Store, box_lv, arg_val, l);
-    }
-    // Deliberately NOT registered in localmap for a declared local: a boxed local
-    // has no frame slot of its own, so lower_var_decl cannot initialize the
-    // variable through a slot typed as the box. value_lvalue routes every access
-    // (the declaration's own initializer included) through the box.
+    // The formal's own Local, which the backend's prologue has filled.
+    const uint32_t  k       = fn_local(vs);
+    const ir::Index box_lv  = boxed_lvalue({ slot, cls }, b, l);
+    const ir::Index arg_val = b.unary(ir::Inst::Tag::Load, b.local(k, inner, l), l);
+    b.binary(ir::Inst::Tag::Store, box_lv, arg_val, l);
     fn_ctx_->boxed[&vs] = { slot, cls };
 }
 
-// Give one of a fork's own block_item_declarations (LRM 9.3.2) its per-ENTRY box,
-// and emit the allocation. Called from lower_fork at the fork statement, so the
-// ClassNew below runs on every EXECUTION of the fork while the home holding the
-// handle is allocated once, at lower time. That split is the whole mechanism:
+// Box an automatic at its declaration if a fork child of the body references it.
+// Called wherever execution enters the variable's scope (a declaration statement, a
+// `for` or `foreach` header, a pattern that binds it), before its storage is
+// declared and its initial value stored.
 //
-//   for (int j = 1; j <= 3; ++j) fork automatic int k = j; ... join_none
+// LRM 6.21: an automatic variable has "the lifetime of the call or block" and is
+// "initialized on each entry to the call or block", and "the lifetime of a scope
+// enclosing any fork-join block includes the lifetime of the fork-join block". So a
+// block entered again while children of its last entry still run has two instances
+// of the variable at once, and each child keeps the one it was forked beside:
 //
-// executes the fork three times, so three boxes exist and each iteration's
-// children hold the one made for them -- the clause's "local copy, k, for each
-// value of j", which prints 123. A per-activation box (install_capture_boxes) would
-// be ONE box written three times and every child would read the last value, 3.
+//   for (int i = 0; i < 3; i++) begin
+//     automatic int id = i;
+//     fork #1 $display(id); join_none
+//   end
+//
+// prints 0, 1 and 2. A static variable is one for the whole run and is not boxed.
+void Lowerer::box_if_captured(const VariableSymbol& vs, bool force_frame, ir::Builder& b) {
+    if (is_static_local(vs, force_frame)) {
+        return;
+    }
+    const auto& refs = fn_ctx_ != nullptr ? fn_ctx_->fork_refs : proc_fork_refs_;
+    if (refs.contains(&vs)) {
+        emit_decl_box(vs, b, to_source_loc(vs.location));
+    }
+}
+
+// Make the box of a captured automatic and store its handle in the variable's home.
+// The ClassNew runs on every EXECUTION of the declaration while the home is
+// allocated once, at lower time: that split is what gives each entry to the scope
+// its own variable, and each fork child the one of the entry that spawned it, since
+// a child takes the handle by value when it is spawned (capture_handle).
 //
 // The handle is stored into its home immediately, before any initializer can
 // allocate, so the box is reachable from a GC root for its whole life: a frame slot
 // in a subroutine (a conservative pinned frame root) or a design-state signal in a
 // process body, where there is no frame (a precise root -- an `initial` block's
 // storage is design state, docs/design/garbage-collection.md 5.4).
-void Lowerer::install_fork_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+void Lowerer::emit_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
     const ir::Ref cls = box_class_for(vs, lower_type(vs.getType()));
     if (fn_ctx_ != nullptr) {
-        // Reuse the ordinary capture-box home so value_lvalue, ForkCaptureDetector
-        // and a nested fork's own capture of this variable all need nothing new.
-        const auto it = fn_ctx_->boxed.find(&vs);
+        const auto     it   = fn_ctx_->boxed.find(&vs);
         const uint32_t slot = it != fn_ctx_->boxed.end() ? it->second.local
                                                          : static_cast<uint32_t>(fn_ctx_->local_types.size());
         if (it == fn_ctx_->boxed.end()) {
@@ -525,38 +524,6 @@ ir::Index Lowerer::capture_handle(const ValueSymbol& vs, ir::Builder& b, ir::Sou
     // than a source-level refusal.
     fail("a fork child that reads '" + std::string(vs.name) +
          "' is not supported (internal: no capture box)");
-}
-
-// The automatic-lifetime variables `body` declares, in declaration order. Only
-// these can box: a static local keeps persistent storage that already outlives
-// every child, and anything else in the candidate set is not this frame's.
-std::vector<const ValueSymbol*> Lowerer::body_automatics(const SubroutineSymbol& sub, const Statement& body) {
-    // Declarations are reached through their STATEMENTS -- a statement visitor does
-    // not visit a VariableSymbol on its own -- so both forms that introduce an
-    // automatic are picked up here: a declaration statement and a `for`'s own loop
-    // variables, which is the shape LRM 9.3.2's example uses.
-    struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
-        std::vector<const ValueSymbol*> out;
-        void take(const VariableSymbol& vs) {
-            if (vs.lifetime == slang::ast::VariableLifetime::Automatic) {
-                out.push_back(&vs);
-            }
-        }
-        void handle(const VariableDeclStatement& d) {
-            take(d.symbol);
-            visitDefault(d);
-        }
-        void handle(const ForLoopStatement& f) {
-            for (const VariableSymbol* v : f.loopVars) {
-                take(*v);
-            }
-            visitDefault(f);
-        }
-    };
-    Scan sc;
-    body.visit(sc);
-    (void)sub;
-    return std::move(sc.out);
 }
 
 std::vector<const VariableSymbol*> Lowerer::static_locals_of(const SubroutineSymbol& sub) {
@@ -1531,6 +1498,11 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
             ctx.this_class = lower_type(sym->getType());
         }
     }
+    // What the child's own fork children reference: an automatic the child declares
+    // among them is boxed at its declaration, as in any body.
+    BoxCandidateScan nested;
+    body.visit(nested);
+    ctx.fork_refs = std::move(nested.candidates);
 
     ir::Builder                b(module_);
     const ir::Builder::Mark    body_mark = b.mark();

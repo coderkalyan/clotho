@@ -1728,14 +1728,6 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )", "string module ports");
     }
-    SUBCASE("string in an event control") {
-        check_rejected(R"(
-            module m;
-                string s;
-                initial @(s) $display("x");
-            endmodule
-        )", "string in an event control");
-    }
     SUBCASE("string argument to a non-%s specifier") {
         check_rejected(R"(
             module m;
@@ -2281,4 +2273,154 @@ TEST_CASE("unique case over strings reports an overlap") {
                                                           "endmodule\n");
     CHECK(run.out == "first\n");
     CHECK(run.err.find("unique") != std::string::npos);
+}
+
+// -- A string in a wait, an event control and a sensitivity list (LRM 9.4.2, 9.4.3) --
+//
+// A string's value is its characters (LRM 6.16), so a store that leaves them as they
+// were is no change and wakes nothing. All of these were refused. No oracle: iverilog
+// 13 and Verilator 5.052 both fail to compile a wait or an event control on a string.
+
+TEST_CASE("a string variable wakes what waits on its value") {
+    constexpr std::string_view src = R"(
+        module m;
+          string s, t;
+          int len, n;
+          always_comb len = s.len();
+          assign t = {s, "!"};
+          always @(s) n++;
+          initial begin
+            #1;
+            fork
+              begin wait (s == "go"); $display("wait at %0t", $time); end
+              begin @(s); $display("event at %0t s=%s", $time, s); end
+              begin @(t); $display("net at %0t t=%s", $time, t); end
+              begin @(len); $display("len at %0t %0d", $time, len); end
+            join_none
+            #1 s = "";
+            #1 s = "ready";
+            #1 s = "ready";
+            #1 s = "go";
+            #1 $display("end n=%0d", n);
+          end
+        endmodule
+    )";
+    // Storing "" over "" at 2 and "ready" over "ready" at 4 changes nothing. The
+    // three woken at 3 run in no fixed order.
+    const std::string out = run_capture(src);
+    CHECK_MESSAGE(out.find("event at 3 s=ready\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.find("net at 3 t=ready!\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.find("len at 3 5\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.find("wait at 5\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.ends_with("end n=2\n"), out);
+}
+
+TEST_CASE("a string member, a string array element and a nonblocking string store wake a wait") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int n; string name; } rec_t;
+          rec_t  r, whole, from;
+          string names [2];
+          string nb;
+          initial begin
+            fork
+              begin wait (r.name == "x"); $display("member at %0t", $time); end
+              begin wait (names[1] == "y"); $display("element at %0t", $time); end
+              begin wait (nb == "z"); $display("nonblocking at %0t", $time); end
+              begin wait (whole.name == "w"); $display("whole at %0t", $time); end
+            join_none
+            from = '{1, "w"};
+            #1 r.name = "x";
+            #1 names[1] = "y";
+            #1 nb <= "z";
+            #1 whole = from;
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "member at 1\nelement at 2\nnonblocking at 3\nwhole at 4\nend\n");
+}
+
+// What a function reads is what a wait on it depends on (LRM 9.4.2), a string
+// variable included, and `@` over a string expression compares its characters.
+TEST_CASE("a function that reads a string variable is waited on through it") {
+    constexpr std::string_view src = R"(
+        module m;
+          string mode;
+          function bit armed(); return mode == "armed"; endfunction
+          function string tag(); return {mode, "/"}; endfunction
+          initial begin
+            fork
+              begin wait (armed()); $display("armed at %0t", $time); end
+              begin @(tag()); $display("tag at %0t %s", $time, tag()); end
+            join_none
+            #1 mode = "idle";
+            #1 mode = "armed";
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "tag at 1 idle/\narmed at 2\nend\n");
+}
+
+// `x = {x, "!"}` builds its result in the target in place, which leaves no old value
+// to compare the new one with; a target something waits on takes the ordinary store.
+TEST_CASE("a concatenation stored into a waited-on string wakes the wait") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; string s; endclass
+          C c = new;
+          string v;
+          task automatic append(ref string x); x = {x, "!"}; endtask
+          initial begin
+            fork
+              begin wait (v == "a!"); $display("variable at %0t", $time); end
+              begin wait (c.s == "b!"); $display("property at %0t", $time); end
+              begin wait (v == "a!!"); $display("ref variable at %0t", $time); end
+              begin wait (c.s == "b!!"); $display("ref property at %0t", $time); end
+            join_none
+            v = "a";
+            c.s = "b";
+            #1 v = {v, "!"};
+            #1 c.s = {c.s, "!"};
+            #1 append(v);
+            #1 append(c.s);
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "variable at 1\nproperty at 2\nref variable at 3\nref property at 4\nend\n");
+}
+
+// The writers that are not an assignment: each sits inside the same compare of the
+// characters before and after.
+TEST_CASE("string methods and system tasks that write a string wake a wait on it") {
+    constexpr std::string_view src = R"(
+        module m;
+          string s = "abc";
+          string names [3];
+          string q [$];
+          initial begin
+            fork
+              begin wait (s == "xbc"); $display("putc at %0t", $time); end
+              begin wait (s == "n=7"); $display("sformat at %0t", $time); end
+              begin wait (s == "42"); $display("itoa at %0t", $time); end
+              begin wait (s == "tok"); $display("sscanf at %0t", $time); end
+              begin wait (names[0] == "a" && names[2] == "c"); $display("pattern at %0t", $time); end
+              begin wait (names[0] == "c"); $display("reverse at %0t", $time); end
+              begin wait (q.size() == 1 && q[0] == "z"); $display("queue at %0t", $time); end
+            join_none
+            #1 s.putc(0, "x");
+            #1 $sformat(s, "n=%0d", 7);
+            #1 s.itoa(42);
+            #1 void'($sscanf("tok rest", "%s", s));
+            #1 names = '{"a", "b", "c"};
+            #1 names.reverse();
+            #1 q.push_back("z");
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "putc at 1\nsformat at 2\nitoa at 3\nsscanf at 4\npattern at 5\n"
+                              "reverse at 6\nqueue at 7\nend\n");
 }

@@ -1674,16 +1674,17 @@ void Backend::emit_string_whole_nba(const LValue& lv, Index rhs) {
 // destination held). rt_string_move re-inits the staged handle, so the record's
 // retained capacity is left as a valid empty string for the next instant.
 //
-// No wake and no VCD touch, unlike the container commit: a string is refused
-// from sensitivity lists and event controls in the frontend (so no process can
-// be waiting on one) and has no $var form.
+// What waits on the signal is woken if some record changed the characters it
+// replaced: each record is an update of its own (LRM 4.9.4), and a string's value
+// is its content (str_chg_snapshot). No VCD touch: a string has no $var form.
 void Backend::emit_string_whole_commit(Signal sig) {
-    auto*          rt    = str_rec_ty();
-    const auto     strd  = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-    auto*          i8    = b_.getInt8Ty();
-    const uint32_t idx   = str_buf_idx(sig);
-    llvm::Value*   base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
-    llvm::Value*   count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+    auto*          rt     = str_rec_ty();
+    const auto     strd   = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+    auto*          i8     = b_.getInt8Ty();
+    const uint32_t idx    = str_buf_idx(sig);
+    const bool     waited = signal_has_waiters(sig);
+    llvm::Value*   base   = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+    llvm::Value*   count  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
 
     auto* fn    = b_.GetInsertBlock()->getParent();
     auto* head  = llvm::BasicBlock::Create(ctx_, "snba.head", fn);
@@ -1692,17 +1693,32 @@ void Backend::emit_string_whole_commit(Signal sig) {
     auto* entry = b_.GetInsertBlock();
     b_.CreateBr(head);
     b_.SetInsertPoint(head);
-    auto* k = b_.CreatePHI(b_.getInt32Ty(), 2);
+    auto* k   = b_.CreatePHI(b_.getInt32Ty(), 2);
+    auto* any = b_.CreatePHI(b_.getInt1Ty(), 2);
     k->addIncoming(b_.getInt32(0), entry);
+    any->addIncoming(b_.getFalse(), entry);
     b_.CreateCondBr(b_.CreateICmpULT(k, count), body, done);
     b_.SetInsertPoint(body);
     llvm::Value* rec    = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(strd)) });
     llvm::Value* dest   = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
     llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
+    llvm::Value* differs =
+      waited ? b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { dest, staged }), b_.getInt32(0)) : b_.getFalse();
     b_.CreateCall(str_move_fn(), { dest, staged });
     k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+    any->addIncoming(b_.CreateOr(any, differs), b_.GetInsertBlock());
     b_.CreateBr(head);
     b_.SetInsertPoint(done);
+
+    if (waited) {
+        auto* svc  = llvm::BasicBlock::Create(ctx_, "snba.svc", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "snba.cont", fn);
+        b_.CreateCondBr(any, svc, cont);
+        b_.SetInsertPoint(svc);
+        service_signal_container_mutation(sig);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
 }
 
 // Largest leaf slot byte size across an aggregate type (sizes the deferred
