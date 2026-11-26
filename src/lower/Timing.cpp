@@ -128,7 +128,6 @@ void Lowerer::collect_wait_events_impl(const TimingControl&        tc,
                                              .handle = weak_notifier_handle(*get, *wait_builder_) });
                 break;
             }
-            refuse_container_event_control(ev);
             const ir::Signal sig = event_signal(ev.expr);
             if (ev.edge == slang::ast::EdgeKind::BothEdges) {
                 // `edge` means posedge-or-negedge (LRM 9.4.2), not any change:
@@ -246,29 +245,27 @@ void Lowerer::push_prop_wait_events(const SignalEventControl&              ev,
     park(to_edge(ev.edge));
 }
 
-// Refuse an event control that reads a CONTAINER class property where it cannot be
-// sampled, loudly.
-//
-// LRM 9.4.2: "a non-edge implicit event shall be detected on any CHANGE in the
-// value of the expression". A container property's notifier fires on MUTATION,
-// and the two are different predicates -- `q.push_back(x); q.pop_back();`
-// mutates twice and leaves `q.size()` exactly where it started -- so handing
-// the control the mutation notifier as its event would be an observable wrong
-// wake. A procedural `@` samples the expression and compares on each wake
-// (lower_sampled_event_wait) and never comes here.
-//
-// TODO: what is left is a control no process can sample for: one in a list with
-// events that are not sampled (the woken process cannot tell which member woke
-// it), and the control of `<= @(...)` or `->> @(...)`, which is a record.
-void Lowerer::refuse_container_event_control(const SignalEventControl& ev) {
-    ClassPropReadScan scan;
-    ev.expr.visit(scan);
-    if (!scan.any_container) {
-        return;
+// Whether the event expression `e` reads heap state: a property, a fork-captured
+// automatic, a method called on an object, or anything a subroutine it calls reads
+// from one.
+bool Lowerer::event_expr_reads_heap(const Expression& e) {
+    ClassPropReadScan props;
+    e.visit(props);
+    if (props.any_prop || !props.weak_gets.empty()) {
+        return true;
     }
-    fail("an event control on a container class property (queue / dynamic array / "
-         "associative array) is not supported in a list with other events, nor as the "
-         "control of a nonblocking assignment or trigger; alone in a procedural `@` it is");
+    if (waited_props_ != nullptr && e.kind != ExpressionKind::NamedValue &&
+        e.kind != ExpressionKind::HierarchicalValue) {
+        const CalleeReads called = callee_reads(e, waited_props_->overrides);
+        if (called.method_call || !called.props.empty() || !called.builtins.empty()) {
+            return true;
+        }
+    }
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+    WaitLocalScan                                                scan;
+    scan.out = &named;
+    e.visit(scan);
+    return std::ranges::any_of(named, [&](const ValueSymbol* vs) { return is_boxed_symbol(*vs); });
 }
 
 // Load the handle of one change notifier of a class property, dereferencing the
@@ -442,6 +439,24 @@ ir::Signal Lowerer::event_signal(const Expression& e) {
         // `@($global_clock)` (LRM 14.14): the global clocking event, which is the
         // event of the block that declares it -- the same wait as `@(cb)` on it.
         return clocking_state(*gc).event;
+    }
+    // An event expression over heap state has to be sampled by the process that
+    // waits on it (lower_sampled_event_wait), and what reaches here is one no
+    // process samples. The temp net at the end of this function would be driven by
+    // a continuous process that evaluates the handles when it is built, before
+    // anything has assigned them, and never runs again when the object changes: a
+    // wait that never wakes.
+    //
+    // TODO: such an expression in a list with a signal or a named event (the woken
+    // process cannot tell which member woke it, so it cannot tell that member's
+    // event from a wake that left its own sample unchanged), and as the control of
+    // `<= @(...)` or `->> @(...)` or as a clocking event of a clocking block, an
+    // assertion or a covergroup, none of which is a process that could sample.
+    if (!e.type->isEvent() && event_expr_reads_heap(e)) {
+        fail("an event control on a method call or on an expression of class properties is "
+             "supported only as a procedural `@`, alone or beside others of its kind: not in "
+             "a list with a signal or a named event, and not as the control of a nonblocking "
+             "assignment, a nonblocking trigger or a clocking event");
     }
     if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
         // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
@@ -1914,25 +1929,7 @@ void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
 // samples itself, nor for one whose dependencies cannot wake anything, which stays
 // on the path it was on.
 bool Lowerer::event_expr_sampled(const Expression& e) {
-    if (e.type->isEvent() || reads_vif(e)) {
-        return false;
-    }
-    ClassPropReadScan props;
-    e.visit(props);
-    bool heap = props.any_prop || !props.weak_gets.empty();
-    if (!heap && waited_props_ != nullptr &&
-        (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue)) {
-        const CalleeReads called = callee_reads(e, waited_props_->overrides);
-        heap                     = called.method_call || !called.props.empty() || !called.builtins.empty();
-    }
-    if (!heap) {
-        ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
-        WaitLocalScan                                                scan;
-        scan.out = &named;
-        e.visit(scan);
-        heap = std::ranges::any_of(named, [&](const ValueSymbol* vs) { return is_boxed_symbol(*vs); });
-    }
-    if (!heap) {
+    if (e.type->isEvent() || reads_vif(e) || !event_expr_reads_heap(e)) {
         return false;
     }
     const ExprWaitDeps deps = expr_wait_deps(e);

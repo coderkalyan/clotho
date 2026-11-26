@@ -53,6 +53,12 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
+std::string lower_error(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_FALSE(r.ok);
+    return r.diagnostic_text();
+}
+
 } // namespace
 
 TEST_CASE("wait on a method is tested again when a property the method reads changes") {
@@ -403,4 +409,46 @@ TEST_CASE("@ on a fork-captured automatic") {
     )";
     CHECK(run_capture(src) == "k=5 at 1\nk=6 at 2\nb0 rose at 3\nb1 rose at 4\n"
                               "task k=7 at 5\ntask k=8 at 6\ndone\n");
+}
+
+// What no process can sample is refused, where it used to be handed to a continuous
+// process that read the handle once, before anything had assigned it, and never ran
+// again. In a list with a signal or a named event the woken process cannot tell
+// which member woke it; the control of a nonblocking assignment or trigger is a
+// record, and a clocking event is a clock.
+TEST_CASE("an event control over heap state that nothing can sample is refused") {
+    constexpr std::string_view needle  = "supported only as a procedural `@`";
+    constexpr std::string_view head    = R"(
+        module m;
+          class C;
+            bit clk; int v;
+            function int get(); return v; endfunction
+          endclass
+          C c = new;
+          bit sysclk, a, x;
+          event e;
+    )";
+    const auto                 refused = [&](std::string_view item) {
+        const std::string err = lower_error(std::string(head) + std::string(item) + "\nendmodule\n");
+        CHECK_MESSAGE(err.find(needle) != std::string::npos, err);
+    };
+    SUBCASE("a list with a signal edge") {
+        refused("initial begin @(c.get() or posedge sysclk); end");
+        refused("always @(c.v == 3 or posedge sysclk) x = 1;");
+    }
+    SUBCASE("a list with a named event") {
+        refused("initial begin @(c.get() or e); end");
+    }
+    SUBCASE("the control of a nonblocking assignment") {
+        refused("initial x <= @(c.get()) 1'b1;");
+    }
+    SUBCASE("the control of a nonblocking trigger") {
+        refused("initial ->> @(c.v == 3) e;");
+    }
+    SUBCASE("a clocking block's event") {
+        refused("clocking cb @(posedge c.get()); input a; endclocking");
+    }
+    SUBCASE("a covergroup's sampling event") {
+        refused("covergroup cg @(posedge c.get()); coverpoint a; endgroup\ncg g = new;");
+    }
 }

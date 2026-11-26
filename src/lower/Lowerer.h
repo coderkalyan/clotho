@@ -2477,7 +2477,7 @@ private:
                                const slang::ast::ClassPropertySymbol& prop,
                                std::vector<ir::WaitEvent>&            out);
 
-    void refuse_container_event_control(const SignalEventControl& ev);
+    bool event_expr_reads_heap(const Expression& e);
 
     ir::Index prop_notifier_handle(const Expression&                      e,
                                    const slang::ast::ClassPropertySymbol& prop,
