@@ -6079,3 +6079,36 @@ TEST_CASE("gc: a young collection walks no state container nothing mutated") {
     const rt_gc_stats full = run_stats(src, "20000 12000\n", cadence_ordinary, nursery_bytes_small, 1);
     CHECK(full.state_containers_read == 1u);
 }
+
+// An event made by the initializer of a class body is stored into the body after it was made. The
+// allocation can collect with the body held only by the code making it, which promotes the body, and
+// the store then lands in an old object nothing logged: the event must be logged by the initializer.
+// Collecting at every allocation is what reaches it; the event is waited on and triggered after a churn.
+TEST_CASE("gc: an event made by a class body's initializer survives in a body a collection promoted") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Holder; event ev; int v; endclass
+            class Junk; int v; string tag; endclass
+            Holder h;
+            Junk   sink;
+            int    hits;
+            initial begin
+                h   = new;
+                h.v = 7;
+                for (int i = 0; i < 400; i++) begin
+                    sink     = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+                fork begin @(h.ev); hits++; end join_none
+                #1;
+                -> h.ev;
+                #1;
+                $display("%0d %0d", hits, h.v);
+            end
+        endmodule
+    )";
+    const std::string          expected = "1 7\n";
+    check_cadences(src, expected);
+    CHECK(run_capture(src, gc_cfg(cadence_stress, nursery_bytes_small, full_every_never)) == expected);
+}
