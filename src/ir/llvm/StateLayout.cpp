@@ -282,6 +282,12 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     for (const InstanceScope& child : scope.children) {
         scope_type(child, claimed, hier + "." + child.name);
     }
+    bool any_handle = false;
+    for (const Signal sig : defined) {
+        any_handle = any_handle || reaches_class_handle(slots_[static_cast<uint32_t>(sig)].ir_type);
+    }
+    const uint32_t cards_field = add_gc_cards(fields, any_handle);
+    anchors_[aid].cards_field  = cards_field;
 
     for (const auto& [def, flds, ty] : def_types_) {
         if (def == scope.def_name && flds == fields) {
@@ -605,7 +611,39 @@ void Backend::build_state_types() {
         }
     }
 
+    {
+        bool any_handle = false;
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            any_handle = any_handle || (!claimed[i] && reaches_class_handle(slots_[i].ir_type));
+        }
+        root_cards_field_ = add_gc_cards(root_fields, any_handle);
+    }
     state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
+}
+
+// A region that can hold a class handle ends in one byte of dirty flag for each RT_GC_CARD_BYTES
+// of what lies before them (Gc.h, rt_gc_roots), so that the card of any place in it is a constant
+// offset from the region's own base, whichever instance's region it is. The fields before the
+// cards keep every offset they had.
+uint32_t Backend::add_gc_cards(std::vector<llvm::Type*>& fields, bool any_handle) {
+    if (!any_handle) {
+        return Anchor::no_cards;
+    }
+    assert(!fields.empty() && "a region that holds a handle has a field");
+    const llvm::DataLayout& dl = root_env_->llmod.getDataLayout();
+    const auto*             sl = dl.getStructLayout(llvm::StructType::get(ctx_, fields));
+    const uint64_t          end =
+      sl->getElementOffset(static_cast<unsigned>(fields.size() - 1)) + dl.getTypeAllocSize(fields.back());
+    assert(end < UINT32_MAX / 2 && "a state region is smaller than 2 GiB");
+    const uint64_t ncards = ((end - 1) >> RT_GC_CARD_SHIFT) + 1;
+    fields.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx_), ncards));
+    return static_cast<uint32_t>(fields.size() - 1);
+}
+
+uint32_t Backend::gc_cards_field(const SignalSlot& s) const {
+    const uint32_t field = s.anchor == SignalSlot::no_anchor ? root_cards_field_ : anchors_[s.anchor].cards_field;
+    assert(field != Anchor::no_cards && "a signal that holds a handle is in a region with card bytes");
+    return field;
 }
 
 const SignalSlot& Backend::slot_of(Signal s) const {

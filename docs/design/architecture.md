@@ -107,9 +107,9 @@ them in step.
 - Suspended frames and the native stack are scanned conservatively until frames
   have explicit stack maps; object fields and design state are scanned precisely.
 - A young collection costs what happened since the last collection (allocation,
-  logged writes, frames that ran), never the size of the design. **Not yet:**
-  each one reads every state root, walks every state-resident container and scans
-  every registered frame.
+  logged writes, frames that ran), never the size of the design. Design-state
+  handle slots are read by dirty card. **Not yet:** each one walks every
+  state-resident container and scans every registered frame.
 - An object is finalized only if it owns a buffer outside the heap when it dies.
   **Not yet:** every dead object with a string or container property runs a
   finalizer.

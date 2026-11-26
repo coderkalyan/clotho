@@ -515,6 +515,15 @@ struct LValueInfo {
     // together with `gc_owner`: a HandleDeref starts a new place.
     llvm::Value* gc_ref_slot  = nullptr;
     llvm::Value* gc_ref_chain = nullptr;
+    // The place is inside the storage of design-state signal `gc_state_sig`, whose first byte is
+    // `gc_state_base`, and a class handle can land at or under it (docs/design/garbage-collection.md
+    // §7). Such a store is logged in the card of the region it lands in (emit_gc_state_barrier).
+    // Set at exactly one place, signal_lvalue; cleared by agg_member for a member that cannot reach
+    // a handle; carried by carry_gc_place through every element step. For a place inside a
+    // container's payload the card is the one of the outermost container, `epoch_chain.front()`.
+    // Never set together with `gc_owner` or `gc_ref_slot`.
+    llvm::Value* gc_state_base = nullptr;
+    Signal       gc_state_sig{ 0 };
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
     // The notifiers of the class property this place selects, or lies inside, when some
@@ -1058,6 +1067,10 @@ struct Anchor {
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
+    // Field of the state struct that holds the card bytes of the region (Gc.h, rt_gc_roots), or
+    // no_cards when the scope holds no class handle.
+    static constexpr uint32_t no_cards    = ~0u;
+    uint32_t                  cards_field = no_cards;
 
     // Instance context: ONE per-instance record (@clotho.inst.<hier>.ctx)
     // holding every base a def-relative body needs, laid out per definition so
@@ -2497,8 +2510,11 @@ private:
 
     void signal_gc_containers(const SignalSlot& s, uint64_t base, std::vector<GcContainer>& out);
 
-    llvm::Constant* gc_roots_global(llvm::Constant* base, const std::vector<uint32_t>& offsets,
-                                    uint32_t index);
+    llvm::Constant* gc_roots_global(llvm::Constant*              base,
+                                    const std::vector<uint32_t>& offsets,
+                                    uint32_t                     index,
+                                    llvm::StructType*            owner,
+                                    uint32_t                     cards_field);
 
     llvm::Constant* gc_containers_global(llvm::Constant* base,
                                          const std::vector<GcContainer>& entries,
@@ -3536,9 +3552,24 @@ private:
 
     void emit_gc_barrier(llvm::Value* owner);
 
-    void emit_gc_barrier_for(const LValueInfo& lv);
+    void emit_gc_barrier_for(const Guarded& lv, uint64_t bytes = sizeof(void*));
 
-    void emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain);
+    // How much design state a store through `lv` writes: the whole signal for a whole-signal
+    // place (a whole-aggregate nonblocking store), else one word.
+    uint64_t gc_store_bytes(const LValueInfo& lv) const;
+
+    void emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain, uint64_t bytes);
+
+    llvm::FunctionCallee gc_note_state_store_fn();
+
+    void emit_gc_state_barrier(const LValue& v, uint64_t bytes);
+
+    // The field of the state struct that holds the card bytes of a signal's region.
+    uint32_t gc_cards_field(const SignalSlot& s) const;
+
+    // Append the card bytes to the fields of a state struct whose signals include one that can
+    // reach a class handle; returns the field index or Anchor::no_cards.
+    uint32_t add_gc_cards(std::vector<llvm::Type*>& fields, bool any_handle);
 
     void carry_gc_place(LValueInfo& to, const LValueInfo& from);
 
@@ -5192,6 +5223,7 @@ private:
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;
+    uint32_t                root_cards_field_ = Anchor::no_cards;
     // The NBA shadow struct (valid iff non-null) and its standalone global.
     llvm::StructType*       shadow_ty_     = nullptr;
     llvm::GlobalVariable*   shadow_global_ = nullptr;

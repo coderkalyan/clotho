@@ -334,6 +334,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // OLD/LOGGED bits inline and names this on the taken edge only.
     expose("rt_gc_remember", &rt_gc_remember);
     expose("rt_gc_note_ref_store", &rt_gc_note_ref_store);
+    expose("rt_gc_note_state_store", &rt_gc_note_state_store);
     expose("rt_gc_roots_add", &rt_gc_roots_add);
     expose("rt_gc_range_add", &rt_gc_range_add);
     expose("rt_gc_identity", &rt_gc_identity);

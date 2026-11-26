@@ -206,10 +206,12 @@ Guarded Backend::agg_member(Guarded lv, Ref struct_type, uint32_t field_index) {
     // question, so an aggregate member and a nested struct member keep the owner
     // of the object they belong to -- which is the right owner, since an interior
     // aggregate is part of that same object's traced image.
-    if ((lv.gc_owner != nullptr || lv.gc_ref_slot != nullptr) && !reaches_class_handle(mt)) {
-        lv.gc_owner     = nullptr;
-        lv.gc_ref_slot  = nullptr;
-        lv.gc_ref_chain = nullptr;
+    if ((lv.gc_owner != nullptr || lv.gc_ref_slot != nullptr || lv.gc_state_base != nullptr) &&
+        !reaches_class_handle(mt)) {
+        lv.gc_owner      = nullptr;
+        lv.gc_ref_slot   = nullptr;
+        lv.gc_ref_chain  = nullptr;
+        lv.gc_state_base = nullptr;
     }
     lv.agg_leaf = is_leaf_type(mt);
     if (lv.agg_leaf) {

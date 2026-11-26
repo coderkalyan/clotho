@@ -1405,11 +1405,12 @@ llvm::StructType* Backend::gc_map_ty() {
     return gc_map_ty_;
 }
 
-// rt_gc_roots (Gc.h:100-105): { ptr base, i32 nhandles, i32 reserved, ptr offsets }.
+// rt_gc_roots (Gc.h): { ptr base, i32 nhandles, i32 bytes, ptr offsets, i32 cards, i32 reserved }.
 llvm::StructType* Backend::gc_roots_ty() {
     if (gc_roots_ty_ == nullptr) {
         gc_roots_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
+          ctx_,
+          { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() },
           "clotho.gcroots");
     }
     return gc_roots_ty_;
@@ -1600,8 +1601,15 @@ llvm::FunctionCallee Backend::gc_remember_fn() {
 }
 
 // rt_gc_note_ref_store (Gc.h): a handle is being stored through a `ref` formal's place.
+// (address, witness chain, bytes stored).
 llvm::FunctionCallee Backend::gc_note_ref_store_fn() {
-    return rt_fn("rt_gc_note_ref_store", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    return rt_fn("rt_gc_note_ref_store", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+}
+
+// rt_gc_note_state_store (Gc.h): the cold half of the inline card test of a store into design
+// state. (address, bytes stored).
+llvm::FunctionCallee Backend::gc_note_state_store_fn() {
+    return rt_fn("rt_gc_note_state_store", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
 // -- Functional coverage struct mirrors and entry points (src/runtime/Coverage.h) --

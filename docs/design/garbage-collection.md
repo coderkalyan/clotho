@@ -672,7 +672,7 @@ are those of one cycle.
 
 | Roots | Mechanism | Precision |
 |---|---|---|
-| Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table of `{ ptr base, u32 nhandles, u32 offsets[] }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`) | precise |
+| Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table per region of `{ ptr base, u32 nhandles, u32 bytes, u32 offsets[], u32 cards }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`). A young collection reads the cards stored to since the last one (§7) | precise |
 | Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, u64 size }` node in the frame, linked at the ramp, unlinked at frame free | conservative, validated, **pinning** |
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
 | Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
@@ -1014,10 +1014,23 @@ collection is the cost to avoid.
   needs no instrumenting either, for a better reason than a range mark: the owner is
   remembered, and tracing the owner walks the container wherever its elements have
   moved to.
-- **No barrier for design state, statics or frame locals.** All scanned in full at
-  every collection. In the implementation this is structural rather than
-  enumerated: the barrier is emitted from an lvalue field set only by `HandleDeref`,
-  so an lvalue rooted in a signal or a frame slot cannot carry an owner to remember.
+- **Design state is logged by cards.** Every state region ends in one byte of dirty flag for each
+  `RT_GC_CARD_BYTES` (512) of the region. A store of a class or event handle into state -- a scalar,
+  an array element, a struct member, the staging of a nonblocking assignment, an aggregate copy, a
+  container mutation -- tests the card byte of the place inline (a load, a compare and a not-taken
+  branch; the byte is at a constant offset from the signal's storage, so shared code names nothing of
+  an instance) and calls `rt_gc_note_state_store` when it is clear. That sets the byte and appends the
+  card to a bounded log. A young collection reads the handle slots of the logged cards (the table's
+  offsets ascend, so a card's slots are a binary search) and no others; a full collection reads every
+  slot; every collection clears the cards it read and empties the log. Past `kLoggedCardsMax` cards,
+  and after a table is registered (its initializer is no store's), the next collection reads every
+  slot instead. This is sound because every slot a collection read names a marked, old object: a slot
+  nothing has stored to since still does. Stores through a `ref` or an output formal reach the same
+  entry from the callee (`rt_gc_note_ref_store` finds the region by address). A frame local needs no
+  barrier; it is scanned in full at every collection.
+  The extra-assertion build checks it twice: `verify_cards` that a card byte is set exactly when the
+  log holds it, and, before a young collection marks anything, that no slot outside the logged cards
+  names an unmarked (young) object.
 - **The mark is the generation.** A young collection never frees a marked object
   and sweeps only blocks allocated from since the last collection, which is what
   lets it skip the stable population without freeing it. Old garbage accumulates

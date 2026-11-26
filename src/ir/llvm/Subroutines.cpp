@@ -2059,7 +2059,9 @@ void Backend::emit_copyout(const Function& f) {
             // The actual may be a class property or design state, which the caller
             // cannot have remembered for a store that happens now.
             if (reaches_class_handle(f.param_types[k])) {
-                emit_gc_note_ref_store(fn_->getArg(base), nullptr);
+                emit_gc_note_ref_store(fn_->getArg(base),
+                                       nullptr,
+                                       env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(f.param_types[k])));
             }
             emit_agg_storage_copy(fn_->getArg(base),
                                   b_.CreateStructGEP(frame_ty_, frame_, k), f.param_types[k]);
@@ -2069,7 +2071,9 @@ void Backend::emit_copyout(const Function& f) {
         // handle back into the caller's handle (the single passed pointer).
         if (is_handle_type(f.param_types[k])) {
             if (reaches_class_handle(f.param_types[k])) {
-                emit_gc_note_ref_store(fn_->getArg(base), nullptr);
+                emit_gc_note_ref_store(fn_->getArg(base),
+                                       nullptr,
+                                       env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(f.param_types[k])));
             }
             emit_handle_assign(fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
                                f.param_types[k]);
@@ -2087,6 +2091,11 @@ void Backend::emit_copyout(const Function& f) {
             continue;
         }
         const Plane v = lower_load(local_lvalue(k));
+        // A class or event handle is one word stored through the caller's pointer, which in a
+        // process is a state signal, so the store is logged here (rt_gc_note_ref_store).
+        if (reaches_class_handle(f.param_types[k])) {
+            emit_gc_note_ref_store(fn_->getArg(base), nullptr, sizeof(void*));
+        }
         b_.CreateStore(v.mm, fn_->getArg(base));
         if (abi_four_state(f.param_types[k])) {
             b_.CreateStore(v.z, fn_->getArg(base + 1));

@@ -5739,3 +5739,184 @@ TEST_CASE("gc: objects larger than a block survive while held and start zeroed")
     CHECK(st.collections > 10u);
     CHECK(st.owned_bytes == 0u);
 }
+
+// -- 9. Design state is read by the cards stored to (docs/design/garbage-collection.md §7) --
+//
+// A young collection reads the handle slots of the cards a store to design state logged since the
+// last collection, and no others. Each case below puts one young object into a state slot by the
+// writer under test, after the first (full) collection and with young collections only, and holds it
+// by that slot alone while junk is allocated over whatever is freed. Where two slots are involved, a
+// pad of state between them keeps them in different cards, so a store logged for one cannot stand for
+// the other.
+
+namespace {
+
+// A design whose process stores a young object into design state at time 20, after the first
+// collection, and prints what the slot holds at 60. Junk of the same shape is allocated for the
+// whole window, so a freed object comes back overwritten with 0x5A5A5A5A.
+std::string state_store_design(std::string_view decls, std::string_view store, std::string_view show) {
+    std::string src = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+    )";
+    src += decls;
+    src += R"(
+            Junk sink;
+            initial begin
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                #20;
+    )";
+    src += store;
+    src += R"(
+                #40;
+    )";
+    src += show;
+    src += R"(
+            end
+        endmodule
+    )";
+    return src;
+}
+
+// The young-only run every case below makes: one full collection, then young ones, with the barrier
+// having logged a card.
+void check_state_store(const std::string& src, const std::string& expected) {
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.state_cards_logged > 0u);
+}
+
+} // namespace
+
+TEST_CASE("gc: a young object stored into a scalar state slot survives young collections") {
+    check_state_store(state_store_design("Cell slot;",
+                                         "slot = new; slot.v = 4242; slot.tag = \"stored\";",
+                                         "$display(\"%0d %s\", slot.v, slot.tag);"),
+                      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object stored into a state array element by a run-time index survives") {
+    check_state_store(state_store_design("Cell arr[64]; int i;",
+                                         "i = 37; arr[i] = new; arr[i].v = 4242; arr[i].tag = \"stored\";",
+                                         "$display(\"%0d %s %0d\", arr[37].v, arr[37].tag, arr[0] == null);"),
+                      "4242 stored 1\n");
+}
+
+TEST_CASE("gc: a young object stored into a state struct member survives") {
+    check_state_store(state_store_design("typedef struct { int n; Cell c; } S_t; S_t s;",
+                                         "s.c = new; s.c.v = 4242; s.c.tag = \"stored\";",
+                                         "$display(\"%0d %s\", s.c.v, s.c.tag);"),
+                      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object committed to a state slot by a nonblocking assignment survives") {
+    check_state_store(state_store_design("Cell slot;",
+                                         "slot <= new; #1; slot.v = 4242; slot.tag = \"stored\";",
+                                         "$display(\"%0d %s\", slot.v, slot.tag);"),
+                      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object delayed into a state array by a nonblocking assignment survives") {
+    check_state_store(state_store_design("Cell arr[2]; int pad[300]; Cell src[2];",
+                                         "src[1] = new; src[1].v = 4242; src[1].tag = \"stored\"; "
+                                         "arr <= #5 src; src[1] = null; #10;",
+                                         "$display(\"%0d %s\", arr[1].v, arr[1].tag);"),
+                      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object $cast into a state slot survives") {
+    check_state_store(state_store_design(R"(
+            class Base; int v; string tag; endclass
+            class Derived extends Base; endclass
+            Base b;
+            int pad[300];
+            Derived d;
+            int ok;)",
+                                         "begin Derived t; t = new; t.v = 4242; t.tag = \"stored\"; b = t; "
+                                         "ok = $cast(d, b); b = null; end",
+                                         "$display(\"%0d %0d %s\", ok, d.v, d.tag);"),
+                      "1 4242 stored\n");
+}
+
+TEST_CASE("gc: a young object copied into a state struct by an aggregate copy survives") {
+    check_state_store(state_store_design(R"(
+            typedef struct { int n; Cell c; } S_t;
+            S_t s1;
+            int pad[300];
+            S_t s2;)",
+                                         "s2.c = new; s2.c.v = 4242; s2.c.tag = \"stored\"; s1 = s2; s2.c = null;",
+                                         "$display(\"%0d %s\", s1.c.v, s1.c.tag);"),
+                      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young mailbox stored into a state slot survives") {
+    check_state_store(state_store_design("mailbox #(int) mb; int got;",
+                                         "mb = new; mb.put(4242);",
+                                         "mb.get(got); $display(\"%0d\", got);"),
+                      "4242\n");
+}
+
+TEST_CASE("gc: a young object stored through a ref into a state slot after a suspend survives") {
+    check_state_store(state_store_design(R"(
+            Cell slot;
+            task automatic fill(ref Cell c);
+                #10;
+                c = new; c.v = 4242; c.tag = "stored";
+            endtask)",
+                                         "fill(slot);",
+                                         "$display(\"%0d %s\", slot.v, slot.tag);"),
+                      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object copied out through an output formal into a state slot survives") {
+    check_state_store(state_store_design(R"(
+            Cell slot;
+            task automatic get(output Cell c);
+                #10;
+                c = new; c.v = 4242; c.tag = "stored";
+            endtask)",
+                                         "get(slot);",
+                                         "$display(\"%0d %s\", slot.v, slot.tag);"),
+                      "4242 stored\n");
+}
+
+// What the cards are for: a young collection reads the slots of the cards stored to and not the others.
+// Twenty thousand slots hold objects that nothing stores to again, beside a churn; no collection after
+// the first reads more than the few cards the design stores to.
+TEST_CASE("gc: a young collection reads no state slot nothing stored to") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Cell; int v; endclass
+            Cell slots[20000];
+            Cell keep;
+            int  n;
+            initial begin
+                foreach (slots[i]) slots[i] = new;
+                repeat (60) begin
+                    repeat (200) begin keep = new; keep.v = n; n++; end
+                    #1;
+                end
+                $display("%0d", n);
+            end
+        endmodule
+    )";
+    const rt_gc_stats          yg  = run_stats(src, "12000\n", cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 1u);
+    // The last collection was young: the slot `keep` is in one card, which the churn stored to.
+    CHECK(yg.state_slots_read <= 4u * (RT_GC_CARD_BYTES / 8u));
+    const rt_gc_stats full = run_stats(src, "12000\n", cadence_ordinary, nursery_bytes_small, 1);
+    CHECK(full.state_slots_read >= 20000u);
+}

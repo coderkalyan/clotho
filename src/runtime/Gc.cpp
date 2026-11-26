@@ -160,6 +160,13 @@ constexpr uint64_t kNurseryBytesFloor = RT_GC_BLOCK_BYTES;
 // makes dropping an entry sound. 2^20 entries is 8 MiB of vector.
 constexpr size_t kRememberedMax = 1u << 20;
 
+// Runaway bound for the log of design-state cards, in the convention of kRememberedMax: not a
+// design limit. A real log is the cards a design stored to between two collections, and a
+// collection empties it. Reaching this means more cards were stored to than a young collection
+// is worth reading one by one, so recording stops and the next collection reads every slot of
+// every table, which needs no log and so loses no store. 2^20 entries is 8 MiB of vector.
+constexpr size_t kLoggedCardsMax = 1u << 20;
+
 // The growth rule that picks the kind when cfg.full_every is 0 (§7). A young
 // collection cannot reclaim old garbage, so old garbage grows monotonically between
 // full collections; a full collection once the old generation holds kFullGrowthFactor
@@ -441,7 +448,26 @@ struct GcState {
     std::vector<ChunkRecord*> young_large;
 
     std::vector<const rt_gc_roots*> roots;  // borrowed: the JIT'd module owns them
-    std::vector<Range>              ranges;
+    // Where each table's region is, to find the table an address belongs to (rt_gc_note_state_store).
+    // `table` indexes `roots`. Sorted by address before it is searched, which `regions_sorted` says.
+    struct Region {
+        uintptr_t lo;
+        uintptr_t hi;
+        uint32_t  table;
+    };
+    std::vector<Region> regions;
+    bool                regions_sorted = true;
+    // The cards stored to since the last collection, each once: a card byte is set exactly when it
+    // is here. At most kLoggedCardsMax of them; past that, or when a table is registered, the next
+    // collection reads every slot instead (`state_all`) and clears every card.
+    struct LoggedCard {
+        uint32_t table;
+        uint32_t card;
+    };
+    std::vector<LoggedCard> logged_cards;
+    bool                    state_all        = true;
+    size_t                  logged_cards_max = kLoggedCardsMax;
+    std::vector<Range>      ranges;
 
     // The block the mutator's free run is in, and where that run began. The accounting
     // the inlined fast path cannot do: it bumps `cursor` and writes metadata bytes,
@@ -2037,44 +2063,140 @@ void drain() {
     assert(g.stats.objects_live <= g.stats.objects_allocated && "live exceeds allocated");
 }
 
-// Precise roots: the design state buffer, per-instance state, static class
-// properties. The backend emits each table's handle slots by byte offset, so this
-// is one load per slot and needs no validation for correctness -- but a slot the
-// backend misclassified (a `chandle` lowers to the same 64-bit plane, design §3.4)
-// would have us trace a foreign DPI pointer, so a non-resolving precise root is
-// fatal rather than skipped. There is no staleness path for a root slot: design
-// state is never recycled heap.
-void push_precise_roots() {
-    for (const rt_gc_roots* t : g.roots) {
-        assert(t != nullptr);
-        assert(t->nhandles < kRootHandlesMax && "an implausible root table size");
-        if (t->nhandles == 0) {
-            continue;
+// -- Design-state roots and their cards (Gc.h, rt_gc_roots) ---------------------------
+//
+// A region's slots are read as roots, but a young collection reads only the slots of the
+// cards logged since the last collection. That is sound because of how an object becomes old:
+// every object a collection reaches is marked, and so old, so a slot nothing has stored to
+// since the collection that read it names an old object, which a young collection leaves
+// alone. A store to design state has to say so, then (rt_gc_note_state_store, and the inline
+// test of the card byte in front of the call), and until it does the slot is nobody's to read.
+// Everything the design held before the code ran has been stored by no instruction of it, so a
+// registration makes the next collection read every slot (state_all).
+
+uint8_t* cards_of(const rt_gc_roots* t) {
+    return static_cast<uint8_t*>(t->base) + t->cards;
+}
+
+uint32_t ncards_of(const rt_gc_roots* t) {
+    return t->bytes - t->cards;
+}
+
+// The region an address is in, or null. The regions are sorted by address the first time one
+// is asked for after a registration, which is once, since they are all registered at start-up.
+const GcState::Region* find_region(uintptr_t a) {
+    if (!g.regions_sorted) {
+        std::sort(g.regions.begin(), g.regions.end(), [](const GcState::Region& x, const GcState::Region& y) {
+            return x.lo < y.lo;
+        });
+        for (size_t i = 1; i < g.regions.size(); ++i) {
+            assert(g.regions[i - 1].hi <= g.regions[i].lo && "two root tables describe one region");
         }
-        assert(t->base != nullptr && "a non-empty root table has a base");
-        assert(t->offsets != nullptr && "a non-empty root table has offsets");
-        uint8_t* base = static_cast<uint8_t*>(t->base);
-        for (uint32_t i = 0; i < t->nhandles; ++i) {
-            void* h = *reinterpret_cast<void**>(base + t->offsets[i]);
-            if (h == nullptr) {
-                continue;
+        g.regions_sorted = true;
+    }
+    const auto it = std::upper_bound(
+      g.regions.begin(), g.regions.end(), a, [](uintptr_t addr, const GcState::Region& r) { return addr < r.lo; });
+    if (it == g.regions.begin()) {
+        return nullptr;
+    }
+    const GcState::Region& r = *(it - 1);
+    return a < r.hi ? &r : nullptr;
+}
+
+// One card of one table: set its byte and record it. A card already set is logged already (the
+// byte and the log are set together), so a hot slot costs this call once per collection cycle,
+// which is also what the inline test in front of the call guarantees. Past kLoggedCardsMax the
+// byte is still set and recording stops: the next collection reads every slot, which needs no
+// log, so a dropped entry costs time and never a slot.
+void mark_card(uint32_t table, uint32_t card) {
+    uint8_t& byte = cards_of(g.roots[table])[card];
+    if (byte != 0) {
+        return;
+    }
+    byte = 1;
+    g.stats.state_cards_logged += 1;
+    if (g.state_all) {
+        return; // every slot is read at the next collection and every card cleared after it
+    }
+    if (g.logged_cards.size() >= g.logged_cards_max) {
+        g.state_all = true;
+        return;
+    }
+    g.logged_cards.push_back(GcState::LoggedCard{ table, card });
+}
+
+// One slot as a root. Precise, and needing no validation for correctness -- but a slot the
+// backend misclassified (a `chandle` lowers to the same 64-bit plane, design §3.4) would have
+// us trace a foreign DPI pointer, so a non-resolving precise root is fatal rather than
+// skipped. There is no staleness path for a root slot: design state is never recycled heap.
+void read_root_slot(const rt_gc_roots* t, uint32_t i) {
+    g.stats.state_slots_read += 1;
+    void* const h = *reinterpret_cast<void**>(static_cast<uint8_t*>(t->base) + t->offsets[i]);
+    if (h == nullptr) {
+        return;
+    }
+    if (rt_gc_find_object(h) != h) {
+        // Report the word, not just the shape: the two ways to get here are a root table
+        // naming a slot that is not a class handle (so the value is whatever the design
+        // stored there) and a live root naming an object the heap has already reclaimed (so
+        // the value is a plausible-looking heap address). The number is what distinguishes them.
+        char note[160];
+        std::snprintf(note,
+                      sizeof note,
+                      "root %u of the table at %p reads %p, which the heap does not own "
+                      "(resolved to %p)",
+                      i,
+                      static_cast<const void*>(t),
+                      h,
+                      rt_gc_find_object(h));
+        gc_fatal("a precise GC root does not name a class object", note);
+    }
+    mark_and_push(h);
+}
+
+// The slots of one card: the offsets in [card * RT_GC_CARD_BYTES, the next card's), found by
+// binary search since a table's offsets ascend.
+void read_card_slots(const rt_gc_roots* t, uint32_t card) {
+    const uint32_t  lo    = card << RT_GC_CARD_SHIFT;
+    const uint32_t  hi    = lo + RT_GC_CARD_BYTES;
+    const uint32_t* first = std::lower_bound(t->offsets, t->offsets + t->nhandles, lo);
+    for (const uint32_t* at = first; at != t->offsets + t->nhandles && *at < hi; ++at) {
+        read_root_slot(t, static_cast<uint32_t>(at - t->offsets));
+    }
+}
+
+// Precise roots: the design state buffer and per-instance state, which hold the static class
+// properties too. A full collection reads every slot, as does one that owes it (state_all); a
+// young one reads the logged cards. Whichever it was, every card is clear after, and the log
+// is empty: the slots stored to from here on are the next collection's.
+void push_precise_roots() {
+    const bool all = g.kind == RT_GC_KIND_FULL || g.state_all;
+    if (all) {
+        for (const rt_gc_roots* t : g.roots) {
+            assert(t != nullptr);
+            assert(t->nhandles < kRootHandlesMax && "an implausible root table size");
+            for (uint32_t i = 0; i < t->nhandles; ++i) {
+                read_root_slot(t, i);
             }
-            if (rt_gc_find_object(h) != h) {
-                // Report the word, not just the shape: the two ways to get here are a
-                // root table naming a slot that is not a class handle (so the value is
-                // whatever the design stored there) and a live root naming an object the
-                // heap has already reclaimed (so the value is a plausible-looking heap
-                // address). The number is what distinguishes them.
-                char note[160];
-                std::snprintf(note, sizeof note,
-                              "root %u of the table at %p reads %p, which the heap does not own "
-                              "(resolved to %p)",
-                              i, static_cast<const void*>(t), h, rt_gc_find_object(h));
-                gc_fatal("a precise GC root does not name a class object", note);
-            }
-            mark_and_push(h);
+            g.stats.state_cards_read += ncards_of(t);
+        }
+    } else {
+        for (const GcState::LoggedCard& l : g.logged_cards) {
+            read_card_slots(g.roots[l.table], l.card);
+        }
+        g.stats.state_cards_read += g.logged_cards.size();
+    }
+    if (g.state_all) {
+        for (const rt_gc_roots* t : g.roots) {
+            std::memset(cards_of(t), 0, ncards_of(t));
+        }
+    } else {
+        for (const GcState::LoggedCard& l : g.logged_cards) {
+            cards_of(g.roots[l.table])[l.card] = 0;
         }
     }
+    g.logged_cards.clear();
+    g.state_all = false;
 }
 
 // Conservative scan of a byte range. Every candidate is validated against our own
@@ -2802,6 +2924,10 @@ void release_heap() {
     g.young.clear();
     g.young_large.clear();
     g.roots.clear();
+    g.regions.clear();
+    g.regions_sorted = true;
+    g.logged_cards.clear();
+    g.state_all = true;
     g.ranges.clear();
     g.nba_queues.clear();
     g.container_tables.clear();
@@ -3290,6 +3416,53 @@ void verify_roots() {
     }
 }
 
+// The two halves of a card agree: a card byte is set exactly when the log holds the card
+// (or every card is owed a read, state_all), and each logged card is in its table. A byte set
+// with no entry is a card the next young collection would never read; an entry with no byte
+// is one a store would log again.
+void verify_cards() {
+    uint64_t set = 0;
+    for (const rt_gc_roots* t : g.roots) {
+        const uint8_t* cards = cards_of(t);
+        for (uint32_t c = 0; c < ncards_of(t); ++c) {
+            set += cards[c] != 0 ? 1 : 0;
+        }
+    }
+    if (g.state_all) {
+        return;
+    }
+    assert(set == g.logged_cards.size() && "a card byte is set that the log does not hold");
+    for (const GcState::LoggedCard& l : g.logged_cards) {
+        assert(l.table < g.roots.size() && l.card < ncards_of(g.roots[l.table]) && "a logged card is in its table");
+        assert(cards_of(g.roots[l.table])[l.card] != 0 && "a logged card lost its byte");
+    }
+}
+
+// A young collection reads the slots of the logged cards and no others, which is sound only
+// if every other slot names an object that is old by now: every object a collection reaches
+// is marked, and so old, and a slot not stored to since names only what the collection that
+// last read it left old. Called before the collection marks anything, so a mark still means
+// old. A slot outside the logged cards that names a young object is a store to design state
+// the code did not log.
+void verify_unlogged_state_slots() {
+    for (const rt_gc_roots* t : g.roots) {
+        const uint8_t* cards = cards_of(t);
+        uint8_t* const base  = static_cast<uint8_t*>(t->base);
+        for (uint32_t i = 0; i < t->nhandles; ++i) {
+            if (cards[t->offsets[i] >> RT_GC_CARD_SHIFT] != 0) {
+                continue;
+            }
+            void* const h = *reinterpret_cast<void**>(base + t->offsets[i]);
+            if (h == nullptr) {
+                continue;
+            }
+            assert(rt_gc_find_object(h) == h && "an unlogged state slot names no object");
+            assert(is_marked_now(h) &&
+                   "an unlogged state slot names a young object: a store to design state was not logged");
+        }
+    }
+}
+
 // The heap-wide totals, split from rt_gc_verify() for length (TigerStyle). Every
 // claim here is about a counter the walk produced rather than about any one object.
 void verify_totals(const VerifyTally& tally) {
@@ -3451,6 +3624,7 @@ extern "C" void rt_gc_init(const rt_gc_config* cfg) {
     g_owned.parking    = false;
     arm_owned_trigger();
     g.remembered.clear();
+    g.logged_cards_max = kLoggedCardsMax;
     for (uint64_t& n : g.by_reason) {
         n = 0;
     }
@@ -3554,14 +3728,28 @@ extern "C" void rt_gc_run_leave(void) {
 extern "C" void rt_gc_roots_add(const rt_gc_roots* table) {
     assert(table != nullptr && "a root table registration needs a table");
     assert(table->nhandles < kRootHandlesMax && "an implausible root table size");
-    assert((table->nhandles == 0 || table->base != nullptr) && "a non-empty table has a base");
+    assert(table->base != nullptr && "a root table names the region it describes");
     assert((table->nhandles == 0 || table->offsets != nullptr) && "a non-empty table has offsets");
-    // Negative space: registering a table twice is harmless to the scan but means
-    // the emitted startup sequence ran twice, which is not harmless anywhere else.
-    // The table's lifetime is the JIT'd module's; the runtime only borrows it.
-    assert(std::find(g.roots.begin(), g.roots.end(), table) == g.roots.end() &&
-           "this root table is already registered");
+    assert(table->cards <= table->bytes && "the card bytes lie inside the region");
+    assert(table->cards > 0 && "a region has something before its card bytes");
+    assert(table->bytes - table->cards == ((table->cards - 1) >> RT_GC_CARD_SHIFT) + 1 &&
+           "a region has one card byte for each card of what lies before them");
+#ifndef NDEBUG
+    for (uint32_t i = 0; i < table->nhandles; ++i) {
+        assert(table->offsets[i] + sizeof(void*) <= table->cards && "a handle slot lies before the card bytes");
+        assert((i == 0 || table->offsets[i - 1] < table->offsets[i]) && "a table's offsets ascend");
+    }
+#endif
+    // The regions of two tables never overlap, which includes a table registered twice (the
+    // emitted startup sequence ran twice); find_region checks it once, when it sorts them. The
+    // table's lifetime is the JIT'd module's; the runtime only borrows it.
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(table->base);
+    g.regions.push_back(GcState::Region{ lo, lo + table->bytes, static_cast<uint32_t>(g.roots.size()) });
+    g.regions_sorted = false;
     g.roots.push_back(table);
+    // What a region holds before the design runs is its initializer's, which no store of the
+    // code logged: the next collection, whatever its kind, reads every slot of every table.
+    g.state_all = true;
 }
 
 // The registry head lives in the mutator now (Gc.h:178-181), which is what let the
@@ -3828,6 +4016,8 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // container-root path kept this queue's elements alive" from "a conservative frame
     // word happened to pin the same object".
     g.stats.container_roots = 0;
+    g.stats.state_slots_read = 0;
+    g.stats.state_cards_read = 0;
     g.worklist.clear();
     g.container_work.clear();
     if (g.worklist.capacity() < kWorklistReserve) {
@@ -3836,6 +4026,14 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     assert(g.pinned.empty() && "the previous collection left a pin behind");
     assert(g.weak_reached.empty() && "the previous collection left a weak reference unexamined");
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Before anything is marked, which is the one moment a mark still says "old": a young
+    // collection reads the logged cards of design state and no others, so a slot outside
+    // them must name no young object.
+    if (kind == RT_GC_KIND_YOUNG && !g.state_all) {
+        verify_unlogged_state_slots();
+    }
+#endif
     mark_from_roots();
     // The marks are complete and nothing is reclaimed yet, which is the one moment to
     // ask whether an object was reached: of a weak reference's referent, and of the
@@ -3906,27 +4104,57 @@ extern "C" void rt_gc_remember(void* obj) {
 }
 
 // The barrier of a store through a `ref` formal, or into the actual of an output formal:
-// a place the callee cannot attribute to an owner statically. `slot` is the address the
-// formal aliases. `chain` is the witness chain the call passed when the place is an
-// element of a container (outermost first, whose first epoch pointer is inside the
-// outermost container's handle), else null. The object that holds the container is the
-// owner of what the store adds, and it is found from that handle; for a place that cannot
-// move it is found from `slot`. A place that lies in no heap object -- a frame, design
-// state, a container no object owns -- has no owner to log, and is read by every collection.
-extern "C" void rt_gc_note_ref_store(void* slot, const rt_ref_witness* chain) {
+// a place the callee cannot attribute to an owner statically. `slot` is the address stored
+// to and `bytes` how much. `chain` is the witness chain the call passed when the place is an
+// element of a container (outermost first, whose first epoch pointer is inside the outermost
+// container's handle), else null. What holds the container is the owner of what the store
+// adds, and it is found from that handle; for a place that cannot move it is found from
+// `slot`. A heap object is logged if it is old. A place in design state is logged as an
+// emitted store to it would be. A place in neither -- a frame -- is read in full.
+extern "C" void rt_gc_note_ref_store(void* slot, const rt_ref_witness* chain, uint64_t bytes) {
     if (g.initialized == 0) {
         return;
     }
     assert(slot != nullptr && "a ref aliases a place");
-    const void* at = slot;
+    void* at = slot;
     if (chain != nullptr && chain->epoch != nullptr) {
-        at = chain->epoch;
+        at    = const_cast<uint64_t*>(chain->epoch);
+        bytes = 1;
     }
-    void* const owner = rt_gc_find_object(at);
-    if (owner == nullptr) {
+    if (void* const owner = rt_gc_find_object(at); owner != nullptr) {
+        rt_gc_remember(owner);
         return;
     }
-    rt_gc_remember(owner);
+    rt_gc_note_state_store(at, bytes);
+}
+
+extern "C" void rt_gc_set_logged_cards_max(uint64_t max) {
+    g.logged_cards_max = static_cast<size_t>(max);
+}
+
+extern "C" void rt_gc_note_state_store(void* addr, uint64_t bytes) {
+    if (g.initialized == 0) {
+        return;
+    }
+    assert(addr != nullptr && "a state store names an address");
+    const GcState::Region* const region = find_region(reinterpret_cast<uintptr_t>(addr));
+    if (region == nullptr) {
+        return; // not design state: a frame, an object, a container payload
+    }
+    const rt_gc_roots* const t     = g.roots[region->table];
+    const uint64_t           first = reinterpret_cast<uintptr_t>(addr) - region->lo;
+    // The cards cover what lies before them. A store into the card bytes themselves is
+    // nobody's, and a range that runs into them is cut there.
+    if (first >= t->cards) {
+        return;
+    }
+    uint64_t last = first + (bytes == 0 ? 0 : bytes - 1);
+    if (last >= t->cards) {
+        last = t->cards - 1;
+    }
+    for (uint64_t card = first >> RT_GC_CARD_SHIFT; card <= (last >> RT_GC_CARD_SHIFT); ++card) {
+        mark_card(region->table, static_cast<uint32_t>(card));
+    }
 }
 
 // -- Introspection ------------------------------------------------------------
@@ -4027,6 +4255,7 @@ extern "C" void rt_gc_verify(void) {
     // freed a live object: reclaiming it clears the very start bit the walk below iterates
     // over, so the walk cannot see the failure the two parities exist to prevent.
     verify_roots();
+    verify_cards();
     // The container half of §13, through the same walkers with marking replaced by an
     // assertion (mark_container_handle): every non-null handle inside a live container --
     // an element handle, or one decoded out of an associative array's KEY bytes by

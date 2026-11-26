@@ -110,21 +110,35 @@ struct rt_alloc_site;
 // sets LOGGED, so a hot object costs the call once per collection cycle rather
 // than once per store.
 //
-// Design state, statics and frame locals need NO inline barrier -- they are scanned in
-// full at every collection, young or not -- so this is emitted only for a store
-// whose target is inside a heap object (§7).
+// Design state has its own barrier, rt_gc_note_state_store below: a young collection
+// reads only the state slots stored to since the last collection, as it traces only
+// the old objects the remembered set names. Statics are state; frame locals need
+// neither barrier, since a frame is scanned in full at every collection.
 void rt_gc_remember(void* obj);
 
-// The same barrier for a store through an address the code cannot attribute to an
-// owner: the place a `ref` formal aliases, or the actual of an output formal that the
-// callee copies out through. `slot` is that place and `chain` the witness chain the
-// call passed (rt_ref_witness, Runtime.h), non-null when the place is an element of a
-// container. The runtime finds the heap object that holds the place -- or the one that
-// holds the outermost container, from the chain -- and logs it if it is old, as above.
-// A place in no heap object is not logged: design state and frames are read in full.
-// Called at each store, because a task can suspend across a collection between the
-// call and its store.
-void rt_gc_note_ref_store(void* slot, const struct rt_ref_witness* chain);
+// The barrier of a store through an address the code cannot attribute to an owner:
+// the place a `ref` formal aliases, or the actual of an output formal that the
+// callee copies out through. `slot` is the address stored to, `bytes` how much, and
+// `chain` the witness chain the call passed (rt_ref_witness, Runtime.h), non-null when
+// the place is an element of a container. The runtime finds what holds the place: the
+// heap object that holds it -- or the one that holds the outermost container, from the
+// chain -- is logged if it is old, as above, and a place in design state is logged as
+// by rt_gc_note_state_store (for a container element, the outermost container's own
+// place, which the chain's first epoch pointer lies in). A place in neither is a
+// frame, which is read in full. Called at each store, because a task can suspend
+// across a collection between the call and its store.
+void rt_gc_note_ref_store(void* slot, const struct rt_ref_witness* chain, uint64_t bytes);
+
+// The write barrier of design state (docs/design/garbage-collection.md §7). A store of a
+// class handle into a state region -- or a mutation of a state-resident container, which
+// stores one into its payload -- has to be logged, because a young collection reads only
+// the cards logged since the last collection: a card is RT_GC_CARD_BYTES of a region, one
+// byte of dirty flag in the region itself. `addr` is the first byte stored to and `bytes`
+// how many; every card they touch is logged. Generated code tests the card byte inline
+// and calls this only when it is clear, so a hot slot costs the call once per collection
+// cycle. An address in no registered region is ignored: the runtime's callers need not
+// know whether a place is state.
+void rt_gc_note_state_store(void* addr, uint64_t bytes);
 
 // -- Per-class trace map ------------------------------------------------------
 //
@@ -185,14 +199,29 @@ typedef struct rt_gc_map {
 // -- Precise global roots -----------------------------------------------------
 //
 // One constant per storage region (the design state buffer, each per-instance
-// state buffer, each static class property block): the class-handle slots inside
-// it, by byte offset. Emitted by the backend and registered once at startup, so
-// the table's lifetime is the JIT'd module's and the runtime only borrows it.
+// state buffer; a static class property is a slot of one of them): the class-handle
+// slots inside it, by ascending byte offset. Emitted by the backend and registered once
+// at startup, so the table's lifetime is the JIT'd module's and the runtime only
+// borrows it.
+//
+// A region ends in its CARD BYTES: one byte for each RT_GC_CARD_BYTES of the region before
+// them, `cards` bytes in from `base`, clear until a store to that stretch is logged
+// (rt_gc_note_state_store) and clear again after the collection that read it. Generated
+// code finds the byte of a place from the place alone -- region offset >> RT_GC_CARD_SHIFT
+// -- so nothing instance-specific is in code shared by the instances of one unit.
+//
+// A young collection reads the slots of the logged cards and no others. A full
+// collection reads every slot of every table.
+#define RT_GC_CARD_SHIFT 9u
+#define RT_GC_CARD_BYTES (1u << RT_GC_CARD_SHIFT)
+
 typedef struct rt_gc_roots {
     void*           base;
     uint32_t        nhandles;
-    uint32_t        reserved;
+    uint32_t        bytes; // the region's size, card bytes included
     const uint32_t* offsets;
+    uint32_t        cards; // offset of the card bytes in the region
+    uint32_t        reserved;
 } rt_gc_roots;
 
 // -- Coroutine frame registry -------------------------------------------------
@@ -526,7 +555,21 @@ typedef struct rt_gc_stats {
     uint64_t heap_bytes;
     // Weak references the collector has cleared over the run (rt_gc_map::weak_referent).
     uint64_t weak_cleared;
+    // Handle slots of design state the last collection read as roots, and the cards of them
+    // it found logged (every card of every region when it read them all). The first is what
+    // a young collection costs of the design's state, and a test asserts it does not grow
+    // with the slots nothing stored to.
+    uint64_t state_slots_read;
+    uint64_t state_cards_read;
+    // Cards the barrier has logged over the run, which is what tells a test the barrier fired at
+    // all rather than a young collection having found the slot some other way.
+    uint64_t state_cards_logged;
 } rt_gc_stats;
+
+// How many logged cards a collection cycle holds before the next collection reads every slot of
+// design state instead (restored by rt_gc_init). For the tests of that fallback, which could not
+// reach the real bound with a design of a reasonable size.
+void rt_gc_set_logged_cards_max(uint64_t max);
 
 void rt_gc_get_stats(rt_gc_stats* out);
 
