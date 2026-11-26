@@ -207,6 +207,11 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     void handle(const slang::ast::NamedValueExpression& e);
     void handle(const slang::ast::HierarchicalValueExpression& e);
     void handle(const MemberAccessExpression& ma);
+    void handle(const slang::ast::ElementSelectExpression& es);
+
+    // An event member or element of an aggregate class property, which `wait` parks on
+    // like an event property (event_props).
+    void take_event_place(const Expression& e);
 };
 
 bool box_can_notify(const slang::ast::Type& ty);

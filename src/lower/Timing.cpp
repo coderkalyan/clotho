@@ -1905,18 +1905,13 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
     if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() &&
         prop_reads.event_props.empty() && boxed_reads.empty() && prop_reads.any_prop) {
         // The condition reads a class property that can carry no notifier -- a covergroup
-        // handle, or an unpacked aggregate holding an event, whose trigger is no store --
-        // and nothing else that can wake this process. Lowering it anyway is what used to
+        // handle -- and nothing else that can wake this process. Lowering it anyway is what used to
         // happen, and it produced a suspend with an EMPTY event list: a permanent park
         // with no diagnostic, in a design whose author had every reason to expect
         // a working wait. `wait(0)` still parks silently, because that one reads
         // nothing at all and is the documented LRM 9.4.3 behaviour.
-        //
-        // TODO: an event inside an unpacked aggregate property (LRM 9.4.3): park on the
-        // event object it holds, as for an event property, beside the property's notifier.
         fail("wait on a class property of a type with no change notifier is not "
-             "supported (a covergroup handle, or an unpacked aggregate holding an "
-             "event, cannot be waited on)");
+             "supported (a covergroup handle property cannot be waited on)");
     }
 
     // The edges to park on, lowered where the caller has its region open: a handle is

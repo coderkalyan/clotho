@@ -864,8 +864,9 @@ copy (`AggCopy`) compares bytes; a container inside fires on every mutation; a `
 actual wakes through the same thunk. `@(obj.s.f)` and other compounds over properties
 wait in `lower_expr_wait` (parked on the notifiers, then compared with a sample), which
 misses a change that reverts before the waiter runs (scheduler-rules R8/R9). `@(obj.s)`
-is no legal event expression (9.4.2: singular values). Not covered: an aggregate holding
-an `event` (a trigger is no store) gets no notifier, and event lists over property parts.
+is no legal event expression (9.4.2: singular values). An event member is an event object
+like an event property's (`@`, `wait(.triggered)`, `->`, `->>` reach it); a trigger fires no
+notifier, its siblings' stores do. Not covered: event lists over property parts.
 
 ## Waiting on an event property (LRM 9.4.2 over 15.5)
 

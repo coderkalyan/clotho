@@ -2507,3 +2507,29 @@ TEST_CASE("@(obj.s.f) wakes only when the member's value changes") {
     )");
     CHECK(out.find("woke 2 7") != std::string::npos);
 }
+
+// An event member of an aggregate class property is an event object like an event
+// property: `@`, `wait(.triggered)` and `->` / `->>` reach it, in a module and in a method
+// (implicit this), and a store to a sibling member still wakes `@*` and `wait`.
+// Refused or silent before. LRM-derived; no oracle parses classes.
+TEST_CASE("event member of an aggregate class property") {
+    const std::string out = run_capture(R"(
+        typedef struct { event e; int f; } s_t;
+        class C; s_t s;
+          task w(); @(s.e) $display("method"); endtask
+          task w2(); wait (s.e.triggered) $display("trig"); endtask
+        endclass
+        module top;
+          C obj = new; int y;
+          initial begin @(obj.s.e) $display("at"); end
+          initial begin wait (obj.s.f == 1) $display("wait f"); end
+          initial begin @(obj.s.e) $display("at nb"); end
+          initial fork obj.w(); obj.w2(); join_none
+          always @* begin y = obj.s.f; $display("W %0t", $time); end
+          initial begin #1 -> obj.s.e; #1 obj.s.f = 1; #1 ->> obj.s.e; #1 $finish; end
+        endmodule
+    )");
+    for (const char* want : { "method", "trig", "at\n", "wait f", "W 2" }) {
+        CHECK_MESSAGE(out.find(want) != std::string::npos, want);
+    }
+}

@@ -168,27 +168,6 @@ bool is_notified_container(const slang::ast::Type& ty) {
     return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
 }
 
-// Whether an aggregate has an event among its members or elements, at any depth.
-static bool holds_event(const slang::ast::Type& t) {
-    const slang::ast::Type& ct = t.getCanonicalType();
-    if (ct.isEvent()) {
-        return true;
-    }
-    if (ct.isUnpackedArray()) {
-        return holds_event(*ct.getArrayElementType());
-    }
-    const auto any_field = [](std::span<const slang::ast::FieldSymbol* const> fields) {
-        return std::ranges::any_of(fields, [](const slang::ast::FieldSymbol* f) { return holds_event(f->getType()); });
-    };
-    if (ct.isUnpackedStruct()) {
-        return any_field(ct.as<slang::ast::UnpackedStructType>().fields);
-    }
-    if (ct.isUnpackedUnion()) {
-        return any_field(ct.as<slang::ast::UnpackedUnionType>().fields);
-    }
-    return false;
-}
-
 // The aggregates whose members one any-change notifier covers: an unpacked struct, an
 // unpacked union and a FIXED unpacked array. The property is one variable, and LRM
 // 9.4.2.2 adds a variable the statement reads, not a member of it, so a change
@@ -199,12 +178,10 @@ static bool holds_event(const slang::ast::Type& t) {
 // which an aggregate has none of, and `@` over a whole aggregate is no legal event
 // expression (9.4.2: "Event expressions shall return singular values").
 //
-// One holding an event has none: a trigger is no store, so the notifier would never
-// fire for a wait on it, and such a wait stays what it is without one.
+// An event member is no value a wait or `@*` reads, so a trigger fires nothing; the
+// member's own stores (its non-event siblings') do.
 bool is_notified_aggregate(const slang::ast::Type& ty) {
-    const bool aggregate =
-      ty.isUnpackedStruct() || ty.isUnpackedUnion() || (ty.isUnpackedArray() && !is_notified_container(ty));
-    return aggregate && !holds_event(ty);
+    return ty.isUnpackedStruct() || ty.isUnpackedUnion() || (ty.isUnpackedArray() && !is_notified_container(ty));
 }
 
 PropNotify prop_notify_kind(const slang::ast::Type& ty) {
@@ -342,8 +319,23 @@ void ClassPropReadScan::handle(const slang::ast::HierarchicalValueExpression& e)
     visitDefault(e);
 }
 
+static bool roots_at_class_prop(const Expression& e);
+
+void ClassPropReadScan::take_event_place(const Expression& e) {
+    if (e.type->isEvent() && roots_at_class_prop(e) && instance_class_prop(e) == nullptr) {
+        event_props.push_back(&e);
+        any_prop = true;
+    }
+}
+
+void ClassPropReadScan::handle(const slang::ast::ElementSelectExpression& es) {
+    take_event_place(es);
+    visitDefault(es);
+}
+
 void ClassPropReadScan::handle(const MemberAccessExpression& ma) {
     take(ma);
+    take_event_place(ma);
     // Descended into on purpose: the object expression of `a.b.p` can itself
     // read properties, and a compound condition nests member accesses.
     visitDefault(ma);

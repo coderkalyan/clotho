@@ -121,11 +121,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
 - [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — a container-valued `@`
-  and an aggregate holding an `event` are not waited on.
+  is refused.
   - [ ] **`@` over a container property expression** (9.4.2) — needs the value
     snapshotted in the waiter and compared on each wake.
-  - [ ] **`wait` and `@*` on an unpacked aggregate property holding an `event`** (9.4.3) —
-    a trigger is no store, so no notifier sees it; refused only when nothing else wakes it.
   - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
     needs DPI.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
