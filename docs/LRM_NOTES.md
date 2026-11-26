@@ -759,13 +759,22 @@ class property read through a handle (`obj.x`) and a virtual-interface member
 is itself a variable read. 9.2.2.2.1 says "References to class objects and method calls
 of class objects do not add anything to the sensitivity list of an always_comb, except
 for any contributions from argument expressions", so `always_comb` over `obj.x` waits
-on neither the member nor `obj`. A virtual interface is not a class object, so
-`always_comb` over `vif.a` waits on the member and on `vif`. A static property is a
-variable of the class, not a reference through an object, and keeps its own signal. A
-body that reads through a handle cannot be statically subscribed, so it waits in its
-own loop and an `always_comb` of that kind is self-starting and queued late, so its time-zero run is note 44's.
+on neither the member nor `obj`. A method call of a class object is the same: the
+handle it is called on adds nothing, and neither does anything the method's body reads
+(a module variable included), while its argument expressions do, and so does what only
+selects the object (`objs[i].get()` waits on `i`). `@*`, `wait` and `@(expr)` read the
+handle of such a call as they read any variable (9.4.2.2, 9.4.3). A virtual interface is
+not a class object, so `always_comb` over `vif.a` waits on the member and on `vif`, and
+a method called through one is a hierarchical call, analyzed as a normal function. A
+static property is a variable of the class, not a reference through an object, and
+keeps its own signal, and a static method called by its class scope is a normal
+function too. A body that reads through a handle cannot be statically subscribed, so it
+waits in its own loop and an `always_comb` of that kind is self-starting and queued late,
+so its time-zero run is note 44's. iverilog 13 runs an always_comb that calls a method
+again when the handle or a variable the method reads changes, against the clause; the
+decision follows the clause.
 
-Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it). No oracle parses these designs.
+Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`, `handle(CallExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it), `tests/class_test.cpp` (the two on a method call and an always_comb). No oracle parses the property and virtual-interface designs; iverilog 13 parses the method-call ones and disagrees, as said.
 
 ## 58. Event control over a handle's members, in a list (9.4.2, 9.4.2.1, 9.4.2.3, 8.4, 25.9)
 

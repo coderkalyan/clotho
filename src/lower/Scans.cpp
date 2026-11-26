@@ -1372,24 +1372,34 @@ void SensitivityCollector::handle(const ForLoopStatement& f) {
     visitDefault(f);
 }
 
-// A called subroutine's argument expressions are always sensitive, and so is the
-// object a method is called on, which the call reads as it reads an argument
-// (`wait (w.get() == null)` is tested again when `w` is pointed at another
-// object). Its body contributes only for a *function* under Comb rules
-// (9.2.2.2.1): a function may reference module signals directly, not only through
-// its arguments, so descend once into the callee body — the callee's formals /
-// locals are not module signals (not in sigmap), so they are ignored, while module
-// signals it reads / writes are recorded as usual. Task bodies never contribute
-// (9.2.2.2.1: "the contents of the tasks do not add anything"), and under
-// ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
+// A called subroutine's argument expressions are always sensitive. So is the object a
+// method is called on under `@*`, `wait` and `@(expr)`, which read it as they read an
+// argument (`wait (w.get() == null)` is tested again when `w` is pointed at another
+// object, 9.4.2.2). An always_comb is different: "References to class objects and
+// method calls of class objects do not add anything to the sensitivity list of an
+// always_comb, except for any contributions from argument expressions passed to these
+// method calls" (9.2.2.2.1), so neither the handle nor the method's body adds anything
+// there and what selects the object (`objs[i].get()`) does. Any other function's body
+// contributes only for a *function* under Comb rules (9.2.2.2.1): a function may
+// reference module signals directly, not only through its arguments, so descend once
+// into the callee body — the callee's formals / locals are not module signals (not in
+// sigmap), so they are ignored, while module signals it reads / writes are recorded
+// as usual. Task bodies never contribute (9.2.2.2.1: "the contents of the tasks do not
+// add anything"), and under ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
 void SensitivityCollector::handle(const CallExpression& c) {
-    if (const Expression* receiver = c.thisClass(); receiver != nullptr) {
+    const Expression* receiver = c.thisClass();
+    // A virtual interface is no class object: a method called through one is a
+    // hierarchical call, analyzed as a normal function (9.2.2.2.1).
+    const bool object_call = receiver != nullptr && receiver->type->getCanonicalType().isClass();
+    if (object_call) {
+        read_object(*receiver);
+    } else if (receiver != nullptr) {
         receiver->visit(*this);
     }
     for (const Expression* arg : c.arguments()) {
         arg->visit(*this);
     }
-    if (c.isSystemCall() || mode != SensitivityMode::Comb) {
+    if (c.isSystemCall() || mode != SensitivityMode::Comb || object_call) {
         return;
     }
     const SubroutineSymbol* sub = std::get<0>(c.subroutine);
