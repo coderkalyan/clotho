@@ -981,3 +981,14 @@ iverilog 13 cannot parse an associative array, so the tests derive from the clau
 with a 4-state index of the type's own width, which was always invalid, as the control.
 
 Code: `src/lower/Containers.cpp` (`lower_assoc_key`). Tests: `tests/associative_array_test.cpp` ("assoc invalid (x/z) index: the cast to a 2-state or narrower index type does not hide it", "assoc 4-state index without an x or z bit names the entry of its value through the cast", "assoc invalid (x/z) index: literals, queue and struct entries and nested arrays", "assoc invalid (x/z) index into a 2-state index type warns under --sanitize=bounds").
+
+## 65. Bounds of a queue slice read as a value (7.10.1, 11.8.3)
+
+7.10.1: "If either a or b are 4-state expressions containing x or z values, it yields the empty
+queue {}", `Q[a:b]` with `a < 0` is `Q[0:b]` and with `b > $` is `Q[a:$]`. Each bound is compared
+by its own signedness and width (11.8.3): an unsigned `bit [7:0]` holding 200 is 200, a `byte`
+holding -2 is below 0. The same holds for `q[i +: n]` and `q[i -: n]` (an x or z bit in `i` or `n`
+makes the slice empty). iverilog 13 gets an x bound (all the elements up to the other bound) and an
+unsigned narrow bound (read as negative) wrong, so the test is derived from the clauses.
+
+Code: `src/lower/SystemTasks.cpp` (`lower_queue_bounds`), `src/ir/llvm/Containers.cpp` (`lower_queue_append_range`). Tests: `tests/queue_test.cpp` ("queue slice read: x/z bound is empty and a bound keeps its own signedness").

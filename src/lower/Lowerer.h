@@ -3984,6 +3984,8 @@ private:
 
     void lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b);
 
+    std::pair<ir::Index, ir::Index> lower_queue_bounds(const RangeSelectExpression& rs, ir::Builder& b);
+
     std::vector<char> scan_conversion_chars(std::string_view fmt);
 
     ir::Index lower_scanf(const CallExpression& call, bool is_sscanf, ir::Builder& b, ir::SourceLoc l);

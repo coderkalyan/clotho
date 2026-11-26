@@ -188,12 +188,21 @@ Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b
 // signedness, with room for the arithmetic of an indexed slice, so that an x or z bit and a
 // negative bound keep their meaning; `$` is a signed `int`.
 void Lowerer::lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b) {
-    const ir::SourceLoc l = loc(rs);
-    t.target              = lower_lvalue(rs.value(), b, /*is_write=*/true);
-    t.base_type           = lower_type(*rs.value().type);
-    t.slice               = ir::kMemSliceQueue;
+    t.target    = lower_lvalue(rs.value(), b, /*is_write=*/true);
+    t.base_type = lower_type(*rs.value().type);
+    t.slice     = ir::kMemSliceQueue;
     const Restore<std::optional<QueueDollarCtx>> dollar_guard(queue_dollar_, QueueDollarCtx{ t.target, t.base_type });
+    std::tie(t.slice_base, t.slice_end) = lower_queue_bounds(rs, b);
+}
 
+// The first and last index `q[a:b]`, `q[i +: n]` or `q[i -: n]` of a queue names (LRM 7.10.1,
+// 11.5.1), for a slice read and a load alike, with `$` resolved by the caller's queue_dollar_.
+// Each is a value wide enough to hold the bound, widened by its own signedness (11.8.3, `$` is a
+// signed `int`), so a negative or unsigned-narrow bound keeps its value; an x or z bit stays in
+// it, for the backend to make the slice empty. The far end of an indexed slice is computed in a
+// type that holds the sum of two operands.
+std::pair<ir::Index, ir::Index> Lowerer::lower_queue_bounds(const RangeSelectExpression& rs, ir::Builder& b) {
+    const ir::SourceLoc l = loc(rs);
     struct Operand {
         ir::Index     value;
         bool          is_signed;
@@ -208,29 +217,22 @@ void Lowerer::lower_queue_slice_target(const RangeSelectExpression& rs, MemTarge
         return b.convert(x.value, make_int_type(width + 2, four), x.is_signed, l);
     };
 
-    const Operand  first = operand(rs.left());
-    const Operand  last  = operand(rs.right());
+    const Operand first = operand(rs.left());
+    const Operand last  = operand(rs.right());
     if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-        t.slice_base = widen(first, std::max(first.type.width, 32u), first.type.four_state);
-        t.slice_end  = widen(last, std::max(last.type.width, 32u), last.type.four_state);
-        return;
+        return { widen(first, std::max(first.type.width, 32u), first.type.four_state),
+                 widen(last, std::max(last.type.width, 32u), last.type.four_state) };
     }
-    // `i +: n` and `i -: n` span n indices from `i`: both operands are runtime values for a
-    // queue (no constant width as for an array), so the far end is computed here, in a type
-    // that holds the sum of two of them. An x or z bit in either makes the far end unknown.
-    const uint32_t width = std::max({ first.type.width, last.type.width, 32u });
-    const bool     four  = first.type.four_state || last.type.four_state;
-    const ir::Ref  wide  = make_int_type(width + 2, four);
+    const uint32_t  width = std::max({ first.type.width, last.type.width, 32u });
+    const bool      four  = first.type.four_state || last.type.four_state;
+    const ir::Ref   wide  = make_int_type(width + 2, four);
     const ir::Index base  = widen(first, width, four);
     const ir::Index count = widen(last, width, four);
     const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, b.constant(module_.pool.put_int(wide, 1), l), l);
     if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
-        t.slice_base = base;
-        t.slice_end  = b.binary(ir::Inst::Tag::Add, base, nm1, l);
-    } else {
-        t.slice_base = b.binary(ir::Inst::Tag::Sub, base, nm1, l);
-        t.slice_end  = base;
+        return { base, b.binary(ir::Inst::Tag::Add, base, nm1, l) };
     }
+    return { b.binary(ir::Inst::Tag::Sub, base, nm1, l), base };
 }
 
 // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.

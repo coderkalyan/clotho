@@ -999,37 +999,9 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
         // in lower_expr. Scoped around both forms below: the Simple bounds
         // AND an indexed form's base index can equally spell `$`.
         const Restore<std::optional<QueueDollarCtx>> dollar_guard(queue_dollar_, QueueDollarCtx{ src, qty });
-        ir::Index lo, hi;
-        if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-            lo = lower_expr(rs.left(), b);
-            hi = lower_expr(rs.right(), b);
-        } else {
-            // Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 11.5.1,
-            // extended to queues by 7.10.4). Unlike the fixed/packed-array
-            // form, a queue's width `n` need NOT be a compile-time constant
-            // (confirmed against slang: it applies no such check when the
-            // base is a queue) -- both `i` and `n` are ordinary runtime
-            // expressions. Translated to the same inclusive [lo:hi] shape the
-            // Simple form already feeds rt_queue_append_range, which clamps
-            // both ends against the source's actual length, so no separate
-            // bounds handling is needed here.
-            // A canonical `int` (LRM's own type for an index/width, and what
-            // `q[$]`'s size()-1 resolution already produces below), not
-            // `rs.left().type`: the base may itself be bare `$`
-            // (UnboundedType), which lower_type rejects outright.
-            const ir::Ref   i32   = make_int_type(32, false);
-            const ir::Index base  = b.convert(lower_expr(rs.left(), b), i32, true, l);
-            const ir::Index count = b.convert(lower_expr(rs.right(), b), i32, true, l);
-            const ir::Index one   = b.constant(module_.pool.put_int(i32, 1), l);
-            const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, one, l);
-            if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
-                lo = base;
-                hi = b.binary(ir::Inst::Tag::Add, base, nm1, l);
-            } else {
-                hi = base;
-                lo = b.binary(ir::Inst::Tag::Sub, base, nm1, l);
-            }
-        }
+        // The bounds keep their own signedness and width, and an x or z bit in one makes the
+        // slice empty (LRM 7.10.1, 11.8.3): see lower_queue_bounds.
+        const auto [lo, hi] = lower_queue_bounds(rs, b);
         b.queue_append_range(dst, src, lo, hi, qty, l);
         return;
     }
