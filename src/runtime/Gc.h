@@ -31,6 +31,7 @@ extern "C" {
 // element-lifecycle walkers, which live in runtime/Containers.cpp.
 struct rt_elem_leaf;
 struct rt_elem_ops;
+struct rt_ref_witness;
 // rt_alloc_site, from Runtime.h: where an allocation came from, for the located
 // fatal. Null where the caller has no statement to name.
 struct rt_alloc_site;
@@ -109,10 +110,21 @@ struct rt_alloc_site;
 // sets LOGGED, so a hot object costs the call once per collection cycle rather
 // than once per store.
 //
-// Design state, statics and frame locals need NO barrier -- they are scanned in
+// Design state, statics and frame locals need NO inline barrier -- they are scanned in
 // full at every collection, young or not -- so this is emitted only for a store
 // whose target is inside a heap object (§7).
 void rt_gc_remember(void* obj);
+
+// The same barrier for a store through an address the code cannot attribute to an
+// owner: the place a `ref` formal aliases, or the actual of an output formal that the
+// callee copies out through. `slot` is that place and `chain` the witness chain the
+// call passed (rt_ref_witness, Runtime.h), non-null when the place is an element of a
+// container. The runtime finds the heap object that holds the place -- or the one that
+// holds the outermost container, from the chain -- and logs it if it is old, as above.
+// A place in no heap object is not logged: design state and frames are read in full.
+// Called at each store, because a task can suspend across a collection between the
+// call and its store.
+void rt_gc_note_ref_store(void* slot, const struct rt_ref_witness* chain);
 
 // -- Per-class trace map ------------------------------------------------------
 //

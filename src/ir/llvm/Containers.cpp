@@ -876,7 +876,7 @@ LValue Backend::dyn_agg_elem_lvalue(const LValueInfo& container,
     // trace map (Gc.h:324-326), so the owner travels with the element lvalue. No
     // reachability gate here, unlike agg_member: a container reaches a class handle
     // exactly when its element does, so the owner is already null if it cannot.
-    sel.gc_owner      = container.gc_owner;
+    carry_gc_place(sel, container);
     return sel;
 }
 

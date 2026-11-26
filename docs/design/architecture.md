@@ -114,9 +114,10 @@ them in step.
   **Not yet:** every dead object with a string or container property runs a
   finalizer.
 - A handle stored through a `ref` argument is recorded by a barrier in the
-  callee, which finds the owning object from the address. **Not yet:** the call
-  site records the owner, and every collection re-records whatever frames
-  reference.
+  callee, which finds the owning object from the address, or from the witness
+  chain when the place is an element of a container. **Not yet:** an output
+  formal bound to an element inside a container's payload is still recorded at
+  the call site.
 - Any process may run on any worker thread, but two run at the same time only
   when what they may access does not overlap with a write, and a run is
   reproducible. So values and containers need no protection against concurrent

@@ -1515,11 +1515,18 @@ void Backend::emit_gc_barrier(llvm::Value* owner) {
 }
 
 // The barrier for a store through `lv`, or nothing when `lv` does not name a place
-// inside a class object. THE call site for every instrumented store: the owner
-// test lives here, once, rather than repeated at each of the eleven store sites,
-// so a new store site is instrumented by routing through this function and cannot
-// forget it.
+// inside a class object or reached through a `ref` formal. THE call site for every
+// instrumented store: the owner test lives here, once, rather than repeated at each of
+// the eleven store sites, so a new store site is instrumented by routing through this
+// function and cannot forget it.
 void Backend::emit_gc_barrier_for(const LValueInfo& lv) {
+    assert((lv.gc_owner == nullptr || lv.gc_ref_slot == nullptr) &&
+           "a place is rooted at an object or at a ref formal, not both");
+    if (lv.gc_ref_slot != nullptr) {
+        assert(!lv.is_string && "a string place never carries a GC owner");
+        emit_gc_note_ref_store(lv.gc_ref_slot, lv.gc_ref_chain);
+        return;
+    }
     if (lv.gc_owner == nullptr) {
         return;
     }
@@ -1533,68 +1540,27 @@ void Backend::emit_gc_barrier_for(const LValueInfo& lv) {
     emit_gc_barrier(lv.gc_owner);
 }
 
-// Record the OUTER container on an element lvalue that has just re-based into that
-// container's malloc'd payload. Only the outermost is kept -- `obj.qq[1][2]` records
-// `obj.qq`, whose handle is in the body -- because that is the only address on the
-// path that a ring growth cannot relocate, and the collector's container walk
-// reaches every nested element from it (visit_elem_image pushes a nested container
-// and drain_containers runs both worklists to a fixpoint, Gc.cpp:1266-1271, :1381).
-// `parent` is the container's own lvalue, so an already-payload-rebased parent hands
-// its record down and this only records where the OUTERMOST one is still unknown.
-// Inheriting and recording in one call is deliberate: split across two statements at
-// five element sites, one of them would eventually be written without the other.
-//
-// Skipped when there is no owner, which also skips the case that needs nothing: a
-// frame-local container is already a registered root for its activation, so its
-// elements are reached without any of this.
-void Backend::note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle, Ref container_type) {
-    assert(handle != nullptr && "a container root needs its handle address");
-    assert(container_type != Ref::Invalid && "a container root names its type");
-    if (lv.gc_owner == nullptr) {
-        return;
-    }
-    lv.gc_container_root = parent.gc_container_root;
-    lv.gc_container_type = parent.gc_container_type;
-    if (lv.gc_container_root != nullptr) {
-        return; // an outer container already stands in for this whole path
-    }
-    lv.gc_container_root = handle;
-    lv.gc_container_type = container_type;
+// What an element, a member or a resolved entry of `from` inherits for the write barrier:
+// the object it is inside, or the `ref` formal it is reached through.
+void Backend::carry_gc_place(LValueInfo& to, const LValueInfo& from) {
+    to.gc_owner     = from.gc_owner;
+    to.gc_ref_slot  = from.gc_ref_slot;
+    to.gc_ref_chain = from.gc_ref_chain;
 }
 
-// A `ref` actual aiming INSIDE a container owned by a class object hands the callee
-// a payload-interior pointer. rt_gc_find_object cannot resolve one -- it is
-// indistinguishable from an integer -- so the conservative frame scan cannot reach
-// the owner and relog_conservative_roots cannot carry it across the suspend that
-// precedes the callee's store. Registering the outer container STANDS IN for that
-// resolution, and therefore has to do both halves of what the frame scan does:
-//
-//   reach the elements -- push_container_roots walks a registered container in full
-//     at every collection of either kind, so the handle the callee stores is found
-//     from the root path whatever the owner's age and whether or not it is logged;
-//   keep the owner alive -- rt_gc_container_add resolves the owner once at
-//     registration and push_container_roots marks it before reading the payload, so
-//     an unpaired registration can only LEAK its owner and can never name memory a
-//     dead object's finalizer freed.
-//
-// That makes the nested case behave exactly like a direct property container, where
-// the frame scan already pins and marks the owner off a body-interior pointer.
-//
-// Task AND function calls. A task can suspend across a collection, and since an
-// allocation that has outrun its budget collects (design §6.1) a function can too: the
-// callee may allocate between the call-site barrier and its store, so the barrier alone
-// no longer covers it.
-llvm::Value* Backend::emit_gc_ref_container_add(const LValueInfo& lv) {
-    if (lv.gc_container_root == nullptr) {
-        return nullptr;
-    }
-    assert(lv.gc_owner != nullptr && "a container root is recorded only inside an object");
-    assert(lv.gc_container_type != Ref::Invalid && "a registered container names its type");
-    b_.CreateCall(gc_container_add_fn(),
-                  { lv.gc_container_root,
-                    b_.getInt32(gc_container_kind(lv.gc_container_type)),
-                    elem_ops_for(lv.gc_container_type) });
-    return lv.gc_container_root;
+// The barrier of a store through an address the code cannot attribute to an owner
+// statically: the aliased place of a `ref` formal, or the actual of an output formal.
+// The runtime finds the object that holds `slot`, or the one that owns the container
+// `chain` names when the place is an element of one, and logs it if it is old
+// (rt_gc_note_ref_store). A call and not an inlined test: the owner's age is not known
+// without finding the owner, and a handle stored through a `ref` is rare enough that the
+// lookup is not a cost worth a second code path. Emitted at each store and not once at
+// the call, because a task can suspend across a collection between two stores.
+void Backend::emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain) {
+    assert(slot != nullptr && "a ref store names the place it aliases");
+    auto* null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    auto* call = b_.CreateCall(gc_note_ref_store_fn(), { slot, chain != nullptr ? chain : null });
+    call->addFnAttr(llvm::Attribute::Cold);
 }
 
 } // namespace clotho::ir::backend

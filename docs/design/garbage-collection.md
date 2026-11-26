@@ -819,15 +819,14 @@ into a frame above the one whose address starts the scan; the scan runs to the b
    call, hence in a callee-saved register or a stack slot, hence found. Every word is
    validated by `rt_gc_find_object` like a frame word, interior pointers included, and
    pinned; the heap is non-moving, so a pin is retention and nothing else.
-2. *The barrier-exempt fresh object.* A store into a handle straight out of `new`
-   carries no barrier because the object is young. An emergency collection may now
-   intervene (a property initializer or constructor argument that is itself a `new`),
-   but the fresh handle is live across it, so it is found, promoted, and re-logged by
-   `relog_conservative_roots`: it is in the remembered set when the store lands, which
-   is all the barrier would have done. The same re-logging covers a `ref`/`out` callee
-   in a *function*, which the call-site barrier used to cover only because a function
-   could not suspend; function calls now register a `ref` into a class-owned container
-   exactly as task calls do.
+2. *The fresh object.* A store into a handle straight out of `new` carries the barrier
+   like any other. An emergency collection may intervene (a property initializer or
+   constructor argument that is itself a `new`, the binding of an event property in the
+   body), and the fresh handle is live across it, so it is found and promoted, and the
+   store that follows lands in an old object. The same holds of a store through a `ref`
+   or into an `out` actual: the callee logs the owner from the address
+   (`rt_gc_note_ref_store`), at each store, so a collection between the call and the
+   store, in a task or in a function that allocates, changes nothing.
 3. *Pointers into owned buffers.* A pointer into a malloc'd payload (a container
    element computed before the allocation) cannot be resolved to its owner. A finalizer
    run by an emergency collection therefore does not free a buffer that a word of the
@@ -867,9 +866,9 @@ said so, and what now holds:
 |---|---|
 | NBA shadow needs no root (`StoreNb` barrier comment) | item 4: shadow registered as a range |
 | array-element, aggregate-leaf, whole-container and virtual-interface NBA records are roots | they were not: item 4, the record queues are registered and scanned |
-| fresh `new` needs no barrier (`HandleDeref`) | item 2: found, promoted, re-logged |
+| fresh `new` needs no barrier (`HandleDeref`) | item 2: it has one, and so does the event binding of a class body |
 | barrier then store, nothing between (`Store`) | still true: nothing between them allocates |
-| call-site barrier is airtight for a function (`lower_call_common`) | item 2: callee holds the actual, re-logged; `ref` into a class-owned container registered |
+| call-site barrier is airtight for a function (`lower_call_common`) | item 2: there is no call-site barrier; the callee logs the owner from the address at each store (`rt_gc_note_ref_store`) |
 | frame unlink with no safepoint after it | still true: the cleanup path allocates nothing |
 | vptr stored before any collection sees the object | still true: nothing allocates between `rt_gc_alloc` and the vptr store |
 | deferred (`<= #d`) targets are design state | unchanged: asserted, and the records are roots |

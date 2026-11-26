@@ -899,10 +899,7 @@ Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
     // The owner travels with the resolved element: a handle stored into an assoc
     // entry lands in the map's malloc'd payload, which only the OWNING object's
     // trace map reaches (Gc.h:324-326), so the store still needs the barrier (§7).
-    el.gc_owner    = lv.gc_owner;
-    // Root and owner travel together; see agg_member for the invariant.
-    el.gc_container_root = lv.gc_container_root;
-    el.gc_container_type = lv.gc_container_type;
+    carry_gc_place(el, lv);
     // Valid where the key is and, for a read, where the entry was found. The deferred
     // place itself carries no verdict here: a base inside an invalid container was
     // opened (lv_handle_ptr) when the place was formed.

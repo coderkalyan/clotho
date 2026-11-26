@@ -30,9 +30,8 @@
 // is the whole of freeing it. Only an object that owes a finalizer is read.
 //
 // PINNING IS INERT. RT_GC_META_PINNED is set on every conservatively-reached object
-// and read only to carry the write-barrier obligation of a suspended activation
-// forward (relog_conservative_roots), because nothing moves. unpin_all() is what
-// makes "every pin is released" checkable.
+// and read by nothing but unpin_all(), because nothing moves: it is what keeps a move
+// of a pinned object a policy change, and what makes "every pin is released" checkable.
 //
 // COLLECTION HAPPENS AT A SAFEPOINT, EXCEPT WHEN AN ALLOCATION LOOP NEVER REACHES ONE.
 // The ordinary collection runs at a scheduler region boundary, the one place with no
@@ -142,11 +141,6 @@ constexpr uint64_t kLargeObjectBytes = RT_GC_LARGE_OBJECT_BYTES;
 // of handles.
 [[maybe_unused]] constexpr uint64_t kContainerWorkMax  = 1ull << 28;
 [[maybe_unused]] constexpr uint64_t kContainerElemsMax = 1ull << 32;
-// Runaway bound on how many live activations may ref into ONE heap-resident container
-// (ContainerReg::refs), a design limit no more than the others: it takes one suspended
-// activation holding a `ref` into the container per count, so 2^20 of them means the
-// register / remove pairing has come apart rather than that a design is large.
-[[maybe_unused]] constexpr uint32_t kContainerRefsMax = 1u << 20;
 
 // Initial worklist capacity, in handles. A page-ish of marking stack covers a
 // small testbench's object graph without a reallocation; deeper graphs grow it
@@ -325,43 +319,11 @@ struct PendingContainer {
 };
 
 // A dynamically-scoped container registration: a frame local, or an element of one,
-// keyed by the address of its rt_dynarr / rt_queue / rt_assoc handle.
+// keyed by the address of its rt_dynarr / rt_queue / rt_assoc handle. One storage address
+// is one frame-local container, since that address is a per-activation alloca.
 struct ContainerReg {
     uint32_t           kind;
     const rt_elem_ops* ops;
-    // The heap object whose body or payload the registered container lives in, or null
-    // when the container's storage is not in the heap at all -- which is every frame-local
-    // registration, whose rt_dynarr / rt_queue / rt_assoc is a coroutine-frame alloca.
-    //
-    // Non-null for the one shape that needs it: a `ref` bound to an ELEMENT of a container
-    // owned by a class property (`obj.q[3]`, or `obj.qq[3]` for a queue of queues). That
-    // actual is a pointer INTO the outer container's malloc'd payload, which
-    // rt_gc_find_object rejects as not-in-a-block, so the conservative frame scan cannot
-    // resolve it to its owner the way it resolves a `ref` to a direct property. The
-    // registration therefore stands in for the resolution the frame scan cannot do, and it
-    // must do BOTH halves of it: reach the elements, and keep the owner alive
-    // (push_container_roots). Without the second half a registration that outlives its
-    // owner -- a task disabled mid-flight never reaches the removal -- would name a
-    // finalized body and the next collection would read freed memory. With it, an unpaired
-    // registration can only LEAK its owner, never dangle, which is the right side of that
-    // trade to fail on.
-    void*              owner;
-    // How many live activations have registered THIS address. Always 1 for a frame-local
-    // container, whose address is a per-activation alloca, so a second registration of one
-    // is an init without its deinit and stays fatal. A heap-resident container's address is
-    // a property of its OWNER, not of the activation, so two `ref` actuals into the same
-    // container -- `t(obj.q[1], obj.q[2])`, or two forked processes each passing obj.q[3]
-    // -- legitimately name the same key, and counting is the only correct answer: without
-    // it the first removal would deregister a container a live activation still refs, and
-    // in a release build the collector would then free what that activation pushes.
-    //
-    // Not a tolerated case but an EMITTED one, so the count cannot be optimised away later:
-    // `t(obj.q[1], obj.q[2])` emits two adds and two removes on this one key in a single
-    // call, and the backend deliberately does not fold them, because the two roots are
-    // separate SSA values that merely happen to compute the same address and relying on CSE
-    // to notice would be unsound exactly where it looked cleanest. So the COUNT is the
-    // only thing that tells one live registration of a key from two.
-    uint32_t           refs;
 };
 
 struct GcState {
@@ -1517,9 +1479,8 @@ void push_marked(void* handle) {
 // "traced" and "promoted". And every reference written into the object AFTER that point
 // takes the write barrier's taken edge -- `(meta & (MARK|LOGGED)) == MARK` -- so the
 // object is in the remembered set and the next collection traces it from there, which
-// covers stores from generated code and, through relog_conservative_roots(), the raw
-// interior stores a suspended activation performs after the barrier that armed it has
-// already been consumed.
+// covers stores from generated code and, through rt_gc_note_ref_store(), the raw
+// interior stores a callee performs through a `ref` it was handed.
 //
 // A third store shape stores no handle into a heap object at all: a class handle written
 // into a CONTAINER owned by an old object lands in the container's malloc'd payload. A
@@ -1535,25 +1496,19 @@ void push_marked(void* handle) {
 // trace `old.f = fresh` and lose `old.q.push_back(fresh)`, freeing an object a live queue
 // still points at.
 //
-// The suspended-activation window is the same for a container held by `ref`, with ONE
-// exception. A `ref` to a container that is a direct class property is a pointer to the
-// rt_queue / rt_dynarr / rt_assoc header inside the owning object's BODY, so the frame
-// scan resolves it to that object (rt_gc_find_object resolves interior pointers) and
-// relog_conservative_roots() carries the obligation forward exactly as for a `ref` to a
-// handle property. A `ref` to a NESTED container element -- `obj.qq[3]` where qq is a
-// queue of queues -- is a pointer into the outer container's malloc'd payload
-// (ir/llvm/StateLayout.cpp, ref_actual_ptr), which rt_gc_find_object correctly rejects as
-// outside the heap, so nothing re-logs the owner and a callee that suspends and only then
-// pushes is outside both mechanisms. It is closed at the call site instead, by
-// registering the actual as a dynamically-scoped container root for the call's duration
-// (rt_gc_container_add / rt_gc_container_remove), which needs nothing from this file,
-// because a container ROOT is scanned in full at every collection whatever its kind.
+// A store through a `ref` formal, or into the actual of an output formal, is a fourth
+// shape: the callee holds a raw interior pointer and cannot name the owner. Its barrier is
+// rt_gc_note_ref_store, which finds the owner from the address -- or, for an element of a
+// container, from the container the ref's witness chain names -- and logs it as the
+// inlined barrier would. It runs at each store, so a task that suspends across a
+// collection before its store logs the owner after it, and no record made at the call is
+// needed or kept.
 //
-// Should that registration ever be missing, the shape is LOUD rather than silent:
+// A young element an un-logged owner holds is LOUD rather than silent:
 // verify_old_edges() walks an un-remembered old object's container leaves and asserts
-// every element is one this collection would spare (is_marked_now), so an un-logged
-// young element fails an assertion at the collection that would have freed it instead of
-// at the use-after-free later.
+// every element is one this collection would spare (is_marked_now), so a missed barrier
+// fails an assertion at the collection that would have freed it instead of at the
+// use-after-free later.
 //
 // By induction over collections, an OLD object outside the remembered set has no
 // out-edge this collection could reach that is not already covered. Skipping it loses
@@ -1998,13 +1953,6 @@ void push_container_roots() {
     // where it happens, by rt_gc_container_remove's assertion, rather than as a leak
     // or a use-after-free one collection later.
     for (const auto& kv : g.containers) {
-        // The owner first, so the container this walk is about to read cannot be a payload
-        // the finalizer of a dead object frees. A young collection legitimately declines to
-        // trace an OLD owner (mark_and_push), and that is not a gap: no young collection
-        // frees an old object, so it is intact either way.
-        if (kv.second.owner != nullptr) {
-            mark_and_push(kv.second.owner);
-        }
         push_container(kv.first, kv.second.kind, kv.second.ops);
     }
     g.stats.container_roots += static_cast<uint64_t>(g.containers.size());
@@ -2411,8 +2359,8 @@ void release_parked() {
 //
 // The barrier's record of the old-to-young edges a young collection could not
 // otherwise see. Two producers -- rt_gc_remember(), the out-of-line half of the
-// inlined barrier, and relog_conservative_roots() below -- and one consumer,
-// push_remembered_roots(), which every collection runs exactly once.
+// inlined barrier, and rt_gc_note_ref_store(), the barrier of a store through a `ref` --
+// and one consumer, push_remembered_roots(), which every collection runs exactly once.
 
 // Set LOGGED and record. Idempotent through the LOGGED bit, so a hot object costs one
 // push per collection CYCLE rather than one per store, and bounded by kRememberedMax:
@@ -2473,48 +2421,6 @@ void push_remembered_roots() {
     g.retraced_bytes = g.stats.bytes_live;
     g.remembered.clear();
     assert(g.remembered.empty() && "the drain must leave the set empty");
-}
-
-// Re-enter every conservatively-reached object into the remembered set, for the NEXT
-// collection. This is not belt-and-braces: it closes a hole the inlined barrier cannot.
-//
-// The barrier is emitted at the store, except for a store through a raw interior pointer
-// whose owner is not statically known -- a `ref` formal bound to a class property, or an
-// output/inout formal whose actual is one -- where it is emitted at the CALL SITE, the
-// last place the owner handle is in hand (ir/llvm/Subroutines.cpp, lower_call_common). A non-blocking call cannot span a safepoint, so for a
-// function the call-site entry is still in the set when the callee's store lands. A
-// blocking TASK can suspend across a collection, which consumes that entry; the store
-// then lands on an OLD object whose LOGGED bit is clear with nothing left to log it, and
-// the next young collection would not trace it and would reclaim the young object it
-// stored while it is still reachable.
-//
-// What closes that is liveness. To perform the store after resuming, the activation must
-// hold the pointer -- the interior pointer, or the owner handle for a copy-back -- across
-// the suspend that PRECEDES the store, so CoroSplit keeps it in the coroutine frame and
-// the frame scan resolves it (rt_gc_find_object resolves interior pointers,
-// Gc.h:433-438). Every collection with such a store still to come therefore sees the
-// object conservatively, and re-logging it there means the first collection after the
-// store traces it. g.pinned is exactly that set, already deduplicated by the PINNED bit.
-//
-// Tracing the object at THIS collection instead would not close the hole: the pointer
-// need not still be live at the next safepoint after the store, so the object may never
-// be reached conservatively again. Only carrying the obligation forward works.
-void relog_conservative_roots() {
-    assert(g.worklist.empty() && "the re-log runs after the mark phase");
-    // The drain emptied the set at the start of this collection and nothing between
-    // then and here logs anything: a finalizer must not store a class handle, and
-    // sweep() asserts the neighbouring halves of that same claim.
-    assert(g.remembered.empty() && "something logged an object mid-collection");
-    for (void* h : g.pinned) {
-        // Marked (hence promoted) or already OLD -- either way remember_object's
-        // precondition holds, which is what this asserts on its behalf.
-        assert(is_old(h) && "a conservatively-reached object is OLD after the mark phase");
-        remember_object(h);
-    }
-    // Never counted into stats.remembered: that counter means "objects the WRITE BARRIER
-    // logged" (Gc.h:408-411), which is what lets a test prove the barrier fired at all,
-    // and it would prove nothing if the collector padded it.
-    assert(g.remembered.size() <= kRememberedMax && "the re-log ran past the bound");
 }
 
 void unpin_all() {
@@ -3382,14 +3288,6 @@ void verify_roots() {
                    "a precise root names a reclaimed object");
         }
     }
-    // The same claim for a container root's OWNER, which is the shape whose failure runs
-    // a finalizer over a live object's string and container buffers rather than merely
-    // dangling one handle.
-    for (const auto& kv : g.containers) {
-        void* owner = kv.second.owner;
-        assert((owner == nullptr || rt_gc_find_object(owner) == owner) &&
-               "a container owner was reclaimed");
-    }
 }
 
 // The heap-wide totals, split from rt_gc_verify() for length (TigerStyle). Every
@@ -3415,8 +3313,8 @@ void verify_totals(const VerifyTally& tally) {
     // The remembered set holds EXACTLY the objects carrying LOGGED, and both directions
     // matter: an object logged but not recorded is an old-to-young edge the next young
     // collection will not trace, and a recorded object whose bit was cleared is a barrier
-    // that can never fire for it again. After a collection both sides hold precisely what
-    // relog_conservative_roots() re-armed; between collections they grow together.
+    // that can never fire for it again. After a collection both sides are empty; between
+    // collections they grow together.
     assert(tally.logged == g.remembered.size() && "a LOGGED object outside the remembered set");
     for (void* h : g.remembered) {
         assert((*meta_ptr(h) & RT_GC_META_LOGGED) != 0 && "a remembered entry lost its bit");
@@ -3792,33 +3690,12 @@ extern "C" void rt_gc_container_add(void* handle, uint32_t kind, const rt_elem_o
     assert(is_container_kind(kind) && "only a dynarr / queue / assoc is registered");
     assert_elem_ops(ops);
     assert(ops->kind == kind && "the kind and the container descriptor disagree");
-    // Whose heap object this container's storage belongs to, if any. Resolved ONCE here
-    // rather than at every collection: it costs a binary search per registration, which is
-    // per activation or per element init, and it turns the walk in push_container_roots
-    // into two loads. Null for a frame-local container, which is every registration the
-    // landed phases make -- so this is additive and changes none of them.
-    void* const owner = rt_gc_find_object(handle);
-    const auto it = g.containers.find(handle);
-    if (it != g.containers.end()) {
-        // Negative space, and the one direction that is still fatal: one storage ADDRESS is
-        // one frame-local container, because that address is a per-activation alloca, so a
-        // second registration of one means an emitted init ran without its deinit. A
-        // heap-resident container is different in kind -- its address belongs to the owner,
-        // so two live activations reffing into it name the same key by construction -- and
-        // there the answer is to count, not to complain.
-        assert(owner != nullptr && "this frame-local container is already registered");
-        assert(it->second.owner == owner && "two registrations disagree on the owner");
-        assert(it->second.kind == kind && "two registrations disagree on the kind");
-        assert(it->second.ops == ops && "two registrations disagree on the descriptor");
-        it->second.refs += 1;
-        assert(it->second.refs <= kContainerRefsMax && "a container registration ran away");
-        return;
-    }
-    [[maybe_unused]] const bool inserted =
-      g.containers.try_emplace(handle, ContainerReg{ kind, ops, owner, 1 }).second;
-    assert(inserted && "the find above said this container is not registered");
-    assert_resolves((owner == nullptr || rt_gc_find_object(owner) == owner) &&
-                    "a resolved container owner is a class object");
+    assert_resolves(rt_gc_find_object(handle) == nullptr && "a registered container is not in the heap");
+    // Negative space, and fatal: one storage ADDRESS is one frame-local container, because
+    // that address is a per-activation alloca, so a second registration of one means an
+    // emitted init ran without its deinit.
+    [[maybe_unused]] const bool inserted = g.containers.try_emplace(handle, ContainerReg{ kind, ops }).second;
+    assert(inserted && "this frame-local container is already registered");
 }
 
 extern "C" void rt_gc_container_remove(void* handle) {
@@ -3826,24 +3703,13 @@ extern "C" void rt_gc_container_remove(void* handle) {
     // O(1) average, and the reason this registry is a hash map where g.ranges is a
     // vector: a frame-local container is registered and removed once per ACTIVATION,
     // not once per run, so a linear scan would be on the call path.
-    const auto it = g.containers.find(handle);
     // Negative space in both directions, both silent otherwise. Absent means this container
     // was never registered, so the emitted init / deinit pair is broken: either a live
     // container is not a root (a use-after-free waiting to happen) or a dead one stays
     // one (a leak of its whole element subtree). A double removal arrives here as the
     // removal that finds nothing, and the same assertion catches it.
-    assert(it != g.containers.end() && "this container was never registered");
-    if (it == g.containers.end()) {
-        return;
-    }
-    assert(it->second.refs > 0 && "a registration with no holder is still in the registry");
-    if (it->second.refs > 1) {
-        // Another live activation still refs this heap-resident container; it stops being a
-        // root only when the last one lets go.
-        it->second.refs -= 1;
-        return;
-    }
-    g.containers.erase(it);
+    [[maybe_unused]] const size_t erased = g.containers.erase(handle);
+    assert(erased == 1 && "this container was never registered");
 }
 
 // -- Collection ---------------------------------------------------------------
@@ -3990,11 +3856,6 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // The sweep runs the finalizers of the objects it frees, which free their buffers.
     sweep();
     g_owned.parking = false;
-    // Before unpin_all(), which is what clears the pins this reads. See the function:
-    // it carries the barrier obligation for a store a suspended activation has not
-    // performed yet, and it is the reason the conservative root set is scanned at all in
-    // a young collection.
-    relog_conservative_roots();
     unpin_all();
 
     rearm_after_collection();
@@ -4035,13 +3896,37 @@ extern "C" void rt_gc_remember(void* obj) {
     }
     const size_t before = g.remembered.size();
     remember_object(obj);
-    // Counted here and NOWHERE else, which is what Gc.h:408-411 promises: the number of
-    // objects the WRITE BARRIER logged over the run. The collector's own re-logging
-    // (relog_conservative_roots) deliberately does not touch it, so a test can still use
-    // this counter to prove the barrier fired rather than a root having found everything.
+    // Counted here and in rt_gc_note_ref_store, the two halves of the write barrier, and
+    // nowhere else, which is what Gc.h promises: the number of objects the barrier logged
+    // over the run. A test can still use it to prove the barrier fired rather than a root
+    // having found everything.
     if (g.remembered.size() != before) {
         g.stats.remembered += 1;
     }
+}
+
+// The barrier of a store through a `ref` formal, or into the actual of an output formal:
+// a place the callee cannot attribute to an owner statically. `slot` is the address the
+// formal aliases. `chain` is the witness chain the call passed when the place is an
+// element of a container (outermost first, whose first epoch pointer is inside the
+// outermost container's handle), else null. The object that holds the container is the
+// owner of what the store adds, and it is found from that handle; for a place that cannot
+// move it is found from `slot`. A place that lies in no heap object -- a frame, design
+// state, a container no object owns -- has no owner to log, and is read by every collection.
+extern "C" void rt_gc_note_ref_store(void* slot, const rt_ref_witness* chain) {
+    if (g.initialized == 0) {
+        return;
+    }
+    assert(slot != nullptr && "a ref aliases a place");
+    const void* at = slot;
+    if (chain != nullptr && chain->epoch != nullptr) {
+        at = chain->epoch;
+    }
+    void* const owner = rt_gc_find_object(at);
+    if (owner == nullptr) {
+        return;
+    }
+    rt_gc_remember(owner);
 }
 
 // -- Introspection ------------------------------------------------------------

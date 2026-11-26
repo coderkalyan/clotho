@@ -3104,6 +3104,159 @@ TEST_CASE("gc: two refs into one container of a promoted object both stay regist
     CHECK(st.collections > 0u);
 }
 
+// The callee's barrier (architecture.md, Memory): a handle stored through a `ref` is
+// recorded by the callee, from the address, at the store. A record made at the call
+// is consumed by any collection that runs before the store, so every case below suspends
+// first, with young-only collections running meanwhile, and stores after.
+
+// A `ref` to a handle PROPERTY of a promoted object. The task suspends across the
+// collections that promote `box`, then stores a fresh object through the ref, so the
+// fresh object is held by one word in an old object that nothing else logged.
+TEST_CASE("gc: a handle stored through a ref into a property of a promoted object after a suspend survives") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            class Box;  string name; Cell leaf; endclass
+            Box  box;
+            Junk sink;
+            int  observed = 0;
+            function automatic void install();
+                box      = new;
+                box.name = "long-lived-box";
+            endfunction
+            task automatic fill(ref Cell slot, input int v);
+                Cell f;
+                #20;
+                f        = new;
+                f.v      = v;
+                f.tag    = "stored-through-ref";
+                slot     = f;
+                f        = null;
+                observed = v;
+            endtask
+            initial begin
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                install();
+                #20;
+                fill(box.leaf, 4242);
+                #20;
+                $display("%0d %0d %s", observed, box.leaf.v, box.leaf.tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "4242 4242 stored-through-ref\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
+    CHECK(yg.remembered > 0u);
+}
+
+// An OUTPUT formal of struct type is copied out by the callee through the pointer to the
+// actual, which is a property of a promoted object. The callee is a task, so a collection
+// runs between the call and the copy-out.
+TEST_CASE("gc: a struct copied out through an output formal into a promoted object after a suspend survives") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            typedef struct { Cell c; int n; } pair_t;
+            class Box; string name; pair_t p; endclass
+            Box  box;
+            Junk sink;
+            function automatic void install();
+                box      = new;
+                box.name = "long-lived-box";
+            endfunction
+            task automatic make(output pair_t r, input int v);
+                Cell f;
+                #20;
+                f        = new;
+                f.v      = v;
+                f.tag    = "copied-out";
+                r.c      = f;
+                r.n      = v;
+                f        = null;
+            endtask
+            initial begin
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                install();
+                #20;
+                make(box.p, 777);
+                #20;
+                $display("%0d %0d %s", box.p.n, box.p.c.v, box.p.c.tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "777 777 copied-out\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
+    CHECK(yg.remembered > 0u);
+}
+
+// `Holder` is allocated, and its property initializer allocates a `Leaf` before the store
+// that puts the leaf in the holder. Under stress the allocation runs a collection with
+// the holder live only in a register: the collection promotes it, and the store lands in
+// an old object. Nothing logged it, since the barrier on a store through a handle that came
+// straight out of `new` was once left out on the ground that the object is young. The
+// holder is then held by design state only, so a young collection reads it as old and
+// never looks at its `leaf`, and `held.l` is freed while the holder points at it.
+TEST_CASE("gc: a property initializer's object survives the collection that promotes its holder") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Leaf;   int v; string tag; endclass
+            class Junk;   int v; string tag; endclass
+            class Holder; Leaf l = new; int n; endclass
+            Holder held[8];
+            Junk   sink;
+            initial begin
+                for (int i = 0; i < 8; i++) begin
+                    held[i]       = new;
+                    held[i].l.v   = 100 + i;
+                    held[i].l.tag = "initializer-object";
+                end
+                for (int i = 0; i < 40; i++) begin
+                    #1;
+                    for (int k = 0; k < 64; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+                $display("%0d %0d %s", held[0].l.v, held[7].l.v, held[3].l.tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "100 107 initializer-object\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_stress, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+}
+
 // The claim the phase exists for (§7, §12 P3 acceptance): a young collection's
 // cost is independent of the stable set's size. 500 nodes in a chain hung off one
 // module-scope handle, plus eight objects allocated and dropped per cycle for 100

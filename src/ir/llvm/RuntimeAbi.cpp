@@ -1575,6 +1575,11 @@ llvm::FunctionCallee Backend::gc_remember_fn() {
     return rt_fn("rt_gc_remember", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+// rt_gc_note_ref_store (Gc.h): a handle is being stored through a `ref` formal's place.
+llvm::FunctionCallee Backend::gc_note_ref_store_fn() {
+    return rt_fn("rt_gc_note_ref_store", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+}
+
 // -- Functional coverage struct mirrors and entry points (src/runtime/Coverage.h) --
 
 llvm::StructType* Backend::cover_range_ty() {

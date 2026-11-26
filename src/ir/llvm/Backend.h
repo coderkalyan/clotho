@@ -505,23 +505,16 @@ struct LValueInfo {
     // lvalue at AssocSelect and consumed by assoc_elem_lvalue's put_ptr path, which is
     // where the key is actually written.
     bool assoc_key_handle = false;
-    // The OUTERMOST container on the path from `gc_owner` to this place whose handle
-    // still lives inside the owner's BODY, with its interned type. Non-null only once a
-    // select has re-based into that container's malloc'd payload, which is exactly when
-    // a `ref` formed here hands the callee a payload-interior pointer that
-    // rt_gc_find_object cannot resolve -- so the conservative frame scan cannot reach
-    // the owner and the collector's re-log cannot carry it forward across a suspension.
-    //
-    // The outermost one, and never the inner element: an element address is inside a
-    // payload that an outer ring growth reallocates, whereas a container handle in the
-    // object body is at a fixed address and never relocates. Registering the inner one
-    // would leave the collector reading freed memory after exactly the restructuring
-    // the ref epoch exists to detect (:22568-22569).
-    //
-    // Consumed only by lower_task_call_inst, which registers it as a dynamically-scoped
-    // container root for the call's duration (emit_gc_ref_container_add).
-    llvm::Value* gc_container_root = nullptr;
-    Ref          gc_container_type = Ref::Invalid;
+    // The place is reached through a `ref` formal, which aliases storage the callee
+    // cannot attribute to an owner statically: an object's body, design state, a frame, or
+    // an element of a container some object owns. `gc_ref_slot` is the aliased address
+    // and `gc_ref_chain` the witness chain the call passed (null for a place that cannot
+    // move), which together let the runtime find the owner when a store lands
+    // (rt_gc_note_ref_store). Set only where the formal's type can hold a class handle,
+    // and cleared by agg_member for a member that cannot, as `gc_owner` is. Never set
+    // together with `gc_owner`: a HandleDeref starts a new place.
+    llvm::Value* gc_ref_slot  = nullptr;
+    llvm::Value* gc_ref_chain = nullptr;
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
     // The notifiers of the class property this place selects, when some `@` / `wait`
@@ -3478,6 +3471,7 @@ private:
     llvm::FunctionCallee gc_alloc_slow_fn();
     llvm::FunctionCallee gc_safepoint_slow_fn();
     llvm::FunctionCallee gc_remember_fn();
+    llvm::FunctionCallee gc_note_ref_store_fn();
 
     llvm::StructType* cover_range_ty();
     llvm::StructType* cover_bin_ty();
@@ -3531,10 +3525,11 @@ private:
 
     void emit_gc_barrier_for(const LValueInfo& lv);
 
-    void note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle,
-                                Ref container_type);
+    void emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain);
 
-    llvm::Value* emit_gc_ref_container_add(const LValueInfo& lv);
+    void carry_gc_place(LValueInfo& to, const LValueInfo& from);
+
+    void set_gc_ref_place(LValueInfo& lv, uint32_t index);
 
     uint32_t intra_idx(Signal sig) const;
     bool              is_intra_target(Signal sig) const;
@@ -3560,7 +3555,11 @@ private:
 
     void init_state();
 
-    void emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path, llvm::Type* root_ty);
+    void emit_agg_init(Ref                        type,
+                       llvm::Value*               base,
+                       std::vector<llvm::Value*>& path,
+                       llvm::Type*                root_ty,
+                       bool                       object_body = false);
 
     void emit_agg_deinit(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path,
                          llvm::Type* root_ty);
