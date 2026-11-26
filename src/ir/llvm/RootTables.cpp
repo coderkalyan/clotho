@@ -367,7 +367,21 @@ void Backend::emit_run_once(Activation which, llvm::Value* wheel, const std::vec
     if (table == nullptr) {
         return;
     }
+    // The checker is told which region's bodies run (R4.1): the bodies carry no origin of their own.
+    uint32_t once = 0;
+    switch (which) {
+        case Activation::PreInit: once = RT_TRACE_ORG_PREINIT; break;
+        case Activation::Preponed: once = RT_TRACE_ORG_PREPONED; break;
+        case Activation::Observed: once = RT_TRACE_ORG_OBSERVED; break;
+        case Activation::ReNba: once = RT_TRACE_ORG_RE_NBA; break;
+        case Activation::Final: once = RT_TRACE_ORG_FINAL; break;
+        case Activation::Initial:
+        case Activation::Reactive:
+        case Activation::Always: break;
+    }
+    emit_trace_once(once);
     b_.CreateCall(run_once_fn(), { table, b_.getInt32(count), wheel });
+    emit_trace_once(0);
 }
 
 // The seed. Every group the drain runs (not the ones that run once, above) has a row
@@ -539,8 +553,30 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             if (!resolve_) {
                 at.where = procs[g]->getName().str();
             }
+            // What the checker holds the group to (R15, R17, R25): the IR's facts about its
+            // processes, read here and not from the choices above, which are what it checks.
+            const auto any_member = [&](auto&& pred) {
+                return std::any_of(sched_[g].rows.begin(), sched_[g].rows.end(), [&](uint32_t row) {
+                    return std::any_of(groups_[row].begin(), groups_[row].end(), [&](uint32_t m) { return pred(all[m]); });
+                });
+            };
+            uint32_t org = RT_TRACE_ORG_PROCESS;
+            if (any_member([](const Process& q) { return q.starts_after_procedures; })) {
+                org |= RT_TRACE_ORG_LATE;
+            } else if (p.activation != Activation::Reactive && any_member([](const Process& q) { return q.spawn_root; })) {
+                org |= RT_TRACE_ORG_PROCEDURE;
+            }
+            if (p.self_start) {
+                org |= RT_TRACE_ORG_SELF_START;
+            }
+            if (p.activation == Activation::Reactive) {
+                org |= RT_TRACE_ORG_PROGRAM;
+            }
+            if (p.reactive_home) {
+                org |= RT_TRACE_ORG_REACTIVE_CONT;
+            }
             llvm::Module& root = root_env_->llmod;
-            trace_rows.push_back(TraceRow{ trace_control(root, RT_TRACE_ORG_PROCESS, at.where),
+            trace_rows.push_back(TraceRow{ trace_control(root, org, at.where),
                                            subscribed_statically(k) ? trace_control(root, RT_TRACE_CTL_STATIC, at.where)
                                                                     : null_ptr });
         }
@@ -702,11 +738,14 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             emit(b_, h);
             b_.CreateBr(done);
         };
-        // The checker sees a queued group as a wake of the activation the seed just created.
-        const auto seeded = [&](llvm::IRBuilder<>& b, llvm::Value* v) { emit_trace_wake(b, v, { .kind = RT_TRACE_SEED }); };
-        arm(RingActive, "seed.active", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v); emit_active_push(b, v); });
-        arm(RingReactive, "seed.reactive", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v); emit_reactive_push(b, v); });
-        arm(RingCont, "seed.cont", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v); emit_reactive_cont_push(b, v); });
+        // The checker sees a queued group as a wake of the activation the seed just created, onto
+        // the ring the arm pushes to.
+        const auto seeded = [&](llvm::IRBuilder<>& b, llvm::Value* v, uint32_t queue) {
+            emit_trace_wake(b, v, { .kind = RT_TRACE_SEED, .ring = b.getInt32(queue) });
+        };
+        arm(RingActive, "seed.active", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v, RT_TRACE_QUEUE_ACTIVE); emit_active_push(b, v); });
+        arm(RingReactive, "seed.reactive", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v, RT_TRACE_QUEUE_REACTIVE); emit_reactive_push(b, v); });
+        arm(RingCont, "seed.cont", [&](llvm::IRBuilder<>& b, llvm::Value* v) { seeded(b, v, RT_TRACE_QUEUE_CONT); emit_reactive_cont_push(b, v); });
         b_.SetInsertPoint(done);
     };
     const auto ring_of = [&](llvm::Value* kind) {

@@ -277,6 +277,36 @@ TEST_CASE("process: kill stops a thread and reports KILLED at once") {
     CHECK(out == "status=4 ticks=3\nafter ticks=3\n");
 }
 
+// R23 x S1 (docs/design/scheduler-rules.md §5.2). LRM-pinned: 9.7 has `kill` terminate the process,
+// so an `always` parked at its leading event control, which Clotho subscribes to once (S1) instead of
+// re-arming it, runs no more once killed. iverilog has no process class and Verilator cannot score an
+// always. The kill force-wakes the parked always, whose loop had no abort poll after that park: the
+// body ran once more and the always went on.
+TEST_CASE("process: kill of an always parked at its static control stops it") {
+    const std::string out = run_capture(R"(
+        module t;
+          process p;
+          reg clk = 0;
+          int n = 0;
+          always @(posedge clk) begin
+            p = process::self();
+            n++;
+            $display("body n=%0d", n);
+          end
+          initial begin
+            #1 clk = 1;
+            #1 clk = 0;
+            #1 p.kill();
+            #1 clk = 1;
+            #1 clk = 0;
+            #1 clk = 1;
+            #10 $display("end n=%0d status=%0d", n, p.status());
+          end
+        endmodule
+    )");
+    CHECK(out == "body n=1\nend n=1 status=4\n");
+}
+
 // LRM-pinned: 9.7 kills "the given process and all its sub-processes", and 9.6.3
 // spells out that descendants include those of children that already terminated.
 // Verilator cannot score this -- its control block detaches a finished thread's

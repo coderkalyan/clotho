@@ -1387,11 +1387,11 @@ bool Backend::ir_has_delay(const Ir& ir) {
 // the task / fork-join epilogue. The seed loop still pushes directly: it
 // creates the handles, so it knows their region without asking.
 void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked, const TraceCause& why) {
-    // The checker sees every wake before the push it reports.
-    emit_trace_wake(b, parked, why);
     if (!design_uses_reactive_) {
         // No body in this design can be reactive-home, so nothing was ever
         // tagged and the reactive ring does not exist. Same code as before.
+        // The checker sees every wake before the push it reports.
+        emit_trace_wake(b, parked, why);
         emit_active_push(b, parked);
         return;
     }
@@ -1412,16 +1412,26 @@ void Backend::emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked, const Tr
     llvm::Value* arr  = b.CreateSelect(home, sym(reactive_gv_), sym(active_gv_));
     llvm::Value* tp   = b.CreateSelect(home, sym(reactive_tail_gv_), sym(active_tail_gv_));
     llvm::Value* hp   = b.CreateSelect(home, sym(reactive_head_gv_), sym(active_head_gv_));
+    llvm::Value* cont = nullptr;
     if (design_uses_reactive_cont_) {
         // A continuous process goes on the reactive CONTINUOUS ring instead, which the
         // reactive drain empties before the reactive one. It is still the reactive
         // region's queue, so the overflow guard below names the reactive ring for it.
         ensure_reactive_cont_queue();
-        llvm::Value* cont = b.CreateICmpEQ(b.CreateAnd(addr, llvm::ConstantInt::get(i64, 7)),
-                                           llvm::ConstantInt::get(i64, kReactiveContTag));
-        arr               = b.CreateSelect(cont, sym(reactive_cont_gv_), arr);
-        tp                = b.CreateSelect(cont, sym(reactive_cont_tail_gv_), tp);
-        hp                = b.CreateSelect(cont, sym(reactive_cont_head_gv_), hp);
+        cont = b.CreateICmpEQ(b.CreateAnd(addr, llvm::ConstantInt::get(i64, 7)),
+                              llvm::ConstantInt::get(i64, kReactiveContTag));
+        arr  = b.CreateSelect(cont, sym(reactive_cont_gv_), arr);
+        tp   = b.CreateSelect(cont, sym(reactive_cont_tail_gv_), tp);
+        hp   = b.CreateSelect(cont, sym(reactive_cont_head_gv_), hp);
+    }
+    if (trace_on()) {
+        // The checker sees every wake before the push it reports, and the ring the tag picks.
+        TraceCause pushed = why;
+        pushed.ring       = b.CreateZExt(home, i32);
+        if (cont != nullptr) {
+            pushed.ring = b.CreateSelect(cont, b.getInt32(RT_TRACE_QUEUE_CONT), pushed.ring);
+        }
+        emit_trace_wake(b, parked, pushed);
     }
     llvm::Value* tl   = b.CreateLoad(i32, tp);
     // The ring is chosen at run time here, so the guard's selector is too: the
@@ -1463,9 +1473,18 @@ void Backend::emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
 // child of a reactive body belongs in the reactive ring for the same reason its
 // parent's `#0` does.
 void Backend::emit_region_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
-    // Both callers are a fork that queues a child its parent does not wait for.
-    emit_trace_wake(b, handle, { .kind = RT_TRACE_SPAWN });
-    emit_by_home(b, [&] { emit_reactive_push(b, handle); }, [&] { emit_active_push(b, handle); });
+    // Both callers are a fork that queues a child its parent does not wait for. The checker sees
+    // the wake on the ring the spawning thread's home picks.
+    emit_by_home(
+      b,
+      [&] {
+          emit_trace_wake(b, handle, { .kind = RT_TRACE_SPAWN, .ring = b.getInt32(RT_TRACE_QUEUE_REACTIVE) });
+          emit_reactive_push(b, handle);
+      },
+      [&] {
+          emit_trace_wake(b, handle, { .kind = RT_TRACE_SPAWN });
+          emit_active_push(b, handle);
+      });
 }
 
 void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
@@ -1925,7 +1944,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             llvm::Value* rsrc = b_.CreateInBoundsGEP(queue_arr_ty_, sym(re_inactive_gv_), { b_.getInt32(0), rk });
             llvm::Value* rdst = b_.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b_.getInt32(0), rk });
             llvm::Value* rparked = b_.CreateLoad(ptr_ty, rsrc);
-            emit_trace_wake(b_, rparked, { .kind = RT_TRACE_INACTIVE });
+            emit_trace_wake(b_, rparked, { .kind = RT_TRACE_INACTIVE, .ring = b_.getInt32(RT_TRACE_QUEUE_REACTIVE) });
             b_.CreateStore(rparked, rdst);
             rk->addIncoming(b_.CreateAdd(rk, b_.getInt32(1)), rpbody);
             b_.CreateBr(rphead);

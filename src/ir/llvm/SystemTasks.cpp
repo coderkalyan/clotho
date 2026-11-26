@@ -164,7 +164,7 @@ void Backend::lower_reactive_pend(Index i) {
     argv.push_back(pend_record_slot());
     llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
     emit_trace_spawn(b_, hdl, RT_TRACE_ORG_PEND, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
-    emit_trace_wake(b_, hdl, { .kind = RT_TRACE_PEND });
+    emit_trace_wake(b_, hdl, { .kind = RT_TRACE_PEND, .ring = b_.getInt32(RT_TRACE_QUEUE_REACTIVE) });
     emit_reactive_push(b_, hdl);
 }
 
@@ -210,6 +210,18 @@ llvm::Value* Backend::expect_queue_ptr(uint32_t monitor) {
     // need the ring it drains onto.
     ensure_reactive_queue();
     return own_field(anchors_[owner].ctx_expect_base + ordinal, llvm::PointerType::getUnqual(ctx_));
+}
+
+// What the trace names the `expect` of `monitor` by, in a waiter's park and in the verdict that wakes
+// it: the own instance's record where the queue is a field of it, which tells two instances sharing
+// code apart even if their queues were one (B43); else the queue itself.
+llvm::Value* Backend::expect_trace_id(uint32_t monitor) {
+    const auto [owner, ordinal] = expect_owner_.at(monitor);
+    (void)ordinal;
+    if (owner != SignalSlot::no_anchor && owner == own_anchor_) {
+        return own_ctx_ != nullptr ? static_cast<llvm::Value*>(own_ctx_) : static_cast<llvm::Value*>(ensure_ctx(anchors_[owner]));
+    }
+    return expect_queue_ptr(monitor);
 }
 
 // The type of an `expect` queue: the count, then the parked handles.
@@ -264,7 +276,7 @@ void Backend::lower_expect_wait(Index i) {
     // sits in no other queue, so the flag must say "not scheduled" or a later
     // event wake would be dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("expect.resume", { .kind = RT_TRACE_CTL_EXPECT });
+    emit_suspend("expect.resume", { .kind = RT_TRACE_CTL_EXPECT, .rec = trace_on() ? expect_trace_id(info.monitor) : nullptr });
 
     // Past the resume point, so this thread is now running in the Reactive
     // region -- and by LRM 24.3.1 it stays there: "all subsequent blocking
@@ -301,7 +313,8 @@ void Backend::lower_expect_wake(Index i) {
     b_.CreateCondBr(b_.CreateICmpNE(must_of(p.op), zero(1)), drain, done);
 
     b_.SetInsertPoint(drain);
-    llvm::Value* q = expect_queue_ptr(p.imm);
+    llvm::Value* q        = expect_queue_ptr(p.imm);
+    llvm::Value* trace_id = trace_on() ? expect_trace_id(p.imm) : nullptr;
     llvm::Value* n = b_.CreateLoad(i32, q);
     // Emptied before the pushes, not after: a woken process may execute this
     // very `expect` again once it runs, and that push must land in an empty
@@ -317,7 +330,7 @@ void Backend::lower_expect_wake(Index i) {
     b_.SetInsertPoint(body);
     llvm::Value* slot   = expect_handle_slot(q, idx);
     llvm::Value* parked = b_.CreateLoad(ptr_ty, slot);
-    emit_trace_wake(b_, parked, { .kind = RT_TRACE_EXPECT });
+    emit_trace_wake(b_, parked, { .kind = RT_TRACE_EXPECT, .obj = trace_id, .ring = b_.getInt32(RT_TRACE_QUEUE_REACTIVE) });
     emit_reactive_push(b_, parked);
     llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
     idx->addIncoming(next, b_.GetInsertBlock());

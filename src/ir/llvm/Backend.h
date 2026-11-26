@@ -2160,17 +2160,24 @@ private:
         std::span<const WaitEdge> edges = {};
         // A delay control: the ticks, an i64 (0: the `#0` region).
         llvm::Value*              delay = nullptr;
+        // A park on a record or a queue (a join, a task call, a semaphore or mailbox, `await`,
+        // `wait fork`, `expect`): the address that names it, which the wake that ends the park
+        // names too (B43).
+        llvm::Value*              rec   = nullptr;
         // Where the construct is, when it is not the instruction being lowered.
         const SourceText*         where = nullptr;
     };
 
     // What pushed an activation: RT_TRACE_*, and what it names -- the signal a store wrote and
-    // the change it made (RT_TRACE_POS ...) for a bucket's scan, the object for an event's.
+    // the change it made (RT_TRACE_POS ...) for a bucket's scan, the object for an event's, the
+    // record or queue a park waits on for a completion's, and the ring it pushes onto.
     struct TraceCause {
         uint32_t              kind = 0;
         std::optional<Signal> sig  = std::nullopt;
         uint32_t              fact = 0;
         llvm::Value*          obj  = nullptr;
+        // An i32 (RT_TRACE_QUEUE_*); null: the Active ring.
+        llvm::Value*          ring = nullptr;
     };
 
     bool trace_on() const;
@@ -2253,6 +2260,23 @@ private:
     void emit_trace_resume(llvm::Value* a, llvm::Constant* control);
 
     void emit_trace_end(llvm::Value* a);
+
+    // The node of activation `a` goes on the list of occupants of a `disable` target (`list`, the
+    // address of its head), comes off it, is declared by the IR to be on it for the activation's
+    // whole life (a fork child), or is linked by the ramp of a fork child before the spawn that
+    // announces it (RT_TRACE_BLOCK_*).
+    void emit_trace_block(llvm::Value* a, llvm::Value* list, uint32_t how);
+
+    // A `disable` is about to walk the list of occupants at `list`; the activation running it is
+    // this body's own, when it has one.
+    void emit_trace_disable(llvm::Value* list);
+
+    // The walk of a `disable` (`list`) or a `kill` (null) marks the activation with handle `a` to
+    // leave (RT_TRACE_ABORT_*).
+    void emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind);
+
+    // clotho.run_once is about to run the bodies of one region (RT_TRACE_ORG_PREINIT ...), or has.
+    void emit_trace_once(uint32_t kind);
 
     // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
     void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
@@ -4161,6 +4185,11 @@ private:
     // instance.
     llvm::Value* expect_queue_ptr(uint32_t monitor);
 
+    // What the trace names the `expect` of `monitor` by, in the park of a waiter and in the verdict
+    // that wakes it: the own instance's record where the queue is a field of it, so that two
+    // instances sharing code are told apart (B43), else the queue.
+    llvm::Value* expect_trace_id(uint32_t monitor);
+
     // The type of an `expect` queue, `{ i32, [cap x ptr] }`, and the slot of the
     // parked handle `idx` of the queue at `queue`.
     llvm::StructType* expect_queue_ty();
@@ -4919,7 +4948,9 @@ private:
 
     llvm::StructType* proc_obj_body_ty();
 
-    void emit_proc_wake_waiters(llvm::Value* head);
+    // Wake every thread parked on the waiter list at `head`. `who` names the thread whose
+    // completion does it, for the trace (null: not known).
+    void emit_proc_wake_waiters(llvm::Value* head, llvm::Value* who);
 
     void emit_proc_complete();
 

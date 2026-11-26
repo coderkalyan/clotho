@@ -335,7 +335,7 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 | R2 × S13 | `#0` resuming in Inactive, before NBA, all together: pinned only through `->> #0` and gate tests [INFERENCE: grep of `tests/`]. |
 | R17 × S5, S10 | The late start of an always_comb group whose schedule group has rows from several instances [INFERENCE]. |
 | R24 × S17 | NBAs staged in the slot of a `$finish` stay uncommitted [INFERENCE: no test found]. |
-| R23 × S1 | `p.kill()` of an always parked at its static leading control resumes its body once and does not stop it: the loop's park has no abort poll (probed on 32ee5c3e). An always that waits at its head polls. |
+| R23 × S1 | Closed: the trace's R23.4 flagged `p.kill()` of an always parked at its static leading control (the loop's park had no abort poll, so the body ran once more and the always went on); `lower_group` now polls after that park (`process_test.cpp` "kill of an always parked at its static control stops it"). |
 | R1 × S12 | Observed reached again from the reactive set, for an assertion clocked by a program signal: refused (`docs/TODO.md`). |
 | Gates | `comb_fuse` and `o3` are never set in a test (`fuse = false` also turns comb fusion off); `dedup`, `split` and `z_elision` in one case each. |
 

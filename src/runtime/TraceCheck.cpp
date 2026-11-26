@@ -62,6 +62,9 @@ enum class Ev : uint8_t {
     Trigger,
     Finish,
     Change,
+    Block,
+    Disable,
+    Abort,
 };
 
 struct Entry {
@@ -72,6 +75,24 @@ struct Entry {
     // an event or a storage the checker does not read.
     const rt_trace_shape* shape = nullptr;
     std::vector<uint8_t>  snap;
+};
+
+// What a thread's home region is, as far as the trace knows it (R25): a program's `initial` and
+// what it forks and calls is reactive, a design process is not, and what the trace cannot tell
+// (a DPI export, a `$strobe` body) is Unknown.
+enum class Home : uint8_t { Active, Reactive, Unknown };
+
+// An abort that a `disable` or a `kill` made of an activation and the activation has not obeyed
+// yet: `target` is the list a `disable` walked, or zero for a `kill`.
+struct Mark {
+    uintptr_t target;
+    uint8_t   kind;
+};
+
+// A `disable` that has to reach an occupant of its list, and has not yet (R23).
+struct AbortOwed {
+    uintptr_t act;
+    uintptr_t target;
 };
 
 struct Act {
@@ -94,6 +115,25 @@ struct Act {
     std::vector<Entry>      pending;
     // Counts the parks, so that a wake owed to one park is not owed to the next.
     uint64_t                park_seq = 0;
+    // The ring a Queued activation sits on (RT_TRACE_QUEUE_*), and the home tag of the thread at its
+    // last park, which says which batch a `#0` waits in.
+    uint8_t                 ring          = 0;
+    bool                    home_reactive = false;
+    // The thread's home, as the trace knows it (R25).
+    Home                    home          = Home::Unknown;
+    // What the last park waits on, for the parks that name a record or a queue (B43).
+    uintptr_t               rec           = 0;
+    bool                    dispatched    = false;
+    // Owed until the first dispatch: a continuously active process evaluates at time zero (R15), a
+    // seeded procedure starts before a late group does (R17), a pended report runs in Postponed (R4).
+    bool                    zero_owed     = false;
+    bool                    proc_owed     = false;
+    bool                    strobe_owed   = false;
+    // The lists of occupants the activation is on (R23), the ones the IR says it is within for its
+    // whole life, and the aborts it has not obeyed.
+    std::vector<uintptr_t>  blocks;
+    std::vector<uintptr_t>  inherits;
+    std::vector<Mark>       marks;
 };
 
 // A table from an address to a value, by open addressing: an activation per frame
@@ -191,6 +231,8 @@ struct Rec {
     Ev                       ev;
     uint8_t                  cause; // a wake's cause, a dispatch's mode, a park's delay flag, a path or a region
     uint8_t                  fact;
+    // A wake's ring (RT_TRACE_QUEUE_*).
+    uint8_t                  queue;
 };
 
 constexpr size_t kRing = 256;
@@ -305,6 +347,23 @@ struct Checker {
     AddrMap<ChgFacts>               chg;
     std::vector<Owed>               owed;
     uint64_t                        step = 0;
+    // R1, R2, R25: how many activations each ring holds, how many wait at a `#0` (by the batch their
+    // thread's home names), and how many of the queued ones are a program's continuous processes.
+    int32_t                         n_queued[4]    = {};
+    int32_t                         n_zero[2]      = {};
+    int32_t                         n_cont_queued  = 0;
+    // R15, R17, R4: activations owed their first dispatch.
+    int32_t                         zero_owed      = 0;
+    int32_t                         proc_owed      = 0;
+    int32_t                         strobes_owed   = 0;
+    // The region whose bodies clotho.run_once is running (RT_TRACE_ORG_PREINIT ...), or zero.
+    uint32_t                        once           = 0;
+    // R23: the activations on each list of occupants, by the list (stale ones are skipped), the lists
+    // a fork child's ramp linked before the spawn that announces it, and the occupants a `disable`
+    // still has to reach.
+    AddrMap<std::vector<uintptr_t>> occ;
+    AddrMap<std::vector<uintptr_t>> ramp;
+    std::vector<AbortOwed>          abort_owed;
 };
 
 Checker g;
@@ -313,6 +372,34 @@ Checker g;
 // home region of a parked handle.
 uintptr_t norm(const void* a) {
     return reinterpret_cast<uintptr_t>(a) & ~static_cast<uintptr_t>(6);
+}
+
+// The kind of a control or an origin, without the facts of a seed row (RT_TRACE_ORG_PROCEDURE ...).
+uint32_t kind_of(const rt_trace_control* c) {
+    return c != nullptr ? (c->kind & RT_TRACE_KIND) : ~0u;
+}
+
+// Whether the activation's origin carries `fact` (RT_TRACE_ORG_SELF_START ...).
+bool has_fact(const Act& act, uint32_t fact) {
+    return act.origin != nullptr && (act.origin->kind & fact) != 0;
+}
+
+// Whether the activation waits at a `#0`.
+bool zero_parked(const Act& act) {
+    return act.state == State::Parked && act.zero && act.park != nullptr && act.park->kind == RT_TRACE_CTL_DELAY;
+}
+
+// The counts of what each ring and each `#0` batch hold follow the state of each activation: a
+// state is left with count(act, -1) and the next one entered with count(act, +1).
+void count(const Act& act, int32_t by) {
+    if (act.state == State::Queued) {
+        g.n_queued[act.ring] += by;
+        if (has_fact(act, RT_TRACE_ORG_REACTIVE_CONT)) {
+            g.n_cont_queued += by;
+        }
+    } else if (zero_parked(act)) {
+        g.n_zero[act.home_reactive ? 1 : 0] += by;
+    }
 }
 
 void appendf(std::string& out, const char* format, ...) {
@@ -325,7 +412,7 @@ void appendf(std::string& out, const char* format, ...) {
 }
 
 const char* control_name(uint32_t kind) {
-    switch (kind) {
+    switch (kind & RT_TRACE_KIND) {
         case RT_TRACE_CTL_STATIC: return "static sensitivity control";
         case RT_TRACE_CTL_EVENT: return "event control";
         case RT_TRACE_CTL_DELAY: return "delay control";
@@ -343,6 +430,11 @@ const char* control_name(uint32_t kind) {
         case RT_TRACE_ORG_STROBE: return "$strobe";
         case RT_TRACE_ORG_MONITOR: return "$monitor";
         case RT_TRACE_ORG_EXPORT: return "DPI export call";
+        case RT_TRACE_ORG_PREINIT: return "pre-init body";
+        case RT_TRACE_ORG_PREPONED: return "Preponed body";
+        case RT_TRACE_ORG_OBSERVED: return "Observed body";
+        case RT_TRACE_ORG_RE_NBA: return "Re-NBA body";
+        case RT_TRACE_ORG_FINAL: return "final block";
     }
     return "?";
 }
@@ -399,6 +491,9 @@ const char* ev_name(Ev ev) {
         case Ev::Trigger: return "trigger";
         case Ev::Finish: return "finish";
         case Ev::Change: return "change";
+        case Ev::Block: return "block";
+        case Ev::Disable: return "disable";
+        case Ev::Abort: return "abort";
     }
     return "?";
 }
@@ -411,7 +506,10 @@ bool is_act_event(Ev ev) {
         case Ev::Wake:
         case Ev::Dispatch:
         case Ev::Resume:
-        case Ev::End: return true;
+        case Ev::End:
+        case Ev::Block:
+        case Ev::Disable:
+        case Ev::Abort: return true;
         default: return false;
     }
 }
@@ -478,8 +576,22 @@ const char* rule_title(const char* rule) {
         { "R20.1", "->> region" },
         { "R20.2", "->> order" },
         { "R20.3", "->> left untriggered" },
-        { "R24.1", "effect after $finish" },
         { "R24.2", "run after $finish" },
+        { "R1.1", "region order" },
+        { "R1.2", "region left with work" },
+        { "R2.2", "#0 batch" },
+        { "R2.3", "timer" },
+        { "R4.1", "run-once region" },
+        { "R4.2", "pended report" },
+        { "R15.1", "time-zero start" },
+        { "R17.1", "late start" },
+        { "R23.1", "block occupancy" },
+        { "R23.2", "disable reach" },
+        { "R23.3", "inherited block" },
+        { "R23.4", "abort obeyed" },
+        { "R23.5", "force wake" },
+        { "R25.1", "home region" },
+        { "R25.2", "continuous before program" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -494,6 +606,25 @@ const char* how_name(uint32_t how) {
         case RT_TRACE_RING: return "from a ring";
         case RT_TRACE_INLINE: return "inline";
         case RT_TRACE_RUN_ONCE: return "run once";
+    }
+    return "?";
+}
+
+const char* block_how_name(uint32_t how) {
+    switch (how) {
+        case RT_TRACE_BLOCK_ENTER: return "enters";
+        case RT_TRACE_BLOCK_EXIT: return "leaves";
+        case RT_TRACE_BLOCK_INHERIT: return "is within";
+        case RT_TRACE_BLOCK_RAMP: return "links in its ramp";
+    }
+    return "?";
+}
+
+const char* queue_name(uint32_t q) {
+    switch (q) {
+        case RT_TRACE_QUEUE_ACTIVE: return "active";
+        case RT_TRACE_QUEUE_REACTIVE: return "reactive";
+        case RT_TRACE_QUEUE_CONT: return "reactive continuous";
     }
     return "?";
 }
@@ -588,14 +719,19 @@ std::string rec_text(const Rec& r) {
         case Ev::Change:
             out += " of " + signal_text(reinterpret_cast<const void*>(r.a)) + " (" + chg_path_name(r.cause) + ")";
             break;
+        case Ev::Block: out += std::string(" ") + block_how_name(r.cause) + " the list at " + address_text(r.x); break;
+        case Ev::Disable: out += " of the list at " + address_text(r.x); break;
+        case Ev::Abort:
+            out += r.cause == RT_TRACE_ABORT_KILL ? ": marked by a kill" : ": marked by a disable of the list at " + address_text(r.x);
+            break;
         default: break;
     }
     return out;
 }
 
 void record(Ev ev, uintptr_t a, uint64_t x, const rt_trace_control* c, uint8_t cause, uint8_t fact,
-            const rt_trace_nba_site* site = nullptr) {
-    g.ring[g.seq % kRing] = Rec{ a, x, g.now, c, site, ev, cause, fact };
+            const rt_trace_nba_site* site = nullptr, uint8_t queue = 0) {
+    g.ring[g.seq % kRing] = Rec{ a, x, g.now, c, site, ev, cause, fact, queue };
     ++g.seq;
     ++g.run.events;
     ++g.total.events;
@@ -676,6 +812,12 @@ bool listed(const std::vector<Entry>& v, const void* x, uint32_t fact) {
     return false;
 }
 
+// Whether a wake names another record or queue than the park it reaches waits on (B43). Either
+// side naming none says nothing.
+bool other_record(const Act& act, const void* x) {
+    return act.rec != 0 && x != nullptr && reinterpret_cast<uintptr_t>(x) != act.rec;
+}
+
 // Empty when `cause` may wake `act`, parked as it is; otherwise why not.
 std::string refusal(const Act& act, uint32_t cause, const void* x, uint32_t fact) {
     const rt_trace_control* c    = act.park;
@@ -714,17 +856,32 @@ std::string refusal(const Act& act, uint32_t cause, const void* x, uint32_t fact
         case RT_TRACE_INACTIVE:
             return kind == RT_TRACE_CTL_DELAY && act.zero ? "" : "the #0 batch woke an activation that is not parked at a #0";
         case RT_TRACE_CHILD:
-            return kind == RT_TRACE_CTL_JOIN ? "" : "a fork child woke a parent that is not parked at a join";
+            if (kind != RT_TRACE_CTL_JOIN) {
+                return "a fork child woke a parent that is not parked at a join";
+            }
+            return other_record(act, x) ? "a fork child woke a parent that is parked at the join of another fork" : "";
         case RT_TRACE_CALLEE:
-            return kind == RT_TRACE_CTL_CALL ? "" : "a callee woke a caller that is not parked at its task call";
+            if (kind != RT_TRACE_CTL_CALL) {
+                return "a callee woke a caller that is not parked at its task call";
+            }
+            return other_record(act, x) ? "a callee woke a caller that is parked on the record of another task call" : "";
         case RT_TRACE_AWAIT:
-            return kind == RT_TRACE_CTL_AWAIT || kind == RT_TRACE_CTL_WAIT_FORK
-                     ? ""
-                     : "a thread's completion woke an activation that is not parked at an await or a wait fork";
+            if (kind != RT_TRACE_CTL_AWAIT && kind != RT_TRACE_CTL_WAIT_FORK) {
+                return "a thread's completion woke an activation that is not parked at an await or a wait fork";
+            }
+            return kind == RT_TRACE_CTL_AWAIT && other_record(act, x)
+                     ? "a thread's completion woke an await on another thread"
+                     : "";
         case RT_TRACE_SYNC:
-            return kind == RT_TRACE_CTL_SYNC ? "" : "a semaphore or mailbox woke an activation that is not parked at its queue";
+            if (kind != RT_TRACE_CTL_SYNC) {
+                return "a semaphore or mailbox woke an activation that is not parked at its queue";
+            }
+            return other_record(act, x) ? "a semaphore or mailbox woke a waiter of another queue" : "";
         case RT_TRACE_EXPECT:
-            return kind == RT_TRACE_CTL_EXPECT ? "" : "an expect verdict woke an activation that is not parked at an expect";
+            if (kind != RT_TRACE_CTL_EXPECT) {
+                return "an expect verdict woke an activation that is not parked at an expect";
+            }
+            return other_record(act, x) ? "an expect verdict woke an expect of another instance" : "";
         case RT_TRACE_PROC:
             return kind == RT_TRACE_CTL_SUSPENDED ? "" : "process::resume woke a thread that is not parked by suspend";
         case RT_TRACE_FORCE:
@@ -742,6 +899,9 @@ std::string cause_text(uint32_t cause, const void* x, uint32_t fact) {
         out += ": event " + signal_text(x);
     } else if (cause == RT_TRACE_TIMER) {
         appendf(out, ": expired at tick %llu", static_cast<unsigned long long>(g.now));
+    } else if (x != nullptr && (cause == RT_TRACE_CHILD || cause == RT_TRACE_CALLEE || cause == RT_TRACE_AWAIT ||
+                                cause == RT_TRACE_SYNC || cause == RT_TRACE_EXPECT)) {
+        out += ": of the record or queue at " + address_text(reinterpret_cast<uintptr_t>(x));
     }
     return out;
 }
@@ -1299,10 +1459,23 @@ void owe(const void* x_, bool pos, bool neg, bool any, bool obj) {
     }
 }
 
+// The point a `disable`'s walk must have reached every occupant of its list by: the next dispatch,
+// park, region or `disable`. An occupant the walk missed would run on (R23.2).
+void settle_aborts() {
+    if (g.abort_owed.empty()) {
+        return;
+    }
+    const AbortOwed o = g.abort_owed.front();
+    g.abort_owed.clear();
+    fail("R23.2", "a disable did not reach an activation that is inside the block or task it names: it would run on", o.act,
+         "the list at " + address_text(o.target) + " held it, and the walk of that list marked no such activation");
+}
+
 // The point a write's wakes must have been made by: every activation still parked as it was is a
 // violation.
 void settle_owed() {
-    if (g.owed.empty()) {
+    settle_aborts();
+    if (g.halted || g.owed.empty()) {
         return;
     }
     for (const Owed& o : g.owed) {
@@ -1319,6 +1492,8 @@ void settle_owed() {
 
 // R6b: at the end of a slot, an activation still parked whose entry the change from its bytes at the
 // park to its bytes now satisfies was never woken, by a store no bracket reported or one it skipped.
+// R2.3: an activation still parked at a `#d` whose deadline is now or past was never woken by its
+// timer.
 void poll_waiters() {
     std::vector<uint8_t> now;
     bool                 bad = false;
@@ -1327,6 +1502,14 @@ void poll_waiters() {
             return;
         }
         const uint32_t kind = act.park->kind;
+        if (kind == RT_TRACE_CTL_DELAY && !act.zero && g.now != UINT64_MAX && act.deadline <= g.now) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "the delay ends at tick %llu and the slot of tick %llu is over: no timer woke it",
+                          static_cast<unsigned long long>(act.deadline), static_cast<unsigned long long>(g.now));
+            fail("R2.3", "a delay control was not resumed at its deadline", a, buf);
+            bad = true;
+            return;
+        }
         if (kind != RT_TRACE_CTL_STATIC && kind != RT_TRACE_CTL_EVENT) {
             return;
         }
@@ -1345,6 +1528,119 @@ void poll_waiters() {
         }
     });
 }
+
+// -- Regions, rings, time zero and blocks (R1, R2, R4, R15, R17, R23, R25) --
+
+// The first activation `pred` holds of, or zero.
+template <typename P>
+uintptr_t first_act(P&& pred) {
+    uintptr_t found = 0;
+    g.acts.for_each([&](uintptr_t a, Act& act) {
+        if (found == 0 && pred(act)) {
+            found = a;
+        }
+    });
+    return found;
+}
+
+// Whether control moved on from a region that still has work (R1.2): `active` asks for the Active
+// set's ring, `reactive` for the Reactive set's two, and `batches` for the `#0` activations waiting
+// in each set's Inactive batch. A promotion of a batch is what starts when one waits, so it is not
+// asked for there.
+bool left_with_work(const char* when, bool active, bool reactive, bool batches) {
+    const bool in_active   = active && g.n_queued[RT_TRACE_QUEUE_ACTIVE] != 0;
+    const bool zero_active = active && batches && g.n_zero[0] != 0;
+    const bool in_reactive = reactive && (g.n_queued[RT_TRACE_QUEUE_REACTIVE] != 0 || g.n_queued[RT_TRACE_QUEUE_CONT] != 0);
+    const bool zero_react  = reactive && batches && g.n_zero[1] != 0;
+    if (!in_active && !zero_active && !in_reactive && !zero_react) {
+        return false;
+    }
+    const uintptr_t who = first_act([&](const Act& act) {
+        if (act.state == State::Queued) {
+            return act.ring == RT_TRACE_QUEUE_ACTIVE ? in_active : in_reactive;
+        }
+        return zero_parked(act) && (act.home_reactive ? zero_react : zero_active);
+    });
+    std::string cause;
+    if (const Act* act = who != 0 ? g.acts.find(who) : nullptr; act != nullptr) {
+        cause = act->state == State::Queued ? std::string("queued on the ") + queue_name(act->ring) + " ring and never dispatched"
+                                            : std::string("parked at a #0 that no promotion released");
+    }
+    fail("R1.2", std::string("control moved on while an earlier region still had work: ") + when, who, cause);
+    return true;
+}
+
+// Whether the scheduler may enter region `to` from `from`, within one slot (R1.1). The regions
+// come in the order of the slot, and one with no code is skipped, so going forward is always
+// possible. Going back is how work in a later region reaches an earlier one: the Active region
+// takes it from every region but Postponed, and the Reactive region from the two regions of its own
+// set that can hand it work. Nothing follows Postponed in the slot, and the top of the slot is first.
+bool legal_region_step(uint32_t from, uint32_t to) {
+    const auto rank = [](uint32_t r) {
+        switch (r) {
+            case RT_TRACE_REG_PREPONED: return 0;
+            case RT_TRACE_REG_ACTIVE: return 1;
+            case RT_TRACE_REG_INACTIVE: return 2;
+            case RT_TRACE_REG_NBA: return 3;
+            case RT_TRACE_REG_OBSERVED: return 4;
+            case RT_TRACE_REG_REACTIVE: return 5;
+            case RT_TRACE_REG_RE_INACTIVE: return 6;
+            case RT_TRACE_REG_RE_NBA: return 7;
+            case RT_TRACE_REG_POSTPONED: return 8;
+            default: return 9;
+        }
+    };
+    if (to == RT_TRACE_REG_PREPONED) {
+        return from == RT_TRACE_REG_PREPONED;
+    }
+    if (rank(to) >= rank(from)) {
+        return true;
+    }
+    if (to == RT_TRACE_REG_ACTIVE) {
+        return from != RT_TRACE_REG_POSTPONED;
+    }
+    return to == RT_TRACE_REG_REACTIVE && (from == RT_TRACE_REG_RE_INACTIVE || from == RT_TRACE_REG_RE_NBA);
+}
+
+// Whether a body the scheduler runs once runs where its region is (R4.1): a `$strobe` or `$monitor`
+// body in Postponed, the others between the markers of the region clotho.run_once was told they
+// belong to (a run that reports no markers is not asked).
+bool run_once_region_ok(const Act& act) {
+    switch (kind_of(act.origin)) {
+        case RT_TRACE_ORG_STROBE:
+        case RT_TRACE_ORG_MONITOR: return g.region == RT_TRACE_REG_POSTPONED;
+        default: break;
+    }
+    switch (g.once) {
+        case RT_TRACE_ORG_PREINIT: return g.region == RT_TRACE_REG_PREPONED && g.slot_no == 0;
+        case RT_TRACE_ORG_PREPONED: return g.region == RT_TRACE_REG_PREPONED;
+        case RT_TRACE_ORG_OBSERVED: return g.region == RT_TRACE_REG_OBSERVED;
+        case RT_TRACE_ORG_RE_NBA: return g.region == RT_TRACE_REG_REACTIVE;
+        case RT_TRACE_ORG_FINAL: return g.in_final;
+        default: return true;
+    }
+}
+
+bool has_block(const Act& act, uintptr_t t) {
+    return std::find(act.blocks.begin(), act.blocks.end(), t) != act.blocks.end();
+}
+
+// An activation links its node on the list at `t`. A block cannot be inside itself, so an activation
+// is on a list once (R23.1). Returns false after a violation.
+bool block_enter(uintptr_t a, Act& act, uintptr_t t) {
+    if (has_block(act, t)) {
+        fail("R23.1", "an activation links its node on a list it is already on: a block is never inside itself", a,
+             "the list at " + address_text(t));
+        return false;
+    }
+    act.blocks.push_back(t);
+    std::vector<uintptr_t>& v = g.occ.at(t);
+    if (std::find(v.begin(), v.end(), a) == v.end()) {
+        v.push_back(a);
+    }
+    return true;
+}
+
 
 } // namespace
 
@@ -1379,6 +1675,20 @@ extern "C" void rt_trace_begin(void) {
     g.chg.clear();
     g.owed.clear();
     g.step = 0;
+    for (int32_t& n : g.n_queued) {
+        n = 0;
+    }
+    for (int32_t& n : g.n_zero) {
+        n = 0;
+    }
+    g.n_cont_queued = 0;
+    g.zero_owed     = 0;
+    g.proc_owed     = 0;
+    g.strobes_owed  = 0;
+    g.once          = 0;
+    g.occ.clear();
+    g.ramp.clear();
+    g.abort_owed.clear();
 }
 
 extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* parent) {
@@ -1393,7 +1703,13 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
         fail("R5.3", "spawn of a null activation", 0, "");
         return;
     }
-    Act& act   = g.acts.at(a);
+    Act& act = g.acts.at(a);
+    // The incarnation that used this address before is gone, and what it still owed or held goes
+    // with it.
+    count(act, -1);
+    g.zero_owed    -= act.zero_owed ? 1 : 0;
+    g.proc_owed    -= act.proc_owed ? 1 : 0;
+    g.strobes_owed -= act.strobe_owed ? 1 : 0;
     act.state  = State::Spawned;
     act.origin = origin;
     act.park   = nullptr;
@@ -1403,7 +1719,49 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
     act.stat.clear();
     act.list.clear();
     act.pending.clear();
+    act.ring          = 0;
+    act.home_reactive = false;
+    act.rec           = 0;
+    act.dispatched    = false;
+    act.zero_owed     = false;
+    act.proc_owed     = false;
+    act.strobe_owed   = false;
+    act.blocks.clear();
+    act.inherits.clear();
+    act.marks.clear();
+    // A thread's home is a program's or a design's by where it starts (R25); what it forks or
+    // calls takes the home of the thread that does.
+    switch (kind_of(origin)) {
+        case RT_TRACE_ORG_PROCESS:
+            act.home = (origin->kind & (RT_TRACE_ORG_PROGRAM | RT_TRACE_ORG_REACTIVE_CONT)) != 0 ? Home::Reactive : Home::Active;
+            break;
+        case RT_TRACE_ORG_PEND: act.home = Home::Reactive; break;
+        case RT_TRACE_ORG_FORK:
+        case RT_TRACE_ORG_TASK: {
+            const Act* creator = act.parent != 0 ? g.acts.find(act.parent) : nullptr;
+            act.home           = creator != nullptr ? creator->home : Home::Unknown;
+            break;
+        }
+        default: act.home = Home::Unknown; break;
+    }
+    if (has_fact(act, RT_TRACE_ORG_SELF_START)) {
+        act.zero_owed = true;
+        ++g.zero_owed;
+    }
+    if (kind_of(origin) == RT_TRACE_ORG_STROBE) {
+        act.strobe_owed = true;
+        ++g.strobes_owed;
+    }
     record(Ev::Spawn, a, 0, origin, 0, 0);
+    // The lists its ramp linked it on before this event announced it.
+    if (std::vector<uintptr_t>* linked = g.ramp.find(a); linked != nullptr) {
+        for (const uintptr_t t : *linked) {
+            if (!block_enter(a, act, t)) {
+                break;
+            }
+        }
+        linked->clear();
+    }
 }
 
 extern "C" void rt_trace_subscribe(void* a_, const rt_trace_entry* list, uint32_t n) {
@@ -1439,7 +1797,7 @@ extern "C" void rt_trace_waits_for(void* a_, const void* x, const char* name, ui
     }
 }
 
-extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t delay) {
+extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t arg) {
     if (g.halted) {
         return;
     }
@@ -1464,6 +1822,18 @@ extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t dela
              a, "");
         return;
     }
+    const uint32_t kind = c != nullptr ? c->kind : ~0u;
+    // A disable or a kill marked the activation to leave, and every park but the two that run their
+    // child or callee inline first comes after the poll that takes it out (R23.4).
+    if (!act->marks.empty() && !g.finished && kind != RT_TRACE_CTL_JOIN && kind != RT_TRACE_CTL_CALL) {
+        const Mark& m = act->marks.front();
+        fail("R23.4", "an activation parked again after a disable or a kill marked it to leave: it ran on past the poll that was to take it out",
+             a,
+             m.kind == RT_TRACE_ABORT_KILL ? std::string("marked by a kill of its thread")
+                                           : "marked by a disable of the list at " + address_text(m.target));
+        return;
+    }
+    count(*act, -1);
     act->state = State::Parked;
     act->park  = c;
     act->list.clear();
@@ -1483,23 +1853,34 @@ extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t dela
             snapshot_entry(e);
         }
     }
-    act->zero     = delay == 0;
-    act->deadline = delay > UINT64_MAX - g.now ? UINT64_MAX : g.now + delay;
-    record(Ev::Park, a, delay, c, 0, 0);
+    // The thread's home tag, which says which batch a `#0` waits in; a delay's ticks, or the record
+    // or queue a park names.
+    act->home_reactive = (reinterpret_cast<uintptr_t>(a_) & 3) == 2;
+    act->zero          = kind == RT_TRACE_CTL_DELAY && arg == 0;
+    act->deadline      = kind != RT_TRACE_CTL_DELAY ? 0 : (arg > UINT64_MAX - g.now ? UINT64_MAX : g.now + arg);
+    act->rec = kind == RT_TRACE_CTL_JOIN || kind == RT_TRACE_CTL_CALL || kind == RT_TRACE_CTL_WAIT_FORK ||
+                       kind == RT_TRACE_CTL_AWAIT || kind == RT_TRACE_CTL_SYNC || kind == RT_TRACE_CTL_EXPECT
+                 ? static_cast<uintptr_t>(arg)
+                 : 0;
+    count(*act, +1);
+    record(Ev::Park, a, arg, c, 0, 0);
 }
 
-extern "C" void rt_trace_wake(void* a_, uint32_t cause, const void* x, uint32_t fact) {
+extern "C" void rt_trace_wake(void* a_, uint32_t cause_word, const void* x, uint32_t fact) {
     if (g.halted) {
         return;
     }
-    const uintptr_t a = norm(a_);
+    const uint32_t  cause = cause_word & 0xff;
+    const uint8_t   queue = static_cast<uint8_t>((cause_word >> RT_TRACE_QUEUE_SHIFT) & 3);
+    const uintptr_t a     = norm(a_);
     ++g.run.wakes;
     ++g.total.wakes;
     Act* act = find("R5.1", a, "wake");
     if (act == nullptr) {
         return;
     }
-    record(Ev::Wake, a, reinterpret_cast<uintptr_t>(x), act->park, static_cast<uint8_t>(cause), static_cast<uint8_t>(fact));
+    record(Ev::Wake, a, reinterpret_cast<uintptr_t>(x), act->park, static_cast<uint8_t>(cause), static_cast<uint8_t>(fact), nullptr,
+           queue);
     switch (act->state) {
         case State::Ended:
             fail("R5.4", "wake of an activation that already ended: its frame is gone", a, cause_text(cause, x, fact));
@@ -1548,9 +1929,38 @@ extern "C" void rt_trace_wake(void* a_, uint32_t cause, const void* x, uint32_t 
              cause_text(cause, x, fact));
         return;
     }
+    // A `disable` or a `kill` wakes the activations its walk marked, and no other (R23.5). A run
+    // whose walks report no abort at all says nothing of what its force wakes were for.
+    if (cause == RT_TRACE_FORCE && act->marks.empty() && g.run.aborts != 0 && !g.finished) {
+        fail("R23.5", "an activation was force-woken that no disable or kill had marked to leave", a, cause_text(cause, x, fact));
+        return;
+    }
+    // An `expect` verdict puts the thread in the Reactive region for the rest of its life (R25).
+    if (cause == RT_TRACE_EXPECT) {
+        act->home = Home::Reactive;
+    }
+    // The ring a wake pushes onto is the one its thread's home names (R25.1). The seed's own choice
+    // for a program's constant-source assign is the Active ring, which settles it before Reactive
+    // starts, so the seed is not asked about the continuous ones.
+    if (act->home != Home::Unknown && !g.finished && !(cause == RT_TRACE_SEED && has_fact(*act, RT_TRACE_ORG_REACTIVE_CONT)) &&
+        (queue != RT_TRACE_QUEUE_ACTIVE) != (act->home == Home::Reactive)) {
+        fail("R25.1",
+             act->home == Home::Reactive ? "a thread of a program was queued for the Active region"
+                                         : "a thread of the design was queued for the Reactive region",
+             a, cause_text(cause, x, fact) + std::string(", onto the ") + queue_name(queue) + " ring");
+        return;
+    }
+    count(*act, -1);
     act->state        = State::Queued;
+    act->ring         = queue;
     act->queued_at    = g.seq;
     act->queued_cause = static_cast<uint8_t>(cause);
+    count(*act, +1);
+    // A procedure the seed queues has to run before a late group's first run (R17).
+    if (cause == RT_TRACE_SEED && has_fact(*act, RT_TRACE_ORG_PROCEDURE) && !act->proc_owed) {
+        act->proc_owed = true;
+        ++g.proc_owed;
+    }
 }
 
 extern "C" int32_t rt_trace_dispatch(void* a_, uint32_t how) {
@@ -1592,7 +2002,69 @@ extern "C" int32_t rt_trace_dispatch(void* a_, uint32_t how) {
                  a, std::string("dispatched ") + how_name(how));
             return 0;
         }
+    } else if (how == RT_TRACE_RING) {
+        // A ring is drained in the Active and Reactive regions, each its own (R1.1, R25.1); the top of
+        // the slot, before the first of them, is not asked.
+        const bool in_reactive = g.region == RT_TRACE_REG_REACTIVE;
+        const bool in_active   = g.region == RT_TRACE_REG_ACTIVE;
+        if (!in_reactive && !in_active && g.region != RT_TRACE_REG_PREPONED) {
+            fail("R1.1", "an activation was popped from a ring outside the Active and Reactive regions", a,
+                 std::string("the scheduler is in the ") + region_name(g.region) + " region");
+            return 0;
+        }
+        if ((in_reactive || in_active) && in_reactive != (act->ring != RT_TRACE_QUEUE_ACTIVE)) {
+            fail("R25.1", in_reactive ? "an activation queued for the Active region ran in the Reactive region"
+                                      : "an activation queued for the Reactive region ran in the Active region",
+                 a, std::string("queued on the ") + queue_name(act->ring) + " ring");
+            return 0;
+        }
+        // A program's continuous processes settle its port copies before program code reads them: while
+        // one is queued, no program code is popped (R25.2).
+        if (in_reactive && act->ring == RT_TRACE_QUEUE_REACTIVE && g.n_cont_queued > 0 &&
+            !has_fact(*act, RT_TRACE_ORG_REACTIVE_CONT)) {
+            const uintptr_t cont = first_act([](const Act& o) { return o.state == State::Queued && has_fact(o, RT_TRACE_ORG_REACTIVE_CONT); });
+            fail("R25.2", "program code ran while a program's continuous process was still queued: it would read its inputs stale", a,
+                 "still queued: " + act_text(cont));
+            return 0;
+        }
+    } else if (how == RT_TRACE_RUN_ONCE && !run_once_region_ok(*act)) {
+        fail("R4.1", "a body the scheduler runs once ran outside the region it belongs to", a,
+             std::string("the scheduler is in the ") + region_name(g.region) + " region");
+        return 0;
     }
+    if (!act->dispatched) {
+        act->dispatched = true;
+        // An activity enabled within a targeted block is on its list before it first runs (R23.3).
+        if (!g.finished) {
+            for (const uintptr_t t : act->inherits) {
+                if (!has_block(*act, t)) {
+                    fail("R23.3", "a fork child runs before it is an occupant of a block or task it was forked inside: a disable of it would miss the child", a,
+                         "the list at " + address_text(t) + " does not hold it");
+                    return 0;
+                }
+            }
+            // A group with an always_comb member starts after every procedure the seed queued (R17).
+            if (has_fact(*act, RT_TRACE_ORG_LATE) && g.proc_owed > 0) {
+                const uintptr_t proc = first_act([](const Act& o) { return o.proc_owed; });
+                fail("R17.1", "an always_comb or always_latch started before every procedure had", a,
+                     "not yet started: " + act_text(proc));
+                return 0;
+            }
+        }
+        if (act->zero_owed) {
+            act->zero_owed = false;
+            --g.zero_owed;
+        }
+        if (act->proc_owed) {
+            act->proc_owed = false;
+            --g.proc_owed;
+        }
+    }
+    if (act->strobe_owed) {
+        act->strobe_owed = false;
+        --g.strobes_owed;
+    }
+    count(*act, -1);
     act->state = State::Running;
     return 1;
 }
@@ -1622,6 +2094,11 @@ extern "C" void rt_trace_resume(void* a_, const rt_trace_control* c) {
     if (!same) {
         fail("R5.3", "resume at a control that is not the last park: a park the trace does not report", a,
              "resumed at " + control_text(c) + ", last parked at " + control_text(p));
+        return;
+    }
+    // The thread past an `expect` is in the Reactive region for the rest of its life (R25).
+    if (c != nullptr && c->kind == RT_TRACE_CTL_EXPECT) {
+        act->home = Home::Reactive;
     }
 }
 
@@ -1643,7 +2120,141 @@ extern "C" void rt_trace_end(void* a_) {
         fail("R5.3", std::string("end of an activation that is ") + state_name(act->state) + ", not running", a, "");
         return;
     }
+    // Every exit of a targeted block, a `return`, a `break`, an abort, takes the node off the list
+    // first: one left on it would be walked after its frame is gone (R23.1).
+    if (!act->blocks.empty() && !g.finished) {
+        fail("R23.1", "an activation ended inside a block or task some disable names: its node would stay linked, and the next walk of the list would follow a dangling pointer", a,
+             "still on the list at " + address_text(act->blocks.front()));
+        return;
+    }
+    act->marks.clear();
     act->state = State::Ended;
+}
+
+extern "C" void rt_trace_block(void* a_, const void* target, uint32_t how) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.blocks;
+    ++g.total.blocks;
+    const uintptr_t a = norm(a_);
+    const uintptr_t t = reinterpret_cast<uintptr_t>(target);
+    if (how == RT_TRACE_BLOCK_RAMP) {
+        // A fork child's ramp runs before the spawn that announces the child: the list is the
+        // child's once it is.
+        record(Ev::Block, a, t, nullptr, static_cast<uint8_t>(how), 0);
+        g.ramp.at(a).push_back(t);
+        return;
+    }
+    Act* act = find("R5.3", a, "block event");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::Block, a, t, act->park, static_cast<uint8_t>(how), 0);
+    switch (how) {
+        case RT_TRACE_BLOCK_ENTER:
+            if (!g.finished) {
+                block_enter(a, *act, t);
+            }
+            break;
+        case RT_TRACE_BLOCK_EXIT: {
+            const auto it = std::find(act->blocks.begin(), act->blocks.end(), t);
+            if (it == act->blocks.end()) {
+                if (!g.finished) {
+                    fail("R23.1", "an activation unlinks its node from a list it is not on", a, "the list at " + address_text(t));
+                }
+                return;
+            }
+            act->blocks.erase(it);
+            // Leaving the block is the poll that obeys a disable of it.
+            size_t kept = 0;
+            for (size_t i = 0; i < act->marks.size(); ++i) {
+                if (act->marks[i].target != t) {
+                    act->marks[kept++] = act->marks[i];
+                }
+            }
+            act->marks.resize(kept);
+            break;
+        }
+        case RT_TRACE_BLOCK_INHERIT: act->inherits.push_back(t); break;
+        default: break;
+    }
+}
+
+extern "C" void rt_trace_disable(void* a_, const void* target) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    // An earlier `disable`'s walk is over by now.
+    settle_aborts();
+    if (g.halted) {
+        return;
+    }
+    const uintptr_t t = reinterpret_cast<uintptr_t>(target);
+    record(Ev::Disable, norm(a_), t, nullptr, 0, 0);
+    if (g.finished) {
+        return;
+    }
+    // Every occupant of the list is on its way to be marked by the walk that follows: one it
+    // misses runs on (R23.2).
+    const std::vector<uintptr_t>* v = g.occ.find(t);
+    if (v == nullptr) {
+        return;
+    }
+    for (const uintptr_t w : *v) {
+        const Act* act = g.acts.find(w);
+        if (act == nullptr || act->state == State::Ended || !has_block(*act, t)) {
+            continue;
+        }
+        bool known = false;
+        for (const AbortOwed& o : g.abort_owed) {
+            known = known || (o.act == w && o.target == t);
+        }
+        if (!known) {
+            g.abort_owed.push_back(AbortOwed{ w, t });
+        }
+    }
+}
+
+extern "C" void rt_trace_abort(void* a_, const void* target, uint32_t kind) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.aborts;
+    ++g.total.aborts;
+    const uintptr_t a   = norm(a_);
+    const uintptr_t t   = reinterpret_cast<uintptr_t>(target);
+    Act*            act = find("R5.3", a, "abort");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::Abort, a, t, act->park, static_cast<uint8_t>(kind), 0);
+    if (g.finished) {
+        return;
+    }
+    // The walk reached it.
+    for (size_t i = 0; i < g.abort_owed.size(); ++i) {
+        if (g.abort_owed[i].act == a && g.abort_owed[i].target == t) {
+            g.abort_owed.erase(g.abort_owed.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    for (const Mark& m : act->marks) {
+        if (m.target == t && m.kind == kind) {
+            return;
+        }
+    }
+    act->marks.push_back(Mark{ t, static_cast<uint8_t>(kind) });
+}
+
+extern "C" void rt_trace_once(uint32_t kind) {
+    if (g.halted) {
+        return;
+    }
+    g.once = kind;
 }
 
 extern "C" void rt_trace_slot(uint64_t now) {
@@ -1676,6 +2287,25 @@ extern "C" void rt_trace_slot_end(void) {
     }
     if (closure("the slot ends", false)) {
         return;
+    }
+    // Time advances only when every region is empty (R1.2). A slot with no region reported (a hand-built
+    // sequence; a run always enters the Active region) has no region that was left.
+    if (!g.finished && g.region != RT_TRACE_REG_PREPONED) {
+        if (left_with_work("the slot ends", true, true, true)) {
+            return;
+        }
+        // A pended `$strobe` runs in the Postponed region of its slot (R4.2).
+        if (g.strobes_owed > 0) {
+            const uintptr_t who = first_act([](const Act& act) { return act.strobe_owed; });
+            fail("R4.2", "a $strobe pended in this slot never ran: its Postponed region did not drain it", who, "");
+            return;
+        }
+        // A continuously active process is evaluated at time zero (R15).
+        if (g.slot_no == 0 && g.zero_owed > 0) {
+            const uintptr_t who = first_act([](const Act& act) { return act.zero_owed; });
+            fail("R15.1", "a continuously active process was not evaluated at time zero: the seed never ran it", who, "");
+            return;
+        }
     }
     poll_waiters();
 }
@@ -1714,6 +2344,55 @@ extern "C" void rt_trace_region(uint32_t region) {
         touch_run();
     }
     record(Ev::Region, 0, 0, nullptr, static_cast<uint8_t>(region), 0);
+    if (region != RT_TRACE_REG_FINAL && !g.finished) {
+        const uint32_t from = g.region;
+        if (!legal_region_step(from, region)) {
+            fail("R1.1",
+                 std::string("the ") + region_name(region) + " region begins after the " + region_name(from) +
+                   " region, which it does not follow",
+                 0, "");
+            return;
+        }
+        // A region begins with every earlier one empty (R1.2), and a batch of `#0` is promoted whole
+        // (R2.2).
+        const auto batch_left = [&](bool reactive) {
+            if (g.n_zero[reactive ? 1 : 0] == 0) {
+                return false;
+            }
+            const uintptr_t who = first_act([&](const Act& act) { return zero_parked(act) && act.home_reactive == reactive; });
+            fail("R2.2", "a #0 was left out of the promotion of its batch: every process parked at a #0 becomes active together", who,
+                 "still parked at a #0 once the batch was promoted");
+            return true;
+        };
+        bool failed = false;
+        switch (region) {
+            case RT_TRACE_REG_ACTIVE: failed = from == RT_TRACE_REG_INACTIVE && batch_left(false); break;
+            case RT_TRACE_REG_INACTIVE:
+                failed = from == RT_TRACE_REG_ACTIVE && left_with_work("the Inactive region begins", true, false, false);
+                break;
+            case RT_TRACE_REG_OBSERVED:
+                failed = from == RT_TRACE_REG_ACTIVE && left_with_work("the Observed region begins", true, false, true);
+                break;
+            case RT_TRACE_REG_REACTIVE:
+                if (from == RT_TRACE_REG_RE_INACTIVE) {
+                    failed = batch_left(true);
+                } else if (from == RT_TRACE_REG_ACTIVE || from == RT_TRACE_REG_OBSERVED) {
+                    failed = left_with_work("the Reactive region begins", true, false, true);
+                }
+                break;
+            case RT_TRACE_REG_RE_INACTIVE:
+                failed = from == RT_TRACE_REG_REACTIVE && left_with_work("the Re-Inactive region begins", false, true, false);
+                break;
+            case RT_TRACE_REG_POSTPONED:
+                failed = (from == RT_TRACE_REG_ACTIVE || from == RT_TRACE_REG_OBSERVED || from == RT_TRACE_REG_REACTIVE) &&
+                         left_with_work("the Postponed region begins", true, true, true);
+                break;
+            default: break;
+        }
+        if (failed) {
+            return;
+        }
+    }
     switch (region) {
         case RT_TRACE_REG_OBSERVED:
         case RT_TRACE_REG_REACTIVE:
@@ -1888,6 +2567,11 @@ extern "C" void rt_trace_nba_pass(uint32_t begin, uint32_t region) {
              std::string("the ") + region_name(region) + " region begins from the " + region_name(g.region) +
                " region, not from the " + region_name(from) + " region it follows",
              0, "");
+        return;
+    }
+    // The NBA region begins with the Active region and the Inactive batch empty (R1.2); the Re-NBA
+    // region's own bodies wake what is queued when its pass begins.
+    if (region == RT_TRACE_REG_NBA && !g.finished && left_with_work("the NBA region begins", true, false, true)) {
         return;
     }
     g.in_pass     = true;
