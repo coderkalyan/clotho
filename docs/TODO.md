@@ -401,8 +401,6 @@ Milestones, in order; lower ones unblock higher ones:
   call or concatenation source, is refused.
 - [ ] **Bit-stream casting** (6.24.3) — `{<<{...}}` / `{>>{...}}` as cast operands, and a cast
   from a queue or dynamic array to a packed type.
-- [ ] **Open question: `$cast` into a packed tagged union** (11.9) — the bit cast is not
-  tag-checked and can install a tag/payload pair no `tagged` expression builds; is that legal?
 
 ### Operators & expressions
 
