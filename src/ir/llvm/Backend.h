@@ -2292,11 +2292,25 @@ private:
     // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
     void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
 
+    // What the seed reports of a guarded group's members (S9): each member's own list (`n` entries at
+    // `list`), how many members there are (zero: the group is not guarded) and whether no two events of
+    // the group share a trigger bit.
+    struct TraceMembers {
+        llvm::Value* list;
+        llvm::Value* n;
+        llvm::Value* members;
+        llvm::Value* exact;
+    };
+
     // The seed's reports of one row: the spawn of its handle `h`, its static list (`n` entries at
-    // `list`, from the IR's wait events) and, when `parked_now` (an i1), its park at the static
-    // control `ctl`, which is where a group that is not queued now waits.
+    // `list`, from the IR's wait events), its members and, when `parked_now` (an i1), its park at the
+    // static control `ctl`, which is where a group that is not queued now waits.
     void emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list, llvm::Value* n,
-                             llvm::Value* parked_now);
+                             llvm::Value* parked_now, const TraceMembers& members);
+
+    // Member `index` of the guarded group being lowered starts its body (S9): a thunk row names the
+    // group by its wake pair, a coroutine by its handle.
+    void emit_trace_member(uint32_t index);
 
     // One event the seed links a persistent waiter onto joins the static list of the group `h`.
     void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);

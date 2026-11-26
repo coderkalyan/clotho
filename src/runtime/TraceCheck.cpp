@@ -68,6 +68,7 @@ enum class Ev : uint8_t {
     Fork,
     ChildDone,
     Join,
+    Member,
 };
 
 struct Entry {
@@ -96,6 +97,24 @@ struct Mark {
 struct AbortOwed {
     uintptr_t act;
     uintptr_t target;
+};
+
+// One entry of a member's own list in a guarded group (S9): the member lists the storage at `x` for `edge`.
+struct MEntry {
+    uintptr_t x;
+    uint32_t  edge;
+    uint32_t  member;
+};
+
+// What a member of a guarded group did in the activation under way: bit 0, a write of its own list owes
+// it a run (and what the write was); bit 1, it ran.
+constexpr uint8_t kMemberOwed = 1;
+constexpr uint8_t kMemberRan  = 2;
+
+struct MState {
+    uint8_t   bits = 0;
+    uintptr_t x    = 0;
+    uint32_t  edge = 0;
 };
 
 struct Act {
@@ -142,6 +161,14 @@ struct Act {
     uintptr_t               forked    = 0;
     uintptr_t               member_of = 0;
     bool                    completed = false;
+    // S9: how many members a guarded group has (zero: it is not one), each member's own list sorted by
+    // storage, what each did in this activation, whether no two events of the group share a trigger bit,
+    // and whether a wake in this activation named no trigger, which sets every bit and runs every member.
+    uint32_t                members = 0;
+    bool                    exact   = false;
+    bool                    all_ok  = false;
+    std::vector<MEntry>     mentries;
+    std::vector<MState>     mstate;
 };
 
 // A table from an address to a value, by open addressing: an activation per frame
@@ -519,6 +546,7 @@ const char* ev_name(Ev ev) {
         case Ev::Fork: return "fork";
         case Ev::ChildDone: return "child done";
         case Ev::Join: return "join";
+        case Ev::Member: return "member";
     }
     return "?";
 }
@@ -537,7 +565,8 @@ bool is_act_event(Ev ev) {
         case Ev::Abort:
         case Ev::Fork:
         case Ev::ChildDone:
-        case Ev::Join: return true;
+        case Ev::Join:
+        case Ev::Member: return true;
         default: return false;
     }
 }
@@ -624,6 +653,8 @@ const char* rule_title(const char* rule) {
         { "R22.2", "child completion" },
         { "R22.3", "join wake" },
         { "R22.4", "join" },
+        { "R5.5", "member run" },
+        { "R6.4", "member run owed" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -768,6 +799,7 @@ std::string rec_text(const Rec& r) {
         case Ev::Fork: out += std::string(": ") + join_name(r.cause) + " on the record at " + address_text(r.x); break;
         case Ev::ChildDone: out += " into the record at " + address_text(r.x); break;
         case Ev::Join: out += " past the join of the record at " + address_text(r.x); break;
+        case Ev::Member: appendf(out, ": member %llu starts", static_cast<unsigned long long>(r.x)); break;
         default: break;
     }
     return out;
@@ -1493,6 +1525,70 @@ void watch_add(const void* x_, uintptr_t a) {
     v.push_back(a);
 }
 
+// The entries of member `i`'s own list, for a report.
+std::string member_list_text(const Act& act, uint32_t i) {
+    std::string out;
+    int         n = 0;
+    for (const MEntry& e : act.mentries) {
+        if (e.member != i) {
+            continue;
+        }
+        if (n++ == 8) {
+            return out + ", ...";
+        }
+        out += n == 1 ? "" : ", ";
+        out += std::string(edge_name(e.edge)) + " " + signal_text(reinterpret_cast<const void*>(e.x));
+    }
+    return n == 0 ? "nothing" : out;
+}
+
+// A write of `x` satisfies the entries of the guarded group's members that it satisfies: each such member is
+// owed a run in this activation, unless it has run in it already (S9). A fused group runs its producers before
+// its consumers, so a write that comes after a member ran finds it past, and owes it nothing in this activation.
+void owe_members(Act& act, uintptr_t x, bool pos, bool neg, bool any) {
+    const auto first = std::lower_bound(act.mentries.begin(), act.mentries.end(), x,
+                                        [](const MEntry& e, uintptr_t v) { return e.x < v; });
+    for (auto it = first; it != act.mentries.end() && it->x == x; ++it) {
+        const bool hit = (it->edge == RT_TRACE_ANY && any) || (it->edge == RT_TRACE_POS && pos) ||
+                         (it->edge == RT_TRACE_NEG && neg);
+        if (!hit || it->member >= act.members) {
+            continue;
+        }
+        MState& s = act.mstate[it->member];
+        if (act.state == State::Running && (s.bits & kMemberRan) != 0) {
+            continue;
+        }
+        if ((s.bits & kMemberOwed) == 0) {
+            s.x    = x;
+            s.edge = it->edge;
+        }
+        s.bits |= kMemberOwed;
+    }
+}
+
+// The activation of a guarded group parks at its static control again: every member that a write owed a run
+// has run (R6.4), and the next activation starts from nothing. Returns false after a violation.
+bool settle_members(uintptr_t a, Act& act) {
+    bool ok = true;
+    for (uint32_t j = 0; j < act.members && ok && !g.finished; ++j) {
+        const MState& s = act.mstate[j];
+        if ((s.bits & (kMemberOwed | kMemberRan)) == kMemberOwed) {
+            std::string what;
+            appendf(what, "member %u of the %u members of a fused group did not run before the group went back to sleep", j,
+                    act.members);
+            fail("R6.4", what, a,
+                 std::string(edge_name(s.edge)) + " " + signal_text(reinterpret_cast<const void*>(s.x)) +
+                   " changed while the group ran or waited, and the member lists it (" + member_list_text(act, j) + ")");
+            ok = false;
+        }
+    }
+    for (MState& s : act.mstate) {
+        s = MState{};
+    }
+    act.all_ok = false;
+    return ok;
+}
+
 // A write (or, for `obj`, a trigger) of `x`: each activation parked at a control that lists an
 // entry the change satisfies is owed a wake before the next dispatch, park or region.
 void owe(const void* x_, bool pos, bool neg, bool any, bool obj) {
@@ -1502,7 +1598,10 @@ void owe(const void* x_, bool pos, bool neg, bool any, bool obj) {
         return;
     }
     for (const uintptr_t a : *v) {
-        const Act* act = g.acts.find(a);
+        Act* act = g.acts.find(a);
+        if (act != nullptr && act->members != 0 && !obj) {
+            owe_members(*act, x, pos, neg, any);
+        }
         if (act == nullptr || act->state != State::Parked || act->park == nullptr) {
             continue;
         }
@@ -1807,6 +1906,11 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
     act.forked    = 0;
     act.member_of = 0;
     act.completed = false;
+    act.members = 0;
+    act.exact   = false;
+    act.all_ok  = false;
+    act.mentries.clear();
+    act.mstate.clear();
     // A thread's home is a program's or a design's by where it starts (R25); what it forks or
     // calls takes the home of the thread that does.
     switch (kind_of(origin)) {
@@ -1918,6 +2022,10 @@ extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t arg)
              a,
              m.kind == RT_TRACE_ABORT_KILL ? std::string("marked by a kill of its thread")
                                            : "marked by a disable of the list at " + address_text(m.target));
+        return;
+    }
+    // A guarded group goes back to sleep: the members its writes owed a run have run (R6.4).
+    if (act->members != 0 && kind == RT_TRACE_CTL_STATIC && !settle_members(a, *act)) {
         return;
     }
     count(*act, -1);
@@ -2053,6 +2161,10 @@ extern "C" void rt_trace_wake(void* a_, uint32_t cause_word, const void* x, uint
     act->ring         = queue;
     act->queued_at    = g.seq;
     act->queued_cause = static_cast<uint8_t>(cause);
+    // A wake that names no trigger sets every bit of a guarded group, which then runs every member (S9).
+    if (act->members != 0 && cause != RT_TRACE_STATIC) {
+        act->all_ok = true;
+    }
     count(*act, +1);
     // A procedure the seed queues has to run before a late group's first run (R17).
     if (cause == RT_TRACE_SEED && has_fact(*act, RT_TRACE_ORG_PROCEDURE) && !act->proc_owed) {
@@ -2459,6 +2571,61 @@ extern "C" void rt_trace_join(void* a_, const void* rec_) {
         appendf(text, "%u of the %u children had completed", f->done, f->width);
         fail("R22.4", std::string("the parent of a ") + join_name(f->kind) + " went on before its children had completed", a, text);
     }
+}
+
+extern "C" void rt_trace_members(void* a_, const rt_trace_member_entry* list, uint32_t n, uint32_t members, uint32_t exact) {
+    if (g.halted) {
+        return;
+    }
+    Act* act = find("R5.3", norm(a_), "member list");
+    if (act == nullptr) {
+        return;
+    }
+    act->members = members;
+    act->exact   = exact != 0;
+    act->all_ok  = false;
+    act->mentries.clear();
+    for (uint32_t i = 0; i < n; ++i) {
+        act->mentries.push_back(MEntry{ reinterpret_cast<uintptr_t>(list[i].x), list[i].edge, list[i].member });
+    }
+    std::sort(act->mentries.begin(), act->mentries.end(), [](const MEntry& l, const MEntry& r) { return l.x < r.x; });
+    act->mstate.assign(members, MState{});
+}
+
+extern "C" void rt_trace_member(void* a_, uint32_t i) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    const uintptr_t a   = norm(a_);
+    Act*            act = find("R5.3", a, "member run");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::Member, a, i, act->park, 0, 0);
+    if (i >= act->members) {
+        std::string what;
+        appendf(what, "member %u", i);
+        fail("R5.3", "a member of a guarded group runs, and the seed did not report its members: a group the trace does not report",
+             a, what);
+        return;
+    }
+    ++g.run.member_runs;
+    ++g.total.member_runs;
+    if (g.finished) {
+        return;
+    }
+    MState& s = act->mstate[i];
+    // The guard lets a member through on a bit of its own, or on every bit a wake that names no trigger sets;
+    // where two events of the group share a bit, a sibling's event does the same (S9).
+    if (!act->all_ok && act->exact && (s.bits & kMemberOwed) == 0) {
+        std::string what;
+        appendf(what, "member %u of the %u members of a fused group ran, and none of its own events fired in this activation: its guard let it through", i,
+                act->members);
+        fail("R5.5", what, a, "the member lists " + member_list_text(*act, i));
+        return;
+    }
+    s.bits = static_cast<uint8_t>((s.bits & ~kMemberOwed) | kMemberRan);
 }
 
 extern "C" void rt_trace_once(uint32_t kind) {

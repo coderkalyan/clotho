@@ -532,7 +532,7 @@ void Backend::emit_trace_thunk_park(llvm::Value* wake, const std::string& where)
 }
 
 void Backend::emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list,
-                                  llvm::Value* n, llvm::Value* parked_now) {
+                                  llvm::Value* n, llvm::Value* parked_now, const TraceMembers& members) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     auto* const ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* const i32  = b_.getInt32Ty();
@@ -540,9 +540,18 @@ void Backend::emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Val
     b_.CreateCall(rt_fn("rt_trace_spawn", b_.getVoidTy(), { ptr, ptr, ptr }),
                   { h, origin, llvm::ConstantPointerNull::get(ptr) });
     b_.CreateCall(rt_fn("rt_trace_subscribe", b_.getVoidTy(), { ptr, ptr, i32 }), { h, list, n });
-    llvm::Function* fn   = b_.GetInsertBlock()->getParent();
-    auto* const     park = llvm::BasicBlock::Create(ctx_, "trace.park", fn);
-    auto* const     done = llvm::BasicBlock::Create(ctx_, "trace.parked", fn);
+    llvm::Function* fn      = b_.GetInsertBlock()->getParent();
+    auto* const     guarded = llvm::BasicBlock::Create(ctx_, "trace.members", fn);
+    auto* const     park    = llvm::BasicBlock::Create(ctx_, "trace.park", fn);
+    auto* const     done    = llvm::BasicBlock::Create(ctx_, "trace.parked", fn);
+    auto* const     decided = llvm::BasicBlock::Create(ctx_, "trace.membered", fn);
+    // Only a guarded group has members to report.
+    b_.CreateCondBr(b_.CreateICmpNE(members.members, b_.getInt32(0)), guarded, decided);
+    b_.SetInsertPoint(guarded);
+    b_.CreateCall(rt_fn("rt_trace_members", b_.getVoidTy(), { ptr, ptr, i32, i32, i32 }),
+                  { h, members.list, members.n, members.members, members.exact });
+    b_.CreateBr(decided);
+    b_.SetInsertPoint(decided);
     b_.CreateCondBr(parked_now, park, done);
     b_.SetInsertPoint(park);
     b_.CreateCall(rt_fn("rt_trace_park", b_.getVoidTy(), { ptr, ptr, i64 }), { h, ctl, b_.getInt64(0) });
@@ -555,6 +564,25 @@ void Backend::emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Val
     (void)list;
     (void)n;
     (void)parked_now;
+    (void)members;
+#endif
+}
+
+void Backend::emit_trace_member(uint32_t index) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i64 = b_.getInt64Ty();
+    // A thunk row is no coroutine: its activation is the wake pair its flag points at, with bit 0 set
+    // (emit_trace_thunk_park).
+    llvm::Value* a = hdl_ != nullptr
+                       ? static_cast<llvm::Value*>(hdl_)
+                       : b_.CreateIntToPtr(b_.CreateOr(b_.CreatePtrToInt(sched_ptr_, i64), b_.getInt64(1)), ptr);
+    b_.CreateCall(rt_fn("rt_trace_member", b_.getVoidTy(), { ptr, b_.getInt32Ty() }), { a, b_.getInt32(index) });
+#else
+    (void)index;
 #endif
 }
 

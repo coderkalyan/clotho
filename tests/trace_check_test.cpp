@@ -100,7 +100,7 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_nba_create", "rt_trace_nba_stage", "rt_trace_nba_release", "rt_trace_nba_pass",
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
                               "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
-                              "rt_trace_fork", "rt_trace_child_done", "rt_trace_join" }) {
+                              "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -2550,5 +2550,136 @@ TEST_CASE("trace check: a child completes once into the record of the fork that 
     rt_trace_join(kParent, &rec_a);
     CHECK(rule() == "R22.4");
     CHECK(has(rt_trace_report(), "0 of the 1 children had completed"));
+}
+
+// S9: the members of a fused group, each guarded on its own sensitivity (B15). The group is proc_a and lists `in_sig`
+// and `mid_sig` for any change; member 0 reads `in_sig` and writes `mid_sig`, and member 1 lists `mid_sig`.
+namespace {
+
+int in_sig, mid_sig;
+
+// A bracket that names no signal, so the names the lists gave are the ones a report uses.
+const rt_trace_change_site kPlain{ "design.sv:8:3", nullptr, RT_TRACE_CHG_STORE };
+
+const rt_trace_member_entry kMembers[] = { { &in_sig, RT_TRACE_ANY, 0 }, { &mid_sig, RT_TRACE_ANY, 1 } };
+
+// The seed's reports of the group: its static list, its members, its park at the static control.
+// A group that the seed does not queue waits at its static control; one it queues does not.
+void seeded_group(void* a, uint32_t exact, bool parked = true) {
+    const rt_trace_entry list[] = { { &in_sig, "in", RT_TRACE_ANY, nullptr }, { &mid_sig, "mid", RT_TRACE_ANY, nullptr } };
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_subscribe(a, list, 2);
+    rt_trace_members(a, kMembers, 2, 2, exact);
+    if (parked) {
+        rt_trace_park(a, &kStatic, 0);
+    }
+}
+
+// `x` changes, the group is woken by it and dispatched.
+void woken_by(void* a, int* x) {
+    rt_trace_change(&kPlain, x, RT_TRACE_SEEN_LEVEL);
+    rt_trace_wake(a, RT_TRACE_STATIC, x, RT_TRACE_ANY);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+}
+
+} // namespace
+
+TEST_CASE("trace check: a member of a fused group runs when a change satisfies its own list, and that includes a change a member before it made (S9, B15)") {
+    void* a = &proc_a;
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    // `in` wakes the group; member 0 runs and writes `mid`, which hands member 1 its trigger bit although the group is
+    // already running; both run, and the group goes back to sleep.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.member_runs == before.member_runs + 2);
+
+    // The next activation is the group's own again: woken by `mid` alone, only member 1 is owed.
+    woken_by(a, &mid_sig);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    // B15: the guard tested the word as it was when the group began, so member 1 never saw the bit that member 0's
+    // write gave it, and the group went back to sleep without running it.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rule() == "R6.4");
+    CHECK(has(rt_trace_report(), "member 1 of the 2"));
+    CHECK(has(rt_trace_report(), "did not run before the group went back to sleep"));
+    CHECK(has(rt_trace_report(), "mid"));
+
+    // A change that arrives while the group is parked or queued is owed to its member too.
+    seeded_group(a, 1);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_wake(a, RT_TRACE_STATIC, &mid_sig, RT_TRACE_ANY);
+    rt_trace_change(&kPlain, &in_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rule() == "R6.4");
+    CHECK(has(rt_trace_report(), "member 0 of the 2"));
+
+    // A member that has run is not owed a second run by a change that comes after it: the producer is before its
+    // consumers in a fused group, and a later write finds the member already past.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_member(a, 1);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a member of a fused group does not run unless one of its own events fired, a wake that names none excepted (S9)") {
+    void* a = &proc_a;
+    // Member 1 runs, and only `in` changed.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_member(a, 1);
+    CHECK(rule() == "R5.5");
+    CHECK(has(rt_trace_report(), "none of its own events fired"));
+    CHECK(has(rt_trace_report(), "any change of mid"));
+
+    // Trigger bits shared by two events of the group let a sibling's event run a member: no member run is then
+    // unjustified.
+    seeded_group(a, 0);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    // A wake that cannot name its trigger sets every bit and runs every member: the seed's time-zero run.
+    seeded_group(a, 1, false);
+    rt_trace_wake(a, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_member(a, 0);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    // A member run of a group whose members the seed did not report.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_member(a, 0);
+    CHECK(rule() == "R5.3");
+    CHECK(has(rt_trace_report(), "did not report its members"));
 }
 #endif // CLOTHO_EXTRA_ASSERTS

@@ -346,6 +346,14 @@ typedef struct rt_trace_nba_site {
     uint32_t bits1;
 } rt_trace_nba_site;
 
+// One entry of a guarded group's member lists (S9): member `member` of the group lists the storage at `x`
+// for `edge` (RT_TRACE_POS ...), which is the sensitivity its guard tests.
+typedef struct rt_trace_member_entry {
+    const void* x;
+    uint32_t    edge;
+    uint32_t    member;
+} rt_trace_member_entry;
+
 // What a run reported, for the suite's summary line.
 typedef struct rt_trace_counts {
     uint64_t runs;
@@ -368,6 +376,8 @@ typedef struct rt_trace_counts {
     // Forks, and the joins their parents passed.
     uint64_t forks;
     uint64_t joins;
+    // Members of guarded groups that ran (S9).
+    uint64_t member_runs;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -391,6 +401,15 @@ void rt_trace_subscribe(void* a, const rt_trace_entry* list, uint32_t n);
 
 // The same for one event object, found when the seed links the persistent node.
 void rt_trace_subscribe_event(void* a, const void* obj, const char* name);
+
+// The members of the guarded group `a` (S9): `list` is each member's own sensitivity as the IR gives it (an
+// event object is not listed), `members` the number of members. `exact` says that no two events of the group
+// share a trigger bit, so a member runs only when one of its own events fired or the wake named none;
+// otherwise a sibling's event that shares its bit runs it too.
+void rt_trace_members(void* a, const rt_trace_member_entry* list, uint32_t n, uint32_t members, uint32_t exact);
+
+// Member `i` of the guarded group `a` starts its body in this activation.
+void rt_trace_member(void* a, uint32_t i);
 
 // Add one entry to the list of the park that follows, at a RT_TRACE_CTL_EVENT control: the
 // activation `a` waits for `x` (`shape`: as rt_trace_entry's).

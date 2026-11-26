@@ -263,6 +263,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_dynarr_temps();
             build_agg_elem_temps();
             llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
+            if (takes_flag) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -545,6 +548,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
             llvm::BasicBlock* join = open_guard(guarded, g_, i);
+            if (guarded) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
