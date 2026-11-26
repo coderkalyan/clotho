@@ -42,18 +42,10 @@ struct Result {
     rt_gc_stats stats = {};
 };
 
-// Lower `source` at IEEE 1800-2023, run it in this process and return what it
-// printed with the collector's counters. slang offers std::weak_reference only at
-// that language version, which lower_text does not select, so the design goes
-// through the driver from a file.
+// Lower `source`, run it in this process and return what it printed with the
+// collector's counters.
 Result run(std::string_view source, const ir::SimulationConfig& config) {
-    const fs::path path = fs::temp_directory_path() / (test::detail::unique_stem() + ".sv");
-    std::ofstream(path) << source;
-    const std::string      file   = path.string();
-    const std::string_view args[] = { "--std=1800-2023", file };
-    const LowerResult      r      = lower_sources(args);
-    std::error_code        ec;
-    fs::remove(path, ec);
+    const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
@@ -79,7 +71,8 @@ Result run(std::string_view source, const ir::SimulationConfig& config) {
     return result;
 }
 
-// The diagnostics of a design that must not lower.
+// The diagnostics of a design that must not lower, at the language version named.
+// A version is an option of the driver, which reads its source from a file.
 std::string refused(std::string_view source, std::string_view std_arg) {
     const fs::path path = fs::temp_directory_path() / (test::detail::unique_stem() + ".sv");
     std::ofstream(path) << source;
