@@ -1240,6 +1240,11 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     // (p - lo_word) * leaves.
     RowOrder      order(inner, inner_dims);
     const int64_t leaves = order.leaves();
+    // The numbers the range the task names holds, one for each leaf of each of its words. A
+    // file of another count is warned of, unless it gives addresses of its own (LRM 21.4).
+    const __int128 range_words =
+      dir > 0 ? static_cast<__int128>(end) - addr + 1 : static_cast<__int128>(addr) - end + 1;
+    const __int128 expected = (range_words > 0 ? range_words : 0) * leaves;
 
     const MemDest dest{ mm_base,
                         z_base,
@@ -1273,6 +1278,11 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     bool    in_row = false;
     bool    row_ok = false;
     int64_t row    = 0;
+    // The numbers of the file seen, whether it gives an address of its own, and whether an
+    // error or the end of the range cut it short.
+    int64_t numbers = 0;
+    bool    saw_at  = false;
+    bool    cut     = false;
 
     const size_t n = buf.size();
     size_t       i = 0;
@@ -1304,6 +1314,7 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             for (int d; i < n && (d = hex_digit(buf[i])) >= 0; ++i) {
                 a = a * 16 + static_cast<uint64_t>(d);
             }
+            saw_at = true;
             // The address has to lie in the range the task names (LRM 21.4); one outside it
             // ends the load, and what was loaded before it stays.
             const auto at = static_cast<int64_t>(a);
@@ -1312,6 +1323,7 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
                                 fmt::format("{}: address {} in '{}' is outside the address range [{}:{}] of the load",
                                             task, at, path, range_a, end),
                                 "the load stopped there, and the words before it are loaded");
+                cut = true;
                 break;
             }
             // An address names a whole word of the highest dimension, so a word that
@@ -1366,11 +1378,13 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             ++i; // an unrecognized character; skip it and continue
             continue;
         }
+        ++numbers;
         if ((dir > 0 && addr > end) || (dir < 0 && addr < end)) {
             // Past the finish / highest address: the remaining file data is dropped.
             mem_load_report(site, false,
                             fmt::format("{}: '{}' holds more words than the range [{}:{}]", task, path, range_a, end),
                             "the extra words are ignored");
+            cut = true;
             break;
         }
         if (!in_row) {
@@ -1390,6 +1404,11 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             in_row = false;
             addr += dir;
         }
+    }
+    if (!cut && !saw_at && numbers < expected) {
+        mem_load_report(site, false,
+                        fmt::format("{}: '{}' holds fewer words than the range [{}:{}]", task, path, range_a, end),
+                        "the other words keep their value");
     }
     return changed;
 }

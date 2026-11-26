@@ -855,7 +855,7 @@ with the same file and arguments, and derive the rest from the clauses above.
 
 Code: `src/lower/SystemTasks.cpp` (`is_mem_target_shape`, `lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `finish_mem_load`), `src/runtime/Io.cpp` (`MemDest`, `rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1", "$fread into a dynamic array or a queue fills the words it holds", "$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements", "$readmemh into a slice of a dynamic array places its words like a fixed memory", "$readmemh into a dynamic array of fixed arrays, an element or a slice of one", "a load into an empty dynamic array or queue does nothing", "a load into a dynamic array or a queue wakes the waiters of its elements", "a load into a dynamic array local to a task"), `tests/runtime_test.cpp` ("rt_readmem walks the words of a queue's ring from its head slot").
 
-## 62. File addresses against the range a `$readmem*` names (21.4)
+## 62. File addresses and word counts against the range a `$readmem*` names (21.4)
 
 21.4: "When addressing information is specified both in the system task and in the data file, the
 addresses in the data file shall be within the address range specified by the system task
@@ -875,7 +875,19 @@ no file is opened. For a `start` or `finish` outside a whole memory or a row of 
 multi-dimensional one the clause says nothing, and that load is unchanged: the words whose
 address has no element are dropped, with a warning per address.
 
+21.4 also asks for a warning when "the number of data words in the file differs from the number
+of words in the range implied by the start through finish addresses and no address
+specifications appear within the data file", the words the file holds being loaded from the
+start address and the others left unmodified. Clotho warns of a file with fewer words once it
+has read it (`$readmemh: 'f.hex' holds fewer words than the range [0:7]`), and of one with
+more at the first extra word, which is ignored with the rest of the file. The second
+is also issued when the file has addresses, where the clause asks for nothing and the extra
+words have nowhere to go. A file with an `@` address, or a load that an error
+ended, is not short of words. For a memory of several dimensions a word of the file is a
+number, so the range holds one for each leaf of each of its rows (note 59); iverilog counts
+the flat leaves and warns differently there.
+
 iverilog 13 has no slice, so the slice tests take the whole-memory load with the same
 addresses as oracle for the words placed, and derive the errors from the clause.
 
-Code: `src/runtime/Io.cpp` (`rt_readmem`), `src/runtime/Reports.cpp` (`mem_load_report`), `src/ir/llvm/SystemTasks.cpp` (`lower_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem ends the load at a file address outside the range the task names", "$readmem into a slice with a start or finish outside its range loads nothing"). Oracle: iverilog 13 for the first.
+Code: `src/runtime/Io.cpp` (`rt_readmem`), `src/runtime/Reports.cpp` (`mem_load_report`), `src/ir/llvm/SystemTasks.cpp` (`lower_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem ends the load at a file address outside the range the task names", "$readmem into a slice with a start or finish outside its range loads nothing", "$readmem warns of a file with fewer or more words than its range unless it has addresses"). Oracle: iverilog 13 for the first and the third.

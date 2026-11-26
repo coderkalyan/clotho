@@ -5087,6 +5087,8 @@ TEST_CASE("$readmem ends the load at a file address outside the range the task n
     CHECK(has("ar5", 1, "[2:5]"));
     CHECK(has("ar6", 1, "[2:9]"));
     CHECK(count_substr(err, "error:") == 7);
+    // A load that an error ended, or whose file has addresses, is not short of words.
+    CHECK(err.find("holds fewer") == std::string::npos);
     for (int k = 1; k <= 6; ++k) {
         std::remove(("clotho_readmem_ar" + std::to_string(k) + ".hex").c_str());
     }
@@ -5138,6 +5140,59 @@ TEST_CASE("$readmem into a slice with a start or finish outside its range loads 
     CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [5:2]") == 1);
     CHECK(count_substr(err, "error:") == 6);
     std::remove("clotho_readmem_sl1.hex");
+}
+
+// A warning "shall be issued if the number of data words in the file differs from the number
+// of words in the range implied by the start through finish addresses and no address
+// specifications appear within the data file" (LRM 21.4). Oracle: iverilog 13 warns in the same
+// cases for a memory, and names the same range. It does not for a memory of several
+// dimensions, whose words it counts as flat leaves; here a word of the file is a number, so
+// the range of a row of three holds three (note 59 of docs/LRM_NOTES.md).
+TEST_CASE("$readmem warns of a file with fewer or more words than its range unless it has addresses") {
+    write_file("clotho_readmem_wc1.hex", "a1 a2\n");
+    write_file("clotho_readmem_wc2.hex", "a1 a2 a3 a4 a5 a6 a7 a8 a9\n");
+    write_file("clotho_readmem_wc3.hex", "@1 a1 a2\n");
+    write_file("clotho_readmem_wc4.hex", "a1 a2 a3 a4 a5 a6\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] mem [0:7];
+            logic [7:0] a [0:7];
+            logic [7:0] m2 [0:1][0:2];
+            initial begin
+                $readmemh("@W1@", mem);
+                $readmemh("@W2@", mem);
+                $readmemh("@W1@", mem, 3);
+                $readmemh("@W2@", mem, 3);
+                $readmemh("@W3@", mem, 0, 7);
+                $readmemh("@W1@", mem, 4, 5);
+                $readmemh("@W1@", mem, 5, 2);
+                $readmemh("@W1@", a[2:5]);
+                $readmemh("@W4@", m2);
+                $readmemh("@W1@", m2);
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 4; ++k) {
+        design = with_path(design, "@W" + std::to_string(k) + "@", "clotho_readmem_wc" + std::to_string(k) + ".hex");
+    }
+    const std::string err = run_capture_stderr(design);
+    const auto        has = [&](const char* kind, const char* file, const char* range) {
+        return err.find(std::string("warning: $readmemh: 'clotho_readmem_") + file + ".hex' holds " + kind +
+                        " words than the range " + range) != std::string::npos;
+    };
+    CHECK(has("fewer", "wc1", "[0:7]"));
+    CHECK(has("more", "wc2", "[0:7]"));
+    CHECK(has("fewer", "wc1", "[3:7]"));
+    CHECK(has("more", "wc2", "[3:7]"));
+    CHECK(has("fewer", "wc1", "[5:2]"));
+    CHECK(has("fewer", "wc1", "[2:5]"));
+    CHECK(has("fewer", "wc1", "[0:1]"));
+    CHECK(count_substr(err, "warning:") == 7);
+    CHECK(count_substr(err, "holds fewer") == 5);
+    CHECK(count_substr(err, "holds more") == 2);
+    for (int k = 1; k <= 4; ++k) {
+        std::remove(("clotho_readmem_wc" + std::to_string(k) + ".hex").c_str());
+    }
 }
 
 // What a memory load still refuses, loudly: an associative array (LRM 21.4.1 makes its
