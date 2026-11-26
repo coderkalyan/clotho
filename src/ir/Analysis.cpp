@@ -1667,12 +1667,17 @@ struct ValueSweep {
 
                 case Inst::Tag::ReadMem: {
                     // Seed 3: the file may contain x and z digits. A 2-state memory
-                    // reads x/z as 0 and stays clean.
+                    // reads x/z as 0 and stays clean. A signal that holds the memory as
+                    // a member of a struct, or is a dynamic array or queue, has no
+                    // domain of its own, so what decides is a 4-state leaf anywhere
+                    // under its type. A class property and an interface member are not
+                    // rooted at a signal and report conservatively (HandleDeref,
+                    // IfaceSignal).
                     const ReadMemInfo info = ir.extra_data<ReadMemInfo>(p.op_extra.extra);
                     const Index       root = lvalue_root(ir, info.target).root;
                     if (ir.tag(root) == Inst::Tag::Signal) {
                         const auto sig = static_cast<uint32_t>(ir.payload(root).signal);
-                        if (m.pool.layout(m.signal(ir.payload(root).signal).type).domain == Domain::Four) {
+                        if (types::has_four_state_leaf(m.pool, m.signal(ir.payload(root).signal).type)) {
                             mark(sig_z[sig]);
                             mark(sig_x[sig]);
                         }

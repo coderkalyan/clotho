@@ -4794,7 +4794,81 @@ TEST_CASE("a load into a fixed array local to a task or bound to a ref argument"
     std::remove("clotho_readmem_ref_test.hex");
 }
 
-// What a memory load still refuses, loudly: a member of a struct, a class or an interface,
+// A member of an unpacked struct, or of an element of an array of them, is an array like
+// any other, laid out inside the struct: the load must leave the neighbouring members
+// alone, and the waiters of the struct hear it. Oracle: the same load of a fixed memory in
+// iverilog 13 (it has no unpacked struct), compared in the design; z digits are read back
+// to pin the may-z seed of a struct signal.
+TEST_CASE("$readmem and $fread into a struct member or a member of an array of structs") {
+    write_file("clotho_readmem_st_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_readmem_stz_test.bin", "0x01 1zzz\n");
+    write_file("clotho_fread_st_test.bin", std::string("\x11\x22\x33\x44\x55", 5));
+    const std::string src = R"(
+        module m;
+            typedef struct { int a; logic [7:0] mem [0:3]; shortint b; } s_t;
+            typedef struct { int a; logic [3:0] z [0:1]; } z_t;
+            s_t s;
+            s_t sa [0:2];
+            z_t zs;
+            logic [7:0] f [0:3];
+            integer i, k, same, fd, rc, at_e = -1, at_w = -1, at_sa = -1;
+            task automatic fresh;
+                s.a = 'haaaa5555; s.b = 16'h1234;
+                for (i = 0; i < 3; i = i + 1) begin sa[i].a = int'(i + 1); sa[i].b = 16'(i + 10); end
+                for (i = 0; i < 4; i = i + 1) begin s.mem[i] = 8'bx; f[i] = 8'bx; sa[0].mem[i] = 8'bx; sa[1].mem[i] = 8'bx; sa[2].mem[i] = 8'bx; end
+            endtask
+            task automatic show_s;
+                same = 1;
+                for (i = 0; i < 4; i = i + 1) begin
+                    $write("%h ", s.mem[i]);
+                    if (f[i] !== s.mem[i]) same = 0;
+                end
+                $display("same=%0d a=%h b=%h", same, s.a, s.b);
+            endtask
+            task automatic show_sa;
+                for (k = 0; k < 3; k = k + 1) begin
+                    for (i = 0; i < 4; i = i + 1) $write("%h", sa[k].mem[i]);
+                    $write("/%0d/%0d ", sa[k].a, sa[k].b);
+                end
+                $display("");
+            endtask
+            initial begin #1; @(s.mem[1]) at_e = $time; end
+            initial begin #1; @(sa[2].mem[3]) at_w = $time; end
+            initial begin
+                #5;
+                fresh; $readmemh("@A6@", s.mem); $readmemh("@A6@", f); show_s;
+                fresh; $readmemh("@A6@", s.mem, 1, 2); $readmemh("@A6@", f, 1, 2); show_s;
+                fresh; $readmemh("@A6@", s.mem, 3, 1); $readmemh("@A6@", f, 3, 1); show_s;
+                fresh; k = 3; $readmemh("@A6@", s.mem[k +: 2]); $readmemh("@A6@", f[k +: 2]); show_s;
+                fresh; $readmemh("@A6@", sa[2].mem); show_sa;
+                fresh; k = 7; $readmemh("@A6@", sa[k].mem); show_sa;
+                fresh; fd = $fopen("@B5@", "rb"); rc = $fread(s.mem, fd); $fclose(fd); $write("rc=%0d ", rc); show_s;
+                $readmemb("@Z@", zs.z);
+                $display("%b %b", zs.z[0], zs.z[1]);
+                $readmemh("@A6@", sa[2].mem);
+                #1 $display("%0d %0d", at_e, at_w);
+            end
+        endmodule
+    )";
+    const std::string design = with_path(with_path(with_path(src, "@A6@", "clotho_readmem_st_test.hex"), "@Z@",
+                                                   "clotho_readmem_stz_test.bin"),
+                                         "@B5@", "clotho_fread_st_test.bin");
+    CHECK(run_capture(design) ==
+          "11 22 33 44 same=1 a=aaaa5555 b=1234\n"
+          "xx 11 22 xx same=1 a=aaaa5555 b=1234\n"
+          "xx 33 22 11 same=1 a=aaaa5555 b=1234\n"
+          "xx xx xx 11 same=1 a=aaaa5555 b=1234\n"
+          "xxxxxxxx/1/10 xxxxxxxx/2/11 11223344/3/12 \n"
+          "xxxxxxxx/1/10 xxxxxxxx/2/11 xxxxxxxx/3/12 \n"
+          "rc=4 11 22 33 44 same=0 a=aaaa5555 b=1234\n"
+          "0x01 1zzz\n"
+          "5 5\n");
+    std::remove("clotho_readmem_st_test.hex");
+    std::remove("clotho_readmem_stz_test.bin");
+    std::remove("clotho_fread_st_test.bin");
+}
+
+// What a memory load still refuses, loudly: a member of a class or an interface,
 // an associative array (LRM 21.4.1 makes its addresses keys but does not say where a load
 // that names none starts) and a slice of a queue (7.10.1: a new queue, not a view of the
 // queue).
@@ -4808,8 +4882,7 @@ TEST_CASE("a memory load into a member, an associative array or a queue slice is
     refused("logic [7:0] q[$]; initial $readmemb(\"f.hex\", q[1:2]);");
     refused("logic [7:0] a[int]; integer fd, rc; initial rc = $fread(a, fd);");
     refused("logic [7:0] q[$]; integer fd, rc; initial rc = $fread(q[1:2], fd);");
-    refused("struct { int a; logic [7:0] m[0:3]; } s; initial $readmemh(\"f.hex\", s.m);");
-    refused("struct { int a; logic [7:0] m[0:3]; } s; integer fd, rc; initial rc = $fread(s.m, fd);");
+    refused("class C; logic [7:0] m[0:3]; endclass C c; initial $readmemh(\"f.hex\", c.m);");
 }
 
 // Slurp a file written by a file-I/O test.
