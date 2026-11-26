@@ -3163,9 +3163,10 @@ TEST_CASE("gc: a handle stored through a ref into a property of a promoted objec
     CHECK(yg.remembered > 0u);
 }
 
-// An OUTPUT formal of struct type is copied out by the callee through the pointer to the
-// actual, which is a property of a promoted object. The callee is a task, so a collection
-// runs between the call and the copy-out.
+// An OUTPUT formal of struct type bound to a property of a promoted object. The callee
+// copies its formal out to a temporary of the caller, and the caller assigns the temporary
+// to the property when the task returns, after the collections that ran while the task was
+// suspended: the store that puts the fresh object in the old one is the caller's.
 TEST_CASE("gc: a struct copied out through an output formal into a promoted object after a suspend survives") {
     constexpr std::string_view src      = R"(
         module m;
@@ -3215,6 +3216,62 @@ TEST_CASE("gc: a struct copied out through an output formal into a promoted obje
     CHECK(yg.young_collections > 0u);
     CHECK(yg.promoted > 0u);
     CHECK(yg.remembered > 0u);
+}
+
+// The same, with the actual an element of a queue the promoted object owns: a place with no
+// address a callee could be handed, since the queue is resized while the task is suspended.
+TEST_CASE("gc: a struct copied out through an output formal into a promoted object's queue element survives") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            typedef struct { Cell c; int n; } pair_t;
+            class Box; string name; pair_t q[$]; endclass
+            Box  box;
+            Junk sink;
+            function automatic void install();
+                pair_t none;
+                box      = new;
+                box.name = "long-lived-box";
+                box.q.push_back(none);
+            endfunction
+            task automatic make(output pair_t r, input int v);
+                Cell f;
+                #20;
+                f        = new;
+                f.v      = v;
+                f.tag    = "copied-out";
+                r.c      = f;
+                r.n      = v;
+                f        = null;
+            endtask
+            initial begin
+                pair_t none;
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    if (i >= 20 && i < 40) box.q.push_back(none);
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                install();
+                #20;
+                make(box.q[0], 777);
+                #20;
+                $display("%0d %0d %0d %s", box.q.size(), box.q[0].n, box.q[0].c.v, box.q[0].c.tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "21 777 777 copied-out\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
 }
 
 // `Holder` is allocated, and its property initializer allocates a `Leaf` before the store
