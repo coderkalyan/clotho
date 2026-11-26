@@ -349,6 +349,27 @@ struct Fork {
     uint32_t  done    = 0;
 };
 
+// An inertial record (R16) from the arm that made it until its update is applied or it is dropped: Live until a
+// later store supersedes it or the wheel fires it, Fired (and waiting for its site's commit) once the runtime
+// took it for the latest of its site, Done after.
+enum class IState : uint8_t { Live, Superseded, Fired, Done };
+
+struct InertRec {
+    uint32_t idx      = 0;
+    IState   state    = IState::Done;
+    uint64_t armed_at = 0;
+    uint64_t deadline = 0;
+    uint64_t epoch    = 0;
+};
+
+// What the checker holds of an inertial site (the dense id of its target): the record its latest arm made,
+// which nothing has superseded or fired, and the epoch its last decision asked a record to be armed with until
+// the arm that does.
+struct InertSite {
+    uintptr_t live   = 0;
+    uint64_t  expect = 0;
+};
+
 struct Checker {
     AddrMap<Act>         acts;
     AddrMap<const char*> names;
@@ -413,6 +434,13 @@ struct Checker {
     std::vector<AbortOwed>          abort_owed;
     // R22: the forks, by join record (a new fork on an address starts a new one).
     AddrMap<Fork>                   forks;
+    // R16: the inertial records by address and the sites by dense id; how many records are Live, how many fired
+    // and wait for a commit, and how many of those the wheel fired (they are due before the Active region).
+    AddrMap<InertRec>               inert;
+    std::vector<InertSite>          inert_sites;
+    int32_t                         inert_live          = 0;
+    int32_t                         inert_waiting       = 0;
+    int32_t                         inert_wheel_waiting = 0;
 };
 
 Checker g;
@@ -655,6 +683,11 @@ const char* rule_title(const char* rule) {
         { "R22.4", "join" },
         { "R5.5", "member run" },
         { "R6.4", "member run owed" },
+        { "R16.1", "inertial decision" },
+        { "R16.2", "inertial arm" },
+        { "R16.3", "inertial fire" },
+        { "R16.4", "inertial supersede" },
+        { "R16.5", "inertial apply" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -1384,6 +1417,39 @@ void settle_pass() {
     g.sorted_keys = 0;
 }
 
+// The first inertial record that fired and waits for its site's commit, for a report.
+std::string inert_waiting_text() {
+    std::string out;
+    g.inert.for_each([&](uintptr_t, InertRec& r) {
+        if (out.empty() && r.state == IState::Fired) {
+            appendf(out, "site %u: armed at tick %llu for tick %llu, fired, not applied", r.idx,
+                    static_cast<unsigned long long>(r.armed_at), static_cast<unsigned long long>(r.deadline));
+        }
+    });
+    return out;
+}
+
+// R16: at the end of a slot, a record whose deadline is this tick or past and that neither the wheel fired nor a
+// later store superseded was lost by the wheel. Returns whether it failed.
+bool poll_inertial() {
+    if (g.inert_live == 0 || g.finished) {
+        return false;
+    }
+    bool failed = false;
+    g.inert.for_each([&](uintptr_t, InertRec& r) {
+        if (failed || r.state != IState::Live || r.deadline == UINT64_MAX || r.deadline > g.now) {
+            return;
+        }
+        std::string text;
+        appendf(text, "site %u: armed at tick %llu for tick %llu, and the slot of tick %llu is over", r.idx,
+                static_cast<unsigned long long>(r.armed_at), static_cast<unsigned long long>(r.deadline),
+                static_cast<unsigned long long>(g.now));
+        fail("R16.3", "an inertial record was never fired at its deadline: the wheel lost it", 0, text);
+        failed = true;
+    });
+    return failed;
+}
+
 // Nothing may be pending at a point the regions that apply NBAs and trigger `->>` are behind:
 // `what` names it. With `active_only`, only what the Active set created is owed (the Reactive
 // set's Re-NBA region is still ahead). Returns whether it failed.
@@ -1404,6 +1470,10 @@ bool closure(const char* what, bool active_only) {
             fail("R20.3", std::string("a `->>` is still untriggered when ") + what, 0, cause);
             return true;
         }
+    }
+    if (!active_only && g.inert_waiting > 0 && !g.finished) {
+        fail("R16.5", std::string("an inertial update that was fired is still unapplied when ") + what, 0, inert_waiting_text());
+        return true;
     }
     return false;
 }
@@ -1863,6 +1933,11 @@ extern "C" void rt_trace_begin(void) {
     g.ramp.clear();
     g.abort_owed.clear();
     g.forks.clear();
+    g.inert.clear();
+    g.inert_sites.clear();
+    g.inert_live          = 0;
+    g.inert_waiting       = 0;
+    g.inert_wheel_waiting = 0;
 }
 
 extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* parent) {
@@ -2628,6 +2703,145 @@ extern "C" void rt_trace_member(void* a_, uint32_t i) {
     s.bits = static_cast<uint8_t>((s.bits & ~kMemberOwed) | kMemberRan);
 }
 
+extern "C" void rt_trace_inertial_decide(uint32_t idx, uint32_t same_pending, uint32_t same_cur, uint64_t epoch) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    touch_run();
+    if (idx >= g.inert_sites.size()) {
+        g.inert_sites.resize(idx + 1);
+    }
+    InertSite&  s = g.inert_sites[idx];
+    std::string text;
+    appendf(text, "site %u: equal to the pending value %u, equal to the current value %u, epoch asked %llu", idx, same_pending,
+            same_cur, static_cast<unsigned long long>(epoch));
+    // The same value again keeps the timer of the pending update running: nothing is armed (LRM 10.3.3 b).
+    if (s.live != 0 && same_pending != 0) {
+        if (epoch != 0) {
+            fail("R16.1", "a store that evaluated to the value its pending update already holds armed a new record: the timer restarted",
+                 0, text);
+        }
+        return;
+    }
+    // Any other value supersedes the pending update, which is how a pulse shorter than the delay is rejected ...
+    if (s.live != 0) {
+        if (InertRec* r = g.inert.find(s.live); r != nullptr) {
+            r->state = IState::Superseded;
+            --g.inert_live;
+        }
+        s.live = 0;
+    }
+    // ... and schedules a new one, unless the value is the target's current one (c, d). A record the runtime still
+    // takes for pending after it fired is tolerated: it keeps a value that the net already holds.
+    if (same_cur != 0) {
+        if (epoch != 0) {
+            fail("R16.1", "a store that evaluated to the target's current value armed an update: the pending one is cancelled and nothing is scheduled",
+                 0, text);
+            return;
+        }
+    } else if (epoch == 0 && same_pending == 0) {
+        fail("R16.1", "a store that evaluated to a new value armed no update: the net would never take it", 0, text);
+        return;
+    }
+    s.expect = epoch;
+}
+
+extern "C" void rt_trace_inertial_arm(uint32_t idx, const void* rec_, uint64_t ticks, uint64_t epoch) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    touch_run();
+    if (idx >= g.inert_sites.size()) {
+        g.inert_sites.resize(idx + 1);
+    }
+    InertSite& s = g.inert_sites[idx];
+    if (epoch == 0 || epoch != s.expect) {
+        std::string text;
+        appendf(text, "site %u: armed for epoch %llu, the store's decision asked for %llu", idx, static_cast<unsigned long long>(epoch),
+                static_cast<unsigned long long>(s.expect));
+        fail("R16.2", "an inertial record was armed that the store's decision did not ask for", 0, text);
+        return;
+    }
+    s.expect            = 0;
+    ++g.run.inertial_arms;
+    ++g.total.inertial_arms;
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    g.inert.at(rec)     = InertRec{ idx, IState::Live, g.now, ticks > UINT64_MAX - g.now ? UINT64_MAX : g.now + ticks, epoch };
+    s.live              = rec;
+    ++g.inert_live;
+}
+
+extern "C" void rt_trace_inertial_fire(const void* rec_, uint32_t current) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    touch_run();
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    InertRec*       r   = g.inert.find(rec);
+    if (r == nullptr || (r->state != IState::Live && r->state != IState::Superseded)) {
+        fail("R16.3", "an inertial record fired that no store armed, or that had fired already", 0, "the record at " + address_text(rec));
+        return;
+    }
+    std::string text;
+    appendf(text, "site %u: armed at tick %llu for tick %llu", r->idx, static_cast<unsigned long long>(r->armed_at),
+            static_cast<unsigned long long>(r->deadline));
+    if (r->deadline != UINT64_MAX && g.now != r->deadline) {
+        std::string what;
+        appendf(what, "an inertial record fired at tick %llu, and was armed for tick %llu", static_cast<unsigned long long>(g.now),
+                static_cast<unsigned long long>(r->deadline));
+        fail("R16.3", what, 0, text);
+        return;
+    }
+    const bool live = r->state == IState::Live;
+    if ((current != 0) != live) {
+        fail("R16.4",
+             current != 0 ? "a record that a later store superseded was applied: a pulse shorter than the delay got through"
+                          : "a record that no later store had superseded was dropped: its update is lost",
+             0, text);
+        return;
+    }
+    if (live) {
+        --g.inert_live;
+        if (InertSite& s = g.inert_sites[r->idx]; s.live == rec) {
+            s.live = 0;
+        }
+    }
+    if (current == 0) {
+        r->state = IState::Done;
+        return;
+    }
+    r->state = IState::Fired;
+    ++g.inert_waiting;
+    if (r->deadline > r->armed_at) {
+        ++g.inert_wheel_waiting;
+    }
+}
+
+extern "C" void rt_trace_inertial_applied(const void* rec_) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    InertRec* r = g.inert.find(reinterpret_cast<uintptr_t>(rec_));
+    if (r == nullptr || r->state != IState::Fired) {
+        return;
+    }
+    // The wheel's records are applied by the commit at the top of their slot, before the Active region (S26); a
+    // zero delay cannot arm the wheel, and its update lands in the NBA region of the slot.
+    const bool wheel = r->deadline > r->armed_at;
+    if (wheel ? g.region != RT_TRACE_REG_PREPONED : !g.in_pass) {
+        fail("R16.5",
+             wheel ? "an inertial update the wheel fired was applied outside the commit at the top of its slot"
+                   : "a zero-delay inertial update was applied outside an NBA pass",
+             0, std::string("the scheduler is in the ") + region_name(g.region) + " region");
+        return;
+    }
+    r->state = IState::Done;
+    --g.inert_waiting;
+    if (wheel) {
+        --g.inert_wheel_waiting;
+    }
+}
+
 extern "C" void rt_trace_once(uint32_t kind) {
     if (g.halted) {
         return;
@@ -2664,6 +2878,9 @@ extern "C" void rt_trace_slot_end(void) {
         return;
     }
     if (closure("the slot ends", false)) {
+        return;
+    }
+    if (poll_inertial()) {
         return;
     }
     // Time advances only when every region is empty (R1.2). A slot with no region reported (a hand-built
@@ -2729,6 +2946,14 @@ extern "C" void rt_trace_region(uint32_t region) {
                  std::string("the ") + region_name(region) + " region begins after the " + region_name(from) +
                    " region, which it does not follow",
                  0, "");
+            return;
+        }
+        // The commit at the top of the slot has applied every inertial update the wheel fired, before the Active
+        // region reads the nets (S26).
+        if (region == RT_TRACE_REG_ACTIVE && from == RT_TRACE_REG_PREPONED && g.inert_wheel_waiting > 0) {
+            fail("R16.5",
+                 "an inertial update that the wheel fired was not applied before the Active region began: its readers would see the old value",
+                 0, inert_waiting_text());
             return;
         }
         // A region begins with every earlier one empty (R1.2), and a batch of `#0` is promoted whole

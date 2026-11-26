@@ -198,7 +198,7 @@ inline int finish() {
     std::fprintf(stderr,
                  "trace check: NBA updates created: %llu block, %llu array, %llu aggregate, %llu zero-delay, %llu timer, "
                  "%llu event; %llu NBA passes, %llu pends, %llu triggers, %llu finishes; %llu block events, %llu aborts; "
-                 "%llu forks, %llu joins, %llu member runs\n",
+                 "%llu forks, %llu joins, %llu member runs, %llu inertial arms\n",
                  static_cast<unsigned long long>(t.creates[RT_TRACE_NBA_BLOCK]),
                  static_cast<unsigned long long>(t.creates[RT_TRACE_NBA_ARRAY]),
                  static_cast<unsigned long long>(t.creates[RT_TRACE_NBA_AGG]),
@@ -209,7 +209,7 @@ inline int finish() {
                  static_cast<unsigned long long>(t.triggers), static_cast<unsigned long long>(t.finishes),
                  static_cast<unsigned long long>(t.blocks), static_cast<unsigned long long>(t.aborts),
                  static_cast<unsigned long long>(t.forks), static_cast<unsigned long long>(t.joins),
-                 static_cast<unsigned long long>(t.member_runs));
+                 static_cast<unsigned long long>(t.member_runs), static_cast<unsigned long long>(t.inertial_arms));
     for (const std::string& name : suite->stale()) {
         const KnownEntry& e = suite->known().at(name);
         std::fprintf(stderr,

@@ -378,6 +378,8 @@ typedef struct rt_trace_counts {
     uint64_t joins;
     // Members of guarded groups that ran (S9).
     uint64_t member_runs;
+    // Inertial records armed (S26).
+    uint64_t inertial_arms;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -507,6 +509,24 @@ void rt_trace_pend(const void* obj);
 
 // Event object `obj` triggers: RT_TRACE_TRIGGER_NOW or RT_TRACE_TRIGGER_NB.
 void rt_trace_trigger(const void* obj, uint32_t kind);
+
+// An inertial store (S26: `assign #d`, a net delay, a gate delay) at site `idx`, the dense id of its target,
+// armed `rec` for the decision it was given: `epoch` is that decision's stamp, which the record carries, and
+// `ticks` the delay from now (zero: the record fires at once, and its update lands in the NBA region).
+void rt_trace_inertial_arm(uint32_t idx, const void* rec, uint64_t ticks, uint64_t epoch);
+
+// The store at site `idx` evaluated a value and the runtime decided (rt_inertial_decide): `same_pending` says the
+// value equals the one a record already armed holds, `same_cur` that it equals the target's current value, and
+// `epoch` is the stamp of a new record the store must arm, or zero when it arms none.
+void rt_trace_inertial_decide(uint32_t idx, uint32_t same_pending, uint32_t same_cur, uint64_t epoch);
+
+// The wheel (or a zero delay) fires inertial record `rec`. `current` says the runtime takes it for the latest
+// of its site, so that its update will be applied; otherwise it is dropped.
+void rt_trace_inertial_fire(const void* rec, uint32_t current);
+
+// The commit of the record's site applies `rec`, a record the site's ready list held (any record of any
+// intra-assignment site comes through here; the ones that are not inertial are none of this event's).
+void rt_trace_inertial_applied(const void* rec);
 
 // -- Events of the scheduler (runtime/Scheduler.cpp) --
 

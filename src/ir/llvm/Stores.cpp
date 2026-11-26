@@ -2350,6 +2350,8 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     // delayed gate driving one bit of a vector (emit_gate_as_process, LRM 28.16)
     // reaches here with a bit-select lvalue and does need both.
     fill_intra_payload(lv, rhs, rt, rec);
+    // The checker is told of the record the decision asked for, before it is armed.
+    emit_trace_inertial_arm(idxv, rec, ticks, ep);
 
     // Arm the wheel for `now + ticks` with rt_inertial_cb. A zero delay cannot
     // arm the wheel, so its store lands in the current instant's NBA region via

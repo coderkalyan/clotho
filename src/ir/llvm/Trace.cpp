@@ -586,6 +586,22 @@ void Backend::emit_trace_member(uint32_t index) {
 #endif
 }
 
+void Backend::emit_trace_inertial_arm(llvm::Value* idx, llvm::Value* rec, llvm::Value* ticks, llvm::Value* epoch) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_inertial_arm", b_.getVoidTy(), { b_.getInt32Ty(), ptr, b_.getInt64Ty(), b_.getInt64Ty() }),
+                  { idx, rec, ticks, epoch });
+#else
+    (void)idx;
+    (void)rec;
+    (void)ticks;
+    (void)epoch;
+#endif
+}
+
 void Backend::emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     auto* const ptr = llvm::PointerType::getUnqual(ctx_);

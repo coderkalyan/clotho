@@ -100,7 +100,8 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_nba_create", "rt_trace_nba_stage", "rt_trace_nba_release", "rt_trace_nba_pass",
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
                               "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
-                              "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member" }) {
+                              "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member", "rt_trace_inertial_arm", "rt_trace_inertial_decide",
+                              "rt_trace_inertial_fire", "rt_trace_inertial_applied" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -2681,5 +2682,212 @@ TEST_CASE("trace check: a member of a fused group does not run unless one of its
     rt_trace_member(a, 0);
     CHECK(rule() == "R5.3");
     CHECK(has(rt_trace_report(), "did not report its members"));
+}
+
+// R16: the update of an inertial store, `assign #d x = y` (S26). The target's site is 3 and its records are
+// irec_a and irec_b. The store evaluates a value and decides (rt_inertial_decide); the generated code arms the
+// record the decision asks for; the wheel fires it, at the top of the slot of its deadline, and the commit
+// applies it before the Active region.
+namespace {
+
+constexpr uint32_t kSite = 3;
+char               irec_a, irec_b;
+
+void evaluates(uint32_t same_pending, uint32_t same_cur, uint64_t epoch) {
+    rt_trace_inertial_decide(kSite, same_pending, same_cur, epoch);
+}
+
+void arms(const void* rec, uint64_t ticks, uint64_t epoch) {
+    rt_trace_inertial_arm(kSite, rec, ticks, epoch);
+}
+
+// The top of the slot of `tick`: the wheel fires the record, and the commit applies it if it is current.
+void top_of_slot(uint64_t tick, const void* rec, uint32_t current) {
+    rt_trace_slot(tick);
+    rt_trace_inertial_fire(rec, current);
+    rt_trace_region(RT_TRACE_REG_PREPONED);
+    if (current != 0) {
+        rt_trace_inertial_applied(rec);
+    }
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+}
+
+} // namespace
+
+TEST_CASE("trace check: an inertial update is armed for its delay, fired by the wheel at its deadline and applied at the top of the slot (R16)") {
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    top_of_slot(5, &irec_a, 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A new value before the deadline supersedes the pending update: the first record is dropped when it fires, and
+    // the second is the one applied, at its own deadline.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 0, 2);
+    arms(&irec_b, 5, 2);
+    top_of_slot(5, &irec_a, 0);
+    rt_trace_slot_end();
+    top_of_slot(7, &irec_b, 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A pulse shorter than the delay: the value goes back to the current one before the deadline, which cancels the
+    // pending update and arms nothing.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 1, 0);
+    top_of_slot(5, &irec_a, 0);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // The same value again keeps the timer running: no new record, and the pending one is applied at its deadline.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(1, 0, 0);
+    top_of_slot(5, &irec_a, 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A zero delay cannot arm the wheel: its record fires at once and is applied in the NBA region of the slot.
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    evaluates(0, 0, 1);
+    arms(&irec_a, 0, 1);
+    rt_trace_inertial_fire(&irec_a, 1);
+    nba_begin();
+    rt_trace_inertial_applied(&irec_a);
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a newer store cancels a pending inertial update, and the same value does not restart it (R16)") {
+    // The pulse gets through: the record that the cancel superseded is applied.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 1, 0);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.4");
+    CHECK(has(rt_trace_report(), "superseded"));
+
+    // The update is lost: a record nothing superseded is dropped.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 0);
+    CHECK(rule() == "R16.4");
+    CHECK(has(rt_trace_report(), "no later store had superseded"));
+
+    // A new value supersedes the record, and it is applied all the same.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 0, 2);
+    arms(&irec_b, 5, 2);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.4");
+
+    // The same value restarts the timer: a record was armed for a value the pending update already holds.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(1, 0, 2);
+    CHECK(rule() == "R16.1");
+    CHECK(has(rt_trace_report(), "the timer restarted"));
+
+    // The value went back to the current one and a record was armed anyway; a new value armed none.
+    rt_trace_begin();
+    evaluates(0, 1, 1);
+    CHECK(rule() == "R16.1");
+    rt_trace_begin();
+    evaluates(0, 0, 0);
+    CHECK(rule() == "R16.1");
+    CHECK(has(rt_trace_report(), "armed no update"));
+
+    // A record armed that no decision asked for, and one armed for another epoch than the decision's.
+    rt_trace_begin();
+    arms(&irec_a, 5, 1);
+    CHECK(rule() == "R16.2");
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 2);
+    CHECK(rule() == "R16.2");
+}
+
+TEST_CASE("trace check: an inertial record fires at its deadline and its update is applied before the Active region (R16)") {
+    // Fired a tick late, and a tick early.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(6);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.3");
+    CHECK(has(rt_trace_report(), "armed for tick 5"));
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(4);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.3");
+
+    // A record that the wheel never fired: found when the slot of its deadline is over.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(5);
+    rt_trace_slot_end();
+    CHECK(rule() == "R16.3");
+    CHECK(has(rt_trace_report(), "never fired"));
+
+    // A record that nothing armed.
+    rt_trace_begin();
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.3");
+
+    // Fired by the wheel and not applied by the commit at the top of the slot: the Active region would read the old value.
+    rt_trace_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    rt_trace_region(RT_TRACE_REG_PREPONED);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rule() == "R16.5");
+    CHECK(has(rt_trace_report(), "before the Active region began"));
+
+    // A zero-delay record applied outside an NBA pass, and one never applied.
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    evaluates(0, 0, 1);
+    arms(&irec_a, 0, 1);
+    rt_trace_inertial_fire(&irec_a, 1);
+    rt_trace_inertial_applied(&irec_a);
+    CHECK(rule() == "R16.5");
+    CHECK(has(rt_trace_report(), "outside an NBA pass"));
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    evaluates(0, 0, 1);
+    arms(&irec_a, 0, 1);
+    rt_trace_inertial_fire(&irec_a, 1);
+    rt_trace_slot_end();
+    CHECK(rule() == "R16.5");
+    CHECK(has(rt_trace_report(), "still unapplied"));
 }
 #endif // CLOTHO_EXTRA_ASSERTS

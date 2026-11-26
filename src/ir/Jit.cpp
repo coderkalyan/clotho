@@ -561,6 +561,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_trace_join", &rt_trace_join);
     expose("rt_trace_members", &rt_trace_members);
     expose("rt_trace_member", &rt_trace_member);
+    expose("rt_trace_inertial_arm", &rt_trace_inertial_arm);
     expose("rt_trace_once", &rt_trace_once);
 #endif
     // libc mem* helpers that LLVM's loop-idiom pass synthesizes under -O (a

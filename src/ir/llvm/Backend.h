@@ -2312,6 +2312,10 @@ private:
     // group by its wake pair, a coroutine by its handle.
     void emit_trace_member(uint32_t index);
 
+    // R16: the generated code armed the inertial record `rec` of site `idx` (the dense id of its target, an
+    // i32) for the decision's `epoch` (an i64), `ticks` (an i64) from now.
+    void emit_trace_inertial_arm(llvm::Value* idx, llvm::Value* rec, llvm::Value* ticks, llvm::Value* epoch);
+
     // One event the seed links a persistent waiter onto joins the static list of the group `h`.
     void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
 
