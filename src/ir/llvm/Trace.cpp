@@ -334,8 +334,13 @@ llvm::Constant* Backend::emit_trace_park(const TracePark& park) {
         b_.CreateCall(rt_fn("rt_trace_waits_for", b_.getVoidTy(), { ptr, ptr, ptr, i64, ptr }),
                       { hdl_, t.x, t.name, b_.getInt64(t.edge), t.shape });
     }
-    b_.CreateCall(rt_fn("rt_trace_park", b_.getVoidTy(), { ptr, ptr, i64 }),
-                  { hdl_, ctl, park.delay != nullptr ? park.delay : b_.getInt64(0) });
+    // The park's operand: a delay's ticks, or the record or queue it waits on, which the wake that
+    // ends it names too. The handle carries the thread's home tag, which says which batch a `#0`
+    // waits in.
+    llvm::Value* arg = park.delay != nullptr ? park.delay
+                       : park.rec != nullptr ? b_.CreatePtrToInt(park.rec, i64)
+                                             : static_cast<llvm::Value*>(b_.getInt64(0));
+    b_.CreateCall(rt_fn("rt_trace_park", b_.getVoidTy(), { ptr, ptr, i64 }), { parked_handle(b_, hdl_), ctl, arg });
     return ctl;
 #else
     (void)park;
@@ -358,8 +363,12 @@ void Backend::emit_trace_wake(llvm::IRBuilder<>& b, llvm::Value* a, const TraceC
     } else if (why.obj != nullptr) {
         x = why.obj;
     }
-    b.CreateCall(rt_fn("rt_trace_wake", b.getVoidTy(), { ptr, i32, ptr, i32 }),
-                 { a, b.getInt32(why.kind), x, b.getInt32(why.fact) });
+    // The cause, and the ring the push goes onto in the bits above it.
+    llvm::Value* cause = b.getInt32(why.kind);
+    if (why.ring != nullptr) {
+        cause = b.CreateOr(cause, b.CreateShl(why.ring, RT_TRACE_QUEUE_SHIFT));
+    }
+    b.CreateCall(rt_fn("rt_trace_wake", b.getVoidTy(), { ptr, i32, ptr, i32 }), { a, cause, x, b.getInt32(why.fact) });
 #else
     (void)b;
     (void)a;
@@ -405,6 +414,59 @@ void Backend::emit_trace_end(llvm::Value* a) {
     b_.CreateCall(rt_fn("rt_trace_end", b_.getVoidTy(), { llvm::PointerType::getUnqual(ctx_) }), { a });
 #else
     (void)a;
+#endif
+}
+
+void Backend::emit_trace_block(llvm::Value* a, llvm::Value* list, uint32_t how) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on() || a == nullptr) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_block", b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty() }), { a, list, b_.getInt32(how) });
+#else
+    (void)a;
+    (void)list;
+    (void)how;
+#endif
+}
+
+void Backend::emit_trace_disable(llvm::Value* list) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_disable", b_.getVoidTy(), { ptr, ptr }),
+                  { hdl_ != nullptr ? static_cast<llvm::Value*>(hdl_) : llvm::ConstantPointerNull::get(ptr), list });
+#else
+    (void)list;
+#endif
+}
+
+void Backend::emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_abort", b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty() }),
+                  { a, list != nullptr ? list : llvm::ConstantPointerNull::get(ptr), b_.getInt32(kind) });
+#else
+    (void)a;
+    (void)list;
+    (void)kind;
+#endif
+}
+
+void Backend::emit_trace_once(uint32_t kind) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    b_.CreateCall(rt_fn("rt_trace_once", b_.getVoidTy(), { b_.getInt32Ty() }), { b_.getInt32(kind) });
+#else
+    (void)kind;
 #endif
 }
 

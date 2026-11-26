@@ -231,6 +231,13 @@ void Backend::lower_fork_inst(Index i) {
         args[0] = callee_record(static_cast<FunctionId>(static_cast<uint32_t>(kid)));
         llvm::Value* child = b_.CreateCall(cf->getFunctionType(), cf, args);
         emit_trace_spawn(b_, child, RT_TRACE_ORG_FORK, fork_where, in_coroutine_body() ? hdl_ : nullptr);
+        // The IR says the child is activity enabled within every targeted block and task it was
+        // forked inside. Its ramp has linked it on their lists, which R23 checks against this.
+        if (trace_on() && design_uses_disable_) {
+            for (const uint32_t t : mod_.function(static_cast<FunctionId>(static_cast<uint32_t>(kid))).fork_targets) {
+                emit_trace_block(child, disable_head_ptr(b_, t), RT_TRACE_BLOCK_INHERIT);
+            }
+        }
         return child;
     };
     std::vector<llvm::Value*> ramped;
@@ -335,7 +342,7 @@ void Backend::lower_fork_inst(Index i) {
         if (park_claim_wanted() && sched_ptr_ != nullptr) {
             b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
         }
-        emit_suspend("fork.join.resume", { .kind = RT_TRACE_CTL_JOIN });
+        emit_suspend("fork.join.resume", { .kind = RT_TRACE_CTL_JOIN, .rec = rec });
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(cont);
@@ -443,7 +450,9 @@ void Backend::lower_disable_list(uint32_t target) {
     auto* step  = llvm::BasicBlock::Create(ctx_, "disable.node.next", fn);
     auto* done  = llvm::BasicBlock::Create(ctx_, "disable.walk.done", fn);
 
-    llvm::Value* first = b_.CreateLoad(ptr_ty, disable_head_ptr(b_, target));
+    llvm::Value* list  = disable_head_ptr(b_, target);
+    emit_trace_disable(list);
+    llvm::Value* first = b_.CreateLoad(ptr_ty, list);
     auto*        entry = b_.GetInsertBlock();
     b_.CreateBr(head);
 
@@ -459,6 +468,7 @@ void Backend::lower_disable_list(uint32_t target) {
     llvm::Value* next = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 0));
     b_.CreateStore(b_.getInt32(1), b_.CreateStructGEP(nty, n, 5));
     llvm::Value* hdl = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 2));
+    emit_trace_abort(hdl, list, RT_TRACE_ABORT_DISABLE);
     // Skip ourselves, when this `disable` runs inside one of the activations.
     llvm::Value* mine = hdl_ != nullptr ? b_.CreateICmpEQ(hdl, parked_handle(b_, hdl_)) : b_.getFalse();
     b_.CreateCondBr(mine, step, self);
@@ -837,7 +847,7 @@ llvm::StructType* Backend::proc_obj_body_ty() {
 // walk is the same one emit_event_wake_list runs, for the same reasons: read
 // `next` before the wake, because the woken thread unlinks its own node, and gate
 // on the scheduled flag, the design's one-wake-per-thread token.
-void Backend::emit_proc_wake_waiters(llvm::Value* head) {
+void Backend::emit_proc_wake_waiters(llvm::Value* head, llvm::Value* who) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* nty  = event_node_ty();
     auto* null = llvm::ConstantPointerNull::get(ptr);
@@ -864,7 +874,7 @@ void Backend::emit_proc_wake_waiters(llvm::Value* head) {
     b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), wake, step);
 
     b_.SetInsertPoint(wake);
-    emit_wake_push(b_, hdl, { .kind = RT_TRACE_AWAIT });
+    emit_wake_push(b_, hdl, { .kind = RT_TRACE_AWAIT, .obj = who });
     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
     b_.CreateBr(step);
 
@@ -893,8 +903,8 @@ void Backend::emit_proc_complete() {
     llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
     llvm::Value*      forkw = ab.CreateAlloca(llvm::PointerType::getUnqual(ctx_), nullptr, "fork_waiters");
     llvm::Value* waiters    = b_.CreateCall(proc_complete_fn(), { pcb_, forkw });
-    emit_proc_wake_waiters(waiters);
-    emit_proc_wake_waiters(b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), forkw));
+    emit_proc_wake_waiters(waiters, pcb_);
+    emit_proc_wake_waiters(b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), forkw), nullptr);
     b_.CreateCall(proc_thread_done_fn(), { pcb_ });
 }
 
@@ -1056,6 +1066,7 @@ void Backend::lower_proc_kill(llvm::Value* target, bool with_self, bool branch_o
 
     b_.SetInsertPoint(wake);
     llvm::Value* hdl = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 2));
+    emit_trace_abort(hdl, nullptr, RT_TRACE_ABORT_KILL);
     emit_node_force_wake(acts, hdl, step);
 
     b_.SetInsertPoint(step);
@@ -1277,7 +1288,7 @@ void Backend::lower_wait_fork() {
     b_.SetInsertPoint(armed);
     b_.CreateStore(node, headp);
     emit_arm_wake_word();
-    emit_suspend("waitfork.resume", { .kind = RT_TRACE_CTL_WAIT_FORK });
+    emit_suspend("waitfork.resume", { .kind = RT_TRACE_CTL_WAIT_FORK, .rec = pcb_ });
     emit_proc_unlink_node(node);
     // Killed while parked (LRM 9.7): leave the barrier now. Re-testing instead
     // would re-park on a still-live child list and the force-wake would be lost;
@@ -1422,7 +1433,7 @@ void Backend::lower_proc_wait(Index i) {
     // in no other queue, so the flag has to read "not scheduled" or the wake is
     // dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("await.resume", { .kind = RT_TRACE_CTL_AWAIT });
+    emit_suspend("await.resume", { .kind = RT_TRACE_CTL_AWAIT, .rec = pcb });
     // Unlink on resume, whoever woke us: the waker only walks and pushes, it does
     // not unlink, which is what keeps a multi-waiter list correct without a
     // compaction pass.
@@ -1633,7 +1644,7 @@ void Backend::emit_sync_wake(llvm::Value* qhead, bool all) {
         b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), push,
                         skip);
         b_.SetInsertPoint(push);
-        emit_wake_push(b_, hdl, { .kind = RT_TRACE_SYNC });
+        emit_wake_push(b_, hdl, { .kind = RT_TRACE_SYNC, .obj = qhead });
         b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
         b_.CreateBr(skip);
         b_.SetInsertPoint(skip);
@@ -1697,7 +1708,7 @@ void Backend::lower_sync_wait(Index i) {
     // sits in no other queue, so the flag must read "not scheduled" or the wake
     // is dropped as a duplicate.
     emit_arm_wake_word();
-    emit_suspend("coro.sync_resume", { .kind = RT_TRACE_CTL_SYNC });
+    emit_suspend("coro.sync_resume", { .kind = RT_TRACE_CTL_SYNC, .rec = qhead });
     if (llvm::Value* aborting = emit_abort_pending(); aborting != nullptr) {
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* leave = llvm::BasicBlock::Create(ctx_, "sync.abort", fn);
@@ -1839,6 +1850,8 @@ void Backend::emit_disable_link(uint32_t target, llvm::Value* node, llvm::Value*
     b_.CreateBr(done);
     b_.SetInsertPoint(done);
     b_.CreateStore(node, head);
+    // The node is on the list now: ramp links come before the spawn that announces the activation.
+    emit_trace_block(hdl_, head, flag != nullptr ? RT_TRACE_BLOCK_RAMP : RT_TRACE_BLOCK_ENTER);
 }
 
 // Unlink it again. Emitted at the top of the epilogue, so an activation is off
@@ -1873,6 +1886,7 @@ void Backend::emit_disable_unlink(uint32_t target, llvm::Value* node) {
     b_.CreateStore(prev, b_.CreateStructGEP(nty, next, 1));
     b_.CreateBr(done);
     b_.SetInsertPoint(done);
+    emit_trace_block(hdl_, disable_head_ptr(b_, target), RT_TRACE_BLOCK_EXIT);
 }
 
 } // namespace clotho::ir::backend

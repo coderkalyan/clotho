@@ -553,6 +553,10 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         // is not a body's (emit_arm_wake_word).
         b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
         emit_wait_suspend({ .kind = RT_TRACE_CTL_STATIC, .where = &trace_at }); // park until next trigger
+        // A `kill` of this thread (LRM 9.7) force-wakes the process here, and so does a `suspend`
+        // that has landed since: the polls every other park gets, so that a killed process ends
+        // instead of running its body once more and going back to wait (R23 x S1).
+        emit_resume_polls();
         b_.CreateBr(loop_bb);
         // The forever back-edge means the shared final-suspend tail below is
         // unreachable; build it in a dead block so the IR stays well-formed.
@@ -1908,7 +1912,7 @@ void Backend::lower_task(FunctionId id) {
                                    : final_bb;
         b_.CreateCondBr(wake, has_bb, after);
         b_.SetInsertPoint(has_bb);
-        emit_wake_push(b_, parent, { .kind = RT_TRACE_CHILD });
+        emit_wake_push(b_, parent, { .kind = RT_TRACE_CHILD, .obj = rec });
         b_.CreateBr(after);
         if (heap) {
             b_.SetInsertPoint(after);
@@ -1919,7 +1923,7 @@ void Backend::lower_task(FunctionId id) {
         llvm::Value* parent = b_.CreateLoad(ptr_ty, rec);
         b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
         b_.SetInsertPoint(has_bb);
-        emit_wake_push(b_, parent, { .kind = RT_TRACE_CALLEE });
+        emit_wake_push(b_, parent, { .kind = RT_TRACE_CALLEE, .obj = rec });
         b_.CreateBr(final_bb);
     }
 
@@ -2640,7 +2644,7 @@ void Backend::lower_task_call_inst(Index i) {
     // completion (coro.done in the drain loop).
     b_.SetInsertPoint(async_bb);
     b_.CreateStore(parked_handle(b_, hdl_), record);
-    emit_suspend("task.resume", { .kind = RT_TRACE_CTL_CALL });
+    emit_suspend("task.resume", { .kind = RT_TRACE_CTL_CALL, .rec = record });
     b_.CreateBr(cont_bb);
 
     b_.SetInsertPoint(cont_bb);

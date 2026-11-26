@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -98,7 +99,7 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_resume", "rt_trace_end", "rt_trace_slot", "rt_trace_halted", "rt_trace_region",
                               "rt_trace_nba_create", "rt_trace_nba_stage", "rt_trace_nba_release", "rt_trace_nba_pass",
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
-                              "rt_trace_change" }) {
+                              "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -1262,6 +1263,47 @@ TEST_CASE("trace check: the scheduler's own events say nothing of a run whose co
     rt_trace_region(RT_TRACE_REG_FINAL);
     CHECK(rt_trace_halted() == 0);
 }
+
+// A block disabled from another process with a fork child inside it, and a thread killed while it
+// waits: the generated code reports each node it links and unlinks, each activation a walk marks and
+// each region the scheduler runs, and the run breaks no rule. LRM-pinned (9.6.2: the disable ends "all
+// activities enabled within the named block", the child of a `join_none` included; 9.7: `kill`).
+TEST_CASE("trace check: a design that disables a block with a fork child inside and kills a thread runs clean and is counted") {
+    if (std::getenv("CLOTHO_NO_TRACE_CHECK") != nullptr) {
+        return;
+    }
+    const LowerResult r = lower_text(R"(
+        module t;
+          process pk;
+          int n = 0;
+          initial begin : worker
+            fork
+              #15 $display("child ran");
+            join_none
+            #20 $display("worker ran on");
+          end
+          initial begin
+            #10 disable worker;
+            fork
+              begin pk = process::self(); forever #4 n++; end
+            join_none
+            #30 pk.kill();
+            #5 $display("n=%0d status=%0d", n, pk.status());
+          end
+        endmodule)");
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    ir::SimulationConfig config;
+    config.trace_check = true;
+    const std::string out = capture_stdout([&] { ir::run_jit(*r.module, nullptr, config); });
+    CHECK(out == "n=7 status=4\n");
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    // The worker and its child are on the list of `worker` and leave it; the kill marks the thread.
+    CHECK(after.blocks >= before.blocks + 4);
+    CHECK(after.aborts >= before.aborts + 3);
+}
 #endif
 
 // ---- Writes and waiters (R6, R7) ----
@@ -1551,4 +1593,672 @@ TEST_CASE("trace check: a value that changed under a parked waiter with no wake 
     CHECK(rule() == "R6.3");
 }
 
+// ---- Regions, time zero, record identity and blocks (R1, R2, R4, R15, R17, R23, R25, B43) ----
+//
+// As above: each sequence is what the scheduler and the generated code report, for the bugs the
+// rules exist for (docs/design/scheduler-rules.md §4). A seed row names the facts of its processes in
+// the kind of its origin, and a wake the ring it pushes onto in the bits above its cause.
+
+namespace {
+
+constexpr uint32_t kOrgProcess = RT_TRACE_ORG_PROCESS;
+
+const rt_trace_control kInitial{ "design.sv:20:3", kOrgProcess | RT_TRACE_ORG_PROCEDURE };
+const rt_trace_control kAssign{ "design.sv:21:3", kOrgProcess | RT_TRACE_ORG_SELF_START };
+const rt_trace_control kComb{ "design.sv:22:3", kOrgProcess | RT_TRACE_ORG_SELF_START | RT_TRACE_ORG_LATE };
+const rt_trace_control kProgram{ "design.sv:23:3", kOrgProcess | RT_TRACE_ORG_PROGRAM };
+const rt_trace_control kCopy{ "design.sv:24:3", kOrgProcess | RT_TRACE_ORG_SELF_START | RT_TRACE_ORG_REACTIVE_CONT };
+const rt_trace_control kStrobeBody{ "design.sv:25:3", RT_TRACE_ORG_STROBE };
+const rt_trace_control kForkChild{ "design.sv:27:3", RT_TRACE_ORG_FORK };
+const rt_trace_control kSyncWait{ "design.sv:12:5", RT_TRACE_CTL_SYNC };
+const rt_trace_control kAwaitWait{ "design.sv:13:5", RT_TRACE_CTL_AWAIT };
+const rt_trace_control kExpectWait{ "design.sv:14:5", RT_TRACE_CTL_EXPECT };
+
+constexpr uint32_t kReactiveRing = RT_TRACE_QUEUE_REACTIVE << RT_TRACE_QUEUE_SHIFT;
+constexpr uint32_t kContRing     = RT_TRACE_QUEUE_CONT << RT_TRACE_QUEUE_SHIFT;
+
+// The lists of occupants of two `disable` targets, and two records.
+int list_a, list_b, rec_a, rec_b;
+
+// An activation address of its own: the tag bits of a parked handle are stripped, so proc_a and proc_c
+// name one activation.
+alignas(8) char proc_d;
+
+uint64_t id_of(const void* p) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
+}
+
+// An activation the checker has seen running and parked at an event control for `clk`.
+void parked_on_clk(void* a, const rt_trace_control* origin = &kProcess) {
+    rt_trace_spawn(a, origin, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS, nullptr);
+    rt_trace_park(a, &kWait, 0);
+}
+
+} // namespace
+
+// B2: a continuous assignment whose source holds a declaration initializer (which makes no edge) is
+// never evaluated if the seed does not run it once at time zero.
+TEST_CASE("trace check: a continuously active process the seed never ran at time zero is flagged (R15, B2)") {
+    rt_trace_begin();
+    void* assign = &proc_a;
+    void* other  = &proc_b;
+    rt_trace_spawn(assign, &kAssign, nullptr);
+    rt_trace_spawn(other, &kInitial, nullptr);
+    rt_trace_wake(other, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(other, RT_TRACE_RING) == 1);
+    rt_trace_end(other);
+    rt_trace_slot_end();
+    CHECK(rule() == "R15.1");
+    CHECK(has(rt_trace_report(), "not evaluated at time zero"));
+    CHECK(has(rt_trace_report(), "design.sv:21:3"));
+
+    // Queued by the seed and run once: nothing is owed, and a later slot owes nothing more.
+    rt_trace_begin();
+    rt_trace_spawn(assign, &kAssign, nullptr);
+    rt_trace_wake(assign, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(assign, RT_TRACE_RING) == 1);
+    rt_trace_park(assign, &kStatic, 0);
+    rt_trace_slot_end();
+    rt_trace_slot(1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+// B24: an always_comb written above an `initial` ran first, before the `initial` had started.
+TEST_CASE("trace check: an always_comb that starts before a procedure the seed queued is flagged (R17, B24)") {
+    void* comb = &proc_a;
+    void* init = &proc_b;
+    rt_trace_begin();
+    rt_trace_spawn(comb, &kComb, nullptr);
+    rt_trace_spawn(init, &kInitial, nullptr);
+    rt_trace_wake(comb, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_wake(init, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(comb, RT_TRACE_RING) == 0);
+    CHECK(rule() == "R17.1");
+    CHECK(has(rt_trace_report(), "before every procedure had"));
+    CHECK(has(rt_trace_report(), "design.sv:20:3"));
+
+    // Queued behind every procedure: each is dispatched first.
+    rt_trace_begin();
+    rt_trace_spawn(comb, &kComb, nullptr);
+    rt_trace_spawn(init, &kInitial, nullptr);
+    rt_trace_wake(init, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_wake(comb, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(init, RT_TRACE_RING) == 1);
+    CHECK(rt_trace_dispatch(comb, RT_TRACE_RING) == 1);
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: the regions of a slot come in order, and work in a later one sends control back (R1.1)") {
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_INACTIVE);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    nba_begin();
+    nba_end();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_OBSERVED);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_OBSERVED);
+    rt_trace_region(RT_TRACE_REG_REACTIVE);
+    rt_trace_region(RT_TRACE_REG_RE_INACTIVE);
+    rt_trace_region(RT_TRACE_REG_REACTIVE);
+    rt_trace_nba_pass(1, RT_TRACE_REG_RE_NBA);
+    rt_trace_nba_pass(0, RT_TRACE_REG_RE_NBA);
+    rt_trace_region(RT_TRACE_REG_REACTIVE);
+    rt_trace_region(RT_TRACE_REG_POSTPONED);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    // Nothing follows Postponed in its slot.
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rule() == "R1.1");
+    CHECK(has(rt_trace_report(), "begins after the postponed region"));
+
+    // A region that sends control back to one that is not the head of a loop, and the top of a slot
+    // after a region.
+    const std::pair<uint32_t, uint32_t> steps[] = { { RT_TRACE_REG_OBSERVED, RT_TRACE_REG_INACTIVE },
+                                                    { RT_TRACE_REG_REACTIVE, RT_TRACE_REG_OBSERVED },
+                                                    { RT_TRACE_REG_RE_INACTIVE, RT_TRACE_REG_INACTIVE },
+                                                    { RT_TRACE_REG_ACTIVE, RT_TRACE_REG_PREPONED } };
+    for (const auto& [from, to] : steps) {
+        rt_trace_begin();
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        rt_trace_region(from);
+        CHECK_MESSAGE(rt_trace_halted() == 0, from);
+        rt_trace_region(to);
+        CHECK_MESSAGE(rule() == "R1.1", from, " -> ", to);
+    }
+
+    // A ring is drained in the Active and Reactive regions only.
+    rt_trace_begin();
+    rt_trace_spawn(&proc_a, &kProcess, nullptr);
+    rt_trace_dispatch(&proc_a, RT_TRACE_INLINE);
+    rt_trace_park(&proc_a, &kDelay, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_INACTIVE);
+    rt_trace_wake(&proc_a, RT_TRACE_INACTIVE, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_OBSERVED);
+    CHECK(rt_trace_dispatch(&proc_a, RT_TRACE_RING) == 0);
+    CHECK(rule() == "R1.1");
+    CHECK(has(rt_trace_report(), "popped from a ring outside the Active and Reactive regions"));
+}
+
+// A region ends only when it is empty, so control that moves on with an activation still queued has
+// skipped it: the Observed bodies woke an Active process and the scheduler went on to Reactive.
+TEST_CASE("trace check: control that moves on with work left in an earlier region is flagged (R1.2)") {
+    struct Step {
+        const char* name;
+        void (*go)();
+    };
+    const Step steps[] = {
+        { "inactive", [] { rt_trace_region(RT_TRACE_REG_INACTIVE); } },
+        { "NBA", [] { nba_begin(); } },
+        { "observed", [] { rt_trace_region(RT_TRACE_REG_OBSERVED); } },
+        { "reactive", [] { rt_trace_region(RT_TRACE_REG_REACTIVE); } },
+        { "postponed", [] { rt_trace_region(RT_TRACE_REG_POSTPONED); } },
+        { "slot end", [] { rt_trace_slot_end(); } },
+    };
+    for (const Step& step : steps) {
+        rt_trace_begin();
+        rt_trace_spawn(&proc_a, &kProcess, nullptr);
+        rt_trace_wake(&proc_a, RT_TRACE_SEED, nullptr, 0);
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        step.go();
+        CHECK_MESSAGE(rule() == "R1.2", step.name);
+        CHECK_MESSAGE(has(rt_trace_report(), "queued on the active ring and never dispatched"), step.name);
+
+        // Dispatched before control moves on: nothing is left.
+        rt_trace_begin();
+        rt_trace_spawn(&proc_a, &kProcess, nullptr);
+        rt_trace_wake(&proc_a, RT_TRACE_SEED, nullptr, 0);
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        CHECK(rt_trace_dispatch(&proc_a, RT_TRACE_RING) == 1);
+        rt_trace_end(&proc_a);
+        step.go();
+        CHECK_MESSAGE(rt_trace_halted() == 0, step.name);
+    }
+
+    // The Reactive set: its rings are empty before the Re-Inactive region and the Postponed one.
+    for (const bool postponed : { false, true }) {
+        rt_trace_begin();
+        rt_trace_spawn(&proc_a, &kProgram, nullptr);
+        rt_trace_wake(&proc_a, RT_TRACE_SEED | kReactiveRing, nullptr, 0);
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        rt_trace_region(RT_TRACE_REG_REACTIVE);
+        CHECK(rt_trace_halted() == 0);
+        rt_trace_region(postponed ? RT_TRACE_REG_POSTPONED : RT_TRACE_REG_RE_INACTIVE);
+        CHECK(rule() == "R1.2");
+        CHECK(has(rt_trace_report(), "queued on the reactive ring"));
+    }
+}
+
+TEST_CASE("trace check: every #0 of a batch is promoted together and none is left behind (R2.2)") {
+    const auto zero_parked = [] {
+        rt_trace_begin();
+        for (void* x : { static_cast<void*>(&proc_a), static_cast<void*>(&proc_b) }) {
+            rt_trace_spawn(x, &kProcess, nullptr);
+            rt_trace_dispatch(x, RT_TRACE_INLINE);
+            rt_trace_park(x, &kDelay, 0);
+        }
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+    };
+    zero_parked();
+    rt_trace_region(RT_TRACE_REG_INACTIVE);
+    rt_trace_wake(&proc_a, RT_TRACE_INACTIVE, nullptr, 0);
+    rt_trace_wake(&proc_b, RT_TRACE_INACTIVE, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_halted() == 0);
+
+    // One of them is not promoted: it would run in a later instant.
+    zero_parked();
+    rt_trace_region(RT_TRACE_REG_INACTIVE);
+    rt_trace_wake(&proc_a, RT_TRACE_INACTIVE, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rule() == "R2.2");
+    CHECK(has(rt_trace_report(), "every process parked at a #0 becomes active together"));
+
+    // The NBA region begins after the Inactive one has emptied, and so does the end of the slot.
+    zero_parked();
+    nba_begin();
+    CHECK(rule() == "R1.2");
+    CHECK(has(rt_trace_report(), "parked at a #0 that no promotion released"));
+    zero_parked();
+    rt_trace_slot_end();
+    CHECK(rule() == "R1.2");
+
+    // The Reactive set has a batch of its own, which a reactive thread's #0 waits in.
+    rt_trace_begin();
+    rt_trace_spawn(&proc_a, &kProgram, nullptr);
+    rt_trace_dispatch(&proc_a, RT_TRACE_INLINE);
+    rt_trace_park(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(&proc_a) | 2), &kDelay, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_REACTIVE);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_region(RT_TRACE_REG_RE_INACTIVE);
+    rt_trace_wake(&proc_a, RT_TRACE_INACTIVE | kReactiveRing, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_REACTIVE);
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a delay's timer that never fired is found when its slot is over (R2.3)") {
+    void* a = &proc_a;
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_park(a, &kDelay, 3);
+    rt_trace_slot(2);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_slot(3);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_slot_end();
+    CHECK(rule() == "R2.3");
+    CHECK(has(rt_trace_report(), "the delay ends at tick 3 and the slot of tick 3 is over"));
+
+    // Woken by its timer in its slot: nothing is overdue.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_park(a, &kDelay, 3);
+    rt_trace_slot(3);
+    rt_trace_wake(a, RT_TRACE_TIMER, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_resume(a, &kDelay);
+    rt_trace_end(a);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a body the scheduler runs once runs in its region, and a pended $strobe in Postponed (R4)") {
+    void* a = &proc_a;
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_OBSERVED);
+    rt_trace_once(RT_TRACE_ORG_OBSERVED);
+    rt_trace_spawn(a, &kProcess, nullptr);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RUN_ONCE) == 1);
+    rt_trace_end(a);
+    rt_trace_once(0);
+    CHECK(rt_trace_halted() == 0);
+
+    // The Observed bodies ran in the Active region.
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_once(RT_TRACE_ORG_OBSERVED);
+    rt_trace_spawn(a, &kProcess, nullptr);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RUN_ONCE) == 0);
+    CHECK(rule() == "R4.1");
+    CHECK(has(rt_trace_report(), "the scheduler is in the active region"));
+
+    // A $strobe body is drained in Postponed.
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_spawn(a, &kStrobeBody, nullptr);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RUN_ONCE) == 0);
+    CHECK(rule() == "R4.1");
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_spawn(a, &kStrobeBody, nullptr);
+    rt_trace_region(RT_TRACE_REG_POSTPONED);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RUN_ONCE) == 1);
+    rt_trace_end(a);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A $strobe pended in the slot and never drained.
+    rt_trace_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_spawn(a, &kStrobeBody, nullptr);
+    rt_trace_region(RT_TRACE_REG_POSTPONED);
+    rt_trace_slot_end();
+    CHECK(rule() == "R4.2");
+    CHECK(has(rt_trace_report(), "never ran"));
+}
+
+TEST_CASE("trace check: program code runs in the Reactive region and design code in the Active one (R25.1)") {
+    void* a = &proc_a;
+    // A program's initial the seed queued for the Active region.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProgram, nullptr);
+    rt_trace_wake(a, RT_TRACE_SEED, nullptr, 0);
+    CHECK(rule() == "R25.1");
+    CHECK(has(rt_trace_report(), "a thread of a program was queued for the Active region"));
+    // ... and a design process queued for the Reactive one.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kInitial, nullptr);
+    rt_trace_wake(a, RT_TRACE_SEED | kReactiveRing, nullptr, 0);
+    CHECK(rule() == "R25.1");
+    CHECK(has(rt_trace_report(), "a thread of the design was queued for the Reactive region"));
+
+    // A child forked by a program's thread is a program's thread: its wake takes the Reactive ring.
+    for (const bool right : { false, true }) {
+        rt_trace_begin();
+        rt_trace_spawn(a, &kProgram, nullptr);
+        rt_trace_wake(a, RT_TRACE_SEED | kReactiveRing, nullptr, 0);
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        rt_trace_region(RT_TRACE_REG_REACTIVE);
+        CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+        rt_trace_spawn(&proc_b, &kForkChild, a);
+        rt_trace_wake(&proc_b, RT_TRACE_SPAWN | (right ? kReactiveRing : 0), nullptr, 0);
+        CHECK_MESSAGE(rt_trace_halted() == (right ? 0 : 1), right);
+    }
+
+    // An `expect` verdict sends the thread to the Reactive region for good: its later wakes take that
+    // ring.
+    for (const bool right : { false, true }) {
+        rt_trace_begin();
+        rt_trace_spawn(a, &kProcess, nullptr);
+        rt_trace_dispatch(a, RT_TRACE_INLINE);
+        rt_trace_park(a, &kExpectWait, id_of(&rec_a));
+        rt_trace_wake(a, RT_TRACE_EXPECT | kReactiveRing, &rec_a, 0);
+        CHECK(rt_trace_halted() == 0);
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        rt_trace_region(RT_TRACE_REG_REACTIVE);
+        CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+        rt_trace_resume(a, &kExpectWait);
+        rt_trace_park(a, &kDelay, 4);
+        rt_trace_slot(4);
+        rt_trace_wake(a, RT_TRACE_TIMER | (right ? kReactiveRing : 0), nullptr, 0);
+        CHECK_MESSAGE(rt_trace_halted() == (right ? 0 : 1), right);
+    }
+
+    // The drain that pops an activation is the one of the ring it was queued on.
+    rt_trace_begin();
+    parked_on_clk(a);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_region(RT_TRACE_REG_REACTIVE);
+    wrote_posedge(&clk);
+    rt_trace_wake(a, RT_TRACE_DYNAMIC, &clk, RT_TRACE_POS);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 0);
+    CHECK(rule() == "R25.1");
+    CHECK(has(rt_trace_report(), "queued for the Active region ran in the Reactive region"));
+}
+
+// B39: a program's initial read an input port as x at time zero (seeded ahead of the port copy), and
+// a #5 read in the slot of the design's write read the old value (the copy was woken behind the thread).
+TEST_CASE("trace check: program code does not run while a program's continuous process is queued (R25.2, B39)") {
+    void* copy = &proc_a;
+    void* prog = &proc_b;
+    for (const bool copy_first : { false, true }) {
+        rt_trace_begin();
+        rt_trace_spawn(copy, &kCopy, nullptr);
+        rt_trace_spawn(prog, &kProgram, nullptr);
+        rt_trace_wake(prog, RT_TRACE_SEED | kReactiveRing, nullptr, 0);
+        rt_trace_wake(copy, RT_TRACE_SEED | kContRing, nullptr, 0);
+        rt_trace_region(RT_TRACE_REG_ACTIVE);
+        rt_trace_region(RT_TRACE_REG_REACTIVE);
+        if (copy_first) {
+            CHECK(rt_trace_dispatch(copy, RT_TRACE_RING) == 1);
+            CHECK(rt_trace_dispatch(prog, RT_TRACE_RING) == 1);
+            CHECK(rt_trace_halted() == 0);
+        } else {
+            CHECK(rt_trace_dispatch(prog, RT_TRACE_RING) == 0);
+            CHECK(rule() == "R25.2");
+            CHECK(has(rt_trace_report(), "would read its inputs stale"));
+            CHECK(has(rt_trace_report(), "design.sv:24:3"));
+        }
+    }
+}
+
+// B43: an `expect`'s waiter queue named by the design-wide monitor number was one queue for the
+// instances of a unit, so one instance's verdict released another's waiter. A wake names the record or
+// queue its park waits on.
+TEST_CASE("trace check: a wake names the record or queue its park waits on (R5.1, B43)") {
+    struct Case {
+        const rt_trace_control* park;
+        uint32_t                cause;
+    };
+    const Case cases[] = { { &kJoin, RT_TRACE_CHILD },
+                           { &kCall, RT_TRACE_CALLEE },
+                           { &kSyncWait, RT_TRACE_SYNC },
+                           { &kAwaitWait, RT_TRACE_AWAIT },
+                           { &kExpectWait, RT_TRACE_EXPECT | kReactiveRing } };
+    for (const Case& c : cases) {
+        const auto parked = [&] {
+            rt_trace_begin();
+            rt_trace_spawn(&proc_a, &kProcess, nullptr);
+            rt_trace_dispatch(&proc_a, RT_TRACE_INLINE);
+            rt_trace_park(&proc_a, c.park, id_of(&rec_a));
+        };
+        parked();
+        rt_trace_wake(&proc_a, c.cause, &rec_a, 0);
+        CHECK_MESSAGE(rt_trace_halted() == 0, c.park->where);
+        // A wake that names no record says nothing of it.
+        parked();
+        rt_trace_wake(&proc_a, c.cause, nullptr, 0);
+        CHECK_MESSAGE(rt_trace_halted() == 0, c.park->where);
+        parked();
+        rt_trace_wake(&proc_a, c.cause, &rec_b, 0);
+        CHECK_MESSAGE(rule() == "R5.1", c.park->where);
+        CHECK_MESSAGE(has(rt_trace_report(), "another"), c.park->where);
+        CHECK_MESSAGE(has(rt_trace_report(), "of the record or queue at"), c.park->where);
+    }
+}
+
+TEST_CASE("trace check: a node on a list of occupants is off it before its activation ends or enters again (R23.1, B29)") {
+    void* a = &proc_a;
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    for (int pass = 0; pass < 2; ++pass) {
+        rt_trace_block(a, &list_a, RT_TRACE_BLOCK_ENTER);
+        rt_trace_block(a, &list_b, RT_TRACE_BLOCK_ENTER);
+        rt_trace_block(a, &list_b, RT_TRACE_BLOCK_EXIT);
+        rt_trace_block(a, &list_a, RT_TRACE_BLOCK_EXIT);
+    }
+    rt_trace_end(a);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.blocks == before.blocks + 8);
+
+    // An exit that skips the block's end leaves the node linked, and the activation ends with it.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_block(a, &list_a, RT_TRACE_BLOCK_ENTER);
+    rt_trace_end(a);
+    CHECK(rule() == "R23.1");
+    CHECK(has(rt_trace_report(), "ended inside a block or task some disable names"));
+
+    // ... or goes round the loop and enters the block again.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_block(a, &list_a, RT_TRACE_BLOCK_ENTER);
+    rt_trace_block(a, &list_a, RT_TRACE_BLOCK_ENTER);
+    CHECK(rule() == "R23.1");
+    CHECK(has(rt_trace_report(), "already on"));
+
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_block(a, &list_a, RT_TRACE_BLOCK_EXIT);
+    CHECK(rule() == "R23.1");
+    CHECK(has(rt_trace_report(), "not on"));
+}
+
+TEST_CASE("trace check: a disable marks every occupant of the list it walks (R23.2)") {
+    void* occupant = &proc_a;
+    void* other    = &proc_b;
+    void* disabler = &proc_d;
+    const auto setup = [&](bool other_leaves) {
+        rt_trace_begin();
+        parked_on_clk(occupant);
+        rt_trace_block(occupant, &list_a, RT_TRACE_BLOCK_ENTER);
+        parked_on_clk(other);
+        rt_trace_block(other, &list_a, RT_TRACE_BLOCK_ENTER);
+        if (other_leaves) {
+            rt_trace_block(other, &list_a, RT_TRACE_BLOCK_EXIT);
+        }
+        rt_trace_spawn(disabler, &kProcess, nullptr);
+        rt_trace_dispatch(disabler, RT_TRACE_INLINE);
+        rt_trace_disable(disabler, &list_a);
+    };
+    setup(false);
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    rt_trace_abort(occupant, &list_a, RT_TRACE_ABORT_DISABLE);
+    rt_trace_wake(occupant, RT_TRACE_FORCE, nullptr, 0);
+    rt_trace_abort(other, &list_a, RT_TRACE_ABORT_DISABLE);
+    rt_trace_wake(other, RT_TRACE_FORCE, nullptr, 0);
+    rt_trace_park(disabler, &kDelay, 1);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.aborts == before.aborts + 2);
+
+    // The walk misses one: a node that was never on the list, or a walk that stopped early. The
+    // activation would run on, and the checker finds it at the next park.
+    setup(false);
+    rt_trace_abort(occupant, &list_a, RT_TRACE_ABORT_DISABLE);
+    rt_trace_wake(occupant, RT_TRACE_FORCE, nullptr, 0);
+    rt_trace_park(disabler, &kDelay, 1);
+    CHECK(rule() == "R23.2");
+    CHECK(has(rt_trace_report(), "did not reach an activation that is inside the block or task it names"));
+    CHECK(has(rt_trace_report(), "design.sv:3:3"));
+
+    // An occupant that left before the walk is not owed.
+    setup(true);
+    rt_trace_abort(occupant, &list_a, RT_TRACE_ABORT_DISABLE);
+    rt_trace_park(disabler, &kDelay, 1);
+    CHECK(rt_trace_halted() == 0);
+}
+
+// B27: `disable F` of a named fork was a silent no-op: the children were on no list.
+TEST_CASE("trace check: a fork child is on the lists the IR says it is within before it first runs (R23.3, B27)") {
+    void* parent = &proc_a;
+    void* child  = &proc_b;
+    rt_trace_begin();
+    rt_trace_spawn(parent, &kProcess, nullptr);
+    rt_trace_dispatch(parent, RT_TRACE_INLINE);
+    rt_trace_block(child, &list_a, RT_TRACE_BLOCK_RAMP);
+    rt_trace_spawn(child, &kForkChild, parent);
+    rt_trace_block(child, &list_a, RT_TRACE_BLOCK_INHERIT);
+    CHECK(rt_trace_dispatch(child, RT_TRACE_INLINE) == 1);
+    rt_trace_block(child, &list_a, RT_TRACE_BLOCK_EXIT);
+    rt_trace_end(child);
+    CHECK(rt_trace_halted() == 0);
+
+    // The ramp linked it on no list.
+    rt_trace_begin();
+    rt_trace_spawn(parent, &kProcess, nullptr);
+    rt_trace_dispatch(parent, RT_TRACE_INLINE);
+    rt_trace_spawn(child, &kForkChild, parent);
+    rt_trace_block(child, &list_a, RT_TRACE_BLOCK_INHERIT);
+    CHECK(rt_trace_dispatch(child, RT_TRACE_INLINE) == 0);
+    CHECK(rule() == "R23.3");
+    CHECK(has(rt_trace_report(), "runs before it is an occupant"));
+
+    // A ramp that linked an earlier incarnation of the address does not carry over.
+    rt_trace_begin();
+    rt_trace_spawn(child, &kForkChild, parent);
+    rt_trace_dispatch(child, RT_TRACE_INLINE);
+    rt_trace_block(child, &list_b, RT_TRACE_BLOCK_ENTER);
+    rt_trace_block(child, &list_b, RT_TRACE_BLOCK_EXIT);
+    rt_trace_end(child);
+    rt_trace_spawn(child, &kForkChild, parent);
+    rt_trace_block(child, &list_a, RT_TRACE_BLOCK_INHERIT);
+    CHECK(rt_trace_dispatch(child, RT_TRACE_INLINE) == 0);
+    CHECK(rule() == "R23.3");
+}
+
+// R23 × S1: `p.kill()` of an always parked at its static leading control resumed its body once and
+// the always went on, because the loop's park had no abort poll.
+TEST_CASE("trace check: an activation a kill or a disable marked leaves before it parks again (R23.4)") {
+    void* a      = &proc_a;
+    void* killer = &proc_b;
+    const rt_trace_entry sub[] = { { &clk, "clk", RT_TRACE_POS, nullptr } };
+    const auto           setup = [&] {
+        rt_trace_begin();
+        rt_trace_spawn(a, &kProcess, nullptr);
+        rt_trace_subscribe(a, sub, 1);
+        rt_trace_park(a, &kStatic, 0);
+        rt_trace_spawn(killer, &kProcess, nullptr);
+        rt_trace_dispatch(killer, RT_TRACE_INLINE);
+    };
+
+    // The kill force-wakes the always, which runs its body and parks at the static control again.
+    setup();
+    rt_trace_abort(a, nullptr, RT_TRACE_ABORT_KILL);
+    rt_trace_wake(a, RT_TRACE_FORCE, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_resume(a, &kStatic);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rule() == "R23.4");
+    CHECK(has(rt_trace_report(), "marked by a kill of its thread"));
+    CHECK(has(rt_trace_report(), "parked again after a disable or a kill marked it to leave"));
+
+    // With the poll, it ends.
+    setup();
+    rt_trace_abort(a, nullptr, RT_TRACE_ABORT_KILL);
+    rt_trace_wake(a, RT_TRACE_FORCE, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_resume(a, &kStatic);
+    rt_trace_end(a);
+    CHECK(rt_trace_halted() == 0);
+
+    // A disable's mark is obeyed by leaving the block it names, after which the activation may park.
+    for (const bool leaves : { false, true }) {
+        rt_trace_begin();
+        parked_on_clk(a);
+        rt_trace_block(a, &list_a, RT_TRACE_BLOCK_ENTER);
+        rt_trace_spawn(killer, &kProcess, nullptr);
+        rt_trace_dispatch(killer, RT_TRACE_INLINE);
+        rt_trace_disable(killer, &list_a);
+        rt_trace_abort(a, &list_a, RT_TRACE_ABORT_DISABLE);
+        rt_trace_wake(a, RT_TRACE_FORCE, nullptr, 0);
+        CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+        rt_trace_resume(a, &kWait);
+        if (leaves) {
+            rt_trace_block(a, &list_a, RT_TRACE_BLOCK_EXIT);
+        }
+        rt_trace_waits_for(a, &clk, "clk", RT_TRACE_POS, nullptr);
+        rt_trace_park(a, &kWait, 0);
+        CHECK_MESSAGE(rt_trace_halted() == (leaves ? 0 : 1), leaves);
+    }
+
+    // The two parks that run a child or a callee inline first can hold a mark: the wake they wait for
+    // comes from its completion, and the poll after it takes the activation out.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_dispatch(a, RT_TRACE_INLINE);
+    rt_trace_abort(a, nullptr, RT_TRACE_ABORT_KILL);
+    rt_trace_park(a, &kJoin, id_of(&rec_a));
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: only an activation a walk marked is force-woken (R23.5)") {
+    void* marked   = &proc_a;
+    void* unmarked = &proc_b;
+    rt_trace_begin();
+    parked_on_clk(marked);
+    parked_on_clk(unmarked);
+    // A run whose walks report nothing says nothing of its force wakes.
+    rt_trace_wake(unmarked, RT_TRACE_FORCE, nullptr, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    rt_trace_begin();
+    parked_on_clk(marked);
+    parked_on_clk(unmarked);
+    rt_trace_abort(marked, nullptr, RT_TRACE_ABORT_KILL);
+    rt_trace_wake(marked, RT_TRACE_FORCE, nullptr, 0);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_wake(unmarked, RT_TRACE_FORCE, nullptr, 0);
+    CHECK(rule() == "R23.5");
+    CHECK(has(rt_trace_report(), "no disable or kill had marked"));
+}
 #endif // CLOTHO_EXTRA_ASSERTS

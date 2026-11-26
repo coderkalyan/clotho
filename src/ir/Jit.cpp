@@ -553,6 +553,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_trace_nba_pass", &rt_trace_nba_pass);
     expose("rt_trace_pend", &rt_trace_pend);
     expose("rt_trace_trigger", &rt_trace_trigger);
+    expose("rt_trace_block", &rt_trace_block);
+    expose("rt_trace_disable", &rt_trace_disable);
+    expose("rt_trace_abort", &rt_trace_abort);
+    expose("rt_trace_once", &rt_trace_once);
 #endif
     // libc mem* helpers that LLVM's loop-idiom pass synthesizes under -O (a
     // zeroing loop becomes memset, a copy loop memcpy, etc.). A dynamically

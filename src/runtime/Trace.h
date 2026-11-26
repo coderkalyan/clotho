@@ -27,7 +27,7 @@ enum {
     RT_TRACE_CTL_EVENT = 1,
     // `#d`, and `#0`.
     RT_TRACE_CTL_DELAY = 2,
-    // The parent's park at a `join` or `join_any`.
+    // The parent's park at a `join` or a `join_any`, on the fork's join record.
     RT_TRACE_CTL_JOIN = 3,
     // A task enable whose callee blocked.
     RT_TRACE_CTL_CALL = 4,
@@ -43,7 +43,8 @@ enum {
     RT_TRACE_CTL_SUSPENDED = 9,
 };
 
-// What an activation was created for: rt_trace_control::kind of an origin.
+// What an activation was created for: rt_trace_control::kind of an origin. The bodies the
+// scheduler runs once (`clotho.run_once`) are named by their region.
 enum {
     RT_TRACE_ORG_PROCESS = 32,
     RT_TRACE_ORG_FORK = 33,
@@ -52,6 +53,62 @@ enum {
     RT_TRACE_ORG_STROBE = 36,
     RT_TRACE_ORG_MONITOR = 37,
     RT_TRACE_ORG_EXPORT = 38,
+    RT_TRACE_ORG_PREINIT = 39,
+    RT_TRACE_ORG_PREPONED = 40,
+    RT_TRACE_ORG_OBSERVED = 41,
+    RT_TRACE_ORG_RE_NBA = 42,
+    RT_TRACE_ORG_FINAL = 43,
+};
+
+// The facts of a seed row's processes, ORed into the kind of its origin (RT_TRACE_ORG_PROCESS)
+// above RT_TRACE_KIND, which is the kind proper.
+enum {
+    RT_TRACE_KIND = 0xff,
+    // An `initial` or an `always` procedure, not one that starts late (R17), and not a program's
+    // `initial`, which starts in the Reactive region.
+    RT_TRACE_ORG_PROCEDURE = 1u << 8,
+    // A continuously active process (Process::self_start): evaluated at time zero (R15).
+    RT_TRACE_ORG_SELF_START = 1u << 9,
+    // A group with an always_comb or always_latch member: its time-zero run follows the start of
+    // every procedure (R17).
+    RT_TRACE_ORG_LATE = 1u << 10,
+    // A program's `initial`: its thread is reactive for its whole life (R25).
+    RT_TRACE_ORG_PROGRAM = 1u << 11,
+    // A reactive-home continuous process: a program's port copy, `assign` or resolver (R25).
+    RT_TRACE_ORG_REACTIVE_CONT = 1u << 12,
+};
+
+// How rt_trace_block reports an activation and a `disable` target, which is the head of the
+// target's list of occupants.
+enum {
+    // The activation links its node on the list: it enters a block some `disable` names from
+    // outside, or the task some `disable` names.
+    RT_TRACE_BLOCK_ENTER = 0,
+    // It unlinks the node: the end of the block, an exit that skips it, the epilogue.
+    RT_TRACE_BLOCK_EXIT = 1,
+    // The IR says the activation is activity enabled within the target for its whole life: a fork
+    // child of a targeted block or task (Function::fork_targets). Reported by the fork, once the
+    // spawn has announced the child; R23 checks that the child's ramp linked it.
+    RT_TRACE_BLOCK_INHERIT = 2,
+    // The ramp of a fork child links its node, before the spawn that announces the child.
+    RT_TRACE_BLOCK_RAMP = 3,
+};
+
+// Why rt_trace_abort marks an activation to leave: a `disable` of a block or task, or a `kill`
+// (`disable fork` too) of its thread.
+enum {
+    RT_TRACE_ABORT_DISABLE = 0,
+    RT_TRACE_ABORT_KILL = 1,
+};
+
+// The ring a wake pushes onto, in bits 8 and up of rt_trace_wake's cause: the Active ring, the
+// Reactive ring, or the reactive continuous ring a program's port copies and assigns drain from
+// before program code.
+enum {
+    RT_TRACE_QUEUE_SHIFT = 8,
+    RT_TRACE_QUEUE_ACTIVE = 0,
+    RT_TRACE_QUEUE_REACTIVE = 1,
+    RT_TRACE_QUEUE_CONT = 2,
 };
 
 // What pushed an activation: the cause of rt_trace_wake.
@@ -73,19 +130,21 @@ enum {
     RT_TRACE_TIMER = 7,
     // The promotion of the `#0` batch.
     RT_TRACE_INACTIVE = 8,
-    // The fork child a parent's join is due on.
+    // The fork child a parent's join is due on: `x` is the join record the parent parked on.
     RT_TRACE_CHILD = 9,
-    // A blocked callee that completed.
+    // A blocked callee that completed: `x` is the task's record.
     RT_TRACE_CALLEE = 10,
-    // `disable` or `kill`.
+    // `disable` or `kill`: the activation was marked to leave (rt_trace_abort).
     RT_TRACE_FORCE = 11,
-    // A semaphore or mailbox handing over.
+    // A semaphore or mailbox handing over: `x` is the head word of the queue.
     RT_TRACE_SYNC = 12,
-    // The completion of a thread that `await` or `wait fork` waits for.
+    // The completion of a thread that `await` or `wait fork` waits for: `x` is the thread that
+    // completed, null for the waiters of a `wait fork` barrier.
     RT_TRACE_AWAIT = 13,
     // `p.resume()`.
     RT_TRACE_PROC = 14,
-    // The verdict of the attempt an `expect` waits for.
+    // The verdict of the attempt an `expect` waits for: `x` is the instance whose monitor reached
+    // it.
     RT_TRACE_EXPECT = 15,
 };
 
@@ -295,6 +354,9 @@ typedef struct rt_trace_counts {
     uint64_t finishes;
     // Writes the brackets reported (rt_trace_change).
     uint64_t changes;
+    // Block entries and exits, and activations a `disable` or `kill` marked.
+    uint64_t blocks;
+    uint64_t aborts;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -327,11 +389,16 @@ void rt_trace_waits_for(void* a, const void* x, const char* name, uint64_t edge,
 // a bracket, which says what it saw (RT_TRACE_SEEN_*). It precedes the wakes the write makes.
 void rt_trace_change(const rt_trace_change_site* site, const void* x, uint32_t seen);
 
-// `a` parks at control `c`: a delay control waits `delay` ticks (0: the `#0` region).
-void rt_trace_park(void* a, const rt_trace_control* c, uint64_t delay);
+// `a` parks at control `c`. `arg` is a delay control's ticks (0: the `#0` region); for the parks
+// that wait on a record or a queue (a join, a task call, a semaphore or mailbox, `await`, `wait
+// fork`, `expect`) it is the address that names it, which the wake that ends the park names too
+// (B43). Bits 1 and 2 of `a` are the thread's home tag (2: reactive), which says whether a `#0`
+// waits in the Inactive batch or the Re-Inactive one.
+void rt_trace_park(void* a, const rt_trace_control* c, uint64_t arg);
 
 // Something pushes `a` onto a ring (RT_TRACE_SEED ...): `x` and `fact` name the signal
-// and change, or the event object, where the cause has one.
+// and change, or the event object or record, where the cause has one. The low byte of
+// `cause` is the cause; from RT_TRACE_QUEUE_SHIFT up, the ring the wake pushes onto.
 void rt_trace_wake(void* a, uint32_t cause, const void* x, uint32_t fact);
 
 // `a` is about to run (RT_TRACE_RING ...). Returns 0 when the run must be skipped: the
@@ -343,6 +410,25 @@ void rt_trace_resume(void* a, const rt_trace_control* c);
 
 // `a` reached its final suspend.
 void rt_trace_end(void* a);
+
+// `a` links its node on the list of occupants of `target`, the head of the list of the block or
+// task a `disable` names, or unlinks it, or is within it for its whole life as the IR says
+// (RT_TRACE_BLOCK_*).
+void rt_trace_block(void* a, const void* target, uint32_t how);
+
+// `a` executes a `disable` of the block or task whose list of occupants is `target` (null: `a`
+// is not an activation). Every occupant of the list is marked by the walk that follows.
+void rt_trace_disable(void* a, const void* target);
+
+// A `disable` (`target`: the list it walks) or a `kill` or `disable fork` (`target` null) marks
+// activation `a` to leave (RT_TRACE_ABORT_*). It leaves `target` (rt_trace_block) or ends before
+// it parks again, except at a join or a task call, which hold their wake until the child or
+// callee completes.
+void rt_trace_abort(void* a, const void* target, uint32_t kind);
+
+// The scheduler runs the bodies of one region through `clotho.run_once` (`kind`:
+// RT_TRACE_ORG_PREINIT ...), or has done (0).
+void rt_trace_once(uint32_t kind);
 
 // The scheduler enters `region` (RT_TRACE_REG_*): the Active drain's entries, the Inactive,
 // Observed, Reactive, Re-Inactive and Postponed regions, and the top of a slot. The NBA and
