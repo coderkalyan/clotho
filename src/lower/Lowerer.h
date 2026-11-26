@@ -4390,6 +4390,10 @@ private:
     // instance of its specialization; `text` is then what follows the path. Anywhere
     // else the whole name is static text: package and `$unit` code, which sits under
     // no instance, and a subroutine reached through a virtual interface, which serves
+    // A packed value holding a packed tagged union whose tag names no member is not a value
+    // of the type ($cast, docs/LRM_NOTES.md note 76).
+    bool      packed_has_tagged_union(const slang::ast::Type& ct);
+    ir::Index packed_tags_valid(ir::Index v, const slang::ast::Type& ct, ir::Builder& b, ir::SourceLoc l);
     // every instance.
     struct ScopeName {
         bool        in_instance = false;
@@ -6013,6 +6017,7 @@ private:
     struct CoverOpts {
         uint32_t                   weight         = 1;
         uint32_t                   type_weight    = 1;
+        uint32_t                   type_goal      = 100;
         uint32_t                   goal           = 100;
         uint32_t                   at_least       = 1;
         uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default

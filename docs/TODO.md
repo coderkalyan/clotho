@@ -65,10 +65,8 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Single-record nonblocking whole-array copy (performance)** — each element of an
   unpacked-array NBA is deferred separately instead of as one memcpy record.
-- [~] **Unpacked-array slices** (7.4.5) — two slice shapes are still refused.
-  - [ ] **Slice of an array with struct or array elements** — refused.
-  - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
-    or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
+- [ ] **By-value read of a slice** (7.4.5) — a constant or indexed slice as a concatenation
+  operand or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
 - [ ] **Whole-array or slice assignment from a concatenation or streaming result** (10.10,
   11.4.14) — an unpacked-array source that is not a variable, pattern or call is refused.
 
@@ -98,8 +96,8 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [~] **Intra-assignment timing** (9.4.5) — target shapes and qualifiers still refused; see
   docs/design/intra-assignment-timing.md.
-  - [ ] **String or whole-container nonblocking target** (`s <= #5 t`, `q <= #2 r`) —
-    needs an owned-copy record that is freed on every drop path.
+  - [ ] **String or whole-container nonblocking target** (`s <= #5 t`, `q <= #2 r`) — the
+    deferred record has no owned-handle tail; needs an owned-copy record freed on every drop path.
   - [ ] **`iff` on a nonblocking intra-assignment event** (9.4.2.3) — only enabled
     occurrences may count down, so a `repeat` count cannot reuse the body guard.
   - [ ] **Runtime-offset select of a very wide vector as a nonblocking target** — needs a
@@ -113,8 +111,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Blocking form onto a string or a whole unpacked array** (`s = #5 t`,
     `mem = #5 other`) — the store path evaluates the LHS before the RHS.
   - [ ] **Blocking form onto an assignment-pattern lvalue** — refused.
-  - [ ] **Intra-assignment timing on a force target** (10.6.2), also as a concatenation
-    operand — suppression is decided at commit, not when the update is armed.
 - [ ] **Per-event `iff` in a multi-event list** (9.4.2.3) — `@(posedge a iff x or b)` needs
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
@@ -159,7 +155,6 @@ Milestones, in order; lower ones unblock higher ones:
     declaration assignment `wire #(r, f) w = e;` (10.3.3).
   - [ ] **Net delay on an unpacked array or aggregate net** — resolution folds packed planes
     only; needs a leaf-wise inertial replay.
-  - [ ] **Net delay on a user-defined-nettype net** — needs nettype resolution functions.
 
 ### Procedural continuous assignment & force
 
@@ -168,8 +163,9 @@ Milestones, in order; lower ones unblock higher ones:
   while that force is active stops the run with a fatal error.
 - [ ] **`force` of an input or inout port target** (10.6.2) — the port-copy driver does not
   honour the force.
-- [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must
-  be decided when the deferred update commits, but the deferred record carries no gate.
+- [ ] **Intra-assignment timing on a write to a `force` target** (9.4.5, 10.6.2), also as a
+  concatenation operand — suppression must be decided when the deferred update commits, but
+  the deferred record carries no gate.
 - [ ] **Gate or switch output on a `force` target variable** (10.3, 10.6.2) — the gate's store
   has no force gate, and 10.6.2 does not say whether a release restores a primitive output.
 - [ ] **Continuous assignment delay on a `force` target variable** (10.3.3, 10.6.2) — the
@@ -243,8 +239,12 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`$fgets`, `$sformat`, `$swrite` and `$ferror` into a part-select or non-byte-multiple
   target** (21.3) — refused.
 - [ ] **`$fread` into a part-select** (21.3.4.4) — refused.
+- [ ] **`$readmemb` / `$readmemh` / `$fread` into an array of dynamic arrays, queues or
+  associative arrays** (21.4, 21.3.4.4) — refused.
+- [ ] **`$fread` into an unpacked struct** (21.3.4.4) — members load in declaration order; a
+  struct target and an array of structs are refused.
 - [~] **`$fscanf` / `$sscanf`** (21.3.4.3) — missing pieces:
-  - [ ] **Target wider than 64 bits or not a whole variable**.
+  - [ ] **Bit-select or part-select target** — `$sscanf(s, "%h", v[7:0])` is refused.
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination**.
   - [ ] **`%t`, `%u`, `%z`, `%v` and `%m` conversions**.
   - [ ] **`%s` into an unpacked array of `byte`** — needs an element-ordered store
@@ -255,8 +255,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination** — needs an ASCII-to-real
     scan and a real write-back.
   - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
-- [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
-  returned to power-on between designs in one process (docs/design/cooperative-finish.md).
 - [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
   - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
   - [ ] **Aggregate or container argument** — refused at compile time.
@@ -281,8 +279,8 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Net types, strengths, resolution
 
-- [ ] **`trireg` nets** — strength and charge storage; also refused as the simulated net of
-  an inout port collapse (23.3.3.7).
+- [ ] **`trireg` nets** (6.6.4) — strength, charge storage, capacitance strengths and decay;
+  also refused as the simulated net of an inout port collapse (23.3.3.7).
 - [~] **Multiple-driver net resolution** (6.6) — missing pieces:
   - [ ] **Unpacked-array and unpacked-struct nets** — needs per-element slots and resolvers.
   - [ ] **Concatenation-operand driver** — needs a split into per-net stores.
@@ -299,8 +297,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Cross-top hierarchical reference** — `top2.sig` from `top1`; each top lowers with its
   own signal map. Calls into another top work; `$unit` code or a method calling `top.f()` is
   refused, and so is a later top's function returning a class handle.
-- [ ] **Hierarchical path through a generate-block instance or an instance-array element**
-  — `g.u.sig` and `arr[i].sig` fail at elaboration.
 - [~] **`inout` / `ref` port aliasing** (23.2.2.1, 23.3.3) — a port and its connection must be
   one whole net each, of one width; missing pieces:
   - [ ] **Port that is a select, or connection that is a select or concatenation** — needs
@@ -331,11 +327,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **NBA to a class property** — `c.x <= v` and an unqualified `x <= v` inside a method, of
   any type including `string`, are refused; NBA staging is keyed by signal and an object body
   has none. See docs/design/classes.md §8.
-- [ ] **Intra-assignment delay on a string or container NBA** — `s <= #5 t` and `q <= #2 r` are
-  refused; the deferred record has no owned-handle tail. See
-  docs/design/intra-assignment-timing.md.
-- [ ] **Non-constant string replication count** (11.4.12.1) — deliberate deviation, kept open to
-  revisit: `{m{"-"}}` with a runtime `m` is accepted when the result is a `string`.
 - [ ] **`string` ports** — a string port, including a string reached through a struct member or a
   container element, is refused.
 - [ ] **Queue, dynamic-array or associative-array port** (23.3.3) — a container port connection
@@ -350,8 +341,8 @@ Milestones, in order; lower ones unblock higher ones:
   — refused in every direction; the copy-in and copy-out are that assignment.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
-  - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an
-    `input` port connection.
+  - [ ] **Struct-element array slice** — refused as an assignment source, as a subroutine
+    actual and as an `input` port connection.
   - [ ] **Slice copy between aggregate frame locals** — `o = x[0:1];` and `return x[0:1];` are
     refused.
   - [ ] **Dynamic-array slice with aggregate elements** (7.4.5) — a struct or heap-handle element
@@ -395,8 +386,6 @@ Milestones, in order; lower ones unblock higher ones:
   container kind with the clause's element type.
 - [ ] **Array query dimension argument beyond 1 on a dynamically sized operand** (20.7) — a nested
   dynamic dimension, as in a queue of queues, is refused.
-- [ ] **Bounded queue `[$:N]` under whole assignment** — `qb = other` from a queue, dynamic array
-  or fixed array keeps every source element instead of truncating to the bound.
 - [~] **Whole queue and dynamic-array assignment** (7.5, 7.10) — source and region shapes still
   refused.
   - [ ] **Nonblocking form from a literal, a fixed array or another container kind** (10.4.2)
@@ -421,8 +410,6 @@ Milestones, in order; lower ones unblock higher ones:
   call or concatenation source, is refused.
 - [ ] **Bit-stream casting** (6.24.3) — `{<<{...}}` / `{>>{...}}` as cast operands, and a cast
   from a queue or dynamic array to a packed type.
-- [ ] **Open question: `$cast` into a packed tagged union** (11.9) — the bit cast is not
-  tag-checked and can install a tag/payload pair no `tagged` expression builds; is that legal?
 
 ### Operators & expressions
 
@@ -462,12 +449,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Nested and extern module declarations** — refused.
 - [ ] **`export pkg::*;` of a name the exporting package never references** — the name does
   not resolve through the export (slang lookup limitation).
-- [ ] **Checkers and nettypes declared in a package** — refused when referenced.
 
 ### Classes (basic OOP)
 
-- [ ] **Bare instance-method call with no receiver in scope** (8.7) — refused when neither
-  an object under construction nor an enclosing method supplies `this`.
 - [ ] **Monomorphic inline cache for virtual calls (performance)** (8.20) — every virtual
   call dispatches through the method table; benchmark a per-call-site cache keyed on the class.
 
@@ -503,8 +487,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
   fails to lower aborts the whole compilation instead of stubbing that one method.
-- [~] **Class scope and nesting** — open pieces of class scope resolution.
-  - [ ] **`::` on a parameterized class specialization** — `C#(args)::` resolution.
 - [ ] **`$cast` to a `chandle` destination** (6.24.2) — refused; a chandle carries no type
   identity to test.
 - [ ] **Deeply nested class inheritance** (8.13) — a chain past a fixed depth limit is
@@ -513,7 +495,8 @@ Milestones, in order; lower ones unblock higher ones:
 ### Constrained randomization
 
 - [ ] **Constraint blocks** — relational, `inside`, `->`, `if`/`else`, `foreach`,
-  `solve … before`, `dist`, `soft` and `unique` constraints; there is no solver.
+  `solve … before`, `dist`, `soft` and `unique` constraints, array reduction methods, function
+  calls, `disable soft` and constraint inheritance; there is no solver.
 - [ ] **Inline constraints** — `randomize() with { … }`, on an object and on
   `std::randomize`.
 - [ ] **`constraint_mode()`** — enabling and disabling constraint blocks.
@@ -552,8 +535,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Clocking item of a `string`, unpacked aggregate or container type** (14.3) —
     refused.
   - [ ] **Assertion item declared inside a clocking block** (14.3, 16.16) — refused.
-  - [ ] **Sampled value function in procedural code** (16.9.3) — needs history rings keyed
-    to the default clocking.
 - [~] **Program blocks** — open pieces of program-block support.
   - [ ] **Clocking block or concurrent assertion clocked by a program signal** (24.3.1) —
     the scheduler does not iterate from the reactive region set back through Observed;
@@ -566,26 +547,22 @@ Milestones, in order; lower ones unblock higher ones:
 ### Concurrent assertions (SVA)
 
 - [~] **Sequence and property operators** (16.9, 16.12) — open operator shapes:
-  - [ ] **Abort over a multi-cycle implication antecedent** — an attempt whose antecedent dies
-    on the abort tick is dropped, so no failure is reported.
-  - [ ] **`disable iff` inside a named property** — refused.
   - [ ] **Repetition with a zero lower bound** — it admits the empty sequence.
-  - [ ] **Goto and non-consecutive repetition over a compound sequence** — only
-    single-expression operands lower.
   - [ ] **Property operator over an operand that raises its own obligation** — a monitor has
     one trigger; only `nexttime[n]` and `always [m:n]` operands lower.
   - [ ] **Non-packed sampled variable** (16.5, 16.6) — aggregate, container, string and
     event operands of an assertion expression are refused.
-  - [ ] **Abort operator below `not`** (16.12.14) — `not accept_on(c) p` is refused.
+  - [ ] **Abort operator below `not`, a property `and`, `always [m:n]` or a followed-by**
+    (16.12.14) — `not accept_on(c) p` and `accept_on(c) p and q` are refused.
   - [ ] **`first_match` past the automaton state limit** (16.9.8) — its operand is
     determinised, so a large one is refused.
   - [ ] **`case` property over a non-integral selector or label** (16.12.16) — refused.
 - [~] **Sampled value functions** (16.9.3) — open pieces:
   - [ ] **Explicit clocking argument** (16.12.14) — refused on `$past`, `$rose`, `$fell`,
     `$stable` and `$changed`; unclocked contexts such as `disable iff` need it.
-  - [ ] **Non-constant `$past` tick count** — refused.
   - [ ] **Operand that is an expression** — the operand must be a plain variable.
-  - [ ] **Use outside an assertion expression** — refused.
+  - [ ] **Sampled value function outside an assertion expression** (16.9.3) — in procedural
+    code, with or without a default clocking; needs history rings keyed to the default clocking.
 - [~] **Function calls in assertion expressions** (16.9.1, 4.4.2) — open pieces:
   - [ ] **User function call** — its body is not traced to add the variables it reads to the
     sampled set.
@@ -709,8 +686,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Modport expression port** (25.5.4) — reached through a modport-qualified handle.
   - [ ] **Subroutine call through a handle to an interface with no signals or no elaborated
     instance** — refused rather than lowered against an instance layout.
-- [ ] **Property expansion for a class-handle `%p` operand** (21.2.1.6) — a direct operand
-  prints only its class name.
 - [ ] **Handle argument to a runtime `$sformat` format** (21.2.1.6) — the renderer cannot
   tell whether it meets `%p` or a numeric conversion.
 - [ ] **`%p` of a nested container or an aggregate holding a handle** (21.2.1.6) — a queue of
@@ -720,10 +695,9 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Net & primitive completeness
 
-- [ ] **User-defined nettypes** — `nettype` declarations and their resolution
-  functions.
+- [ ] **User-defined nettypes** — `nettype` declarations, including one in a package, their
+  resolution functions and a net delay on such a net.
 - [ ] **Generic interconnect** — `interconnect` nets.
-- [ ] **`trireg` charge storage** — capacitance strengths and charge decay.
 
 ### Timing & back-annotation
 
@@ -733,15 +707,11 @@ Milestones, in order; lower ones unblock higher ones:
   `$timeskew`, `$fullskew`, `$nochange`, and `$setuphold` with notifiers.
 - [ ] **SDF annotation** — `$sdf_annotate`.
 - [ ] **Pulse-style controls** — pulse filtering control in specify blocks.
-- [ ] **Hierarchical and fractional time units** — full per-scope `timeunit` /
-  `timeprecision` and precision-correct rounding of fractional delays.
 
 ### Configuration & checkers
 
-- [ ] **Library maps and configurations** — `library`, `config`, `design`, `cell` and
-  `instance` binding, `liblist` and `use`.
-- [ ] **Checkers** — `checker` / `endchecker` declarations, their assertions, free
-  variables and instantiation.
+- [ ] **Checkers** — `checker` / `endchecker` declarations, including one in a package, their
+  assertions, free variables and instantiation.
 - [ ] **Nested `rand join`** (18.17.5) — a `rand join` operand that is itself a `rand join`.
 
 ### Language corners
@@ -751,11 +721,6 @@ Milestones, in order; lower ones unblock higher ones:
     unpacked struct or array.
   - [ ] **Non-integral tagged-union payload** — a pattern over an unpacked tagged
     union with a `real`, `string`, unpacked aggregate or class member.
-- [ ] **Recursive properties** — a property that instantiates itself.
-- [ ] **Full constraint language** — array reduction methods and functions in
-  constraints, `disable soft`, iterative constraints, constraint inheritance.
-- [ ] **Coverage corners** — real coverpoints, type coverage, cross `binsof`
-  expressions, coverage merge and database; see docs/design/functional-coverage.md.
 - [ ] **Attributes** — semantic meaning for `(* ... *)` attributes beyond
   parse-through.
 - [ ] **Protected envelopes** (34) — encrypted source cannot be decrypted, so it is refused.
@@ -774,6 +739,3 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **VPI** — object-model access (`vpi_handle`, `vpi_get`, `vpi_get_value`),
   value-change and start/end-of-simulation callbacks, `vpi_put_value`.
 - [ ] **Assertion and coverage APIs** — the VPI assertion and coverage extensions.
-- [ ] **Compiler directive semantics** — `` `define `` with arguments, conditionals,
-  `` `include ``, `` `line ``, `` `resetall ``, `` `default_nettype ``, `` `celldefine `` and
-  `` `pragma `` are not verified to take their semantic effect.

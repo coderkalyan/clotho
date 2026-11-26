@@ -84,6 +84,9 @@ typedef struct rt_cover_point {
     // null when empty.
     const char* inst_comment;
     const char* type_comment;
+    // type_option.weight and type_option.goal of the coverpoint (default 1 and 100).
+    uint32_t type_weight;
+    uint32_t type_goal;
 } rt_cover_point;
 
 typedef struct rt_cover_type {
@@ -108,6 +111,8 @@ typedef struct rt_cover_type {
     // option.comment and type_option.comment, null when empty.
     const char* inst_comment;
     const char* type_comment;
+    // type_option.goal of the covergroup (LRM 19.7.1, default 100).
+    uint32_t type_goal;
 } rt_cover_type;
 
 // Emitted once per design as `clotho.cover.config` and handed to rt_cover_init.
@@ -203,6 +208,15 @@ int64_t rt_cover_opt_get(uint64_t h, uint32_t point, uint32_t which);
 void    rt_cover_opt_set_str(uint64_t h, uint32_t point, uint32_t which, const char* s, uint64_t len);
 void    rt_cover_opt_get_str(struct rt_string* dst, uint64_t h, uint32_t point, uint32_t which,
                              const struct rt_alloc_site* site);
+
+// Type options assigned or read procedurally (LRM 19.7.1: weight, goal and comment may be
+// assigned at any time). `point` is the coverpoint index or RT_COVER_OPT_GROUP, and `type` is
+// the covergroup type index. Weight and goal are integers, comment a string.
+void    rt_cover_type_opt_set(uint32_t type, uint32_t point, uint32_t which, int64_t value);
+int64_t rt_cover_type_opt_get(uint32_t type, uint32_t point, uint32_t which);
+void    rt_cover_type_opt_set_str(uint32_t type, uint32_t point, uint32_t which, const char* s, uint64_t len);
+void    rt_cover_type_opt_get_str(struct rt_string* dst, uint32_t type, uint32_t point, uint32_t which,
+                                  const struct rt_alloc_site* site);
 
 // -- Queries (LRM 19.8, 19.11) ------------------------------------------------
 //

@@ -195,7 +195,7 @@ PropNotify prop_notify_kind(const slang::ast::Type& ty) {
         return PropNotify::None;
     }
     if (ty.isIntegral() || ty.isFloating() || ty.isClass() || ty.isCHandle() ||
-        ty.isVirtualInterface()) {
+        ty.isVirtualInterface() || ty.isCovergroup()) {
         return PropNotify::Word;
     }
     return PropNotify::None;

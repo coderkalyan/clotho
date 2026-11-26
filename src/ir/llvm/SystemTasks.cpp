@@ -83,7 +83,9 @@ llvm::Constant* Backend::cover_config_global() {
                                                          b_.getInt32(cp.auto_total),
                                                          b_.getInt32(cp.is_signed ? 1u : 0u),
                                                          cover_string(cp.inst_comment),
-                                                         cover_string(cp.type_comment) }));
+                                                         cover_string(cp.type_comment),
+                                                         b_.getInt32(cp.type_weight),
+                                                         b_.getInt32(cp.type_goal) }));
         }
         types.push_back(llvm::ConstantStruct::get(
           cover_type_ty(),
@@ -100,7 +102,8 @@ llvm::Constant* Backend::cover_config_global() {
             ct.inst_name.has_value() ? static_cast<llvm::Constant*>(b_.CreateGlobalString(*ct.inst_name))
                                      : llvm::Constant::getNullValue(raw_ptr_ty()),
             cover_string(ct.inst_comment),
-            cover_string(ct.type_comment) }));
+            cover_string(ct.type_comment),
+            b_.getInt32(ct.type_goal) }));
     }
     llvm::Constant* path = config_.coverage_report.empty()
                              ? llvm::Constant::getNullValue(raw_ptr_ty())
@@ -762,6 +765,22 @@ void Backend::lower_cover_query(Index i) {
                           { str_of(i), handle(), b_.getInt32(info.point), cast(must_of(args[1]), 32, false),
                             alloc_site_global(loc_text(i), "string") });
             return;
+        case CoverOp::TypeOptGet:
+            if (args.size() != 1) {
+                throw BackendError{ "internal: cover_query type_opt_get takes an option id" };
+            }
+            set_value(i, two_val(b_.CreateCall(cover_type_opt_get_fn(),
+                                               { cover_type_value(info.type_idx), b_.getInt32(info.point),
+                                                 cast(must_of(args[0]), 32, false) })));
+            return;
+        case CoverOp::TypeOptGetStr:
+            if (args.size() != 1) {
+                throw BackendError{ "internal: cover_query type_opt_get_str takes an option id" };
+            }
+            b_.CreateCall(cover_type_opt_get_str_fn(),
+                          { str_of(i), cover_type_value(info.type_idx), b_.getInt32(info.point),
+                            cast(must_of(args[0]), 32, false), alloc_site_global(loc_text(i), "string") });
+            return;
         case CoverOp::DesignCoverage:
             set_value(i, real_plane(b_.CreateCall(cover_design_coverage_fn(), {})));
             return;
@@ -819,6 +838,24 @@ void Backend::lower_cover_ctl(Index i) {
             b_.CreateCall(cover_opt_set_str_fn(),
                           { h, b_.getInt32(info.point), cast(must_of(args[1]), 32, false), s.ptr,
                             b_.CreateZExt(s.len, b_.getInt64Ty()) });
+            return;
+        }
+        case CoverOp::TypeOptSet:
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_ctl type_opt_set takes an option id and a value" };
+            }
+            b_.CreateCall(cover_type_opt_set_fn(),
+                          { cover_type_value(info.type_idx), b_.getInt32(info.point),
+                            cast(must_of(args[0]), 32, false), cast(must_of(args[1]), 64, true) });
+            return;
+        case CoverOp::TypeOptSetStr: {
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_ctl type_opt_set_str takes an option id and a string" };
+            }
+            const AsciiArg s = spill_ascii_arg(args[1], "cover.type_opt");
+            b_.CreateCall(cover_type_opt_set_str_fn(),
+                          { cover_type_value(info.type_idx), b_.getInt32(info.point),
+                            cast(must_of(args[0]), 32, false), s.ptr, b_.CreateZExt(s.len, b_.getInt64Ty()) });
             return;
         }
         case CoverOp::SetName: {

@@ -3544,6 +3544,10 @@ private:
     llvm::FunctionCallee cover_opt_get_fn();
     llvm::FunctionCallee cover_opt_set_str_fn();
     llvm::FunctionCallee cover_opt_get_str_fn();
+    llvm::FunctionCallee cover_type_opt_set_fn();
+    llvm::FunctionCallee cover_type_opt_get_fn();
+    llvm::FunctionCallee cover_type_opt_set_str_fn();
+    llvm::FunctionCallee cover_type_opt_get_str_fn();
     llvm::FunctionCallee cover_set_name_fn();
     llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);

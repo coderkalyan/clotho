@@ -378,6 +378,74 @@ TEST_CASE("tagged union: an x tag selects no member and names itself as undefine
     CHECK(run.err.find("the tag selects undefined (x)") != std::string::npos);
 }
 
+TEST_CASE("$cast into a packed tagged union succeeds only for a tag that names a member (LRM 6.24.2, 7.3.2)") {
+    // Oracle: LRM-derived (docs/LRM_NOTES.md note 76); iverilog 13 does not parse tagged
+    // unions. Three has three members, so two tag bits and tag 3 names none. Outer's
+    // member X is a tagged union too, checked only while the outer tag selects X. A
+    // failed function-form $cast answers 0 and leaves the destination as it was.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { bit [7:0] A; bit [3:0] B; void C; } Three;
+            typedef union tagged packed { bit [1:0] P; bit [1:0] Q; void R; } Inner;
+            typedef union tagged packed { Inner X; bit [3:0] Y; } Outer;
+            typedef struct packed { bit [1:0] pad; Three t; } Wrap;
+            typedef union tagged packed { logic [3:0] L; void N; } Four;
+            Three t; Outer o; Wrap w; Four f; int ok;
+            initial begin
+                t = tagged A 8'h11;
+                ok = $cast(t, 10'b01_0000_0101); $display("tag B: %0d %b", ok, t);
+                ok = $cast(t, 10'b11_0000_0001); $display("tag 3: %0d %b", ok, t);
+                ok = $cast(t, 10'b10_1111_1111); $display("tag C: %0d %b", ok, t);
+                o = tagged Y 4'h3;
+                ok = $cast(o, 5'b0_11_01); $display("inner tag 3: %0d %b", ok, o);
+                ok = $cast(o, 5'b1_11_01); $display("Y, inner bits unchecked: %0d %b", ok, o);
+                ok = $cast(o, 5'b0_10_01); $display("inner R: %0d %b", ok, o);
+                w = '0;
+                ok = $cast(w, 12'b11_11_00000000); $display("struct bad: %0d %b", ok, w);
+                ok = $cast(w, 12'b11_00_00000001); $display("struct ok: %0d %b", ok, w);
+                f = tagged N;
+                ok = $cast(f, 5'b0_0001); $display("one tag bit L: %0d %b", ok, f);
+                ok = $cast(f, 5'b1_0001); $display("one tag bit N: %0d %b", ok, f);
+                ok = $cast(f, 5'bx_0001); $display("x tag: %0d %b", ok, f);
+                ok = $cast(f, 5'bz_0001); $display("z tag: %0d %b", ok, f);
+                $cast(t, 10'b01_0000_0111); $display("task ok: %b", t);
+            end
+        endmodule
+    )") == "tag B: 1 0100000101\n"
+           "tag 3: 0 0100000101\n"
+           "tag C: 1 1011111111\n"
+           "inner tag 3: 0 10011\n"
+           "Y, inner bits unchecked: 1 11101\n"
+           "inner R: 1 01001\n"
+           "struct bad: 0 000000000000\n"
+           "struct ok: 1 110000000001\n"
+           "one tag bit L: 1 00001\n"
+           "one tag bit N: 1 10001\n"
+           "x tag: 0 10001\n"
+           "z tag: 0 10001\n"
+           "task ok: 0100000111\n");
+}
+
+TEST_CASE("$cast task form into a packed tagged union with a tag that names no member is a run-time error") {
+    // Oracle: LRM-derived (6.24.2: "a run-time error occurs, and the destination variable
+    // is left unchanged").
+    const std::string src = "module m;\n"
+                            "    typedef union tagged packed { bit [7:0] A; bit [3:0] B; void C; } Three;\n"
+                            "    Three t;\n"
+                            "    initial begin\n"
+                            "        t = tagged A 8'h11;\n"
+                            "        $cast(t, 10'b11_0000_0000);\n"
+                            "        $display(\"after\");\n"
+                            "    end\n"
+                            "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.empty());
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("$cast: the source is not assignment compatible with the destination") != std::string::npos);
+}
+
 TEST_CASE("unpacked tagged union: LSB overlay under the synthesized tag (LRM 7.3.2)") {
     // An unpacked tagged union lowers to the same flat {synthesized-tag, payload}
     // value, so a member read is the low payload bits. Only the member the tag

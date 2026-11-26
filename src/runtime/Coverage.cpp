@@ -38,6 +38,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+
+namespace {
+// Strings a procedural type_option.comment assignment gave the model, freed with it.
+std::vector<char*> g_type_opt_strs;
+} // namespace
 
 namespace {
 
@@ -922,6 +928,10 @@ extern "C" void rt_cover_shutdown(void) {
     // The instances go before the model, because an instance is described by it.
     // Both are the runtime's own storage: the model is copy_model's single block,
     // so one free retires the whole tree.
+    for (char* s : g_type_opt_strs) {
+        std::free(s);
+    }
+    g_type_opt_strs.clear();
     std::free(g_model);
     g_model = nullptr;
     // Idempotent, and safe before any rt_cover_init: the harness may tear down a
@@ -1327,6 +1337,85 @@ extern "C" void rt_cover_opt_get_str(rt_string* dst, uint64_t h, uint32_t point,
         } else if (which == RT_COVER_OPT_COMMENT) {
             s = point == RT_COVER_OPT_GROUP ? inst->comment : point < inst->npoints ? inst->popts[point].comment : nullptr;
         }
+    }
+    rt_internal::str_assign(dst, s != nullptr ? s : "", s != nullptr ? std::strlen(s) : 0, site);
+}
+
+// -- Type options assigned after construction (LRM 19.7.1) ---------------------
+//
+// The model is the runtime's own copy (copy_model), so a type option is written in place; the
+// `const` of g_config is the model's read-only view, not its storage. $get_coverage reads
+// type_weight from here, and the report prints type_comment from here.
+
+namespace {
+
+rt_cover_type* type_opt_target(uint32_t type) {
+    if (g_config == nullptr || type >= g_config->ntypes) {
+        return nullptr;
+    }
+    return const_cast<rt_cover_type*>(&g_config->types[type]);
+}
+
+} // namespace
+
+extern "C" void rt_cover_type_opt_set(uint32_t type, uint32_t point, uint32_t which, int64_t value) {
+    rt_cover_type* ty = type_opt_target(type);
+    if (ty == nullptr || (point != RT_COVER_OPT_GROUP && point >= ty->npoints)) {
+        return;
+    }
+    if (which == RT_COVER_OPT_WEIGHT && value < 0) {
+        cover_fatal(point == RT_COVER_OPT_GROUP ? ty->banner : ty->points[point].banner,
+                    "type_option.weight must be a non-negative value", "LRM 19.7.1, Table 19-3");
+    }
+    uint32_t* slot = nullptr;
+    if (point == RT_COVER_OPT_GROUP) {
+        slot = which == RT_COVER_OPT_WEIGHT ? &ty->type_weight : which == RT_COVER_OPT_GOAL ? &ty->type_goal : nullptr;
+    } else {
+        auto* pt = const_cast<rt_cover_point*>(&ty->points[point]);
+        slot     = which == RT_COVER_OPT_WEIGHT ? &pt->type_weight : which == RT_COVER_OPT_GOAL ? &pt->type_goal : nullptr;
+    }
+    if (slot != nullptr) {
+        *slot = static_cast<uint32_t>(value);
+    }
+}
+
+extern "C" int64_t rt_cover_type_opt_get(uint32_t type, uint32_t point, uint32_t which) {
+    const rt_cover_type* ty = type_opt_target(type);
+    if (ty == nullptr || (point != RT_COVER_OPT_GROUP && point >= ty->npoints)) {
+        return 0;
+    }
+    if (point == RT_COVER_OPT_GROUP) {
+        return which == RT_COVER_OPT_WEIGHT ? ty->type_weight : which == RT_COVER_OPT_GOAL ? ty->type_goal : 0;
+    }
+    const rt_cover_point& pt = ty->points[point];
+    return which == RT_COVER_OPT_WEIGHT ? pt.type_weight : which == RT_COVER_OPT_GOAL ? pt.type_goal : 0;
+}
+
+extern "C" void rt_cover_type_opt_set_str(uint32_t type, uint32_t point, uint32_t which, const char* s, uint64_t len) {
+    rt_cover_type* ty = type_opt_target(type);
+    if (ty == nullptr || which != RT_COVER_OPT_COMMENT || (point != RT_COVER_OPT_GROUP && point >= ty->npoints)) {
+        return;
+    }
+    char* copy = static_cast<char*>(std::malloc(static_cast<size_t>(len) + 1));
+    if (copy == nullptr) {
+        cover_fatal(nullptr, "out of memory for a covergroup option string", nullptr);
+    }
+    if (len != 0) {
+        std::memcpy(copy, s, static_cast<size_t>(len));
+    }
+    copy[len] = '\0';
+    g_type_opt_strs.push_back(copy);
+    const char*& slot = point == RT_COVER_OPT_GROUP ? ty->type_comment
+                                                    : const_cast<rt_cover_point*>(&ty->points[point])->type_comment;
+    slot = len != 0 ? copy : nullptr;
+}
+
+extern "C" void rt_cover_type_opt_get_str(rt_string* dst, uint32_t type, uint32_t point, uint32_t which,
+                                          const rt_alloc_site* site) {
+    const rt_cover_type* ty = type_opt_target(type);
+    const char*          s  = nullptr;
+    if (ty != nullptr && which == RT_COVER_OPT_COMMENT && (point == RT_COVER_OPT_GROUP || point < ty->npoints)) {
+        s = point == RT_COVER_OPT_GROUP ? ty->type_comment : ty->points[point].type_comment;
     }
     rt_internal::str_assign(dst, s != nullptr ? s : "", s != nullptr ? std::strlen(s) : 0, site);
 }

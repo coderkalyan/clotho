@@ -1636,7 +1636,9 @@ llvm::StructType* Backend::cover_point_ty() {
                                                      b_.getInt32Ty(),
                                                      b_.getInt32Ty(),
                                                      raw_ptr_ty(),
-                                                     raw_ptr_ty() },
+                                                     raw_ptr_ty(),
+                                                     b_.getInt32Ty(),
+                                                     b_.getInt32Ty() },
                                                    "clotho.coverpoint");
     }
     return cover_point_ty_;
@@ -1656,7 +1658,8 @@ llvm::StructType* Backend::cover_type_ty() {
                                                     b_.getInt32Ty(),
                                                     raw_ptr_ty(),
                                                     raw_ptr_ty(),
-                                                    raw_ptr_ty() },
+                                                    raw_ptr_ty(),
+                                                    b_.getInt32Ty() },
                                                   "clotho.covertype");
     }
     return cover_type_ty_;
@@ -1731,6 +1734,25 @@ llvm::FunctionCallee Backend::cover_opt_set_str_fn() {
 llvm::FunctionCallee Backend::cover_opt_get_str_fn() {
     return rt_fn("rt_cover_opt_get_str", b_.getVoidTy(),
                  { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_set_fn() {
+    return rt_fn("rt_cover_type_opt_set", b_.getVoidTy(),
+                 { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_get_fn() {
+    return rt_fn("rt_cover_type_opt_get", b_.getInt64Ty(), { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_set_str_fn() {
+    return rt_fn("rt_cover_type_opt_set_str", b_.getVoidTy(),
+                 { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_get_str_fn() {
+    return rt_fn("rt_cover_type_opt_get_str", b_.getVoidTy(),
+                 { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
 }
 
 llvm::FunctionCallee Backend::cover_set_name_fn() {
