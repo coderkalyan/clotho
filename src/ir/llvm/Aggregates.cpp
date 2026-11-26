@@ -20,6 +20,16 @@ llvm::StructType* Backend::agg_leaf_slot_ty(Ref type) {
 // and a leaf slot for each scalar / string / real. Unlike the flat memory
 // path this does NOT flatten array dimensions, so arbitrary nesting
 // (array-of-struct, struct-with-array-member, ...) is a direct mirror.
+//
+// NOTE: one StructType per list of field types, as slot_type is one per shape,
+// not one per struct type or per use. scope_type gives the instances of a
+// definition one state struct only when their field types are the same objects,
+// and the pool does not merge struct types with the same members: each
+// declaration the front end lowers interns its own. A type per use gave each
+// instance with an unpacked struct member a state struct of its own, so the
+// port layout that the instances of a definition share split, and code a
+// virtual interface handle runs against the representative's layout read
+// another instance's record.
 llvm::Type* Backend::agg_storage_ty(Ref type) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::UnpackedArray) {
@@ -30,7 +40,11 @@ llvm::Type* Backend::agg_storage_ty(Ref type) {
         for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
             fields.push_back(agg_storage_ty(f.type));
         }
-        return llvm::StructType::create(ctx_, fields, "clotho.agg");
+        const auto [it, fresh] = agg_struct_tys_.try_emplace(std::move(fields), nullptr);
+        if (fresh) {
+            it->second = llvm::StructType::create(ctx_, it->first, "clotho.agg");
+        }
+        return it->second;
     }
     if (t.kind == Type::Kind::String) {
         return str_slot_ty();

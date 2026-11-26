@@ -2049,6 +2049,25 @@ private:
 
     void finalize_sim_nets();
 
+    // A net's own net delay (LRM 28.16): its single delay-value expression and the
+    // multipliers of the time unit of the module that declares the net (LRM 3.14.1),
+    // as time_mul_ / prec_over_tick_ hold them while that module is lowered.
+    // emit_wire_resolvers lowers the delay after the whole top is walked, when the
+    // unit of no one instance is current.
+    struct NetDelay {
+        const Expression* expr;
+        uint64_t          time_mul;
+        uint64_t          prec_over_tick;
+    };
+
+    // fail()'s text for a net delay of rise / fall / turn-off values.
+    static constexpr std::string_view kNetDelayTriple =
+      "net delay rise/fall/turn-off triples (wire #(a,b,c)) are not supported";
+
+    NetDelay net_delay_of(const NetSymbol& net);
+
+    ir::Index scaled_net_delay(const NetDelay& d, ir::Builder& b);
+
     static bool is_modeled_net_kind(NetType::NetKind kind);
 
     // fail()'s text for a net type is_modeled_net_kind refuses.
@@ -2249,7 +2268,8 @@ private:
 
     void reject_concat_resolved_driver(const Expression& lhs);
 
-    void store_driver_slot(const Expression& left,
+    void store_driver_slot(ir::Signal        net,
+                           const Expression& left,
                            ir::Signal        slot,
                            ir::Index         val,
                            const Expression* delay_expr,
@@ -2502,13 +2522,27 @@ private:
     // which is any expression. A part-select bound is always Required.
     std::optional<GateTerm> gate_static_term(const Expression& e, Fold mode);
 
+    // The (signal, bit) a 1-bit constant select of a packed signal names through any
+    // chain of selects and packed-struct members (LRM 7.2.1), which gate_static_term
+    // does not follow. Output terminals only: the indexes fold as Required.
+    std::optional<GateTerm> gate_packed_term(const Expression& lhs);
+
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index);
 
     GateTerm lower_gate_output(const Expression& conn);
 
     void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up);
 
-    void emit_pull_driver(const ValueSymbol& net, bool up, uint8_t level, ir::SourceLoc l, bool program_driver);
+    void lower_pull_terminal(const Expression& term, bool up, uint8_t level, ir::SourceLoc l);
+
+    // `part` is the bit- or part-select of `net` a pullup / pulldown names, or null
+    // for the whole net.
+    void emit_pull_driver(const ValueSymbol& net,
+                          const Expression*  part,
+                          bool               up,
+                          uint8_t            level,
+                          ir::SourceLoc      l,
+                          bool               program_driver);
 
     void lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver);
 
@@ -4257,6 +4291,27 @@ private:
     ir::Index lower_string_arg(const Expression& expr, ir::Builder& b);
 
     ir::Index lower_address_arg(const Expression& expr, ir::Builder& b);
+
+    // The array a $readmem / $fread loads (LRM 21.4, 21.3.4.4), as ReadMemInfo and
+    // FreadMemInfo name it: `target` the array lvalue, or the one an indexed slice
+    // selects from, and `type` the array the load fills. `slice_end` is the last index
+    // of a slice of a queue, whose first is `slice_base`.
+    struct MemTarget {
+        ir::Index target;
+        ir::Ref   type;
+        ir::Ref   base_type  = ir::Ref::Invalid;
+        ir::Index slice_base = ir::Index{ 0 };
+        ir::Index slice_end  = ir::Index{ 0 };
+        uint32_t  slice      = ir::kMemSliceNone;
+    };
+
+    static bool is_mem_target_shape(const Expression& e);
+
+    MemTarget lower_mem_target(const Expression& e, ir::Builder& b);
+
+    void lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b);
+
+    std::pair<ir::Index, ir::Index> lower_queue_bounds(const RangeSelectExpression& rs, ir::Builder& b);
 
     std::vector<char> scan_conversion_chars(std::string_view fmt);
 
@@ -6314,12 +6369,12 @@ private:
     };
     ankerl::unordered_dense::map<uint32_t, PullInfo> net_pull_;
     // Nets declared with a plain net delay (`wire #5 w;`, no net_decl_assignment
-    // — LRM 28.16), keyed by signal id: the single delay-value expression,
-    // lowered lazily by emit_wire_resolvers once every driver has registered
-    // its slot. Distinct from a delay embedded in a net-declaration ASSIGNMENT
-    // (`wire #5 w = expr;`), which LRM 10.3.3 treats as that one driver's own
-    // continuous-assign delay instead and lowers through lower_net_initializer.
-    ankerl::unordered_dense::map<uint32_t, const Expression*> net_delay_;
+    // — LRM 28.16), keyed by signal id, lowered lazily by emit_wire_resolvers once
+    // every driver has registered its slot. Distinct from a delay embedded in a
+    // net-declaration ASSIGNMENT (`wire #5 w = expr;`), which LRM 10.3.3 treats as
+    // that one driver's own continuous-assign delay instead and lowers through
+    // lower_net_initializer.
+    ankerl::unordered_dense::map<uint32_t, NetDelay> net_delay_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.

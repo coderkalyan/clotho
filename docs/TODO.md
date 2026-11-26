@@ -69,7 +69,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Slice of an array with struct or array elements** — refused.
   - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
     or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
-- [ ] **Sliced memory target for `$readmem*` / `$fread`** — a slice destination is refused.
 - [ ] **Whole-array or slice assignment from a concatenation or streaming result** (10.10,
   11.4.14) — an unpacked-array source that is not a variable, pattern or call is refused.
 
@@ -158,13 +157,10 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Continuous assignment delay** (10.3.3) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — `assign #(r, f)` and `assign #(r, f, t)`.
   - [ ] **Delay on a select, concatenation or aggregate target**.
-  - [ ] **Delay on a partial driver of a resolved net** — its slot powers up all-x, so the
-    undriven bits would fold as x instead of z.
 - [~] **Gate delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — `#(r, f)` and `#(r, f, t)` on any gate or
     switch, including `cmos` / `rcmos` and the turn-off delay of tri-state gates (28.6).
   - [ ] **Delayed gate with a bit-addressed output on a single-driver net**.
-  - [ ] **Delayed gate as a partial driver of a resolved net**.
 - [~] **Net delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
     declaration assignment `wire #(r, f) w = e;` (10.3.3).
@@ -199,7 +195,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Concurrent fractional-delay timers (performance)** (3.14) — fine-tick periods past
   the wheel window spill to the overflow heap; needs a hierarchical wheel or a coarser tick.
-- [ ] **`%c`, `%u` and `%z` of a real argument**.
 
 ### Observability & debug
 
@@ -215,8 +210,6 @@ Milestones, in order; lower ones unblock higher ones:
   one `$var` per leaf.
 - [ ] **VCD of a container or class-handle signal** — a dump over a queue, dynamic array,
   associative array or class handle is refused.
-- [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
-  string-literal suffix is accepted.
 - [ ] **Freeing a finished simulation** — frames and allocations of processes still
   suspended when a simulation ends are not freed, so a host running several leaks them.
 - [ ] **Debugger breakpoints and stepping** — the DAP adapter refuses every stop-shaped
@@ -260,15 +253,12 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Part-select destination** — refused for every conversion.
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination** — needs an ASCII-to-real
     scan and a real write-back.
-  - [ ] **Numeric conversion into a `string` destination** — `%d` and friends must store the
-    converted value as an integral-to-string assignment (6.16).
   - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
 - [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
   returned to power-on between designs in one process (docs/design/cooperative-finish.md).
 - [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
   - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
   - [ ] **Aggregate or container argument** — refused at compile time.
-  - [ ] **Operand wider than 64 bits under `%e`, `%f`, `%g`**.
   - [ ] **Empty argument (adjacent commas)** (21.2.1) — contributes format text, which is
     unknown at compile time.
   - [ ] **Format held in an unpacked array of `byte`** (21.3.3) — refused.
@@ -278,8 +268,6 @@ Milestones, in order; lower ones unblock higher ones:
 ### Structural primitives
 
 - [~] **Gate output terminals** — missing pieces:
-  - [ ] **Member of a packed-struct net driven by a single gate** — `s.lo[0]` has no static
-    terminal; only the multi-driver resolved form works.
   - [ ] **Concatenation or part-select output**.
 - [ ] **Bit-select gate output (performance)** — each update rewrites the whole word and
   drops thunk/fusion eligibility; needs per-bit packed-signal fusion.
@@ -294,14 +282,11 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **`trireg` nets** — strength and charge storage; also refused as the simulated net of
   an inout port collapse (23.3.3.7).
-- [ ] **Net delay on an inout port net that dominates the net it connects to** (23.3.3.7,
-  28.16) — the delay needs the declaring module's time unit.
 - [~] **Multiple-driver net resolution** (6.6) — missing pieces:
   - [ ] **Unpacked-array and unpacked-struct nets** — needs per-element slots and resolvers.
   - [ ] **Concatenation-operand driver** — needs a split into per-net stores.
 - [~] **Drive strengths** — missing pieces:
   - [ ] **Drive strength on `wand` / `wor` nets**.
-  - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
   - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the
     r-variants do not reduce it; refused when the output net is resolved against a
     driver or weak pull and the strengths do not order as strong (LRM_NOTES note 38).
@@ -330,8 +315,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Port coercion to inout of a port that is not a whole net of its own width** (23.3.3.1)
   — with `--allow-port-coercion`, a connection to a select, concatenation, expression or net
   of another width is refused.
-- [ ] **Initializer on a select port whose variable is declared apart from the port** (23.2.2.2)
-  — `output x = 1;` with a later `reg [3:0] x;` under `module m(x[3:2])` is refused.
 
 ### Timing checks (basic)
 

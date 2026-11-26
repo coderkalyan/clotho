@@ -507,6 +507,58 @@ int64_t real_time_ticks(double v, uint64_t mul) {
     return sat_round_i64(scaled);
 }
 
+// The value of the `width`-bit little-endian word array `val` as a double, rounded
+// once to nearest even (LRM §6.12.1; the same result as the codegen's integral to
+// real conversion), negative if `is_signed` and the top bit is set. A value past
+// the double range is an infinity. Unknown bits read as 0: `val` is the must plane.
+double wide_to_double(const uint64_t* val, uint32_t width, bool is_signed) {
+    const uint32_t        words = plane_words(width);
+    std::vector<uint64_t> mag(val, val + words);
+    const uint32_t        top      = width - 1;
+    const bool            negative = is_signed && ((mag[top / 64] >> (top % 64)) & 1u) != 0;
+    if (negative) {
+        uint64_t carry = 1;
+        for (uint32_t k = 0; k < words; ++k) {
+            const uint64_t inv = ~mag[k] + carry;
+            carry              = (carry != 0 && inv == 0) ? 1 : 0;
+            mag[k]             = inv;
+        }
+        if (width % 64 != 0) {
+            mag[words - 1] &= (uint64_t{ 1 } << (width % 64)) - 1;
+        }
+    }
+    const auto bit = [&mag](int64_t i) { return (mag[static_cast<size_t>(i) / 64] >> (i % 64)) & 1u; };
+    int64_t    msb = -1;
+    for (uint32_t k = words; k-- > 0;) {
+        if (mag[k] != 0) {
+            msb = int64_t{ k } * 64 + 63 - __builtin_clzll(mag[k]);
+            break;
+        }
+    }
+    if (msb < 0) {
+        return 0.0;
+    }
+    double r = 0.0;
+    if (msb < 64) {
+        r = static_cast<double>(mag[0]);
+    } else {
+        uint64_t m = 0;
+        for (int64_t i = msb; i > msb - 53; --i) {
+            m = (m << 1) | bit(i);
+        }
+        const bool guard  = bit(msb - 53) != 0;
+        bool       sticky = false;
+        for (int64_t i = msb - 54; i >= 0 && !sticky; --i) {
+            sticky = bit(i) != 0;
+        }
+        if (guard && (sticky || (m & 1u) != 0)) {
+            ++m;
+        }
+        r = std::ldexp(static_cast<double>(m), static_cast<int>(msb - 52));
+    }
+    return negative ? -r : r;
+}
+
 // Reconcile one descriptor with the conversion a RUNTIME format asked for.
 //
 // With a compile-time format lower/SystemTasks.cpp's build_format has the specifier in hand
@@ -564,9 +616,21 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
             scratch.val = static_cast<uint64_t>(sat_round_i64(std::bit_cast<double>(a.val[0])));
             return synth(/*is_signed=*/true);
         }
-        // TODO: %c of a real (the rounded integer truncated to a character code)
-        // and %u / %z of a real (its raw bits, LRM §21.2.1.3). build_format
-        // refuses both on the compile-time path; keep the two paths agreeing.
+        if (lc == 'c') {
+            // The rounded integer (LRM §6.12.1), of which %c prints the low 8 bits.
+            scratch.val = static_cast<uint64_t>(sat_round_i64(std::bit_cast<double>(a.val[0])));
+            return synth(/*is_signed=*/true);
+        }
+        if (lc == 'u' || lc == 'z') {
+            // LRM §21.2.1.1: the 2-value / 4-value binary representation of the
+            // data, which for a real is its IEEE 754 bit pattern with no unknown
+            // bits: 64 bits, or 32 for a shortreal (the codegen widened it).
+            const bool single = (a.flags & 16u) != 0;
+            double     d      = std::bit_cast<double>(a.val[0]);
+            scratch.val       = single ? std::bit_cast<uint32_t>(static_cast<float>(d)) : a.val[0];
+            scratch.arg       = rt_arg{ single ? 32u : 64u, 0u, &scratch.val, &scratch.zero, &scratch.zero };
+            return scratch.arg;
+        }
         dynfmt_fatal(dyn, spec_name(conv) + " with a real argument is not supported");
     }
 
@@ -576,13 +640,12 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
         // formatter. Mirrors build_format's ItoF, which reads the must plane and
         // therefore takes x/z bits as 0.
         if (a.width > 64) {
-            // TODO: an operand wider than 64 bits under %e / %f / %g from a
-            // runtime format. The compile-time path handles it (ItoF lowers to
-            // SIToFP on the full iW), but accumulating the planes here would
-            // round at every word boundary instead of once, so it would be
-            // quietly off rather than merely imprecise.
-            dynfmt_fatal(dyn, spec_name(conv) + " of an operand wider than 64 bits is not supported "
-                                                "from a runtime format string");
+            // One rounding over the whole operand, as the compile-time path's
+            // SIToFP / UIToFP does; accumulating word by word would round at each
+            // word boundary.
+            scratch.val = std::bit_cast<uint64_t>(wide_to_double(a.val, a.width, (a.flags & 1u) != 0));
+            scratch.arg = rt_arg{ 64, 0b101u, &scratch.val, nullptr, nullptr };
+            return scratch.arg;
         }
         const uint64_t bits = a.val[0];
         double         d    = 0.0;

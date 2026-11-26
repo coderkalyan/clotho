@@ -3278,6 +3278,8 @@ private:
     llvm::FunctionCallee sscanf_fn();
     llvm::FunctionCallee readmem_fn();
     llvm::FunctionCallee fread_fn();
+    llvm::FunctionCallee readmem_assoc_fn();
+    llvm::FunctionCallee fread_assoc_fn();
 
     llvm::FunctionCallee vcd_open_fn();
     llvm::FunctionCallee vcd_begin_fn();
@@ -4375,6 +4377,62 @@ private:
         llvm::Value* fwd;
     };
     AsciiArg spill_ascii_arg(Index v, const char* name);
+
+    std::pair<llvm::Value*, uint32_t> mem_inner_dims(Ref array_type);
+
+    // The array a $readmem or $fread loads, resolved for rt_readmem / rt_fread: the
+    // leaf planes of the first word that exists, the leaf slot's facts, the loaded
+    // array's dimensions (the declared bounds of its highest, `inner` for the rest),
+    // which of the words of the highest dimension have storage and, for a queue, the
+    // ring they sit in. An associative array has no planes to point at (its elements are
+    // created by the load): rt_readmem_assoc / rt_fread_assoc take its handle, its
+    // descriptor and the index's width instead, and the slot facts describe one element.
+    struct MemTarget {
+        llvm::Value*                      mm_base = nullptr;
+        llvm::Value*                      z_base  = nullptr;
+        uint32_t                          stride  = 0;
+        uint32_t                          width   = 0;
+        bool                              four_state = false;
+        std::pair<llvm::Value*, uint32_t> inner;
+        // i64 values: the declared bounds of the highest dimension. Constants for a
+        // fixed-size array, [0 : size - 1] for a dynamic array or queue, whose size is
+        // read at run time.
+        llvm::Value* left  = nullptr;
+        llvm::Value* right = nullptr;
+        // i64 values: the words at positions [lo_word, lo_word + word_count), counted
+        // from `left`, exist; a count of 0 means the target names none.
+        llvm::Value* lo_word    = nullptr;
+        llvm::Value* word_count = nullptr;
+        // i64 values: the ring of a queue (see rt_readmem); 0 and 0 for any other array.
+        llvm::Value* ring_head = nullptr;
+        llvm::Value* ring_cap  = nullptr;
+        // An associative array: its handle (ptr) and descriptor, the index's width and
+        // signedness, the byte offset of the z plane in an element slot, and the i1 that
+        // says the target is valid at run time (null: always).
+        bool            assoc       = false;
+        llvm::Value*    assoc_handle = nullptr;
+        llvm::Constant* assoc_ops    = nullptr;
+        uint32_t        key_width    = 0;
+        bool            key_signed   = false;
+        uint32_t        z_off        = 0;
+        llvm::Value*    assoc_valid  = nullptr;
+        // The place the load writes: whose waiters it wakes and what it marks for the
+        // dump. `container` says it is a dynamic array, queue or associative array, which
+        // wakes through the container notifier (notify_container_mutation) rather than the
+        // waiters of an array signal.
+        LValueInfo place;
+        bool       container = false;
+    };
+
+    MemTarget resolve_mem_target(Index       target,
+                                 Ref         type,
+                                 Ref         base_type,
+                                 uint32_t    slice,
+                                 Index       slice_base,
+                                 Index       slice_end,
+                                 const char* task);
+
+    void finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix);
 
     void lower_fread_word(Index i);
 
@@ -6022,6 +6080,8 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).
     ankerl::unordered_dense::map<uint32_t, llvm::StructType*> class_body_ty_;
+    // Memoized unpacked-struct storage mirror per field-type list (see agg_storage_ty).
+    std::map<std::vector<llvm::Type*>, llvm::StructType*> agg_struct_tys_;
     // Memoized reaches_class_handle() per type Ref. Design-wide, not per module: the
     // answer depends only on the intern pool.
     ankerl::unordered_dense::map<uint32_t, bool> reaches_class_handle_;

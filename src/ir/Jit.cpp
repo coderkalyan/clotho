@@ -231,6 +231,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_fscanf", &rt_fscanf);
     expose("rt_sscanf", &rt_sscanf);
     expose("rt_fread", &rt_fread);
+    expose("rt_fread_assoc", &rt_fread_assoc);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
@@ -270,6 +271,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_sim_run", &rt_sim_run);
     expose("rt_fflush", &rt_fflush);
     expose("rt_readmem", &rt_readmem);
+    expose("rt_readmem_assoc", &rt_readmem_assoc);
     expose("rt_random", &rt_random);
     expose("rt_dist_uniform", &rt_dist_uniform);
     expose("rt_dist_normal", &rt_dist_normal);

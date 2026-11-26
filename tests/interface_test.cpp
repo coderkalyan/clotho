@@ -1532,6 +1532,84 @@ TEST_CASE("virtual interface: struct-member and whole-queue writes to twin insta
     CHECK(out == "b0 7 1 b1 8 1\n");
 }
 
+// An interface with an unpacked struct member, instantiated twice, whose members are
+// waited on and written through handles (LRM 25.9, 9.4.2). The backend made a storage
+// type for each use of a struct, so the instances of one definition got state structs of
+// their own and, with them, wait-list layouts of their own: a write through a handle ran
+// the code lowered against the first instance on its twin's record, and jumped into
+// garbage ("internal error"). The instances of a definition must lay out alike whatever
+// their members are. Each subcase is the plain design plus struct members, so what the
+// plain design prints is the oracle (iverilog 13 has neither interfaces nor unpacked
+// structs). The first handle waits on the instance the backend lowers against, the
+// second on its twin, and a direct waiter on the twin wakes with the second.
+TEST_CASE("virtual interface: twin instances of an interface with an unpacked struct member") {
+    constexpr std::string_view top = R"(
+        module top;
+            ibus u1(), u2();
+            virtual ibus v1, v2, w, y;
+            integer at1 = -1, at2 = -1, atd = -1;
+            initial begin v1 = u1; #1; @(v1.mem[1]) at1 = $time; end
+            initial begin v2 = u2; #1; @(v2.mem[1]) at2 = $time; end
+            initial begin #1; @(u2.mem[1]) atd = $time; end
+            initial begin
+                #2; w = u2; w.mem[1] = 8'h11;
+                #1; w = u1; w.mem[1] = 8'h22;
+            end
+            initial #4 $display("at %0d %0d %0d mem %h %h", at1, at2, atd, u1.mem[1], u2.mem[1]);
+    )";
+    const auto design = [&](std::string_view interface_text, std::string_view tail) {
+        return std::string(interface_text) + std::string(top) + std::string(tail) + "endmodule\n";
+    };
+    const std::string plain = run_capture(design("interface ibus; logic [7:0] mem [0:3]; endinterface\n", ""));
+    CHECK(plain == "at 3 2 2 mem 22 11\n");
+
+    SUBCASE("a struct type declared in the interface") {
+        CHECK(run_capture(design(R"(
+            interface ibus;
+                typedef struct { int a; } s_t;
+                s_t s;
+                logic [7:0] mem [0:3];
+            endinterface
+        )", R"(
+            initial begin
+                #5; y = u2; y.s.a = 7; u1.s.a = 3;
+                #1 $display("s %0d %0d", u1.s.a, u2.s.a);
+            end
+        )")) == plain + "s 3 7\n");
+    }
+    SUBCASE("a struct type declared outside, members before the array, an array of structs") {
+        CHECK(run_capture(design(R"(
+            typedef struct { int a; logic [3:0] b; } t_t;
+            interface ibus;
+                t_t s;
+                t_t sa [0:1];
+                logic [7:0] mem [0:3];
+            endinterface
+        )", R"(
+            initial begin
+                #5; y = u2; y.s.a = 7; y.sa[1].b = 4'h9; u1.sa[0].a = 3;
+                #1 $display("s %0d %h %0d", u2.s.a, u2.sa[1].b, u1.sa[0].a);
+            end
+        )")) == plain + "s 7 9 3\n");
+    }
+    SUBCASE("two struct members of different types, nested, with an array and a string inside") {
+        CHECK(run_capture(design(R"(
+            interface ibus;
+                logic [7:0] mem [0:3];
+                typedef struct { int a; } in_t;
+                typedef struct { in_t i; logic [7:0] arr [0:1]; string name; } out_t;
+                out_t o;
+                in_t x;
+            endinterface
+        )", R"(
+            initial begin
+                #5; y = u2; y.o.i.a = 5; y.o.arr[1] = 8'h66; y.o.name = "two"; y.x.a = 9;
+                #1 $display("o %0d %h %s x %0d / %0d", u2.o.i.a, u2.o.arr[1], u2.o.name, u2.x.a, u1.o.i.a);
+            end
+        )")) == plain + "o 5 66 two x 9 / 0\n");
+    }
+}
+
 // Instances of one definition bound to different interface instances, nets and
 // events, through a parent's own port too: each instance reaches what its own
 // parent binds (LRM 23.3.3, 25.3), however many instances share the body.

@@ -308,6 +308,18 @@ These were pre-existing, independent of the feature:
   for `a[k]` itself. A bare queue / dynamic-array / associative-array key
   still refuses `%p` cleanly (no crash), matching the pre-existing,
   independent "container VALUE element" `%p` limitation.
+- **P4e — an x/z bit that the cast to the index type dropped.** slang casts the index
+  expression of `a[k]`, `a.exists(k)` and `a.delete(k)` to the index type with an implicit
+  conversion around it, and a conversion to a 2-state type (or a narrower one) turns an x
+  or z bit into 0 before the backend sees the key: with `int a[int]`, `a[k]` for an `integer
+  k` holding `'x` read, wrote, incremented, found, removed and bound to a `ref` entry 0 (and
+  `4'b1x01` entry 9). The P4b gate only ever saw a key whose own type was 4-state, so it
+  could not tell. Fixed in `lower_assoc_key`: an index expression that is 4-state and whose
+  cast could drop a bit is evaluated once, cast there, and handed on as all-x if the
+  expression as written had an x or z bit (docs/LRM_NOTES.md, note 71), which the backend
+  gate then finds invalid as it does a 4-state key of the index type. Nothing else about a
+  key changes: an expression that is 2-state, or whose cast keeps every bit, takes the path
+  it always did.
 
 ## 8. Test and oracle plan
 

@@ -371,22 +371,31 @@ TEST_CASE("a signed output port sign-extends onto a multiply driven net") {
 
 // The initializer of a select port whose variable is declared apart from the port
 // (`output x = 4'b1001;` then `reg [3:0] x;`) is on the port declaration, not on the
-// variable's own declarator, so it cannot be bound to the variable: refused rather
-// than applied with the select's width (docs/TODO.md).
-TEST_CASE("an initializer on a select port of a separately declared variable fails loudly") {
-    const LowerResult r = lower_text(R"(
+// variable's own declarator, and initializes the variable, sized by it: `~4'b0` is
+// 8 bits wide in a byte. iverilog 13 rejects this form ("Incomplete port
+// declarations cannot be initialized"), so the expectation is the inline form's,
+// which it accepts (the test above), with LRM 6.8 and 23.2.2.1.
+TEST_CASE("an initializer on a select port of a separately declared variable") {
+    const std::string out = run_capture(R"(
         module m(x[3:2]);
             output x = 4'b1001;
             reg [3:0] x;
         endmodule
+        module m_bit(b[0]);
+            output b = 8'hA5;
+            reg [7:0] b;
+        endmodule
+        module m_wide(x[1:0]);
+            output x = ~4'b0;
+            reg [7:0] x;
+        endmodule
         module top;
-            wire [1:0] w;
-            m u(w);
+            wire [1:0] w; wire wb; wire [1:0] ww;
+            m u(w); m_bit v(wb); m_wide t(ww);
+            initial #1 $display("w=%b u.x=%b wb=%b v.b=%h ww=%b t.x=%h", w, u.x, wb, v.b, ww, t.x);
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("initializer on a select port of a variable declared apart from the port") !=
-          std::string::npos);
+    CHECK(out == "w=10 u.x=1001 wb=1 v.b=a5 ww=11 t.x=ff\n");
 }
 
 

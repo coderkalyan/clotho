@@ -659,11 +659,76 @@ TEST_CASE("a shortreal delay and %t operand widen to real before scaling to tick
     CHECK(same_unit == "3.0000\n3\n");
 }
 
-TEST_CASE("%c of a real is still rejected loudly") {
-    // %h/%o/%b/%x of a real now round-and-format (see the base-conversion case
-    // above), but %c has no defined real operand conversion in Table 21-1, so
-    // it stays guarded rather than silently picking a character code.
-    expect_reject(R"(module m; initial $display("%c", 1.5); endmodule)", "%c with a real argument is not supported");
+// %c of a real prints the low 8 bits of its rounded integer (LRM 6.12.1 rounds half
+// away from zero). Oracle: iverilog 13 ([B][\xBF][B]).
+TEST_CASE("%c of a real is the rounded integer's character code") {
+    CHECK(run_capture(R"(module m; initial $display("[%c][%c][%c]", 65.6, -65.4, 321.5); endmodule)") ==
+          "[B][\xBF][B]\n");
+}
+
+// %u of a real transfers its IEEE 754 representation (LRM 21.2.1.1: the 2-value
+// binary representation of the specified data), native endian, LSB word first:
+// 64 bits for a real, 32 for a shortreal. Only a runtime format reaches it (slang
+// rejects %u of a real in a literal one); iverilog 13 does not support it, so the
+// bytes are the little-endian IEEE patterns the test builds with $bitstoreal.
+TEST_CASE("%u of a real in a runtime format is its IEEE 754 bit pattern") {
+    CHECK(run_capture(R"(
+        module m;
+            string f = "%u";
+            string s;
+            real r;
+            shortreal sr;
+            initial begin
+                r = $bitstoreal(64'h0102030405060708);
+                sr = $bitstoshortreal(32'h0a0b0c0d);
+                s = $sformatf(f, r);
+                $display("%0d %h", s.len(), {s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]});
+                s = $sformatf(f, sr);
+                $display("%0d %h", s.len(), {s[0], s[1], s[2], s[3]});
+            end
+        endmodule
+    )") == "8 0807060504030201\n4 0d0c0b0a\n");
+}
+
+// $timeformat with no arguments returns to the defaults of Table 20-3 (the smallest
+// precision, precision 0, no suffix, width 20), and its suffix may be a string
+// variable. Oracle: iverilog 13.
+TEST_CASE("$timeformat: no arguments reset the format, and the suffix may be a variable") {
+    CHECK(run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+            string sfx = " ps";
+            initial begin
+                $timeformat(-9, 2, " ns", 10);
+                #1 $display("[%t]", $realtime);
+                $timeformat;
+                $display("[%t]", $realtime);
+                $timeformat(-12, 0, sfx, 8);
+                $display("[%t]", $realtime);
+                $timeformat();
+                $display("[%t]", $realtime);
+            end
+        endmodule
+    )") == "[   1.00 ns]\n[                1000]\n[ 1000 ps]\n[                1000]\n");
+}
+
+// A runtime format with an operand wider than 64 bits under %f converts the whole
+// value with one rounding (iverilog 13 agrees: 2**70; the third rounds the
+// 53-bit boundary up where two roundings would not).
+TEST_CASE("a wide operand under %f in a runtime format") {
+    CHECK(run_capture(R"(
+        module m;
+            string f = "%f";
+            logic [99:0] v = 100'd1 << 70;
+            logic signed [99:0] n = -(100'sd1 << 70);
+            logic [99:0] w = (100'd1 << 64) + (100'd1 << 11) + 1;
+            initial begin
+                $display("%s", $sformatf(f, v));
+                $display("%s", $sformatf(f, n));
+                $display("%s", $sformatf(f, w));
+            end
+        endmodule
+    )") == "1180591620717411303424.000000\n-1180591620717411303424.000000\n18446744073709555712.000000\n");
 }
 
 // A scan destination is written as must/may plane words, and a real slot is an

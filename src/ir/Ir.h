@@ -503,24 +503,52 @@ struct AssocArg {
 };
 
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
-// unpacked-array memory. The filename value is the instruction's `op`: either a
+// unpacked array (LRM 21.4). The filename value is the instruction's `op`: either a
 // packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
 // string value (the backend reads the rt_string handle's bytes at the call site).
-// `target` is the destination memory signal. `start` / `finish` are optional
-// address-bound operands (valid per `has_start` / `has_finish`). `hex` selects hex
-// vs binary digits.
+// `target` is the array lvalue the load names -- a whole memory, an element of a
+// multidimensional one (an array of lesser dimension) or a constant-bounds slice
+// (arr_slice) -- and `type` its interned UnpackedArray type, whose highest dimension
+// the addresses name. An indexed slice `target[base +: width]` / `[base -: width]`
+// has a runtime position, so it is not an lvalue: `slice` says which form it is, the
+// base value is `slice_base`, `base_type` the type of `target` it selects from, and
+// `type` the slice's own. A slice of a queue has runtime bounds as well, its first
+// and last indices `slice_base` and `slice_end` (kMemSliceQueue). `start` / `finish`
+// are optional address-bound operands (valid per `has_start` / `has_finish`). `hex`
+// selects hex vs binary digits.
 struct ReadMemInfo {
-    // Destination memory signal.
-    Signal target;
-    // Optional first / last address operands (declared-range coordinates).
+    // The array lvalue the load names, or the one an indexed slice selects from.
+    Index target;
+    // Optional first / last address operands, in the loaded array's own bounds.
     Index start;
     Index finish;
+    // The base value of an indexed slice, or the first index of a queue slice, widened
+    // to its own signedness so that it reads as a signed number; unused unless `slice`
+    // is not kMemSliceNone.
+    Index slice_base;
+    // The last index of a queue slice, widened as `slice_base` is; unused unless `slice`
+    // is kMemSliceQueue.
+    Index slice_end;
+    // The UnpackedArray type of the array the load fills.
+    Ref type;
+    // The UnpackedArray type of `target` for an indexed slice, else unused.
+    Ref base_type;
     // 1 for $readmemh, 0 for $readmemb.
     uint32_t hex;
     // Whether the start / finish operands are present.
     uint32_t has_start;
     uint32_t has_finish;
+    // kMemSliceNone, kMemSliceUp (`+:`), kMemSliceDown (`-:`) or kMemSliceQueue.
+    uint32_t slice;
 };
+
+// How an indexed slice of the array a memory task loads is written (ReadMemInfo,
+// FreadMemInfo). kMemSliceQueue is a slice of a queue, `q[a:b]` with its runtime first
+// and last indices (LRM 7.10.1).
+inline constexpr uint32_t kMemSliceNone  = 0;
+inline constexpr uint32_t kMemSliceUp    = 1;
+inline constexpr uint32_t kMemSliceDown  = 2;
+inline constexpr uint32_t kMemSliceQueue = 3;
 
 // Extra payload for `call`: the callee plus its already-lowered argument values,
 // in formal-parameter order (each resized to the parameter type by the frontend).
@@ -1201,17 +1229,30 @@ struct ScanfInfo {
 };
 
 // Extra payload for `fread_mem`: $fread(mem, fd[, start[, count]]) reads raw bytes
-// into the unpacked-array memory `mem`. The fd value is the instruction's `op`;
-// `start` / `count` are optional address / element-count operands (valid per has_*).
+// into the unpacked array `mem` names (LRM 21.3.4.4). The fd value is the
+// instruction's `op`; `target`, `type`, `slice_base`, `slice_end`, `base_type` and
+// `slice` name the array exactly as ReadMemInfo does, and `start` / `count` are
+// optional address / word-count operands (valid per has_*) over its highest dimension.
 struct FreadMemInfo {
-    // Destination memory signal.
-    Signal mem;
-    // Optional first-address and max-element-count operands.
+    // The array lvalue the load names, or the one an indexed slice selects from.
+    Index target;
+    // Optional first-address and max-word-count operands.
     Index start;
     Index count;
+    // The base value of an indexed slice, or the first index of a queue slice; unused
+    // unless `slice` is not kMemSliceNone.
+    Index slice_base;
+    // The last index of a queue slice; unused unless `slice` is kMemSliceQueue.
+    Index slice_end;
+    // The UnpackedArray type of the array the load fills.
+    Ref type;
+    // The UnpackedArray type of `target` for an indexed slice, else unused.
+    Ref base_type;
     // Whether the start / count operands are present.
     uint32_t has_start;
     uint32_t has_count;
+    // kMemSliceNone, kMemSliceUp (`+:`), kMemSliceDown (`-:`) or kMemSliceQueue.
+    uint32_t slice;
 };
 
 // Extra payload for `test_plusargs`: $test$plusargs(str) (LRM §21.6). `str` is
@@ -1230,8 +1271,8 @@ struct TestPlusArgsInfo {
 // (d/o/b/h/s — e/f/g are a documented gap, real conversion needs the same
 // ASCII->real scan $fscanf/$sscanf's own %f/%e/%g gap needs). The
 // instruction's `op` (in the enclosing op_extra payload) is the output lvalue,
-// and may be a `string` object -- for `s` only, the clause's "no conversion"
-// form, where the plusarg remainder is the value verbatim.
+// and may be a `string` object: `s` stores the plusarg remainder verbatim, a
+// numeric conversion the converted value cast to string (LRM 6.16).
 struct ValuePlusArgsInfo {
     // First extra word of the packed plusarg_string prefix bytes.
     ExtraIndex prefix;
@@ -1243,8 +1284,9 @@ struct ValuePlusArgsInfo {
 
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
-// suffix string is appended after the formatted number and lives packed
-// little-endian (4 chars per u32 word) at `suffix` for `suffix_len` bytes.
+// suffix string is appended after the formatted number. It is a literal packed
+// little-endian (4 chars per u32 word) at `suffix` for `suffix_len` bytes, unless
+// `suffix_value` is not kNoFormatValue: then it is that string value operand.
 struct TimeFormatInfo {
     // Time-unit exponent operand (10^units seconds).
     Index units;
@@ -1256,6 +1298,8 @@ struct TimeFormatInfo {
     ExtraIndex suffix;
     // Suffix length in bytes.
     uint32_t suffix_len;
+    // A string operand holding the suffix, or kNoFormatValue for the literal.
+    Index suffix_value;
 };
 
 // Extra payload for `str_putc`: s[i] = c / s.putc(i, c). The string lvalue is
@@ -2311,8 +2355,8 @@ struct Inst {
         // destination lvalue, r the descriptor value), -> bytes read. LRM
         // §21.3.4. Lowers to an rt_fread call.
         FreadWord,
-        // $fread into an unpacked-array memory (payload: op_extra -> FreadMemInfo;
-        // op is the fd value), -> bytes read. LRM §21.3.4. Lowers to an rt_fread call.
+        // $fread into an unpacked array (payload: op_extra -> FreadMemInfo; op is the
+        // fd value), -> bytes read. LRM §21.3.4. Lowers to an rt_fread call.
         FreadMem,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
@@ -2348,9 +2392,9 @@ struct Inst {
         // --allow-system (see SystemAccess); lowers to an rt_system call that
         // itself re-checks the access tier as a backstop.
         System,
-        // $readmemh / $readmemb: load a hex/binary file into an unpacked-array
-        // memory (payload: op_extra -> ReadMemInfo; op is the filename value). LRM
-        // §21.4. Lowers to an rt_readmem call.
+        // $readmemh / $readmemb: load a hex/binary file into an unpacked array
+        // (payload: op_extra -> ReadMemInfo; op is the filename value). LRM §21.4.
+        // Lowers to an rt_readmem call.
         ReadMem,
 
         // -- Value-change dump (VCD, LRM §21.7; see docs/VCD.md) --
@@ -3207,6 +3251,11 @@ enum class ExtraOperandTail : uint8_t {
     // + SeverityInfo::path, when the report's banner names the instance it is
     // made in: an InstPath value, read at run time.
     SeverityPath,
+    // + ReadMemInfo::slice_base / FreadMemInfo::slice_base: the runtime base of an
+    // indexed slice of the array a memory task loads, when it has one, and with
+    // ::slice_end the last index of a slice of a queue. The span holds the filename or
+    // descriptor, the target lvalue and the optional address operands.
+    MemSliceBase,
 };
 
 // Constexpr for the same reason as extra_operand_shape(): operand walks inline
@@ -3232,6 +3281,9 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
             return E::WaitHandles;
         case T::Severity:
             return E::SeverityPath;
+        case T::ReadMem:
+        case T::FreadMem:
+            return E::MemSliceBase;
         default:
             return E::None;
     }
@@ -3265,6 +3317,9 @@ constexpr bool extra_operand_tails_total() {
             return false;
         }
         if (tail == ExtraOperandTail::InsideSetMembers && tag != Inst::Tag::InsideSet) {
+            return false;
+        }
+        if (tail == ExtraOperandTail::MemSliceBase && tag != Inst::Tag::ReadMem && tag != Inst::Tag::FreadMem) {
             return false;
         }
     }
@@ -3545,6 +3600,24 @@ public:
                 const auto info = extra_data<SeverityInfo>(p.extra);
                 if (info.path != kNoIndex) {
                     fn(info.path);
+                }
+                return;
+            }
+            case ExtraOperandTail::MemSliceBase: {
+                // The two records agree on which operands those are; the slice only
+                // exists for the form the operands name.
+                const auto visit = [&](const auto& info) {
+                    if (info.slice != kMemSliceNone) {
+                        fn(info.slice_base);
+                    }
+                    if (info.slice == kMemSliceQueue) {
+                        fn(info.slice_end);
+                    }
+                };
+                if (tag(inst) == Inst::Tag::ReadMem) {
+                    visit(extra_data<ReadMemInfo>(p.op_extra.extra));
+                } else {
+                    visit(extra_data<FreadMemInfo>(p.op_extra.extra));
                 }
                 return;
             }

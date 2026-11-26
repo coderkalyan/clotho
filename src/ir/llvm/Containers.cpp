@@ -1150,9 +1150,13 @@ void Backend::lower_queue_append_range(Index i) {
     const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
     const uint64_t bound_v = std::get<Type>(mod_.pool.get(qs.queue_type)).left;
     llvm::Value* bound = queue_bound_of(lvalue_of(p.op), bound_v);
-    // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
-    llvm::Value* lo = cast(must_of(qs.lo), 64, /*sign=*/true);
-    llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
+    // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); the lowering widened each by
+    // its own signedness. An x or z bit in either makes the slice empty (LRM 7.10.1: lo > hi).
+    llvm::Value* lo = select_index(value_of(qs.lo), type_of(qs.lo));
+    llvm::Value* hi = select_index(value_of(qs.hi), type_of(qs.hi));
+    llvm::Value* bad = b_.CreateOr(any_unknown(qs.lo), any_unknown(qs.hi));
+    lo               = b_.CreateSelect(bad, b_.getInt64(1), lo);
+    hi               = b_.CreateSelect(bad, b_.getInt64(0), hi);
     // A slice append copies a range of elements in. See lower_queue_push.
     emit_gc_barrier_for(lvalue_of(p.op));
     queue_engine_call(queue_append_range_fn(),

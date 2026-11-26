@@ -101,10 +101,149 @@ ir::Index Lowerer::lower_address_arg(const Expression& expr, ir::Builder& b) {
     return coerce(lower_expr(expr, b), *expr.type, i64, b, loc(expr));
 }
 
+// Whether the memory argument of $readmem / $fread names what the load can fill
+// (LRM 21.4): a variable holding an unpacked array of fixed size, a dynamic array, a
+// queue or an associative array; an element of one that is itself an array (a partially
+// indexed multidimensional memory); or a slice of either, with every dimension above the
+// slice indexed. The variable can be a member of an unpacked struct, a property of a class
+// object or a member of the interface a virtual interface handle names (LRM 25.9).
+bool Lowerer::is_mem_target_shape(const Expression& e) {
+    for (const Expression* cur = &e;;) {
+        const slang::ast::Type& type = cur->type->getCanonicalType();
+        if (type.as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr &&
+            type.as_if<slang::ast::DynamicArrayType>() == nullptr && type.as_if<slang::ast::QueueType>() == nullptr &&
+            type.as_if<slang::ast::AssociativeArrayType>() == nullptr) {
+            return false;
+        }
+        switch (cur->kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::MemberAccess:
+                // A member of an unpacked struct, itself possibly an element of an array of them,
+                // of a class object, or of the interface a virtual interface handle names.
+                {
+                    const slang::ast::Type& base = cur->as<MemberAccessExpression>().value().type->getCanonicalType();
+                    return base.isUnpackedStruct() || base.isClass() || base.isVirtualInterface();
+                }
+            case ExpressionKind::ElementSelect:
+                cur = &cur->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                cur = &cur->as<RangeSelectExpression>().value();
+                break;
+            default:
+                return false;
+        }
+    }
+}
+
+// The array a $readmem / $fread loads, which is the array lvalue its argument is, but
+// for a slice. `a[l:r]`, `a[i +: n]` and `a[i -: n]` (LRM 7.4.5, 11.5.1) select words
+// of `a`, which only the load knows how to place: a slice is the array `a` plus the
+// direction and the coordinate of its first word, and the backend finds the words that
+// exist, so it is the one form of slice a dynamic array has as well as a fixed array
+// (neither has a sub-array a view could name, once `a` is a member of an aggregate or
+// a heap buffer). `a[l:r]` starts at its left bound, going the way the slice does. The
+// base is widened by its own signedness, with room for the arithmetic, exactly as
+// emit_indexed_slice_copy does, so an x or z bit and a negative base keep their
+// meaning.
+//
+// A slice of a queue differs in that its bounds are runtime values and clip to the
+// queue (LRM 7.10.1), so it is the queue plus the first and last index it selects, and
+// the backend finds the elements that are left (kMemSliceQueue).
+Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b) {
+    MemTarget t;
+    t.type = lower_type(*e.type);
+    if (e.kind == ExpressionKind::RangeSelect) {
+        const RangeSelectExpression& rs = e.as<RangeSelectExpression>();
+        if (is_queue(rs.value())) {
+            lower_queue_slice_target(rs, t, b);
+            return t;
+        }
+        guard_indexed_array_slice(rs);
+        const auto    w        = std::max(static_cast<uint32_t>(rs.left().type->getBitWidth()), 32u) + 2;
+        const ir::Ref extended = make_int_type(w, rs.left().type->isFourState());
+        t.target               = lower_lvalue(rs.value(), b, /*is_write=*/true);
+        t.base_type            = lower_type(*rs.value().type);
+        if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+            const ir::Type slice_type = std::get<ir::Type>(module_.pool.get(t.type));
+            t.slice = slice_type.left <= slice_type.right ? ir::kMemSliceUp : ir::kMemSliceDown;
+        } else {
+            t.slice = rs.getSelectionKind() == RangeSelectionKind::IndexedDown ? ir::kMemSliceDown : ir::kMemSliceUp;
+        }
+        t.slice_base = b.convert(lower_expr(rs.left(), b), extended, rs.left().type->isSigned(), loc(rs.left()));
+        return t;
+    }
+    t.target = lower_lvalue(e, b, /*is_write=*/true);
+    return t;
+}
+
+// A slice of a queue as the array a load fills (LRM 21.4, 7.10.1): the queue `q` and the
+// first and last index the slice selects, `q[a:b]` as written, `q[i +: n]` as `q[i:i+n-1]`
+// and `q[i -: n]` as `q[i-n+1:i]` (11.5.1). The addresses of the load are those indices of
+// `q`, as a slice of a fixed array has its own, and the backend clips the range to the
+// queue and takes none of it for an empty or unknown one (resolve_mem_target). A bound is
+// any integral expression and can spell `$`, the last index of `q`. It widens by its own
+// signedness, with room for the arithmetic of an indexed slice, so that an x or z bit and a
+// negative bound keep their meaning; `$` is a signed `int`.
+void Lowerer::lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b) {
+    t.target    = lower_lvalue(rs.value(), b, /*is_write=*/true);
+    t.base_type = lower_type(*rs.value().type);
+    t.slice     = ir::kMemSliceQueue;
+    const Restore<std::optional<QueueDollarCtx>> dollar_guard(queue_dollar_, QueueDollarCtx{ t.target, t.base_type });
+    std::tie(t.slice_base, t.slice_end) = lower_queue_bounds(rs, b);
+}
+
+// The first and last index `q[a:b]`, `q[i +: n]` or `q[i -: n]` of a queue names (LRM 7.10.1,
+// 11.5.1), for a slice read and a load alike, with `$` resolved by the caller's queue_dollar_.
+// Each is a value wide enough to hold the bound, widened by its own signedness (11.8.3, `$` is a
+// signed `int`), so a negative or unsigned-narrow bound keeps its value; an x or z bit stays in
+// it, for the backend to make the slice empty. The far end of an indexed slice is computed in a
+// type that holds the sum of two operands.
+std::pair<ir::Index, ir::Index> Lowerer::lower_queue_bounds(const RangeSelectExpression& rs, ir::Builder& b) {
+    const ir::SourceLoc l = loc(rs);
+    struct Operand {
+        ir::Index     value;
+        bool          is_signed;
+        ir::ValueType type;
+    };
+    const auto operand = [&](const Expression& x) {
+        const ir::Index v = lower_expr(x, b);
+        return Operand{ v, x.type->isUnbounded() || x.type->isSigned(), b.type_of(v) };
+    };
+    // Two bits wider than `width`, which is no narrower than an `int`.
+    const auto widen = [&](const Operand& x, uint32_t width, bool four) {
+        return b.convert(x.value, make_int_type(width + 2, four), x.is_signed, l);
+    };
+
+    const Operand first = operand(rs.left());
+    const Operand last  = operand(rs.right());
+    if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+        return { widen(first, std::max(first.type.width, 32u), first.type.four_state),
+                 widen(last, std::max(last.type.width, 32u), last.type.four_state) };
+    }
+    const uint32_t  width = std::max({ first.type.width, last.type.width, 32u });
+    const bool      four  = first.type.four_state || last.type.four_state;
+    const ir::Ref   wide  = make_int_type(width + 2, four);
+    const ir::Index base  = widen(first, width, four);
+    const ir::Index count = widen(last, width, four);
+    const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, b.constant(module_.pool.put_int(wide, 1), l), l);
+    if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
+        return { base, b.binary(ir::Inst::Tag::Add, base, nm1, l) };
+    }
+    return { b.binary(ir::Inst::Tag::Sub, base, nm1, l), base };
+}
+
 // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
-// Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory
-// must be a whole unpacked array (a plain name or hierarchical reference); the
-// filename is a string literal, string-typed expression, or integral value
+// Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory is a
+// whole unpacked array (a plain name or hierarchical reference) of fixed size or a
+// dynamic array or queue, whose size the load does not change (21.4.1), or an
+// associative array of integral index, whose elements the load creates (21.4.1), an
+// element of a multidimensional one that is itself an array, or a slice of either (21.4:
+// "The memory_name can be an unpacked array or a partially indexed multidimensional
+// unpacked array", its lowest dimension sliceable); start and finish then address that
+// array. The filename is a string literal, string-typed expression, or integral value
 // holding packed ASCII (LRM §21.4), and the optional address bounds are general
 // runtime values.
 void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b) {
@@ -120,13 +259,11 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
         mem_arg = &mem_arg->as<AssignmentExpression>().left();
     }
     const Expression& mem = *mem_arg;
-    const auto*       vsb = mem.as_if<slang::ast::ValueExpressionBase>();
-    if (vsb == nullptr || mem.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
-        // TODO: a sliced memory target (mem[a:b]) or a multidimensional slice.
-        fail("$readmem target must be a whole unpacked-array memory");
+    if (!is_mem_target_shape(mem)) {
+        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one");
     }
-    const ir::Signal target     = signal_of(vsb->symbol);
     const ir::Index  filename   = lower_expr(*args[0], b);
+    const MemTarget  target     = lower_mem_target(mem, b);
     ir::Index        start      = filename; // placeholder; unused unless has_start
     ir::Index        finish     = filename;
     const bool       has_start  = args.size() >= 3;
@@ -137,39 +274,58 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
     if (has_finish) {
         finish = lower_address_arg(*args[3], b);
     }
-    b.read_mem(target, filename, start, finish, hex, has_start, has_finish, loc(call));
+    const ir::ReadMemInfo info{ .target     = target.target,
+                                .start      = start,
+                                .finish     = finish,
+                                .slice_base = target.slice_base,
+                                .slice_end  = target.slice_end,
+                                .type       = target.type,
+                                .base_type  = target.base_type,
+                                .hex        = hex ? 1u : 0u,
+                                .has_start  = has_start ? 1u : 0u,
+                                .has_finish = has_finish ? 1u : 0u,
+                                .slice      = target.slice };
+    b.read_mem(filename, info, loc(call));
 }
 
 // $timeformat(units, precision, suffix, min_width): set the %t format for all
-// later %t specifiers (LRM §20.4.3). units / precision / min_width are general
-// runtime rvalues; the suffix must be a string literal.
+// later %t specifiers (LRM §20.4.3). units / precision / min_width and the suffix
+// are general runtime rvalues; a literal suffix travels as bytes. With no
+// arguments the format returns to the defaults of Table 20-3: the smallest time
+// precision of the design (the unit the runtime seeds at startup), precision 0, a
+// null suffix and a field width of 20.
 void Lowerer::lower_timeformat(const CallExpression& call, ir::Builder& b) {
-    const auto args = call.arguments();
-    // The no-argument form resets to the defaults; slang accepts it but
-    // Clotho's runtime default is already seeded at startup, so it is unused
-    // in practice. Require the full four-argument form for now.
-    // TODO: the zero-argument $timeformat resets to the LRM default values.
+    const auto          args = call.arguments();
+    const ir::SourceLoc l    = loc(call);
+    if (args.empty()) {
+        const ir::Ref i32 = make_int_type(32, true);
+        b.timeformat(iconst(i32, static_cast<uint64_t>(static_cast<int64_t>(module_.timeformat_units)), b, l),
+                     iconst(i32, 0, b, l),
+                     std::string_view(),
+                     iconst(i32, 20, b, l),
+                     l);
+        return;
+    }
     if (args.size() != 4) {
-        fail("$timeformat requires four arguments (units, precision, suffix, min_width)");
-    }
-
-    // The suffix must be a literal string: dynamic string values have no
-    // runtime representation yet, so only a compile-time literal is passed to
-    // the runtime as (ptr, len).
-    // TODO: a non-literal suffix (a string variable / expression) needs full
-    // dynamic string support, which Clotho lacks.
-    const Expression* suffix = args[2];
-    while (suffix->kind == ExpressionKind::Conversion) {
-        suffix = &suffix->as<ConversionExpression>().operand();
-    }
-    if (suffix->kind != ExpressionKind::StringLiteral) {
-        fail("$timeformat suffix must be a string literal");
+        fail("$timeformat takes four arguments (units, precision, suffix, min_width) or none (LRM 20.4.3)");
     }
 
     const ir::Index units     = lower_expr(*args[0], b);
     const ir::Index precision = lower_expr(*args[1], b);
-    const ir::Index min_width = lower_expr(*args[3], b);
-    b.timeformat(units, precision, suffix->as<StringLiteral>().getValue(), min_width, loc(call));
+    const Expression* suffix = args[2];
+    while (suffix->kind == ExpressionKind::Conversion) {
+        suffix = &suffix->as<ConversionExpression>().operand();
+    }
+    if (suffix->kind == ExpressionKind::StringLiteral) {
+        const ir::Index min_width = lower_expr(*args[3], b);
+        b.timeformat(units, precision, suffix->as<StringLiteral>().getValue(), min_width, l);
+        return;
+    }
+    // The suffix is a string object (slang converts an integral one), whose bytes
+    // the runtime copies.
+    const ir::Index suffix_value = lower_expr(*args[2], b);
+    const ir::Index min_width    = lower_expr(*args[3], b);
+    b.timeformat(units, precision, suffix_value, min_width, l);
 }
 
 // $printtimescale [hier]: print "Time scale of (<path>) is <unit> / <prec>"
@@ -468,16 +624,12 @@ ir::Index Lowerer::lower_scanf(const CallExpression& call, bool is_sscanf, ir::B
         if (a->type->isFloating()) {
             fail("$fscanf / $sscanf into a real variable is not supported");
         }
-        // A `string` object destination is sanctioned for %s alone (LRM
+        // A `string` object destination: %s assigns the token verbatim (LRM
         // 21.3.4.3: "The string format specifier %s (or %S) may be used to
         // read into a variable of integral, unpacked array of byte, or string
-        // data types" -- the integer specifiers list integral types only). The
-        // scan engine's string store relies on this pairing: it assigns the %s
-        // token verbatim and never converts.
-        if (a->type->getCanonicalType().isString() && convs[k] != 's') {
-            fail(std::string("$fscanf / $sscanf %") + convs[k] +
-                 " into a string object is not supported");
-        }
+        // data types"), and any other conversion stores its value as an
+        // integral-to-string assignment (LRM 6.16), sized like an unsized literal
+        // (docs/LRM_NOTES.md): the scan engine does both.
         // An unpacked aggregate destination. The integer specifiers "shall not
         // be used with any unpacked aggregate data type" (LRM 21.3.4.3), and
         // the flat plane store the engine does would land a %s token
@@ -1753,8 +1905,11 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     }
 
     // $fread(target, fd[, start[, count]]) (LRM §21.3.4): binary read into a
-    // single vector or a whole unpacked-array memory. The memory form (like
-    // $readmem) takes optional start-address and element-count bounds.
+    // single vector, or an unpacked-array memory: a whole one (of fixed size, or a
+    // dynamic array or queue, whose size the read does not change), an element of a
+    // multidimensional one that is itself an array, or a slice of either. The memory
+    // form (like $readmem) takes optional start-address and word-count bounds over
+    // the array it names.
     if (name == "$fread") {
         const auto args = call.arguments();
         if (args.size() < 2 || args.size() > 4) {
@@ -1767,14 +1922,18 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             target_arg = &target_arg->as<AssignmentExpression>().left();
         }
         const Expression& target = *target_arg;
-        if (is_unpacked_array(target)) {
-            const auto* vsb = target.as_if<slang::ast::ValueExpressionBase>();
-            if (vsb == nullptr) {
-                // TODO: a sliced memory target (mem[a:b]).
-                fail("$fread memory target must be a whole unpacked-array memory");
+        if (target.type->getCanonicalType().isUnpackedArray()) {
+            if (!is_mem_target_shape(target)) {
+                fail("$fread memory target must be an unpacked array variable, an element of one or a slice of one");
             }
-            const ir::Signal mem       = signal_of(vsb->symbol);
+            // NOTE: 21.4.1 addresses an associative array by an integral index only. slang checks
+            // that of a $readmem and not of a $fread, so an index it has no address for stops here.
+            if (const auto* aa = target.type->getCanonicalType().as_if<slang::ast::AssociativeArrayType>();
+                aa != nullptr && !aa->hasWildcardIndexType() && !aa->indexType->isIntegral()) {
+                fail("$fread into an associative array needs an integral index type (LRM 21.4.1)");
+            }
             const ir::Index  fd        = lower_expr(*args[1], b);
+            const MemTarget  mem       = lower_mem_target(target, b);
             const bool       has_start = args.size() >= 3;
             const bool       has_count = args.size() >= 4;
             ir::Index        start     = fd; // placeholder unless present
@@ -1785,7 +1944,17 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             if (has_count) {
                 cnt = lower_address_arg(*args[3], b);
             }
-            return b.fread_mem(fd, mem, start, cnt, has_start, has_count, l);
+            const ir::FreadMemInfo info{ .target     = mem.target,
+                                         .start      = start,
+                                         .count      = cnt,
+                                         .slice_base = mem.slice_base,
+                                         .slice_end  = mem.slice_end,
+                                         .type       = mem.type,
+                                         .base_type  = mem.base_type,
+                                         .has_start  = has_start ? 1u : 0u,
+                                         .has_count  = has_count ? 1u : 0u,
+                                         .slice      = mem.slice };
+            return b.fread_mem(fd, info, l);
         }
         if (args.size() != 2) {
             fail("$fread into a scalar variable takes exactly two arguments");
@@ -2984,25 +3153,35 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                     case 'x': // check_specifier keeps %x/%X as a hex alias
                     case 'o':
                     case 'b':
-                        // A real under %d/%h/%x/%o/%b prints its rounded
+                    case 'c':
+                        // A real under %d/%h/%x/%o/%b/%c prints its rounded
                         // integer value in the requested base: Table 21-1
                         // gives these specifiers a common integral operand,
-                        // and LRM 21.2.1.2 converts a real argument to that
-                        // operand by the LRM 6.12.1 real-to-integer rule
-                        // (round half away from zero). Only the base
-                        // differs, so width/zero-padding/sign stay on the
-                        // shared integer path below. Signed 64-bit keeps
+                        // and a real argument converts to that operand by the
+                        // LRM 6.12.1 real-to-integer rule (round half away
+                        // from zero). Only the base differs, so width/zero-padding/sign stay on
+                        // the shared integer path below, and %c takes the low
+                        // 8 bits as it does of any integer. Signed 64-bit keeps
                         // negatives printing as two's complement (matches
-                        // iverilog: -3.7 under %h is fffffffffffffffc).
+                        // iverilog: -3.7 under %h is fffffffffffffffc, 65.6
+                        // under %c is B).
                         v        = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false), al);
                         v_signed = true;
                         break;
                     case 't':
                         break; // scale_to_ticks below has the real path
+                    case 'u':
+                    case 'z': {
+                        // LRM 21.2.1.1: %u / %z transfer the 2-value / 4-value
+                        // binary representation of the specified data, which
+                        // for a real is its IEEE 754 bit pattern (64 bits, 32
+                        // for a shortreal) with no unknown bits.
+                        const uint32_t bits = arg->type->getBitWidth();
+                        v                   = b.float_cvt(ir::Inst::Tag::FBitcast, v, make_int_type(bits, false), al);
+                        v_signed            = false;
+                        break;
+                    }
                     default:
-                        // TODO: %c of a real (would need the rounded integer
-                        // truncated to a character code), and %u / %z of a
-                        // real (unformatted raw bits, LRM 21.2.1.3).
                         fail(std::string("%") + conv + " with a real argument is not supported");
                 }
             } else if (!fl && real_conv) {

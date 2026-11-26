@@ -878,7 +878,43 @@ ir::Index Lowerer::lower_assoc_key(const Expression& key, ir::Ref assoc_ty, ir::
              "is not supported");
     }
     if (!is_agg_abi_ref(kr)) {
-        return lower_expr(key, b);
+        // LRM 7.8.4: the index expression is cast to the index type, and a 4-state
+        // expression with an x or z bit is an invalid index (7.8.6). slang does the cast
+        // with implicit conversions around the expression, which to a 2-state or a narrower
+        // type drop such a bit, and the backend can only see the key it is handed. An
+        // expression that could lose one is evaluated once and cast here, and the key is
+        // all-x if it had a bit, so the backend finds it invalid as it does a 4-state
+        // key of the index type.
+        std::vector<const ConversionExpression*> casts;
+        const Expression*                         index = &key;
+        while (index->kind == ExpressionKind::Conversion && index->as<ConversionExpression>().isImplicit()) {
+            casts.push_back(&index->as<ConversionExpression>());
+            index = &casts.back()->operand();
+        }
+        const auto drops_unknown = [](const ConversionExpression* c) {
+            return !c->type->isFourState() || c->type->getBitWidth() < c->operand().type->getBitWidth();
+        };
+        if (!index->type->isIntegral() || !index->type->isFourState() ||
+            std::none_of(casts.begin(), casts.end(), drops_unknown)) {
+            return lower_expr(key, b);
+        }
+        const ir::SourceLoc kl      = loc(key);
+        ir::Index           value   = lower_expr(*index, b);
+        const ir::Index     unknown = b.unary(ir::Inst::Tag::IsUnknown, value, kl);
+        for (auto it = casts.rbegin(); it != casts.rend(); ++it) {
+            const ConversionExpression& c = **it;
+            const bool propagated         = c.conversionKind == ConversionKind::Propagated;
+            value                         = coerce(value,
+                           *c.operand().type,
+                           lower_type(*c.type),
+                           b,
+                           kl,
+                           propagated ? c.type->isSigned() : c.operand().type->isSigned());
+        }
+        const auto    width = static_cast<uint32_t>(key.type->getBitWidth());
+        const ir::Ref four  = make_int_type(width, true);
+        const ir::Index all_x = b.constant(svint_to_ref(slang::SVInt::createFillX(width, false), four), kl);
+        return b.select(unknown, all_x, b.convert(value, four, false, kl), kl);
     }
     const Expression& src = unwrap_conversion(key);
     if (is_struct_lvalue_shape(src)) {
@@ -962,39 +998,13 @@ void Lowerer::append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qt
         // in lower_expr. Scoped around both forms below: the Simple bounds
         // AND an indexed form's base index can equally spell `$`.
         const Restore<std::optional<QueueDollarCtx>> dollar_guard(queue_dollar_, QueueDollarCtx{ src, qty });
-        ir::Index lo, hi;
-        if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-            lo = lower_expr(rs.left(), b);
-            hi = lower_expr(rs.right(), b);
-        } else {
-            // Indexed part-select `q[i +: n]` / `q[i -: n]`. DELIBERATE DEVIATION from LRM 7.4.5,
-            // "The size of the part-select or slice shall be constant" (7.4.6 writes `A[i+:c]` with a
-            // constant `c`); 7.10.1 exempts only a queue's `Q[a:b]`. A queue's width `n` need NOT be a
-            // compile-time constant here (docs/LRM_NOTES.md, note 60): the slice is well defined for any
-            // `n`, and rejecting it would break designs that run
-            // (confirmed against slang: it applies no such check when the
-            // base is a queue) -- both `i` and `n` are ordinary runtime
-            // expressions. Translated to the same inclusive [lo:hi] shape the
-            // Simple form already feeds rt_queue_append_range, which clamps
-            // both ends against the source's actual length, so no separate
-            // bounds handling is needed here.
-            // A canonical `int` (LRM's own type for an index/width, and what
-            // `q[$]`'s size()-1 resolution already produces below), not
-            // `rs.left().type`: the base may itself be bare `$`
-            // (UnboundedType), which lower_type rejects outright.
-            const ir::Ref   i32   = make_int_type(32, false);
-            const ir::Index base  = b.convert(lower_expr(rs.left(), b), i32, true, l);
-            const ir::Index count = b.convert(lower_expr(rs.right(), b), i32, true, l);
-            const ir::Index one   = b.constant(module_.pool.put_int(i32, 1), l);
-            const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, one, l);
-            if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
-                lo = base;
-                hi = b.binary(ir::Inst::Tag::Add, base, nm1, l);
-            } else {
-                hi = base;
-                lo = b.binary(ir::Inst::Tag::Sub, base, nm1, l);
-            }
-        }
+        // The bounds keep their own signedness and width, and an x or z bit in one makes the
+        // slice empty (LRM 7.10.1, 11.8.3): see lower_queue_bounds.
+        // NOTE: DELIBERATE DEVIATION from LRM 7.4.5, "The size of the part-select or slice shall
+        // be constant"; 7.10.1 exempts only a queue's `Q[a:b]`. An indexed queue slice
+        // `q[i +: n]` takes a runtime `n` too (docs/LRM_NOTES.md, note 60): it is the slice
+        // `q[i : i+n-1]`, well defined for any `n`, and rejecting it would break designs that run.
+        const auto [lo, hi] = lower_queue_bounds(rs, b);
         b.queue_append_range(dst, src, lo, hi, qty, l);
         return;
     }

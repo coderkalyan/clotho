@@ -633,6 +633,157 @@ TEST_CASE("pullup and pulldown compete on strength") {
     CHECK(out == "10\n00\n11\n");
 }
 
+// pullup / pulldown on a bit-select or a part-select (an instance array, LRM
+// 28.3.6) drive that region like any partial driver (LRM 28.10): the other bits
+// stay z, a stronger driver of the bit wins, and a z driver leaves the pull.
+// Oracle: iverilog 13 (0z10 and 0010; the bit that is driven reads the driver).
+TEST_CASE("pullup and pulldown on a bit or part select of a net") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [3:0] w;
+          pullup (w[1]);
+          pulldown (w[3]);
+          assign w[0] = 1'b0;
+          wire [3:0] v;
+          pulldown pd[1:0] (v[3:2]);
+          pullup (v[1]);
+          assign v[0] = 1'b0;
+          wire [1:0] u;
+          logic en = 0, d = 0;
+          pullup (u[0]);
+          assign u[0] = en ? d : 1'bz;
+          initial begin
+            #1 $display("%b %b %b", w, v, u[0]);
+            en = 1; #1 $display("%b", u[0]);
+            d = 1; #1 $display("%b", u[0]);
+          end
+        endmodule
+    )");
+    CHECK(out == "0z10 0010 1\n0\n1\n");
+}
+
+// The terminal of a pullup / pulldown is a net_lvalue (LRM 28.10), so it may be a
+// concatenation, and each element is a net the source places its value on. Oracle:
+// iverilog 13 for a one-element concatenation and for one in an instance array
+// (`1 0 1 z1zz`, `1 0 011z`); it rejects a wider concatenation on a single instance
+// (width 3 against the terminal's 1), so that form is derived from the clause.
+TEST_CASE("pullup and pulldown on a concatenation of nets") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire a, b, c;
+          wire [3:0] w;
+          pullup ({a});
+          pulldown ({b});
+          pullup (strong1) ({c});
+          pullup ({w[2]});
+          wire a2, b2;
+          wire [3:0] w2;
+          pullup p[2:0] ({a2, w2[2:1]});
+          pulldown q[1:0] ({b2, w2[3]});
+          wire d, e, f;
+          wire [3:0] v;
+          pullup ({d, e});
+          pulldown ({v[1:0], f});
+          initial #1 begin
+            $display("%b %b %b %b", a, b, c, w);
+            $display("%b %b %b", a2, b2, w2);
+            $display("%b %b %b %b", d, e, f, v);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0 1 z1zz\n1 0 011z\n1 1 0 zz00\n");
+}
+
+// Each element of a concatenation takes the pull at its strength, so a stronger driver
+// of one element wins and a weaker one loses. LRM-derived (28.10, 28.11, 28.12):
+// iverilog 13 resolves a pull on a concatenation target against a stronger driver as x.
+TEST_CASE("a pull on a concatenation target folds by strength per element") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire a, b;
+          wire [3:0] w;
+          pullup ({a, w[3]});
+          assign w[3] = 1'b0;
+          assign (weak0, weak1) a = 1'b0;
+          pulldown (weak0) ({b});
+          assign b = 1'b1;
+          initial #1 $display("%b %b %b", a, b, w);
+        endmodule
+    )");
+    CHECK(out == "1 1 0zzz\n");
+}
+
+// A delayed partial driver of a resolved net powers up as x in its own bits and z
+// elsewhere, so the undriven bits fold as z (28.16, 10.3.3). Oracle: iverilog 13
+// (`1 10xx`, `6 1001`; the gate form `1 0x`, `4 01`).
+TEST_CASE("a delay on a partial driver of a resolved net") {
+    const std::string out = run_capture(R"(
+        module top;
+          tri1 [3:0] w;
+          assign #5 w[1:0] = 2'b01;
+          assign w[3:2] = 2'b10;
+          reg a = 1;
+          tri1 [1:0] g;
+          buf #3 (g[0], a);
+          assign g[1] = 1'b0;
+          initial begin
+            #1 $display("%0d %b %b", $time, w, g);
+            #3 $display("%0d %b %b", $time, w, g);
+            #2 $display("%0d %b %b", $time, w, g);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 10xx 0x\n4 10xx 01\n6 1001 01\n");
+}
+// The net delay of the net that dominates an inout port's net is the simulated net's
+// (23.3.3.7), in the time unit of the module that declares it (3.14.1). iverilog 13
+// has no net delays, so the oracle is the LRM text: the child's wand #3 dominates
+// the wire, so a change of the driver reaches it 3 later.
+TEST_CASE("a net delay on an inout port net that dominates its owner") {
+    const std::string out = run_capture(R"(
+        module c(io);
+          inout io;
+          wand #3 io;
+        endmodule
+        module top;
+          wire w;
+          logic a = 0;
+          assign w = a;
+          c u(w);
+          initial begin
+            #10 $display("t=%0d w=%b", $time, w);
+            a = 1; #1 $display("t=%0d w=%b", $time, w);
+            #3 $display("t=%0d w=%b", $time, w);
+          end
+        endmodule
+    )");
+    CHECK(out == "t=10 w=0\nt=11 w=0\nt=14 w=1\n");
+}
+
+// A net delay is in the time unit of the module that declares the net, not of the
+// top that is walked last: the child's #5 is 5 ns although the top counts in ps.
+// LRM 3.14.1 and 28.16; no iverilog oracle (no net delays).
+TEST_CASE("a net delay takes the time unit of its own module") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module child;
+          wire #5 w;
+          reg dd = 0;
+          assign w = dd;
+          initial begin
+            #1 dd = 1;
+            #3 $display("%0t %b", $realtime, w);
+            #3 $display("%0t %b", $realtime, w);
+          end
+        endmodule
+        `timescale 1ps/1ps
+        module t;
+          child c();
+        endmodule
+    )");
+    CHECK(out == "4000 x\n7000 1\n");
+}
+
 // supply0 / supply1 nets (LRM 6.6.5): a permanent Supply-strength (level 4)
 // driver of 0 / 1 that beats even a Strong driver.
 TEST_CASE("supply0/supply1 nets hold their value and beat strong drivers") {
@@ -1587,21 +1738,6 @@ TEST_CASE("the delay of an external net that an inout port dominates is dropped"
     CHECK(undelayed == through_port);
 }
 
-// A net delay on the net that dominates cannot be lowered in the owner's context.
-TEST_CASE("a net delay on an inout port net that dominates its owner fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module c(io);
-          inout io;
-          wand #3 io;
-        endmodule
-        module top;
-          wire w;
-          c u(w);
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("a net delay on a net that dominates") != std::string::npos);
-}
 
 // A `warn` cell: external wand, internal tri1 (neither dominates). The external
 // type is used, so there is no pull, and slang reports the connection.
