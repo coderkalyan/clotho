@@ -422,6 +422,190 @@ TEST_CASE("queue output and inout arguments") {
     CHECK(run_capture(src) == "3 10 20 30\n3 11 21 31\n");
 }
 
+// The copy-out of an output formal is an assignment to the actual when the task
+// returns (LRM 13.5), and the actual here is a place inside another container that
+// is resized while the task is suspended. The callee used to be handed the address
+// of the place as it was at the call, and wrote its result into storage the
+// container had moved away from. No oracle: iverilog 13 parses none of the nested
+// forms; the expected values are the assignment `actual = formal` at the return.
+TEST_CASE("a container output formal bound to a place inside a resized container") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int tag; int q[$]; } s_t;
+            class C;
+                int qq[$][$];
+            endclass
+            int qq[$][$];
+            int aq[string][$];
+            s_t sq[$];
+            int dq[][$];
+            int dd[][];
+            C   c = new;
+            task automatic fill(output int o[$], input int v);
+                #2 o = '{v, v + 1, v + 2};
+            endtask
+            task automatic grow(inout int o[$], input int v);
+                #2 o.push_back(v);
+            endtask
+            task automatic filld(output int o[], input int v);
+                #2 o = new[2];
+                o[0] = v;
+                o[1] = v + 1;
+            endtask
+            initial begin
+                s_t s;
+                s.tag = 0;
+                s.q   = '{1};
+                qq.push_back('{1});
+                aq["k"] = '{1};
+                sq.push_back(s);
+                dq = new[1];
+                dd = new[1];
+                c.qq.push_back('{1});
+                c.qq.push_back('{2});
+                fork
+                    fill(qq[0], 10);
+                    fill(aq["k"], 20);
+                    fill(sq[0].q, 30);
+                    fill(dq[0], 40);
+                    fill(c.qq[0], 50);
+                    grow(c.qq[1], 60);
+                    filld(dd[0], 70);
+                    begin
+                        #1;
+                        for (int i = 0; i < 2000; i++) begin
+                            qq.push_back('{i});
+                            aq[$sformatf("n%0d", i)] = '{i};
+                            s.tag = i;
+                            sq.push_back(s);
+                            c.qq.push_back('{i});
+                        end
+                        dq = new[2000](dq);
+                        dd = new[2000](dd);
+                    end
+                join
+                $display("%p %p %p %p", qq[0], aq["k"], sq[0].q, dq[0]);
+                $display("%p %p %p", c.qq[0], c.qq[1], dd[0]);
+                $display("%0d %0d %0d %0d", qq.size(), aq.num(), sq.size(), c.qq.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "'{10, 11, 12} '{20, 21, 22} '{30, 31, 32} '{40, 41, 42}\n"
+                              "'{50, 51, 52} '{2, 60} '{70, 71}\n"
+                              "2001 2001 2001 2002\n");
+}
+
+// A queue formal bound to a dynamic array and the reverse: the copy-in and the
+// copy-out are assignments between the two kinds (LRM 13.5 over 7.5.1 and 7.10.2).
+// The callee used to be handed the actual's handle as if it were one of its own
+// kind, and the actual came back empty or with a stray element. iverilog 13 asserts
+// on the call, so the LRM is the oracle.
+TEST_CASE("a queue output formal bound to a dynamic array, and the reverse") {
+    constexpr std::string_view src = R"(
+        module m;
+            int d[];
+            int q[$];
+            task automatic fq(output int o[$]);
+                o = '{1, 2, 3};
+            endtask
+            task automatic fd(output int o[]);
+                o = new[3];
+                o[0] = 5; o[1] = 6; o[2] = 7;
+            endtask
+            task automatic incq(inout int o[$]);
+                foreach (o[i]) o[i] += 100;
+                o.push_back(9);
+            endtask
+            function automatic int incd(inout int o[]);
+                foreach (o[i]) o[i] += 1000;
+                return o.size();
+            endfunction
+            initial begin
+                int n;
+                fq(d);
+                fd(q);
+                $display("%p %p", d, q);
+                incq(d);
+                n = incd(q);
+                $display("%p %p %0d", d, q, n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "'{1, 2, 3} '{5, 6, 7}\n'{101, 102, 103, 9} '{1005, 1006, 1007} 3\n");
+}
+
+// The copy-in of an input formal is the same assignment in the other direction: the
+// callee gets a container of its formal's kind holding the actual's elements, and
+// the actual is not written. This was refused with "unsupported assignment target".
+TEST_CASE("a queue input formal bound to a dynamic array, and the reverse") {
+    constexpr std::string_view src = R"(
+        module m;
+            int d[];
+            int q[$];
+            function automatic int sumq(input int o[$]);
+                sumq = 0;
+                o.push_back(100);
+                foreach (o[i]) sumq += o[i];
+                sumq = sumq * 10 + o.size();
+            endfunction
+            function automatic int sumd(input int o[]);
+                sumd = 0;
+                foreach (o[i]) sumd += o[i];
+                o[0] = 0;
+                sumd = sumd * 10 + o.size();
+            endfunction
+            initial begin
+                d = new[3];
+                d[0] = 1; d[1] = 2; d[2] = 3;
+                q = '{4, 5};
+                $display("%0d %0d", sumq(d), sumd(q));
+                $display("%p %p", d, q);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1064 92\n'{1, 2, 3} '{4, 5}\n");
+}
+
+// A fixed-size array and a dynamic array or queue are assignment compatible when
+// their sizes match at run time (LRM 7.6), which Clotho does not lower. As an
+// argument the pair used to write a handle's words over the fixed array (a
+// container output formal), crash the compiler (a fixed-size formal) or be refused
+// with a message about a conversion (a container input formal).
+TEST_CASE("a fixed-size array bound to a container formal, and the reverse, is refused") {
+    constexpr std::string_view head = R"(
+        module m;
+            int f[3];
+            int d[];
+            int q[$];
+            int n;
+            function automatic int sumq(input int o[$]); return o.size(); endfunction
+            function automatic int sumd(input int o[]); return o.size(); endfunction
+            function automatic int sum3(input int o[3]); return o[0] + o[1] + o[2]; endfunction
+            task automatic fq(output int o[$]); o = '{1, 2, 3}; endtask
+            task automatic fd(inout int o[]); o = new[3]; endtask
+            task automatic fill3(output int o[3]); o = '{7, 8, 9}; endtask
+            task automatic bump3(inout int o[3]); o[0] += 1; endtask
+    )";
+    for (const std::string_view call : { "n = sumq(f);",
+                                         "n = sumd(f);",
+                                         "fq(f);",
+                                         "fd(f);",
+                                         "n = sum3(d);",
+                                         "n = sum3(q);",
+                                         "fill3(d);",
+                                         "fill3(q);",
+                                         "bump3(d);",
+                                         "bump3(q);" }) {
+        CAPTURE(call);
+        const LowerResult r =
+          lower_text(std::string(head) + "initial begin " + std::string(call) + " end\nendmodule\n");
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find("binding a fixed-size array to a dynamic array or queue formal") !=
+                        std::string::npos,
+                      r.diagnostic_text());
+    }
+}
+
 TEST_CASE("queue function return value") {
     constexpr std::string_view src = R"(
         module m;

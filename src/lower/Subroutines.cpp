@@ -2124,6 +2124,18 @@ const slang::ast::ClassType* Lowerer::class_of_ref(ir::Ref ref) {
     fail("internal: class ref without a symbol");
 }
 
+namespace {
+
+// TODO: a fixed-size array bound to a dynamic array or queue formal, and a dynamic
+// array or queue bound to a fixed-size array formal (LRM 13.5 over 7.6). The copy
+// between the two is an assignment whose sizes are compared at run time, which is
+// not lowered as a statement either ("whole unpacked array assignment").
+constexpr std::string_view kMixedArrayArgument =
+  "binding a fixed-size array to a dynamic array or queue formal, or a dynamic array or queue to a "
+  "fixed-size array formal, is not supported";
+
+} // namespace
+
 // Build the call-argument operands for a user function / task (LRM 13.5): an
 // input passes a value resized to the formal; a ref passes the actual's lvalue;
 // an output / inout uses a fresh caller temp (copied in from the actual for
@@ -2196,6 +2208,9 @@ std::vector<ir::Index> Lowerer::build_call_args(std::span<const FormalArgumentSy
                 actual = &actual->as<AssignmentExpression>().left();
             }
             const Expression& src = unwrap_conversion(*actual);
+            if (is_handle_expr(src)) {
+                throw LowerError{ std::string(kMixedArrayArgument), to_source_span(src.sourceRange) };
+            }
             // A slice is a legal whole-array actual (LRM 7.4.5): same element
             // count, so it copies element-wise into the temp like any array.
             const bool lvalue_shape =
@@ -2237,33 +2252,54 @@ std::vector<ir::Index> Lowerer::build_call_args(std::span<const FormalArgumentSy
             args.push_back(temp);
             continue;
         }
-        // A dynamic-array actual passes one handle lvalue for every direction:
-        // the callee deep-copies it in (input / inout), copies its frame handle
-        // back out (output / inout), or aliases it (ref). No caller temp — the
-        // actual is always a whole handle. slang wraps an output / inout actual
-        // in an AssignmentExpression; unwrap to the bound lvalue.
+        // A container actual passes one handle lvalue: the callee deep-copies it in
+        // (input / inout) and copies its frame handle back out through it (output /
+        // inout). slang wraps an output / inout actual in an AssignmentExpression;
+        // unwrap to the bound lvalue.
         if (is_handle_ref(pty)) {
             const Expression* actual = actuals[i];
             if (actual->kind == ExpressionKind::Assignment) {
                 actual = &actual->as<AssignmentExpression>().left();
             }
-            const ir::Ref actual_ty = lower_type(*actual->type);
-            const auto&   at        = std::get<ir::Type>(module_.pool.get(actual_ty));
-            if (dir != slang::ast::ArgumentDirection::In && at.kind == ir::Type::Kind::Queue && at.left != 0) {
-                // The callee copies its formal back through whatever handle it is given,
-                // and knows only its own type's bound. Hand it a temp and assign the temp
-                // to the actual after the call (LRM 13.5: copy-out is an assignment).
+            // An input actual of another kind arrives under the conversion slang
+            // puts on it; an output or inout actual is the bare lvalue.
+            const Expression& src = unwrap_conversion(*actual);
+            if (src.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                throw LowerError{ std::string(kMixedArrayArgument), to_source_span(src.sourceRange) };
+            }
+            if (dir == slang::ast::ArgumentDirection::In) {
+                if (is_handle_expr(src)) {
+                    const ir::Ref        src_ty      = lower_type(*src.type);
+                    const ir::Type::Kind src_kind    = std::get<ir::Type>(module_.pool.get(src_ty)).kind;
+                    const ir::Type::Kind formal_kind = std::get<ir::Type>(module_.pool.get(pty)).kind;
+                    if (src_kind != formal_kind) {
+                        // A queue formal bound to a dynamic array or the reverse (LRM
+                        // 7.5.1, 7.10.2): the callee copies in from a handle of its
+                        // formal's kind, so the actual is assigned to one first.
+                        const ir::Index temp = make_arg_temp(pty, b, l);
+                        emit_container_place_copy(temp, pty, lower_lvalue(src, b), src_ty, b, l);
+                        args.push_back(temp);
+                        continue;
+                    }
+                }
+                args.push_back(lower_lvalue(*actual, b));
+                continue;
+            }
+            const ir::Ref src_ty = lower_type(*src.type);
+            if (container_actual_needs_temp(src, src_ty, pty)) {
+                // Hand the callee a temp of its formal's type and assign the temp to
+                // the actual after the call (LRM 13.5: copy-out is an assignment).
                 const ir::Index temp = make_arg_temp(pty, b, l);
                 if (dir == slang::ast::ArgumentDirection::InOut) {
-                    b.queue_copy(temp, lower_lvalue(*actual, b), pty, l);
+                    emit_container_place_copy(temp, pty, lower_lvalue(src, b), src_ty, b, l);
                 }
                 args.push_back(temp);
-                CopyOutArg oc{ temp, actual, actual_ty, &formals[i]->getType() };
-                oc.is_bounded_queue = true;
+                CopyOutArg oc{ temp, &src, src_ty, &formals[i]->getType() };
+                oc.is_container = true;
                 outs.push_back(oc);
                 continue;
             }
-            args.push_back(lower_lvalue(*actual, b));
+            args.push_back(lower_lvalue(src, b));
             continue;
         }
         if (dir == slang::ast::ArgumentDirection::In) {
@@ -2351,8 +2387,8 @@ void Lowerer::emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builde
             continue;
         }
         const ir::Index dst = lower_lvalue(*oc.actual, b);
-        if (oc.is_bounded_queue) {
-            b.queue_copy(dst, oc.temp, oc.actual_ty, l);
+        if (oc.is_container) {
+            emit_container_place_copy(dst, oc.actual_ty, oc.temp, lower_type(*oc.formal_ty), b, l);
             continue;
         }
         if (oc.is_agg) {
@@ -2374,6 +2410,83 @@ void Lowerer::emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builde
         // value (LRM 10.6.2, matching iverilog 13); the call itself and the
         // callee's write to its own temp are unaffected.
         store_or_gate(pca_info_of_lvalue(*oc.actual), ir::Inst::Tag::Store, dst, val, b, l);
+    }
+}
+
+// Whether the place `e` names lies in the payload of a dynamic array, a queue or
+// an associative array: storage the container moves when it is resized, so its
+// address is good only until something that can resize the container runs. An
+// object does not move, so a property is no such place whatever its handle was
+// read from.
+bool Lowerer::place_in_container_payload(const Expression& e) {
+    switch (e.kind) {
+        case ExpressionKind::ElementSelect: {
+            const Expression& value = e.as<ElementSelectExpression>().value();
+            if (value.type->getCanonicalType().kind != SymbolKind::FixedSizeUnpackedArrayType) {
+                return true;
+            }
+            return place_in_container_payload(value);
+        }
+        case ExpressionKind::MemberAccess: {
+            const auto& ma = e.as<MemberAccessExpression>();
+            return ma.member.kind != SymbolKind::ClassProperty && place_in_container_payload(ma.value());
+        }
+        default:
+            return false;
+    }
+}
+
+// Whether a container output / inout formal cannot be handed its actual's own
+// handle. The callee copies its formal back through the handle it is given when
+// it returns, as a container of its formal's type, so the actual has to be one
+// of that kind, at an address that is still the actual's then:
+//
+//   - A bounded queue actual: the callee knows only its formal's bound, and the
+//     copy-out truncates to the actual's (LRM 7.10.5).
+//   - A queue formal bound to a dynamic array, or the reverse (LRM 7.5.1, 7.10.2):
+//     the two handles are different records.
+//   - An actual inside another container's payload (`qq[0]`, `sq[i].q`): a task
+//     can suspend, and the payload can have moved by the time it returns.
+bool Lowerer::container_actual_needs_temp(const Expression& actual, ir::Ref actual_ty, ir::Ref formal_ty) {
+    const auto&          at          = std::get<ir::Type>(module_.pool.get(actual_ty));
+    const ir::Type::Kind formal_kind = std::get<ir::Type>(module_.pool.get(formal_ty)).kind;
+    if (at.kind != formal_kind || (at.kind == ir::Type::Kind::Queue && at.left != 0)) {
+        return true;
+    }
+    return place_in_container_payload(actual);
+}
+
+// Assign the container at `src` to the container at `dst`, whose type it is
+// assignment compatible with (LRM 7.5.1, 7.9.9, 7.10.2). Place to place, so there
+// is no expression to dispatch on.
+void Lowerer::emit_container_place_copy(ir::Index     dst,
+                                        ir::Ref       dst_ty,
+                                        ir::Index     src,
+                                        ir::Ref       src_ty,
+                                        ir::Builder&  b,
+                                        ir::SourceLoc l) {
+    const ir::Type::Kind dk = std::get<ir::Type>(module_.pool.get(dst_ty)).kind;
+    const ir::Type::Kind sk = std::get<ir::Type>(module_.pool.get(src_ty)).kind;
+    switch (dk) {
+        case ir::Type::Kind::Queue:
+            if (sk == ir::Type::Kind::DynArray) {
+                b.queue_copy_dynarr(dst, src, dst_ty, l);
+            } else {
+                b.queue_copy(dst, src, dst_ty, l);
+            }
+            return;
+        case ir::Type::Kind::DynArray:
+            if (sk == ir::Type::Kind::Queue) {
+                b.dyn_array_copy_queue(dst, src, dst_ty, l);
+            } else {
+                b.dyn_array_copy(dst, src, dst_ty, l);
+            }
+            return;
+        case ir::Type::Kind::Assoc:
+            b.assoc_copy(dst, src, dst_ty, l);
+            return;
+        default:
+            fail("internal: a container copy between places that are not containers");
     }
 }
 
