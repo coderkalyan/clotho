@@ -65,6 +65,9 @@ enum class Ev : uint8_t {
     Block,
     Disable,
     Abort,
+    Fork,
+    ChildDone,
+    Join,
 };
 
 struct Entry {
@@ -134,6 +137,11 @@ struct Act {
     std::vector<uintptr_t>  blocks;
     std::vector<uintptr_t>  inherits;
     std::vector<Mark>       marks;
+    // R22: the join record of this activation's latest fork, whose children it creates next; the record
+    // of the fork this activation is a child of; whether it completed into it.
+    uintptr_t               forked    = 0;
+    uintptr_t               member_of = 0;
+    bool                    completed = false;
 };
 
 // A table from an address to a value, by open addressing: an activation per frame
@@ -294,12 +302,24 @@ struct ChgFacts {
     bool     any  = false;
 };
 
-// A wake that a change owes to an activation parked as it was at that moment (R6.1).
+// A wake that a change owes to an activation parked as it was at that moment (R6.1), or that the
+// completion of a fork's child owes to its parent parked at the join (`join`, R22.3: `x` is the record).
 struct Owed {
     uintptr_t act;
     uint64_t  seq;
     uintptr_t x;
     uint64_t  edge;
+    bool      join = false;
+};
+
+// A fork on its join record (R22): who forked, how it joins, how many children it announced, and how
+// many have been created and have completed since.
+struct Fork {
+    uintptr_t parent  = 0;
+    uint8_t   kind    = RT_TRACE_JOIN_ALL;
+    uint32_t  width   = 0;
+    uint32_t  spawned = 0;
+    uint32_t  done    = 0;
 };
 
 struct Checker {
@@ -364,6 +384,8 @@ struct Checker {
     AddrMap<std::vector<uintptr_t>> occ;
     AddrMap<std::vector<uintptr_t>> ramp;
     std::vector<AbortOwed>          abort_owed;
+    // R22: the forks, by join record (a new fork on an address starts a new one).
+    AddrMap<Fork>                   forks;
 };
 
 Checker g;
@@ -494,6 +516,9 @@ const char* ev_name(Ev ev) {
         case Ev::Block: return "block";
         case Ev::Disable: return "disable";
         case Ev::Abort: return "abort";
+        case Ev::Fork: return "fork";
+        case Ev::ChildDone: return "child done";
+        case Ev::Join: return "join";
     }
     return "?";
 }
@@ -509,7 +534,10 @@ bool is_act_event(Ev ev) {
         case Ev::End:
         case Ev::Block:
         case Ev::Disable:
-        case Ev::Abort: return true;
+        case Ev::Abort:
+        case Ev::Fork:
+        case Ev::ChildDone:
+        case Ev::Join: return true;
         default: return false;
     }
 }
@@ -592,6 +620,10 @@ const char* rule_title(const char* rule) {
         { "R23.5", "force wake" },
         { "R25.1", "home region" },
         { "R25.2", "continuous before program" },
+        { "R22.1", "child start" },
+        { "R22.2", "child completion" },
+        { "R22.3", "join wake" },
+        { "R22.4", "join" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -625,6 +657,15 @@ const char* queue_name(uint32_t q) {
         case RT_TRACE_QUEUE_ACTIVE: return "active";
         case RT_TRACE_QUEUE_REACTIVE: return "reactive";
         case RT_TRACE_QUEUE_CONT: return "reactive continuous";
+    }
+    return "?";
+}
+
+const char* join_name(uint32_t kind) {
+    switch (kind) {
+        case RT_TRACE_JOIN_ALL: return "join";
+        case RT_TRACE_JOIN_ANY: return "join_any";
+        case RT_TRACE_JOIN_NONE: return "join_none";
     }
     return "?";
 }
@@ -724,6 +765,9 @@ std::string rec_text(const Rec& r) {
         case Ev::Abort:
             out += r.cause == RT_TRACE_ABORT_KILL ? ": marked by a kill" : ": marked by a disable of the list at " + address_text(r.x);
             break;
+        case Ev::Fork: out += std::string(": ") + join_name(r.cause) + " on the record at " + address_text(r.x); break;
+        case Ev::ChildDone: out += " into the record at " + address_text(r.x); break;
+        case Ev::Join: out += " past the join of the record at " + address_text(r.x); break;
         default: break;
     }
     return out;
@@ -816,6 +860,28 @@ bool listed(const std::vector<Entry>& v, const void* x, uint32_t fact) {
 // side naming none says nothing.
 bool other_record(const Act& act, const void* x) {
     return act.rec != 0 && x != nullptr && reinterpret_cast<uintptr_t>(x) != act.rec;
+}
+
+// Whether the completion just counted is the one the join of `f` is due to wake its parent at: the
+// last of a `join`, the first of a `join_any`, and none of a `join_none`, whose parent never parks.
+bool join_due(const Fork& f) {
+    return f.kind == RT_TRACE_JOIN_ALL ? f.done == f.width : (f.kind == RT_TRACE_JOIN_ANY && f.done == 1);
+}
+
+// Why the child may not be resumed at its creation, or empty (R22.1): a `join_none` child starts when
+// its parent blocks or ends, and a `join_any` sibling is not run once the parent is due to go on.
+std::string child_start_refusal(const Act& act) {
+    const Fork* f = act.member_of != 0 ? g.forks.find(act.member_of) : nullptr;
+    if (f == nullptr) {
+        return "";
+    }
+    if (f->kind == RT_TRACE_JOIN_NONE) {
+        return "a join_none child ran at the fork: it starts when its parent blocks or ends";
+    }
+    if (f->kind == RT_TRACE_JOIN_ANY && f->done != 0) {
+        return "a join_any sibling ran after the first child had completed: the parent goes on, and the others start when it blocks or ends";
+    }
+    return "";
 }
 
 // Empty when `cause` may wake `act`, parked as it is; otherwise why not.
@@ -1481,6 +1547,14 @@ void settle_owed() {
     for (const Owed& o : g.owed) {
         const Act* act = g.acts.find(o.act);
         if (act != nullptr && act->state == State::Parked && act->park_seq == o.seq) {
+            if (o.join) {
+                const Fork* f     = g.forks.find(o.x);
+                std::string cause = "the completion that a ";
+                cause += f != nullptr ? join_name(f->kind) : "join";
+                cause += " is due to wake its parent at came, and the parent was still parked at the join when the next dispatch, park or region came";
+                fail("R22.3", "the parent of a fork was not woken by the completion its join is due at", o.act, cause);
+                break;
+            }
             std::string cause = std::string(edge_name(o.edge)) + " " + signal_text(reinterpret_cast<const void*>(o.x)) +
                                 " changed, and the activation was still parked when the next dispatch, park or region came";
             fail("R6.1", "an activation parked on a change that happened was not woken", o.act, cause);
@@ -1689,6 +1763,7 @@ extern "C" void rt_trace_begin(void) {
     g.occ.clear();
     g.ramp.clear();
     g.abort_owed.clear();
+    g.forks.clear();
 }
 
 extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* parent) {
@@ -1729,6 +1804,9 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
     act.blocks.clear();
     act.inherits.clear();
     act.marks.clear();
+    act.forked    = 0;
+    act.member_of = 0;
+    act.completed = false;
     // A thread's home is a program's or a design's by where it starts (R25); what it forks or
     // calls takes the home of the thread that does.
     switch (kind_of(origin)) {
@@ -1753,6 +1831,15 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
         ++g.strobes_owed;
     }
     record(Ev::Spawn, a, 0, origin, 0, 0);
+    // A fork child belongs to the latest fork of its creator (R22).
+    if (kind_of(origin) == RT_TRACE_ORG_FORK && act.parent != 0) {
+        const Act* creator = g.acts.find(act.parent);
+        Fork*      f       = creator != nullptr && creator->forked != 0 ? g.forks.find(creator->forked) : nullptr;
+        if (f != nullptr) {
+            ++f->spawned;
+            act.member_of = creator->forked;
+        }
+    }
     // The lists its ramp linked it on before this event announced it.
     if (std::vector<uintptr_t>* linked = g.ramp.find(a); linked != nullptr) {
         for (const uintptr_t t : *linked) {
@@ -1923,6 +2010,17 @@ extern "C" void rt_trace_wake(void* a_, uint32_t cause_word, const void* x, uint
             return;
         }
     }
+    // The wake of a parent parked at a join comes at the completion its join is due at (R22.3).
+    if (cause == RT_TRACE_CHILD && !g.finished) {
+        if (const Fork* f = g.forks.find(reinterpret_cast<uintptr_t>(x)); f != nullptr && !join_due(*f)) {
+            std::string text;
+            appendf(text, "%u of the %u children had completed; a join is woken by the last and a join_any by the first", f->done,
+                    f->width);
+            fail("R22.3", std::string("the parent of a ") + join_name(f->kind) + " was woken by a completion its join is not due at", a,
+                 text);
+            return;
+        }
+    }
     // Past a `$finish` only the completions that make each frame leave wake anything (R24).
     if (g.finished && !completion_cause(cause)) {
         fail("R24.1", "wake after $finish: code of the finishing thread, or of something it woke, ran on", a,
@@ -2031,6 +2129,12 @@ extern "C" int32_t rt_trace_dispatch(void* a_, uint32_t how) {
         fail("R4.1", "a body the scheduler runs once ran outside the region it belongs to", a,
              std::string("the scheduler is in the ") + region_name(g.region) + " region");
         return 0;
+    } else if (how == RT_TRACE_INLINE) {
+        const std::string why = child_start_refusal(*act);
+        if (!why.empty()) {
+            fail("R22.1", why, a, "dispatched inline");
+            return 0;
+        }
     }
     if (!act->dispatched) {
         act->dispatched = true;
@@ -2248,6 +2352,113 @@ extern "C" void rt_trace_abort(void* a_, const void* target, uint32_t kind) {
         }
     }
     act->marks.push_back(Mark{ t, static_cast<uint8_t>(kind) });
+}
+
+extern "C" void rt_trace_fork(void* a_, const void* rec_, uint32_t kind, uint32_t width) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.forks;
+    ++g.total.forks;
+    const uintptr_t a   = norm(a_);
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    Act*            act = nullptr;
+    if (a != 0) {
+        act = find("R5.3", a, "fork");
+        if (act == nullptr) {
+            return;
+        }
+    }
+    record(Ev::Fork, a, rec, act != nullptr ? act->park : nullptr, static_cast<uint8_t>(kind), 0);
+    g.forks.at(rec) = Fork{ a, static_cast<uint8_t>(kind), width, 0, 0 };
+    if (act != nullptr) {
+        act->forked = rec;
+    }
+}
+
+extern "C" void rt_trace_child_done(void* a_, const void* rec_) {
+    if (g.halted) {
+        return;
+    }
+    const uintptr_t a   = norm(a_);
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    Act*            act = find("R5.3", a, "child completion");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::ChildDone, a, rec, act->park, 0, 0);
+    Fork* f = g.forks.find(rec);
+    if (f == nullptr) {
+        if (!g.finished) {
+            fail("R22.2", "a fork child completes into a record that no fork announced: a fork the trace does not report", a,
+                 "the record at " + address_text(rec));
+        }
+        return;
+    }
+    if (!g.finished) {
+        if (act->member_of != 0 && act->member_of != rec) {
+            fail("R22.2", "a fork child completes into the record of another fork: its count would be wrong, and so would the wake", a,
+                 "created for the record at " + address_text(act->member_of) + ", completes into the one at " + address_text(rec));
+            return;
+        }
+        if (act->completed) {
+            fail("R22.2", "a fork child completes twice: the join would count it twice", a, "the record at " + address_text(rec));
+            return;
+        }
+    }
+    act->completed = true;
+    ++f->done;
+    if (g.finished || f->parent == 0 || !join_due(*f)) {
+        return;
+    }
+    // This is the completion the parent's join is due at: if the parent is parked at it, it is woken
+    // before anything else runs.
+    const Act* parent = g.acts.find(f->parent);
+    if (parent != nullptr && parent->state == State::Parked && parent->park != nullptr && parent->park->kind == RT_TRACE_CTL_JOIN &&
+        parent->rec == rec) {
+        g.owed.push_back(Owed{ f->parent, parent->park_seq, rec, 0, true });
+    }
+}
+
+extern "C" void rt_trace_join(void* a_, const void* rec_) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.joins;
+    ++g.total.joins;
+    const uintptr_t a   = norm(a_);
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    Act*            act = find("R5.3", a, "join");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::Join, a, rec, act->park, 0, 0);
+    if (g.finished) {
+        return;
+    }
+    const Fork* f = g.forks.find(rec);
+    if (f == nullptr) {
+        fail("R22.4", "a join of a record that no fork announced: a fork the trace does not report", a, "the record at " + address_text(rec));
+        return;
+    }
+    if (f->parent != a) {
+        fail("R22.4", "an activation passes the join of a fork that another made", a,
+             "the record at " + address_text(rec) + " was forked by " + address_text(f->parent));
+        return;
+    }
+    std::string text;
+    if (f->spawned != f->width) {
+        appendf(text, "the fork announced %u children and had created %u when its parent joined", f->width, f->spawned);
+        fail("R22.4", "a join passed before every child of its fork was created: the count it waits on can never reach its due value", a, text);
+        return;
+    }
+    const bool ok = f->kind == RT_TRACE_JOIN_ALL ? f->done == f->width : (f->kind == RT_TRACE_JOIN_ANY ? f->done >= 1 : true);
+    if (!ok) {
+        appendf(text, "%u of the %u children had completed", f->done, f->width);
+        fail("R22.4", std::string("the parent of a ") + join_name(f->kind) + " went on before its children had completed", a, text);
+    }
 }
 
 extern "C" void rt_trace_once(uint32_t kind) {

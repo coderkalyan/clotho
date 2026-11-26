@@ -2279,6 +2279,13 @@ private:
     // leave (RT_TRACE_ABORT_*).
     void emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind);
 
+    // R22: the body's own activation (null in a function) forks onto the join record `rec`
+    // (`kind`: RT_TRACE_JOIN_*, `width` children); fork child `a` completes into `rec`; the
+    // activation is past the join of `rec`.
+    void emit_trace_fork(llvm::Value* rec, uint32_t kind, uint32_t width);
+    void emit_trace_child_done(llvm::Value* a, llvm::Value* rec);
+    void emit_trace_join(llvm::Value* rec);
+
     // clotho.run_once is about to run the bodies of one region (RT_TRACE_ORG_PREINIT ...), or has.
     void emit_trace_once(uint32_t kind);
 

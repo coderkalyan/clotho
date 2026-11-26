@@ -459,6 +459,49 @@ void Backend::emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind)
 #endif
 }
 
+void Backend::emit_trace_fork(llvm::Value* rec, uint32_t kind, uint32_t width) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32 = b_.getInt32Ty();
+    // A function has no activation: a fork there can only be a join_none, which parks nobody.
+    llvm::Value* a = in_coroutine_body() ? static_cast<llvm::Value*>(hdl_) : llvm::ConstantPointerNull::get(ptr);
+    b_.CreateCall(rt_fn("rt_trace_fork", b_.getVoidTy(), { ptr, ptr, i32, i32 }),
+                  { a, rec, b_.getInt32(kind), b_.getInt32(width) });
+#else
+    (void)rec;
+    (void)kind;
+    (void)width;
+#endif
+}
+
+void Backend::emit_trace_child_done(llvm::Value* a, llvm::Value* rec) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_child_done", b_.getVoidTy(), { ptr, ptr }), { a, rec });
+#else
+    (void)a;
+    (void)rec;
+#endif
+}
+
+void Backend::emit_trace_join(llvm::Value* rec) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_join", b_.getVoidTy(), { ptr, ptr }), { hdl_, rec });
+#else
+    (void)rec;
+#endif
+}
+
 void Backend::emit_trace_once(uint32_t kind) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     if (!trace_on()) {

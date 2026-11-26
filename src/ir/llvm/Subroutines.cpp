@@ -1902,6 +1902,9 @@ void Backend::lower_task(FunctionId id) {
         auto*        rty    = fork_record_ty(heap);
         auto*        cntp   = b_.CreateStructGEP(rty, rec, 0);
         llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
+        // The completion is reported to the record before it is counted, so before the wake it may
+        // make (R22).
+        emit_trace_child_done(hdl_, rec);
         b_.CreateStore(cnt, cntp);
         llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(rty, rec, 1));
         llvm::Value* due    = heap

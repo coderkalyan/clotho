@@ -99,7 +99,8 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_resume", "rt_trace_end", "rt_trace_slot", "rt_trace_halted", "rt_trace_region",
                               "rt_trace_nba_create", "rt_trace_nba_stage", "rt_trace_nba_release", "rt_trace_nba_pass",
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
-                              "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once" }) {
+                              "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
+                              "rt_trace_fork", "rt_trace_child_done", "rt_trace_join" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -2260,5 +2261,294 @@ TEST_CASE("trace check: only an activation a walk marked is force-woken (R23.5)"
     rt_trace_wake(unmarked, RT_TRACE_FORCE, nullptr, 0);
     CHECK(rule() == "R23.5");
     CHECK(has(rt_trace_report(), "no disable or kill had marked"));
+}
+
+// R22: the children of a fork and the join that waits for them. The parent is proc_a, the children
+// proc_b, proc_d and proc_e (the tag bits of a parked handle are stripped, so proc_c would name proc_a),
+// and the fork's record is rec_a.
+namespace {
+
+alignas(8) char proc_e, proc_f;
+
+void* const kParent     = &proc_a;
+void* const kChildren[] = { &proc_b, &proc_d, &proc_e };
+
+// The parent runs and forks `width` children, which the spawns that follow announce.
+void fork_of(uint32_t kind, uint32_t width) {
+    rt_trace_begin();
+    rt_trace_spawn(kParent, &kProcess, nullptr);
+    rt_trace_dispatch(kParent, RT_TRACE_INLINE);
+    rt_trace_fork(kParent, &rec_a, kind, width);
+    for (uint32_t i = 0; i < width; ++i) {
+        rt_trace_spawn(kChildren[i], &kForkChild, kParent);
+    }
+}
+
+// A child resumed at the fork, which runs to its end.
+void completes_inline(void* kid) {
+    CHECK_MESSAGE(rt_trace_dispatch(kid, RT_TRACE_INLINE) == 1, std::string(rt_trace_report()));
+    rt_trace_child_done(kid, &rec_a);
+    rt_trace_end(kid);
+}
+
+// A child resumed at the fork, which parks at a `#ticks`.
+void parks_inline(void* kid, uint64_t ticks) {
+    CHECK_MESSAGE(rt_trace_dispatch(kid, RT_TRACE_INLINE) == 1, std::string(rt_trace_report()));
+    rt_trace_park(kid, &kDelay, ticks);
+}
+
+// The timer of a child's delay expires at `tick` and the child runs to its completion, which the
+// caller then follows (or not) with the wake of the parent.
+void timer_completes(void* kid, uint64_t tick) {
+    rt_trace_slot(tick);
+    rt_trace_wake(kid, RT_TRACE_TIMER, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK_MESSAGE(rt_trace_dispatch(kid, RT_TRACE_RING) == 1, std::string(rt_trace_report()));
+    rt_trace_resume(kid, &kDelay);
+    rt_trace_child_done(kid, &rec_a);
+}
+
+void parent_joins() {
+    rt_trace_park(kParent, &kJoin, id_of(&rec_a));
+}
+
+} // namespace
+
+TEST_CASE("trace check: a join is woken by the last of its children and passed only then (R22)") {
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    parks_inline(kChildren[1], 1);
+    parks_inline(kChildren[2], 2);
+    parent_joins();
+    timer_completes(kChildren[1], 1);
+    rt_trace_end(kChildren[1]);
+    timer_completes(kChildren[2], 2);
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    rt_trace_end(kChildren[2]);
+    CHECK(rt_trace_dispatch(kParent, RT_TRACE_RING) == 1);
+    rt_trace_resume(kParent, &kJoin);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.forks == before.forks + 1);
+    CHECK(after.joins == before.joins + 1);
+
+    // Children that all completed at the fork leave nothing to park for: the parent passes the join.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    completes_inline(kChildren[0]);
+    completes_inline(kChildren[1]);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rt_trace_halted() == 0);
+
+    // Woken by the second of three: the join would go on with a child running.
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    parks_inline(kChildren[1], 1);
+    parks_inline(kChildren[2], 2);
+    parent_joins();
+    timer_completes(kChildren[1], 1);
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "2 of the 3 children had completed"));
+    CHECK(has(rt_trace_report(), "woken by a completion its join is not due at"));
+
+    // The last child completes and wakes nobody: the parent stays at its join for good.
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    parks_inline(kChildren[1], 1);
+    parks_inline(kChildren[2], 2);
+    parent_joins();
+    timer_completes(kChildren[1], 1);
+    rt_trace_end(kChildren[1]);
+    timer_completes(kChildren[2], 2);
+    rt_trace_end(kChildren[2]);
+    rt_trace_slot_end();
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "was not woken by the completion its join is due at"));
+    CHECK(has(rt_trace_report(), "still parked at the join"));
+
+    // The parent goes on past a join with a child still to complete.
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "1 of the 3 children had completed"));
+}
+
+TEST_CASE("trace check: a join_any is woken by its first child, which the parent passes it on, and the siblings start later (R22)") {
+    // The first child completes at the fork: the parent does not park, and the siblings are queued.
+    fork_of(RT_TRACE_JOIN_ANY, 3);
+    completes_inline(kChildren[0]);
+    rt_trace_wake(kChildren[1], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_wake(kChildren[2], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_park(kParent, &kDelay, 1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[1], &rec_a);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_dispatch(kChildren[2], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[2], &rec_a);
+    rt_trace_end(kChildren[2]);
+    CHECK(rt_trace_halted() == 0);
+
+    // Every child parks: the first to complete wakes the parent, and the second wakes nobody.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    parent_joins();
+    timer_completes(kChildren[0], 1);
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    rt_trace_end(kChildren[0]);
+    CHECK(rt_trace_dispatch(kParent, RT_TRACE_RING) == 1);
+    rt_trace_resume(kParent, &kJoin);
+    rt_trace_join(kParent, &rec_a);
+    rt_trace_park(kParent, &kDelay, 5);
+    timer_completes(kChildren[1], 2);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_halted() == 0);
+
+    // The first completion wakes nobody: the next event shows the parent still at its join.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    parent_joins();
+    timer_completes(kChildren[0], 1);
+    rt_trace_end(kChildren[0]);
+    rt_trace_slot(2);
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "join_any"));
+    // Woken before any child completed: the parent would go on with all of them still running.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    parent_joins();
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "0 of the 2 children had completed"));
+
+    // With no child completed, a join_any does not pass.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "0 of the 2 children had completed"));
+}
+
+// R22: a join_none child starts when its parent blocks or ends, and a join_any sibling not at all
+// before that once the parent is due to go on (fork_test.cpp, "fork: join_none does not run its
+// children at the fork" and "fork: join_any does not run the siblings it is not waiting for").
+TEST_CASE("trace check: a child that the parent does not wait for starts from a ring, not at the fork (R22)") {
+    // join_none: queued, and run once the parent has blocked.
+    fork_of(RT_TRACE_JOIN_NONE, 2);
+    rt_trace_wake(kChildren[0], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_wake(kChildren[1], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_park(kParent, &kDelay, 1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[0], &rec_a);
+    rt_trace_end(kChildren[0]);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[1], &rec_a);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_halted() == 0);
+
+    // join_none: resumed at the fork, while the parent runs.
+    fork_of(RT_TRACE_JOIN_NONE, 2);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_INLINE) == 0);
+    CHECK(rule() == "R22.1");
+    CHECK(has(rt_trace_report(), "a join_none child ran at the fork"));
+    CHECK(has(rt_trace_report(), "design.sv:27:3"));
+
+    // join_any: the first child completed, and a sibling is resumed all the same.
+    fork_of(RT_TRACE_JOIN_ANY, 3);
+    completes_inline(kChildren[0]);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_INLINE) == 0);
+    CHECK(rule() == "R22.1");
+    CHECK(has(rt_trace_report(), "a join_any sibling ran after the first child had completed"));
+
+    // join_any: while none has completed, the parent still waits for each of them and runs them inline.
+    fork_of(RT_TRACE_JOIN_ANY, 3);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    completes_inline(kChildren[2]);
+    CHECK(rt_trace_halted() == 0);
+
+    // A fork in a function has no activation and no join: its children are not tied to a parent, and
+    // run from the ring.
+    rt_trace_begin();
+    rt_trace_fork(nullptr, &rec_a, RT_TRACE_JOIN_NONE, 2);
+    rt_trace_spawn(kChildren[0], &kForkChild, nullptr);
+    rt_trace_spawn(kChildren[1], &kForkChild, nullptr);
+    rt_trace_wake(kChildren[0], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_wake(kChildren[1], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[0], &rec_a);
+    rt_trace_end(kChildren[0]);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[1], &rec_a);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a child completes once into the record of the fork that made it, and a join is of a fork whole (R22)") {
+    // Into the record of another fork: the count of the wrong parent would fall, and its wake would come
+    // from the wrong fork.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    rt_trace_fork(nullptr, &rec_b, RT_TRACE_JOIN_NONE, 1);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_INLINE) == 1);
+    rt_trace_child_done(kChildren[0], &rec_b);
+    CHECK(rule() == "R22.2");
+    CHECK(has(rt_trace_report(), "the record of another fork"));
+
+    // Twice.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    completes_inline(kChildren[0]);
+    rt_trace_child_done(kChildren[0], &rec_a);
+    CHECK(rule() == "R22.2");
+    CHECK(has(rt_trace_report(), "completes twice"));
+
+    // Into a record that no fork announced.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    rt_trace_spawn(&proc_f, &kProcess, nullptr);
+    CHECK(rt_trace_dispatch(&proc_f, RT_TRACE_INLINE) == 1);
+    rt_trace_child_done(&proc_f, &rec_b);
+    CHECK(rule() == "R22.2");
+    CHECK(has(rt_trace_report(), "no fork announced"));
+
+    // A join before the fork created every child it announced: its count could never be reached.
+    rt_trace_begin();
+    rt_trace_spawn(kParent, &kProcess, nullptr);
+    rt_trace_dispatch(kParent, RT_TRACE_INLINE);
+    rt_trace_fork(kParent, &rec_a, RT_TRACE_JOIN_ALL, 3);
+    rt_trace_spawn(kChildren[0], &kForkChild, kParent);
+    rt_trace_spawn(kChildren[1], &kForkChild, kParent);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "announced 3 children and had created 2"));
+
+    // The join of a fork that another activation made.
+    fork_of(RT_TRACE_JOIN_ALL, 1);
+    completes_inline(kChildren[0]);
+    rt_trace_spawn(kChildren[1], &kProcess, nullptr);
+    rt_trace_dispatch(kChildren[1], RT_TRACE_INLINE);
+    rt_trace_join(kChildren[1], &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "another made"));
+
+    // A new fork on the address a finished one used starts a new record: the old count is gone.
+    fork_of(RT_TRACE_JOIN_ALL, 1);
+    completes_inline(kChildren[0]);
+    rt_trace_join(kParent, &rec_a);
+    rt_trace_fork(kParent, &rec_a, RT_TRACE_JOIN_ALL, 1);
+    rt_trace_spawn(kChildren[1], &kForkChild, kParent);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "0 of the 1 children had completed"));
 }
 #endif // CLOTHO_EXTRA_ASSERTS

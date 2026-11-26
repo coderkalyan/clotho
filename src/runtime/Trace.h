@@ -101,6 +101,14 @@ enum {
     RT_TRACE_ABORT_KILL = 1,
 };
 
+// The join of a fork (rt_trace_fork): `join` waits for every child, `join_any` for the first and
+// `join_none` for none.
+enum {
+    RT_TRACE_JOIN_ALL = 0,
+    RT_TRACE_JOIN_ANY = 1,
+    RT_TRACE_JOIN_NONE = 2,
+};
+
 // The ring a wake pushes onto, in bits 8 and up of rt_trace_wake's cause: the Active ring, the
 // Reactive ring, or the reactive continuous ring a program's port copies and assigns drain from
 // before program code.
@@ -357,6 +365,9 @@ typedef struct rt_trace_counts {
     // Block entries and exits, and activations a `disable` or `kill` marked.
     uint64_t blocks;
     uint64_t aborts;
+    // Forks, and the joins their parents passed.
+    uint64_t forks;
+    uint64_t joins;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -425,6 +436,20 @@ void rt_trace_disable(void* a, const void* target);
 // it parks again, except at a join or a task call, which hold their wake until the child or
 // callee completes.
 void rt_trace_abort(void* a, const void* target, uint32_t kind);
+
+// `a` forks `width` children onto the join record `rec`, which the children's epilogues, the join's
+// park and the parent's wake name alike (RT_TRACE_JOIN_*); `a` is null in a function, which has no
+// activation and no join. The children are announced by the spawns that follow, each of them
+// created by `a`. A fork on an address a record had starts a new record.
+void rt_trace_fork(void* a, const void* rec, uint32_t kind, uint32_t width);
+
+// Fork child `a` completes into the join record `rec`: before the decrement of the record's own
+// count, and so before the wake of the parent that this completion is due to make.
+void rt_trace_child_done(void* a, const void* rec);
+
+// `a` is past the join of the fork on `rec`, which it either did not park for (the children it waits
+// for had completed already) or was woken from.
+void rt_trace_join(void* a, const void* rec);
 
 // The scheduler runs the bodies of one region through `clotho.run_once` (`kind`:
 // RT_TRACE_ORG_PREINIT ...), or has done (0).
