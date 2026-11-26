@@ -121,25 +121,16 @@ Milestones, in order; lower ones unblock higher ones:
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
 - [ ] **Non-null `chandle` property transition** (9.4.2, 9.4.3) — not exercised end to end;
   making one needs DPI.
-- [~] **Event control and `wait` over a method call or an expression of properties**
-  (9.4.2) — the forms below are refused, or accepted and not woken by the change.
-  - [ ] **Event list mixing a class-property or virtual-interface member with a signal or
-    event, and `->> @(m) e` / `x <= @(m) y` over such a member** (9.4.2, 15.5.1, 9.4.5) —
-    refused; needs a per-registration fired marker in the wait node.
-  - [ ] **Event list mixing a method call with another event** — `@(c.get() or
-    posedge clk)` needs identification of the waking source.
-  - [ ] **Method call as the control of `<= @(...)` or `->> @(...)`, or as a clocking
-    event** — a record or a clock is not a process that can sample it.
-  - [ ] **Method that reads an `event` property or a string variable** — those have no
-    change notifier.
-  - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
-    change notifier.
+- [~] **Event control over a method call, an expression of class properties or
+  virtual-interface members, or a string expression** (9.4.2) — the forms below are refused.
+  - [ ] **In a list with a signal or a named event** — `@(c.get() or posedge clk)` needs a
+    per-registration fired marker in the wait node, to tell which term woke the process.
+  - [ ] **As the control of `<= @(...)` or `->> @(...)`, or as a clocking event** (15.5.1,
+    9.4.5) — a record or a clock is not a process that can sample it.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
   `wait(vif.q.size())` is not exercised end to end.
-- [ ] **`@` or `wait` on a fork-captured unpacked struct, union, fixed unpacked array or
-  `event`** (9.4.2, 9.4.3, 9.3.2) — the capture box has no change notifier for these types.
 - [~] **Event-controlled nonblocking trigger** (15.5.1) — `->> @(...) e` forms still refused.
   - [ ] **Non-constant `repeat` count** — `->> repeat(n) @(x) e` with a runtime `n`.
   - [ ] **`iff` on the controlling event** (9.4.2.3) — `->> @(posedge c iff en) e`.
@@ -151,6 +142,8 @@ Milestones, in order; lower ones unblock higher ones:
   inside a task, with `p` a formal, is refused.
 - [ ] **`fork` child reading an `output` or `inout` formal of its subroutine** (9.3.2, 13.5) —
   writes made through the capture would not reach the formal's copy-out.
+- [ ] **`fork` child reading its function's return variable or a randsequence production's
+  formal** (9.3.2, 13.4.1, 18.17) — neither has a capture box.
 
 ### Continuous / structural timing
 
@@ -343,8 +336,10 @@ Milestones, in order; lower ones unblock higher ones:
   copy, equality, argument and `%p` positions; needs a by-value aggregate ABI.
 - [ ] **Whole aggregate element of an associative array in a by-value context** (7.8) — as a
   subroutine argument or a raw rvalue; refused in the backend.
-- [ ] **String event control / sensitivity** — `@(s)` and inferred sensitivity on a string are
-  refused.
+- [ ] **Dynamic array or queue assigned to a fixed-size array** (7.6) — `f = d;` is refused; the
+  sizes have to be compared at run time.
+- [ ] **Fixed-size array bound to a dynamic array or queue formal, and the reverse** (13.5, 7.6)
+  — refused in every direction; the copy-in and copy-out are that assignment.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
   - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an

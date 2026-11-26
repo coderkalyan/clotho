@@ -229,8 +229,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), params, false);
         // Internal: its callers are the entry of its schedule group, in this
-        // module when the group has no other row (where the inliner may fold the
-        // body in), or a dispatcher in root, which promotes it through sym().
+        // module when the group has no other row (where the body is moved into
+        // the entry, emit_sched_entries), or a dispatcher in root, which promotes
+        // it through sym().
         fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
         fn_->getArg(0)->setName("ctx");
         wheel_ = fn_->getArg(1);
@@ -263,6 +264,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_dynarr_temps();
             build_agg_elem_temps();
             llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
+            if (takes_flag) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -545,6 +549,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
             llvm::BasicBlock* join = open_guard(guarded, g_, i);
+            if (guarded) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
@@ -1902,6 +1909,9 @@ void Backend::lower_task(FunctionId id) {
         auto*        rty    = fork_record_ty(heap);
         auto*        cntp   = b_.CreateStructGEP(rty, rec, 0);
         llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
+        // The completion is reported to the record before it is counted, so before the wake it may
+        // make (R22).
+        emit_trace_child_done(hdl_, rec);
         b_.CreateStore(cnt, cntp);
         llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(rty, rec, 1));
         llvm::Value* due    = heap
