@@ -156,16 +156,24 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e) 
     return prop;
 }
 
-// The three container kinds whose mutation surface a change notifier covers: a
-// queue (LRM 7.10), an associative array (7.8) and a dynamic array (7.5). Tested
-// in that order because slang answers isDynamicallySizedArray() for an
-// associative array too (foreach_dim_ref was bitten by exactly that).
+// The types whose change notifier fires on MUTATION, with no value to classify.
 //
-// A FIXED unpacked array is deliberately absent. Its storage never changes
-// extent, so it has no mutation op at all -- every write to one is an element
-// store -- and it is refused rather than given a notifier nothing would fire.
+// The three containers a method can resize: a queue (LRM 7.10), an associative
+// array (7.8) and a dynamic array (7.5). Tested in that order because slang answers
+// isDynamicallySizedArray() for an associative array too (foreach_dim_ref was
+// bitten by exactly that).
+//
+// And the aggregates a store reaches member by member: an unpacked struct or union
+// (7.2, 7.3) and a fixed unpacked array (7.4). A store to any member or element at
+// any depth fires the notifier of the property it is inside, as a whole-object copy
+// does (Backend::agg_member, emit_agg_copy).
+//
+// Only what re-tests may park on such a notifier: a `wait`, and an `@` that samples
+// its expression. No `@` names one of these whole: "event expressions shall return
+// singular values" (9.4.2).
 bool is_notified_container(const slang::ast::Type& ty) {
-    return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
+    return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray() || ty.isUnpackedArray() ||
+           ty.isUnpackedStruct() || ty.isUnpackedUnion();
 }
 
 PropNotify prop_notify_kind(const slang::ast::Type& ty) {
@@ -246,14 +254,6 @@ bool is_sync_builtin_class(const slang::ast::ClassType& clt) {
     return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
 }
 
-const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt) {
-    // Bounded by the inheritance depth, which slang has already found finite.
-    for (const slang::ast::ClassType* k = &clt; k != nullptr;) {
-        if (is_weak_reference_class(*k)) {
-            return k;
-        }
-        const slang::ast::Type* base = k->getBaseClass();
-        k = base != nullptr ? &base->getCanonicalType().as<slang::ast::ClassType>() : nullptr;
 bool is_process_class(const slang::ast::ClassType& clt) {
     if (clt.name != "process") {
         return false;
@@ -262,6 +262,14 @@ bool is_process_class(const slang::ast::ClassType& clt) {
     return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
 }
 
+const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt) {
+    // Bounded by the inheritance depth, which slang has already found finite.
+    for (const slang::ast::ClassType* k = &clt; k != nullptr;) {
+        if (is_weak_reference_class(*k)) {
+            return k;
+        }
+        const slang::ast::Type* base = k->getBaseClass();
+        k = base != nullptr ? &base->getCanonicalType().as<slang::ast::ClassType>() : nullptr;
     }
     return nullptr;
 }
@@ -577,12 +585,18 @@ CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides) 
 
 // The design-wide notifiers `e` needs: one per instance property and per built-in
 // class that a subroutine it calls reads.
+//
+// An `event` property has two. Its own fires when another event is stored into it.
+// What a method reads through it (`e.triggered`, LRM 15.5.3) changes when the event
+// it names is triggered, and that may be any event of the design, so the second is
+// one notifier every trigger fires, keyed here on the design root.
 void WaitPropScan::note_callees(const Expression& e) {
     const CalleeReads reads = callee_reads(e, out->overrides);
     for (const slang::ast::ClassPropertySymbol* prop : reads.props) {
-        // A property of a type that has no notifier (an unpacked struct or union,
-        // a fixed unpacked array) has no design-wide one either.
-        if (box_can_notify(prop->getType())) {
+        if (prop->getType().getCanonicalType().isEvent()) {
+            out->add_shared(*prop);
+            out->add_shared(prop->getParentScope()->getCompilation().getRoot());
+        } else if (box_can_notify(prop->getType())) {
             out->add_shared(*prop);
         }
     }

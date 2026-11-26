@@ -610,3 +610,194 @@ TEST_CASE("wait on process::status() wakes when an always procedure is killed") 
     )";
     CHECK(run_capture(src) == "killed at 3\nend\n");
 }
+
+// -- Unpacked struct, union and fixed unpacked-array properties ---------------------
+//
+// LRM 9.4.2: "Changing the value of object data members, aggregate elements, or the
+// size of a dynamically sized array referenced by a method or function shall cause
+// the event expression to be reevaluated." An aggregate property is waited on as a
+// container is: any store into it re-tests the wait, and `@` over an expression of
+// it compares the value. A wait on one was refused, and a method that read one was
+// accepted and never woken.
+
+TEST_CASE("wait and @ on a member of a struct property and an element of an array property") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int a; string name; int q[$]; } rec_t;
+          typedef struct { rec_t inner; bit ok; } outer_t;
+          typedef union { int i; shortint s; } num_t;
+          class C;
+            rec_t   r;
+            outer_t o;
+            num_t   u;
+            int     arr [4];
+            function int sum(); return arr[0] + arr[1] + arr[2] + arr[3]; endfunction
+            function bit named(); return o.inner.name == "x"; endfunction
+          endclass
+          C c = new;
+          int k = 3;
+          initial begin
+            fork
+              begin wait (c.r.a == 3); $display("member at %0t", $time); end
+              begin wait (c.arr[2] == 7); $display("element at %0t", $time); end
+              begin wait (c.r.q.size() == 1); $display("nested queue at %0t", $time); end
+              begin wait (c.sum() == 12); $display("method at %0t", $time); end
+              begin wait (c.named()); $display("nested string at %0t", $time); end
+              begin wait (c.u.i == 9); $display("union at %0t", $time); end
+              begin @(c.arr[0] + c.arr[1]); $display("event at %0t", $time); end
+            join_none
+            #1 c.r.a = 3;
+            #1 c.arr[2] = 7;
+            #1 c.r.q.push_back(1);
+            #1 c.arr[k] = 5;
+            #1 c.o.inner.name = "x";
+            #1 c.u.i = 9;
+            #1 c.arr[1] = 0;
+            #1 c.arr[0] = 4;
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    // The stores at 2, 4 and 7 into `arr` leave arr[0] + arr[1] at 0.
+    CHECK(run_capture(src) == "member at 1\nelement at 2\nnested queue at 3\nmethod at 4\n"
+                              "nested string at 5\nunion at 6\nevent at 8\nend\n");
+}
+
+TEST_CASE("a whole-object store and a ref argument wake a wait on an aggregate property") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int a; int b; } pair_t;
+          typedef struct { pair_t p; int n; } wrap_t;
+          class C;
+            pair_t p;
+            wrap_t w;
+            int    arr [2];
+          endclass
+          C c = new;
+          task automatic bump(ref int x); x = x + 1; endtask
+          task automatic fill(ref pair_t x); x.a = 8; endtask
+          initial begin
+            pair_t v;
+            fork
+              begin wait (c.p.b == 2); $display("copy at %0t", $time); end
+              begin wait (c.arr[1] == 9); $display("pattern at %0t", $time); end
+              begin wait (c.w.p.a == 1); $display("inner copy at %0t", $time); end
+              begin wait (c.arr[0] == 1); $display("ref element at %0t", $time); end
+              begin wait (c.p.a == 8); $display("ref struct at %0t", $time); end
+            join_none
+            v = '{1, 2};
+            #1 c.p = v;
+            #1 c.arr = '{0, 9};
+            #1 c.w.p = v;
+            #1 bump(c.arr[0]);
+            #1 fill(c.p);
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "copy at 1\npattern at 2\ninner copy at 3\nref element at 4\n"
+                              "ref struct at 5\nend\n");
+}
+
+// The writers that are not an assignment statement: each reaches the property's
+// notifier because it stores member by member.
+TEST_CASE("an array method, a streaming unpack and a system task wake a wait on an aggregate property") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int a; int b; } pair_t;
+          class C;
+            int    arr [4];
+            pair_t p;
+          endclass
+          C c = new;
+          initial begin
+            c.arr = '{4, 3, 2, 1};
+            fork
+              begin wait (c.arr[0] == 1); $display("sort at %0t", $time); end
+              begin wait (c.arr[0] == 4 && $time > 1); $display("reverse at %0t", $time); end
+              begin wait (c.p.a == 5); $display("stream at %0t", $time); end
+              begin wait (c.p.b == 9); $display("sscanf at %0t", $time); end
+            join_none
+            #1 c.arr.sort();
+            #1 c.arr.reverse();
+            #1 {>>{c.p}} = 64'h0000_0005_0000_0006;
+            #1 void'($sscanf("9", "%d", c.p.b));
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "sort at 1\nreverse at 2\nstream at 3\nsscanf at 4\nend\n");
+}
+
+TEST_CASE("wait on a fork-captured struct, array and event") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int a; int b; } pair_t;
+          initial begin
+            fork
+              automatic pair_t p = '{0, 0};
+              automatic int    arr [2] = '{0, 0};
+              automatic event  e;
+              begin wait (p.b == 2); $display("struct at %0t", $time); end
+              begin wait (arr[1] == 3); $display("array at %0t", $time); end
+              begin wait (e.triggered); $display("event at %0t", $time); end
+              begin #1 p.b = 2; #1 arr[1] = 3; #1 -> e; end
+            join
+            $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "struct at 1\narray at 2\nevent at 3\nend\n");
+}
+
+// -- An event property read by a method ------------------------------------------------
+//
+// A method can read `triggered` of the event a property names on any object, so a
+// wait on the method is re-tested when any event is triggered, and when the property
+// is assigned another event.
+
+TEST_CASE("wait on a method that reads an event property's triggered state") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C;
+            event e;
+            function bit fired(); return e.triggered; endfunction
+          endclass
+          C c = new;
+          initial begin
+            fork
+              begin wait (c.fired()); $display("blocking at %0t", $time); end
+            join_none
+            #2 -> c.e;
+            #1;
+            fork
+              begin wait (c.fired()); $display("nonblocking at %0t", $time); end
+            join_none
+            #2 ->> c.e;
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "blocking at 2\nnonblocking at 5\nend\n");
+}
+
+TEST_CASE("wait on a method that compares an event property wakes when the property is assigned") {
+    constexpr std::string_view src = R"(
+        module m;
+          event shared_ev;
+          class C;
+            event e;
+            function bit merged(); return e == shared_ev; endfunction
+          endclass
+          C c = new;
+          initial begin
+            fork
+              begin wait (c.merged()); $display("merged at %0t", $time); end
+            join_none
+            #3 c.e = shared_ev;
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "merged at 3\nend\n");
+}

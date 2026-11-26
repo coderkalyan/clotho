@@ -1698,13 +1698,11 @@ TEST_CASE("a scalar property store with no value change does not wake a non-edge
     CHECK(out == "s at 4\nr at 4\nh at 4\n");
 }
 
-// An unpacked struct is what is left unsupported after this rung: comparing one
-// needs a walk over its leaves rather than a word compare. `@` on the whole
-// property is refused by the LANGUAGE -- an event expression must be integral or a
-// named event (LRM 9.4.2), which slang enforces -- so this is pinned to the
-// diagnostic a user actually sees, not to a clotho message. `wait` over one of its
-// leaves is refused by clotho instead, with "no change notifier"
-// (tests/wait_test.cpp), because the level path is where the silent park lived.
+// `@` on a whole unpacked struct property is refused by the LANGUAGE -- "event
+// expressions shall return singular values" (LRM 9.4.2), which slang enforces -- so
+// this is pinned to the diagnostic a user actually sees, not to a clotho message.
+// `wait` and `@` over one of its members work (tests/wait_test.cpp,
+// tests/heap_wait_test.cpp).
 TEST_CASE("an event control on an aggregate class property is rejected") {
     const std::string err =
       reject("module m; typedef struct { int a; int b; } pr_t; class C; pr_t p; "

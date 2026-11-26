@@ -1741,7 +1741,9 @@ Lowerer::ExprWaitDeps Lowerer::expr_wait_deps(const Expression& e) {
         scan.out = &named;
         e.visit(scan);
         for (const ValueSymbol* vs : named) {
-            if (is_boxed_symbol(*vs)) {
+            // A captured `event` is waited on as an event property is, below: on the
+            // object it holds, which is what a trigger fires.
+            if (is_boxed_symbol(*vs) && !vs->getType().isEvent()) {
                 deps.boxed.push_back(vs);
             }
         }
@@ -1759,6 +1761,20 @@ Lowerer::ExprWaitDeps Lowerer::expr_wait_deps(const Expression& e) {
                 break;
             }
         }
+        struct BoxedEvents : slang::ast::ASTVisitor<BoxedEvents, slang::ast::VisitFlags::AllGood> {
+            const Lowerer*                                               self;
+            ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> seen;
+            std::vector<const Expression*>*                              out;
+            void handle(const slang::ast::NamedValueExpression& nv) {
+                if (nv.type->isEvent() && self->is_boxed_symbol(nv.symbol) && seen.insert(&nv.symbol).second) {
+                    out->push_back(&nv);
+                }
+            }
+        };
+        BoxedEvents events;
+        events.self = this;
+        events.out  = &deps.props.event_props;
+        e.visit(events);
     }
     add_callee_wait_events(e, deps.reads);
     deps.unwakeable = deps.reads.empty() && deps.vif_reads.empty() && deps.props.notifiable.empty() &&
@@ -1793,9 +1809,13 @@ void Lowerer::add_callee_wait_events(const Expression& e, std::vector<ir::WaitEv
         add(entry->signal);
     };
     for (const slang::ast::ClassPropertySymbol* prop : called.props) {
-        // As the pre-pass: a property of a type that has no notifier has no
-        // design-wide one (WaitPropScan::note_callees).
-        if (box_can_notify(prop->getType())) {
+        // As the pre-pass (WaitPropScan::note_callees): an `event` property has its
+        // own notifier and the one every trigger fires, and a property of a type
+        // that has no notifier has no design-wide one.
+        if (prop->getType().getCanonicalType().isEvent()) {
+            shared(*prop);
+            shared(prop->getParentScope()->getCompilation().getRoot());
+        } else if (box_can_notify(prop->getType())) {
             shared(*prop);
         }
     }
@@ -1903,6 +1923,12 @@ void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
         info.shared_notify   = next;
         const ir::Signal sig = register_signal(std::move(info));
         shared_notifiers_->of.emplace(sym, SharedNotifiers::Entry{ .index = next, .signal = sig });
+        if (sym->kind == SymbolKind::Root) {
+            // The notifier every event trigger fires (WaitPropScan::note_callees),
+            // hung on the event type for the backend to find: no store has a field
+            // of that type to select, so nothing else can resolve it.
+            module_.set_change_notify_shared(module_.pool.event_type, 0, next, /*container=*/false);
+        }
         ++next;
     }
 }
@@ -2141,29 +2167,19 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
     const ir::SourceLoc l = loc(w);
     const ExprWaitDeps  deps = expr_wait_deps(w.cond);
     if (deps.unnotified_box != nullptr) {
-        // TODO: same aggregate shapes as the property arm below, plus
-        // `event`, whose `.triggered` a capture box cannot notify on yet.
-        fail("wait on the fork-captured automatic '" + std::string(deps.unnotified_box->name) + "' of type " +
-             deps.unnotified_box->getType().toString() +
-             " is not supported: a capture box of this type has no change notifier");
+        // No type gets here today: every type a capture box can hold has a
+        // notifier (box_can_notify), and a captured event is waited on through its
+        // own object. Kept so that a type added without one cannot park for ever.
+        fail("internal: wait on the fork-captured automatic '" + std::string(deps.unnotified_box->name) + "' of type " +
+             deps.unnotified_box->getType().toString() + ", whose capture box has no change notifier");
     }
     if (deps.unwakeable) {
-        // The condition reads a class property that can carry no notifier -- an
-        // unpacked struct or union, or a FIXED unpacked array -- and nothing else
-        // that can wake this process. Lowering it anyway is what used to happen,
-        // and it produced a suspend with an EMPTY event list: a permanent park
-        // with no diagnostic, in a design whose author had every reason to expect
-        // a working wait. `wait(0)` still parks silently, because that one reads
-        // nothing at all and is the documented LRM 9.4.3 behaviour.
-        //
-        // TODO: the two aggregate shapes. Both need a comparison over the whole
-        // aggregate rather than over one word: an unpacked struct or union needs
-        // the store path to walk its leaves, and a fixed unpacked array needs the
-        // notifier to survive the element-store descent (agg_member clears it on
-        // purpose today, see ir/llvm/Aggregates.cpp).
-        fail("wait on a class property of a type with no change notifier is not "
-             "supported (an unpacked struct, union or fixed unpacked array "
-             "property cannot be waited on)");
+        // The condition reads a class property and nothing that can wake this
+        // process. No property type is without a notifier today; lowering such a
+        // wait anyway would produce a suspend with an EMPTY event list, a permanent
+        // park with no diagnostic. `wait(0)` still parks silently, because that one
+        // reads nothing at all and is the documented LRM 9.4.3 behaviour.
+        fail("internal: wait on a class property of a type with no change notifier");
     }
 
     const auto park = [&] {

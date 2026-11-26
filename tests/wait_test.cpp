@@ -24,11 +24,6 @@ std::string run_capture_finish(std::string_view source) {
     return test::run_design_subprocess(source);
 }
 
-std::string lower_error(std::string_view source) {
-    const LowerResult r = lower_text(source);
-    return r.ok ? std::string{} : r.diagnostic_text();
-}
-
 } // namespace
 
 // IEEE 1800-2023 9.4.3: a `wait` whose condition is already true does not
@@ -287,27 +282,31 @@ TEST_CASE("wait on a property of an assoc-array element resumes when it changes"
     CHECK(run_capture_finish(src) == "woke 1\n");
 }
 
-// A property whose type carries neither an old -> new WORD to classify nor a
-// mutation surface gets no notifier, so there is nothing to park on. It must be
-// REFUSED: lowering it anyway is what produced the silent permanent park this
-// whole feature exists to remove. `wait(0)` is unaffected -- it reads no property
-// at all and keeps the documented LRM 9.4.3 behaviour (the case above).
-//
-// An unpacked struct is what is left after the scalar rung: comparing one needs a
-// walk over its leaves, not a word compare, which is a different mechanism.
-TEST_CASE("wait on a class property with no change notifier fails loudly") {
-    const std::string err = lower_error(R"(
+// An unpacked struct property has one notifier for the whole of it, fired by a
+// store to any member (docs/design/classes.md, "Aggregate properties"). It used to
+// be refused: lowering the wait with nothing to park on is what produced the silent
+// permanent park this whole feature exists to remove. `wait(0)` is unaffected -- it
+// reads no property at all and keeps the documented LRM 9.4.3 behaviour (the case
+// above).
+TEST_CASE("wait on a member of an unpacked struct class property resumes when it is stored") {
+    constexpr std::string_view src = R"(
         module m;
             typedef struct { int a; int b; } pair_t;
             class C;
                 pair_t p;
-                task w(); wait(p.a == 1); $display("x"); endtask
+                task w(); wait(p.a == 1); $display("woke %0t", $time); endtask
             endclass
             C c;
-            initial begin c = new; c.w(); end
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #2 c.p.b = 1;
+                #1 c.p.a = 1;
+                #1 $finish;
+            end
         endmodule
-    )");
-    CHECK(err.find("no change notifier") != std::string::npos);
+    )";
+    CHECK(run_capture_finish(src) == "woke 3\n");
 }
 
 // -- wait on a CONTAINER class property (LRM 9.4.3) --------------------------
@@ -642,21 +641,27 @@ TEST_CASE("an event control on a container class property detects a change of th
     CHECK(run_capture_finish(src) == "size 2\n");
 }
 
-// A FIXED unpacked array is not in the notified set: its extent never changes, so
-// it has no mutation op, and the element store that would have to fire the
-// notifier descends through agg_member, which clears it. Refused, not hung.
-TEST_CASE("wait on a fixed unpacked-array class property fails loudly") {
-    const std::string err = lower_error(R"(
+// A FIXED unpacked array has no mutation op of its own: every write to one is an
+// element store, and the element's place keeps the property's notifier.
+TEST_CASE("wait on an element of a fixed unpacked-array class property resumes when it is stored") {
+    constexpr std::string_view src = R"(
         module m;
             class C;
                 int a[4];
-                task w(); wait(a[0] == 1); $display("x"); endtask
+                task w(); wait(a[0] == 1); $display("woke %0t", $time); endtask
             endclass
             C c;
-            initial begin c = new; c.w(); end
+            int k = 0;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #2 c.a[3] = 1;
+                #1 c.a[k] = 1;
+                #1 $finish;
+            end
         endmodule
-    )");
-    CHECK(err.find("no change notifier") != std::string::npos);
+    )";
+    CHECK(run_capture_finish(src) == "woke 3\n");
 }
 
 // -- wait on a SCALAR class property (LRM 9.4.3) -----------------------------
@@ -1253,10 +1258,9 @@ TEST_CASE("wait over two captured automatics re-tests until both are written") {
     CHECK(run_capture_finish(src) == "woke at 8\n");
 }
 
-// A captured automatic of a type with no change notifier (an unpacked struct)
-// is refused loudly, like the class-property arm: a silent permanent park is
-// the defect this whole section exists to prevent.
-TEST_CASE("wait on a captured unpacked struct fails loudly") {
+// A captured unpacked struct is boxed with the same one notifier an aggregate class
+// property has, since a capture box is a one-field object.
+TEST_CASE("wait on a captured unpacked struct resumes when a member is stored") {
     constexpr std::string_view src = R"(
         module m;
             typedef struct { int a; } st;
@@ -1264,28 +1268,29 @@ TEST_CASE("wait on a captured unpacked struct fails loudly") {
                 st x;
                 fork begin #2 x.a = 1; end join_none
                 wait (x.a != 0);
+                $display("woke %0t", $time);
             endtask
             initial begin t(); $finish; end
         endmodule
     )";
-    CHECK(lower_error(src).find("fork-captured automatic 'x' of type m.st is not supported") != std::string::npos);
+    CHECK(run_capture_finish(src) == "woke 2\n");
 }
 
-// A captured event has no notifier for `.triggered` either; the refusal names the
-// event rather than describing aggregate types it is not.
-TEST_CASE("wait on a captured event's triggered fails loudly") {
+// A captured event is waited on through the object it holds, the one a trigger
+// fires, as an event class property is.
+TEST_CASE("wait on a captured event's triggered resumes at the trigger") {
     constexpr std::string_view src = R"(
         module m;
             task automatic t;
                 event e;
                 fork begin #1 -> e; end join_none
                 wait (e.triggered);
+                $display("woke %0t", $time);
             endtask
             initial begin t(); $finish; end
         endmodule
     )";
-    CHECK(lower_error(src).find("fork-captured automatic 'e' of type event is not supported") !=
-          std::string::npos);
+    CHECK(run_capture_finish(src) == "woke 1\n");
 }
 
 // A write through a `ref` to a container ELEMENT wakes the waiters of the container's signal at the

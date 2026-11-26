@@ -123,30 +123,20 @@ Milestones, in order; lower ones unblock higher ones:
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
-- [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate
-  waits are refused.
-  - [ ] **`wait` on an unpacked struct, union or fixed unpacked-array property**
-    (9.4.3) — needs a whole-aggregate change compare.
-  - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
-    needs DPI.
-- [~] **Event control and `wait` over a method call or an expression of properties**
-  (9.4.2) — the forms below are accepted and are not woken by the change.
-  - [ ] **Event list mixing such an expression with another event** — `@(c.get() or
-    posedge clk)` needs identification of the waking source.
-  - [ ] **Such an expression as the control of `<= @(...)` or `->> @(...)`, or as a
-    clocking event** — a record or a clock is not a process that can sample it.
-  - [ ] **Method that reads an unpacked struct, union, fixed unpacked-array or `event`
-    property, or a string variable** — those have no change notifier.
-  - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
-    change notifier.
+- [ ] **Non-null `chandle` property transition in an event control or `wait`** (9.4.2,
+  9.4.3) — not exercised end to end; making one needs DPI.
+- [~] **Event control over a method call, an expression of class properties or a string
+  expression** (9.4.2) — sampled only as a procedural `@`; the forms below are refused.
+  - [ ] **In a list with a signal or a named event** — `@(c.get() or posedge clk)` needs
+    identification of the waking source.
+  - [ ] **As the control of `<= @(...)` or `->> @(...)`, or as a clocking event** — a
+    record or a clock is not a process that can sample it.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
 - [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
   refused.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
   `wait(vif.q.size())` is not exercised end to end.
-- [ ] **`@` or `wait` on a fork-captured unpacked struct, union, fixed unpacked array or
-  `event`** (9.4.2, 9.4.3, 9.3.2) — the capture box has no change notifier for these types.
 - [~] **Event-controlled nonblocking trigger** (15.5.1) — `->> @(...) e` forms still refused.
   - [ ] **Non-constant `repeat` count** — `->> repeat(n) @(x) e` with a runtime `n`.
   - [ ] **`iff` on the controlling event** (9.4.2.3) — `->> @(posedge c iff en) e`.
@@ -158,6 +148,8 @@ Milestones, in order; lower ones unblock higher ones:
   inside a task, with `p` a formal, is refused.
 - [ ] **`fork` child reading an `output` or `inout` formal of its subroutine** (9.3.2, 13.5) —
   writes made through the capture would not reach the formal's copy-out.
+- [ ] **`fork` child reading its function's return variable or a randsequence production's
+  formal** (9.3.2, 13.4.1, 18.17) — neither has a capture box.
 
 ### Continuous / structural timing
 
@@ -366,8 +358,6 @@ Milestones, in order; lower ones unblock higher ones:
   copy, equality, argument and `%p` positions; needs a by-value aggregate ABI.
 - [ ] **Whole aggregate element of an associative array in a by-value context** (7.8) — as a
   subroutine argument or a raw rvalue; refused in the backend.
-- [ ] **String event control / sensitivity** — `@(s)` and inferred sensitivity on a string are
-  refused.
 - [ ] **`case ... inside` string range bound** (11.4.13) — a `[lo:hi]` item over a string selector
   is refused.
 - [ ] **Enum `next` / `prev` with a non-constant step** — only a constant step is lowered.

@@ -169,16 +169,20 @@ Guarded Backend::agg_member(Guarded lv, Ref struct_type, uint32_t field_index) {
     lv.agg_path.push_back(b_.getInt32(field_index + class_header_words(struct_type)));
     lv.agg_field_path.push_back(field_index);
     // The change notifiers of a waited-on class property (LRM 9.4.2), resolved
-    // here because this is the one member-GEP chokepoint. Only for a property off
-    // the body, so `chg_body` is that body and a notifier is a sibling field of
-    // it. Assigned unconditionally, so descending into an interior aggregate
-    // clears it: a notifier belongs to the whole property, not to a leaf in it.
-    lv.chg = off_body ? mod_.change_notify(struct_type, field_index) : nullptr;
-    if (lv.chg != nullptr) {
-        // Only a property off the body, where no select has been applied yet, so the
-        // place cannot be invalid and the body pointer is the root itself.
-        lv.chg_body    = lv.unguarded().base;
-        lv.chg_body_ty = lv.root_ty;
+    // here because this is the one member-GEP chokepoint. Looked up for a property
+    // off the body, so `chg_body` is that body and a notifier is a sibling field of
+    // it. A member further in keeps what it came with: an unpacked struct, union or
+    // fixed array property has one notifier for the whole of it, which a store to
+    // any member at any depth fires (it is a mutation notifier, as a container's
+    // is). No other property is descended into with a notifier still set.
+    if (off_body) {
+        lv.chg = mod_.change_notify(struct_type, field_index);
+        if (lv.chg != nullptr) {
+            // No select has been applied yet, so the place cannot be invalid and the
+            // body pointer is the root itself.
+            lv.chg_body    = lv.unguarded().base;
+            lv.chg_body_ty = lv.root_ty;
+        }
     }
     // The write barrier's precision knob (§7): a member that cannot reach a class
     // handle cannot be the store that needs remembering, so `obj.count = 5` and
@@ -813,6 +817,11 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
     llvm::Value* const dst = agg_image_ptr(dlv);
     llvm::Value* const src = agg_read_ptr(slv, info.type);
     llvm::Type* st = nullptr;
+    // A whole-object copy into a waited-on aggregate class property, or into an
+    // aggregate inside one, fires the property's notifier: a mutation notifier, so
+    // unconditionally, and before the copy is as good as after (what it wakes
+    // cannot run until this process suspends).
+    const bool prop_service = !silent_stores_ && dlv.chg != nullptr;
     // Which storage model a place is in is decided by its TYPE for everything
     // struct- or container-bearing (needs_agg_storage), so both sides of such a
     // copy are necessarily in the canonical mirror and its own type is the
@@ -847,6 +856,9 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
                                   dlv.sig,
                                   !silent_stores_ && dlv.is_signal &&
                                     signal_has_waiters(dlv.sig));
+            if (prop_service) {
+                notify_container_mutation(dlv);
+            }
             return;
         }
         // Equal slots make the two images byte-identical -- both are row-major
@@ -896,6 +908,8 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
         emit_ref_wake_call(dlv.ref_wake_fn, dlv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
+    } else if (prop_service) {
+        notify_container_mutation(dlv);
     }
 }
 
