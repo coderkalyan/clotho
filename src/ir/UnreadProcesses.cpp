@@ -215,11 +215,12 @@ void remove_unread_processes(Design& design) {
             }
         };
 
-        // Roots: what something outside the unit's processes can read.
+        // Roots: what something outside the unit's processes can read: a port, a
+        // member another unit names, and another instance's storage, which a copy
+        // alias of a bound port (alias_copies) lets a local name write.
         for (uint32_t h = 0; h < n; ++h) {
             const UnitSignal& s = u.signals[h];
-            if (s.import == kLocal &&
-                (s.info.dir != SignalInfo::Direction::Internal || imported.contains(s.info.name))) {
+            if (s.import != kLocal || s.info.dir != SignalInfo::Direction::Internal || imported.contains(s.info.name)) {
                 mark(h);
             }
         }

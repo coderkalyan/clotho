@@ -1251,6 +1251,12 @@ public:
         allow_port_coercion_ = allow;
     }
 
+    // Whether input and output ports may hold no storage of their own
+    // (bind_value_port): off for a design lowered as written.
+    void set_merge_ports(bool merge) {
+        merge_ports_ = merge;
+    }
+
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
     // every call made through this Lowerer.
     // Design-wide: some assignment can retarget an event variable, so no event's
@@ -1924,6 +1930,16 @@ private:
     void build_inout_aliases(const InstanceSymbol& inst);
 
     bool needs_port_coercion(const PortConnection& pc, const PortSymbol& p);
+
+    void bind_value_port(const InstanceSymbol& inst, const PortConnection& pc, const PortSymbol& p);
+
+    bool value_port_bindable(const InstanceSymbol& inst, const PortSymbol& p);
+
+    const ValueSymbol* direct_port_target(const PortConnection& pc, const PortSymbol& p);
+
+    ir::Signal port_temp(const PortSymbol& p);
+
+    bool forced_member(const ValueSymbol& sym);
 
     bool net_is_read(const ValueSymbol& sym);
 
@@ -6357,8 +6373,13 @@ private:
     const InferredClockMap* inferred_clocks_ = nullptr;
     // Port coercion (LRM 23.3.3.1); see set_allow_port_coercion.
     bool allow_port_coercion_ = false;
+    // See set_merge_ports.
+    bool merge_ports_ = true;
     // The ports build_inout_aliases coerced to inout: wire_ports copies nothing for them.
     ankerl::unordered_dense::set<const PortSymbol*> coerced_ports_;
+    // The input and output ports bind_value_port bound to the parent's own signal:
+    // wire_ports copies nothing for them. A port bound to a temporary keeps its copy.
+    ankerl::unordered_dense::set<const PortSymbol*> bound_value_ports_;
     // Every write target in this top's hierarchy, by the value symbol it roots at, and
     // the instance body each one is written in.
     ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, std::vector<const Expression*>> writes_;

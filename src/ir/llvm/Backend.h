@@ -4467,7 +4467,7 @@ private:
 
     const char* vcd_unrepresentable(Ref type) const;
 
-    void vcd_plan_var(VcdRows& rows, Signal sig);
+    void vcd_plan_var(VcdRows& rows, Signal sig, bool hidden = false);
 
     // The function of root that registers every dumped signal (lower_dump_vars).
     llvm::Function* vcd_register_fn();
@@ -5364,6 +5364,10 @@ private:
     std::vector<std::string>                            dpi_scope_names_;
     ankerl::unordered_dense::map<std::string, uint32_t> dpi_scope_index_;
     std::vector<int32_t>  vcd_index_;
+    // Per signal: 1 when a scope alias names it (InstanceScope::aliases), 2 once
+    // build_vcd_index registered it hidden: storage no scope lists (a temporary a
+    // parent binds to a child's port), dumped under the alias's name only.
+    std::vector<uint8_t> vcd_hidden_;
     // The shared scans (static_scan_fn, static_scan_port_fn) per LLVM module and shape.
     std::map<std::tuple<llvm::Module*, bool, bool, uint32_t>, llvm::Function*> static_scan_fns_;
     std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*>       static_scan_port_fns_;

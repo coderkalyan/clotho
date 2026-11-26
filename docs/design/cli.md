@@ -180,7 +180,7 @@ a `+` command slang gained through `--cmd-rename`.
 
 Options for working on Clotho or tuning its internals rather than for simulating
 a design -- `--stat`, `--gc-stress`, `--gc-nursery`, `--gc-heap-max`,
-`--gc-full-every`, `--loose-stale-ref`, `--keep-unread-logic` and
+`--gc-full-every`, `--loose-stale-ref`, `--as-written` and
 `--perf-jitdump` -- are registered with `Registry::add_developer`. They parse and
 are scope-checked like any other option, but only `--help-all` lists them, under
 "Developer options (for working on clotho)", so `run --help` stays readable.

@@ -104,11 +104,14 @@ struct Import {
 };
 
 // A port of a unit that the instantiating parent binds rather than drives: the
-// LRM 23.3.3 name-binding half of the port boundary. Value-flow ports (input and
-// output) are ordinary local signals the parent's port-copy processes import.
+// LRM 23.3.3 name-binding half of the port boundary. An inout, ref or event port
+// always is; an input or output port is wherever the child's definition lets one
+// storage stand for both sides (Lowerer::bind_value_port), and otherwise a local
+// signal the parent's port-copy process imports.
 struct BoundPort {
     enum class Kind : uint8_t {
-        // An inout, ref or merged-nettype port; the parent binds a signal.
+        // An input, output, inout, ref or merged-nettype port, or a driver's
+        // contribution; the parent binds a signal.
         Signal,
         // An interface port; the parent binds an interface instance.
         Instance,
@@ -116,6 +119,9 @@ struct BoundPort {
 
     std::string name;
     Kind        kind = Kind::Signal;
+    // A port the definition declares, which the instance's scope lists (the VCD
+    // dump names it, bound to what its parent binds), as opposed to a contribution.
+    bool declared = false;
 
     bool operator==(const BoundPort&) const = default;
 };
@@ -150,10 +156,11 @@ struct UnitSignal {
     // VCD dump and the scope tree show. False for storage the compiler adds to
     // a unit without declaring it there, such as a constant table.
     bool scoped = true;
-    // kLocal, or the local signal whose storage this local signal names: it was
-    // a pure continuous copy of that signal or the source of one, and
-    // alias_copies removed the copy. It has no storage of its own; flatten
-    // binds every reference to it, imports by name included, to the target's.
+    // kLocal, or the signal whose storage this local signal names, a local one
+    // or a port the parent binds: it was a pure continuous copy of that signal
+    // or the source of one, and alias_copies removed the copy. It has no storage
+    // of its own; flatten binds every reference to it, imports by name
+    // included, to the target's.
     uint32_t alias = kLocal;
 
     bool operator==(const UnitSignal&) const = default;

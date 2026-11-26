@@ -102,8 +102,10 @@ struct Copy {
 };
 
 // The copy `target = source` process `p` is, if it is exactly a continuous
-// assignment of one whole local signal to another of the same aliasable type,
-// woken by any change of the source alone.
+// assignment of one whole signal to another of the same aliasable type, woken by
+// any change of the source alone. Each side is a local signal or a port the
+// parent binds (Import::Kind::Port), whose storage is the parent's but which only
+// this unit's instance names as the port; at least one side is local.
 std::optional<Copy> pure_copy(const InternPool& pool, const Unit& u, uint32_t k) {
     const Process& p  = u.processes[k];
     const Ir&      ir = p.ir;
@@ -137,10 +139,13 @@ std::optional<Copy> pure_copy(const InternPool& pool, const Unit& u, uint32_t k)
         if (t == s || s != static_cast<uint32_t>(w.signal)) {
             return std::nullopt;
         }
-        const UnitSignal& ts = u.signals[t];
-        const UnitSignal& ss = u.signals[s];
-        if (ts.import != kLocal || ss.import != kLocal || ts.info.is_event || ss.info.is_event ||
-            ts.info.type != ss.info.type || !aliasable_type(pool, ts.info.type)) {
+        const UnitSignal& ts       = u.signals[t];
+        const UnitSignal& ss       = u.signals[s];
+        const auto        endpoint = [&](const UnitSignal& x) {
+            return x.import == kLocal || u.imports[x.import].kind == Import::Kind::Port;
+        };
+        if (!endpoint(ts) || !endpoint(ss) || (ts.import != kLocal && ss.import != kLocal) || ts.info.is_event ||
+            ss.info.is_event || ts.info.type != ss.info.type || !aliasable_type(pool, ts.info.type)) {
             return std::nullopt;
         }
         return Copy{ k, t, s };
@@ -236,12 +241,15 @@ void alias_copies(Design& design) {
         // Classes of signals sharing one storage, rooted at the member that
         // keeps it; class_writes of a root counts the non-read uses of every
         // member. A port is never made an alias: the instantiating parent and the
-        // flat scope tree both name it as a port of this instance.
+        // flat scope tree both name it as a port of this instance, and a bound
+        // port's storage is its parent's.
         parent.resize(n);
         for (uint32_t h = 0; h < n; ++h) {
             parent[h] = h;
         }
-        const auto is_port = [&](uint32_t h) { return u.signals[h].info.dir != SignalInfo::Direction::Internal; };
+        const auto is_port = [&](uint32_t h) {
+            return u.signals[h].import != kLocal || u.signals[h].info.dir != SignalInfo::Direction::Internal;
+        };
         drop.assign(u.processes.size(), 0);
         bool any = false;
         for (uint32_t k = 0; k < u.processes.size(); ++k) {

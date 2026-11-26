@@ -540,7 +540,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
                          bool                                                partial,
                          bool                                                allow_port_coercion,
                          uint32_t                                            stats,
-                         bool                                                keep_unread) {
+                         bool                                                as_written) {
     // (allow_port_coercion reaches each Lowerer below.)
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
@@ -906,6 +906,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
             Lowerer           lw(*module, *result.sources, tick_fs, allow_system);
             lw.set_allow_port_coercion(allow_port_coercion);
+            lw.set_merge_ports(!as_written && !partial);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
@@ -995,7 +996,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         ir::alias_copies(*design);
         // A poisoned module is still analysed (`lint`), and a partial one is an
         // editor's view of one file: both want every process as written.
-        if (!keep_unread && !poisoned && !partial) {
+        if (!as_written && !poisoned && !partial) {
             ir::remove_unread_processes(*design);
         }
         module = ir::flatten(std::move(*design));
@@ -1190,7 +1191,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               DiagStyle                      style               = {},
                               bool                           allow_port_coercion = false,
                               uint32_t                       stats               = 0,
-                              bool                           keep_unread         = false) {
+                              bool                           as_written          = false) {
     const slang::SourceManager* const sm = comp.getSourceManager();
     if (sm == nullptr) {
         LowerResult bare = lower_design(comp,
@@ -1202,7 +1203,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                                         partial,
                                         allow_port_coercion,
                                         stats,
-                                        keep_unread);
+                                        as_written);
         assert_well_typed(bare);
 
         return bare;
@@ -1234,7 +1235,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                                       partial,
                                       allow_port_coercion,
                                       stats,
-                                      keep_unread);
+                                      as_written);
     result.diagnostics.insert(result.diagnostics.begin(), std::make_move_iterator(option_items.begin()),
                               std::make_move_iterator(option_items.end()));
     assert_well_typed(result);
@@ -1435,7 +1436,7 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          PathPrefixMap                          path_prefix_map,
                          bool                                   allow_port_coercion,
                          uint32_t                               stats,
-                         bool                                   keep_unread) {
+                         bool                                   as_written) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`
@@ -1504,7 +1505,7 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                                style_of(dr),
                                allow_port_coercion,
                                stats,
-                               keep_unread);
+                               as_written);
     // `--diag-json`: the Driver closes the array and writes the file, or prints it to
     // stdout for `-`. Its own text client has collected the same items a second time;
     // emptied, so the Driver prints none of it and the caller's rendering is the text.
@@ -1564,7 +1565,7 @@ LowerResult lower_text(std::string_view source,
                        Timings*         timings,
                        ir::SystemAccess allow_system,
                        bool             allow_port_coercion,
-                       bool             keep_unread) {
+                       bool             as_written) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // `SyntaxTree::fromText` uses slang's process-wide default SourceManager, so
@@ -1582,7 +1583,7 @@ LowerResult lower_text(std::string_view source,
     }
 
     LowerResult result =
-      lower_compilation(cr, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion, 0, keep_unread);
+      lower_compilation(cr, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion, 0, as_written);
     check_design(result,
                  LowerInputs{ .entry               = LowerInputs::Entry::Text,
                               .text                = source,

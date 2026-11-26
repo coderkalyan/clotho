@@ -1077,6 +1077,7 @@ set(CLOTHO_TEST_SOURCES
   tests/intra_assign_test.cpp
   tests/continuous_assign_delay_test.cpp
   tests/copy_alias_test.cpp
+  tests/port_alias_test.cpp
   tests/unread_logic_test.cpp
   tests/net_delay_test.cpp
   tests/string_test.cpp

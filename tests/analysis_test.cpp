@@ -35,9 +35,9 @@ struct Analyzed {
     }
 };
 
-// The facts of every process as lowered, logic nothing reads included.
+// The facts of every process of the design as written (Lower.h, lower_text).
 Analyzed run(std::string_view source) {
-    Analyzed a{ .lowered = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*keep_unread=*/true),
+    Analyzed a{ .lowered = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true),
                 .facts   = {} };
     REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostic_text());
     REQUIRE(a.lowered.module != nullptr);

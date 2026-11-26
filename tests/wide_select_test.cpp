@@ -44,8 +44,8 @@ using namespace clotho;
 
 namespace {
 
-LowerResult lower_ok(std::string_view src, bool keep_unread = false) {
-    LowerResult r = lower_text(src, nullptr, ir::SystemAccess::Off, false, keep_unread);
+LowerResult lower_ok(std::string_view src, bool as_written = false) {
+    LowerResult r = lower_text(src, nullptr, ir::SystemAccess::Off, false, as_written);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
     return r;
@@ -88,7 +88,7 @@ std::string emit_ir(std::string_view source) {
 // The IR as the backend emits it, before the optimizer has folded or removed any of
 // it: for a test of what the backend does, not of what is left.
 std::string emit_raw_ir(std::string_view source) {
-    // Raw IR of how a select lowers, so the logic nothing reads is kept.
+    // Raw IR of how a select lowers, so the design is lowered as written.
     const LowerResult        r = lower_ok(source, true);
     std::string              text;
     llvm::raw_string_ostream os(text);

@@ -746,10 +746,12 @@ TEST_CASE("vcd: a $dumpvars in the body of twin instances dumps both instances' 
         endmodule
     )";
     const std::string vcd = run_vcd(src);
-    CHECK(contains(vcd, "$scope module u0 $end\n$var reg 32 ! k $end\n$var event 1 \" e $end\n"
-                        "$var event 1 # f $end\n$upscope $end\n$scope module u1 $end\n"
-                        "$var reg 32 $ k $end\n$var event 1 % e $end\n$var event 1 & f $end\n"));
-    CHECK(body_of(vcd) == "#1\nb1 !\nb100 $\n#2\n1\"\n#3\n1\"\n#5\n1%\n#6\n1%\n");
+    // Each `k` is a bound port: its storage is top's, registered before either
+    // child's scope, so the two k codes come first.
+    CHECK(contains(vcd, "$scope module u0 $end\n$var reg 32 ! k $end\n$var event 1 # e $end\n"
+                        "$var event 1 $ f $end\n$upscope $end\n$scope module u1 $end\n"
+                        "$var reg 32 \" k $end\n$var event 1 % e $end\n$var event 1 & f $end\n"));
+    CHECK(body_of(vcd) == "#1\nb1 !\nb100 \"\n#2\n1#\n#3\n1#\n#5\n1%\n#6\n1%\n");
 }
 
 TEST_CASE("vcd: a checkpoint with nothing to checkpoint writes no time marker") {

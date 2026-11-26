@@ -92,9 +92,11 @@ bindings, RNG seeds, and covergroup and assertion instance records.
 LRM 23.3.3 splits every cross-unit edge into one of two kinds.
 
 **Value flow.** Input and output ports: "each port connection shall be a
-continuous assignment of source to sink". The assignment is a process in the
-parent's unit, reading or writing the child's port. Value flow composes through
-the scheduler.
+continuous assignment of source to sink". 23.3.3.7 also makes it "permissible
+to merge" the nets on the two sides, and Clotho binds a value port wherever one
+storage can stand for both (below); what is left is a process in the parent's
+unit, reading or writing the child's port, which composes through the
+scheduler.
 
 **Name binding.** A ref port is "treated as hierarchical references to the
 variable to which it is connected"; an inout is a bidirectional connection;
@@ -103,6 +105,50 @@ single simulated net"; an interface port is connected to an interface instance.
 Hierarchical references, package items and `$unit` items are bindings too. A
 unit imports a binding by name; the link step resolves it per instance. Binding
 composes through the linker.
+
+**Bound value ports.** An input or output port whose definition allows it
+(`Lowerer::value_port_bindable`) holds no storage of its own: it is a bound
+port, like an inout, and the parent binds a signal of its own to it. That
+decision reads the child's definition only, never a connection, so every
+instance of a definition is bound alike and its unit's IR does not depend on
+how any parent connects it. The parent binds the connected signal itself when
+the connection is that whole signal of the port's type, and otherwise a
+temporary of its own (`<port>$port`), written or read by the port copy that
+was there before; an unconnected port binds a temporary too. The parent's IR
+depends on the child's port declarations, as it already did. A port stays
+storage of the child's, copied, where one storage cannot stand for both sides:
+a program's or an interface's port, a select port, a non-integral type, a net
+that resolves, pulls or delays, an input something else drives, a forced input
+variable. A port the child declares and its parent supplies is still listed in
+its scope, as a second name of what its parent binds (`InstanceScope::aliases`).
+A design lowered as written (`lint`, `synth`, the debugger's `--as-written`)
+and an editor's partial design bind no value port.
+
+Facts from outside a definition would otherwise reach its code, and each has
+its place:
+
+- What its storage is, for a bound port: the child's code reaches whatever
+  signal each parent binds, and any of the owner signal's facts it read would
+  make the instances' code differ, so that a new instance or a parent's edit
+  changed the child's module. A signal a port is bound to (`Module::port_bound`,
+  the backend's `uniform`) therefore has one shape and one port layout whatever
+  it is: the z word its type allows (as a `ref` actual has), every wake bucket,
+  every id and the dump-var index in its port, and `code_key` names the binding
+  alone. What a given instance lacks there (a bucket nobody subscribed to, a
+  `<= @` trigger, a dump) is null, no_id or -1 in the record, tested at run time.
+- Which edges anything waits on, for a signal a child port binds: the child's
+  waiters subscribe to the parent's signal, so the parent's wake code would
+  depend on its children's waits, and through a chain of ports on its
+  grandchildren's. Every writer of a bound signal, the owner's code and the
+  child's alike, classifies all three edges (any, posedge, negedge) and scans
+  each bucket its port does not mark empty, an edge nobody waits on costing one
+  load and one branch; the code then depends on "bound to a port", a fact of
+  the units themselves.
+- Whether a port is forced or procedurally assigned (LRM 10.6) from anywhere:
+  a forced input variable keeps its storage. The frontend joins it over every
+  instance of a definition (`forceable_`, see "Known leaks"), and it becomes a
+  summary entry of the definition with the others (Inbound facts and
+  summaries).
 
 ## Invariants
 
@@ -259,14 +305,22 @@ readings open, decided in `collapse_port_net`:
   owner, which would need the declaring module's time unit.
 
 **Input and output.** 23.3.3 makes the port "a continuous assignment from source
-to sink", and that is what Clotho lowers: the sink net keeps its own type and
-resolves its drivers, the port copy among them, as that type says. 23.3.3.7 only
-calls merging the two nets "permissible", so a design that connects dissimilar
-nets through an input or output port is conforming without it, and where the LRM
-allows both behaviors Clotho takes the cheaper. What the LRM attaches to not
-merging is warnings: Table 23-1's `warn` cells are slang's, for a port of any
-direction, and 23.3.3.6 asks for one when a uwire is on either side of a port
-whose nets are not merged (`uwire-port-not-merged`).
+to sink", and 23.3.3.7 only calls merging the two nets "permissible", so either
+is conforming, and where the LRM allows both behaviors Clotho takes the cheaper.
+A bound value port (The boundary) is the merge, made only where it cannot be
+told from the copy: the two sides are of one type and both nets or both
+variables, a net on the child's side is a plain wire or tri with no delay and no
+other driver, and a net the child drives is the parent's only driver of it. The
+one difference left is the one 23.3.3.7 leaves open: a `force` of one of two
+merged NETS reaches the other, as it would in a simulator that collapses ports.
+A variable has no collapse (LRM 10.6.2 forces the variable alone), so a forced
+port variable, a forced parent variable on an output, and a net facing a
+variable keep the copy. Elsewhere the sink net keeps its own type and resolves
+its drivers, the port copy among them, as that type says. What the LRM attaches
+to not merging is warnings: Table 23-1's `warn` cells are slang's, for a port of
+any direction, and 23.3.3.6 asks for one when a uwire is on either side of a
+port whose nets are not merged (`uwire-port-not-merged`); a uwire port is never
+merged.
 
 ### Copy aliasing
 
@@ -336,12 +390,12 @@ processes after it draw their random seed from; LRM 18.14 fixes no seed values,
 and the result is still the same on every run of the same source.
 
 The pass runs only for `build` and `run`, and not for a design that calls
-`$dumpvars`, whose whole-design form reads everything, nor under
-`--keep-unread-logic`, which the debug adapter passes so a debugger sees every
-signal. `lint`, `synth`, a poisoned design and an editor's partial one keep
-every process as written. Not yet: a port read by no parent (the per-port
-"read" fact of the summaries below), and a store into an unread signal inside a
-process that stays.
+`$dumpvars`, whose whole-design form reads everything, nor under `--as-written`,
+which the debug adapter passes so a debugger sees every signal, and which also
+keeps every input and output port's storage of its own (The boundary). `lint`,
+`synth`, a poisoned design and an editor's partial one keep every process as
+written. Not yet: a port read by no parent (the per-port "read" fact of the
+summaries below), and a store into an unread signal inside a process that stays.
 
 ## Inbound facts and summaries
 

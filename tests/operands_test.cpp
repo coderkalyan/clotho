@@ -316,8 +316,8 @@ std::set<ir::Inst::Tag> sweep_all() {
     std::set<ir::Inst::Tag> seen;
 
     for (const Design& d : kDesigns) {
-        // Every tag as lowered, so logic nothing reads is kept.
-        const LowerResult r = lower_text(d.source, nullptr, ir::SystemAccess::Off, false, /*keep_unread=*/true);
+        // Every tag of the design as written.
+        const LowerResult r = lower_text(d.source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
         REQUIRE_MESSAGE(r.ok, d.name, ": ", r.diagnostic_text());
         REQUIRE(r.module != nullptr);
 

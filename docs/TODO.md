@@ -246,9 +246,9 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Process fusion across instances (performance)** — groups fuse only within one
   instance, and comb-fused groups never share a subscription across instances, so a comb
   chain through many instances runs one wake per instance (docs/design/comb-fusion.md).
-- [ ] **Port copies as aliases (performance)** (23.3.3.7) — an input or output port is
-  still a process copying between two instances' signals; only copies within one unit
-  alias (docs/design/modular-compilation.md, "Copy aliasing").
+- [ ] **Port copies that stay processes (performance)** (23.3.3.7) — a program's or
+  interface's port, a select or non-integral port, and a port net that resolves, pulls or
+  delays still copy (docs/design/modular-compilation.md, "The boundary").
 - [ ] **Unread output ports (performance)** — logic whose only reader is an output port no
   parent reads still runs; needs the per-port "read" summary (docs/design/modular-compilation.md,
   "Unread logic").

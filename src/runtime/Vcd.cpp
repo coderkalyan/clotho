@@ -680,6 +680,10 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     if (v.nwords > g_vcd.max_nwords) {
         g_vcd.max_nwords = v.nwords;
     }
+    if ((flags & RT_VCD_FLAG_HIDDEN) != 0) {
+        g_vcd.vars.push_back(std::move(v));
+        return;
+    }
     // A real declares var type `real`; its size field is meaningless to a reader
     // (the value is a decimal, not a bit string), so it is always 64 -- what
     // Verilator writes, and what a shortreal's widened double matches.
@@ -722,9 +726,10 @@ extern "C" void rt_vcd_alias(const char* name, uint32_t name_len, uint32_t width
     if (g_vcd.file == nullptr || g_vcd.started) {
         return;
     }
-    const char* vtype = (flags & RT_VCD_FLAG_REAL) != 0  ? "real"
-                        : (flags & RT_VCD_FLAG_NET) != 0 ? "wire"
-                                                         : "reg";
+    const char* vtype = (flags & RT_VCD_FLAG_REAL) != 0    ? "real"
+                        : (flags & RT_VCD_FLAG_EVENT) != 0 ? "event"
+                        : (flags & RT_VCD_FLAG_NET) != 0   ? "wire"
+                                                           : "reg";
     vcd_puts("$var ");
     vcd_puts(vtype);
     vcd_put(' ');

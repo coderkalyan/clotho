@@ -696,9 +696,10 @@ void Adapter::on_launch(const Request& request) {
         fail(request, "'args' must carry the `clotho run` arguments for the design, and is empty");
         return;
     }
-    // A debugger shows any signal, so the design keeps the logic nothing in it
-    // reads (docs/design/modular-compilation.md, "Unread logic").
-    design_args_ = { "--keep-unread-logic" };
+    // A debugger shows any signal, so the design is simulated as written: the
+    // logic nothing reads is kept and every port has storage of its own
+    // (docs/design/modular-compilation.md, "Unread logic", "The boundary").
+    design_args_ = { "--as-written" };
     design_args_.insert(design_args_.end(),
                         std::make_move_iterator(arguments.args->begin()),
                         std::make_move_iterator(arguments.args->end()));

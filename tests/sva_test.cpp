@@ -1445,8 +1445,9 @@ endmodule
 )", r);
     REQUIRE(r.ok);
     REQUIRE(m.monitors.size() == 2);
-    CHECK(m.signal(m.monitors[0].clock).name == "u0.clk");
-    CHECK(m.signal(m.monitors[1].clock).name == "u1.clk");
+    // Each instance's clock port is bound to its parent's clock (bound value ports).
+    CHECK(m.signal(m.monitors[0].clock).name == "ck0");
+    CHECK(m.signal(m.monitors[1].clock).name == "ck1");
 }
 
 TEST_CASE("an inferred clock clotho cannot place in the procedure is refused") {

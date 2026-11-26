@@ -17,10 +17,10 @@ using namespace clotho;
 namespace {
 
 // Lower and require success, returning the module. The structural checks below
-// count the processes a gate lowers to, so by default the logic nothing reads
-// is kept (Lower.h, lower_text).
-LowerResult lower_ok(std::string_view src, bool keep_unread = true) {
-    LowerResult r = lower_text(src, nullptr, ir::SystemAccess::Off, false, keep_unread);
+// count the processes a gate lowers to, so by default the design is lowered as
+// written (Lower.h, lower_text).
+LowerResult lower_ok(std::string_view src, bool as_written = true) {
+    LowerResult r = lower_text(src, nullptr, ir::SystemAccess::Off, false, as_written);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
@@ -418,7 +418,7 @@ TEST_CASE("module instance arrays lower one instance per element") {
             reg  [1:0] a;
             sub u[1:0](a, y);
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     std::set<std::string> names;

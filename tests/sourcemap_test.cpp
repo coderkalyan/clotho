@@ -47,7 +47,7 @@ endmodule
                                      nullptr,
                                      ir::SystemAccess::Off,
                                      false,
-                                     /*keep_unread=*/true);
+                                     /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.sources != nullptr);
     REQUIRE_FALSE(r.sources->empty());
