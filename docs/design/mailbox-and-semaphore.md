@@ -116,8 +116,13 @@ in the order they constrain it:
   the run-time error nor the negative return is reachable — §8.
 
 Neither class is `abstract` or `final` (unlike `process`), so `new` is legal and
-slang admits `class my_mbx extends mailbox #(int);`. Derivation is refused in the
-first cut (§10, hazard 9).
+slang admits `class my_mbx extends mailbox #(int);`. A derived class starts with
+the built-in class's synthetic body (`push_sync_body`), so the built-in methods
+reach the same fields through a handle of either class, and `super.new` stores the
+bound or the key count as `new` of the built-in class does (`emit_sync_ctor`). No
+built-in method is virtual, so a method of the same name in the derived class hides
+it for a derived-typed handle only. (§10's hazard 9 planned a refusal; the first
+cut shipped an internal error instead.)
 
 ---
 

@@ -974,10 +974,12 @@ int64_t norm_addr(int64_t decl_left, int64_t decl_right, int64_t addr) {
 // word is at mm_base + i*stride, its z word at z_base + i*stride (the backend passes
 // the two region bases, already offset to element 0). Each parsed token is assembled
 // into u64 must / may / z accumulators (element width <= 64, enforced by the backend)
-// and written through mem_write — no per-element allocation.
-extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
-                           uint32_t stride, uint32_t count, uint32_t width, int64_t decl_left,
-                           int64_t decl_right, int64_t start, int64_t finish, uint32_t flags) {
+// and written through mem_write — no per-element allocation. Returns the number of
+// elements whose value the load changed, so the caller wakes the memory's waiters
+// only when it did.
+extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
+                               uint32_t stride, uint32_t count, uint32_t width, int64_t decl_left,
+                               int64_t decl_right, int64_t start, int64_t finish, uint32_t flags) {
     const bool hex          = (flags & 1u) != 0;
     const bool has_start    = (flags & 2u) != 0;
     const bool has_finish   = (flags & 4u) != 0;
@@ -994,7 +996,7 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) {
         std::fprintf(stderr, "$readmem: cannot open file '%s'\n", path.c_str());
-        return;
+        return 0;
     }
     std::fseek(f, 0, SEEK_END);
     const long sz = std::ftell(f);
@@ -1031,15 +1033,24 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     std::vector<uint64_t> z(words);
 
     const MemDest dest{ mm_base, z_base, stride, count, width, four_state, narrow };
-    const auto    write_elem = [&](int64_t idx) {
+    // An element's slot holds both of its planes, so its `stride` bytes before and
+    // after the write tell whether the value changed.
+    std::vector<uint8_t> before(stride);
+    uint32_t             changed    = 0;
+    const auto           write_elem = [&](int64_t idx) {
         if (idx < 0 || idx >= static_cast<int64_t>(count)) {
             std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
             return;
         }
+        uint8_t* const slot = mm_base + static_cast<size_t>(idx) * stride;
+        std::memcpy(before.data(), slot, stride);
         if (wide) {
             mem_write_wide(dest, idx, must.data(), may.data(), z.data());
         } else {
             mem_write(dest, idx, must[0], may[0], z[0]);
+        }
+        if (std::memcmp(before.data(), slot, stride) != 0) {
+            ++changed;
         }
     };
 
@@ -1129,6 +1140,7 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
         write_elem(norm_addr(decl_left, decl_right, addr));
         addr += dir;
     }
+    return changed;
 }
 
 extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,

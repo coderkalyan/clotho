@@ -89,12 +89,12 @@ them in step.
   object, with a finalizer for any native resource it owns. **Not yet:**
   covergroup instances live until the run ends.
 - A covergroup instance's results outlive it: its finalizer folds them into the
-  type's record, and an instance with its own sampling event stays reachable
-  while that event can fire (tentative until read against clause 19).
+  type's record, an instance with `option.per_instance` set keeps its own record
+  as well (LRM 19.7 requires that one in the report), and an instance with its own
+  sampling event stays reachable while that event can fire.
 - Collection is generational: an object is old once a collection has marked it.
   That bit is the only generation state; it is kept beside the heap, not in the
-  object, and a full collection clears it first. **Not yet:** marks are an epoch
-  parity in each object's header, with a separate old bit.
+  object, and a full collection clears it first.
 - Objects do not move, but only what the collector scans may rely on that: an
   object's address is held in object fields, design state, frames and the stack
   and nowhere else, and identity and ordering never use it, so that moving can be
@@ -124,17 +124,15 @@ them in step.
   runs every process.
 - An object's metadata is found from its address in constant time: chunks are
   aligned and carry their own metadata, and a table of chunks says whether an
-  address is in the heap. **Not yet:** a binary search over chunks, then a
-  backward scan of a bitmap.
+  address is in the heap.
 - Free space is reclaimed at the 16-byte granule, with one metadata byte per
-  granule. **Not yet:** at the 128-byte line.
+  granule.
 - An object has no collector header: its flags are in its granule's byte, and
-  objects are 16-byte aligned. **Not yet:** an 8-byte word before each object,
-  which leaves it at 8 mod 16.
+  objects are 16-byte aligned.
 - An object too large for a block has its own mapping, found through the same
-  table and returned to the system when it dies. **Not yet:** a sorted list.
-- After a full collection, empty chunks beyond a reserve go back to the system.
-  **Not yet:** the heap never shrinks during a run.
+  table. A dead one's mapping is kept for the next object of its size.
+- After a full collection, empty chunks and kept mappings beyond what the last
+  cycle allocated go back to the system.
 - A young collection runs after a fixed amount of allocation (8 MiB, counting
   the buffers objects own).
 - A full collection runs when the old generation has grown by a fixed factor
@@ -159,19 +157,23 @@ them in step.
   clears the referent of each weak reference it reached whose referent is
   unmarked. Collection timing is then visible to a design, so a collection
   happens at a point that is a function of the run, never of thread timing.
-  **Not yet:** the class is refused.
+- Weak references are cleared only by a collection at the scheduler's safepoint. A
+  collection run from inside an allocation keeps every referent, so a design sees
+  a weak reference change only between time steps, and a wait on `get()` is woken
+  at the safepoint, before the next time step runs.
+- The scheduler edge that finds the wheel idle ends the run and is not a
+  safepoint.
 - An object's identity number (`weak_reference::get_id`, the order of an
   associative array keyed by a class handle) is assigned on first request and
   kept in a table beside the heap, so objects that never ask pay nothing; the
-  pass that clears weak references drops a dead object's entry. **Not yet:** no
-  such number.
-- The collector is checked three ways: each test design runs at three collection
-  cadences (never, ordinary, stress) on one code path and its output must not
-  change; a heap verifier runs after each collection in extra-assertion builds;
-  and a model-based test drives the collector's C interface with random graphs,
-  stores and collections against a shadow reachability model. A design that uses
-  a weak reference is left out of the cadence comparison. **Not yet:** there is
-  no never cadence and no model-based test.
+  pass that clears weak references drops a dead object's entry.
+- The collector is checked three ways: each design in the collector's tests runs
+  at three collection cadences (never, ordinary, stress) on one code path and its
+  output must not change; a heap verifier runs after each collection in
+  extra-assertion builds; and a model-based test drives the collector's C
+  interface with random graphs, stores and collections against a shadow
+  reachability model. A design in which the collector can clear a weak reference
+  states its output for each cadence instead.
 
 ## Containers and classes
 

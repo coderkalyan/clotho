@@ -644,6 +644,8 @@ void Backend::lower_inst(Index i) {
             // static-property map must wake the map SIGNAL's Any waiters.
             el.mut_sig_valid = hlv.is_signal || hlv.mut_sig_valid;
             el.mut_sig       = hlv.is_signal ? hlv.sig : hlv.mut_sig;
+            el.ref_wake_fn   = hlv.ref_wake_fn;
+            el.ref_wake_ctx  = hlv.ref_wake_ctx;
             // An entry's slot lives until that entry is erased, so a `ref`
             // through it records the map's relocation epoch, appended to whatever
             // containers the MAP itself sits inside (docs/design/data-model.md
@@ -714,6 +716,8 @@ void Backend::lower_inst(Index i) {
             el.chg_body_ty      = dlv.chg_body_ty;
             el.mut_sig_valid    = dlv.is_signal || dlv.mut_sig_valid;
             el.mut_sig          = dlv.is_signal ? dlv.sig : dlv.mut_sig;
+            el.ref_wake_fn      = dlv.ref_wake_fn;
+            el.ref_wake_ctx     = dlv.ref_wake_ctx;
             el.epoch_chain      = dlv.epoch_chain;
             el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
                                                         handle_epoch_field(pt.type)));
@@ -803,12 +807,12 @@ void Backend::lower_inst(Index i) {
             // 4-state leaves, init its string leaves, and yield the handle as an
             // i64 (reference semantics: the pointer is the value).
             //
-            // The allocator returns the HANDLE -- the body base, one word above
-            // the GC header -- with the body already zeroed (2-state and handle
-            // leaves power on 0 / null) and the GC word already written, so no
-            // memset is emitted here. The header sits BELOW the handle precisely
-            // so that every property offset and the vptr store are plain
-            // non-negative offsets off the value a program holds (Gc.h:41-46).
+            // The allocator returns the HANDLE, which is the object's first byte, with
+            // the body already zeroed (2-state and handle leaves power on 0 / null)
+            // and the object's metadata written beside the heap, so no memset is
+            // emitted here. Nothing precedes the body, so every property offset and
+            // the vptr store are plain non-negative offsets off the value a program
+            // holds (Gc.h).
             //
             // The common case emits NO call at all: the bump sequence is inlined
             // (emit_gc_alloc_fast, design §4.3) and reaches rt_gc_alloc_slow only
@@ -868,8 +872,9 @@ void Backend::lower_inst(Index i) {
             //
             // The one exemption is the same fact the null check just used: a handle
             // straight out of ClassNew names an object the allocator returned a few
-            // instructions ago, whose GC word has mark bits 0 and OLD clear (Gc.cpp,
-            // alloc_object), so the barrier's test would not fire and the store needs none.
+            // instructions ago, which no collection has marked and which is therefore not
+            // old (Gc.cpp, alloc_object), so the barrier's test would not fire and the
+            // store needs none.
             //
             // That used to hold because nothing could collect between the `new` and the
             // store. An allocation can now (design §6.1): a property initializer or a
@@ -1215,7 +1220,7 @@ void Backend::lower_inst(Index i) {
             // out-of-bounds destination pointer that the NBA region dereferences
             // unconditionally when it replays -- and for a scalar select, an
             // unrestricted mask.
-            lv.when_valid(b_, [&](const LValue& v) { emit_intra_nba_arm(v, rhs, ticks); });
+            lv.when_valid(b_, [&](const LValue& v) { emit_intra_nba_arm(v, rhs, ticks, /*restates=*/false); });
             return;
         }
 
@@ -1973,7 +1978,22 @@ void Backend::lower_inst(Index i) {
             // does, so a report queued before this point never matures. A target
             // id names ANOTHER procedure's counter -- the remote case, where the
             // reports to drop are not this group's.
-            if (p.label == kNoDisableTarget) {
+            if (p.label == kNoDisableTarget && cur_fn_ != nullptr) {
+                // The resume of a task is a flush point of the thread that called it
+                // (LRM 16.4.2), whose counter the task read at entry. Null when that
+                // thread holds none, or the task does not need the generation.
+                if (gen_slot_ != nullptr) {
+                    llvm::Value* gen  = b_.CreateLoad(raw_ptr_ty(), gen_slot_);
+                    auto*        fn   = b_.GetInsertBlock()->getParent();
+                    auto*        bump = llvm::BasicBlock::Create(ctx_, "gen.bump", fn);
+                    auto*        cont = llvm::BasicBlock::Create(ctx_, "gen.cont", fn);
+                    b_.CreateCondBr(b_.CreateIsNotNull(gen), bump, cont);
+                    b_.SetInsertPoint(bump);
+                    emit_defer_gen_bump_at(gen);
+                    b_.CreateBr(cont);
+                    b_.SetInsertPoint(cont);
+                }
+            } else if (p.label == kNoDisableTarget) {
                 emit_defer_gen_bump();
             } else {
                 emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));
@@ -2008,7 +2028,7 @@ void Backend::lower_inst(Index i) {
             // `-> e` (LRM 15.5.2): resolve the handle, stamp the trigger time and
             // wake every waiter now. Zero-time — the current process does not
             // suspend, so it does not end the NBA segment.
-            emit_event_fire_guarded(must_of(p.unary), wheel_);
+            emit_event_fire_guarded(must_of(p.unary), wheel_, RT_TRACE_TRIGGER_NOW);
             return;
 
         case Inst::Tag::EventTriggerNb:
@@ -2662,6 +2682,10 @@ LValue Backend::local_lvalue(uint32_t index) {
         lv.root_ty   = s.storage_ty;
         lv.is_agg    = true;
         lv.is_signal = false;
+        if (s.is_ref && design_ref_wake_) {
+            lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
+            lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
+        }
         return lv;
     }
     if (base == nullptr) {
@@ -2669,6 +2693,7 @@ LValue Backend::local_lvalue(uint32_t index) {
     }
     LValue lv;
     lv.base        = base;
+    lv.queue_bound = s.is_ref ? ref_ptr_[index].bound : nullptr;
     lv.slot_ty     = s.slot_ty;
     lv.four_state  = s.four_state;
     lv.has_z       = s.four_state;
@@ -2678,6 +2703,10 @@ LValue Backend::local_lvalue(uint32_t index) {
     lv.is_signal   = false;
     lv.sig         = Signal{ 0 };
     lv.is_string   = s.is_string;
+    if (s.is_ref && design_ref_wake_) {
+        lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
+        lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
+    }
     return lv;
 }
 

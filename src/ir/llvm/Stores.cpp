@@ -773,12 +773,16 @@ void Backend::emit_block_commit_body(uint32_t id) {
             }
         }
         // The wake a blocking store to this signal makes (edge facts, the buckets of
-        // its instance's record, `<= @e` triggers), then its dump-var touch.
-        service_wait_queue(bs.sig, old_mm, new_mm, old_z, new_z);
+        // its instance's record, `<= @e` triggers), then its dump-var touch, which
+        // the Any bucket's scan may carry (service_wait_queue).
+        const int32_t fold = design_uses_vcd_ && !slot_of(bs.sig).is_array ? vcd_index_[static_cast<uint32_t>(bs.sig)]
+                                                                            : -1;
         // Mark a dumped scalar target dirty in the VCD set. Commit is
         // unconditional, so a no-change commit over-touches; the flush diff
         // suppresses it.
-        vcd_touch_signal(bs.sig);
+        if (!service_wait_queue(bs.sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT, fold)) {
+            vcd_touch_signal(bs.sig);
+        }
         if (after_hold != nullptr) {
             b_.CreateBr(after_hold);
             b_.SetInsertPoint(after_hold);
@@ -971,11 +975,12 @@ llvm::Value* Backend::emit_nba_any_staged() {
 // Position-independent by construction -- every block this creates hangs off
 // b_.GetInsertBlock()->getParent(), as do the four commit helpers it calls --
 // which is what makes a second copy after the Reactive region possible.
-void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
+void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel, uint32_t region) {
     // Root code: the whole-design commit names the design-wide numbers of the NBA
     // record buffers it drains (arr_idx, handle_buf_idx, ...), so it is never lowered
     // as a shared unit's code.
     assert(!share_active_ && "the whole-design NBA commit is code of root, never of a shared unit");
+    emit_trace_nba_pass(true, region);
     auto*      ptr_ty   = llvm::PointerType::getUnqual(ctx_);
     const bool uses_vcd = design_uses_vcd();
     // Block-commit scalar NBAs: call the head block's commit function; it
@@ -1051,6 +1056,7 @@ void Backend::emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
     if (design_uses_nb_events_) {
         emit_event_pend_drain(wheel);
     }
+    emit_trace_nba_pass(false, region);
 }
 
 // Per intra-NBA signal: dense id and the record StructType. The rt_timer
@@ -1316,6 +1322,9 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
 // NBAs to one signal in a block accumulate in the shadow. No wait queues are
 // serviced here — that happens in the NBA region after the active drain.
 void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
+    // The update this statement creates, reported once whichever way it is staged. A force or a
+    // procedural assign on the target (a gated store) can have its commit drop it.
+    emit_trace_nba(nullptr, trace_nba_of(lv, rhs, nba_hold_.force != NbaHold::no_hold), RT_TRACE_NBA_BLOCK);
     const SignalSlot& s  = slot_of(lv.sig);
 
     // Aggregate static-path leaf: stage the whole leaf into its shadow slot
@@ -1568,7 +1577,9 @@ void Backend::emit_handle_whole_nba(Index i) {
     llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
     const auto   hsz    = env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(qa.queue_type));
     b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(hsz), llvm::MaybeAlign{ 1 });
-    emit_handle_assign(staged, lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read), qa.queue_type);
+    const auto qbound = is_queue_type(qa.queue_type) ? std::get<Type>(mod_.pool.get(qa.queue_type)).left : 0;
+    emit_handle_assign(staged, lv_handle_ptr(lvalue_of(qa.arg), HandleUse::Read), qa.queue_type, loc_text(i),
+                       queue_site_name(dlv, qbound));
 }
 
 // Replay a container's deferred whole-NBA records: move each staged handle into
@@ -1806,6 +1817,7 @@ llvm::Value* Backend::agg_slot_ptr(const LValue& lv) {
 // point past the array, and the NBA region memcpys through that pointer
 // unconditionally when it replays the record.
 void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
+    emit_trace_nba(nullptr, trace_nba_of(lv, rhs, false), RT_TRACE_NBA_AGG);
     const SignalSlot& s      = slot_of(lv.sig);
     const uint32_t    W      = lv.store_width;
     const llvm::Align a1{ 1 };
@@ -1960,6 +1972,7 @@ void Backend::emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
 // destination pointer that the NBA region later dereferences unconditionally when
 // replaying the record.
 void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
+    emit_trace_nba(nullptr, trace_nba_of(lv, rhs, arr_hold_.count(static_cast<uint32_t>(lv.sig)) != 0), RT_TRACE_NBA_ARRAY);
     const uint32_t    W = lv.store_width;
     const SignalSlot& s = slot_of(lv.sig);
     const llvm::Align a1{ 1 }; // records live in an unaligned byte buffer
@@ -2153,7 +2166,7 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
 // out-of-bounds destination pointer that the NBA region dereferences
 // unconditionally when it replays -- and for a scalar select, an unrestricted
 // mask. Mirrors emit_array_nba.
-void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
+void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks, bool restates) {
     const SignalSlot& s      = slot_of(lv.sig);
     llvm::StructType* rt     = intra_rec_ty(s);
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
@@ -2163,6 +2176,10 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
       b_.CreateCall(intra_rec_rooted(s) ? intra_alloc_rooted_fn() : intra_alloc_fn(), { idxv, b_.getInt32(stride) });
     b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
     fill_intra_payload(lv, rhs, rt, rec);
+    // A zero delay creates its update now; a timed one when the timer fires, so the record is armed
+    // for the timer to release. The copy a plain NBA makes of itself restates an update that its own
+    // statement created already.
+    const TraceNba traced = restates ? TraceNba{} : trace_nba_of(lv, rhs, false);
 
     // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
     // (deadline must be > now) and its update lands in the current instant's
@@ -2170,9 +2187,13 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     // A compile-time-constant delay emits only the taken path; a runtime delay
     // that happens to be zero branches to the same immediate path.
     auto  schedule  = [&] {
+        emit_trace_nba(rec, traced, RT_TRACE_NBA_TIMER);
         b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, intra_cb_trampoline() });
     };
-    auto immediate = [&] { b_.CreateCall(intra_now_fn(), { rec }); };
+    auto immediate = [&] {
+        emit_trace_nba(nullptr, traced, RT_TRACE_NBA_ZERO);
+        b_.CreateCall(intra_now_fn(), { rec });
+    };
 
     if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
         if (c->isZero()) {
@@ -2233,7 +2254,7 @@ void Backend::emit_intra_nba_ordered(const LValue& lv, Plane rhs) {
     b_.CreateCondBr(waiting, copy, cont);
 
     b_.SetInsertPoint(copy);
-    emit_intra_nba_arm(lv, rhs, b_.getInt64(0));
+    emit_intra_nba_arm(lv, rhs, b_.getInt64(0), /*restates=*/true);
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(cont);
@@ -2380,6 +2401,7 @@ void Backend::emit_intra_event_arm(const LValue&                lv,
     b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2));
     b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
     fill_intra_payload(lv, rhs, rt, rec);
+    emit_trace_nba(rec, trace_nba_of(lv, rhs, false), RT_TRACE_NBA_EVENT);
     if (trig_ids.size() == 1) {
         b_.CreateCall(intra_event_register_fn(), { trig_ids[0], rec });
         return;
@@ -2536,7 +2558,7 @@ void Backend::emit_intra_commit(Signal sig) {
         llvm::Value* new_z   = s.has_z ? b_.CreateAlignedLoad(zty, dst_z, z_al) : nullptr;
         llvm::Value* rec_ctx = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_ctx(s)), a1);
         CtxOverride  ov(*this, rec_ctx, s.anchor);
-        service_wait_queue(sig, rec_old_mm, new_mm, rec_old_z, new_z);
+        service_wait_queue(sig, rec_old_mm, new_mm, rec_old_z, new_z, RT_TRACE_CHG_COMMIT);
         vcd_touch_signal(sig);
     }
     i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
@@ -2563,7 +2585,7 @@ void Backend::emit_intra_commit(Signal sig) {
         if (signal_has_waiters(sig)) {
             llvm::Value* new_mm = b_.CreateAlignedLoad(mmty, live_mm, mm_al);
             llvm::Value* new_z  = s.has_z ? b_.CreateAlignedLoad(zty, live_z, z_al) : nullptr;
-            service_wait_queue(sig, old_mm, new_mm, old_z, new_z);
+            service_wait_queue(sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT);
         }
         vcd_touch_signal(sig);
     }
@@ -2758,7 +2780,7 @@ void Backend::emit_array_commit(Signal sig, llvm::Value* state) {
         }
         llvm::Value* rec_ctx = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_ctx(s)));
         CtxOverride  ov(*this, rec_ctx, s.anchor);
-        service_wait_queue(sig, old_mm, new_mm, old_z, new_z);
+        service_wait_queue(sig, old_mm, new_mm, old_z, new_z, RT_TRACE_CHG_COMMIT);
         vcd_touch_signal(sig);
     }
     if (next != nullptr) {

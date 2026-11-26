@@ -178,7 +178,12 @@ void Lowerer::lower_timeformat(const CallExpression& call, ir::Builder& b) {
 // compile-time constant, and so is the path of a scope the argument names.
 void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
     ScopeName                       path = instance_scope();
-    std::optional<slang::TimeScale> ts   = scope_->getTimeScale();
+    std::optional<slang::TimeScale> ts   = effective_time_scale(*scope_, tick_fs_ != 0);
+    if (!path.in_instance && path.text.empty()) {
+        // A subroutine declared directly in `$unit` is in no instance and no
+        // named scope; its time scale is `$unit`'s.
+        path.text = "$unit";
+    }
     if (!call.arguments().empty()) {
         // The argument names another scope. That scope's timescale is one
         // Scope::getTimeScale() call away and no signal is involved, so the
@@ -199,7 +204,7 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
             case SymbolKind::CompilationUnit:
                 // getHierarchicalPath() spells this scope "$unit"; the symbol
                 // itself is unnamed.
-                ts   = sym.as<CompilationUnitSymbol>().timeScale;
+                ts   = effective_time_scale(sym.as<CompilationUnitSymbol>(), tick_fs_ != 0);
                 path = ScopeName{ .text = sym.getHierarchicalPath() };
                 break;
             case SymbolKind::Root:

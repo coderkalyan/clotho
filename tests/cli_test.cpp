@@ -222,11 +222,13 @@ const std::vector<std::string> kCommonSource = {
     "-j",
     "--error-limit",
     "--color-diagnostics",
+    "-W",
+    "--diag-json",
 };
 
 // slang options a design can do without: only `--help-all` lists them.
 const std::vector<std::string> kUncommonSource = {
-    "--depfile-trim", "--max-case-analysis-steps", "--isystem", "--diag-json", "-v", "-W"
+    "--depfile-trim", "--max-case-analysis-steps", "--isystem", "-v"
 };
 
 // The commands this build has. A command a build leaves out (`synth`, `lsp` and
@@ -1033,6 +1035,76 @@ TEST_CASE("cli: -G overrides a parameter of the top-level module") {
         CHECK(r.code == 1);
         CHECK(contains(r.err, "is not a valid form of parameter override"));
     }
+    // slang drops an override that names no top parameter, silently. iverilog's
+    // `-P` reports the same case as an error.
+    SUBCASE("an override naming no parameter of any top is an error") {
+        const Result r = s.run(std::format("run -GNOPE=5 \"{}\"", design.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "-G NOPE: no top-level module has a parameter named 'NOPE'"));
+        CHECK(r.out.empty());
+    }
+    // slang applies a simple-name override to a localparam, which LRM 6.20.4 does
+    // not let a command line change; `-G top.L=9` (the defparam form) is already
+    // refused by slang.
+    SUBCASE("an override of a localparam is an error") {
+        const fs::path local = s.write("local.sv", R"(
+module top;
+    localparam int L = 7;
+    initial $display("L=%0d", L);
+endmodule
+)");
+        const Result r = s.run(std::format("run -GL=9 \"{}\"", local.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "'L' is a localparam of top 'top'"));
+        CHECK(r.out.empty());
+    }
+}
+
+// A top-level TYPE parameter takes a data type (LRM 6.20.3, 23.10.2). It was ignored
+// silently: slang skipped type parameters when it applied -G and parsed every value as
+// an expression. No oracle: iverilog -P takes values only, so these follow the LRM.
+TEST_CASE("cli: -G overrides a type parameter of the top-level module") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module top #(parameter type T = int, parameter int W = 3);
+            T v;
+            initial $display("bits=%0d W=%0d", $bits(v), W);
+        endmodule
+    )");
+    const auto run = [&](std::string_view args) { return s.run(std::format("run {} \"{}\"", args, design.string())); };
+    SUBCASE("the default stands without an override") {
+        CHECK(run("").out == "bits=32 W=3\n");
+    }
+    SUBCASE("a packed type replaces the default") {
+        const Result r = run("'-GT=logic[7:0]'");
+        CHECK(r.code == 0);
+        CHECK(r.out == "bits=8 W=3\n");
+    }
+    SUBCASE("a built-in type name, beside a value override") {
+        const Result r = run("-GT=longint -GW=9");
+        CHECK(r.code == 0);
+        CHECK(r.out == "bits=64 W=9\n");
+    }
+    SUBCASE("a value for a type parameter is an error") {
+        const Result r = run("-GT=5");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error"));
+    }
+    SUBCASE("a type for a value parameter is an error") {
+        const Result r = run("'-GW=logic[7:0]'");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error"));
+    }
+    SUBCASE("a type that does not parse is an error") {
+        const Result r = run("'-GT=logic[7:'");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "is not a valid form of parameter override"));
+    }
+    SUBCASE("a name that is no type is an error") {
+        const Result r = run("-GT=nosuchtype");
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error"));
+    }
 }
 
 TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup") {
@@ -1121,6 +1193,120 @@ TEST_CASE("cli: design diagnostics are coloured only when asked for, on a pipe")
     SUBCASE("--color-diagnostics=false is not colour either") {
         const Result off = s.run(std::format("lint --color-diagnostics=false \"{}\"", unused.string()));
         CHECK_FALSE(contains(off.err, kEsc));
+    }
+}
+
+// What a design's diagnostics honour of slang's diagnostic options: `-W`, `-Werror`,
+// `--error-limit`, `--suppress-warnings` and `--waiver-file` used to configure only the
+// Driver's own engine, which reports nothing of the design. Oracle: slang's own
+// driver (`slang -Wno-unused-variable` etc.) gives the same effects; the defaults are
+// what clotho printed before the options reached the engine.
+TEST_CASE("cli: -W, -Werror, --error-limit, --suppress-warnings and --waiver-file reach design diagnostics") {
+    const Scratch  s;
+    const fs::path unused = s.write("unused.sv", "module top;\n  int unused_var;\nendmodule\n");
+    const std::string path = unused.string();
+
+    SUBCASE("by default every warning shows and the exit status is clean") {
+        const Result r = s.run(std::format("lint \"{}\"", path));
+        CHECK(r.code == 0);
+        CHECK(contains(r.err, "warning: unused variable 'unused_var'"));
+    }
+    SUBCASE("-Wno-<name> silences that warning") {
+        const Result r = s.run(std::format("lint -Wno-unused-variable \"{}\"", path));
+        CHECK(r.code == 0);
+        CHECK_FALSE(contains(r.err, "unused variable"));
+    }
+    SUBCASE("-Werror makes a warning an error and the exit status nonzero") {
+        const Result r = s.run(std::format("lint -Werror \"{}\"", path));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error: unused variable 'unused_var'"));
+        const Result run = s.run(std::format("run -Werror \"{}\"", path));
+        CHECK(run.code == 1);
+    }
+    SUBCASE("-Werror=<name> promotes one warning") {
+        const Result r = s.run(std::format("lint -Werror=unused-variable \"{}\"", path));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error: unused variable 'unused_var'"));
+    }
+    SUBCASE("an unknown warning name is reported") {
+        const Result r = s.run(std::format("lint -Wno-no-such-warning \"{}\"", path));
+        CHECK(contains(r.err, "no-such-warning"));
+    }
+    SUBCASE("--suppress-warnings silences a path") {
+        const Result r = s.run(std::format("lint --suppress-warnings \"{}\" \"{}\"", path, path));
+        CHECK(r.code == 0);
+        CHECK_FALSE(contains(r.err, "unused variable"));
+    }
+    SUBCASE("--waiver-file waives by diagnostic name") {
+        const fs::path waiver = s.write("waive.toml", "[[waivers]]\nfile = \"**/unused.sv\"\ndiagnostic = \"unused-variable\"\n");
+        const Result   r = s.run(std::format("lint --waiver-file \"{}\" \"{}\"", waiver.string(), path));
+        CHECK(r.code == 0);
+        CHECK_FALSE(contains(r.err, "unused variable"));
+    }
+    SUBCASE("--error-limit stops reporting errors after that many") {
+        const fs::path many = s.write("many.sv", "module top;\n  initial begin\n    a = 1;\n    b = 2;\n    c = 3;\n  end\nendmodule\n");
+        const auto     errors = [](const Result& r) {
+            size_t n = 0;
+            for (size_t p = r.err.find("error:"); p != std::string::npos; p = r.err.find("error:", p + 1)) {
+                ++n;
+            }
+            return n;
+        };
+        CHECK(errors(s.run(std::format("lint \"{}\"", many.string()))) >= 3);
+        const Result limited = s.run(std::format("lint --error-limit 1 \"{}\"", many.string()));
+        CHECK(limited.code == 1);
+        CHECK(errors(limited) < 3);
+    }
+    SUBCASE("a promotion clotho makes itself holds against -W") {
+        // slang keeps the first of two defparams on one parameter; LRM 23.10.1 keeps the last, so
+        // clotho turns slang's warning into an error and no -W option can take it back.
+        const fs::path dp = s.write("dp.sv",
+                                    "module m #(parameter P = 1);\nendmodule\n"
+                                    "module top;\n  m u();\n  defparam u.P = 2;\n  defparam u.P = 3;\nendmodule\n");
+        const Result   r  = s.run(std::format("lint -Wno-duplicate-defparam \"{}\"", dp.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "error: parameter already has a defparam override"));
+    }
+}
+
+// `--diag-json` carries every diagnostic the design drew, slang's own and clotho's, to
+// the file (the text still goes to stderr), or to stdout for `-`, where it replaces the text.
+TEST_CASE("cli: --diag-json carries a design's diagnostics") {
+    const Scratch  s;
+    const fs::path unused  = s.write("unused.sv", "module top;\n  int unused_var;\nendmodule\n");
+    const fs::path refused = s.write("refused.sv", kRefusedDesign);
+
+    SUBCASE("to a file, slang's items") {
+        const fs::path json = s.path("diag.json");
+        const Result   r    = s.run(std::format("lint --diag-json \"{}\" \"{}\"", json.string(), unused.string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.err, "unused variable 'unused_var'"));
+        const std::string text = clotho::test::detail::read_file(json);
+        CHECK(contains(text, "\"severity\": \"warning\""));
+        CHECK(contains(text, "unused variable 'unused_var'"));
+        CHECK(contains(text, "unused.sv:2:"));
+    }
+    SUBCASE("to a file, clotho's own items") {
+        const fs::path json = s.path("diag.json");
+        const Result   r    = s.run(std::format("lint --diag-json \"{}\" \"{}\"", json.string(), refused.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(r.err, "wait on the fork-captured"));
+        const std::string text = clotho::test::detail::read_file(json);
+        CHECK(contains(text, "\"severity\": \"error\""));
+        CHECK(contains(text, "wait on the fork-captured"));
+    }
+    SUBCASE("to stdout with -, instead of the text") {
+        const Result r = s.run(std::format("lint --diag-json - \"{}\"", unused.string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, "unused variable 'unused_var'"));
+        CHECK(contains(r.out, "\"severity\": \"warning\""));
+        CHECK_FALSE(contains(r.err, "unused variable"));
+    }
+    SUBCASE("-Werror shows in the JSON as an error") {
+        const fs::path json = s.path("diag.json");
+        const Result   r = s.run(std::format("lint -Werror --diag-json \"{}\" \"{}\"", json.string(), unused.string()));
+        CHECK(r.code == 1);
+        CHECK(contains(clotho::test::detail::read_file(json), "\"severity\": \"error\""));
     }
 }
 
@@ -1515,7 +1701,7 @@ TEST_CASE("cli: instances of one module share a unit when each builds a covergro
         const fs::path design = s.write("design.sv", std::format(R"(
             module leaf;
               bit [1:0] v = 0;
-              covergroup cg; coverpoint v; endgroup
+              covergroup cg; option.per_instance = 1; coverpoint v; endgroup
               {}
             endmodule
             module top;
@@ -1555,7 +1741,7 @@ TEST_CASE("cli: per-instance initializers keep %m, assertion banners and covergr
     const fs::path design = s.write("design.sv", R"(
         module leaf(input bit clk);
           bit [1:0] v = 0;
-          covergroup cg @(posedge clk); coverpoint v; endgroup
+          covergroup cg @(posedge clk); option.per_instance = 1; coverpoint v; endgroup
           cg c = new;
           always @(negedge clk) v <= v + 1;
           a: assert property (@(posedge clk) v != 2'd3) else $error("v hit 3");
@@ -1621,7 +1807,7 @@ TEST_CASE("cli: instances of one module share a unit when each builds a package'
     const fs::path design = s.write("design.sv", R"(
         package p;
           bit [1:0] pv = 0;
-          covergroup pcg; coverpoint pv; endgroup
+          covergroup pcg; option.per_instance = 1; coverpoint pv; endgroup
         endpackage
         module leaf(input bit [1:0] hit);
           import p::*;

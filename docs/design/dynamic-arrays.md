@@ -423,8 +423,8 @@ Associative (any key kind — key passed as a normalized byte span, §4a):
   value.
 - **Copy**: assignment and pass-by-value are deep copies; for POD elements this
   is `memcpy` of the buffer (dynarr/queue) or an entry-wise copy (assoc).
-- **Queue bound** `q[$:N]`: enforce max length on push (LRM 7.10.4 — excess push
-  is dropped with a warning). Confirm exact drop-end vs error against iverilog.
+- **Queue bound** `q[$:N]`: every write keeps the first N+1 elements and warns
+  (LRM 7.10.5; docs/LRM_NOTES.md, note 6). Matches iverilog on the paths it compiles.
 
 ## 9. Lifecycle (managed elements landed)
 
@@ -505,7 +505,6 @@ a `localparam` and comparing it with the runtime result.
   `isSystemCall()` true and the bare method name (no `$`); the receiver is
   `arguments()[0]`. `first`/`last`/`next`/`prev` take the key variable by ref,
   which slang may wrap in an `AssignmentExpression` (unwrap to the lvalue).
-- Queue-bound overflow drop semantics vs iverilog (LRM 7.10.4).
 - `foreach` over an assoc binds the loop var to each key (LRM 7.9.4): the backend
   denormalizes each `first`/`next` result span into the key-typed loop var.
 

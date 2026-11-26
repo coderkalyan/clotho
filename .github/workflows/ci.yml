@@ -45,7 +45,7 @@ env:
   # nothing else records this today (§8's delivery-mechanism decision is
   # still open — this is the minimal fix, not that one).
   ZIG_VERSION: "0.16.0"
-  LIBSVA_REF: "0f41ddad8277b1625b51610ac76b1ae25728de08"
+  LIBSVA_REF: "ea92f7bb4aa630a1b0af1487821f20bb167ce92e"
   # sv-tests with the clotho runner, from the coderkalyan/sv-tests fork until
   # the runner is upstream.
   SV_TESTS_REPO: "https://github.com/coderkalyan/sv-tests.git"

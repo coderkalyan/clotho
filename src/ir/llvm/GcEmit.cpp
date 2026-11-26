@@ -457,9 +457,15 @@ std::vector<uint32_t> Backend::class_handle_offsets(Ref class_ref) {
     const auto*           bl   = env_->llmod.getDataLayout().getStructLayout(body);
     const uint32_t        hdr  = class_header_words(class_ref);
     std::vector<uint32_t> out;
-    uint32_t              f = 0;
+    // The referent of a weak reference (LRM 8.30) is handle-typed like any property,
+    // and left out here: not being in this table is what makes it weak. The map
+    // names it separately (rt_gc_map::weak_referent) so the collector can clear it.
+    const WeakClass* weak = mod_.weak_class(class_ref);
+    uint32_t         f    = 0;
     for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-        collect_class_handles(fld.type, bl->getElementOffset(hdr + f), body->getElementType(hdr + f), out);
+        if (weak == nullptr || weak->referent_field != f) {
+            collect_class_handles(fld.type, bl->getElementOffset(hdr + f), body->getElementType(hdr + f), out);
+        }
         ++f;
     }
     // Ascending, so the collector's scan is a forward walk and so the table is
@@ -617,25 +623,53 @@ llvm::Constant* Backend::class_gc_map_global(Ref class_ref) {
     assert((leaves.empty() == llvm::isa<llvm::ConstantPointerNull>(leaf_arr)) &&
            "a zero leaf count pairs with a null leaf pointer");
     const uint64_t size = gc_object_bytes(class_ref);
-    auto* init = llvm::ConstantStruct::get(
-      gc_map_ty(), { b_.getInt64(size), b_.getInt32(static_cast<uint32_t>(offsets.size())),
-                     b_.getInt32(static_cast<uint32_t>(leaves.size())),
-                     gc_offsets_global(offsets, nm + ".handles"), leaf_arr,
-                     class_finalizer_fn(class_ref) });
+    // A weak reference (LRM 8.30): where its referent is, and where the event is
+    // that a wait on `get()` parks on, if the design has such a wait. The referent
+    // is a plain word, so class_handle_offsets left it out, which is the whole of
+    // what makes the reference weak; naming it here is what lets the collector
+    // clear it. Offset 0 is the vptr, so 0 says "none" for both.
+    uint32_t        weak_referent = 0;
+    uint32_t        weak_notify   = 0;
+    llvm::Constant* weak_shared   = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    if (const WeakClass* weak = mod_.weak_class(class_ref); weak != nullptr) {
+        const auto*    sl      = env_->llmod.getDataLayout().getStructLayout(class_body_ty(class_ref));
+        const uint32_t hdr     = class_header_words(class_ref);
+        weak_referent          = static_cast<uint32_t>(sl->getElementOffset(hdr + weak->referent_field));
+        const ChangeNotify* cn = mod_.change_notify(class_ref, weak->referent_field);
+        if (cn != nullptr && cn->field[static_cast<uint32_t>(Edge::Any)] != kNoNotify) {
+            weak_notify =
+              static_cast<uint32_t>(sl->getElementOffset(hdr + cn->field[static_cast<uint32_t>(Edge::Any)]));
+        }
+        if (cn != nullptr && cn->shared != kNoNotify) {
+            // The referents' design-wide notifier, by the address of its handle
+            // (chg_shared_slot): the collector has no other way to the event.
+            weak_shared = chg_shared_slot(cn->shared);
+        }
+        assert(weak_referent != 0 && "the referent follows the vptr");
+    }
+    auto* init = llvm::ConstantStruct::get(gc_map_ty(),
+                                           { b_.getInt64(size),
+                                             b_.getInt32(static_cast<uint32_t>(offsets.size())),
+                                             b_.getInt32(static_cast<uint32_t>(leaves.size())),
+                                             gc_offsets_global(offsets, nm + ".handles"),
+                                             leaf_arr,
+                                             class_finalizer_fn(class_ref),
+                                             b_.getInt32(weak_referent),
+                                             b_.getInt32(weak_notify),
+                                             weak_shared });
     return new llvm::GlobalVariable(env_->llmod, gc_map_ty(), /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init, nm);
 }
 
-// rt_gc_map::size for a class: the header plus the body's alloc size, rounded up
-// to the heap's object alignment (Gc.h:75-78). This is the byte count rt_gc_alloc
-// bumps by, so the ClassNew site and the map constant MUST agree -- hence one
-// helper feeding both rather than the same expression written twice.
+// rt_gc_map::size for a class: the body's alloc size rounded up to the heap's
+// granule (Gc.h). This is the byte count rt_gc_alloc bumps by, so the ClassNew
+// site and the map constant MUST agree -- hence one helper feeding both rather
+// than the same expression written twice.
 uint64_t Backend::gc_object_bytes(Ref class_ref) {
     const uint64_t body_bytes =
       env_->llmod.getDataLayout().getTypeAllocSize(class_body_ty(class_ref));
-    const uint64_t want = body_bytes + RT_GC_HEADER_BYTES;
-    const uint64_t size = (want + RT_GC_ALIGN - 1) & ~(uint64_t{ RT_GC_ALIGN } - 1);
-    assert(size >= want && "object size must cover header and body");
+    const uint64_t size = (body_bytes + RT_GC_ALIGN - 1) & ~(uint64_t{ RT_GC_ALIGN } - 1);
+    assert(size >= body_bytes && "object size must cover the body");
     assert(size % RT_GC_ALIGN == 0 && "object size must be heap-aligned");
     return size;
 }
@@ -1153,77 +1187,69 @@ void Backend::emit_gc_frame_unlink() {
 
 // Whether `new` for this class allocates through the inlined bump sequence.
 //
-// A class at or above the runtime's large-object threshold keeps the out-of-line
-// rt_gc_alloc: such an object never comes out of a block hole at all, it owns a
-// separately-allocated cell with no start bit and no line marks (Gc.cpp:192-195,
-// 556-560), so there is no bump range to bump and nothing the inline sequence
-// could do with one. RT_GC_LARGE_OBJECT_BYTES is the runtime's own macro
-// (Gc.h:52) and Gc.cpp's kLargeObjectBytes is defined from it, so the threshold
-// cannot drift between the two files. The comparison is `<=`, matching
-// rt_gc_alloc's own `size <= kLargeObjectBytes` (Gc.cpp:1697) exactly, so a class
-// of precisely threshold size is block-resident on both paths rather than on
-// whichever one happened to round differently.
+// A class above the runtime's large-object threshold keeps the out-of-line
+// rt_gc_alloc: such an object never comes out of a block at all, it owns a
+// mapping of its own, so there is no bump range to bump and nothing the inline
+// sequence could do with one. RT_GC_LARGE_OBJECT_BYTES is the runtime's own macro
+// and Gc.cpp's kLargeObjectBytes is defined from it, so the threshold cannot drift
+// between the two files. The comparison is `<=`, matching rt_gc_alloc's own
+// `size <= kLargeObjectBytes` exactly, so a class of precisely threshold size is
+// block-resident on both paths rather than on whichever one happened to round
+// differently.
 bool Backend::gc_alloc_is_inline(Ref class_ref) {
     const uint64_t size = gc_object_bytes(class_ref);
-    assert(size > RT_GC_HEADER_BYTES && "an object is a header plus a body");
-    assert(size % RT_GC_ALIGN == 0 && "an object size is grain-aligned");
+    assert(size >= sizeof(void*) && "an object holds at least its vptr");
+    assert(size % RT_GC_ALIGN == 0 && "an object size is granule-aligned");
     return size <= RT_GC_LARGE_OBJECT_BYTES;
 }
 
-// `bitmap[byte] |= bit`, for one of the two bitmaps the mutator caches.
-//
-// OR, never a plain store: a bitmap byte covers eight grains and this object owns
-// exactly one of them, so assigning would clear up to seven neighbours' bits. The
-// runtime asserts against an OR for the same reason (Gc.cpp:544).
-void Backend::emit_gc_bitmap_set(GcMutField f, llvm::Value* byi, llvm::Value* bit, const char* nm) {
-    assert(byi != nullptr && bit != nullptr && "a bitmap set needs both a byte and a bit");
-    assert((f == GcMutField::StartBitmap || f == GcMutField::FinBitmap) &&
-           "only the start and finalizable bitmaps are set inline");
-    llvm::Value* bmpp = gc_mut_ptr(f, "gc.bmpp");
-    llvm::Value* bmp  = b_.CreateLoad(raw_ptr_ty(), bmpp, "gc.bitmap");
-    llvm::Value* slot = b_.CreateInBoundsGEP(b_.getInt8Ty(), bmp, byi, nm);
-    llvm::Value* old  = b_.CreateLoad(b_.getInt8Ty(), slot);
-    b_.CreateStore(b_.CreateOr(old, bit), slot);
+// The address of the metadata byte for the granule `obj` points at: the chunk is
+// the address with its low bits cleared, and the byte is RT_GC_META_OFFSET plus
+// the granule's index into the chunk (Gc.h). Arithmetic on the address alone, so
+// it needs nothing from the mutator and holds for any object, a large one
+// included, whose mapping is aligned as a chunk is.
+llvm::Value* Backend::emit_gc_meta_ptr(llvm::Value* obj, const char* nm) {
+    assert(obj != nullptr && obj->getType()->isPointerTy() && "a metadata byte is found from a pointer");
+    constexpr unsigned kGranuleShift = 4;
+    static_assert((1u << kGranuleShift) == RT_GC_ALIGN, "the granule shift is log2(RT_GC_ALIGN)");
+    static_assert((RT_GC_CHUNK_BYTES & (RT_GC_CHUNK_BYTES - 1)) == 0, "a chunk is a power of two");
+    const uint64_t mask  = uint64_t{ RT_GC_CHUNK_BYTES } - 1;
+    llvm::Value*   addr  = b_.CreatePtrToInt(obj, b_.getInt64Ty());
+    llvm::Value*   chunk = b_.CreateIntrinsic(llvm::Intrinsic::ptrmask, { raw_ptr_ty(), b_.getInt64Ty() },
+                                              { obj, b_.getInt64(~mask) }, nullptr, "gc.chunk");
+    llvm::Value*   gran  = b_.CreateLShr(b_.CreateAnd(addr, b_.getInt64(mask)), kGranuleShift, "gc.granule");
+    llvm::Value*   off   = b_.CreateAdd(gran, b_.getInt64(RT_GC_META_OFFSET), "gc.metaoff", /*HasNUW=*/true,
+                                        /*HasNSW=*/true);
+    return b_.CreateGEP(b_.getInt8Ty(), chunk, off, nm);
 }
 
-// The object-start bit, plus the finalizable bit when this class has a finalizer.
+// The metadata bytes of a fresh object of `granules` granules, as a constant the
+// fast path copies into place: the first byte says an object starts here and
+// whether it owes a finalizer, and each later byte holds its distance back to the
+// first, capped (Gc.h). The runtime's set_object_meta writes the same bytes, and
+// rt_gc_verify() checks both against one description.
 //
-// Both bitmaps are indexed identically and `addr` is the OBJECT START -- the
-// gcword, one word below the handle -- not the handle: the bit index is
-// `((addr - block_base) >> 4)`, the byte is `index >> 3` and the bit is
-// `index & 7` (Gc.h:169-176). block_base, start_bitmap and fin_bitmap are
-// published together with cursor and limit and always describe the SAME block, so
-// a fast-path allocation cannot index another block's metadata.
-//
-// Neither bit is optional bookkeeping, which is why this is emitted before the
-// handle can escape:
-//   start -- an object whose start bit is clear is INVISIBLE to
-//       rt_gc_find_object, which is both the conservative-scan validator and the
-//       interior-pointer resolver (Gc.h:271-276). A live object would be missed by
-//       a frame scan, and a `ref` into one of its properties would not resolve.
-//   fin   -- lose it and the class's finalizer never runs, so every `string` and
-//       container buffer the body owns leaks. It is set from the same
-//       compile-time predicate that decides the gcword's FINALIZE bit, so the two
-//       cannot disagree.
-void Backend::emit_gc_start_bits(llvm::Value* start, bool fin) {
-    assert(start != nullptr && "an object start is needed to index the bitmaps");
-    constexpr unsigned kGrainShift = 4;  // log2(RT_GC_ALIGN)
-    constexpr unsigned kByteShift  = 3;  // log2(bits per bitmap byte)
-    static_assert((1u << kGrainShift) == RT_GC_ALIGN, "the grain shift is log2(RT_GC_ALIGN)");
-    static_assert((1u << kByteShift) == 8u, "a bitmap byte holds eight grains");
-    llvm::Value* basep = gc_mut_ptr(GcMutField::BlockBase, "gc.basep");
-    llvm::Value* base  = b_.CreateLoad(raw_ptr_ty(), basep, "gc.blockbase");
-    llvm::Value* delta = b_.CreateSub(b_.CreatePtrToInt(start, b_.getInt64Ty()),
-                                      b_.CreatePtrToInt(base, b_.getInt64Ty()), "gc.delta");
-    llvm::Value* idx = b_.CreateLShr(delta, kGrainShift, "gc.grain");
-    llvm::Value* byi = b_.CreateLShr(idx, kByteShift, "gc.bitbyte");
-    llvm::Value* sh  = b_.CreateAnd(b_.CreateTrunc(idx, b_.getInt8Ty()),
-                                    b_.getInt8((1u << kByteShift) - 1u), "gc.bitsh");
-    llvm::Value* bit = b_.CreateShl(b_.getInt8(1), sh, "gc.bit");
-    emit_gc_bitmap_set(GcMutField::StartBitmap, byi, bit, "gc.startp");
-    if (fin) {
-        emit_gc_bitmap_set(GcMutField::FinBitmap, byi, bit, "gc.finp");
+// Neither half is optional bookkeeping, which is why the copy is emitted before
+// the handle can escape: an object without its first byte is INVISIBLE to
+// rt_gc_find_object, which is both the conservative-scan validator and the
+// interior-pointer resolver, and one without FINALIZE never has its finalizer
+// run, so every `string` and container buffer the body owns leaks.
+llvm::Constant* Backend::gc_meta_pattern(uint64_t granules, bool fin) {
+    assert(granules >= 1 && granules <= RT_GC_BLOCK_BYTES / RT_GC_ALIGN && "an inlined object fits a block");
+    const std::string nm = "clotho.gc.meta." + std::to_string(granules) + (fin ? ".fin" : "");
+    if (auto* g = env_->llmod.getNamedGlobal(nm)) {
+        return g;
     }
+    std::vector<uint8_t> bytes(granules);
+    bytes[0] = static_cast<uint8_t>(RT_GC_META_START | (fin ? RT_GC_META_FINALIZE : 0));
+    for (uint64_t k = 1; k < granules; ++k) {
+        bytes[k] = static_cast<uint8_t>(k < RT_GC_META_BACK_MAX ? k : RT_GC_META_BACK_MAX);
+    }
+    llvm::Constant* init = llvm::ConstantDataArray::get(ctx_, llvm::ArrayRef<uint8_t>(bytes));
+    auto* g = new llvm::GlobalVariable(env_->llmod, init->getType(), /*isConstant=*/true,
+                                       llvm::GlobalValue::PrivateLinkage, init, nm);
+    g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+    return g;
 }
 
 // `new`, inlined: bump the mutator's cursor within its current hole and call out
@@ -1231,9 +1257,9 @@ void Backend::emit_gc_start_bits(llvm::Value* start, bool fin) {
 // exactly as rt_gc_alloc does, leaving the insert point on the join block.
 //
 // The two paths produce one handle value and identical observable state: the fast
-// block does by hand precisely what rt_gc_alloc_slow does in the runtime -- set the
-// start bit, set the finalizable bit when the class has a finalizer, write the
-// gcword, zero the body -- so the phi's two inputs are indistinguishable to
+// block does by hand precisely what rt_gc_alloc_slow does in the runtime -- write
+// the object's metadata bytes, with FINALIZE when the class has a finalizer, and
+// zero the body -- so the phi's two inputs are indistinguishable to
 // everything downstream, including emit_class_body_init and the vptr store the
 // caller emits once, after the join.
 //
@@ -1250,16 +1276,12 @@ llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site) {
     assert(gc_alloc_is_inline(class_ref) && "a large object keeps the out-of-line call");
     const uint64_t  size = gc_object_bytes(class_ref);
     llvm::Constant* map  = class_gc_map_global(class_ref);
-    // FINALIZE is the only header bit `new` ever sets, and whether it is set is a
-    // compile-time property of the class. Mark bits 0-1 stay 0, which is "never
-    // marked" and is what makes the next collection trace the object (Gc.h:47-52);
-    // PINNED and FORWARDED are the collector's own and start clear; the payload is
-    // empty until a forwarding address lands in it.
-    // This is the same word rt_gc_alloc writes (Gc.cpp:1704), and the bit MUST
-    // agree with `map->finalize` being non-null because run_finalizers() asserts
-    // the two agree (Gc.cpp:1297, 1337).
-    const bool     fin  = !class_finalizer_fn(class_ref)->isNullValue();
-    const uint64_t word = fin ? static_cast<uint64_t>(RT_GC_FLAG_FINALIZE) : 0ull;
+    // FINALIZE is the only flag `new` ever sets, and whether it is set is a
+    // compile-time property of the class. MARK stays clear, which is "young" and is
+    // what makes the next collection trace the object; LOGGED and PINNED are the
+    // collector's own and start clear. The flag MUST agree with `map->finalize`
+    // being non-null: rt_gc_verify() asserts the two agree.
+    const bool fin = !class_finalizer_fn(class_ref)->isNullValue();
 
     llvm::Function* fn   = b_.GetInsertBlock()->getParent();
     auto*           fast = llvm::BasicBlock::Create(ctx_, "gc.alloc.fast", fn);
@@ -1288,18 +1310,20 @@ llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site) {
 
     b_.SetInsertPoint(fast);
     b_.CreateStore(next, curp);
-    emit_gc_start_bits(cur, fin);
-    b_.CreateStore(b_.getInt64(word), cur);
-    llvm::Value* hdl =
-      b_.CreateConstInBoundsGEP1_32(b_.getInt8Ty(), cur, RT_GC_HEADER_BYTES, "gc.hdl");
-    // The body, from the handle to the end of the object: exactly the bytes
-    // rt_gc_alloc zeroes (Gc.cpp:1707), padding included. 2-state leaves and handle
-    // properties power on 0 / null (LRM Table 7-1) and these bytes are recycled
-    // heap, so this is required rather than merely tidy. A constant size lowers to
-    // stores. The handle is RT_GC_HEADER_BYTES past a grain boundary, which is the
-    // alignment gcword_ptr asserts (Gc.cpp:319) and all that may be claimed here.
-    b_.CreateMemSet(hdl, b_.getInt8(0), b_.getInt64(size - RT_GC_HEADER_BYTES),
-                    llvm::MaybeAlign(RT_GC_HEADER_BYTES));
+    // A constant length, so this lowers to a store or two for a class of ordinary
+    // size. The granules are free, their bytes zero, so a copy and not an OR.
+    const uint64_t granules = size / RT_GC_ALIGN;
+    b_.CreateMemCpy(emit_gc_meta_ptr(cur, "gc.meta"), llvm::MaybeAlign(1), gc_meta_pattern(granules, fin),
+                    llvm::MaybeAlign(1), b_.getInt64(granules));
+    // The body. 2-state leaves and handle properties power on 0 / null (LRM Table
+    // 7-1) and these bytes are recycled heap, so this is required rather than merely
+    // tidy. The padding that rounds the object up to a granule is left as it is:
+    // nothing reads it, and rt_gc_alloc zeroing it too changes nothing a program or
+    // the collector can see. The handle is the object's first byte, on a granule
+    // boundary.
+    const uint64_t body = env_->llmod.getDataLayout().getTypeAllocSize(class_body_ty(class_ref));
+    assert(body <= size && size - body < RT_GC_ALIGN && "an object is its body rounded up to a granule");
+    b_.CreateMemSet(cur, b_.getInt8(0), b_.getInt64(body), llvm::MaybeAlign(RT_GC_ALIGN));
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(slow);
@@ -1312,7 +1336,7 @@ llvm::Value* Backend::emit_gc_alloc_fast(Ref class_ref, llvm::Constant* site) {
 
     b_.SetInsertPoint(cont);
     llvm::PHINode* out = b_.CreatePHI(raw_ptr_ty(), 2, "gc.obj");
-    out->addIncoming(hdl, fast);
+    out->addIncoming(cur, fast);
     out->addIncoming(slow_hdl, slow);
     return out;
 }
@@ -1378,7 +1402,18 @@ llvm::Value* Backend::gc_mutator_cur() {
 // Stress mode needs nothing extra here: rt_gc_init arms `request` and every
 // collection re-arms it, so this same poll fires at every safepoint
 // (Gc.h:144-149).
-void Backend::emit_gc_safepoint() {
+//
+// A collection here is the one that clears weak references, and it puts the
+// notifier of each one it clears that a wait reads get() of on the pending chain
+// (LRM 8.30.3; runtime/Gc.cpp, clear_weak_referents). Those are fired as soon as it
+// returns: every process is parked at this edge, so the waiters woken are the ones
+// that were waiting when the reference was cleared, and they run in the time step
+// that is about to begin. The chain holds nothing else, since the NBA region
+// emptied it before time moved. The trigger is an immediate one, as a store's
+// notification is, not the update event of a `->>` (which belongs to an NBA pass);
+// the order among the notifiers of one collection means nothing. Only a design with
+// such a wait has the code, on the cold side of the poll.
+void Backend::emit_gc_safepoint(llvm::Value* wheel) {
     llvm::Function* fn = b_.GetInsertBlock()->getParent();
     // Every poll site is scheduler-level (emit_active_run, lowered into
     // sim_drain), never inside a body. gc_mutator_cur() serves coroutines too now
@@ -1397,6 +1432,37 @@ void Backend::emit_gc_safepoint() {
 
     b_.SetInsertPoint(collect);
     b_.CreateCall(gc_safepoint_slow_fn(), {});
+    const bool weak_waits = std::ranges::any_of(mod_.weak_classes(), [&](const WeakClass& weak) {
+        return mod_.change_notify(weak.class_ref, weak.referent_field) != nullptr;
+    });
+    if (weak_waits) {
+        auto*        ptr   = llvm::PointerType::getUnqual(ctx_);
+        auto*        null  = llvm::ConstantPointerNull::get(ptr);
+        auto*        walk  = llvm::BasicBlock::Create(ctx_, "gc.weak.walk", fn);
+        auto*        fire  = llvm::BasicBlock::Create(ctx_, "gc.weak.fire", fn);
+        auto*        fired = llvm::BasicBlock::Create(ctx_, "gc.weak.fired", fn);
+        llvm::Value* headp = sym(event_pend_head_gv_);
+        llvm::Value* first = b_.CreateLoad(ptr, headp);
+        b_.CreateStore(null, headp);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(walk);
+        llvm::PHINode* n = b_.CreatePHI(ptr, 2);
+        n->addIncoming(first, entry);
+        b_.CreateCondBr(b_.CreateICmpNE(n, null), fire, fired);
+
+        // The link is read before the fire, as emit_event_pend_drain reads it.
+        b_.SetInsertPoint(fire);
+        llvm::Value* next = b_.CreateLoad(ptr, event_field(n, kEventNextPend));
+        b_.CreateStore(null, event_field(n, kEventNextPend));
+        b_.CreateStore(b_.getInt8(0), event_field(n, kEventPending));
+        emit_event_fire(n, wheel, RT_TRACE_TRIGGER_NOW);
+        n->addIncoming(next, b_.GetInsertBlock());
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(fired);
+    }
     b_.CreateBr(done);
     b_.SetInsertPoint(done);
 }
@@ -1414,13 +1480,14 @@ void Backend::emit_gc_safepoint() {
 // every collection, young or not (Gc.h:105-107). LValue::gc_owner is what decides
 // which stores those are, and it is non-null only for a place inside an object.
 //
-// One mask and one compare rather than two tests: OLD says the young collection
-// will not trace this object and LOGGED says the remembered set already holds it,
-// so the exact value OLD-without-LOGGED is the only case that needs the call. The
-// branch is weighted cold the way emit_gc_safepoint and emit_null_handle_check
-// weight theirs, which sinks the call out of line and leaves four instructions --
-// a GEP, a load, an and/compare pair folded by the backend, and a not-taken
-// branch -- on the path a young object or an already-logged object takes.
+// One mask and one compare rather than two tests: MARK says the object is old, so
+// a young collection will not trace it, and LOGGED says the remembered set already
+// holds it, so the exact value MARK-without-LOGGED is the only case that needs the
+// call. The branch is weighted cold the way emit_gc_safepoint and
+// emit_null_handle_check weight theirs, which sinks the call out of line and
+// leaves the address arithmetic, a byte load, an and/compare pair folded by the
+// backend, and a not-taken branch on the path a young object or an already-logged
+// object takes.
 void Backend::emit_gc_barrier(llvm::Value* owner) {
     assert(owner != nullptr && "a barrier needs the object acquiring the reference");
     llvm::Function* fn = b_.GetInsertBlock()->getParent();
@@ -1429,16 +1496,11 @@ void Backend::emit_gc_barrier(llvm::Value* owner) {
     // (HandleDeref's own inttoptr, reused rather than repeated). A caller holding
     // only the i64 handle bits converts once at its own site.
     assert(owner->getType()->isPointerTy() && "an owner is a class body pointer");
-    // The GC word sits BELOW the handle, so the header is at handle[-8]. That
-    // placement is what keeps every property GEP and the $cast display arithmetic
-    // a plain offset off the handle a program holds, with the header out of their
-    // way (Gc.h:54-59).
-    const int64_t hdr_off = -static_cast<int64_t>(RT_GC_HEADER_BYTES);
-    llvm::Value* hdr = b_.CreateGEP(b_.getInt8Ty(), owner, b_.getInt64(hdr_off), "gc.hdr");
-    llvm::Value*  w   = b_.CreateLoad(b_.getInt64Ty(), hdr, "gc.word");
-    llvm::Value*  age = b_.CreateAnd(
-      w, b_.getInt64(RT_GC_FLAG_OLD | RT_GC_FLAG_LOGGED), "gc.age");
-    llvm::Value* due = b_.CreateICmpEQ(age, b_.getInt64(RT_GC_FLAG_OLD), "gc.unlogged");
+    // The flags are in the metadata byte of the object's first granule, which the
+    // handle's address alone locates (emit_gc_meta_ptr).
+    llvm::Value* w   = b_.CreateLoad(b_.getInt8Ty(), emit_gc_meta_ptr(owner, "gc.metap"), "gc.meta");
+    llvm::Value* age = b_.CreateAnd(w, b_.getInt8(RT_GC_META_MARK | RT_GC_META_LOGGED), "gc.age");
+    llvm::Value* due = b_.CreateICmpEQ(age, b_.getInt8(RT_GC_META_MARK), "gc.unlogged");
     auto*        remember = llvm::BasicBlock::Create(ctx_, "gc.remember", fn);
     auto*        done     = llvm::BasicBlock::Create(ctx_, "gc.logged", fn);
     llvm::BranchInst* br  = b_.CreateCondBr(due, remember, done);

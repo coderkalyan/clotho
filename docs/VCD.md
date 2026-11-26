@@ -376,7 +376,10 @@ checkpoint with only minor cleanup.
   (`emit_nba_commit_bucket`, index from `clotho.nba_vcd`), and array NBA commit
   (whole-array `rt_vcd_touch_range`): `if (rt_vcd_active) rt_vcd_touch(idx)`.
   The dumped set is compile-time known, so a non-dumped signal emits no hook,
-  and a design with no `$dump*` call at all emits none.
+  and a design with no `$dump*` call at all emits none. A scalar store whose
+  Any-edge bucket is scanned through its port hands the index to that shared
+  scan (`static_scan_port_fn`), which touches after the scan, so the store site
+  holds no hook and the touch is made only when the value changed.
 - **Close.** `wdone` and the `run_jit` longjmp handler call `rt_vcd_close`.
 
 ---

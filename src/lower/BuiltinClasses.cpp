@@ -64,10 +64,9 @@ ir::Ref Lowerer::lower_semaphore_class(const slang::ast::ClassType& clt) {
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
     std::vector<ir::FieldRow> fields;
-    fields.push_back({ kSemKeysField, make_int_type(64, false), kSemKeys });
-    fields.push_back({ kSemHeadField, make_int_type(64, false), kSemQHead });
-    fields.push_back({ kSemTailField, make_int_type(64, false), kSemQTail });
+    push_sync_body(clt, fields);
     module_.pool.set_struct_fields(fid, std::move(fields));
+    register_sync_notifier(clt, ref);
     // Same two obligations lower_process_class has: the reserved randomization
     // slots need an (empty) rand block for the generated bodies to read, and the
     // outermost frame drains the ids compute_vtable reserved.
@@ -77,6 +76,113 @@ ir::Ref Lowerer::lower_semaphore_class(const slang::ast::ClassType& clt) {
         drain_rand_bodies();
     }
     return ref;
+}
+
+// How many body fields the built-in synchronization class `sync` takes.
+uint32_t Lowerer::sync_body_fields(const slang::ast::ClassType& sync) {
+    return sync.name == "mailbox" ? kMbxPeekTail + 1 : kSemQTail + 1;
+}
+
+// Give `class_ref`, which is `sync` or a class derived from it, the design-wide
+// notifier of the state a function of `sync` reads: a mailbox's FIFO, a semaphore's
+// key count. One exists when some `@` or `wait` calls such a function, at its top
+// (`wait (mb.num() != 0)`) or through a subroutine (CalleeReads::builtins), and
+// then every `put`, `get` and `try_*` fires it by storing where it stores.
+void Lowerer::register_sync_notifier(const slang::ast::ClassType& sync, ir::Ref class_ref) {
+    const bool mailbox = sync.name == "mailbox";
+    register_shared_notifier(sync, class_ref, mailbox ? kMbxFifo : kSemKeys, /*container=*/mailbox);
+}
+
+// Append the synthetic body of `semaphore` or of one `mailbox #(T)` to `fields`:
+// the body of that class, and the first fields of every class derived from it
+// (LRM 8.13), which is what lets a built-in method reach them through a handle
+// of either.
+void Lowerer::push_sync_body(const slang::ast::ClassType& sync, std::vector<ir::FieldRow>& fields) {
+    const ir::Ref word = make_int_type(64, false);
+    if (sync.name != "mailbox") {
+        fields.push_back({ kSemKeysField, word, kSemKeys });
+        fields.push_back({ kSemHeadField, word, kSemQHead });
+        fields.push_back({ kSemTailField, word, kSemQTail });
+        return;
+    }
+    const slang::ast::Symbol* tsym = sync.find("T");
+    if (tsym == nullptr || tsym->kind != SymbolKind::TypeParameter) {
+        fail("internal: std::mailbox without its type parameter");
+    }
+    const slang::ast::Type& mt = tsym->as<slang::ast::TypeParameterSymbol>().targetType.getType();
+    if (mt.isError() || mt.getCanonicalType().kind == SymbolKind::UntypedType) {
+        // TODO: the typeless mailbox (LRM 15.4.9's `dynamic_type`). It needs a
+        // dynamically typed element -- a per-slot descriptor plus a run-time
+        // type identity for 15.4.5's type check, 15.4.6's negative return and
+        // 15.4.8's -- which is a new rt_elem kind and a new notion of type
+        // equality (docs/design/mailbox-and-semaphore.md §8).
+        fail("the typeless std::mailbox (LRM 15.4.9) is not supported; use mailbox #(T)");
+    }
+    const ir::Ref elem = lower_type(mt);
+    guard_container_element(mt.getCanonicalType(), elem, "mailbox message");
+    ir::Type qt;
+    qt.kind            = ir::Type::Kind::Queue;
+    qt.element         = elem;
+    qt.left            = 0; // unbounded; the mailbox bound is enforced in emitted IR
+    const ir::Ref fifo = module_.pool.put(ir::Item{ qt });
+    fields.push_back({ kMbxBoundField, word, kMbxBound });
+    fields.push_back({ kMbxFifoField, fifo, kMbxFifo });
+    fields.push_back({ kMbxGetHeadField, word, kMbxGetHead });
+    fields.push_back({ kMbxGetTailField, word, kMbxGetTail });
+    fields.push_back({ kMbxPutHeadField, word, kMbxPutHead });
+    fields.push_back({ kMbxPutTailField, word, kMbxPutTail });
+    fields.push_back({ kMbxPeekHeadField, word, kMbxPeekHead });
+    fields.push_back({ kMbxPeekTailField, word, kMbxPeekTail });
+}
+
+// `semaphore::new(int keyCount = 0)` and `mailbox::new(int bound = 0)` (LRM 15.3.1,
+// 15.4.1), run against `handle`, an object of `class_ref`, which is `sync` or a
+// class derived from it. Both are BODYLESS built-in constructors: emit_ctor_call
+// would lower slang's empty prototype and die on an out-of-range formal index, so
+// the argument is stored into the synthetic body here instead. The rest of the
+// body powers on all-zero, which is exactly an empty wait queue. `where` names the
+// construction in the report a negative bound gets.
+void Lowerer::emit_sync_ctor(const slang::ast::ClassType&       sync,
+                             std::span<const Expression* const> actuals,
+                             ir::Index                          handle,
+                             ir::Ref                            class_ref,
+                             slang::SourceLocation              where,
+                             ir::Builder&                       b,
+                             ir::SourceLoc                      l) {
+    const ir::Ref i64 = make_int_type(64, false);
+    ir::Index     arg = b.constant(module_.pool.put_int(i64, 0), l);
+    if (actuals.size() == 1) {
+        const Expression& a = *actuals[0];
+        // coerce, not resize: the actual is a signed `int`, and a
+        // negative bound / key count must sign-extend to be seen as one.
+        arg = coerce(lower_expr(a, b), *a.type, i64, b, l);
+    }
+    const bool is_mbx = sync.name == "mailbox";
+    // Only a bound that was written can be negative, and only that has a place to
+    // name: the default is 0.
+    if (is_mbx && actuals.size() == 1) {
+        // LRM 15.4.1: "The bound shall be positive. Negative bounds are
+        // illegal and can result in indeterminate behavior, but
+        // implementations can issue a warning." Clotho never silently
+        // accepts, so it reports -- at run time, because the argument need
+        // not be constant.
+        const ir::Index bad = b.binary(ir::Inst::Tag::SLt, arg, b.constant(module_.pool.put_int(i64, 0), l), l);
+        b.open_region();
+        {
+            const std::string banner = banner_at(where);
+            emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner,
+                        "mailbox bound is negative (LRM 15.4.1)", {}, l);
+            b.finish(banner + "mailbox", 1, l);
+        }
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region();
+        b.cond(bad, then_r, else_r, l, /*unlikely=*/true);
+    }
+    b.binary(ir::Inst::Tag::Store,
+             b.member_select(b.handle_deref(handle, class_ref, l), is_mbx ? kMbxBound : kSemKeys, class_ref, l),
+             arg,
+             l);
 }
 
 // Whether `sub` is one of the built-in synchronization classes' methods (LRM
@@ -98,11 +204,7 @@ bool Lowerer::is_sync_method(const slang::ast::SubroutineSymbol& sub) {
 
 // Whether `clt` is a built-in synchronization class of the `std` package.
 bool Lowerer::is_sync_class(const slang::ast::ClassType& clt) {
-    if (clt.name != "semaphore" && clt.name != "mailbox") {
-        return false;
-    }
-    const slang::ast::Scope* pkg = clt.getParentScope();
-    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+    return is_sync_builtin_class(clt);
 }
 
 // Lower one `mailbox #(T)` specialization (LRM 15.4). slang monomorphizes the
@@ -120,33 +222,9 @@ bool Lowerer::is_sync_class(const slang::ast::ClassType& clt) {
 // the one place the FIFO discipline of 15.4.5 must not apply (§6.2 of the
 // design doc).
 ir::Ref Lowerer::lower_mailbox_class(const slang::ast::ClassType& clt) {
-    const slang::ast::Symbol* tsym = clt.find("T");
-    if (tsym == nullptr || tsym->kind != SymbolKind::TypeParameter) {
-        fail("the built-in 'mailbox' class is not supported");
-    }
-    const slang::ast::Type& mt = tsym->as<slang::ast::TypeParameterSymbol>().targetType.getType();
-    if (mt.isError() || mt.getCanonicalType().kind == SymbolKind::UntypedType) {
-        // TODO: the typeless mailbox (LRM 15.4.9's `dynamic_type`). It needs a
-        // dynamically typed element -- a per-slot descriptor plus a run-time
-        // type identity for 15.4.5's type check, 15.4.6's negative return and
-        // 15.4.8's -- which is a new rt_elem kind and a new notion of type
-        // equality (docs/design/mailbox-and-semaphore.md §8).
-        fail("the typeless std::mailbox (LRM 15.4.9) is not supported; use mailbox #(T)");
-    }
-    if (clt.getBaseClass() != nullptr) {
-        // TODO: deriving from a built-in class. The synthetic body has no
-        // user-visible members to inherit and every built-in method takes no
-        // vtable slot (is_user_virtual), so an override could not dispatch.
-        fail("deriving from the built-in 'mailbox' class is not supported");
-    }
-    const ir::Ref elem = lower_type(mt);
-    guard_container_element(mt.getCanonicalType(), elem, "mailbox message");
-    ir::Type qt;
-    qt.kind        = ir::Type::Kind::Queue;
-    qt.element     = elem;
-    qt.left        = 0; // unbounded; the mailbox bound is enforced in emitted IR
-    const ir::Ref fifo = module_.pool.put(ir::Item{ qt });
-
+    // The body first: it lowers the message type, which is what can refuse.
+    std::vector<ir::FieldRow> fields;
+    push_sync_body(clt, fields);
     const uint32_t fid = module_.pool.reserve_struct_fields();
     ir::Type       t;
     t.kind      = ir::Type::Kind::Class;
@@ -154,23 +232,190 @@ ir::Ref Lowerer::lower_mailbox_class(const slang::ast::ClassType& clt) {
     t.element   = ir::Ref::Invalid;
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
-    const ir::Ref             word = make_int_type(64, false);
-    std::vector<ir::FieldRow> fields;
-    fields.push_back({ kMbxBoundField, make_int_type(64, false), kMbxBound });
-    fields.push_back({ kMbxFifoField, fifo, kMbxFifo });
-    fields.push_back({ kMbxGetHeadField, word, kMbxGetHead });
-    fields.push_back({ kMbxGetTailField, word, kMbxGetTail });
-    fields.push_back({ kMbxPutHeadField, word, kMbxPutHead });
-    fields.push_back({ kMbxPutTailField, word, kMbxPutTail });
-    fields.push_back({ kMbxPeekHeadField, word, kMbxPeekHead });
-    fields.push_back({ kMbxPeekTailField, word, kMbxPeekTail });
     module_.pool.set_struct_fields(fid, std::move(fields));
+    register_sync_notifier(clt, ref);
     class_rand_.emplace(&clt, ClassRand{});
     compute_vtable(clt, ref);
     if (class_depth_ == 1) {
         drain_rand_bodies();
     }
     return ref;
+}
+
+// How many body fields `std::weak_reference` takes in this design: the referent,
+// and its change notifier when some `@` or `wait` reads `get()` of this
+// specialization (WaitPropScan). Answered from the design-wide pre-pass alone, so
+// the class and every class derived from it agree before either is laid out.
+uint32_t Lowerer::weak_body_fields(const slang::ast::ClassType& weak) const {
+    return waited_props_ != nullptr && waited_props_->waits_weak(weak) ? 2 : 1;
+}
+
+// Append the synthetic body of `std::weak_reference #(T)` (LRM 8.30) to `fields`,
+// and register what the backend needs to know about `class_ref`, which is that
+// class or one derived from it.
+//
+// The referent is a property of type T like any handle property: `get()` loads it,
+// `clear()` stores null into it, a shallow copy copies it. What makes it weak is one
+// fact about the class, recorded here: the backend leaves this field out of the
+// class's trace map and names it there as the weak referent instead, and the
+// collector stores null into it when the referent is reachable no other way
+// (ir::WeakClass, rt_gc_map::weak_referent).
+//
+// The notifier is the any-change notifier a waited-on property has
+// (ir::ChangeNotify), so a store through `clear()` fires it as any store to a
+// waited-on property does, and the collector fires it when it clears the referent.
+void Lowerer::push_weak_body(const slang::ast::ClassType& weak, ir::Ref class_ref, std::vector<ir::FieldRow>& fields) {
+    const slang::ast::Symbol* tsym = weak.find("T");
+    if (tsym == nullptr || tsym->kind != SymbolKind::TypeParameter) {
+        fail("internal: std::weak_reference without its type parameter");
+    }
+    // A class type: slang refuses any other argument (LRM 8.30.1).
+    const slang::ast::Type& referent = tsym->as<slang::ast::TypeParameterSymbol>().targetType.getType();
+    fields.push_back({ kWeakReferentField, lower_type(referent), kWeakReferent });
+    module_.set_weak_class(class_ref, kWeakReferent);
+    // The referents' design-wide notifier, when a subroutine some wait calls reads
+    // get() (CalleeReads::builtins).
+    register_shared_notifier(weak, class_ref, kWeakReferent, /*container=*/false);
+    if (weak_body_fields(weak) > 1) {
+        fields.push_back({ kWeakNotifyField, module_.pool.event_type, kWeakNotify });
+        module_.set_change_notify(class_ref, kWeakReferent, ir::Edge::Any, kWeakNotify, /*container=*/false);
+    }
+}
+
+// Lower one `std::weak_reference #(T)` specialization (LRM 8.30). Like `mailbox` it
+// is a generic class slang monomorphizes and gives signatures only, so the body is
+// synthesized (push_weak_body) and the four methods are lowered in place
+// (lower_weak_method). In every other way it is an ordinary class: an instance is
+// collected like any object (8.30.1), two instances with one referent are two
+// objects (8.30.2), and a user class may derive from it.
+//
+// Interned before the referent type is lowered, as a user class is before its
+// properties: `class C; weak_reference #(C) w; endclass` reaches this class from
+// inside C's own layout, and lowering C from here must find it.
+ir::Ref Lowerer::lower_weak_class(const slang::ast::ClassType& clt) {
+    const uint32_t fid = module_.pool.reserve_struct_fields();
+    ir::Type       t;
+    t.kind            = ir::Type::Kind::Class;
+    t.fields_id       = fid;
+    t.element         = ir::Ref::Invalid;
+    const ir::Ref ref = module_.pool.put(ir::Item{ t });
+    bind_class_type(clt, ref);
+    // An entry for a class that failed to lower must not survive to be reused
+    // (lower_class_type's InternGuard says why).
+    struct Abandon {
+        ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::Ref>& table;
+        const slang::ast::ClassType*                                         key;
+        bool                                                                 committed = false;
+        ~Abandon() {
+            if (!committed) {
+                table.erase(key);
+            }
+        }
+    } abandon{ class_type_cache_, &clt };
+    std::vector<ir::FieldRow> fields;
+    push_weak_body(clt, ref, fields);
+    module_.pool.set_struct_fields(fid, std::move(fields));
+    // The two obligations lower_process_class has: an (empty) rand block for the
+    // reserved randomization slots, and the outermost frame's drain.
+    class_rand_.emplace(&clt, ClassRand{});
+    compute_vtable(clt, ref);
+    if (class_depth_ == 1) {
+        drain_rand_bodies();
+    }
+    abandon.committed = true;
+    return ref;
+}
+
+// `weak_reference::new(T referent)` (LRM 8.30.2), run against `handle`, an object of
+// `class_ref` or of a class derived from it. A bodyless built-in constructor, so the
+// one thing it does is stored here. A null referent is stored as it is and reported
+// by nothing (8.30.2).
+void Lowerer::emit_weak_ctor(std::span<const Expression* const> actuals,
+                             ir::Index                          handle,
+                             ir::Ref                            class_ref,
+                             ir::Builder&                       b,
+                             ir::SourceLoc                      l) {
+    if (actuals.size() != 1) {
+        fail("internal: weak_reference::new takes the referent and nothing else");
+    }
+    const ir::Index referent = lower_expr(*actuals[0], b);
+    b.binary(ir::Inst::Tag::Store,
+             b.member_select(b.handle_deref(handle, class_ref, l), kWeakReferent, class_ref, l),
+             referent,
+             l);
+}
+
+// The object a built-in method of `weak_reference`, `semaphore` or `mailbox` acts
+// on, and its static class: the receiver the call names, or `this` for an
+// unqualified call (or one through `super`) in a method of a class derived from the
+// built-in one.
+std::pair<ir::Index, ir::Ref> Lowerer::builtin_receiver(const CallExpression& call, ir::Builder& b) {
+    if (const Expression* recv = call.thisClass(); recv != nullptr) {
+        return { lower_expr(*recv, b), lower_type(*recv->type) };
+    }
+    if (ctor_this_) {
+        return { ctor_this_->handle, ctor_this_->cls };
+    }
+    if (fn_ctx_ != nullptr && fn_ctx_->has_this) {
+        return { this_handle(b, loc(call)), fn_ctx_->this_class };
+    }
+    // slang resolves a non-static method call against an object or not at all.
+    fail("internal: built-in method '" + std::string(call.getSubroutineName()) + "' called on no object");
+}
+
+// Lower one of the four built-in `weak_reference` methods (LRM 8.30.2 to 8.30.5);
+// `new` is emit_weak_ctor.
+std::optional<ir::Index> Lowerer::lower_weak_method(const CallExpression&   call,
+                                                    const SubroutineSymbol& sub,
+                                                    ir::Builder&            b) {
+    const ir::SourceLoc l = loc(call);
+    if (sub.name == "get_id") {
+        // LRM 8.30.5, static: 0 for null, otherwise a value that is the object's own
+        // whatever class the handle is typed as, and no other live object's. That is
+        // the object's identity number (rt_gc_identity), which is never handed out
+        // twice in a run, so the reuse 8.30.5 allows after collection does not happen.
+        if (call.arguments().size() != 1) {
+            fail("internal: weak_reference::get_id takes one object");
+        }
+        return b.handle_identity(lower_expr(*call.arguments()[0], b), l);
+    }
+    const auto [handle, cls] = builtin_receiver(call, b);
+    const auto referent      = [&, handle = handle, cls = cls] {
+        return b.member_select(b.handle_deref(handle, cls, l), kWeakReferent, cls, l);
+    };
+    if (sub.name == "get") {
+        // LRM 8.30.3: the referent, or null once the reference has been cleared, by
+        // clear() or by the collector. Both store null where this loads.
+        return b.unary(ir::Inst::Tag::Load, referent(), l);
+    }
+    if (sub.name == "clear") {
+        // LRM 8.30.4. An ordinary store, so a wait on get() sees it.
+        const ir::Index dst  = referent();
+        const ir::Index null = b.constant(module_.pool.put_int(make_int_type(64, false), 0), l);
+        b.binary(ir::Inst::Tag::Store, dst, null, l);
+        return std::nullopt;
+    }
+    // Every method of LRM 8.30 is handled above; a fifth would come from a slang
+    // release, not from a design.
+    fail("internal: unknown weak_reference method '" + std::string(sub.name) + "'");
+}
+
+// Load the handle of the change notifier of the weak reference `get` is called on,
+// dereferencing that weak reference where the wait is, as prop_notifier_handle does
+// for a property.
+ir::Index Lowerer::weak_notifier_handle(const CallExpression& get, ir::Builder& b) {
+    const ir::SourceLoc l      = loc(get);
+    const auto [handle, cls]   = builtin_receiver(get, b);
+    const ir::ChangeNotify* cn = module_.change_notify(cls, kWeakReferent);
+    if (cn == nullptr || cn->field[static_cast<uint32_t>(ir::Edge::Any)] == ir::kNoNotify) {
+        // The design-wide pre-pass decides which weak reference classes carry a
+        // notifier and this decides which are used; they read the same resolver.
+        fail("internal: no change notifier for weak_reference::get()");
+    }
+    return b.unary(
+      ir::Inst::Tag::Load,
+      b.member_select(b.handle_deref(handle, cls, l), cn->field[static_cast<uint32_t>(ir::Edge::Any)], cls, l),
+      l);
 }
 
 // Whether `sub` is one of `process`'s nine built-in methods (LRM 9.7). Keyed on
@@ -268,12 +513,8 @@ std::optional<ir::Index> Lowerer::lower_sync_method(const CallExpression&   call
     if (cls == "mailbox") {
         return lower_mailbox_method(call, sub, b);
     }
-    const ir::SourceLoc l = loc(call);
-    if (call.thisClass() == nullptr) {
-        fail("semaphore::" + std::string(sub.name) + " needs an explicit semaphore handle");
-    }
-    const ir::Ref   ref    = lower_type(*call.thisClass()->type);
-    const ir::Index handle = lower_expr(*call.thisClass(), b);
+    const ir::SourceLoc l      = loc(call);
+    const auto [handle, ref]   = builtin_receiver(call, b);
     const ir::Ref   i64    = make_int_type(64, false);
     const ir::Ref   int_ty = make_int_type(32, true);
     // The body lvalue is re-derived per access rather than held across the park:
@@ -357,12 +598,8 @@ std::optional<ir::Index> Lowerer::lower_sync_method(const CallExpression&   call
 std::optional<ir::Index> Lowerer::lower_mailbox_method(const CallExpression&   call,
                                                        const SubroutineSymbol& sub,
                                                        ir::Builder&            b) {
-    const ir::SourceLoc l = loc(call);
-    if (call.thisClass() == nullptr) {
-        fail("mailbox::" + std::string(sub.name) + " needs an explicit mailbox handle");
-    }
-    const ir::Ref   ref    = lower_type(*call.thisClass()->type);
-    const ir::Index handle = lower_expr(*call.thisClass(), b);
+    const ir::SourceLoc l    = loc(call);
+    const auto [handle, ref] = builtin_receiver(call, b);
     const ir::Ref   fifo_ty =
       module_.pool.struct_fields(std::get<ir::Type>(module_.pool.get(ref)).fields_id)[kMbxFifo].type;
     const ir::Ref elem_ty = std::get<ir::Type>(module_.pool.get(fifo_ty)).element;

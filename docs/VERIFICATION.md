@@ -97,6 +97,25 @@ VCD, not only what a test prints.
   longer differs fails the run. `CLOTHO_CONFIG_MATRIX_TIMEOUT` (seconds per child)
   and `CLOTHO_CONFIG_MATRIX_LOG` (one line per design) tune it. It costs a process
   per variant per design, so it is not in CI.
+- **Scheduler trace check.** A build with `CLOTHO_EXTRA_ASSERTS` makes the generated
+  code and the scheduler report each spawn, park, wake, dispatch, resume, end, region,
+  NBA update and pass, `->>` pend and trigger, and `$finish` to `src/runtime/TraceCheck.cpp`,
+  which tests the rules of docs/design/scheduler-rules.md online: R5 (a wake needs a
+  parked activation waiting for its cause, a dispatch a queued one, a resume the control
+  it parked at, nothing touches an ended one), R12 (each NBA pass leaves its targets as
+  the updates give in creation order, and none is left over), R20 (a `->>` triggers inside
+  an NBA pass, in the order they were pended), R24 (past a `$finish` only the exit that
+  follows it runs), R6 (every write a parked waiter lists wakes it, no write that changed
+  nothing wakes anyone, and a parked waiter's value read from design memory has not changed
+  at the end of a slot without a wake), R7 (the edge and change facts of each write are
+  Table 9-2's), and the region, time-zero, timer, program-region and disable/kill rules
+  of phase 4 (R1, R2, R4, R15, R17, R23, R25). It is on by default in such a build, for the suite and for
+  `clotho run`; `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status
+  99, `clotho: scheduler trace violation:` and a report naming the rule, the time, the
+  target or activation, and the cause) and fails the test that ran the design, unless
+  `tests/trace-check-known.txt` lists it as `bug` or `rule`; an entry whose test no
+  longer violates fails the run. The sv-tests summary classifies the marker as `trace`.
+  A shipped build emits no call and links no checker (`trace_check_test.cpp`).
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.
 - **sv-tests.** Outcomes are classified as pass, refused, crash or fail; the
   crash count is zero. A pass there means only that nothing failed, not that

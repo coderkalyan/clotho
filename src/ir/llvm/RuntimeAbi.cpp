@@ -102,12 +102,22 @@ llvm::FunctionCallee Backend::finish_coop_fn() {
                  { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
 }
 
-// void rt_observed_case_violation(ptr banner, i64 now, i32 kind) — queues the
+// void rt_observed_case_violation(ptr banner, i64 now, i32 kind, ptr gen) — queues the
 // report for the Observed region (rt_observed_flush emits it). kind selects
-// the message (0 = no match, 1 = overlap).
+// the message (0 = no match, 1 = overlap); gen is the executing thread's report
+// generation counter, or null.
 llvm::FunctionCallee Backend::observed_case_violation_fn() {
     return rt_fn("rt_observed_case_violation", b_.getVoidTy(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty() });
+}
+
+// ptr rt_gen_cell_alloc() / void rt_gen_cell_free(ptr) — a fork child's report generation.
+llvm::FunctionCallee Backend::gen_cell_alloc_fn() {
+    return rt_fn("rt_gen_cell_alloc", raw_ptr_ty(), {});
+}
+
+llvm::FunctionCallee Backend::gen_cell_free_fn() {
+    return rt_fn("rt_gen_cell_free", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
 // void rt_observed_flush() — emit + clear every Observed-region report queued
@@ -289,12 +299,12 @@ llvm::FunctionCallee Backend::tagged_access_fn() {
 // -- Checked heap allocation --
 
 // The rt_alloc_site record (Runtime.h): { ptr where, ptr line, ptr what,
-// i32 line_no, i32 column, i32 end_column }. Field order and types mirror
+// i32 line_no, i32 column, i32 end_column, ptr name }. Field order and types mirror
 // the C struct exactly, so the two change together.
 llvm::StructType* Backend::alloc_site_ty() {
     auto* i32 = b_.getInt32Ty();
     return llvm::StructType::get(ctx_,
-                                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+                                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
 }
 
 // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
@@ -416,14 +426,14 @@ llvm::FunctionCallee Backend::sscanf_fn() {
     return env_->llmod.getOrInsertFunction("rt_sscanf", fnty);
 }
 
-// void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
-//                 i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
-//                 i64 start, i64 finish, i32 flags)
+// i32 rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
+//                i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
+//                i64 start, i64 finish, i32 flags)
 llvm::FunctionCallee Backend::readmem_fn() {
     auto* ptr = raw_ptr_ty();
     auto* i32 = b_.getInt32Ty();
     auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_readmem", b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
+    return rt_fn("rt_readmem", i32, { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
 }
 
 // i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
@@ -593,7 +603,7 @@ llvm::FunctionCallee Backend::nba_arr_reset_fn() {
 
 // The rt_elem_ops mirror type (Runtime.h:947-958):
 // { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves,
-//   i32 nhandles, i32 nkeyshape, ptr handles, ptr keyshape, ptr copy, ptr destroy }.
+//   i32 nhandles, i32 nkeyshape, ptr handles, ptr keyshape, ptr copy, ptr destroy, i64 bound }.
 // Must match the runtime struct exactly.
 //
 // The last four fields are the collector's (docs/design/garbage-collection.md
@@ -604,7 +614,8 @@ llvm::StructType* Backend::elem_ops_ty() {
         elem_ops_ty_ = llvm::StructType::create(
           ctx_,
           { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty(),
-            raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() },
+            raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(),
+            b_.getInt64Ty() },
           "clotho.elemops");
     }
     return elem_ops_ty_;
@@ -740,17 +751,18 @@ llvm::FunctionCallee Backend::queue_delete_all_fn() {
     return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
-// void rt_queue_assign_dynarr(rt_queue*, const rt_dynarr*, const rt_elem_ops*,
+// void rt_queue_assign_dynarr(rt_queue*, const rt_dynarr*, const rt_elem_ops*, u64 bound,
 //                             const rt_alloc_site*)
 llvm::FunctionCallee Backend::queue_assign_dynarr_fn() {
     return rt_fn("rt_queue_assign_dynarr", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
 }
 
-// void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*, const rt_alloc_site*)
+// void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*, u64 bound,
+//                      const rt_alloc_site*)
 llvm::FunctionCallee Backend::queue_assign_fn() {
     return rt_fn("rt_queue_assign", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
 }
 
 // void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops*)
@@ -1199,6 +1211,26 @@ llvm::FunctionCallee Backend::dpi_export_task_no_task_frame_fn() {
     return rt_fn("rt_dpi_export_task_no_task_frame", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+// The current DPI scope (LRM 35.5.3, runtime/Svdpi.cpp): enter sets the scope of an
+// index and returns the one it replaced, leave restores that one, index reads the
+// current one for an export thunk several scopes share, whose no-scope fatal takes the
+// c_identifier and the exporters' names and never returns.
+llvm::FunctionCallee Backend::svdpi_scope_enter_fn() {
+    return rt_fn("rt_svdpi_scope_enter", raw_ptr_ty(), { b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::svdpi_scope_leave_fn() {
+    return rt_fn("rt_svdpi_scope_leave", b_.getVoidTy(), { raw_ptr_ty() });
+}
+
+llvm::FunctionCallee Backend::svdpi_scope_index_fn() {
+    return rt_fn("rt_svdpi_scope_index", b_.getInt32Ty(), {});
+}
+
+llvm::FunctionCallee Backend::dpi_export_no_scope_fn() {
+    return rt_fn("rt_dpi_export_no_scope", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::wheel_now_fn() {
     return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
 }
@@ -1335,15 +1367,22 @@ llvm::StructType* Backend::rt_svopen_ty() {
 
 // -- Garbage collector struct mirrors and entry points (src/runtime/Gc.h) --
 
-// rt_gc_map (Gc.h:85-92):
-// { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize }.
+// rt_gc_map (Gc.h):
+// { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize,
+//   i32 weak_referent, i32 weak_notify, ptr weak_shared }.
 llvm::StructType* Backend::gc_map_ty() {
     if (gc_map_ty_ == nullptr) {
-        gc_map_ty_ = llvm::StructType::create(
-          ctx_,
-          { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(),
-            raw_ptr_ty() },
-          "clotho.gcmap");
+        gc_map_ty_ = llvm::StructType::create(ctx_,
+                                              { b_.getInt64Ty(),
+                                                b_.getInt32Ty(),
+                                                b_.getInt32Ty(),
+                                                raw_ptr_ty(),
+                                                raw_ptr_ty(),
+                                                raw_ptr_ty(),
+                                                b_.getInt32Ty(),
+                                                b_.getInt32Ty(),
+                                                raw_ptr_ty() },
+                                              "clotho.gcmap");
     }
     return gc_map_ty_;
 }
@@ -1392,15 +1431,14 @@ llvm::StructType* Backend::gc_frame_ty() {
     return gc_frame_ty_;
 }
 
-// rt_gc_mutator (Gc.h:163-182): { ptr cursor, ptr limit, i64 budget_left,
-// i32 block_index, i32 request, ptr block_base, ptr start_bitmap,
-// ptr fin_bitmap, ptr frames_head }.
+// rt_gc_mutator (Gc.h): { ptr cursor, ptr limit, i64 budget_left, i32 reserved,
+// i32 request, ptr frames_head }.
 //
 // Mirrored because this one is an ADDRESSING contract, not just an argument
 // type, and since P2 it is the widest one in the file: generated code reads AND
 // WRITES these fields directly. `request` at every safepoint
-// (emit_gc_safepoint); `cursor` / `limit` / `block_base` / `start_bitmap` /
-// `fin_bitmap` at every inlined allocation (emit_gc_alloc_fast); `frames_head` at
+// (emit_gc_safepoint); `cursor` / `limit` at every inlined allocation
+// (emit_gc_alloc_fast); `frames_head` at
 // every coroutine ramp and cleanup (emit_gc_frame_link / emit_gc_frame_unlink).
 // So a field added, widened or reordered ahead of any of them silently moves the
 // bytes generated code touches -- and unlike the poll, the allocator's stores
@@ -1409,7 +1447,7 @@ llvm::StructType* Backend::gc_frame_ty() {
 // rt_gc_init catches exactly that: gc_mutator_request_offset() and
 // gc_mutator_bytes() below are handed over in rt_gc_config and compared against
 // the runtime's own offsetof and sizeof (Gc.h:196-203). The size check is what
-// makes the other eight offsets trustworthy: this mirror and the C struct are
+// makes the other offsets trustworthy: this mirror and the C struct are
 // both padding-free LP64 layouts, so agreeing on the total is agreeing on every
 // field boundary.
 llvm::StructType* Backend::gc_mutator_ty() {
@@ -1417,7 +1455,7 @@ llvm::StructType* Backend::gc_mutator_ty() {
         gc_mutator_ty_ = llvm::StructType::create(
           ctx_,
           { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-            raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() },
+            raw_ptr_ty() },
           "clotho.gcmutator");
     }
     return gc_mutator_ty_;
@@ -1518,7 +1556,7 @@ llvm::FunctionCallee Backend::gc_container_remove_fn() {
 
 // The out-of-line half of the inlined allocation fast path (Gc.h:243-253): the
 // current hole cannot satisfy the request, so the runtime refills and allocates,
-// and refreshes cursor / limit / block_base / start_bitmap / fin_bitmap. Reached
+// and refreshes cursor / limit. Reached
 // only on the cold edge emit_gc_alloc_fast branches to.
 llvm::FunctionCallee Backend::gc_alloc_slow_fn() {
     return rt_fn("rt_gc_alloc_slow", raw_ptr_ty(),

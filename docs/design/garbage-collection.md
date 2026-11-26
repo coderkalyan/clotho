@@ -1,7 +1,9 @@
 # Garbage collection (LRM 8.4)
 
 Status: **P0-P4 landed, and the collector is unconditional. Both tracks
-(evacuation, multi-mutator) remain the proposal (§12).** What runs today: the Immix-shaped heap
+(evacuation, multi-mutator) remain the proposal (§12).** The heap layout of §3.1 and
+§4 has since replaced the header word, line marks and bitmaps those phases describe.
+What runs today: a mark-region heap
 with an inlined bump-allocation fast path, the object model, precise global roots,
 precise container roots, conservative pinned coroutine-frame roots, per-class trace
 maps and finalizers, generational collection in place with an inlined write
@@ -117,7 +119,7 @@ its own heap too (`emit_class_body_init`, `ir/llvm/Aggregates.cpp`, has no
 matching `emit_agg_deinit` call anywhere).
 
 **In scope.** Class bodies; the heap they own through managed properties; event
-objects (`event-handles.md` §9); `std::weak_reference` when it lands (`TODO.md`).
+objects (`event-handles.md` §9); `std::weak_reference` (§7a).
 `std::mailbox` and `std::semaphore` are ordinary traced class bodies
 (`mailbox-and-semaphore.md` §4.4).
 
@@ -161,9 +163,11 @@ reclaim it.
   store, and under multiple mutators those become atomic RMWs on shared objects —
   the worst possible scaling shape.
 
-- **Immix, not size-class pools.** Mark-region: 32 KiB blocks divided into 128 B
-  lines, bump allocation within a block, line-granularity reclamation
-  (Blackburn & McKinley, PLDI 2008). It is chosen because it is the one heap
+- **Immix, not size-class pools.** Mark-region: 32 KiB blocks, bump allocation
+  within a block, reclamation of free runs rather than cells
+  (Blackburn & McKinley, PLDI 2008, which divides a block into 128 B lines; the
+  heap as built reclaims at the 16-byte granule instead, §4.2).
+  It is chosen because it is the one heap
   organisation that does not force the moving/non-moving decision at design time:
   the same heap runs strictly non-moving, generationally in place (StickyImmix),
   or with opportunistic evacuation, as a *policy* setting. It also gets
@@ -210,10 +214,11 @@ reclaim it.
   scanned word-wise, every candidate validated against our own metadata, and hits
   are pinned.
 
-- **One extra header word, at offset −8.** Below the descriptor pointer, so
-  `class_header_words()` stays 1, every property GEP index stays `1 + declIndex`,
-  and `$cast`'s negative-offset display arithmetic (`ir/llvm/Inst.cpp, lower_inst`)
-  is untouched. This is `jl_taggedvalue_t`'s placement for the same reason.
+- **No header word.** What the collector records about an object lives in a
+  metadata byte beside the heap (§4.1), found from the object's address by
+  arithmetic. So `class_header_words()` stays 1, every property GEP index stays
+  `1 + declIndex`, `$cast`'s negative-offset display arithmetic
+  (`ir/llvm/Inst.cpp, lower_inst`) is untouched, and an object is 16-byte aligned.
 
 - **Finalize; do not re-own.** A collected object runs a per-class finalizer that
   is exactly the existing `emit_agg_deinit` walk. Managed buffers keep their
@@ -294,22 +299,32 @@ prerequisites for evacuation, and they are all fixable (§8):
 
 ## 3. Object model
 
-### 3.1 The GC word
+### 3.1 An object and its metadata
 
 ```
-        handle - 8   ┌──────────────────────────┐
-                     │ gcword : u64             │  state | pin | payload
-        handle + 0   ├──────────────────────────┤
+        handle + 0   ┌──────────────────────────┐
                      │ vptr   : ptr             │  → clotho.classdesc.<Ref>.slots[0]
         handle + 8   │ property 0 …             │
                      └──────────────────────────┘
 ```
 
-Low bits: mark/age state (`CLEAN` / `MARKED` / `OLD` / `OLD_MARKED`), `PINNED`,
-`FORWARDED`. The payload is empty except during an evacuating collection, when it
-holds a **forwarding address**.
+A handle is the address of the object's first byte, which is 16-byte aligned. The
+object's size is its body rounded up to 16 bytes, and comes from the class's trace
+map (§3.2). There is nothing before the body.
 
-**Identity numbers are not in the word.** An object used as an associative-array
+What the collector records about an object is in the metadata byte of its first
+granule (§4.1): that an object starts there, and four flags.
+
+- `MARK`. The only generation state: an object is old exactly when it is marked. A
+  young collection marks what it reaches and leaves a marked object alone; a full
+  collection clears every mark before it marks anything.
+- `LOGGED`. The remembered set holds the object (§7).
+- `PINNED`. A conservative root named the object in the collection now running. A
+  bit plus a side list of the pinned objects, cleared when the collection ends.
+- `FINALIZE`. The class has a finalizer, which the sweep runs when it frees the
+  object.
+
+**Identity numbers are not in the metadata either.** An object used as an associative-array
 key or formatted with an integral conversion needs a name that is not its address:
 key bytes are compared, hashed and sorted, output is diffed between runs, and
 neither may depend on where an object sits. That name is the object's identity
@@ -342,16 +357,8 @@ keys), against the same tree with the address in the key:
 A lookup converts once; a traversal step converts the current key to bytes and the
 next key back. The numbers are per operation of a loop that does nothing else.
 
-The vptr must *not* be overwritten by forwarding, because object size is derived
-from the type and is needed while sweeping. That is precisely why the GC word
-exists as a separate word rather than as stolen vptr bits, and it is a second
-reason not to steal them (the first: a mask on every virtual dispatch and every
-`$cast`).
-
-`PINNED` is a bit, not a count, plus a side list of pinned objects for the current
-collection — pins from conservative roots are collection-scoped and cleared at the
-end. Pins with lifetime (an outstanding `ref`, §5.3) use a small count in the
-payload's spare bits, asserted non-saturating.
+**Objects do not move.** There is no forwarding address and nowhere to put one;
+§8 records what evacuation would need.
 
 ### 3.2 The trace map
 
@@ -493,32 +500,71 @@ root table would trace foreign DPI pointers.
 
 ## 4. Heap
 
-### 4.1 Blocks, lines, and metadata
+### 4.1 Chunks, blocks and metadata
 
-- **32 KiB blocks, 128 B lines**, the paper's experimentally-selected sizes. Block
-  metadata (line mark bytes, hole count, a `has_young` flag) is off-heap and
-  block-aligned.
-- **Line marks are bytes, not bits**, and so are object mark states (in the GC
-  word). Parallel marking therefore needs no CAS and no atomics: two threads
-  racing to mark the same line or object write the same value. This is the single
-  cheapest MT accommodation available and it costs 0.8% of the heap.
-- **An object-start bitmap**, one bit per 8 bytes (1.6%), written only by the
-  owning mutator and block-aligned so no two mutators share a bitmap word. It
-  serves four purposes: validating conservative candidate words, resolving
-  interior pointers to object starts, heap parsability for the verify mode, and
-  the sweep cursor.
+- **4 MiB chunks, aligned to 4 MiB.** A chunk is one mapping: a record page, the
+  metadata for the whole chunk, then 119 blocks of 32 KiB. Because a chunk is
+  aligned, the chunk an address belongs to is the address with its low 22 bits
+  cleared, and nothing is searched to find it.
+- **One metadata byte per 16-byte granule**, at `chunk + 4096 + (offset >> 4)`:
+  6.25% of the heap. The byte is 0 for a free granule, has its top bit set with
+  the object's flags (§3.1) for the first granule of an object, and otherwise
+  holds the distance back to the object's first granule, capped at 127 so that a
+  long object is walked in hops. An interior pointer therefore resolves to its
+  object in one load for an object up to 2 KiB and a few for a larger one.
+- **A table of chunks** (a hash map keyed by `address >> 22`, behind a lowest
+  and highest heap address) says whether an address is in the heap at all. Only
+  the conservative scan and `rt_gc_find_object` consult it: generated code and
+  the marker reach metadata from an object they already know to be one.
+- **Marks are bytes, not bits.** Parallel marking therefore needs no CAS and no
+  atomics for the mark itself: two threads racing to mark an object write the
+  same value.
 - **Alignment 16, not 64.** The 64-byte guarantee exists for coroutine frame plane
-  spills (`runtime/Scheduler.cpp, rt_alloc`) and is waste for objects. Frames keep
-  `rt_alloc`; objects get the Immix allocator.
-- **Large objects** (larger than a line, or larger than some fraction of a block)
-  go to a separate large-object space with the same GC word, never evacuated.
+  spills (`runtime/Scheduler.cpp, rt_alloc`) and is waste for objects.
+- **An object larger than a block** (32 KiB) has a mapping of its own, aligned as
+  a chunk is and entered in the same table, with the object at a fixed offset so
+  that the same arithmetic finds its metadata byte. When the object dies its
+  mapping leaves the table and is kept for the next object of the same size
+  (§4.2).
 
 ### 4.2 Reclamation
 
-Line-granularity: a collection marks lines, and reclamation threads free *holes*
-(runs of unmarked lines) rather than individual cells, which is what makes sweep
-cost independent of the number of dead objects. Blocks with no marked line are
-recycled whole. Sweeping is lazy — a mutator sweeps a block when it acquires it.
+A sweep walks a block's metadata from object to object. A marked object stays; an
+unmarked one has its finalizer run if it owes one, and then its metadata bytes are
+zeroed. That is all freeing is: the allocator finds free space as runs of zero
+metadata bytes, and uses any run the request fits in. No object is read except to
+be finalized.
+
+The sweep reads the metadata eight granules to a word. A block in which nothing is
+marked, the usual end of a block of short-lived objects, is freed whole: its
+finalizers are run if any object owes one, and its metadata is zeroed in one go.
+Only a block that keeps something is walked object by object.
+
+A young collection sweeps only the blocks allocated from since the last collection
+and the large objects allocated since then, because nothing else can hold an
+unmarked object. A full collection sweeps every block that is not wholly free. So
+a young collection's sweep costs what was allocated, not the size of the heap.
+
+The sweep leaves each block it visits wholly free, full, or partial with its longest
+free run recorded. Partial blocks are listed by that run's length, one list per
+power of two, so an allocation that needs a block takes one whose run is known to
+fit without searching: a partial block first, a free block only when no partial one
+is certain to fit. A block in the class just below the request may fit and is
+passed over; it serves smaller requests.
+
+A full collection leaves the heap as many free blocks as were allocated from since
+the last collection, and never fewer than one allocation budget's worth: what the
+next cycle will want again. A chunk with no object beyond that goes back to the
+system. So a design allocating at a steady rate keeps its chunks, and one whose
+live set has shrunk returns the difference at its next full collection.
+
+Large objects follow the same rule. A dead one's mapping is kept, by object size,
+and the next object of that size is put in it with nothing mapped; a full
+collection returns, of each size, the mappings beyond the number of objects of
+that size allocated since the last collection. A kept mapping still counts as
+heap, toward the growth that brings a full collection on and against
+`--gc-heap-max`, and the heap gives all of them back before it reports that the
+ceiling or the system has no room.
 
 ### 4.3 The allocation fast path
 
@@ -534,7 +580,7 @@ almost every `new` site because `getTypeAllocSize` is known at codegen.
 br %fits, label %fast, label %refill
 fast:
 store ptr %next, ptr %mut.cursor
-; object-start bit, gcword, vptr stores follow
+; metadata bytes, zeroed body, vptr store follow
 ```
 
 The **mutator context pointer is the whole MT story of the allocator**. Under a
@@ -562,6 +608,63 @@ does not check (`ir/llvm/Inst.cpp, lower_inst` elides null guards on a fresh
 handle). The Immix allocator must preserve "never returns null" by taking the
 existing located-fatal path (`alloc_bytes`, `runtime/Reports.cpp`) after a
 collection fails to satisfy the request.
+
+### 4.4 What the layout costs
+
+Two measurements, each within one tree, in the shipped configuration: Release,
+extra assertions off, default tier. Instructions are user-mode, per iteration, the
+least of three runs, from two runs of different lengths; time is CPU time for the
+longer run, the least of five, and includes about 0.1 s of compilation.
+
+**The layout against the collector it replaced** (an 8-byte header word, 128-byte
+line marks, object-start and finalizable bitmaps, large objects from 8 KiB in
+malloc'd cells). When this was measured a dead large object's mapping was unmapped
+at once, and `memset` in the simulator was a byte loop on both sides (below).
+
+| per iteration | before | after | time |
+|---|---|---|---|
+| allocate and drop a 24-byte-body object | 121 | 110 | 474 to 427 ms |
+| the same with a `string` property (a finalizer) | 306 | 237 | 665 to 547 ms |
+| the same beside 200,000 live objects | 215 | 150 | 395 to 295 ms |
+| replace a random element of two arrays of handles (20-byte and 100-byte bodies) | 457 | 395 | 2621 to 1262 ms |
+| two handle stores into an old object | 32 | 42 | 313 to 307 ms |
+| allocate and drop a 12 KiB object | 29.7k | 36.8k | 4269 to 4621 ms |
+| allocate and drop a 64 KiB object | 157.0k | 156.4k | 5025 to 15004 ms |
+
+What is behind the three that got worse:
+
+- **The barrier** finds the owner's metadata byte by arithmetic on its address,
+  where it used to load the word before the object: five instructions more per
+  handle store into an object.
+- **An object of 8 KiB to 32 KiB** is now in a block and allocated inline, where it
+  had a malloc'd cell. Its metadata is 1/16 of its size to write and to clear, and
+  what is left of a block after the last object that fits is unused until the next
+  collection sweeps the block: a 12 KiB object leaves a quarter of each block, an
+  object just over 16 KiB nearly half.
+- **A mapping made and unmade per large object** cost about 50 microseconds: the
+  system calls, and a page fault for each page the object touches. That is the
+  last row, and why a dead object's mapping is now kept (§4.2).
+
+**Kept mappings, and the C library's `memset`.** Two later changes, measured on a
+later tree whose generated code had changed as well, so its first column is not the
+table above's last. The simulator links libsva, which bundles Zig's compiler-rt,
+and that defines `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp` and `strlen` as
+weak symbols; linked in, they replaced the C library's for the simulator and for
+the code it generates, and its `memset` is a byte loop that the default tier calls
+at every `new`. libsva now keeps those names to itself in an ELF archive.
+
+| per iteration | before | kept mappings | and the C library's `memset` | time |
+|---|---|---|---|---|
+| allocate and drop a 24-byte-body object | 101 | 101 | 59 | 445, 437, 248 ms |
+| the same with a `string` property | 228 | 228 | 140 | 565, 583, 362 ms |
+| the same beside 200,000 live objects | 141 | 141 | 98 | 321, 306, 208 ms |
+| replace a random element of two arrays of handles | 388 | 387 | 308 | 1372, 1408, 1366 ms |
+| two handle stores into an old object | 37 | 37 | 37 | 293, 293, 293 ms |
+| allocate and drop a 12 KiB object | 36.8k | 36.8k | 19.5k | 4823, 4996, 2489 ms |
+| allocate and drop a 64 KiB object | 156.4k | 155.9k | 69.9k | 15943, 4870, 2697 ms |
+
+Peak resident memory for the last row is 214, 226 and 221 MiB: the kept mappings
+are those of one cycle.
 
 ---
 
@@ -619,8 +722,8 @@ mirroring `build_str_temps`, and prove the liveness analysis complete — is
 strictly more code with a use-after-free as its failure mode.
 
 Conservative here is much stronger than Boehm-style conservative, because every
-candidate word is validated against our own metadata: it must land in a live
-block, be 16-aligned, and have its object-start bit set. The same lookup resolves
+candidate word is validated against our own metadata: it must land in a mapped
+chunk and in a granule some object occupies. The same lookup resolves
 an *interior* pointer to its object start, which is what makes
 `ref`-into-a-class-property (F6) work with no epoch machinery at all.
 
@@ -888,7 +991,7 @@ coverage, objections) plus violent young churn. Re-marking the stable set every
 collection is the cost to avoid.
 
 - **Sticky mark bits (StickyImmix).** In-place generational: young collections
-  trace from roots plus the remembered set and stop at `OLD_MARKED` objects. The
+  trace from roots plus the remembered set and stop at marked objects. The
   paper introduces this variant explicitly "to support pinning", which is exactly
   the property §5.3 needs. Julia's MMTk configuration defaults to `StickyImmix`
   and Ruby's to Immix with a non-moving nursery; mmtk-core's own default is
@@ -896,16 +999,16 @@ collection is the cost to avoid.
   reachable from this heap organisation without redesign.
 - **Object remembering, not card marking.** This document specified an unconditional
   card store; the implementation is Julia-shaped object remembering, and the change
-  was right. A handle store into a heap object tests the *owner's* header inline —
-  `(gcword & (OLD|LOGGED)) == OLD` — and calls `rt_gc_remember` only on the taken
+  was right. A handle store into a heap object tests the *owner's* metadata byte inline —
+  `(meta & (MARK|LOGGED)) == MARK` — and calls `rt_gc_remember` only on the taken
   edge, which sets `LOGGED` so a hot object costs the call once per cycle rather
-  than once per store. Five IR instructions, cold-weighted, the same idiom as the
+  than once per store. A few IR instructions, cold-weighted, the same idiom as the
   safepoint poll and the null-handle check.
 
   The reason to prefer it here is the one the card-marking argument got backwards. A
   container's payload is not a GC object, so a card keyed on the *store's address*
   marks a card that no collection scans — the mutated container needs its OWNER
-  remembered, and the owner is exactly what the object-header test already has in
+  remembered, and the owner is exactly what the inline test already has in
   hand. `Runtime.h:874-877`'s licence to relocate elements by raw `memcpy` then
   needs no instrumenting either, for a better reason than a range mark: the owner is
   remembered, and tracing the owner walks the container wherever its elements have
@@ -914,9 +1017,10 @@ collection is the cost to avoid.
   every collection. In the implementation this is structural rather than
   enumerated: the barrier is emitted from an lvalue field set only by `HandleDeref`,
   so an lvalue rooted in a signal or a frame slot cannot carry an owner to remember.
-- **Per-line age records** (`line_old`) let reclamation protect a line holding an old
-  survivor, re-derived at every full collection. That is what makes a young
-  collection able to skip the stable population without freeing it.
+- **The mark is the generation.** A young collection never frees a marked object
+  and sweeps only blocks allocated from since the last collection, which is what
+  lets it skip the stable population without freeing it. Old garbage accumulates
+  until a full collection clears the marks and sweeps everything.
 
 ### 7.1 Two use-after-free bugs the phase shipped with, and what they teach
 
@@ -961,6 +1065,66 @@ The distinction the code now makes explicitly: `is_marked_word` answers "may thi
 collection free the object", `is_stamped && !spared_by_age` answers "has this
 collection already been here". They are different questions and only the second is a
 dedup guard. One predicate for two questions was the actual mistake.
+
+Neither mechanism exists any more. A mark is one bit that a full collection clears
+before it marks, so there is no parity to go stale, and "old" and "marked" are the
+same bit, so there is one question left to ask of it. The remembered set traces its
+objects by a path of its own (`push_marked`) rather than through the test that
+refuses a marked object.
+
+---
+
+## 7a. Weak references (LRM 8.30)
+
+`std::weak_reference #(T)` is an ordinary class with a synthetic body
+(`lower/BuiltinClasses.cpp`, `lower_weak_class`): one property of type `T`, the
+referent. `new` stores it, `get()` loads it, `clear()` stores null, a shallow copy
+copies it, and a user class may extend the class. One fact makes it weak, and it is
+a fact about the class: the trace map leaves the referent's offset out of `handles`
+and gives it as `rt_gc_map::weak_referent` (`ir::WeakClass`, `class_gc_map_global`).
+
+The collector records each weak reference it marks. When marking is complete it
+stores null into the referent of each recorded one whose referent is unmarked
+(`clear_weak_referents`), before anything is finalized or swept. Every weak
+reference to one referent is cleared in that one pass, which is the atomicity
+8.30.1 asks for.
+
+A young collection examines only the weak references it marked, which are the young
+ones and the logged ones. That is enough: a weak reference's referent is written
+when the weak reference is made and by `clear()`, and never otherwise, so a weak
+reference that has survived a collection names an object that collection marked, or
+null. An old weak reference therefore names an old object, which a young collection
+does not free. `tests/gc_model_test.cpp` has weak objects in its random graphs and
+holds every collection to this; its mutator also takes a referent back out of a
+weak reference whose referent nothing else reaches and no collection has freed yet.
+
+**Only a collection at the scheduler's safepoint clears.** A collection run from
+inside an allocation (§6.1) is in the middle of some process's statement, at a
+point the heap's size chose. It marks every referent instead
+(`keep_weak_referents`), so a referent it would have found unreachable survives it
+and waits for the next full collection at the safepoint. Every process is parked at
+the safepoint, so a design sees a weak reference change only between time steps.
+
+**Waiting on `get()`** (8.30.3, `wait (w.get() == null)`). A specialization that
+some `wait` or `@` reads `get()` of carries a second field, the referent's change
+notifier, the event object a waited-on property has (`ir::ChangeNotify`). `clear()`
+is a store and fires it as any store to a waited-on property does. The collector
+puts it on the chain `->>` pends events on (`rt_internal::event_pend`), and the
+safepoint fires that chain as soon as the collection returns
+(`emit_gc_safepoint`), on the cold side of its poll. The waiters woken are exactly
+those waiting when the reference was cleared, and they run in the active region of
+the time step that is beginning.
+
+The scheduler edge at which the wheel is idle is not a safepoint
+(`ir/llvm/Scheduler.cpp`). The run ends there, so a collection would free what
+teardown is about to free, and a waiter it woke would have no time step to run in.
+
+`get_id` (8.30.5) is the identity number of §3 (`rt_gc_identity`): 0 for null, the
+object's own whatever the handle's type, and never handed out twice.
+
+What a design sees of a weak reference depends on when collections run, which
+`--gc-nursery`, `--gc-full-every` and `--gc-stress` change. `tests/weak_reference_test.cpp`
+says what each cadence must do; a cadence that never collects never clears.
 
 ---
 
@@ -1034,7 +1198,7 @@ referenced only by its locals die at the next collection — which is also why
 `disable`'s raw-destroy paths must unlink (§5.1).
 
 **Named event handles.** An event object is the second collected family: it has
-this document's GC word and a trace map of its own, which the runtime owns
+metadata as any object has and a trace map of its own, which the runtime owns
 because only the runtime allocates one (`event-handles.md` §3.2, §9). An event
 handle is traced wherever a class handle is. Two things are particular to it:
 
@@ -1048,9 +1212,7 @@ handle is traced wherever a class handle is. Two things are particular to it:
    `x <= @(c) v`) is reachable only while `c` is, and is dropped with it
    (`event-handles.md` §9).
 
-**`std::weak_reference` (LRM 8.30)** becomes implementable: a weak table cleared
-after marking, before sweeping. `TODO.md` already notes it presupposes a
-collector.
+**`std::weak_reference` (LRM 8.30)** is §7a.
 
 **Unchanged**: `null` is all-zero; `==` is one `icmp`; the null-deref fatal path
 (`emit_null_handle_check`) is untouched; `$cast` still reads field 0; the
@@ -1196,9 +1358,9 @@ parent handle — keeps exactly its 45 live components while 4,000 transactions 
 through the heap, and the dropped-subtree case reclaims. **A real UVM testbench can
 now run collected**, which was this phase's whole point.
 
-The rest of the family — `rt_event` sync objects and `std::weak_reference` — is
-blocked on those features existing at all, not on the collector. `std::mailbox`,
-`semaphore` and `process` have since landed as ordinary traced class bodies.
+The rest of the family has since landed: `std::mailbox`, `semaphore` and `process`
+as ordinary traced class bodies, event objects (`event-handles.md` §9), and
+`std::weak_reference` (§7a).
 
 **Track A — evacuation.** Gated on P3's fragmentation and survival numbers, not on
 taste. Prerequisites in §8: pin-on-`ref`, `rt_ref_names` discipline, `data-model.md`
@@ -1237,7 +1399,7 @@ protected.
 
 - **The strongest test oracle.** "Byte-identical with the collector off" compared
   against a reference in which nothing can be freed early. §13.1 states what
-  replaced it and what that no longer covers.
+  replaced it: a cadence at which the collector never runs, on the one code path.
 - **The escape hatch.** A collector bug can no longer be worked around from the
   command line. That is a deliberate trade for one code path instead of two — a
   dual path that is exercised by every test is a real maintenance asset, and one
@@ -1255,28 +1417,30 @@ the test that proved the off mode collected nothing.
 iverilog cannot check it — per `PRINCIPLES.md`, the substitute strategy is stated, and
 it is four things:
 
-1. **Cadence identity, and it is weaker than it was.** Every existing test is
-   byte-identical under the ordinary cadence and under `--gc-stress` (and later
-   under `--gc-defrag=opportunistic`). A collector that changes observable
-   behaviour is a bug by definition, and for a *moving* collector this is the bug
-   this catches.
+1. **Cadence identity.** Every design in `tests/gc_test.cpp` prints the same bytes
+   at three cadences: never (a budget no run can spend, so no collection runs),
+   ordinary (a collection when the budget is spent) and `--gc-stress` (one at every
+   safepoint). A collector that changes observable behaviour is a bug by
+   definition.
 
-   What it no longer catches: **a bug that affects both cadences equally.** Until
-   §12a the strongest leg of this oracle was "byte-identical with the collector
-   *off*", and an uncollected run is a perfect reference because nothing in it can
-   be freed early. That leg went with the flag. Stress is a far more aggressive
-   cadence than the default, so it still catches anything sensitive to *when*
-   collection happens — which is what a missing root is — but it cannot catch a
-   wrong answer that both cadences produce identically.
+   The never cadence is the reference, because nothing in it can be freed early.
+   It is what "byte-identical with the collector *off*" was before §12a, without a
+   second code path: the same generated code and the same runtime, with the one
+   number that paces collections out of reach. Without it the comparison showed
+   only that two collection schedules agree, and a wrong answer both produce
+   passed. Stress is the cadence that bites: a missing root is sensitive to *when*
+   collection happens, and stress collects whenever it can.
 
-   What covers the gap, and why the reachability cases are built the way they are:
-   each runs a filler process that recycles and poisons freed lines, so a
+   The comparison is on what a design prints, so it is as strong as the case.
+   The rest of the suite runs at the ordinary cadence only.
+
+   Why the reachability cases are built the way they are:
+   each runs a filler process that recycles and poisons freed granules, so a
    wrongly-collected object reads back as `0x5A5A5A5A` instead of its own
    stale-but-intact bytes — a value check needing no reference run. Several also
    give the object under test a `string` property, so the same mistake becomes a
    heap-use-after-free under ASan rather than a text diff. Both devices measure
-   against an absolute expectation rather than a differential one, which is
-   precisely why they were built that way while the off mode still existed.
+   against an absolute expectation rather than a differential one.
 2. **LeakSanitizer with the overrides removed.** The house method for lifetime
    work (`fork-join.md:495-497`: "a missed release leaks and a double release is a
    double free, and neither shows up in a value check"). Concrete criterion:
@@ -1291,10 +1455,11 @@ it is four things:
   `-DCLOTHO_SANITIZE=ON`. Turns a latent missing root into a deterministic
   failure. Under evacuation, also *move every movable object at every collection*,
   which is the standard way to shake out stale-pointer bugs.
-- **Heap verify** — after marking, walk every block via the object-start bitmap
-  and assert each live object's descriptor is a known `clotho.classdesc`, its size
-  matches its type, its line marks are consistent, and every handle field points at
-  an allocated object start. Pair-assertion discipline
+- **Heap verify** — after a collection, walk every block through its metadata
+  bytes and assert that they parse as free granules and whole objects, that each
+  object's descriptor is a known `clotho.classdesc`, its extent matches its type,
+  its `FINALIZE` flag matches its class, every handle field points at an
+  object, and no unlogged old object holds a young one. Pair-assertion discipline
   (TigerStyle) applied to the heap. It walks the whole heap after every collection,
   2.3x slower on an allocation-heavy design, so it is built only with
   `CLOTHO_EXTRA_ASSERTS` (Debug and CI); shipped builds keep the per-object
@@ -1323,7 +1488,6 @@ validate-on-trace as the canonical pair.
   leaves (P4, §3.3), and an associative-array key containing a class handle (§3.3a).
 - Event handles are traced like class handles (`types::is_object_handle`), in every
   place one can sit, a variable-length associative key included (§3.3a).
-- `std::weak_reference` — already loud (`lower/Classes.cpp, lower_class_type`).
 - Virtual interfaces (`src/lower/`) — unrelated to GC, but another
   handle-shaped family; whether it becomes GC-managed is that design's question.
 - Compaction of the large-object space; user-visible pinning; `%p` of a handle

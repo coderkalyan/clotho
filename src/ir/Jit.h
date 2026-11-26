@@ -5,7 +5,9 @@
 // ORC LLJIT, eagerly compile it for the host, and run its `clotho_main` through rt_run. The IR
 // emission paths (emit_llvm / print_module, behind `clotho build`) remain for debugging.
 
+#include <functional>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "Module.h"
@@ -29,5 +31,22 @@ namespace clotho::ir {
 // points at (see build_modules); without it they read "<unknown>".
 int run_jit(const Module& m, Timings* timings = nullptr, const SimulationConfig& config = {},
            std::span<const std::string_view> plusargs = {}, const LocResolver& resolve = {});
+
+#ifdef CLOTHO_EXTRA_ASSERTS
+// What the scheduler trace's checker found in the run that just ended (docs/design/
+// scheduler-trace.md): the rule it broke ("R5.1") and its report.
+struct TraceViolation {
+    std::string rule;
+    std::string report;
+};
+
+using TraceHook = std::function<void(const TraceViolation&)>;
+
+// Install `hook` for every run that follows, or none with an empty one. run_jit calls it once
+// a run that broke a rule has returned, on the host's side of the JIT, so it may throw: the
+// test that ran the design fails. The runtime has already printed the report on stderr, so a
+// host with no hook still shows it; the run's exit status is its own.
+void set_trace_hook(TraceHook hook);
+#endif
 
 } // namespace clotho::ir

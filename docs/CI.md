@@ -40,17 +40,21 @@ with the clotho runner from the `coderkalyan/sv-tests` fork, pinned by
 `SV_TESTS_REF`. `.github/scripts/sv-tests-summary.py` classifies each test as
 pass, self-check (sv-tests counts a pass but the design printed `FAILED`, as
 ivtest designs do when their own checks fail), crash, timeout, ran (exit 0 but
-failed: a wrong result or an accepted invalid design) or rejected, and fails
-the job on any crash, timeout, self-check or ran outcome the known list below
-does not explain, or on an out-of-date known entry. The report and
-logs are uploaded as the `sv-tests-report` artifact.
+failed: a wrong result or an accepted invalid design), rejected or trace (the
+binary's scheduler trace check, which the extra asserts turn on, ended the run
+at a broken rule and printed `clotho: scheduler trace violation:`; read before
+pass and rejected), and fails the job on any crash or timeout, and on any
+self-check, ran or trace outcome the known list below does not explain, or on
+an out-of-date known entry. The report and logs are uploaded as the
+`sv-tests-report` artifact.
 
-`.github/scripts/sv-tests-known.txt` lists the self-check and ran tests that are
+`.github/scripts/sv-tests-known.txt` lists the self-check, ran and trace tests that are
 understood and not Clotho defects to fix now, one `<category> <test> <reason>`
 line each: `race` (outcome rests on an order LRM 4.7 leaves open; each reviewed,
-and no design may rely on it), `oracle` (the test's expectation contradicts the LRM) and
-`known-ran`. The summary prints each category in its own section and leaves
-those tests out of the self-check and ran counts, so a non-zero count there is
+and no design may rely on it), `oracle` (the test's expectation contradicts the LRM),
+`known-ran` and `trace` (a Clotho bug with a row in docs/design/scheduler-rules.md
+§4, or a rule to reword). The summary prints each category in its own section and leaves
+those tests out of the self-check, ran and trace counts, so a non-zero count there is
 new. An entry whose test now passes, fails another way or has left the report is
 listed under "known list out of date": delete or correct it. Removing a test
 from the list is the only way to make it count again; a new entry needs a

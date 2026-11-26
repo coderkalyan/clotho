@@ -363,7 +363,7 @@ void Backend::compute_fusion_groups() {
             bool           simple = config_.fuse;
             bool           thunk  = true;
             for (const auto& pj : u.procs) {
-                simple = simple && facts_.processes[pj[o]].simple_always;
+                simple = simple && facts_.processes[pj[o]].simple_always && !facts_.processes[pj[o]].gen_counter;
                 thunk  = thunk && thunkable(pj[o]);
             }
             u.thunk[o] = thunk ? 1 : 0;
@@ -936,6 +936,12 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
             }
             b_.CreateCall(group_fns[r]->getFunctionType(), sym(group_fns[r]), args);
         }
+        // Parked again at its static control: the trace sees it before the word that lets a waker
+        // push it reads "not queued".
+        if (trace_on()) {
+            const SourceText at = trace_process_text(mod_.processes()[sg.front]);
+            emit_trace_thunk_park(flag, resolve_ ? at.where : fn_->getName().str());
+        }
         b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
         b_.CreateRetVoid();
         fns[s] = fn_;
@@ -974,6 +980,10 @@ llvm::Function* Backend::emit_unit_entry(llvm::Function* row, uint32_t g0) {
         args.push_back(flag);
     }
     b_.CreateCall(row->getFunctionType(), row, args);
+    if (trace_on()) {
+        const SourceText at = trace_process_text(mod_.processes()[groups_[g0].front()]);
+        emit_trace_thunk_park(flag, resolve_ ? at.where : fn_->getName().str());
+    }
     b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
     b_.CreateRetVoid();
     llvm::Function* const entry = fn_;

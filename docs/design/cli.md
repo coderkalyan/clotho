@@ -122,7 +122,8 @@ same namespace as slang's `-D`, `-I`, `-y`,
 values both take effect); a name no top-level module has is not reported, so a
 typo simulates the design with its defaults. `--libmap <file>` reads library maps,
 which assign source files to libraries; `-L` sets the library priority order and a
-`config` can name its own.
+`config` can name its own. With no `--std`, the language is IEEE 1800-2023, the
+standard Clotho implements, where slang's own default is 1800-2017.
 
 "both" in the table means `build` and `run`. The options in it that steer code
 generation or what the artifact does when it runs -- `-O`, `--stat`, `--sanitize`,
@@ -249,9 +250,10 @@ them always means something and none of them needs a companion flag.
 | 1 | compile, emission, link or JIT-setup failure; for `run` and an executable, also a `$fatal` in the design (LRM 20.10 "terminates the simulation with an error code") |
 | 2 | usage error, of clotho or of an executable |
 | 130 | `run` and an executable: interrupted by Ctrl-C (SIGINT) |
+| 99 | `run` and an executable, in a build with `CLOTHO_EXTRA_ASSERTS`: the scheduler trace check ended the run at a broken rule and printed `clotho: scheduler trace violation:` and its report (docs/design/scheduler-trace.md). A Clotho bug or a rule to reword, never a property of the design; shipped builds never produce it |
 
-A design can only produce 0, 1 or 130, so there is no "the design's own status"
-row.
+A design can only produce 0, 1 or 130 (or 99, in a build with the trace check), so there is no
+"the design's own status" row.
 
 `run_jit`'s negative setup sentinel is mapped to 1 rather than returned raw (it
 used to reach the shell as 255).

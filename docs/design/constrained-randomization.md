@@ -142,7 +142,7 @@ That single fact decides §6 and §7.
 | where does randomize live | a synthesized IR function per class, `clotho.randomize.<Ref>` | §2.5: the runtime cannot address properties |
 | how is it reached | a reserved vtable slot `"$randomize"`, alongside `kCopySlot` | LRM makes `randomize` virtual; the slot also solves the layout-offset problem (§5.3) |
 | how are srandom / rand_mode reached | one more reserved slot `"$randops"`, `i64 (this, i32 op, i64 arg)` | same offset problem, one slot instead of four |
-| where does the object RNG live | four `i64` words appended to the class body struct | GC header must stay at `handle[-1]` (`src/runtime/Gc.h:41-46`); the body is the only free space |
+| where does the object RNG live | four `i64` words appended to the class body struct | an object is its body and nothing else (`src/runtime/Gc.h`); the body is the only space there is |
 | when is it seeded | at `ClassNew`, one draw of the creating thread, splitmix64-expanded | LRM 18.14.2 |
 | does `randomize` draw from the thread RNG | **no** | the object owns the stream; keeps `blocks_thunk` off (§9.3) |
 | does `new` of a rand class draw from the thread RNG | **yes, exactly one draw** | LRM 18.14.2 hierarchical seeding; forces `rng_own_` (§9.2) |

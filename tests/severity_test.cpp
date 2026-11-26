@@ -507,8 +507,7 @@ TEST_CASE("deferred #0 assertion: the report names the instance and the label") 
     CHECK_EQ(count_occ(c.err, "ERROR: "), 2u);
 }
 
-// Phase 1 guards: a deferred action that is not a severity report, or a deferred
-// assertion inside a function, is rejected loudly.
+// Phase 1 guards: a deferred action that is not a severity report is rejected loudly.
 TEST_CASE("deferred assertion: unsupported action / context rejected") {
     // $display action (stdout, not a severity task) — Phase 2.
     CHECK(contains(reject("module m; initial begin\n"
@@ -520,16 +519,17 @@ TEST_CASE("deferred assertion: unsupported action / context rejected") {
                           "  a1: assert #0 (0) else $fatal(1);\n"
                           "end endmodule"),
                    "deferred assertion action"));
-    // Deferred assertion inside a function — Phase 2 (generation threading).
-    CHECK(contains(reject("module m;\n"
-                          "  function int f(int v);\n"
-                          "    p: assert #0 (v > 0);\n"
-                          "    return v;\n"
-                          "  endfunction\n"
-                          "  int y;\n"
-                          "  initial y = f(3);\n"
-                          "endmodule"),
-                   "deferred assertion inside a function"));
+    // A deferred assertion inside a function is accepted: see "deferred assertion: inside a
+    // function, a task and a fork child".
+    CHECK(run_capture("module m;\n"
+                      "  function int f(int v);\n"
+                      "    p: assert #0 (v > 0);\n"
+                      "    return v;\n"
+                      "  endfunction\n"
+                      "  int y;\n"
+                      "  initial y = f(3);\n"
+                      "endmodule")
+            .err.empty());
 }
 
 // LRM 16.4.4: disabling "a specific deferred assertion" cancels its pending reports. A label is
@@ -776,107 +776,104 @@ TEST_CASE("deferred assertion: what is not a resume from an event control keeps 
     }
 }
 
-// A wait inside a task the process calls is a resume of the PROCESS, whose reports the task
-// cannot reach, and `wait fork` / `wait_order` are wait statements whose resume the clause does
-// not settle: a process holding a deferred assertion is refused these rather than left to
-// report what the LRM says is flushed. A virtual call may reach any override.
-TEST_CASE("deferred assertion: shapes whose flush points are not reachable are refused") {
+// `wait fork` and `wait_order` are `wait_statement`s in the grammar whose resume the clause
+// does not settle: a process holding a deferred assertion is refused these rather than left to
+// report what the LRM may say is flushed.
+TEST_CASE("deferred assertion: wait fork and wait_order are refused") {
     const auto holds = [](std::string_view decls, std::string_view body) {
         return std::string("module t;\n  logic x = 0; event e;\n") + std::string(decls) +
                "\n  initial begin\n    assert #0 (x) else $error(\"r\");\n" + std::string(body) + "\n  end\nendmodule";
     };
-    const std::string wait_refusal = "that holds a deferred assertion is not supported yet";
-
-    CHECK(contains(reject(holds("task T; @(e); endtask", "T();")), wait_refusal));
-    CHECK(contains(reject(holds("task T; wait (x); endtask", "T();")), wait_refusal));
-    CHECK(contains(reject(holds("task T; logic y; y = @(e) 1'b1; endtask", "T();")), wait_refusal));
-    CHECK(
-      contains(reject(holds("task Inner; @(e); endtask\n  task Outer; Inner(); endtask", "Outer();")), wait_refusal));
-    CHECK(
-      contains(reject(holds("class C; virtual task v(); #1; endtask endclass\n  C h = new;", "h.v();")), wait_refusal));
     CHECK(contains(reject(holds("", "fork #1; join_none\n    wait fork;")), "wait fork in a process"));
     CHECK(contains(reject(holds("event f;", "wait_order (e, f) $display(\"ok\"); else $display(\"bad\");")),
                    "wait_order in a process"));
 }
 
-// A virtual task reached THROUGH another task is as unreachable as a direct virtual call: the
-// body read for the callee is the declared method's, and any override may be the one that runs and
-// waits, so a virtual task called anywhere along the way counts as waiting, as the direct call is
-// refused. Only the direct call was: a non-virtual task that called `h.v()` was accepted, and the
-// process printed the report that its resume from the override's event control flushes. A
-// virtual FUNCTION cannot wait, a `super.` call binds statically to the base method, and a task
-// that only delays does not wait, so those stay accepted and keep their report. LRM-derived; no
-// oracle implements deferred assertions.
-TEST_CASE("deferred assertion: a virtual task called through another task is refused like a direct one") {
+// LRM 16.4.2: a wait inside a task the process calls is a resume of the PROCESS, so it flushes
+// the reports the process queued. The calling process's report generation travels with the call
+// (a virtual task, a task called through another task and a recursive cycle included), which is
+// what lets a task be shared by callers that hold reports and callers that do not. Expected
+// values are derived from the clause; no available simulator implements deferred assertions.
+TEST_CASE("deferred assertion: a wait inside a called task flushes the calling process's report") {
     const auto holds = [](std::string_view decls, std::string_view body) {
         return std::string("module t;\n  logic x = 0; event e;\n") + std::string(decls) +
-               "\n  initial begin\n    assert #0 (x) else $error(\"r\");\n" + std::string(body) + "\n  end\nendmodule";
+               "\n  initial begin\n    assert #0 (x) else $error(\"r\");\n" + std::string(body) +
+               "\n    $display(\"done\");\n  end\nendmodule";
     };
-    const std::string wait_refusal = "that holds a deferred assertion is not supported yet";
-    const std::string classes      = "class A; virtual task v(); endtask endclass\n"
-                                     "  class D extends A; virtual task v(); @(e); endtask endclass\n"
-                                     "  D d = new;\n";
-    // Accepted: the design runs and its one report matures.
+    const auto flushed = [&](std::string_view decls, std::string_view body) {
+        const Captured c = run_capture(holds(decls, body));
+        CHECK_EQ(count_occ(c.err, "ERROR: "), 0u);
+        CHECK(c.out == "done\n");
+    };
+    // The task only delays, or never waits: not a resume from an event control, the report
+    // matures.
     const auto kept = [&](std::string_view decls, std::string_view body) {
         const Captured c = run_capture(holds(decls, body));
         CHECK_EQ(count_occ(c.err, "ERROR: "), 1u);
+        CHECK(c.out == "done\n");
     };
 
-    SUBCASE("through a non-virtual task") {
-        CHECK(contains(reject(holds(classes + "  task T(A h); h.v(); endtask", "T(d);")), wait_refusal));
+    SUBCASE("an event control") {
+        flushed("task T; @(e); endtask\n  initial #0 -> e;", "T();");
     }
-
+    SUBCASE("a wait statement") {
+        flushed("logic go = 0; task T; wait (go); endtask\n  initial #0 go = 1;", "T();");
+    }
+    SUBCASE("an event control on an assignment") {
+        flushed("task T; logic y; y = @(e) 1'b1; endtask\n  initial #0 -> e;", "T();");
+    }
     SUBCASE("two tasks down") {
-        CHECK(
-          contains(reject(holds(classes + "  task T2(A h); h.v(); endtask\n  task T1(A h); T2(h); endtask", "T1(d);")),
-                   wait_refusal));
+        flushed("task Inner; @(e); endtask\n  task Outer; Inner(); endtask\n  initial #0 -> e;", "Outer();");
     }
-
-    SUBCASE("through a method that calls it on its own object") {
-        CHECK(contains(reject(holds("class B; virtual task v(); endtask task w(); v(); endtask endclass\n"
-                                    "  class C extends B; virtual task v(); @(e); endtask endclass\n"
-                                    "  C c = new;",
-                                    "c.w();")),
-                       wait_refusal));
+    SUBCASE("a virtual task") {
+        flushed("class C; virtual task v(); @(e); endtask endclass\n  C h = new;\n  initial #0 -> e;", "h.v();");
     }
-
-    SUBCASE("a chain of tasks that only delays is not refused") {
+    SUBCASE("a virtual task reached through another task") {
+        flushed("class A; virtual task v(); endtask endclass\n"
+                "  class D extends A; virtual task v(); @(e); endtask endclass\n  D d = new;\n"
+                "  task T(A h); h.v(); endtask\n  initial #0 -> e;",
+                "T(d);");
+    }
+    SUBCASE("a recursive cycle that waits") {
+        flushed("task X(int n); Y(n); endtask\n  task Y(int n); if (n > 0) X(n - 1); else @(e); endtask\n"
+                "  initial #0 -> e;",
+                "X(2);");
+    }
+    SUBCASE("a task that only delays") {
+        kept("task T; #1; endtask", "T();");
+    }
+    SUBCASE("a chain of tasks that only delays") {
         kept("task T2; #1; endtask\n  task T1; T2(); endtask", "T1();");
     }
-
-    SUBCASE("a virtual function, which cannot wait, is not refused") {
+    SUBCASE("a recursive cycle that waits nowhere") {
+        kept("task X(int n); Y(n); endtask\n  task Y(int n); if (n > 0) X(n - 1); endtask", "X(2);");
+    }
+    SUBCASE("a virtual function, which cannot wait") {
         kept("class A; virtual function int f(); return 1; endfunction endclass\n  A a = new;\n"
              "  task T; int y; y = a.f(); endtask",
              "T();");
     }
-
-    SUBCASE("a super call, which binds to the base method, is not refused") {
+    SUBCASE("a super call, which binds to the base method") {
         kept("class A; virtual task v(); #1; endtask endclass\n"
              "  class D extends A; virtual task v(); super.v(); endtask task w(); super.v(); endtask endclass\n"
              "  D d = new;",
              "d.w();");
     }
-}
 
-// The wait walk is transitive over a recursive cycle too, from either member, and the same walk as
-// the remote-disable park walk (reaches_property). The wait is in Y after its call back into the
-// cycle. Such a design was already refused before the walk was made exact (a refused answer ends
-// the compile, so a stale "no" never decided anything), so these pin the walk rather than flip. A
-// cycle that waits nowhere is accepted and keeps its report.
-TEST_CASE("deferred assertion: the wait walk is exact over a recursive cycle") {
-    const auto holds = [](std::string_view decls, std::string_view body) {
-        return std::string("module t;\n  logic x = 0; event e;\n") + std::string(decls) +
-               "\n  initial begin\n    assert #0 (x) else $error(\"r\");\n" + std::string(body) + "\n  end\nendmodule";
-    };
-    const std::string wait_refusal = "that holds a deferred assertion is not supported yet";
-    const std::string cycle = "task X(int n); Y(n); endtask\n  task Y(int n); if (n > 0) X(n - 1); @(e); endtask";
-
-    CHECK(contains(reject(holds(cycle, "X(1);")), wait_refusal));
-    CHECK(contains(reject(holds(cycle, "Y(1);")), wait_refusal));
-
-    const Captured c =
-      run_capture(holds("task X(int n); Y(n); endtask\n  task Y(int n); if (n > 0) X(n - 1); endtask", "X(2);"));
-    CHECK_EQ(count_occ(c.err, "ERROR: "), 1u);
+    // One task, two callers: only the caller whose resume is inside the task is flushed.
+    SUBCASE("a task shared by a caller that holds a report and one that does not") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0, y = 0; event e;
+              task T; @(e); endtask
+              initial begin assert #0 (x) else $error("holder"); T(); $display("holder done"); end
+              initial begin T(); $display("other done"); end
+              initial begin #1 -> e; end
+              initial begin #0 -> e; end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "holder"), 0u);
+    }
 }
 
 // -- Concurrent assertions (LRM 16.14): the default failure action is a $error --
@@ -934,4 +931,80 @@ TEST_CASE("a failing wait_order's default report names its scope and the time") 
                                    "  initial wait_order (a, b);\n"
                                    "endmodule\n");
     CHECK(c.err == "ERROR: source:4: top at 1 s: wait_order: events triggered out of order\n");
+}
+
+// A deferred assertion in a function, a task or a fork child queues its report under the report
+// generation of the thread that runs it (LRM 16.4.2): the calling process's for a function or task,
+// the child's own for a fork child. Expected output is derived from the clause; no oracle.
+TEST_CASE("deferred assertion: inside a function, a task and a fork child") {
+    SUBCASE("a function called by a process matures its report") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0;
+              function automatic void f(); assert #0 (x) else $error("fn"); endfunction
+              initial begin f(); #1 $display("done"); end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "fn"), 1u);
+    }
+    SUBCASE("the calling process's resume from an event control flushes it") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              function automatic void f(); assert #0 (x) else $error("fn"); endfunction
+              initial begin f(); @(e); $display("resumed"); end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "fn"), 0u);
+        CHECK(c.out == "resumed\n");
+    }
+    SUBCASE("a task, with a wait of its own after the assertion") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              task automatic tk(); assert #0 (x) else $error("tk"); @(e); endtask
+              initial begin tk(); $display("done"); end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "tk"), 0u);
+    }
+    SUBCASE("a fork child matures its own report") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0;
+              initial begin
+                fork begin assert #0 (x) else $error("child"); end join_none
+                #1;
+              end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "child"), 1u);
+    }
+    SUBCASE("a fork child resumed twice in one time step reports once") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              initial fork
+                forever begin @(e); assert #0 (x) else $error("child at %0t", $time); end
+              join_none
+              initial begin #1 -> e; #0 -> e; end
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "child at 1"), 1u);
+    }
+    SUBCASE("the parent's resume does not flush the child's report") {
+        const Captured c = run_capture(R"(
+            module t;
+              logic x = 0; event e;
+              initial begin
+                fork begin assert #0 (x) else $error("child"); end join_none
+                @(e);
+              end
+              initial #0 -> e;
+            endmodule
+        )");
+        CHECK_EQ(count_occ(c.err, "child"), 1u);
+    }
 }

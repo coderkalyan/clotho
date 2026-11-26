@@ -177,6 +177,24 @@ const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e
 
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e);
 
+// Whether `clt` is `std::weak_reference #(T)` itself (LRM 8.30), and the weak
+// reference class in `clt`'s inheritance chain, itself included, or null.
+bool is_weak_reference_class(const slang::ast::ClassType& clt);
+
+const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt);
+
+// Whether `clt` is `std::semaphore` or a `std::mailbox #(T)` (LRM 15.3, 15.4).
+bool is_sync_builtin_class(const slang::ast::ClassType& clt);
+
+// Whether `sub` is one of weak_reference's four built-in methods.
+bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
+
+// `e` as a call of `weak_reference::get()` (LRM 8.30.3), or null. An event control
+// treats such a call as a read of the weak reference's referent, which is what it
+// is, so `wait (w.get() == null)` parks on the referent's change notifier: 8.30.3
+// names that wait as the way to learn that a weak reference has been cleared.
+const CallExpression* weak_get_call(const Expression& e);
+
 // Every class-property reference in an expression, whether or not it is notifiable.
 // `wait` needs both halves: the notifiable ones become sensitivity, and the mere
 // PRESENCE of a non-notifiable one is what turns an otherwise empty sensitivity
@@ -193,12 +211,16 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     // OBJECT the property names -- the thing `-> e` fires -- not on a notifier;
     // prop_notify_kind mints none for an event on purpose.
     std::vector<const Expression*> event_props;
+    // Calls of `weak_reference::get()`, in source order. Each is a read of that weak
+    // reference's referent and parks on its change notifier (weak_get_call).
+    std::vector<const CallExpression*> weak_gets;
 
     void take(const Expression& e);
 
     void handle(const slang::ast::NamedValueExpression& e);
     void handle(const slang::ast::HierarchicalValueExpression& e);
     void handle(const MemberAccessExpression& ma);
+    void handle(const CallExpression& call);
 };
 
 bool box_can_notify(const slang::ast::Type& ty);
@@ -212,6 +234,61 @@ struct WaitLocalScan : slang::ast::ASTVisitor<WaitLocalScan, VisitFlags::AllGood
     void handle(const slang::ast::NamedValueExpression& e);
     void handle(const slang::ast::HierarchicalValueExpression& e);
 };
+
+// The methods that override each virtual method of the design, and the methods that
+// implement each method of an interface class: what a call bound to the key can run
+// (LRM 8.20, 8.26). One step only; the override of an override is under its own key.
+struct MethodOverrides {
+    ankerl::unordered_dense::map<const SubroutineSymbol*, std::vector<const SubroutineSymbol*>> of;
+};
+
+void collect_method_overrides(const slang::ast::Compilation& comp,
+                              const slang::ast::RootSymbol&  root,
+                              MethodOverrides&               out);
+
+// What an `@` or `wait` expression depends on through the subroutines it calls. LRM
+// 9.4.2: "Changing the value of object data members, aggregate elements, or the size
+// of a dynamically sized array referenced by a method or function shall cause the
+// event expression to be reevaluated." The body of each function the expression
+// calls is walked, and of each function those call, and for a virtual method the
+// bodies of every method that can stand in for it.
+struct CalleeReads {
+    // Instance class properties named in a callee body. The body can reach them
+    // through any object, so each is waited on by its design-wide notifier
+    // (ir::ChangeNotify::shared), not by an object's.
+    std::vector<const slang::ast::ClassPropertySymbol*> props;
+    // The built-in classes whose own state a built-in method reads: `mailbox #(T)`
+    // (num, try_get, try_peek, try_put), `semaphore` (try_get), and in a callee body
+    // `weak_reference #(T)` (get; at the top of the expression that one has the weak
+    // reference's own notifier, weak_get_call).
+    std::vector<const slang::ast::ClassType*> builtins;
+    // Every other value a callee body names: a static property, a module or package
+    // variable. Those that are signals are waited on as signals.
+    std::vector<const slang::ast::ValueSymbol*> values;
+    // The expression calls a method on an object, at its top or in a callee. Such an
+    // expression cannot be evaluated outside the process that waits on it.
+    bool method_call = false;
+};
+
+struct CalleeReadScan : slang::ast::ASTVisitor<CalleeReadScan, VisitFlags::AllGood> {
+    CalleeReads*           out       = nullptr;
+    const MethodOverrides* overrides = nullptr;
+    // 0 in the expression itself, one more in each callee body.
+    uint32_t depth = 0;
+    // Bodies walked, so that one is walked once and recursion ends.
+    ankerl::unordered_dense::set<const SubroutineSymbol*>   entered;
+    ankerl::unordered_dense::set<const slang::ast::Symbol*> seen;
+
+    void enter(const SubroutineSymbol& sub);
+    void take(const slang::ast::Symbol& sym);
+
+    void handle(const CallExpression& call);
+    void handle(const slang::ast::NamedValueExpression& e);
+    void handle(const slang::ast::HierarchicalValueExpression& e);
+    void handle(const MemberAccessExpression& ma);
+};
+
+CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides);
 
 // Which (class property, edge) pairs the whole design waits on. Design-wide because
 // a class's object body must carry the notifiers BEFORE it is laid out, and
@@ -233,8 +310,22 @@ struct WaitedProps {
     // of the symbols that end up boxed -- signals and class properties land here too
     // and are simply never asked about.
     ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> locals;
+    // The `std::weak_reference` specializations whose `get()` some `@` or `wait`
+    // reads. Each lays out a change notifier beside its referent.
+    ankerl::unordered_dense::set<const slang::ast::ClassType*> weak_classes;
+    // The instance properties and built-in classes some `@` or `wait` reaches through
+    // a subroutine it calls (CalleeReads::props, ::builtins). Each has a design-wide
+    // notifier, numbered in the order met, which is `shared_order`.
+    std::vector<const slang::ast::Symbol*>                  shared_order;
+    ankerl::unordered_dense::set<const slang::ast::Symbol*> shared;
+    // Filled before the scan, which follows virtual calls through it.
+    MethodOverrides overrides;
+
+    void add_shared(const slang::ast::Symbol& sym);
 
     bool waits_local(const slang::ast::ValueSymbol& vs) const;
+
+    bool waits_weak(const slang::ast::ClassType& weak) const;
 
     void add(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge);
 
@@ -255,6 +346,19 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
     void handle(const slang::ast::SignalEventControl& ev);
 
     void handle(const slang::ast::WaitStatement& w);
+
+    void note_callees(const Expression& e);
+};
+
+// The design-wide change notifiers (ir::ChangeNotify::shared): one hidden event per
+// entry of WaitedProps::shared_order, declared by the globals Lowerer before any
+// class is laid out and read by every Lowerer.
+struct SharedNotifiers {
+    struct Entry {
+        uint32_t   index = ir::kNoNotify;
+        ir::Signal signal{};
+    };
+    ankerl::unordered_dense::map<const slang::ast::Symbol*, Entry> of;
 };
 
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out);
@@ -288,7 +392,9 @@ uint64_t design_min_precision_fs(const InstanceSymbol& inst);
 
 bool scope_declares_subroutine(const Scope& scope);
 
-uint64_t global_scope_tick_fs(const Scope& scope, bool& any_explicit);
+uint64_t global_scope_tick_fs(const Scope& scope, const slang::TimeScale& ts);
+
+std::optional<slang::TimeScale> effective_time_scale(const Scope& scope, bool timed);
 
 int32_t fs_to_unit_exponent(uint64_t fs);
 
@@ -1164,6 +1270,12 @@ public:
         waited_props_ = wp;
     }
 
+    // Point this Lowerer at the design-wide change notifiers. The globals Lowerer
+    // fills the table (declare_shared_notifiers); every other one reads it.
+    void set_shared_notifiers(SharedNotifiers* sn) {
+        shared_notifiers_ = sn;
+    }
+
     void set_class_ids(ClassIds* ids) {
         class_ids_ = ids;
     }
@@ -1430,11 +1542,41 @@ private:
 
     ir::Ref lower_semaphore_class(const slang::ast::ClassType& clt);
 
+    void register_sync_notifier(const slang::ast::ClassType& sync, ir::Ref class_ref);
+
     static bool is_sync_method(const slang::ast::SubroutineSymbol& sub);
 
     static bool is_sync_class(const slang::ast::ClassType& clt);
 
     ir::Ref lower_mailbox_class(const slang::ast::ClassType& clt);
+
+    static uint32_t sync_body_fields(const slang::ast::ClassType& sync);
+
+    void push_sync_body(const slang::ast::ClassType& sync, std::vector<ir::FieldRow>& fields);
+
+    void emit_sync_ctor(const slang::ast::ClassType&       sync,
+                        std::span<const Expression* const> actuals,
+                        ir::Index                          handle,
+                        ir::Ref                            class_ref,
+                        slang::SourceLocation              where,
+                        ir::Builder&                       b,
+                        ir::SourceLoc                      l);
+
+    ir::Ref lower_weak_class(const slang::ast::ClassType& clt);
+
+    uint32_t weak_body_fields(const slang::ast::ClassType& weak) const;
+
+    void push_weak_body(const slang::ast::ClassType& weak, ir::Ref class_ref, std::vector<ir::FieldRow>& fields);
+
+    void emit_weak_ctor(std::span<const Expression* const> actuals,
+                        ir::Index                          handle,
+                        ir::Ref                            class_ref,
+                        ir::Builder&                       b,
+                        ir::SourceLoc                      l);
+
+    std::pair<ir::Index, ir::Ref> builtin_receiver(const CallExpression& call, ir::Builder& b);
+
+    ir::Index weak_notifier_handle(const CallExpression& get, ir::Builder& b);
 
     static bool is_process_method(const slang::ast::SubroutineSymbol& sub);
 
@@ -1555,7 +1697,7 @@ private:
 
     static bool aggregate_has_field_defaults(const slang::ast::Type& t);
 
-    void emit_var_field_defaults(const VariableSymbol& vs, ir::Index lv, ir::Builder& b, ir::SourceLoc l);
+    void emit_field_defaults(ir::Index lv, const slang::ast::Type& sv_type, ir::Builder& b, ir::SourceLoc l);
 
     void emit_string_literal_array_store(ir::Index        lhs,
                                          ir::Ref          type,
@@ -2378,6 +2520,53 @@ private:
 
     void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
 
+    // What a process waiting on an expression parks on (LRM 9.4.2, 9.4.3): `wait`'s
+    // condition, and an event expression that is sampled (lower_sampled_event_wait).
+    struct ExprWaitDeps {
+        // Signals, each an any-change wait: those the expression names and those the
+        // subroutines it calls name.
+        std::vector<ir::WaitEvent> reads;
+        // Members read through a virtual interface handle.
+        std::vector<const MemberAccessExpression*> vif_reads;
+        // Class properties the expression names, by kind.
+        ClassPropReadScan props;
+        // Fork-captured automatics it names, each in a box with a notifier.
+        std::vector<const ValueSymbol*> boxed;
+        // A fork-captured automatic it names whose type has no notifier, or null.
+        const ValueSymbol* unnotified_box = nullptr;
+        // The expression names a property of a type with no notifier (an unpacked
+        // struct or union, a fixed unpacked array) and nothing else that can wake a
+        // process waiting on it.
+        bool unwakeable = false;
+    };
+
+    ExprWaitDeps expr_wait_deps(const Expression& e);
+
+    void add_callee_wait_events(const Expression& e, std::vector<ir::WaitEvent>& reads);
+
+    void push_wait_edges(const ExprWaitDeps& deps, ir::Builder& b, ir::SourceLoc l, std::vector<ir::WaitEdge>& edges);
+
+    bool event_expr_sampled(const Expression& e);
+
+    bool event_member_sampled(const SignalEventControl& ev);
+
+    bool event_control_sampled(const TimingControl& tc, std::vector<const SignalEventControl*>* members = nullptr);
+
+    ir::Index sampled_event_hit(ir::Index            old,
+                                ir::Index            cur,
+                                ir::Ref              ty,
+                                slang::ast::EdgeKind edge,
+                                ir::Builder&         b,
+                                ir::SourceLoc        l);
+
+    void lower_sampled_event_wait(std::span<const SignalEventControl* const> members, ir::Builder& b, ir::SourceLoc l);
+
+    void declare_shared_notifiers(const RootSymbol& root);
+
+    const SharedNotifiers::Entry* shared_notifier(const slang::ast::Symbol& sym) const;
+
+    void register_shared_notifier(const slang::ast::Symbol& sym, ir::Ref class_ref, uint32_t field, bool container);
+
     void lower_vif_clocking_drive(const MemberAccessExpression& ma, const AssignmentExpression& a,
                                   ir::Builder& b);
 
@@ -2550,11 +2739,17 @@ private:
 
     bool subroutine_parks(const SubroutineSymbol& sub);
 
-    bool subroutine_waits_on_event(const SubroutineSymbol& sub);
-
     void flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l);
 
     bool design_virtual_forks(slang::ast::Compilation& comp);
+
+    bool design_has_reports(slang::ast::Compilation& comp);
+
+    bool task_flushes_reports();
+
+    bool subroutine_reports(const SubroutineSymbol& sub);
+
+    bool body_may_report(const Statement& body);
 
     bool design_virtual_parks(slang::ast::Compilation& comp);
 
@@ -2640,7 +2835,8 @@ private:
 
     void require_finish_inlinable(const Statement& action);
 
-    ir::FunctionId build_action_body(const Statement& body, std::string_view name);
+    ir::FunctionId build_action_body(const Statement& body, std::string_view name,
+                                     std::optional<uint32_t> expect_monitor = std::nullopt);
 
     ir::FunctionId build_default_fail_body(const ir::AssertionMonitor& mon);
 
@@ -2704,6 +2900,9 @@ private:
         ir::Signal passing{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
+        // Attempt tally, for the same: the clocking edges an evaluation of the
+        // property started on (not disabled, not $assertoff).
+        ir::Signal attempts{ 0 };
         // -- `expect` only (LRM 16.17), both absent for every other directive. --
         //
         // The pending REQUEST: a process executing the statement sets it, and the
@@ -3066,6 +3265,7 @@ private:
                           ir::Index           seeding,
                           ir::Index           active,
                           ir::Index           verdict,
+                          ir::Index           wake,
                           ir::Builder&        b,
                           ir::SourceLoc       l);
 
@@ -3076,7 +3276,29 @@ private:
 
     void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st, const AssertionActions& act);
 
+    void emit_cover_attempt(const MonitorState& st, ir::Index active, ir::Index edge, ir::Builder& b, ir::SourceLoc l);
+
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b);
+
+    // -- Cover statistics (docs/design/functional-coverage.md, "Cover statements") --
+    //
+    // A `cover` site keeps its counts in hidden signals of its instance and files them at
+    // the end of the run as an ir::Severity::Cover record (a Final process), which is
+    // what the `--coverage` report lists. `fmt` names the site to the runtime: the
+    // record's operation, its kind, an ordinal per instance, and its source location.
+    ir::Signal  new_cover_counter(ir::SourceLoc l);
+    void        bump_cover_counter(ir::Signal counter, ir::Builder& b, ir::SourceLoc l);
+    std::string cover_site_fmt(char op, std::string_view kind, const std::string& banner, uint32_t ordinal) const;
+    void        emit_cover_record(const std::string&         banner,
+                                  const std::string&         fmt,
+                                  std::span<const ir::Signal> counters,
+                                  ir::SourceLoc              l,
+                                  uint32_t                   defer,
+                                  ir::Builder&               b);
+    void        add_cover_report(const std::string&         banner,
+                                 const std::string&         fmt,
+                                 std::span<const ir::Signal> counters,
+                                 ir::SourceSpan             span);
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b);
 
@@ -5080,7 +5302,8 @@ private:
           , blocks_(l.named_blocks_, {})
           , root_(l.proc_root_block_, nullptr)
           , depth_(l.loop_depth_, 0)
-          , defers_(l.proc_defers_, false) {}
+          , defers_(l.proc_defers_, false)
+          , flushes_(l.proc_flushes_, false) {}
 
     private:
         Restore<FnCtx*>                 ctx_;
@@ -5088,6 +5311,7 @@ private:
         Restore<const Symbol*>          root_;
         Restore<uint32_t>               depth_;
         Restore<bool>                   defers_;
+        Restore<bool>                   flushes_;
     };
 
     // The PreInit segment of the instance that declares a static, while the
@@ -5155,36 +5379,58 @@ private:
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
 
+    // The scope a DPI subroutine declared in `scope` belongs to (LRM 35.5.3, H.9.2:
+    // the subroutine's fully qualified name minus its own), spelled as
+    // ir::Function::dpi_scope spells it: free of the instance that holds it.
+    static std::string dpi_scope_text(const Scope& scope);
+
+    // One `export "DPI-C"` directive found in a scope: the subroutine it names and the
+    // c_identifier it exports it as.
+    struct DpiExportDecl {
+        const SubroutineSymbol* sub;
+        std::string             cid;
+    };
+
+    // The export directives of `scope`, resolved to the subroutines they name. slang
+    // resolves them too (Compilation::getDPIExports) but keeps one per c_identifier,
+    // and only for the scopes it elaborates, which leaves out every instance whose
+    // body duplicates an earlier one: a c_identifier exported from several scopes
+    // (LRM 35.4) would arrive as its first scope alone. The directive is not a member
+    // of the scope, so it is read from the syntax slang built the scope from.
+    static void scan_dpi_exports(const Scope& scope, std::vector<DpiExportDecl>& out);
+
+    // The directives of every scope this Lowerer walked, noted by lower_members as it
+    // meets each scope and consumed by collect_dpi_exports.
+    std::vector<DpiExportDecl> dpi_export_decls_;
+
     // Collect `export "DPI-C"` directives (LRM 35.5 / 35.8): for each, force-lower
     // the SV subroutine and record a DpiExport so the backend emits its C-callable
-    // thunk. slang resolves the export -> subroutine binding and the c_identifier
-    // (Compilation::getDPIExports). Scope: functions AND tasks; input/output/inout
+    // thunk. Scope: functions AND tasks; input/output/inout
     // scalar / chandle / real / packed-vector args; input string args;
     // scalar/chandle/real/void return. LRM 35.8 puts a task under exactly 35.7's
     // argument rules, so every guard below applies to one unchanged. Deferred
     // (loud-fail): string return (returned-char* lifetime), output/inout string,
     // open-array/unpacked args. Public: called by lower_compilation.
     //
-    // getDPIExports is compilation-wide, but every top has its own Lowerer that only
-    // knows its own symbols, and instance binding is baked into the lowered body (the
-    // backend addresses each signal absolutely off that instance's own state global).
-    // So an export must be collected by the Lowerer of the top containing it: `top`
-    // admits this top's module-scope exports, and `collect_globals` — true on exactly
-    // one call — admits the $unit/package exports, which have no instance multiplicity
+    // Every top has its own Lowerer that only knows its own symbols, and instance
+    // binding is baked into the lowered body (the backend addresses each signal
+    // absolutely off that instance's own state global). So an export must be
+    // collected by the Lowerer of the top containing it: the directives of the scopes
+    // this Lowerer walked are its own, and `collect_globals` — true on exactly one
+    // call — adds the $unit/package exports, which have no instance multiplicity
     // (LRM 6.8) and lower once through the shared globals Lowerer function_id
-    // delegates to. `top` is nullable: a design with no elaborated top module at all
-    // (e.g. an interface-only file bound into a package, LRM 23.4 -- a real shape,
-    // not a degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
+    // delegates to. A design with no elaborated top module at all (e.g. an
+    // interface-only file bound into a package, LRM 23.4 -- a real shape, not a
+    // degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
     // single top-less interface) still has $unit/package exports to collect, and the
-    // caller passes null with collect_globals=true exactly once for it, since there is
-    // no "first top" to piggyback the one-time collection on. A null top can never
-    // equal a module-scope export's real owning instance, so the module-scope branch
-    // below just skips every such export via the same `continue` an ordinary
-    // wrong-top mismatch already takes -- correctly, since a design with no top module
-    // has no module-scope subroutine any export could belong to either.
+    // caller collects them once through the globals Lowerer, since there is no
+    // "first top" to piggyback the one-time collection on.
+    //
+    // One c_identifier may be exported from several scopes (LRM 35.4): each scope's
+    // directive becomes a DpiExport of its own and the backend makes one thunk that
+    // dispatches on the current scope (docs/design/dpi-c.md, "Scopes").
 public:
-    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol* top,
-                             bool collect_globals);
+    void collect_dpi_exports(const slang::ast::Compilation& comp, bool collect_globals);
 
 private:
     void apply_time_scale(const Scope& scope);
@@ -5390,6 +5636,8 @@ private:
     std::optional<ir::Index> lower_mailbox_method(const CallExpression&   call,
                                                   const SubroutineSymbol& sub,
                                                   ir::Builder&            b);
+
+    std::optional<ir::Index> lower_weak_method(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b);
 
     void emit_mbx_message_arrived(ir::Index get_head, ir::Index get_tail, ir::Index peek_head,
                                   ir::Index peek_tail, ir::Builder& b, ir::SourceLoc l);
@@ -5613,6 +5861,10 @@ private:
         // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
         bool    is_agg = false;
         ir::Ref agg_ty = ir::Ref::Invalid;
+        // A queue output / inout formal whose actual is a BOUNDED queue, passed via a
+        // temp so the copy-back is a whole-queue assignment that truncates to the actual's
+        // bound (the callee only knows its formal's own, usually unbounded, type).
+        bool is_bounded_queue = false;
     };
 
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
@@ -5786,9 +6038,17 @@ private:
     // reports it queued (LRM 16.4.2), and lower_event_wait / lower_wait_stmt say so.
     // Set per procedural block; false inside a subroutine body (FnScope).
     bool proc_defers_ = false;
-    // Memoized "calling this can wait on an event control or a wait statement", see
-    // subroutine_waits_on_event.
-    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_event_waits_;
+    // Whether its own body holds a deferred assertion or a unique/priority statement,
+    // whose pending reports an event control or wait statement in it flushes (LRM
+    // 16.4.2). Unlike proc_defers_ it never refuses anything. Set per procedural block;
+    // false inside a subroutine body (FnScope).
+    bool proc_flushes_ = false;
+    // Whether the design has a deferred assertion or a unique/priority statement
+    // anywhere (design_has_reports); computed on first use.
+    std::optional<bool> design_has_reports_;
+    // Memoized "calling this can reach a deferred assertion or unique/priority statement", see
+    // subroutine_reports.
+    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_reports_;
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
@@ -5958,6 +6218,8 @@ private:
     // Lowerer with no pre-pass -- which then lays out no notifier, so `@p` / `wait(p)`
     // fails loudly rather than parking on nothing.
     const WaitedProps* waited_props_ = nullptr;
+    // The design-wide change notifiers, or null on a standalone Lowerer.
+    SharedNotifiers* shared_notifiers_ = nullptr;
     // (waited-on class property, ir::Edge) -> the object-body field index of its
     // hidden change-notifier event property (ir::ChangeNotify). Filled by
     // lower_class_type at the same time as class_prop_index_, and read by the wait
@@ -6021,6 +6283,14 @@ private:
     static constexpr uint32_t         kSemKeys      = 0;
     static constexpr uint32_t         kSemQHead     = 1;
     static constexpr uint32_t         kSemQTail     = 2;
+    // The built-in `std::weak_reference #(T)` class (LRM 8.30): the referent, and
+    // after it the referent's change notifier when some `@` or `wait` in the design
+    // reads `get()`. The notifier takes the `$chg.` prefix every change notifier
+    // has, which is what keeps a shallow copy from sharing it.
+    static constexpr std::string_view kWeakReferentField = "$referent";
+    static constexpr std::string_view kWeakNotifyField   = "$chg.$referent";
+    static constexpr uint32_t         kWeakReferent      = 0;
+    static constexpr uint32_t         kWeakNotify        = 1;
     // The built-in `mailbox #(T)` class (LRM 15.4): the bound, the message FIFO,
     // and the three wait queues -- consuming `get` waiters, space-waiting `put`
     // waiters, and non-consuming `peek` waiters, which are woken as a set.

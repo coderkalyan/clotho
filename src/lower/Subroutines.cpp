@@ -684,13 +684,10 @@ void Lowerer::build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
     // a located fatal if the task it drives does not complete in zero time
     // (rt_dpi_export_task_suspended). Lifting that needs the baton-pool stack
     // handoff and a task call site here (docs/design/dpi-c.md, "DPI tasks").
-    // `context` (LRM 35.5.3) is accepted and lowered identically to a plain
-    // import: its purpose is to let the C call exported SV functions (and the
-    // svScope APIs), and an export thunk needs no scope to find its instance —
-    // the lowered SV function it calls already addresses that instance's state
-    // absolutely. The svScope C API is provided (svGetScope / svSetScope /
-    // svGetScopeFromName / user data, exposed as JIT symbols in Jit.cpp) with one
-    // scope per top; a handle naming a nested instance is the deferred piece.
+    // `context` (LRM 35.5.3): the call sets the current scope to the one declaring the
+    // import (dpi_scope, below) for its duration, so the C sees it through svGetScope and
+    // an export several scopes share runs in the right instance (docs/design/dpi-c.md,
+    // "Scopes").
 
     // A DPI import has no body, so slang leaves returnValVar null even for a
     // non-void function; decide void-ness from the declared return type.
@@ -789,6 +786,10 @@ void Lowerer::build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
                                        .dpi_arg_ctypes      = std::move(arg_cts),
                                        .dpi_ret_ctype       = ret_ct,
                                        .dpi_arg_elem_ctypes = std::move(arg_elem_cts),
+                                       .dpi_context         = sub.flags.has(MethodFlags::DPIContext),
+                                       .dpi_scope           = sub.flags.has(MethodFlags::DPIContext)
+                                                                ? dpi_scope_text(*sub.getParentScope())
+                                                                : std::string(),
                                        .span                = span_of(sub),
                                        .ir                  = b.finish() });
 }
@@ -832,19 +833,107 @@ void Lowerer::build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
     arg_elem_cts.push_back(*ec);
 }
 
-void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
-                                  const InstanceSymbol*          top,
-                                  bool                           collect_globals) {
-    for (const auto& ex : comp.getDPIExports()) {
-        const SubroutineSymbol& sub = *ex.subroutine;
-        if (is_global_subroutine(sub)) {
-            if (!collect_globals) {
-                continue; // collected once for the design, not once per top
-            }
-        } else if (top == nullptr || owning_top(sub) != top) {
-            continue; // another top's export (or no elaborated instance at all)
+std::string Lowerer::dpi_scope_text(const Scope& scope) {
+    for (const Scope* s = &scope; s != nullptr; s = s->asSymbol().getParentScope()) {
+        const Symbol& sym = s->asSymbol();
+        switch (sym.kind) {
+            case SymbolKind::InstanceBody:
+                return generate_path(&scope);
+            case SymbolKind::Package:
+                return std::string(sym.name);
+            case SymbolKind::CompilationUnit:
+                return "$unit";
+            default:
+                break;
         }
-        const bool is_task = sub.subroutineKind == SubroutineKind::Task;
+    }
+    return "$unit";
+}
+
+void Lowerer::scan_dpi_exports(const Scope& scope, std::vector<DpiExportDecl>& out) {
+    using namespace slang::syntax;
+    const SyntaxNode* const syntax = scope.asSymbol().getSyntax();
+    if (syntax == nullptr) {
+        return;
+    }
+    // A directive is a member of the scope's syntax, or of a `generate` region in it
+    // (a region is transparent). A directive slang rejected names nothing and is skipped:
+    // slang has reported it.
+    const auto member = [&](const auto& self, const SyntaxNode& node) -> void {
+        if (node.kind == SyntaxKind::GenerateRegion) {
+            for (const MemberSyntax* m : node.as<GenerateRegionSyntax>().members) {
+                self(self, *m);
+            }
+        } else if (node.kind == SyntaxKind::DPIExport) {
+            const auto&            d    = node.as<DPIExportSyntax>();
+            const std::string_view name = d.name.valueText();
+            const Symbol* const    sym  = name.empty() ? nullptr : scope.find(name);
+            if (sym == nullptr || sym->kind != SymbolKind::Subroutine) {
+                return;
+            }
+            const std::string_view cid = d.c_identifier ? d.c_identifier.valueText() : name;
+            out.push_back(DpiExportDecl{ &sym->as<SubroutineSymbol>(), std::string(cid) });
+        }
+    };
+    switch (syntax->kind) {
+        case SyntaxKind::ModuleDeclaration:
+        case SyntaxKind::InterfaceDeclaration:
+        case SyntaxKind::ProgramDeclaration:
+        case SyntaxKind::PackageDeclaration:
+            for (const MemberSyntax* m : syntax->as<ModuleDeclarationSyntax>().members) {
+                member(member, *m);
+            }
+            break;
+        case SyntaxKind::CompilationUnit:
+            for (const MemberSyntax* m : syntax->as<CompilationUnitSyntax>().members) {
+                member(member, *m);
+            }
+            break;
+        case SyntaxKind::GenerateBlock:
+            for (const MemberSyntax* m : syntax->as<GenerateBlockSyntax>().members) {
+                member(member, *m);
+            }
+            break;
+        default:
+            member(member, *syntax); // a generate block of one member, not wrapped in begin/end
+            break;
+    }
+}
+
+void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp, bool collect_globals) {
+    std::vector<DpiExportDecl> decls = std::move(dpi_export_decls_);
+    dpi_export_decls_.clear();
+    if (collect_globals) {
+        const auto declare_context_imports = [&](const Scope& s) {
+            for (const Symbol& m : s.members()) {
+                if (m.kind == SymbolKind::Subroutine) {
+                    const auto& sub = m.as<SubroutineSymbol>();
+                    if (sub.flags.has(MethodFlags::DPIImport) && sub.flags.has(MethodFlags::DPIContext)) {
+                        (void)function_id(sub);
+                    }
+                }
+            }
+        };
+        for (const slang::ast::PackageSymbol* pkg : comp.getPackages()) {
+            scan_dpi_exports(*pkg, decls);
+            declare_context_imports(*pkg);
+        }
+        for (const slang::ast::CompilationUnitSymbol* unit : comp.getCompilationUnits()) {
+            scan_dpi_exports(*unit, decls);
+            declare_context_imports(*unit);
+        }
+    }
+    // The first export of each c_identifier so far (earlier tops included): every other
+    // export of it must agree with it in C signature (LRM 35.5.4), and no scope may
+    // export one c_identifier twice (LRM 35.4).
+    ankerl::unordered_dense::map<std::string, size_t> first_of;
+    for (size_t i = 0; i < module_.dpi_exports.size(); ++i) {
+        first_of.try_emplace(module_.dpi_exports[i].extern_name, i);
+    }
+    std::set<std::pair<std::string, const Scope*>> in_scope;
+    for (const DpiExportDecl& d : decls) {
+        const SubroutineSymbol& sub     = *d.sub;
+        const bool              is_task = sub.subroutineKind == SubroutineKind::Task;
         // An exported TASK (LRM 35.8) is admitted here and lowers as an ordinary
         // task coroutine; the backend thunk drives it (emit_dpi_export). Only the
         // ZERO-TIME case works: a task that actually suspends is a located
@@ -882,47 +971,38 @@ void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
             arg_cts.push_back(*c);
             arg_dirs.push_back(to_arg_dir(fa->direction));
         }
-        // One C symbol cannot name two SV functions: llvm::Function::Create
-        // would silently rename the second thunk to `<name>.1`, leaving C bound
-        // to an arbitrary instance. slang's own c_identifier dedup makes this
-        // unreachable today, but the invariant has to be Clotho's.
-        for (const ir::DpiExport& prev : module_.dpi_exports) {
-            if (prev.extern_name == ex.cIdentifier) {
-                fail("duplicate DPI export c_identifier '" + ex.cIdentifier +
-                     "' (one C name cannot bind two SystemVerilog functions)");
+        if (!in_scope.emplace(d.cid, sub.getParentScope()).second) {
+            fail("DPI export c_identifier '" + d.cid + "' is exported twice from one scope (LRM 35.4)");
+        }
+        if (const auto it = first_of.find(d.cid); it != first_of.end()) {
+            const ir::DpiExport& first = module_.dpi_exports[it->second];
+            if (first.is_task != is_task || first.ret_ctype != ret_ct || first.arg_ctypes != arg_cts ||
+                first.arg_dirs != arg_dirs) {
+                fail("DPI exports of c_identifier '" + d.cid +
+                     "' differ in C signature (LRM 35.5.4: all declarations of one c_identifier have "
+                     "exactly the same type signature)");
             }
         }
         // function_id force-lowers the SV subroutine: a task takes build_task,
         // so the thunk has a real coroutine ramp to drive.
         const ir::FunctionId id = function_id(sub);
-        module_.dpi_exports.push_back(ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts),
-                                                     std::move(arg_dirs), ret_ct, is_task });
+        first_of.try_emplace(d.cid, module_.dpi_exports.size());
+        module_.dpi_exports.push_back(ir::DpiExport{ id, d.cid, std::move(arg_cts), std::move(arg_dirs), ret_ct,
+                                                     is_task, dpi_scope_text(*sub.getParentScope()) });
     }
 }
 
-// Point the delay / $time multipliers at `scope`'s effective timescale. A
-// `#5` written there means 5 of that scope's time units (LRM 3.14.2), so the
-// unit multiplier is unit/tick; a real delay first rounds to the scope's
-// precision, hence precision/tick. Both ratios are exact integers: the tick
-// is the design-wide GCD of every unit and of every precision that a real
-// delay rounds to (design_tick_fs / global_scope_tick_fs), and every
+// Point the delay / $time multipliers at `scope`'s effective timescale
+// (effective_time_scale, which gives a `$unit` subroutine or class the tool
+// default). A `#5` written there means 5 of that scope's time units (LRM
+// 3.14.2), so the unit multiplier is unit/tick; a real delay first rounds to
+// the scope's precision, hence precision/tick. Both ratios are exact integers:
+// the tick is the design-wide GCD of every unit and of every precision that a
+// real delay rounds to (design_tick_fs / global_scope_tick_fs), and every
 // timescale value is a power of ten. Callers guard on tick_fs_ != 0; unitless
 // mode leaves both at 1 and scales nothing.
-//
-// TODO: a scope slang hands back no timescale for falls into that unitless
-// branch even when the design HAS a tick, and then reads/writes time in raw
-// wheel ticks. The case that reaches it is a subroutine or class declared
-// directly in `$unit`: a `timescale directive applies to design elements
-// (LRM 3.14.2.2), so CompilationUnitSymbol::timeScale stays unset unless
-// `$unit` carries its own `timeunit` / `timeprecision`. So a `$unit` function
-// under `timescale 1ns/1ps` reports 3000 where its 1ns caller reports 3 --
-// and the number moves with unrelated code, since dropping a `#0.5` anywhere
-// shifts the tick from 1ns to 1ps. iverilog reports 0 there (its own 1s
-// default). The fix is a fixed tool-default timescale for such a scope, folded
-// into the wheel tick the way global_scope_tick_fs already folds the scopes
-// that DO declare one. Declaring in a package or module is unaffected.
 void Lowerer::apply_time_scale(const Scope& scope) {
-    const auto ts   = scope.getTimeScale();
+    const auto ts   = effective_time_scale(scope, tick_fs_ != 0);
     time_mul_       = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
     prec_over_tick_ = ts ? tsv_to_fs(ts->precision) / tick_fs_ : 1;
 }
@@ -1776,6 +1856,10 @@ std::optional<ir::Index> Lowerer::lower_user_call(const CallExpression& call, ir
         // body, so none of the call path below applies.
         return lower_sync_method(call, sub, b);
     }
+    if (is_weak_reference_method(sub)) {
+        // `weak_reference`'s methods (LRM 8.30), bodyless built-ins as well.
+        return lower_weak_method(call, sub, b);
+    }
     // A covergroup / coverpoint built-in method (LRM 19.8). Intercepted here for
     // the same reason the `std` classes are: slang gives these a signature and
     // no body, and a covergroup is not a class, so nothing below applies.
@@ -1885,18 +1969,10 @@ void Lowerer::lower_task_call(const CallExpression&    call,
     // no body to lower — its prototype stub supplies the signature instead
     // (virtual_sig_id).
     const bool is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
-    // LRM 16.4.2: the process resuming from an event control or wait statement inside the task is
-    // a flush point for the reports the PROCESS queued, and the task, shared by every caller,
-    // cannot reach them. Refused rather than left to report what the LRM says is flushed. A
-    // virtual call is refused whenever it is made from such a process, since any override may be
-    // the one that waits; a task that only delays is not affected.
-    if (proc_defers_ && (is_virtual || subroutine_waits_on_event(sub))) {
-        // TODO: thread the calling process's deferred-assertion generation through the task ABI
-        // (the same gap as a deferred assertion inside a task, lower_immediate_assertion).
-        fail("call of a task that can wait on an event control or a wait statement from a process "
-             "that holds a deferred assertion is not supported yet (resuming inside the task is a "
-             "flush point of the process's pending reports)");
-    }
+    // LRM 16.4.2: a wait inside the task is a flush point of the PROCESS that called it. The
+    // backend threads the calling thread's report generation through the call (a published
+    // global, read at the task's entry), and a task that waits flushes it where it resumes
+    // (flush_deferred_on_resume).
     // A receiver that is a virtual interface handle, or a bare sibling call from
     // inside a ctx-parameterized body, both dispatch to the one shared body.
     const bool           through_vif = is_vif_call(call) || vif_ctx_arg_wanted(sub);
@@ -2199,6 +2275,22 @@ std::vector<ir::Index> Lowerer::build_call_args(std::span<const FormalArgumentSy
             if (actual->kind == ExpressionKind::Assignment) {
                 actual = &actual->as<AssignmentExpression>().left();
             }
+            const ir::Ref actual_ty = lower_type(*actual->type);
+            const auto&   at        = std::get<ir::Type>(module_.pool.get(actual_ty));
+            if (dir != slang::ast::ArgumentDirection::In && at.kind == ir::Type::Kind::Queue && at.left != 0) {
+                // The callee copies its formal back through whatever handle it is given,
+                // and knows only its own type's bound. Hand it a temp and assign the temp
+                // to the actual after the call (LRM 13.5: copy-out is an assignment).
+                const ir::Index temp = make_arg_temp(pty, b, l);
+                if (dir == slang::ast::ArgumentDirection::InOut) {
+                    b.queue_copy(temp, lower_lvalue(*actual, b), pty, l);
+                }
+                args.push_back(temp);
+                CopyOutArg oc{ temp, actual, actual_ty, &formals[i]->getType() };
+                oc.is_bounded_queue = true;
+                outs.push_back(oc);
+                continue;
+            }
             args.push_back(lower_lvalue(*actual, b));
             continue;
         }
@@ -2287,6 +2379,10 @@ void Lowerer::emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builde
             continue;
         }
         const ir::Index dst = lower_lvalue(*oc.actual, b);
+        if (oc.is_bounded_queue) {
+            b.queue_copy(dst, oc.temp, oc.actual_ty, l);
+            continue;
+        }
         if (oc.is_agg) {
             // A whole-array output / inout: copy the callee-written temp back
             // into the actual element-wise (layout-converting), the reverse of

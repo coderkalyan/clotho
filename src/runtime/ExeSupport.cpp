@@ -69,7 +69,8 @@ extern "C" void rt_libcxx_abort(const char* format, ...) {
 
 // std::string's members that libc++'s <string> declares `extern template`, for
 // its library to provide. There is no library here, so instantiate them as
-// libc++'s own src/string.cpp does, from the same list.
+// libc++'s own src/string.cpp does, from the same list, plus the one free
+// function that file instantiates beside it.
 _LIBCPP_BEGIN_NAMESPACE_STD
 #define CLOTHO_INSTANTIATE(...) template __VA_ARGS__;
 #ifdef _LIBCPP_ABI_STRING_OPTIMIZED_EXTERNAL_INSTANTIATION
@@ -78,4 +79,5 @@ _LIBCPP_STRING_UNSTABLE_EXTERN_TEMPLATE_LIST(CLOTHO_INSTANTIATE, char)
 _LIBCPP_STRING_V1_EXTERN_TEMPLATE_LIST(CLOTHO_INSTANTIATE, char)
 #endif
 #undef CLOTHO_INSTANTIATE
+template string operator+ <char, char_traits<char>, allocator<char>>(char const*, string const&);
 _LIBCPP_END_NAMESPACE_STD

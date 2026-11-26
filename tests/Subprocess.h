@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -72,6 +73,14 @@ inline constexpr std::string_view run_variant_flag = "--clotho-run-variant";
 // be spawned from any working directory.
 inline std::string self_exe;
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+// Called with the rule and the report of a child process's trace check once the child has ended
+// (TraceCheck.h installs it; empty ignores the report). The child writes both to the file
+// spawn_design names in CLOTHO_TRACE_REPORT, on top of printing them, so the parent can raise
+// them in the test that ran the design.
+inline std::function<void(const std::string& rule, const std::string& report)> trace_child_report;
+#endif
+
 // Everything one design run produced. `status` is the raw std::system() return
 // value; read an exit code out of it with design_exit_code. `timed_out` and
 // `seconds` are set by run_self_bounded alone.
@@ -112,6 +121,13 @@ inline DesignRun spawn_design(std::string_view source, bool capture_err, std::st
     const fs::path    src  = dir / (stem + ".sv");
     const fs::path    out  = dir / (stem + ".out");
     const fs::path    err  = dir / (stem + ".err");
+#ifdef CLOTHO_EXTRA_ASSERTS
+    const fs::path    trace       = dir / (stem + ".trace");
+    const std::string environment = std::string(env) + (env.empty() || env.back() == ' ' ? "" : " ") +
+                                    "CLOTHO_TRACE_REPORT=" + trace.string() + " ";
+#else
+    const std::string environment(env);
+#endif
     {
         std::ofstream f(src, std::ios::binary);
         f.write(source.data(), static_cast<std::streamsize>(source.size()));
@@ -122,15 +138,15 @@ inline DesignRun spawn_design(std::string_view source, bool capture_err, std::st
 #if defined(_WIN32)
     // cmd.exe has no `NAME=value command` form, so each assignment becomes a
     // `set` that the command inherits.
-    for (size_t at = 0; at < env.size();) {
-        const size_t end = std::min(env.find(' ', at), env.size());
+    for (size_t at = 0; at < environment.size();) {
+        const size_t end = std::min(environment.find(' ', at), environment.size());
         if (end > at) {
-            prefix += "set \"" + std::string(env.substr(at, end - at)) + "\" && ";
+            prefix += "set \"" + environment.substr(at, end - at) + "\" && ";
         }
         at = end + 1;
     }
 #else
-    prefix = std::string(env);
+    prefix = environment;
 #endif
     std::string cmd = prefix + quote(self_exe) + " " + std::string(flag) + " " + quote(src.string()) +
                       " > " + quote(out.string());
@@ -164,6 +180,14 @@ inline DesignRun spawn_design(std::string_view source, bool capture_err, std::st
         run.err = read_file(err);
         fs::remove(err, ec);
     }
+#ifdef CLOTHO_EXTRA_ASSERTS
+    const std::string trace_text = read_file(trace);
+    fs::remove(trace, ec);
+    if (!trace_text.empty() && trace_child_report) {
+        const size_t nl = trace_text.find('\n');
+        trace_child_report(trace_text.substr(0, nl), nl == std::string::npos ? std::string() : trace_text.substr(nl + 1));
+    }
+#endif
     return run;
 }
 

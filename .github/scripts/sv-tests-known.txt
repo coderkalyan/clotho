@@ -10,6 +10,9 @@
 #   oracle     self-check: the design's own expectation contradicts the LRM, and
 #              Clotho follows the LRM. NN is a docs/LRM_NOTES.md note.
 #   known-ran  ran: clotho exits 0 but sv-tests marks the test failed.
+#   trace      trace: the run broke a rule of the scheduler (docs/design/scheduler-trace.md), which
+#              the linux-x64 binary's trace check reports as `clotho: scheduler trace violation:`.
+#              A Clotho bug with a row in docs/design/scheduler-rules.md §4, or a rule to reword.
 #
 # Test names are the report's TestName column: ivtest's are
 # regress-<list>_<name>_iv, <list> being vlg or sv.

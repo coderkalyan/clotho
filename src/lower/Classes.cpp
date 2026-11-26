@@ -49,19 +49,17 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // reached has its vtable numbering. See rand_pending_.
     const Restore<uint32_t> depth(class_depth_, class_depth_ + 1);
     // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4) and
-    // `std::weak_reference` (LRM 8.30) are built-in classes slang synthesizes
+    // `std::weak_reference #(T)` (LRM 8.30) are built-in classes slang synthesizes
     // into the `std` package. Slang builds their *signatures* only -- every
     // method is a bodyless SubroutineSymbol whose semantics the simulator
-    // supplies. `semaphore` and `mailbox` are ordinary traced class objects with
-    // a synthetic body (lower/BuiltinClasses.cpp,
-    // docs/design/mailbox-and-semaphore.md).
+    // supplies. All three are ordinary traced class objects with a synthetic body
+    // (lower/BuiltinClasses.cpp, docs/design/mailbox-and-semaphore.md); what is
+    // particular to a weak reference is that the collector does not follow its
+    // referent (docs/design/garbage-collection.md).
     //
     // `process` (LRM 9.7) has its own body shape and its own method lowering,
     // because a `process` object is not a user class but a handle onto a
     // thread's control block. See docs/design/process-class.md.
-    //
-    // TODO: `std::weak_reference` (LRM 8.30) -- needs a weak table the
-    // collector clears (docs/design/garbage-collection.md).
     if (const slang::ast::Scope* parent = clt.getParentScope();
         parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
         if (clt.name == "process") {
@@ -72,6 +70,9 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
         }
         if (clt.name == "mailbox") {
             return lower_mailbox_class(clt);
+        }
+        if (clt.name == "weak_reference") {
+            return lower_weak_class(clt);
         }
         fail("the built-in '" + std::string(clt.name) + "' class is not supported");
     }
@@ -221,7 +222,14 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // Owns the composed change-notifier field names; see
     // emit_change_notifier_fields for why the rows cannot hold a temporary.
     std::deque<std::string> chg_names;
-    uint32_t                idx = 0;
+    // A class derived from a built-in class with a synthetic body
+    // (`std::weak_reference`, `semaphore`, `mailbox`) starts with that body, which
+    // has no property symbols for the two passes below to find, so its fields are
+    // counted here and pushed ahead of the second pass.
+    const slang::ast::ClassType& root      = *chain.front();
+    const bool                   weak_root = is_weak_reference_class(root);
+    const bool                   sync_root = is_sync_class(root);
+    uint32_t idx = weak_root ? weak_body_fields(root) : sync_root ? sync_body_fields(root) : 0;
     ClassRand               rand;
     for (const slang::ast::ClassType* k : chain) {
         if (rand.unsupported.empty() && has_constraint_blocks(*k)) {
@@ -294,6 +302,12 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     }
     class_rand_.emplace(&clt, rand);
 
+    if (weak_root) {
+        push_weak_body(root, ref, fields);
+    } else if (sync_root) {
+        push_sync_body(root, fields);
+        register_sync_notifier(root, ref);
+    }
     for (const slang::ast::ClassType* k : chain) {
         for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
             if (prop.lifetime == slang::ast::VariableLifetime::Static) {
@@ -338,6 +352,9 @@ uint32_t Lowerer::reserve_change_notifiers(const slang::ast::ClassPropertySymbol
                                            ir::Ref                                class_ref,
                                            uint32_t                               prop_field,
                                            uint32_t                               next) {
+    // The property's design-wide notifier, if a subroutine some wait calls reads
+    // it. It is an event of the design, not a field, so it takes no index.
+    register_shared_notifier(prop, class_ref, prop_field, is_notified_container(prop.getType().getCanonicalType()));
     if (waited_props_ == nullptr || !waited_props_->contains(prop)) {
         return 0;
     }
@@ -967,46 +984,11 @@ ir::Index Lowerer::lower_new_class(const slang::ast::NewClassExpression& nc, ir:
     const ir::Ref   class_ref = lower_type(*nc.type);
     const ir::Index handle    = b.class_new(class_ref, l);
     if (is_sync_class(clt)) {
-        // `semaphore::new(int keyCount = 0)` is a BODYLESS built-in constructor
-        // (LRM 15.3.1): emit_ctor_call would lower slang's empty prototype and
-        // die on an out-of-range formal index, so the argument is stored into the
-        // synthetic body here instead. The rest of the body powers on all-zero,
-        // which is exactly an empty wait queue.
-        const ir::Ref i64 = make_int_type(64, false);
-        ir::Index     arg = b.constant(module_.pool.put_int(i64, 0), l);
+        std::span<const Expression* const> bound;
         if (const Expression* cc = nc.constructorCall()) {
-            const CallExpression& call = cc->as<CallExpression>();
-            if (call.arguments().size() == 1) {
-                const Expression& a = *call.arguments()[0];
-                // coerce, not resize: the actual is a signed `int`, and a
-                // negative bound / key count must sign-extend to be seen as one.
-                arg = coerce(lower_expr(a, b), *a.type, i64, b, l);
-            }
+            bound = cc->as<CallExpression>().arguments();
         }
-        const bool is_mbx = clt.name == "mailbox";
-        if (is_mbx) {
-            // LRM 15.4.1: "The bound shall be positive. Negative bounds are
-            // illegal and can result in indeterminate behavior, but
-            // implementations can issue a warning." Clotho never silently
-            // accepts, so it reports -- at run time, because the argument need
-            // not be constant.
-            const ir::Index bad = b.binary(ir::Inst::Tag::SLt, arg, b.constant(module_.pool.put_int(i64, 0), l), l);
-            b.open_region();
-            {
-                const std::string banner = banner_at(nc.sourceRange.start());
-                emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(nc.sourceRange.start()),
-                           "mailbox bound is negative (LRM 15.4.1)", {}, l);
-                b.finish(banner + "mailbox", 1, l);
-            }
-            const ir::ExtraSlice then_r = b.close_region();
-            b.open_region();
-            const ir::ExtraSlice else_r = b.close_region();
-            b.cond(bad, then_r, else_r, l, /*unlikely=*/true);
-        }
-        b.binary(ir::Inst::Tag::Store,
-                 b.member_select(b.handle_deref(handle, class_ref, l),
-                                 is_mbx ? kMbxBound : kSemKeys, class_ref, l),
-                 arg, l);
+        emit_sync_ctor(clt, bound, handle, class_ref, nc.sourceRange.start(), b, l);
         return handle;
     }
     emit_object_rng_seed(clt, handle, class_ref, b, l);
@@ -1177,6 +1159,21 @@ void Lowerer::emit_ctor_call(const slang::ast::ClassType&       clt,
                              ir::Index                          handle,
                              ir::Builder&                       b,
                              ir::SourceLoc                      l) {
+    if (is_weak_reference_class(clt)) {
+        // `weak_reference::new` is bodyless and built in (LRM 8.30.2); every way of
+        // constructing a weak reference, `super.new` from a derived class included,
+        // arrives here.
+        emit_weak_ctor(actuals, handle, lower_type(clt), b, l);
+        return;
+    }
+    if (is_sync_class(clt)) {
+        // So are `semaphore::new` and `mailbox::new`. Reached for a class derived
+        // from one; `new` of the built-in class itself is lower_new_class's.
+        const slang::SourceLocation where =
+          actuals.empty() ? slang::SourceLocation::NoLocation : actuals[0]->sourceRange.start();
+        emit_sync_ctor(clt, actuals, handle, lower_type(clt), where, b, l);
+        return;
+    }
     if (ctor == nullptr) {
         // No constructor: only the base part needs constructing. A ctor-less
         // class cannot take constructor arguments.
@@ -1289,6 +1286,13 @@ void Lowerer::emit_class_property_inits(const slang::ast::ClassType& clt,
         }
         const Expression* init = prop.getInitializer();
         if (init == nullptr) {
+            // A struct-typed property with no initializer of its own still takes
+            // the field-level defaults its struct type declares (LRM 7.2.1), as a
+            // variable of the type does.
+            if (aggregate_has_field_defaults(prop.getType())) {
+                const ir::SourceLoc pl = to_source_loc(prop.location);
+                emit_field_defaults(class_member_lvalue(handle, prop, class_ref, b, pl), prop.getType(), b, pl);
+            }
             continue;
         }
         const ir::SourceLoc il = loc(*init);

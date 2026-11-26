@@ -280,6 +280,7 @@ public:
     std::vector<std::pair<Ref, uint32_t>> iface_type_ids;
     std::vector<Ref>                      process_classes;
     std::vector<ChangeNotify>             change_notifies;
+    std::vector<WeakClass>                weak_classes;
     // Units whose every instance a virtual interface handle can name; flatten
     // turns them into Module::vif_scopes.
     std::vector<UnitId> vif_units;

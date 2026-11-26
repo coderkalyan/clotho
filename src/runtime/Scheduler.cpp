@@ -7,6 +7,7 @@
 // Simulation kernel: time wheel, run loop, processes, NBA and intra-assignment staging, finish.
 
 #include "Gc.h"
+#include "Trace.h"
 #include "RuntimeInternal.h"
 
 using namespace rt_internal;
@@ -284,6 +285,10 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
 
 extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
     // The record base is the timer (timer at offset 0), so recover it by cast.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The update this record armed is created now (docs/design/scheduler-trace.md, `nba_create`).
+    rt_trace_nba_release(timer, RT_TRACE_NBA_TIMER, 0);
+#endif
     intra_ready_push(reinterpret_cast<rt_intra_rec*>(timer));
 }
 
@@ -464,6 +469,10 @@ extern "C" void rt_intra_event_fire(uint32_t trig_id) {
         if (e.weak) {
             rt_gc_range_add(rec, intra_sites[rec->idx].stride);
         }
+#ifdef CLOTHO_EXTRA_ASSERTS
+        // The occurrence that matured the record is a moment of its own (rt_intra_moment).
+        rt_trace_nba_release(rec, RT_TRACE_NBA_EVENT, intra_moment);
+#endif
         intra_ready_push(rec); // last awaited edge -> commit this instant
         // First fire wins: this record is done, so take it off every OTHER trigger
         // it was listed on. Skipping `trig_id` is what keeps the loop above stable.
@@ -613,7 +622,7 @@ namespace {
 
 // Why rt_wheel_advance refused to start the next time step, for rt_sim_run to tell
 // the ways a run ends from outside the design apart.
-enum class Halt : uint8_t { None, StopTime, Interrupt };
+enum class Halt : uint8_t { None, StopTime, Interrupt, Trace };
 
 Halt g_halt = Halt::None;
 
@@ -635,6 +644,10 @@ volatile std::sig_atomic_t g_interrupt = 0;
 
 extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
     RuntimeWheel& w = *unwrap(wheel);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Every region is empty: nothing may be left staged for one that has passed (R12, R20).
+    rt_trace_slot_end();
+#endif
     // The boundary between two time steps: the one that just settled is complete
     // and sampled, and nothing of the next has run. It is the only point a run can
     // be ended from outside the design without leaving a step half done, so it is
@@ -659,6 +672,19 @@ extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
             return 0;
         }
     }
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // The scheduler trace's checker found a violation (docs/design/scheduler-trace.md): the
+    // run ends here, before any consequence of it, without the finals.
+    if (rt_trace_halted() != 0) [[unlikely]] {
+        g_halt = Halt::Trace;
+        return 0;
+    }
+    // Time moves to the next tick before the timers of that tick fire, so the checker knows the
+    // time a timer wake happens at. An idle wheel moves to no tick.
+    if (const uint64_t next = w.next_tick(); !w.empty()) {
+        rt_trace_slot(next);
+    }
+#endif
     return w.advance(ctx) ? 1 : 0;
 }
 namespace rt_internal {
@@ -792,6 +818,9 @@ void finish_report(const char* banner, uint64_t now, int32_t arg) {
 } // namespace
 
 extern "C" void rt_finish_coop(const char* banner, uint64_t now, int32_t arg) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    rt_trace_finish();
+#endif
     finish_report(banner, now, arg);
     rt_finishing = 1;
     // Returns. The caller is a JIT'd body, which leaves through its own
@@ -920,6 +949,9 @@ struct DeferReport {
     const uint64_t* gen;      // owning process's generation counter
     uint64_t        gen_val;  // generation at queue time
     bool            is_final; // final (Postponed) vs observed (#0, Observed)
+    // A deferred `cover`'s hit, filed when it matures instead of printed; `line` is empty.
+    bool     is_cover = false;
+    CoverRef cover;
 };
 std::vector<DeferReport> g_defer;
 
@@ -929,6 +961,11 @@ extern "C" void rt_defer_report(int32_t level, uint64_t is_final, const void* ge
                                 const char* banner, const rt_string* path, const char* tail, const char* fmt,
                                 uint32_t argc, const rt_arg* argv) {
     io_ensure_init();
+    if (level == 4) { // ir::Severity::Cover: a hit to count once it matures, nothing to print
+        g_defer.push_back({ {}, static_cast<const uint64_t*>(gen), gen_val, is_final != 0, true,
+                            cover_ref(banner, path, tail, fmt) });
+        return;
+    }
     // Rendered, and stamped with the time, now: the arguments are sampled at the
     // point the assertion executes, and maturation is in the same instant.
     std::string line = severity_line(level, banner, path, tail, fmt, argc, argv);
@@ -952,6 +989,10 @@ static void defer_mature(bool final_pass) {
             continue;
         }
         if (r.gen == nullptr || *r.gen == r.gen_val) {
+            if (r.is_cover) {
+                cover_file(r.cover, 0, nullptr);
+                continue;
+            }
             std::fputs(r.line.c_str(), stderr);
             wrote = true;
         }
@@ -986,6 +1027,12 @@ void sim_teardown() {
     g_strobe_queue.clear();
     g_strobe_read = 0;
     g_observed_case.clear();
+    // Cells of fork children still live at the end go back to the pool.
+    g_gen_free.clear();
+    for (const std::unique_ptr<uint64_t>& cell : g_gen_cells) {
+        *cell = 0;
+        g_gen_free.push_back(cell.get());
+    }
     g_defer.clear();
     rt_nba_arr_reset();
     rt_intra_reset();
@@ -1088,6 +1135,32 @@ int32_t g_run_status = 0;
 // reports for a process that SIGINT killed.
 constexpr int32_t kInterruptedStatus = 130;
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+// The exit status of a run the scheduler trace's checker ended (docs/design/scheduler-trace.md):
+// its own, so that a script tells it from a design's `$fatal` (1) and from an interrupt.
+constexpr int32_t kTraceViolationStatus = 99;
+
+// What the checker found, on stderr after the design's own output, and in the file
+// CLOTHO_TRACE_REPORT names, which the test runner's child processes use to hand it to their
+// parent. It is a Clotho bug or a rule that needs rewording, never a property of the design.
+void report_trace_violation() {
+    const char* const rule = rt_trace_rule();
+    if (rule == nullptr) {
+        return;
+    }
+    std::fflush(stdout);
+    std::fputs("clotho: scheduler trace violation:\n", stderr);
+    std::fputs(rt_trace_report(), stderr);
+    std::fflush(stderr);
+    if (const char* const path = std::getenv("CLOTHO_TRACE_REPORT"); path != nullptr && path[0] != '\0') {
+        if (std::FILE* const file = std::fopen(path, "w")) {
+            std::fprintf(file, "%s\n%s", rule, rt_trace_report());
+            std::fclose(file);
+        }
+    }
+}
+#endif
+
 } // namespace
 
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
@@ -1114,16 +1187,37 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // The drain stopped at a time-step boundary, so the design's state is settled
     // and the dump has every step that ran, whichever way it ended.
     const Halt halt = g_halt;
+#ifdef CLOTHO_EXTRA_ASSERTS
+    const bool traced_early = rt_trace_halted() != 0;
+#else
+    const bool traced_early = false;
+#endif
     if (halt == Halt::Interrupt) {
         // The user asked for the run to end, not for it to wrap up: no finals.
         report_halt("clotho: interrupted at ");
+    } else if (traced_early) {
+        // The checker ended the run at a violation: the design is not in a state the finals
+        // could be asked to observe.
     } else {
         if (halt == Halt::StopTime) {
             // As a $finish at the stop time would, the finals follow the report.
             report_halt("clotho: stopped at --stop-time ");
         }
+#ifdef CLOTHO_EXTRA_ASSERTS
+        // The finals run: what a `$finish` held back it holds back no longer (R24).
+        rt_trace_region(RT_TRACE_REG_FINAL);
+#endif
         finals(state, wheel);
     }
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // A final block is a trace too, so the checker is asked again.
+    const bool traced = rt_trace_halted() != 0;
+    if (traced) {
+        report_trace_violation();
+    }
+#else
+    const bool traced = false;
+#endif
     rt_gc_run_leave();
     // Functional coverage (LRM 19.9: the database is written "at the end of a
     // simulation run"). Here rather than from a synthesized `final` process
@@ -1133,12 +1227,17 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // covergroup writes nothing: rt_cover_report returns immediately on an empty
     // model. An interrupted run reports what it covered so far.
     rt_cover_report();
-    if (halt != Halt::None) {
+    if (halt != Halt::None || traced) {
         // The dump is closed by the drain; this is every other open file, which the
         // process would flush on exit but a host that keeps running would not.
         std::fflush(nullptr);
     }
     g_run_status = halt == Halt::Interrupt ? kInterruptedStatus : (g_fatal_seen ? 1 : 0);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (traced && halt != Halt::Interrupt) {
+        g_run_status = kTraceViolationStatus;
+    }
+#endif
     g_diag_wheel = nullptr;
     sim_teardown();
 }
@@ -1169,9 +1268,8 @@ void* alloc_pool_chunk(size_t bytes) {
 // and every object on the chain is a root (event_gc_roots), so the collector does
 // not follow the link and `->> e` needs no write barrier.
 
-constexpr uint64_t kEventBytes =
-  (RT_GC_HEADER_BYTES + sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
-constexpr rt_gc_map kEventMap = { kEventBytes, 0, 0, nullptr, nullptr, nullptr };
+constexpr uint64_t kEventBytes = (sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
+constexpr rt_gc_map kEventMap   = { kEventBytes, 0, 0, nullptr, nullptr, nullptr, 0, 0, nullptr };
 
 // The descriptor: the map pointer, then the bytes that separate it from the word
 // an object's vptr names (rt_gc_map_vptr_offset). Filled by rt_run_init.
@@ -1358,6 +1456,18 @@ void event_gc_release_dead(bool (*reached)(void* handle)) {
         g_event_controls[trig] = nullptr;
         g_event_trig_free.push_back(trig);
     }
+}
+
+void event_pend(void* handle) {
+    assert(handle != nullptr && "an event object is pended, not null");
+    assert(g_event_pend_head != nullptr && "an event is pended during a run");
+    auto* const e = static_cast<rt_event*>(handle);
+    if (e->pending != 0) {
+        return; // already on the chain, which holds an event once
+    }
+    e->pending         = 1;
+    e->next_pend       = *g_event_pend_head;
+    *g_event_pend_head = e;
 }
 
 void event_keep(rt_event* e) {
@@ -1712,6 +1822,10 @@ extern "C" void rt_free(void* p) {
 
 // Defined last so every process-global it arms is in scope.
 int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void)) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Every activation of the last run is gone, and so is its violation.
+    rt_trace_begin();
+#endif
     g_plusargs.clear();
     g_plusargs.reserve(config->plusarg_count);
     for (uint32_t k = 0; k < config->plusarg_count; ++k) {

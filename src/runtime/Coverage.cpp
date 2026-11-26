@@ -668,11 +668,17 @@ extern "C" void rt_cover_init(const rt_cover_config* config) {
     g_nreg = g_config->ntypes;
 }
 
+namespace rt_internal {
+// The `cover` statements' half of the report (Reports.cpp), which also forgets them.
+void cover_sites_write(std::FILE* f);
+} // namespace rt_internal
+
 extern "C" void rt_cover_report(void) {
     // No --coverage: write nothing. The design still samples and get_coverage()
     // still answers, because both are design-visible semantics that a reporting
     // option must not change (design §9).
     if (g_config == nullptr || g_config->report_path == nullptr || g_config->report_path[0] == '\0') {
+        rt_internal::cover_sites_write(nullptr);
         return;
     }
     std::FILE* f = std::fopen(g_config->report_path, "wb");
@@ -681,12 +687,15 @@ extern "C" void rt_cover_report(void) {
         // stderr and carry on. A report that cannot be written is not a reason to
         // fail a simulation that has already finished running.
         std::fprintf(stderr, "--coverage: cannot open '%s'\n", g_config->report_path);
+        rt_internal::cover_sites_write(nullptr);
         return;
     }
     assert(g_config->ntypes == g_nreg && "the registry and the model disagree on the type count");
 
     char loc[256];
-    std::fprintf(f, "clotho functional coverage (LRM 19)\n");
+    // A design with `cover` statements and no covergroup has no functional coverage to
+    // name in the title or to total.
+    std::fprintf(f, g_config->ntypes != 0 ? "clotho functional coverage (LRM 19)\n" : "clotho coverage\n");
     // Ordered by type index, then by instance creation order -- never by pointer
     // or hash order, so two runs of one design produce byte-identical reports and
     // a diff of them is a diff of the coverage.
@@ -694,7 +703,10 @@ extern "C" void rt_cover_report(void) {
         const rt_cover_type& ty = g_config->types[t];
         std::fprintf(
           f, "\ncovergroup %s  (%s)\n", or_else(ty.name, "<covergroup>"), location(loc, sizeof(loc), ty.banner));
-        for (const Inst* in = g_reg[t].head; in != nullptr; in = in->next) {
+        // LRM 19.7 [unverified wording]: instance data is saved only when option.per_instance
+        // is 1, so a covergroup that leaves it 0 reports its type line alone.
+        // get_inst_coverage() still answers: the counts are kept either way.
+        for (const Inst* in = ty.per_instance != 0 ? g_reg[t].head : nullptr; in != nullptr; in = in->next) {
             const InstResult ir = inst_result(in);
             std::fprintf(f,
                          "  instance %s  coverage %6.2f%%  bins %u/%u\n",
@@ -731,7 +743,10 @@ extern "C" void rt_cover_report(void) {
                      tr.bins.total,
                      g_reg[t].ninst);
     }
-    std::fprintf(f, "\ndesign coverage %6.2f%%\n", rt_cover_design_coverage());
+    if (g_config->ntypes != 0) {
+        std::fprintf(f, "\ndesign coverage %6.2f%%\n", rt_cover_design_coverage());
+    }
+    rt_internal::cover_sites_write(f);
     std::fclose(f);
 }
 

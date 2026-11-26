@@ -72,6 +72,10 @@ struct SignalInfo {
     // bytes into its state field's static initializer and skips the power-on
     // fill, so materializing a table costs no instructions at any point.
     Ref const_data = Ref::Invalid;
+    // This event is design-wide change notifier number `shared_notify`
+    // (ChangeNotify::shared), or ~0 for any other signal. Carried by the signal so
+    // that it reaches the backend with it, whatever unit the signal lands in.
+    uint32_t shared_notify = ~uint32_t{ 0 };
 
     bool operator==(const SignalInfo&) const = default;
 };
@@ -745,6 +749,17 @@ struct Function {
     // LogicVec/...); DpiCType::Void for a non-OpenArray argument. Parallel to
     // dpi_arg_ctypes; only populated when is_dpi.
     std::vector<DpiCType> dpi_arg_elem_ctypes;
+    // A `context` DPI import (LRM 35.5.3): its call sets the current scope -- the one
+    // svGetScope answers and an export several scopes share dispatches on -- to the
+    // scope that declares the import, and puts the caller's back when it returns.
+    // `dpi_scope` names that scope without naming an instance, so every instance of a
+    // specialization lowers identically: for a subroutine of an instance it is the
+    // generate blocks between the instance and the declaration (".blk[1]", empty for
+    // the instance body itself), which the backend appends to the instance's path;
+    // for a package's or `$unit`'s, which belong to no instance, it is the whole name.
+    // Only meaningful when dpi_context.
+    bool        dpi_context = false;
+    std::string dpi_scope;
     // Full source extent of the subroutine declaration. Empty for a
     // compiler-synthesized body (a $strobe/$monitor thunk, a fork child).
     SourceSpan span;
@@ -781,6 +796,11 @@ struct DpiExport {
     // `int` whatever ret_ctype says (a task has no SV return; the int is 35.9's
     // disable channel). ret_ctype is always Void here.
     bool is_task = false;
+    // The scope the export is declared in, spelled as Function::dpi_scope spells the
+    // scope of a context import. A c_identifier exported from several scopes (LRM
+    // 35.4) is one C symbol with one DpiExport per scope, and the symbol runs the
+    // export of the scope that is current when C calls it.
+    std::string scope;
 };
 
 // Deepest inheritance chain a class may have (LRM 8.13 puts no limit on it).
@@ -918,6 +938,14 @@ inline constexpr uint32_t kNoNotify = ~uint32_t{ 0 };
 // rather than stored. It therefore carries a single Any notifier that fires on
 // every MUTATION, which is sound only for the level-sensitive `wait` of LRM
 // 9.4.3 -- see docs/design/classes.md, "Waiting on a container property".
+//
+// A property that a method called from an `@` or `wait` reads has no object for the
+// waiter to name: the method can reach any object. Such a property has a notifier
+// for the whole design instead (`shared`), an event that a change of the property
+// on ANY object fires, which LRM 9.4.2 allows ("An implementation may cause the
+// event expression to be reevaluated when changing the value or size even if the
+// members are not referenced by the method or function"). Its waiters re-evaluate
+// their expression on every wake, so the extra fires cost a re-test each.
 struct ChangeNotify {
     Ref class_ref = Ref::Invalid;
     // Object-body field index of the notified property.
@@ -927,6 +955,27 @@ struct ChangeNotify {
     // The property is a container, so `field[Any]` fires on mutation and the
     // other two are always kNoNotify (`@` over a container is refused).
     bool container = false;
+    // The number of the property's design-wide notifier (SignalInfo::shared_notify),
+    // or kNoNotify.
+    uint32_t shared = kNoNotify;
+
+    // Whether a change of kind `edge` has anything to fire.
+    [[nodiscard]] bool wants(Edge edge) const {
+        return field[static_cast<uint32_t>(edge)] != kNoNotify || (edge == Edge::Any && shared != kNoNotify);
+    }
+};
+
+// A class whose instances are weak references (LRM 8.30): `std::weak_reference
+// #(T)`, or a class derived from one. `referent_field` is the object-body field
+// that holds the referent's handle. It is typed as the handle it is, so loads,
+// stores and copies treat it as any handle property. The backend alone treats it
+// differently: it leaves the field out of the class's trace map and names it there
+// instead (rt_gc_map::weak_referent), and the collector stores null in it when the
+// referent is reachable no other way. A wait on `get()` parks on that field's
+// any-change notifier, which is an ordinary ChangeNotify entry.
+struct WeakClass {
+    Ref      class_ref      = Ref::Invalid;
+    uint32_t referent_field = 0;
 };
 
 class Module {
@@ -1131,6 +1180,26 @@ public:
         return false;
     }
 
+    // Record that `class_ref` is a weak-reference class (WeakClass).
+    void set_weak_class(Ref class_ref, uint32_t referent_field) {
+        for (const WeakClass& w : weak_classes_) {
+            if (w.class_ref == class_ref) {
+                return;
+            }
+        }
+        weak_classes_.push_back(WeakClass{ .class_ref = class_ref, .referent_field = referent_field });
+    }
+
+    // The weak-reference record of `class_ref`, or null for any other class.
+    const WeakClass* weak_class(Ref class_ref) const {
+        for (const WeakClass& w : weak_classes_) {
+            if (w.class_ref == class_ref) {
+                return &w;
+            }
+        }
+        return nullptr;
+    }
+
     // The descriptor of a class type, or null when the type has not been lowered
     // as a class (every lowered class registers one).
     const ClassDesc* class_desc(Ref class_ref) const {
@@ -1170,6 +1239,24 @@ public:
         change_notifies_.push_back(cn);
     }
 
+    // Give a class property its design-wide notifier (ChangeNotify::shared).
+    void set_change_notify_shared(Ref class_ref, uint32_t prop_field, uint32_t shared, bool container) {
+        assert(shared != kNoNotify && "a design-wide notifier has a number");
+        for (ChangeNotify& cn : change_notifies_) {
+            if (cn.class_ref == class_ref && cn.prop_field == prop_field) {
+                cn.shared    = shared;
+                cn.container = container;
+                return;
+            }
+        }
+        ChangeNotify cn;
+        cn.class_ref  = class_ref;
+        cn.prop_field = prop_field;
+        cn.shared     = shared;
+        cn.container  = container;
+        change_notifies_.push_back(cn);
+    }
+
     // The change notifiers of one class property, or null when nothing in the design
     // waits on it. The empty-table early-out is what makes a design that waits on no
     // property pay nothing here: the store path asks this at every member select.
@@ -1198,6 +1285,11 @@ public:
     // Every waited-on class property's notifiers.
     [[nodiscard]] std::span<const ChangeNotify> change_notifies() const {
         return change_notifies_;
+    }
+
+    // Every weak-reference class, in registration order.
+    [[nodiscard]] std::span<const WeakClass> weak_classes() const {
+        return weak_classes_;
     }
 
     // Hand the pool to a new owner, as partition does once it has copied every
@@ -1229,6 +1321,8 @@ private:
     // (class Ref, property field). Empty in a design that waits on no property,
     // which is what change_notify's early-out keys on.
     std::vector<ChangeNotify> change_notifies_;
+    // The weak-reference classes (LRM 8.30), one entry per class Ref.
+    std::vector<WeakClass> weak_classes_;
     // Next InstanceScope::id (see alloc_scope_id).
     uint32_t next_scope_id_ = 0;
 };

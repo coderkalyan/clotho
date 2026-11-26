@@ -296,6 +296,12 @@ FetchContent_Declare(
   # two-bit vector. A built-in system function cannot be replaced from outside:
   # Compilation::addSystemSubroutine keeps the subroutine already registered under
   # a name. Not upstream.
+  #
+  # slang-type-param-override: `-G T=<type>` on a top-level type parameter was dropped
+  # silently: slang's cli overrides skipped `isTypeParam` and parsed every value as an
+  # expression. The value now parses as a data type when it is no expression, and the
+  # override reaches the type parameter's builder through the hierarchy override node,
+  # keyed by its declarator like a value parameter's (LRM 6.20.3, 23.10.2). Not upstream.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  "-DPATCH_SET_HASH=${clotho_slang_patch_hash}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
@@ -403,10 +409,12 @@ if(CLOTHO_SVA)
   set(_libsva_include ${_libsva_prefix}/inc)
   file(GLOB _libsva_sources "${CLOTHO_LIBSVA_DIR}/src/*.zig")
 
-  # -Dcpu=baseline: Zig otherwise targets the build machine's CPU, and the
-  # compiler_rt it bundles into libsva supplies clotho's memcpy and memset, so a
-  # binary built on a machine with newer vector extensions died with SIGILL at
-  # startup on an older one.
+  # -Dcpu=baseline: Zig otherwise targets the build machine's CPU, for libsva's
+  # code and for the compiler_rt it bundles. That compiler_rt once supplied
+  # clotho's memcpy and memset as well, so a binary built on a machine with newer
+  # vector extensions died with SIGILL at startup on an older one. libsva keeps
+  # those names to itself on ELF now (tests/runtime_test.cpp holds it to that);
+  # the rest of its code still has to run wherever clotho does.
   set(_libsva_zig_args -Doptimize=${_libsva_optimize} -Dcpu=baseline)
   if(CLOTHO_LIBSVA_ZIG_TARGET)
     list(APPEND _libsva_zig_args -Dtarget=${CLOTHO_LIBSVA_ZIG_TARGET})
@@ -455,6 +463,7 @@ add_library(clotho_runtime STATIC
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
   src/runtime/Wheel.cpp
+  src/runtime/TraceCheck.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # unordered_dense is header-only (INTERFACE), so it adds only an include dir:
@@ -569,6 +578,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/Stores.cpp
   src/ir/llvm/Subroutines.cpp
   src/ir/llvm/SystemTasks.cpp
+  src/ir/llvm/Trace.cpp
   src/ir/llvm/Vcd.cpp
   src/ir/Jit.cpp
   src/ir/CoffArm64.cpp
@@ -825,6 +835,7 @@ add_library(clotho_runtime_exe STATIC
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
   src/runtime/Wheel.cpp
+  src/runtime/TraceCheck.cpp
   src/runtime/ExeMain.cpp
   src/runtime/ExeSupport.cpp
 )
@@ -1127,6 +1138,7 @@ set(CLOTHO_TEST_SOURCES
   tests/memory_bounds_test.cpp
   tests/invalid_index_test.cpp
   tests/encoding_check_test.cpp
+  tests/trace_check_test.cpp
   tests/queue_test.cpp
   tests/associative_array_test.cpp
   tests/array_ordering_test.cpp
@@ -1134,6 +1146,8 @@ set(CLOTHO_TEST_SOURCES
   tests/class_test.cpp
   tests/gc_test.cpp
   tests/gc_model_test.cpp
+  tests/weak_reference_test.cpp
+  tests/heap_wait_test.cpp
   tests/unbased_test.cpp
   tests/preprocess_test.cpp
   tests/interface_test.cpp
@@ -1293,6 +1307,22 @@ if(NOT WIN32)
   endforeach()
 endif()
 
+# The C sides of the svScope tests in tests/dpi_test.cpp: native code that selects an
+# instance with svSetScope and calls an export several scopes share. Only a relocatable
+# object can reach an export, so those tests link one into the JIT; dpi_test.cpp learns
+# its path from the definitions below, which are set on that file alone so that the
+# rest of the suite does not rebuild with them.
+if(NOT WIN32)
+  foreach(name IN ITEMS dpi_scope dpi_scope_task)
+    add_library(clotho_${name}_object OBJECT tests/dpi_scope/${name}.c)
+    set_target_properties(clotho_${name}_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(clotho_${name}_object PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime")
+    add_dependencies(clotho_test clotho_${name}_object)
+  endforeach()
+  set_source_files_properties(tests/dpi_test.cpp PROPERTIES COMPILE_DEFINITIONS
+    "CLOTHO_DPI_SCOPE_OBJECT=\"$<TARGET_OBJECTS:clotho_dpi_scope_object>\";CLOTHO_DPI_SCOPE_TASK_OBJECT=\"$<TARGET_OBJECTS:clotho_dpi_scope_task_object>\"")
+endif()
+
 # A --dpi-lib definition wins over a same-named libc symbol, under the JIT and
 # in a linked executable alike. getpid is the probe: libc defines it, LLVM never
 # synthesizes it, and the real value cannot be 31337.
@@ -1313,7 +1343,7 @@ endif()
 # there could neither link nor load. The compiler that builds it is sanitized.
 if(CLOTHO_SANITIZE)
   foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared clotho_dpi_shadow
-                 clotho_gc_dpi_object)
+                 clotho_gc_dpi_object clotho_dpi_scope_object clotho_dpi_scope_task_object)
     if(TARGET ${target})
       target_compile_options(${target} PRIVATE -fno-sanitize=all)
       target_link_options(${target} PRIVATE -fno-sanitize=all)

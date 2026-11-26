@@ -826,6 +826,7 @@ private:
         d_.iface_type_ids.assign(m_.iface_type_ids().begin(), m_.iface_type_ids().end());
         d_.process_classes.assign(m_.process_classes().begin(), m_.process_classes().end());
         d_.change_notifies.assign(m_.change_notifies().begin(), m_.change_notifies().end());
+        d_.weak_classes.assign(m_.weak_classes().begin(), m_.weak_classes().end());
         for (const uint32_t scope : m_.vif_scopes) {
             d_.vif_units.push_back(UnitId{ unit_of_scope(scope) });
         }

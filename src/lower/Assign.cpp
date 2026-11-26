@@ -123,7 +123,7 @@ bool Lowerer::struct_has_field_defaults(const slang::ast::Type& t) {
         return false;
     }
     for (const auto& f : ct.as<slang::ast::UnpackedStructType>().membersOfType<slang::ast::FieldSymbol>()) {
-        if (f.getInitializer() != nullptr || struct_has_field_defaults(f.getType())) {
+        if (f.getInitializer() != nullptr || aggregate_has_field_defaults(f.getType())) {
             return true;
         }
     }
@@ -156,9 +156,8 @@ void Lowerer::emit_struct_field_defaults(ir::Index               lhs,
             } else {
                 b.binary(ir::Inst::Tag::Store, fld_lv, coerce(rhs, *init->type, lower_type(f.getType()), b, l), l);
             }
-        } else if (struct_has_field_defaults(f.getType())) {
-            emit_struct_field_defaults(
-              b.member_select(lhs, idx, sty, l), lower_type(f.getType()), f.getType(), b, l);
+        } else if (aggregate_has_field_defaults(f.getType())) {
+            emit_field_defaults(b.member_select(lhs, idx, sty, l), f.getType(), b, l);
         }
         ++idx;
     }
@@ -177,25 +176,29 @@ bool Lowerer::aggregate_has_field_defaults(const slang::ast::Type& t) {
     return false;
 }
 
-// Apply a struct-typed variable's field-level default initializers when
-// the variable itself has none (see struct_has_field_defaults /
-// emit_struct_field_defaults). An array of such a struct is a documented
-// follow-up: loud-guarded, not a silent no-op, since silently skipping it
-// would leave every element at its plain power-on value with the field
-// defaults dropped -- the exact bug this function exists to fix.
-void Lowerer::emit_var_field_defaults(const VariableSymbol& vs, ir::Index lv, ir::Builder& b, ir::SourceLoc l) {
-    if (!aggregate_has_field_defaults(vs.getType())) {
+// Apply the field-level default initializers an unpacked struct type declares
+// (struct_has_field_defaults) to `lv`, a place of type `sv_type` with no
+// initializer of its own: a struct directly, a fixed-size unpacked array of
+// them element by element. Only called when aggregate_has_field_defaults holds.
+void Lowerer::emit_field_defaults(ir::Index lv, const slang::ast::Type& sv_type, ir::Builder& b, ir::SourceLoc l) {
+    const slang::ast::Type& ct = sv_type.getCanonicalType();
+    const ir::Ref           ty = lower_type(ct);
+    if (ct.isUnpackedStruct()) {
+        emit_struct_field_defaults(lv, ty, ct, b, l);
         return;
     }
-    if (is_unpacked_struct(vs.getType())) {
-        emit_struct_field_defaults(lv, lower_type(vs.getType()), vs.getType(), b, l);
-        return;
+    const auto&     arr = ct.as<slang::ast::FixedSizeUnpackedArrayType>();
+    // A copy: the loop interns constants and lowers each element, and either can
+    // grow the pool and move what a reference into it would point at.
+    const ir::Type  t   = std::get<ir::Type>(module_.pool.get(ty));
+    const uint32_t  n   = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+    for (uint32_t k = 0; k < n; ++k) {
+        const int32_t coord =
+          t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+        const ir::Index idx = b.constant(
+          module_.pool.put_int(make_int_type(32, false), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
+        emit_field_defaults(b.elem_select(lv, idx, ty, l), arr.elementType, b, l);
     }
-    // TODO: an array of a struct with field-level defaults, and no array
-    // initializer of its own -- each element needs the same per-field
-    // defaulting emit_struct_field_defaults does for a bare struct.
-    fail("an array of a struct with field-level default initializers, and no "
-         "array initializer of its own, is not supported");
 }
 
 // Store a string literal into a fixed-size unpacked array of byte-shaped
@@ -960,9 +963,24 @@ void Lowerer::emit_handle_literal_init(ir::Index                          lhs,
         }
         return;
     }
-    b.queue_delete(lhs, lhs, /*has_idx*/ false, type, l);
+    // A literal longer than a bounded queue holds is built whole in an unbounded temp and
+    // assigned once, so it reports one overflow with its full count (docs/LRM_NOTES.md,
+    // note 6) rather than one per element past the bound.
+    const bool overflows = t.left != 0 && count > static_cast<uint32_t>(t.left) + 1;
+    ir::Ref    build_ty  = type;
+    ir::Index  build     = lhs;
+    if (overflows) {
+        ir::Type unbounded = t;
+        unbounded.left     = 0;
+        build_ty           = module_.pool.put(ir::Item{ unbounded });
+        build              = make_arg_temp(build_ty, b, l);
+    }
+    b.queue_delete(build, build, /*has_idx*/ false, build_ty, l);
     for (uint32_t k = 0; k < count; ++k) {
-        b.queue_push(lhs, lower_container_element_value(*elems[k % n], type, b, l), /*front*/ false, type, l);
+        b.queue_push(build, lower_container_element_value(*elems[k % n], build_ty, b, l), /*front*/ false, build_ty, l);
+    }
+    if (overflows) {
+        b.queue_copy(lhs, build, type, l);
     }
 }
 

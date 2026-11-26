@@ -58,6 +58,16 @@ std::string Backend::bounds_name(const LValueInfo& lv) const {
     return lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>");
 }
 
+std::string Backend::queue_site_name(const LValueInfo& lv, uint64_t bound) const {
+    if (bound == 0 || !lv.is_signal) {
+        return {};
+    }
+    // The declared name alone: the signal's full name carries its instance's path, which
+    // differs between instances that run this code (shared code bakes no instance fact).
+    const std::string& full = mod_.signal(lv.sig).name;
+    return full.substr(full.rfind('.') == std::string::npos ? 0 : full.rfind('.') + 1);
+}
+
 // Record an array-element check on `target` (the lvalue the select produces)
 // for later reporting. `named` is the lvalue that knows what was indexed --
 // the same as `target` for an in-place fixed-array select, the base lvalue
@@ -563,16 +573,21 @@ llvm::Constant* Backend::tagged_site_global(const SourceText& at, const TaggedCh
 
 // One constant rt_alloc_site per allocating call. Everything the fatal knows
 // is compile-time, so only the simulation time travels as an argument.
-// `what` is the diagnostic noun naming the container being grown.
-llvm::Constant* Backend::alloc_site_global(const SourceText& at, std::string_view what) {
+// `what` is the diagnostic noun naming the container being grown; `name` is its declared
+// name for a report that names it (empty: no name, a null pointer in the record).
+llvm::Constant* Backend::alloc_site_global(const SourceText& at, std::string_view what, std::string_view name) {
     auto* const i32  = b_.getInt32Ty();
     auto* const rec  = alloc_site_ty();
+    llvm::Constant* name_ptr = name.empty()
+                                 ? static_cast<llvm::Constant*>(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(raw_ptr_ty())))
+                                 : static_cast<llvm::Constant*>(b_.CreateGlobalString(name, "alloc.name"));
     auto*       init = llvm::ConstantStruct::get(
       rec, { b_.CreateGlobalString(at.where, "alloc.at"),
              b_.CreateGlobalString(at.line, "alloc.src"),
              b_.CreateGlobalString(what, "alloc.what"),
              llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
-             llvm::ConstantInt::get(i32, at.end_column) });
+             llvm::ConstantInt::get(i32, at.end_column),
+             name_ptr });
     return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init,
                                     "clotho.alloc.site");

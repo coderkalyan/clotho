@@ -724,6 +724,12 @@ private:
                     m_.set_change_notify(cn.class_ref, cn.prop_field, static_cast<Edge>(e), cn.field[e], cn.container);
                 }
             }
+            if (cn.shared != kNoNotify) {
+                m_.set_change_notify_shared(cn.class_ref, cn.prop_field, cn.shared, cn.container);
+            }
+        }
+        for (const WeakClass& w : d_.weak_classes) {
+            m_.set_weak_class(w.class_ref, w.referent_field);
         }
         for (const UnitId u : d_.vif_units) {
             for (const uint32_t ii : instances_of_[static_cast<uint32_t>(u)]) {
@@ -798,6 +804,8 @@ Function signature_of(const Function& f) {
         .dpi_arg_ctypes      = f.dpi_arg_ctypes,
         .dpi_ret_ctype       = f.dpi_ret_ctype,
         .dpi_arg_elem_ctypes = f.dpi_arg_elem_ctypes,
+        .dpi_context         = f.dpi_context,
+        .dpi_scope           = f.dpi_scope,
         .span                = f.span,
         .scope               = f.scope,
     };

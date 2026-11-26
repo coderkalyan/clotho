@@ -742,9 +742,7 @@ constexpr size_t kHelpKeyMax = 32;
 // The slang options a command's help lists beside Clotho's own: the ones most
 // designs need, in the order they are listed. `--help-all` lists the rest. This
 // only names options; slang's registration stays the one record of what each
-// takes and says. `-W` and `--diag-json` are slang options Clotho accepts without
-// effect (`-W` changes nothing about design diagnostics, nothing writes the JSON),
-// so only `--help-all` shows them until they work.
+// takes and says.
 constexpr std::string_view kCommonSourceOptions[] = {
     "-f",
     "-F",
@@ -762,6 +760,8 @@ constexpr std::string_view kCommonSourceOptions[] = {
     "-j",
     "--error-limit",
     "--color-diagnostics",
+    "-W",
+    "--diag-json",
 };
 
 // An option as slang's help text prints it.
@@ -1463,6 +1463,8 @@ int main(int argc, char** argv) {
     // report on and translate the design as written.
     const bool keep_unread =
       options.keep_unread_logic == true || (command != Command::Build && command != Command::Run);
+    // `--diag-json -` puts the diagnostics on stdout as JSON, and then they are not also text.
+    const bool json_to_stdout = driver->options.diagJson.has_value() && *driver->options.diagJson == "-";
     const clotho::LowerResult result = clotho::lower_driver(std::move(driver),
                                                             tp,
                                                             config.allow_system,
@@ -1470,7 +1472,7 @@ int main(int argc, char** argv) {
                                                             options.allow_port_coercion == true,
                                                             config.stats,
                                                             keep_unread);
-    if (!result.diagnostics.empty()) {
+    if (!result.diagnostics.empty() && !json_to_stdout) {
         std::print(stderr, "{}", result.diagnostic_text());
     }
     // `lint`: the diagnostics ARE the artifact, so stop here.

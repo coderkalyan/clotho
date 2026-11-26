@@ -47,14 +47,29 @@ const Symbol* Lowerer::outermost_named_block(const Statement& body) {
 
 namespace {
 
-// Whether `body` itself queues deferred assertion reports: a deferred statement anywhere in it,
-// but not in a subroutine it calls (a deferred assertion there is refused,
-// lower_immediate_assertion).
+// What `body` itself queues reports of: a deferred statement anywhere in it, or a
+// unique/priority if or case, but not in a subroutine it calls (a deferred assertion there
+// is refused, lower_immediate_assertion; the reports of a called subroutine are tagged with
+// the caller's generation by the backend).
 struct DeferredAssertionScan : ASTVisitor<DeferredAssertionScan, VisitFlags::AllGood> {
-    bool found = false;
+    bool found   = false; // a deferred assertion
+    bool flushes = false; // a deferred assertion or a unique/priority statement
 
     void handle(const ImmediateAssertionStatement& s) {
-        found = found || s.isDeferred;
+        found   = found || s.isDeferred;
+        flushes = flushes || s.isDeferred;
+        visitDefault(s);
+    }
+    void handle(const ConditionalStatement& s) {
+        flushes = flushes || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const CaseStatement& s) {
+        flushes = flushes || s.check != slang::ast::UniquePriorityCheck::None;
+        visitDefault(s);
+    }
+    void handle(const slang::ast::PatternCaseStatement& s) {
+        flushes = flushes || s.check != slang::ast::UniquePriorityCheck::None;
         visitDefault(s);
     }
 };
@@ -64,6 +79,13 @@ bool holds_deferred_assertion(const Statement& body) {
     body.visit(scan);
 
     return scan.found;
+}
+
+bool holds_flushable_reports(const Statement& body) {
+    DeferredAssertionScan scan;
+    body.visit(scan);
+
+    return scan.flushes;
 }
 
 // The implicit block a label gives a deferred assertion (`a1: assert #0 (...) ...;`, LRM 9.3.5).
@@ -98,7 +120,8 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
 
     // Whether its own body queues deferred assertion reports, which makes each event control and
     // wait statement in it a flush point (LRM 16.4.2); see flush_deferred_on_resume.
-    proc_defers_ = holds_deferred_assertion(sym.getBody());
+    proc_defers_  = holds_deferred_assertion(sym.getBody());
+    proc_flushes_ = holds_flushable_reports(sym.getBody()) || body_may_report(sym.getBody());
 
     // A module-item concurrent assertion is not a process of its own. slang
     // wraps it in ProceduralBlockSymbol(Always, isFromAssertion) purely to
@@ -184,7 +207,8 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
         if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
             infer = true;
             body  = &timed.stmt;
-        } else if (is_event_control(timed.timing) && !sensitivity_needs_handle(timed.timing)) {
+        } else if (is_event_control(timed.timing) && !sensitivity_needs_handle(timed.timing) &&
+                   !event_control_sampled(timed.timing)) {
             iff_guard    = collect_wait_events(timed.timing, wait_events);
             body         = &timed.stmt;
             proc_timing_ = &timed.timing;
@@ -1042,7 +1066,7 @@ void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool forc
     if (aggregate_has_field_defaults(vs.getType())) {
         // The struct type declares field-level defaults (LRM 7.2 / 8.8), which
         // override the type defaults just written.
-        emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+        emit_field_defaults(value_lvalue(vs, b, l), vs.getType(), b, l);
     }
 }
 
@@ -1163,7 +1187,7 @@ void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
             }
             ir::Builder&        b = *preinit_;
             const ir::SourceLoc l = to_source_loc(vs.location);
-            emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+            emit_field_defaults(value_lvalue(vs, b, l), vs.getType(), b, l);
         }
         return;
     }
@@ -1427,7 +1451,8 @@ ir::Index Lowerer::foreach_base_lv(const ForeachLoopStatement& f, size_t dim, ir
     ir::Index base = lower_lvalue(f.arrayRef, b);
     for (size_t k = 0; k < dim; ++k) {
         const ir::Ref   cref = foreach_dim_ref(f, k);
-        const ir::Type& cty  = std::get<ir::Type>(module_.pool.get(cref));
+        // Read now: lowering the loop variable below can grow the pool.
+        const bool      is_assoc = std::get<ir::Type>(module_.pool.get(cref)).kind == ir::Type::Kind::Assoc;
         const ForeachLoopStatement::LoopDim& d = f.loopDims[k];
         if (d.loopVar == nullptr) {
             // `foreach (a[, i])` where dimension k is runtime-sized: there is no
@@ -1439,8 +1464,7 @@ ir::Index Lowerer::foreach_base_lv(const ForeachLoopStatement& f, size_t dim, ir
                  "skipped is not supported");
         }
         const ir::Index iter = b.unary(ir::Inst::Tag::Load, value_lvalue(*d.loopVar, b, l), l);
-        base = cty.kind == ir::Type::Kind::Assoc ? b.assoc_select(base, iter, cref, l)
-                                                 : b.elem_select(base, iter, cref, l);
+        base = is_assoc ? b.assoc_select(base, iter, cref, l) : b.elem_select(base, iter, cref, l);
     }
     return base;
 }

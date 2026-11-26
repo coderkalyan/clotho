@@ -95,7 +95,7 @@ void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src, const rt_all
             return;
         case rt_elem_queue:
             rt_queue_assign(static_cast<rt_queue*>(dst), static_cast<const rt_queue*>(src),
-                            o->inner, site);
+                            o->inner, o->bound, site);
             return;
         case rt_elem_assoc:
             rt_assoc_assign(static_cast<rt_assoc*>(dst), static_cast<const rt_assoc*>(src),
@@ -578,7 +578,17 @@ extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
     ++h->epoch;
 }
 
-extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
+// How many of `len` source elements a queue with max index `bound` keeps (0 is
+// unbounded); reports the overflow, one per assignment, when it drops any.
+static uint64_t queue_assign_keep(uint64_t len, uint64_t bound, const rt_alloc_site* site) {
+    if (bound == 0 || len <= bound + 1) {
+        return len;
+    }
+    rt_queue_overflow_report(site, bound, len, rt_diag_now());
+    return bound + 1;
+}
+
+extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops, uint64_t bound,
                                 const rt_alloc_site* site) {
     if (dst == src) {
         return;
@@ -588,30 +598,31 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
         return;
     }
     const uint64_t stride = ops->stride;
+    const uint64_t keep   = queue_assign_keep(src->len, bound, site);
     auto* buf = static_cast<uint8_t*>(
-        rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
+        rt_alloc_elems_checked(keep, stride, site, rt_diag_now()));
     if (!elem_managed(ops)) {
-        for (uint64_t i = 0; i < src->len; ++i) {
+        for (uint64_t i = 0; i < keep; ++i) {
             std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
         }
     } else {
         assert(ops->copy != nullptr && "a managed queue element has a copy kernel");
-        for (uint64_t i = 0; i < src->len; ++i) {
+        for (uint64_t i = 0; i < keep; ++i) {
             ops->copy(buf + i * stride, q_elem(src, stride, i), site);
         }
     }
     dst->base = buf;
     dst->head = 0;
-    dst->len  = src->len;
-    dst->cap  = src->len;
+    dst->len  = keep;
+    dst->cap  = keep;
 }
 
 // Deep-copy a dynamic array into a queue (LRM 7.10 assignment compatibility):
 // `q = d`. The source is an rt_dynarr (contiguous {data,len}), NOT an rt_queue,
 // so it cannot go through rt_queue_assign, whose struct layout differs. An empty
 // source clears the queue to size 0.
-extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
-                                       const rt_elem_ops* ops, const rt_alloc_site* site) {
+extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops,
+                                       uint64_t bound, const rt_alloc_site* site) {
     // No dst == src guard, unlike every sibling assign: the operands are an
     // rt_queue and an rt_dynarr: distinct handle types that can never name the
     // same object, so the comparison could only ever be false. A comment costs
@@ -621,21 +632,22 @@ extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
         return;
     }
     const uint64_t stride = ops->stride;
+    const uint64_t keep   = queue_assign_keep(src->len, bound, site);
     const auto*    sdata  = static_cast<const uint8_t*>(src->data);
     auto* buf = static_cast<uint8_t*>(
-        rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
+        rt_alloc_elems_checked(keep, stride, site, rt_diag_now()));
     if (!elem_managed(ops)) {
-        std::memcpy(buf, sdata, static_cast<size_t>(src->len * stride));
+        std::memcpy(buf, sdata, static_cast<size_t>(keep * stride));
     } else {
         assert(ops->copy != nullptr && "a managed queue element has a copy kernel");
-        for (uint64_t i = 0; i < src->len; ++i) {
+        for (uint64_t i = 0; i < keep; ++i) {
             ops->copy(buf + i * stride, sdata + i * stride, site);
         }
     }
     dst->base = buf;
     dst->head = 0;
-    dst->len  = src->len;
-    dst->cap  = src->len;
+    dst->len  = keep;
+    dst->cap  = keep;
 }
 
 // Deep-copy a queue into a dynamic array (LRM 7.5.1 resizeable assignment):
