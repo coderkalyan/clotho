@@ -2017,7 +2017,7 @@ ir::Index Lowerer::sampled_event_hit(ir::Index            old,
     if (edge == slang::ast::EdgeKind::None) {
         if (module_.pool.is_float(ty)) {
             // The bit patterns, as a real signal's store compares them: a NaN is the
-            // value it was, and +0.0 is not -0.0.
+            // value it was, and +0.0 is not -0.0 (docs/LRM_NOTES.md, note 75; provisional).
             const ir::Ref   bits     = make_int_type(module_.pool.layout(ty).width, false);
             const ir::Index now_bits = b.float_cvt(T::FBitcast, cur, bits, l);
             const ir::Index was_bits = b.float_cvt(T::FBitcast, old, bits, l);

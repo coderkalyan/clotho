@@ -555,3 +555,32 @@ TEST_CASE("wait and @ on a method that reads an aggregate property") {
     )";
     CHECK(run_capture(src) == "wait f 2\nat f 2\nat a 4\ndone 5\n");
 }
+
+// What a change of a `real` is (docs/LRM_NOTES.md, note 75, provisional): its bit
+// pattern, for a plain `@(r)` and for a sampled wait alike. 0.0 to -0.0 is a change,
+// a NaN stored again over the same NaN is not, and -0.0 to a NaN and back are. No
+// oracle: the LRM does not decide it, and iverilog 13 sees no event on 0.0 to -0.0.
+TEST_CASE("a real changes when its bit pattern does, for @(r) and a sampled wait") {
+    constexpr std::string_view src = R"(
+        class C; real r; function real get(); return r; endfunction endclass
+        module m;
+          real r, z, nan;
+          C c;
+          integer n_plain = 0, n_sampled = 0;
+          initial begin
+            z = 0.0; nan = z / z; r = 0.0; c = new; c.r = 0.0;
+            fork
+              forever begin @(r) n_plain++; end
+              forever begin @(c.get()) n_sampled++; end
+            join_none
+            #1 r = -0.0;  c.r = -0.0;
+            #1 r = nan;   c.r = nan;
+            #1 r = nan;   c.r = nan;
+            #1 r = -0.0;  c.r = -0.0;
+            #1 $display("plain %0d sampled %0d", n_plain, n_sampled);
+            $finish;
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "plain 3 sampled 3\n");
+}

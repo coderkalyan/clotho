@@ -1145,3 +1145,19 @@ as 0 (`next` found the entry after 0). `first` and `last` do not read their argu
 unchanged.
 
 Code: `src/ir/llvm/AssocArrays.cpp` (`lower_assoc_traverse`). Tests: `tests/associative_array_test.cpp` ("assoc next/prev with an x or z index argument finds nothing and warns").
+
+## 75. What counts as a change of a `real` (9.4.2, 6.12)
+
+9.4.2 wakes an event control on a change of its operand's value, and 6.12 makes a
+`real` an IEEE 754 double, but no clause says whether two values that compare equal
+yet differ in bits (`0.0` and `-0.0`), or a NaN stored over the same NaN, are a
+change. Clotho compares bit patterns, at a real variable's store (whose slot is the
+bit pattern) and in a sampled wait alike: `0.0` to `-0.0` is a change, which `1.0/r`
+can tell apart, and a NaN stored again over the same NaN is not. Comparing with `==`
+would instead make `0.0` to `-0.0` no change, as iverilog 13 does for `@(r)`, and a
+NaN a change at every comparison.
+
+Provisional: the project owner chose the bit-pattern reading for now and may revisit
+it.
+
+Code: `src/ir/llvm/Backend.h` (real storage as its bit pattern), `src/lower/Timing.cpp` (`sampled_event_hit`). Tests: `tests/heap_wait_test.cpp` ("a real changes when its bit pattern does, for @(r) and a sampled wait"). Oracle: iverilog 13 differs on `0.0` to `-0.0` (no event).
