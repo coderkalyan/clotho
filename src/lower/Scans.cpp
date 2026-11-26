@@ -161,11 +161,27 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e) 
 // in that order because slang answers isDynamicallySizedArray() for an
 // associative array too (foreach_dim_ref was bitten by exactly that).
 //
-// A FIXED unpacked array is deliberately absent. Its storage never changes
-// extent, so it has no mutation op at all -- every write to one is an element
-// store -- and it is refused rather than given a notifier nothing would fire.
+// A FIXED unpacked array is deliberately absent: its extent never changes, so it has
+// no mutation op, and every write to one is an element store. It is an aggregate
+// (is_notified_aggregate).
 bool is_notified_container(const slang::ast::Type& ty) {
     return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
+}
+
+// The aggregates whose members one any-change notifier covers: an unpacked struct, an
+// unpacked union and a FIXED unpacked array. The property is one variable, and LRM
+// 9.4.2.2 adds a variable the statement reads, not a member of it, so a change
+// anywhere in it wakes. A store to a leaf or an element classifies its own old -> new
+// transition, as a scalar property's does, and fires the property's notifier; a copy
+// over the whole of it, and a mutation of a container inside it, fire it too. There is no
+// edge notifier: an edge is the least significant bit of an expression (LRM 9.4.2),
+// which an aggregate has none of, and `@` over a whole aggregate is no legal event
+// expression (9.4.2: "Event expressions shall return singular values").
+//
+// An event member is no value a wait or `@*` reads, so a trigger fires nothing; the
+// member's own stores (its non-event siblings') do.
+bool is_notified_aggregate(const slang::ast::Type& ty) {
+    return ty.isUnpackedStruct() || ty.isUnpackedUnion() || (ty.isUnpackedArray() && !is_notified_container(ty));
 }
 
 PropNotify prop_notify_kind(const slang::ast::Type& ty) {
@@ -221,13 +237,125 @@ const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e
     return prop;
 }
 
-// Either kind: what a `wait` condition can park on. The design-wide pre-pass and
-// the wait lowering MUST agree on this set, so both call this and nothing else.
+// The AGGREGATE property an expression names. Like a container's, its notifier is for a
+// level-sensitive wait: it fires on a change anywhere in the property, and a wait
+// re-tests its condition. See is_notified_aggregate.
+const slang::ast::ClassPropertySymbol* waited_aggregate_prop(const Expression& e) {
+    const auto* prop = instance_class_prop(e);
+    if (prop == nullptr || !is_notified_aggregate(prop->getType().getCanonicalType())) {
+        return nullptr;
+    }
+    return prop;
+}
+
+// Any of the three kinds: what a `wait` condition, or an inferred `@*`, can park on.
+// The design-wide pre-pass and the wait lowering MUST agree on this set, so both call
+// this and nothing else.
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e) {
     if (const auto* p = waited_class_prop(e); p != nullptr) {
         return p;
     }
-    return waited_container_prop(e);
+    if (const auto* p = waited_container_prop(e); p != nullptr) {
+        return p;
+    }
+    return waited_aggregate_prop(e);
+}
+
+// Whether an event expression waits in a loop of its own on the class properties it
+// reads (Lowerer::lower_expr_wait): a compound over properties read through handles,
+// such as `obj.s.f` or `obj.x + 1`. A property named by itself parks on its own notifier
+// (`@(obj.x)`, `@(posedge obj.x)`), an event on the object it holds, a member of a
+// virtual interface on that member's waiter list, a string is refused (event_signal),
+// and an expression that reads a container is refused: a mutation is not a change in
+// value (LRM 9.4.2). The design-wide pre-pass and the lowering MUST agree on this, so
+// both call it and nothing else.
+bool event_reads_props(const Expression& e) {
+    if (e.type->isEvent() || e.type->getCanonicalType().isString() || waited_class_prop(e) != nullptr) {
+        return false;
+    }
+    if (e.kind == ExpressionKind::MemberAccess &&
+        e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface()) {
+        return false;
+    }
+    ClassPropReadScan scan;
+    e.visit(scan);
+    return !scan.notifiable.empty() && !scan.any_container;
+}
+
+bool event_term_reads_member(const Expression& e) {
+    if (e.type->isEvent()) {
+        return false;
+    }
+    if (reads_vif(e)) {
+        return true;
+    }
+    ClassPropReadScan scan;
+    e.visit(scan);
+    return scan.any_prop;
+}
+
+bool reads_vif(const Expression& e) {
+    struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const MemberAccessExpression& ma) {
+            found = found || ma.value().type->getCanonicalType().isVirtualInterface();
+            visitDefault(ma);
+        }
+    };
+    Scan scan;
+    e.visit(scan);
+    return scan.found;
+}
+
+// A virtual-interface member by itself: `vif.a`, not `vif.s.f` or `vif.a & vif.b`.
+static bool is_vif_member(const Expression& e) {
+    return e.kind == ExpressionKind::MemberAccess &&
+           e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface();
+}
+
+// An event is woken through its own object, so a handle or an index in the expression that
+// names it is no operand to wait on: `@(ev[vif.i])` parks on the event it names right now
+// (LRM 15.5.5), whatever the expression reads.
+bool event_term_needs_loop(const Expression& e) {
+    if (e.type->isEvent()) {
+        return false;
+    }
+    return event_reads_props(e) || (reads_vif(e) && !is_vif_member(e));
+}
+
+void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out) {
+    switch (tc.kind) {
+        case TimingControlKind::SignalEvent:
+            out.push_back(&tc.as<SignalEventControl>());
+            return;
+        case TimingControlKind::EventList:
+            for (const TimingControl* t : tc.as<EventListControl>().events) {
+                event_terms(*t, out);
+            }
+            return;
+        default:
+            // An implicit @* names no term of its own, and no other control is a list member.
+            return;
+    }
+}
+
+bool control_needs_loop(const TimingControl& tc) {
+    std::vector<const SignalEventControl*> terms;
+    event_terms(tc, terms);
+    return std::ranges::any_of(terms, [](const SignalEventControl* t) { return event_term_needs_loop(t->expr); });
+}
+
+bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b) {
+    if (&a.member != &b.member) {
+        return false;
+    }
+    const auto variable = [](const Expression& h) {
+        return h.kind == ExpressionKind::NamedValue || h.kind == ExpressionKind::HierarchicalValue;
+    };
+    const Expression& ha = a.value();
+    const Expression& hb = b.value();
+    return variable(ha) && variable(hb) &&
+           &ha.as<ValueExpressionBase>().symbol == &hb.as<ValueExpressionBase>().symbol;
 }
 
 bool is_weak_reference_class(const slang::ast::ClassType& clt) {
@@ -327,8 +455,23 @@ void ClassPropReadScan::handle(const slang::ast::HierarchicalValueExpression& e)
     visitDefault(e);
 }
 
+static bool roots_at_class_prop(const Expression& e);
+
+void ClassPropReadScan::take_event_place(const Expression& e) {
+    if (e.type->isEvent() && roots_at_class_prop(e) && instance_class_prop(e) == nullptr) {
+        event_props.push_back(&e);
+        any_prop = true;
+    }
+}
+
+void ClassPropReadScan::handle(const slang::ast::ElementSelectExpression& es) {
+    take_event_place(es);
+    visitDefault(es);
+}
+
 void ClassPropReadScan::handle(const MemberAccessExpression& ma) {
     take(ma);
+    take_event_place(ma);
     // Descended into on purpose: the object expression of `a.b.p` can itself
     // read properties, and a compound condition nests member accesses.
     visitDefault(ma);
@@ -638,6 +781,14 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
                 out->add(*prop, ir::Edge::Any);
                 break;
         }
+    } else if (event_reads_props(ev.expr)) {
+        // A compound over class properties waits in a loop of its own, parked on the
+        // any-change notifier of each property it reads (Lowerer::lower_expr_wait).
+        ClassPropReadScan scan;
+        ev.expr.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            out->add(*level_waited_prop(*e), ir::Edge::Any);
+        }
     }
     if (const CallExpression* get = weak_get_call(ev.expr); get != nullptr) {
         // `@(w.get())` (LRM 8.30.3): the referent's any-change notifier. A class
@@ -646,6 +797,31 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
           &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
     }
     visitDefault(ev);
+}
+
+// An event list with a term that waits in a loop of its own (Lowerer::lower_expr_wait)
+// parks on the any-change notifier of every property any of its terms reads, a property
+// named by itself included: its edge notifier alone would not wake the loop. The leaves
+// are not visited, so such a term mints no edge notifier nothing will use.
+void WaitPropScan::handle(const slang::ast::EventListControl& list) {
+    if (!control_needs_loop(list)) {
+        visitDefault(list);
+        return;
+    }
+    std::vector<const SignalEventControl*> terms;
+    event_terms(list, terms);
+    for (const SignalEventControl* term : terms) {
+        ClassPropReadScan scan;
+        term->expr.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
+        }
+    }
 }
 
 void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
@@ -673,6 +849,25 @@ void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
           &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
     }
     visitDefault(w);
+}
+
+// An implicit `@*` before a statement reads the class properties that statement reads
+// (LRM 9.4.2.2), so their object bodies must carry change notifiers before any class
+// is laid out, as for a `wait`.
+void WaitPropScan::handle(const slang::ast::TimedStatement& t) {
+    if (t.timing.kind == slang::ast::TimingControlKind::ImplicitEvent) {
+        ClassPropReadScan scan;
+        t.stmt.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
+        }
+    }
+    visitDefault(t);
 }
 
 // Every class declared under `scope`, appended to `out`. This is what makes static
@@ -1020,6 +1215,31 @@ void SensitivityCollector::mark_written(const ValueSymbol& sym) {
     }
 }
 
+// Whether a place expression is, or selects inside, a class property read through a
+// handle: through struct members, element selects and part selects, down to the
+// property itself.
+static bool roots_at_class_prop(const Expression& e) {
+    const Expression* cur = &e;
+    for (;;) {
+        if (instance_class_prop(*cur) != nullptr) {
+            return true;
+        }
+        switch (cur->kind) {
+            case ExpressionKind::MemberAccess:
+                cur = &cur->as<MemberAccessExpression>().value();
+                break;
+            case ExpressionKind::ElementSelect:
+                cur = &cur->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                cur = &cur->as<RangeSelectExpression>().value();
+                break;
+            default:
+                return false;
+        }
+    }
+}
+
 // Record the write target(s) of an lvalue: the base name is written, but any
 // selector expression on it (an index or a non-constant part-select bound) is
 // a read and is descended into.
@@ -1059,6 +1279,22 @@ void SensitivityCollector::record_write(const Expression& lhs) {
             for (const Expression* op : pat.elements()) {
                 record_write(*op);
             }
+            break;
+        }
+        case ExpressionKind::MemberAccess: {
+            // The member written is not read; the handle it goes through is.
+            const auto& ma = lhs.as<MemberAccessExpression>();
+            if (ma.value().type->getCanonicalType().isVirtualInterface() || instance_class_prop(ma) != nullptr) {
+                read_object(ma.value());
+                break;
+            }
+            // A member of a class property (`obj.s.f = ...`) is a write of that property,
+            // which the statement does not read; the handle it goes through is.
+            if (ma.member.kind == SymbolKind::Field && roots_at_class_prop(ma.value())) {
+                record_write(ma.value());
+                break;
+            }
+            lhs.visit(*this);
             break;
         }
         case ExpressionKind::Conversion:
@@ -1160,6 +1396,57 @@ void SensitivityCollector::handle(const CallExpression& c) {
     if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function && entered.insert(sub).second) {
         sub->getBody().visit(*this);
     }
+}
+
+void SensitivityCollector::read_object(const Expression& obj) {
+    if (mode != SensitivityMode::Comb) {
+        obj.visit(*this);
+        return;
+    }
+    switch (obj.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue:
+            return;
+        case ExpressionKind::ElementSelect: {
+            const auto& es = obj.as<ElementSelectExpression>();
+            read_object(es.value());
+            es.selector().visit(*this);
+            return;
+        }
+        case ExpressionKind::MemberAccess:
+            read_object(obj.as<MemberAccessExpression>().value());
+            return;
+        default:
+            obj.visit(*this);
+            return;
+    }
+}
+
+// A member reached through a handle. A virtual-interface member is a signal of the
+// instance the handle names (LRM 25.9): it joins the sensitivity beside the handle
+// itself, in `always @*` (9.4.2.2: every variable the statement reads) and in
+// `always_comb` (9.2.2.2.1's exemption is for class objects only). A non-static class
+// property joins it in `always @*` the same way, and adds nothing at all to an
+// `always_comb`, handle included.
+void SensitivityCollector::handle(const MemberAccessExpression& ma) {
+    if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+        if (!ma.type->isEvent() &&
+            std::ranges::none_of(handles.vif, [&](const MemberAccessExpression* h) { return same_member_read(*h, ma); })) {
+            handles.vif.push_back(&ma);
+        }
+        visitDefault(ma);
+        return;
+    }
+    if (instance_class_prop(ma) != nullptr) {
+        if (mode == SensitivityMode::Comb) {
+            read_object(ma.value());
+            return;
+        }
+        if (level_waited_prop(ma) != nullptr) {
+            handles.props.push_back(&ma);
+        }
+    }
+    visitDefault(ma);
 }
 
 // Whether this node, ignoring its children, is safe to evaluate eagerly.

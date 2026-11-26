@@ -93,9 +93,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Thousands of straight-line statements over wide values** — LLVM's type legalizer
   recurses once per store of a value above 128 bits (a 4-state vector above 64 bits) in one
   block and overflows the compile thread's stack, so the JIT dies with SIGSEGV.
-- [ ] **Subroutine call as a `for` step** (12.7.1) — a `function_subroutine_call` in the step
-  list is refused.
-
 ## M2 — Icarus Verilog parity
 
 ### Time-consuming procedural code
@@ -123,26 +120,23 @@ Milestones, in order; lower ones unblock higher ones:
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
-- [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate
-  waits are refused.
-  - [ ] **`wait` on an unpacked struct, union or fixed unpacked-array property**
-    (9.4.3) — needs a whole-aggregate change compare.
-  - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
-    needs DPI.
+- [ ] **Non-null `chandle` property transition** (9.4.2, 9.4.3) — not exercised end to end;
+  making one needs DPI.
 - [~] **Event control and `wait` over a method call or an expression of properties**
-  (9.4.2) — the forms below are accepted and are not woken by the change.
-  - [ ] **Event list mixing such an expression with another event** — `@(c.get() or
+  (9.4.2) — the forms below are refused, or accepted and not woken by the change.
+  - [ ] **Event list mixing a class-property or virtual-interface member with a signal or
+    event, and `->> @(m) e` / `x <= @(m) y` over such a member** (9.4.2, 15.5.1, 9.4.5) —
+    refused; needs a per-registration fired marker in the wait node.
+  - [ ] **Event list mixing a method call with another event** — `@(c.get() or
     posedge clk)` needs identification of the waking source.
-  - [ ] **Such an expression as the control of `<= @(...)` or `->> @(...)`, or as a
-    clocking event** — a record or a clock is not a process that can sample it.
+  - [ ] **Method call as the control of `<= @(...)` or `->> @(...)`, or as a clocking
+    event** — a record or a clock is not a process that can sample it.
   - [ ] **Method that reads an unpacked struct, union, fixed unpacked-array or `event`
     property, or a string variable** — those have no change notifier.
   - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
     change notifier.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
-- [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
-  refused.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
   `wait(vif.q.size())` is not exercised end to end.
 - [ ] **`@` or `wait` on a fork-captured unpacked struct, union, fixed unpacked array or
@@ -368,9 +362,6 @@ Milestones, in order; lower ones unblock higher ones:
   subroutine argument or a raw rvalue; refused in the backend.
 - [ ] **String event control / sensitivity** — `@(s)` and inferred sensitivity on a string are
   refused.
-- [ ] **`case ... inside` string range bound** (11.4.13) — a `[lo:hi]` item over a string selector
-  is refused.
-- [ ] **Enum `next` / `prev` with a non-constant step** — only a constant step is lowered.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
   - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an
@@ -449,15 +440,9 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Operators & expressions
 
-- [ ] **Concatenation as a compound-assignment target** — `{a, b} += x` is refused.
-- [ ] **String element as a compound-assignment target** — `s[i] += c` is refused.
 - [~] **`inside` operator** (11.4.13) — missing set-member and range forms:
-  - [ ] **Associative-array set member** — needs the first/next key walk (7.9.4) rather
-    than an index loop.
-  - [ ] **Queue or dynamic-array set member with non-singular elements** — refused.
-  - [ ] **Tolerance ranges** — `[c +/- d]` and `[c +%- d]` are refused.
-  - [ ] **Unbounded `$` range bounds** — `[$:a]` and `[a:$]` are refused.
-  - [ ] **Unpacked array of strings as a set member** — refused.
+  - [ ] **Queue, dynamic-array or associative-array set member with non-singular elements** —
+    refused.
 - [~] **Streaming operators** (11.4.14) — forms that need a bit-level stream buffer:
   - [ ] **`with` clause on a stream operand** — refused.
   - [ ] **Width not a multiple of the destination granule** — e.g. `bit [5:0] q[$]` into a
@@ -467,18 +452,14 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Unpack from a dynamically sized source** (11.4.14.3) — `{>>{q}} = s` is refused.
   - [ ] **Associative-array operand or member** (11.4.14.1) — streamed in index-sorted order;
     refused.
-  - [ ] **Non-integral leaf or element in a streamed aggregate or container** (11.4.14.1) — a
-    string leaf of an unpacked struct or array, a class handle, and a container whose
-    elements are aggregates or containers are refused, packing and unpacking.
+  - [ ] **Non-integral leaf or element in a streamed aggregate or container** (11.4.14.1, 20.6.2)
+    — a string leaf, a class handle (also under `$bits`) and a container of aggregates or
+    containers are refused, packing and unpacking.
   - [ ] **Unpack into a nested `{<<S{...}}` or with a slice size that does not divide the
     target** (11.4.14.3) — refused.
 
 ### Procedural control
 
-- [ ] **`case … inside` tolerance ranges** (12.5.4) — `[a +/- b]` and `[a +%- b]` labels
-  are refused.
-- [ ] **`case … inside` unbounded range bounds** (12.5.4) — `[$:a]` and `[a:$]` labels are
-  refused.
 - [ ] **`always_ff` non-sequential body warning** (9.2.2.4) — no diagnostic is issued when
   the body does not describe sequential logic.
 - [ ] **`foreach` skipping an outer dimension over a nested runtime one** (12.7.3) —
@@ -516,7 +497,6 @@ Milestones, in order; lower ones unblock higher ones:
     assertion is refused `wait fork` and `wait_order`.
   - [ ] **Action block scheduled in the Reactive region** — the report matures through the
     deferred queue instead of scheduling the action block in Reactive.
-- [ ] **`$countbits` with a non-constant control bit** — refused.
 - [ ] **`$isunbounded` of a hierarchical reference** — refused; slang does not
   constant-evaluate it.
 
@@ -745,12 +725,10 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Virtual interfaces** (25.9) — open pieces; see docs/design/interfaces.md:
   - [ ] **Member or clocking block of an interface instantiated inside the interface a handle
     names** (`vif.i.d`) — the context record does not carry its children's.
-  - [ ] **`edge` / `iff` qualifier on an event control over an expression of members** —
-    refused.
   - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
     — refused.
-  - [ ] **Composite expression of members outside a lone procedural event control** —
-    e.g. one operand of an event list, `@(vif.a & vif.b or c)`.
+  - [ ] **Virtual-interface expression as the clock of a clocking block, covergroup or
+    assertion** (14.3, 19.4, 16.5, 25.9) — refused.
   - [ ] **Parameter or other member with no signal storage** — `vif.P`, or a clockvar the
     interface's instances do not provide.
   - [ ] **Modport expression port** (25.5.4) — reached through a modport-qualified handle.
@@ -809,7 +787,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Complete system task / function library
 
-- [ ] **`$bits` over every type** — the remaining query-function operand types.
 - [ ] **Extended VCD** — the `$dumpports` family.
 - [ ] **`$writememh` / `$writememb`** — writing memory contents to a file.
 - [ ] **PLA modeling tasks** — `$async$and$array`, `$sync$nand$plane` and the rest of

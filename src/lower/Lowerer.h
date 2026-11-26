@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -147,11 +148,14 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e);
 
 bool is_notified_container(const slang::ast::Type& ty);
 
+bool is_notified_aggregate(const slang::ast::Type& ty);
+
 // What a store to a property of this type can classify, and therefore which change
 // notifiers the property may carry (LRM 9.4.2: "any change in the value").
 enum class PropNotify : uint8_t {
-    // Neither an old -> new word nor a mutation surface: an unpacked struct or
-    // union, a FIXED unpacked array. Refused loudly in both constructs.
+    // Neither an old -> new word nor a mutation surface: an event (which has a
+    // waiter list of its own), a covergroup handle. An unpacked struct, union or fixed
+    // array is not this: its leaves are words, and is_notified_aggregate covers it.
     None,
     // The value IS one stored word, so a store compares old against new through
     // the same emit_edge_facts a signal store uses. Every integral type; the three
@@ -175,6 +179,8 @@ const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e);
 
 const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e);
 
+const slang::ast::ClassPropertySymbol* waited_aggregate_prop(const Expression& e);
+
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e);
 
 // Whether `clt` is `std::weak_reference #(T)` itself (LRM 8.30), and the weak
@@ -194,6 +200,28 @@ bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 // is, so `wait (w.get() == null)` parks on the referent's change notifier: 8.30.3
 // names that wait as the way to learn that a weak reference has been cleared.
 const CallExpression* weak_get_call(const Expression& e);
+
+bool event_reads_props(const Expression& e);
+
+// Whether an expression reaches through a virtual interface handle anywhere. Such a place
+// names an instance chosen at run time, which the signal-keyed wait engine cannot subscribe to.
+bool reads_vif(const Expression& e);
+
+// Whether an event term waits in a loop of its own (Lowerer::lower_expr_wait) rather than on
+// one wait source: a compound over class properties or virtual-interface members. A member of
+// a virtual interface by itself (`vif.a`), a class property by itself, an event and a plain
+// signal expression each have a wait source of their own.
+bool event_term_needs_loop(const Expression& e);
+
+// The same for a whole event control: true when any term of it, in a list or alone, does.
+bool control_needs_loop(const TimingControl& tc);
+
+// Whether an event term reads a non-static class property or a virtual-interface member
+// (an event is not one: it has its own wait object).
+bool event_term_reads_member(const Expression& e);
+
+// The terms of an event control in source order: its one term, or every term of its list.
+void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out);
 
 // Every class-property reference in an expression, whether or not it is notifiable.
 // `wait` needs both halves: the notifiable ones become sensitivity, and the mere
@@ -221,6 +249,11 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     void handle(const slang::ast::HierarchicalValueExpression& e);
     void handle(const MemberAccessExpression& ma);
     void handle(const CallExpression& call);
+    void handle(const slang::ast::ElementSelectExpression& es);
+
+    // An event member or element of an aggregate class property, which `wait` parks on
+    // like an event property (event_props).
+    void take_event_place(const Expression& e);
 };
 
 bool box_can_notify(const slang::ast::Type& ty);
@@ -345,7 +378,11 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
 
     void handle(const slang::ast::SignalEventControl& ev);
 
+    void handle(const slang::ast::EventListControl& list);
+
     void handle(const slang::ast::WaitStatement& w);
+
+    void handle(const slang::ast::TimedStatement& t);
 
     void note_callees(const Expression& e);
 };
@@ -419,6 +456,26 @@ enum class SensitivityMode : uint8_t {
     ImplicitEvent,
 };
 
+// Whether two reads of a member through a handle name the same storage whatever the
+// handle holds: the same member through the same handle variable. Any other pair of
+// handle expressions (`vifs[i].a`, `get().a`) counts as two, which costs at most a
+// second park; counting `v0.a` and `v1.a` as one parked on one instance only.
+bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b);
+
+// What an inferred sensitivity reads that is not a signal of the module: members
+// of a virtual interface (LRM 25.9, a signal of whichever instance the handle names)
+// and non-static class properties (heap storage with a change notifier). A process's
+// static subscription cannot name either, so a body that reads one waits in its own
+// code (Lowerer::emit_inferred_park).
+struct HandleReads {
+    std::vector<const MemberAccessExpression*> vif;
+    std::vector<const Expression*>             props;
+
+    bool any() const {
+        return !vif.empty() || !props.empty();
+    }
+};
+
 // Collects the reads and writes that build a process's inferred sensitivity
 // (an `always_comb`, `always_latch`, `always @*`, or continuous assign): the
 // signals the body reads to compute a result, and the ones it writes. Whether
@@ -446,6 +503,8 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // User functions already descended into, so a function called from several
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
+    // Members read through a handle; see HandleReads.
+    HandleReads handles;
 
     // Creates a STATIC class property's module-signal storage and returns it
     // (Lowerer::declare_static_prop). That storage is minted LAZILY -- at the first
@@ -490,6 +549,14 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     void handle(const ForLoopStatement& f);
 
     void handle(const CallExpression& c);
+
+    void handle(const MemberAccessExpression& ma);
+
+    // The object expression of a member read or written through a handle: a plain read
+    // of the handle, except that `always_comb` adds nothing for a class object
+    // (LRM 9.2.2.2.1: "References to class objects and method calls of class objects
+    // do not add anything to the sensitivity list of an always_comb").
+    void read_object(const Expression& obj);
 };
 
 // Whether an expression may be evaluated even when its value turns out not to
@@ -2474,7 +2541,10 @@ private:
                                   const Expression*&          iff,
                                   uint32_t&                   n_events);
 
-    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode, std::vector<ir::WaitEvent>& out);
+    void collect_inferred_sensitivity(const Statement&            body,
+                                      SensitivityMode             mode,
+                                      std::vector<ir::WaitEvent>& out,
+                                      HandleReads*                handles = nullptr);
 
     static ir::Edge to_edge(slang::ast::EdgeKind edge);
 
@@ -2484,10 +2554,13 @@ private:
 
     void refuse_container_event_control(const SignalEventControl& ev);
 
+    void refuse_detached_member_event(const TimingControl& tc);
+
     ir::Index prop_notifier_handle(const Expression&                      e,
                                    const slang::ast::ClassPropertySymbol& prop,
                                    ir::Edge                               edge,
-                                   ir::Builder&                           b);
+                                   ir::Builder&                           b,
+                                   bool                                   null_ok = false);
 
     // True when a `@(...)` on this expression needs a runtime event HANDLE rather
     // than a signal: it is event-typed but is not a plain reference to a declared
@@ -2508,8 +2581,6 @@ private:
     // empty event list is complete rather than malformed (lower_event_wait).
     bool wait_dead_ = false;
 
-    static bool reads_vif(const Expression& e);
-
     static std::vector<const MemberAccessExpression*> vif_member_reads(const Expression& e);
 
     ir::Signal event_signal(const Expression& e);
@@ -2518,7 +2589,9 @@ private:
 
     uint32_t anon_local(ir::Ref type);
 
-    void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
+    void lower_expr_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index lsb_edge_fired(ir::Index old_v, ir::Index new_v, slang::ast::EdgeKind edge, ir::Builder& b, ir::SourceLoc l);
 
     // What a process waiting on an expression parks on (LRM 9.4.2, 9.4.3): `wait`'s
     // condition, and an event expression that is sampled (lower_sampled_event_wait).
@@ -2571,6 +2644,12 @@ private:
                                   ir::Builder& b);
 
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
+
+    void lower_implicit_event_wait(const Statement& body, ir::Builder& b, ir::SourceLoc l);
+
+    void emit_inferred_park(const Statement& body, SensitivityMode mode, ir::Builder& b, ir::SourceLoc l);
+
+    void lower_inferred_loop(const Statement& body, bool comb, ir::Builder& b, ir::SourceLoc l);
 
     void lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b);
 
@@ -3546,6 +3625,29 @@ private:
 
     static bool is_unbounded_bound(const Expression& e);
 
+    // A range bound of `inside` / `case ... inside` as comparison operands in the
+    // common type `ty` (LRM 11.4.13): a plain bound converted, `$` the lowest or
+    // highest value of `ty`, and a tolerance range `[a +/- b]` / `[a +%- b]`
+    // expanded to its low and high bounds, swapped if need be.
+    struct InsideBounds {
+        ir::Index lo;
+        ir::Index hi;
+    };
+
+    InsideBounds inside_range_bounds(const ValueRangeExpression& vr, ir::Ref ty, bool is_signed, ir::Builder& b);
+
+    // The same range over a real selector: `sel >= lo && sel <= hi` at `real`.
+    ir::Index inside_real_range_pred(const ValueRangeExpression& vr, ir::Index sel, ir::Ref rty, ir::Builder& b);
+
+    ir::Index type_extreme(ir::Ref ty, bool is_signed, bool high, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index inside_assoc_pred(const Expression& m,
+                                ir::Index         sel,
+                                ir::Ref           ty,
+                                bool              real,
+                                ir::Builder&      b,
+                                ir::SourceLoc     l);
+
     CaseCompareType common_inside_type(const CaseStatement& c);
 
     ir::Index lower_inside_label_pred(const Expression& label,
@@ -4149,12 +4251,16 @@ private:
 
     std::string format_typename(const slang::ast::Type& type);
 
-    uint32_t count_control_class(const Expression& ctrl);
+    std::optional<uint32_t> count_control_class(const Expression& ctrl);
 
     ir::Index lower_bit_query(std::string_view      name,
                               const CallExpression& call,
                               ir::Builder&          b,
                               const ir::SourceLoc   l);
+
+    ir::Index bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l);
 
     void emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l);
 
@@ -4531,19 +4637,43 @@ private:
 
     ir::Index lower_compound_assign(const AssignmentExpression& a, ir::Builder& b);
 
+    // A read-modify-write target with no single lvalue to Load and Store through
+    // (a concatenation, a string character): `read` yields the target's current
+    // value, `write` stores a new one, and both go through lvalues bound once when
+    // the place was made, so a compound assignment or `++`/`--` evaluates its
+    // target's index expressions exactly once (LRM 11.4.1, 11.4.2).
+    using CompoundRead  = std::function<ir::Index(ir::Builder&, ir::SourceLoc)>;
+    using CompoundWrite = std::function<void(ir::Index, ir::Builder&, ir::SourceLoc)>;
+
+    struct RmwPlace {
+        CompoundRead  read;
+        CompoundWrite write;
+    };
+
+    // Null for an ordinary single-lvalue target.
+    std::optional<RmwPlace> bind_rmw_place(const Expression& target, ir::Builder& b);
+
+    ir::Index lower_compound_rhs(const AssignmentExpression& a, const CompoundRead& read, ir::Builder& b);
+
+    // The lvalue each leaf operand of an lvalue concatenation evaluated to, bound
+    // ahead of a scatter that must not evaluate them again.
+    using ConcatLvalues = ankerl::unordered_dense::map<const Expression*, ir::Index>;
+
     void store_concat(const ConcatenationExpression& cc,
                       ir::Index                      rhs,
                       ir::Inst::Tag                  tag,
                       ir::Builder&                   b,
                       ir::SourceLoc                  l,
-                      const IntraNbTiming*           nbt = nullptr);
+                      const IntraNbTiming*           nbt   = nullptr,
+                      const ConcatLvalues*           bound = nullptr);
 
     void store_concat_ops(std::span<const Expression* const> ops,
                           ir::Index                          rhs,
                           ir::Inst::Tag                      tag,
                           ir::Builder&                       b,
                           ir::SourceLoc                      l,
-                          const IntraNbTiming*               nbt = nullptr);
+                          const IntraNbTiming*               nbt   = nullptr,
+                          const ConcatLvalues*               bound = nullptr);
 
     [[noreturn]] void fail_keyed_pattern_lvalue();
 
@@ -6375,10 +6505,11 @@ private:
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
-    // The LHS lvalue of the compound assignment currently being lowered, read by
-    // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
-    // outside a compound assignment.
-    std::optional<ir::Index> compound_lv_;
+    // How the LValueReferenceExpression slang embeds in a compound assignment's
+    // rewritten RHS reads its target: through the lvalue lower_compound_rhs bound,
+    // or through a read-modify-write place. Null outside a compound assignment;
+    // scoped by Restore, never assigned bare.
+    const CompoundRead* compound_read_ = nullptr;
     // The value an output port's connection assigns, read by the EmptyArgument
     // slang leaves for it in the connection's right-hand side (lower_port_output).
     // Nullopt outside one; scoped by Restore, never assigned bare.

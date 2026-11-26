@@ -524,16 +524,19 @@ struct LValueInfo {
     Ref          gc_container_type = Ref::Invalid;
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
-    // The notifiers of the class property this place selects, when some `@` / `wait`
-    // in the design waits on it, plus the object body they live in. Null for every
-    // other place -- and null for EVERY place in a design that waits on no property,
+    // The notifiers of the class property this place selects, or lies inside, when some
+    // `@` / `wait` in the design waits on it, plus the object body they live in. Null for
+    // every other place -- and null for EVERY place in a design that waits on no property,
     // which is what makes that design pay nothing.
     //
     // Set at exactly one place, agg_member, off the interned class Ref plus the
-    // property's field index. A blocking store then classifies its own old -> new
-    // transition and wakes the notifiers whose edge it produced -- literally
+    // property's field index, and kept by every select inside an AGGREGATE property
+    // (a member, an element): the property is one variable (LRM 9.4.2.2), and a store to
+    // any leaf of it is a change of it. A blocking store then classifies its own old ->
+    // new transition and wakes the notifiers whose edge it produced -- literally
     // service_wait_queue's job, with the waiter lists reached through the object
-    // instead of through per-signal globals.
+    // instead of through per-signal globals. A whole-object copy (AggCopy) compares the
+    // bytes, and a container inside the aggregate fires on every mutation.
     const ChangeNotify* chg         = nullptr;
     llvm::Value*        chg_body    = nullptr;
     llvm::Type*         chg_body_ty = nullptr;

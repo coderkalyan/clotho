@@ -516,6 +516,301 @@ TEST_CASE("virtual interface: an event control on a member expression") {
     CHECK(out == "changed 2\n");
 }
 
+// The edge qualifiers and the `iff` gate on an event control over an expression of
+// members (LRM 9.4.2, 9.4.2.3, 25.9): an edge is detected on the least
+// significant bit of the expression, a plain change on any bit, and `iff` is
+// evaluated when the expression changes, so a change it suppresses is not an
+// event and a change of what it reads is no event either. Each waiter logs the
+// times it woke. The same waiters over plain module variables are the
+// pre-existing synthesized-net path; its trace on this stimulus is the one
+// expected here (iverilog 13 agrees on the waiters without `iff`, which it does
+// not parse; the `iff` ones were worked out from 9.4.2.3).
+TEST_CASE("virtual interface: an edge or an iff on an event control over member expressions") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0, b = 0, en = 0; logic [3:0] v = 4'b0000; endinterface
+        module top;
+            ifc i();
+            virtual ifc vi;
+            string and_pos, and_neg, v_iff, v2_iff, v0_iff;
+            initial begin
+                vi = i;
+                fork
+                    forever begin @(posedge (vi.a & vi.b)); and_pos = {and_pos, $sformatf("%0t ", $time)}; end
+                    forever begin @(negedge (vi.a & vi.b)); and_neg = {and_neg, $sformatf("%0t ", $time)}; end
+                    forever begin @(vi.v iff vi.en); v_iff = {v_iff, $sformatf("%0t ", $time)}; end
+                    forever begin @(edge vi.v[2] iff vi.en); v2_iff = {v2_iff, $sformatf("%0t ", $time)}; end
+                    forever begin @(posedge (vi.v & 4'b0001) iff vi.en); v0_iff = {v0_iff, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 i.a = 1;
+                #1 i.b = 1;
+                #1 i.en = 1;
+                #1 i.v = 4'b0100;
+                #1 i.v = 4'b0000;
+                #1 i.en = 0;
+                #1 i.v = 4'b0100;
+                #1 i.en = 1;
+                #1 i.v = 4'b0100;
+                #1 i.v = 4'b0101;
+                #1 i.a = 0;
+                #1 i.b = 0; i.a = 1;
+                #1 i.b = 1;
+                #1;
+                $display("and_pos: %s", and_pos);
+                $display("and_neg: %s", and_neg);
+                $display("v_iff: %s", v_iff);
+                $display("v2_iff: %s", v2_iff);
+                $display("v0_iff: %s", v0_iff);
+            end
+        endmodule
+    )");
+    CHECK(out == "and_pos: 2 13 \nand_neg: 11 \nv_iff: 4 5 10 \nv2_iff: 4 5 \nv0_iff: 10 \n");
+}
+
+// An event list over expressions of members (LRM 9.4.2.1, 25.9) is the OR of its terms, in
+// either order, and a term over an expression is a change of its value, so a write that
+// leaves `a & b` alone is no event. A property can sit in the same list.
+// iverilog 13 gave `2 3 4 5 7` for each waiter on the plain-signal analog of the first design;
+// it parses neither a virtual interface nor a class, so the mixed list is LRM-derived.
+// Before: refused ("an event control on an expression through a virtual interface").
+TEST_CASE("virtual interface: an event list over member expressions") {
+    SUBCASE("two member terms, in either order") {
+        const std::string out = run_capture(R"(
+            interface ifc; logic a = 0, b = 0, c = 0; endinterface
+            module top;
+              ifc i();
+              virtual ifc vi;
+              string x1, x2;
+              initial begin
+                vi = i;
+                fork
+                  forever begin @(vi.a & vi.b or vi.c) x1 = {x1, $sformatf("%0t ", $time)}; end
+                  forever begin @(vi.c or vi.a & vi.b) x2 = {x2, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 i.a = 1;
+                #1 i.b = 1;
+                #1 i.c = 1;
+                #1 i.a = 0;
+                #1 i.a = 1;
+                #1 i.c = 1;
+                #1 i.c = 0;
+                #1 $display("x1: %s", x1);
+                $display("x2: %s", x2);
+              end
+            endmodule
+        )");
+        CHECK(out == "x1: 2 3 4 5 7 \nx2: 2 3 4 5 7 \n");
+    }
+    SUBCASE("a member expression and a class property") {
+        const std::string out = run_capture(R"(
+            interface ifc; logic a = 0, b = 0; endinterface
+            typedef struct { int f; } s_t;
+            class C; s_t s; endclass
+            module top;
+              ifc i();
+              virtual ifc vi = i;
+              C obj = new;
+              string log;
+              initial begin
+                fork
+                  forever begin @(vi.a & vi.b or obj.s.f) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 i.a = 1;
+                #1 i.b = 1;
+                #1 obj.s.f = 1;
+                #1 i.b = 0;
+                #1 obj.s.f = 1;
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "2 3 4 \n");
+    }
+}
+
+// A term's edge is the edge of the least significant bit of its expression and its `iff` is
+// its own, evaluated when the term changes (LRM 9.4.2, 9.4.2.3): the posedge of `a & b` at 2
+// is suppressed by `en`, and a change of `en` is no event. LRM-derived; iverilog parses no
+// `iff`. Before: refused.
+TEST_CASE("virtual interface: an edge or an iff on a term of an event list") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0, b = 0, en = 0, c = 1; endinterface
+        module top;
+          ifc i();
+          virtual ifc vi;
+          string log;
+          initial begin
+            vi = i;
+            fork
+              forever begin @(posedge (vi.a & vi.b) iff vi.en or negedge vi.c) log = {log, $sformatf("%0t ", $time)}; end
+            join_none
+            #1 i.a = 1;
+            #1 i.b = 1;
+            #1 i.a = 0;
+            #1 i.en = 1;
+            #1 i.a = 1;
+            #1 i.c = 0;
+            #1 i.c = 1;
+            #1 i.a = 0;
+            #1 i.a = 1;
+            #1 $display("%s", log);
+          end
+        endmodule
+    )");
+    CHECK(out == "5 6 9 \n");
+}
+
+// A process's own sensitivity list over members cannot be a static subscription either: it
+// names an instance only once the handle is read, so it stays in the body. Each term is a
+// member by itself here, so the edges are those of the members. LRM-derived. Before: refused.
+TEST_CASE("virtual interface: a process's sensitivity list over members") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic clk = 0, rst_n = 1; endinterface
+        module top;
+          ifc i();
+          virtual ifc vi = i;
+          int n = 0;
+          string log;
+          always @(posedge vi.clk or negedge vi.rst_n) begin n++; log = {log, $sformatf("%0t ", $time)}; end
+          initial begin
+            #1 i.clk = 1;
+            #1 i.clk = 0;
+            #1 i.rst_n = 0;
+            #1 i.clk = 1;
+            #1 $display("n=%0d at %s", n, log);
+          end
+        endmodule
+    )");
+    CHECK(out == "n=3 at 1 3 4 \n");
+}
+
+// The same member through two handles is two places, one in each instance: an expression
+// over `v0.a` and `v1.a` has to park on both, in a lone control, in a list, in `wait` and in
+// `always @*`. Each waiter used to park on the first handle's instance only, so the change of
+// `i1.a` woke none of them. LRM-derived.
+TEST_CASE("virtual interface: the members of two handles in one expression park on their own instances") {
+    SUBCASE("a lone control, a wait and always @*") {
+        const std::string out = run_capture(R"(
+            interface ifc; logic a = 0; endinterface
+            module top;
+              ifc i0(), i1();
+              virtual ifc v0 = i0, v1 = i1;
+              logic y = 0;
+              string ex, wt;
+              always @* y = v0.a & v1.a;
+              initial begin
+                i0.a = 1;
+                fork
+                  begin @(v0.a & v1.a) ex = $sformatf("expr at %0t", $time); end
+                  begin wait (v0.a && v1.a) wt = $sformatf("wait at %0t", $time); end
+                join_none
+                #1 i1.a = 1;
+                #1 $display("%s | %s | y=%b", ex, wt, y);
+              end
+            endmodule
+        )");
+        CHECK(out == "expr at 1 | wait at 1 | y=1\n");
+    }
+    SUBCASE("a list") {
+        const std::string out = run_capture(R"(
+            interface ifc; logic a = 0, b = 0; endinterface
+            module top;
+              ifc i0(), i1();
+              virtual ifc v0 = i0, v1 = i1;
+              string ex;
+              initial begin
+                i0.a = 1;
+                fork
+                  begin @(v0.a & v1.a or v0.b) ex = $sformatf("list at %0t", $time); end
+                join_none
+                #1 i1.a = 1;
+                #1 $display("%s", ex);
+              end
+            endmodule
+        )");
+        CHECK(out == "list at 1\n");
+    }
+}
+
+// LRM 25.9: "Attempting to use a null virtual interface shall result in a fatal run-time
+// error." An explicit control evaluates its expression where the wait begins, so a null
+// handle in a term of a list is that fatal at the wait (1 s), as for a lone term. Out of
+// process because the report ends the run.
+TEST_CASE("virtual interface: a null handle in an event list term is a located fatal") {
+    constexpr std::string_view src = "interface ifc; logic a = 0, b = 0; endinterface\n"
+                                     "module top;\n"
+                                     "    ifc i();\n"
+                                     "    virtual ifc vi;\n"
+                                     "    initial begin\n"
+                                     "        $display(\"before\");\n"
+                                     "        #1 @(vi.a & vi.b or vi.a);\n"
+                                     "        $display(\"UNREACHABLE\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out == "before\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: use of a null virtual interface") != std::string::npos);
+    CHECK(run.err.find("the handle names no interface instance at 1 s") != std::string::npos);
+    CHECK(run.err.find("source:7:14") != std::string::npos);
+}
+
+// Refused for now (docs/TODO.md): a list mixing a virtual-interface member expression with a
+// signal or an event, and `->> @(m) e` / `x <= @(m) y` over a member. Both used to be
+// accepted: the list never woke on the member, the others never woke at all.
+TEST_CASE("virtual interface: a member mixed with a signal in a list, or over a detached control, is refused") {
+    const std::string decls = "interface ifc; logic a, b; endinterface\n"
+                              "module top; ifc i(); virtual ifc vi = i; logic d; event e; int x, y;\n";
+    const auto refused = [&](std::string_view body, std::string_view message) {
+        const LowerResult r = lower_text(decls + "initial begin " + std::string(body) + " end endmodule");
+        INFO(body);
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find(message) != std::string::npos);
+    };
+    refused("@(vi.a & vi.b or d);", "an event list mixing a class-property or virtual-interface member");
+    refused("->> @(vi.a) e;", "over a class-property or virtual-interface member is not supported yet");
+    refused("x <= @(vi.a & vi.b) y;", "over a class-property or virtual-interface member is not supported yet");
+}
+
+// Table 9-2 on the least significant bit of a member expression, x and z included: a
+// posedge is 0 to 1, x or z and x or z to 1, a negedge the mirror image, `edge` either,
+// and a change between x and z is none of them. iverilog 13 gives the same classes on
+// a variable's bit select.
+TEST_CASE("virtual interface: the edges of a member bit follow Table 9-2") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic [3:0] v = 4'b0000; endinterface
+        module top;
+            ifc i();
+            virtual ifc vi;
+            string pos, neg, any;
+            initial begin
+                vi = i;
+                fork
+                    forever begin @(posedge vi.v[0]); pos = {pos, $sformatf("%0t ", $time)}; end
+                    forever begin @(negedge vi.v[0]); neg = {neg, $sformatf("%0t ", $time)}; end
+                    forever begin @(edge vi.v[0]); any = {any, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 i.v = 4'b0001;
+                #1 i.v = 4'b0000;
+                #1 i.v = 4'b000x;
+                #1 i.v = 4'b000z;
+                #1 i.v = 4'b0001;
+                #1 i.v = 4'b000x;
+                #1 i.v = 4'b0000;
+                #1 i.v = 4'b000z;
+                #1 i.v = 4'b0000;
+                #1 i.v = 4'b0000;
+                #1;
+                $display("pos: %s", pos);
+                $display("neg: %s", neg);
+                $display("edge: %s", any);
+            end
+        endmodule
+    )");
+    CHECK(out == "pos: 1 3 5 8 \nneg: 2 6 7 9 \nedge: 1 2 3 5 6 7 8 9 \n");
+}
+
 // An interface subroutine reached through a handle (LRM 25.7) is lowered ONCE for
 // the definition, with the handle as formal 0, and addresses its signals through
 // the instance that names. Two handles on twin instances must therefore drive

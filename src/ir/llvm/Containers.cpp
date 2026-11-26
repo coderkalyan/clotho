@@ -456,9 +456,9 @@ llvm::Value* Backend::lv_handle_ptr(const Guarded& g, HandleUse use) {
     return g.pointer_or(b_, form, sink);
 }
 
-// Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or
-// emit nothing at all when the property carries none -- which is every property
-// in a design that waits on no container.
+// Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or that of the
+// aggregate property the container is a member of, or emit nothing at all when the
+// property carries none -- which is every property in a design that waits on no container.
 //
 // UNCONDITIONAL, unlike the integral service_change_notify: the property's value
 // is the container's CONTENTS, and `q.size()` is computed rather than stored, so
@@ -505,9 +505,9 @@ void Backend::notify_container_mutation(const LValueInfo& lv) {
         }
         return;
     }
-    if (!lv.chg->container) {
-        return;
-    }
+    // A container property's own notifier, or that of the aggregate property the container
+    // is a member of: either way the property changed, and every such property carries an
+    // any-change notifier.
     if (!lv.chg->wants(Edge::Any)) {
         throw BackendError{ "internal: container change notifier with no any-change field" };
     }

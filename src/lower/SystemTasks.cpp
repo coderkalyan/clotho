@@ -569,42 +569,71 @@ ir::Index Lowerer::lower_enum_method(std::string_view            name,
                            l);
     }
 
-    // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
-    // one in declaration order, wrapping. N is an optional constant (default
-    // 1); a non-member receiver yields X (matches iverilog; LRM leaves it
-    // undefined). Lowered as a branchless packed select chain over the member
-    // set — an integer select, so any base width works.
+    // next(N)/prev(N) (LRM 6.19.5.3, 6.19.5.4): the Nth member after/before the
+    // current one in declaration order, wrapping; N defaults to 1. A non-member
+    // receiver yields the enum's default initial value (Table 6-7: X of a 4-state
+    // base, 0 of a 2-state one). A constant N is lowered as a branchless select
+    // chain over the member set -- an integer select, so any base width works --
+    // and a run-time N as modular arithmetic on the receiver's position.
     if (name == "next" || name == "prev") {
-        int64_t step = 1;
-        if (call.arguments().size() >= 2) {
-            const slang::ConstantValue cv = fold_const(*call.arguments()[1], Fold::Runtime);
-            if (!cv.isInteger()) {
-                // TODO: a runtime (non-constant) step needs value->index lookup
-                // plus modular index arithmetic; rare, so reject for now.
-                fail("enum next/prev with a non-constant step is not supported");
-            }
-            step = cv.integer().as<int64_t>().value_or(0);
-        }
-
-        const int64_t num   = static_cast<int64_t>(members.size());
-        const int64_t delta = (name == "next") ? step : -step;
-        const auto    wrap  = [num](int64_t k) { return ((k % num) + num) % num; };
-
-        const ir::Index recv = lower_expr(*call.arguments()[0], b);
+        const int64_t num  = static_cast<int64_t>(members.size());
+        const bool    next = name == "next";
         // Default (no member matched): X of the base type (2-state base cannot
         // hold X, so it degrades to 0 via svint_to_ref's must plane).
-        ir::Index res = b.constant(svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
-                                                               : slang::SVInt(et.bitWidth, 0, et.isSigned),
-                                                base_ty),
-                                   l);
-        for (size_t i = members.size(); i-- > 0;) {
-            const ir::Index memberc = b.constant(svint_to_ref(members[i].value, base_ty), l);
-            const ir::Index targetc = b.constant(
-              svint_to_ref(members[static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta))].value, base_ty), l);
-            const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
-            res                = b.select(eq, targetc, res, l);
+        const auto default_value = [&] {
+            return b.constant(svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
+                                                          : slang::SVInt(et.bitWidth, 0, et.isSigned),
+                                           base_ty),
+                              l);
+        };
+        const auto member_value = [&](size_t i) {
+            return b.constant(svint_to_ref(members[i].value, base_ty), l);
+        };
+
+        std::optional<int64_t> step = 1;
+        if (call.arguments().size() >= 2) {
+            const slang::ConstantValue cv = fold_const(*call.arguments()[1], Fold::Runtime);
+            step = cv.isInteger() ? std::optional<int64_t>(cv.integer().as<int64_t>().value_or(0)) : std::nullopt;
         }
-        return res;
+
+        const ir::Index recv = lower_expr(*call.arguments()[0], b);
+        if (step) {
+            const int64_t delta = next ? *step : -*step;
+            const auto    wrap  = [num](int64_t k) { return ((k % num) + num) % num; };
+
+            ir::Index res = default_value();
+            for (size_t i = members.size(); i-- > 0;) {
+                const ir::Index memberc = member_value(i);
+                const ir::Index targetc = member_value(static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta)));
+                const ir::Index eq      = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
+                res                     = b.select(eq, targetc, res, l);
+            }
+            return res;
+        }
+
+        // A step known only at run time. N is an `int unsigned`, so it can exceed
+        // the member count: reduce it modulo `num` first, which also keeps the
+        // position arithmetic below from wrapping. `pos` is the receiver's index
+        // in declaration order, or `num` when it matches no member.
+        const ir::Ref   u64      = make_int_type(64, false);
+        const auto      position = [&](int64_t k) { return b.constant(module_.pool.put_int(u64, static_cast<uint64_t>(k)), l); };
+        const ir::Index count    = position(num);
+        ir::Index       pos      = count;
+        for (size_t i = 0; i < members.size(); ++i) {
+            const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, member_value(i), l);
+            pos                = b.select(eq, position(static_cast<int64_t>(i)), pos, l);
+        }
+        const ir::Index n    = b.convert(lower_expr(*call.arguments()[1], b), u64, /*sign_extend=*/false, l);
+        const ir::Index by   = b.binary(ir::Inst::Tag::UMod, n, count, l);
+        // The Nth previous is the (num - N mod num)th next.
+        const ir::Index move = next ? by : b.binary(ir::Inst::Tag::Sub, count, by, l);
+        const ir::Index to   = b.binary(ir::Inst::Tag::UMod, b.binary(ir::Inst::Tag::Add, pos, move, l), count, l);
+        ir::Index       res  = default_value();
+        for (size_t j = members.size(); j-- > 0;) {
+            res = b.select(b.binary(ir::Inst::Tag::Eq, to, position(static_cast<int64_t>(j)), l), member_value(j), res, l);
+        }
+        // `pos == num` is the receiver matching no member, whose answer is the default.
+        return b.select(b.binary(ir::Inst::Tag::Ne, pos, count, l), res, default_value(), l);
     }
 
     // LRM 6.19.2-6.19.5 defines six enum methods -- first, last, next, prev,
@@ -640,12 +669,12 @@ std::string Lowerer::format_typename(const slang::ast::Type& type) {
 }
 
 // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
-// value naming which 4-state value that control tallies. A non-constant
-// control is rejected (it would need a runtime class-mask select).
-uint32_t Lowerer::count_control_class(const Expression& ctrl) {
+// value naming which 4-state value that control tallies. Null for a control
+// that is not constant, whose class is picked at run time by lower_bit_query.
+std::optional<uint32_t> Lowerer::count_control_class(const Expression& ctrl) {
     const slang::ConstantValue cv = fold_const(ctrl, Fold::Runtime);
     if (!cv.isInteger()) {
-        fail("$countbits control bit must be a constant 0/1/x/z");
+        return std::nullopt;
     }
     const slang::logic_t bit = cv.integer()[0];
     if (bit.value == slang::logic_t::X_VALUE) {
@@ -657,9 +686,9 @@ uint32_t Lowerer::count_control_class(const Expression& ctrl) {
     return bit.value != 0 ? ir::CountOne : ir::CountZero;
 }
 
-// Runtime lowering for the utility bit-query functions (LRM 20.9; $bits on a
-// dynamic string per 20.6.2) when the operand is not constant. A constant
-// operand folds in slang and never reaches here.
+// Runtime lowering for the utility bit-query functions (LRM 20.9; $bits of an
+// operand whose size is only known at run time, 20.6.2) when the operand is not
+// constant. A constant operand folds in slang and never reaches here.
 ir::Index Lowerer::lower_bit_query(std::string_view      name,
                                    const CallExpression& call,
                                    ir::Builder&          b,
@@ -667,13 +696,14 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
     const auto    args = call.arguments();
     const ir::Ref i32  = make_int_type(32, false);
 
-    // $bits: the only non-constant operand Clotho stores is a dynamic
-    // string, whose bit count is 8 per current character (LRM 6.16, 20.6.2).
-    // A fixed-size operand would have const-folded above; any other dynamic
-    // type (queue / dynamic array / class handle) is unsupported storage.
+    // $bits: a dynamic string's bit count is 8 per current character (LRM 6.16,
+    // 20.6.2); every other operand goes through bits_of_expr.
     if (name == "$bits") {
-        if (args.size() != 1 || !is_string_expr(*args[0])) {
-            fail("$bits of a non-constant, non-string operand is not supported");
+        if (args.size() != 1) {
+            fail("internal: $bits takes one argument");
+        }
+        if (!is_string_expr(*args[0])) {
+            return b.convert(bits_of_expr(*args[0], b, l), lower_type(*call.type), call.type->isSigned(), l);
         }
         const ir::Index len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(*args[0], b), l);
         const ir::Index eight = b.constant(module_.pool.put_int(i32, 8), l);
@@ -681,8 +711,8 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
     }
 
     // The 20.9 counting family. The first argument is the counted value;
-    // $countbits additionally carries constant control-bit arguments naming
-    // which 4-state values to tally.
+    // $countbits additionally carries control-bit arguments naming which 4-state
+    // values to tally.
     const ir::Index val = lower_expr(*args[0], b);
 
     // $onehot / $onehot0 / $isunknown carry their qualifier in the tag.
@@ -696,14 +726,280 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
         return b.convert(b.unary(ir::Inst::Tag::IsUnknown, val, l), lower_type(*call.type), call.type->isSigned(), l);
     }
 
-    uint32_t mask = ir::CountOne; // $countones counts definite-1 bits
+    uint32_t               mask = ir::CountOne; // $countones counts definite-1 bits
+    std::vector<ir::Index> dynamic;             // control bits known only at run time
+    const ir::Ref          logic1 = make_int_type(1, true);
     if (name == "$countbits") {
         mask = 0;
         for (size_t k = 1; k < args.size(); ++k) {
-            mask |= count_control_class(*args[k]);
+            if (const std::optional<uint32_t> cls = count_control_class(*args[k])) {
+                mask |= *cls;
+            } else {
+                // A control wider than one bit contributes its least significant
+                // bit only (LRM 20.9); narrowing to a 4-state bit keeps its x / z.
+                dynamic.push_back(b.convert(lower_expr(*args[k], b), logic1, false, l));
+            }
         }
     }
-    return b.convert(b.count_bits(val, mask, l), lower_type(*call.type), call.type->isSigned(), l);
+    // The counted classes are a compile-time mask in the instruction, so a control
+    // chosen at run time cannot widen it. Instead each class that no constant
+    // control already names is counted on its own and kept when some run-time
+    // control selects it. A class repeated across controls is counted once, as
+    // LRM 20.9 requires ("treated exactly as if it had appeared once").
+    std::optional<ir::Index> total;
+    if (mask != 0 || dynamic.empty()) {
+        total = b.count_bits(val, mask, l);
+    }
+    // Used only to drop a class no run-time control selected.
+    const ir::Index zero = dynamic.empty() ? ir::Index{} : b.constant(module_.pool.put_int(i32, 0), l);
+    const struct {
+        uint32_t cls;
+        uint64_t bit; // the control value that names the class
+        bool     x;
+        bool     z;
+    } classes[] = { { ir::CountZero, 0, false, false },
+                    { ir::CountOne, 1, false, false },
+                    { ir::CountX, 0, true, false },
+                    { ir::CountZ, 0, false, true } };
+    for (const auto& c : classes) {
+        if (dynamic.empty() || (mask & c.cls) != 0) {
+            continue;
+        }
+        const slang::SVInt     named = c.x ? slang::SVInt::createFillX(1, false)
+                                         : c.z ? slang::SVInt::createFillZ(1, false) : slang::SVInt(1, c.bit, false);
+        const ir::Index        want  = b.constant(svint_to_ref(named, logic1), l);
+        std::optional<ir::Index> selected;
+        for (const ir::Index ctrl : dynamic) {
+            const ir::Index is = b.binary(ir::Inst::Tag::CaseEq, ctrl, want, l);
+            selected           = selected ? b.binary(ir::Inst::Tag::Lor, *selected, is, l) : is;
+        }
+        const ir::Index term = b.select(*selected, b.count_bits(val, c.cls, l), zero, l);
+        total                = total ? b.binary(ir::Inst::Tag::Add, *total, term, l) : term;
+    }
+    return b.convert(*total, lower_type(*call.type), call.type->isSigned(), l);
+}
+
+// Whether streaming a value of this type reaches a class handle (LRM 11.4.14.1): it is
+// one, or an unpacked struct, union or array of any kind with one among its members or
+// elements, at any depth.
+static bool holds_class_handle(const slang::ast::Type& t) {
+    const slang::ast::Type& ct = t.getCanonicalType();
+    if (ct.isClass()) {
+        return true;
+    }
+    if (ct.isUnpackedArray()) {
+        return holds_class_handle(*ct.getArrayElementType());
+    }
+    const auto any_field = [](std::span<const slang::ast::FieldSymbol* const> fields) {
+        return std::ranges::any_of(fields,
+                                   [](const slang::ast::FieldSymbol* f) { return holds_class_handle(f->getType()); });
+    };
+    if (ct.isUnpackedStruct()) {
+        return any_field(ct.as<slang::ast::UnpackedStructType>().fields);
+    }
+    if (ct.isUnpackedUnion()) {
+        return any_field(ct.as<slang::ast::UnpackedUnionType>().fields);
+    }
+    return false;
+}
+
+// `$bits(expression)` of an operand slang could not fold (LRM 20.6.2): the number
+// of bits the expression holds as a bit stream (6.24.3), as an unsigned 64-bit
+// value. A fixed-size type has the width of the type, and that is all it takes: the
+// LRM has the value "determined without actual evaluation of the expression it
+// encloses", which is why a hierarchical reference slang will not fold reads
+// nothing here. An operand of dynamic size is read for the size it has right now,
+// and a dynamically sized one that is currently empty is 0.
+//
+// The place to read is the operand's own storage when it names one, and otherwise
+// a temporary the expression is built into by the ordinary whole-value store (a
+// concatenation, a conditional, a slice). A function that returns a dynamically
+// sized type is an error in the LRM ("It shall be an error to enclose a function
+// that returns a dynamically sized data type"), as it would have to be evaluated.
+//
+// An operand that is, or holds, a class handle is refused before its type's size is
+// taken: the bits are those of the objects the handles refer to (11.4.14.1), which no type
+// fixes. slang does not fold such an operand either (patches/slang-bits-class-handle.patch),
+// so every one arrives here.
+//
+// The data-type form `$bits(B)` is no operand: it folds in slang to the size of the class's
+// properties and stays (LRM_NOTES 59).
+ir::Index Lowerer::bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceLoc l) {
+    const slang::ast::Type& t = *e.type;
+    if (holds_class_handle(t)) {
+        // TODO: measuring the objects handles refer to (11.4.14.1: the members of the
+        // object, base classes first, a null handle streaming nothing) needs the walk of
+        // an object, which streaming a class handle needs too.
+        fail("$bits of a class handle, or of a value holding one, is not supported: it counts the bits of the "
+             "objects the handles refer to (LRM 11.4.14.1), which Clotho does not measure");
+    }
+    if (t.isFixedSize()) {
+        return b.constant(module_.pool.put_int(make_int_type(64, false), t.getBitstreamWidth()), l);
+    }
+    const slang::ast::Type& ct   = t.getCanonicalType();
+    const Expression&       bare = unwrap_conversion(e);
+    if (is_struct_lvalue_shape(bare)) {
+        return bitstream_width(lower_lvalue(bare, b), t, b, l);
+    }
+    if (bare.kind == ExpressionKind::Call) {
+        fail("$bits of a call that returns a dynamically sized type is not legal (LRM 20.6.2)");
+    }
+    const ir::Ref   ty  = lower_type(t);
+    const ir::Index tmp = make_arg_temp(ty, b, l);
+    if (ct.isUnpackedArray() && !ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+        emit_container_store(tmp, ty, e, b, l);
+    } else {
+        emit_struct_store(tmp, ty, e, ir::Inst::Tag::Store, b, l);
+    }
+
+    return bitstream_width(tmp, t, b, l);
+}
+
+// The bit stream length of the value stored at `lv`, of type `t` (LRM 6.24.3,
+// 11.4.14.1), as an unsigned 64-bit value. The pieces of a type that have a fixed
+// size are added as constants; what has none is read from the storage, down to
+// the elements and members that are themselves dynamic:
+//
+//   string                    8 per character
+//   queue, dynamic array      the element count times the element size, a sum
+//                             over the elements when those have no fixed size
+//   associative array         the same over the entries, walked by key (7.9.4)
+//   unpacked struct           the sum over the members, in declaration order
+//   fixed-size array          the same over its elements, when they are dynamic
+//
+// A class handle is not measured: bits_of_expr refuses it before it gets here.
+ir::Index Lowerer::bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l) {
+    using T    = ir::Inst::Tag;
+    using Step = ir::Builder::AssocStep;
+    const ir::Ref u64  = make_int_type(64, false);
+    const ir::Ref i32  = make_int_type(32, false);
+    const ir::Ref bit1 = make_int_type(1, false);
+    const auto    count = [&](uint64_t n) { return b.constant(module_.pool.put_int(u64, n), l); };
+    const auto    wide  = [&](ir::Index v) { return b.convert(v, u64, /*sign_extend=*/false, l); };
+    if (t.isFixedSize()) {
+        return count(t.getBitstreamWidth());
+    }
+    // A running total in a cell, for what loops and branches add into.
+    const auto add_into = [&](const TempCell& acc, ir::Index w) {
+        const ir::Index slot = acc.lv(b, l);
+        const ir::Index cur  = b.unary(T::Load, acc.lv(b, l), l);
+        b.binary(T::Store, slot, b.binary(T::Add, cur, w, l), l);
+    };
+    const auto zeroed = [&](const TempCell& acc) {
+        const ir::Index slot = acc.lv(b, l);
+        b.binary(T::Store, slot, count(0), l);
+    };
+
+    const slang::ast::Type& ct = t.getCanonicalType();
+    if (ct.isString()) {
+        return b.binary(T::Mul, wide(b.unary(T::StrLen, b.unary(T::Load, lv, l), l)), count(8), l);
+    }
+    if (ct.isUnpackedStruct()) {
+        const ir::Ref            sty = lower_type(t);
+        uint64_t                 fixed = 0;
+        std::optional<ir::Index> dynamic;
+        for (const slang::ast::FieldSymbol* f : ct.as<slang::ast::UnpackedStructType>().fields) {
+            const slang::ast::Type& ft = f->getType();
+            if (ft.isFixedSize()) {
+                fixed += ft.getBitstreamWidth();
+                continue;
+            }
+            const ir::Index w = bitstream_width(b.member_select(lv, f->fieldIndex, sty, l), ft, b, l);
+            dynamic           = dynamic ? b.binary(T::Add, *dynamic, w, l) : w;
+        }
+        return dynamic ? b.binary(T::Add, *dynamic, count(fixed), l) : count(fixed);
+    }
+    if (!ct.isUnpackedArray()) {
+        fail("internal: $bits of a dynamically sized type that is not a string, struct or array");
+    }
+
+    const slang::ast::Type& et  = *ct.getArrayElementType();
+    const ir::Ref           aty = lower_type(t);
+    const ir::Type          at  = std::get<ir::Type>(module_.pool.get(aty));
+    if (at.kind == ir::Type::Kind::Assoc) {
+        const ir::Index entries = wide(b.assoc_num(lv, aty, l));
+        if (et.isFixedSize()) {
+            return b.binary(T::Mul, entries, count(et.getBitstreamWidth()), l);
+        }
+        // Entries whose elements are dynamic are summed over a first / next key
+        // walk, the shape `foreach` over an associative array lowers to.
+        const ir::Ref  kr  = at.right != 0 ? make_int_type(64, false) : static_cast<ir::Ref>(at.fields_id);
+        const TempCell acc = make_temp_cell(u64, "bits_acc");
+        const TempCell key = make_temp_cell(kr, "bits_key");
+        const TempCell ok  = make_temp_cell(bit1, "bits_ok");
+        zeroed(acc);
+        const ir::Index ok_lv    = ok.lv(b, l);
+        const ir::Index ok_first = b.convert(b.assoc_traverse(lv, key.lv(b, l), Step::First, aty, l), bit1, false, l);
+        b.binary(T::Store, ok_lv, ok_first, l);
+
+        b.open_region();
+        const ir::Index      pred = b.unary(T::Load, ok.lv(b, l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        const ir::Index key_operand = is_agg_abi_ref(kr) ? key.lv(b, l) : b.unary(T::Load, key.lv(b, l), l);
+        add_into(acc, bitstream_width(b.assoc_select(lv, key_operand, aty, l), et, b, l));
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index ok_step = ok.lv(b, l);
+        const ir::Index ok_next = b.convert(b.assoc_traverse(lv, key.lv(b, l), Step::Next, aty, l), bit1, false, l);
+        b.binary(T::Store, ok_step, ok_next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
+        return b.unary(T::Load, acc.lv(b, l), l);
+    }
+
+    // An index-addressed container: a queue, a dynamic array, or a fixed-size
+    // array of elements with no fixed size.
+    ir::Index count32;
+    if (at.kind == ir::Type::Kind::Queue) {
+        count32 = b.queue_size(lv, aty, l);
+    } else if (at.kind == ir::Type::Kind::DynArray) {
+        count32 = b.dyn_array_size(lv, aty, l);
+    } else {
+        const uint32_t n = (at.left >= at.right ? at.left - at.right : at.right - at.left) + 1;
+        count32          = b.constant(module_.pool.put_int(i32, n), l);
+    }
+    if (et.isFixedSize()) {
+        return b.binary(T::Mul, wide(count32), count(et.getBitstreamWidth()), l);
+    }
+    const TempCell acc   = make_temp_cell(u64, "bits_acc");
+    const TempCell idx   = make_temp_cell(i32, "bits_idx");
+    const TempCell bound = make_temp_cell(i32, "bits_n");
+    zeroed(acc);
+    const ir::Index bound_lv = bound.lv(b, l);
+    b.binary(T::Store, bound_lv, b.convert(count32, i32, true, l), l);
+    const ir::Index idx_lv = idx.lv(b, l);
+    b.binary(T::Store, idx_lv, b.constant(module_.pool.put_int(i32, 0), l), l);
+
+    b.open_region();
+    const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
+    const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
+    const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
+    const ir::ExtraSlice cond = b.close_region();
+
+    b.open_region();
+    // A fixed-size array is addressed by its declared index, which runs up or down
+    // from its left bound; a queue and a dynamic array are 0-based.
+    ir::Index at_index = b.unary(T::Load, idx.lv(b, l), l);
+    if (at.kind == ir::Type::Kind::UnpackedArray) {
+        const ir::Index left = b.constant(module_.pool.put_int(i32, at.left), l);
+        at_index             = b.binary(at.left <= at.right ? T::Add : T::Sub, left, at_index, l);
+    }
+    add_into(acc, bitstream_width(b.elem_select(lv, at_index, aty, l), et, b, l));
+    const ir::ExtraSlice body = b.close_region();
+
+    b.open_region();
+    const ir::Index idx_slot = idx.lv(b, l);
+    const ir::Index sc       = b.unary(T::Load, idx.lv(b, l), l);
+    const ir::Index one      = b.constant(module_.pool.put_int(i32, 1), l);
+    b.binary(T::Store, idx_slot, b.binary(T::Add, sc, one, l), l);
+    const ir::ExtraSlice step = b.close_region();
+
+    b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
+    return b.unary(T::Load, acc.lv(b, l), l);
 }
 
 // A failed $cast called as a task is a run-time error (LRM 6.24.2), reported
@@ -1066,6 +1362,12 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         // $bits is "determined without actual evaluation of the expression it
         // encloses" (LRM 20.6.2), so a call inside it never runs and still folds.
         // The others read the operand's value, and a call in it has to run.
+        //
+        // NOTE: `$bits(class_type)` folds here too, to slang's size: the bits of the class's
+        // properties, base class first (32 for `class B; int a;`, 96 for `class D extends B;
+        // int b, c;`). LRM 20.6.2 and 6.24.3 give a class type no size, and keeping slang's
+        // value is LRM_NOTES 59. An operand that is, or holds, a class handle never folds
+        // (patches/slang-bits-class-handle.patch) and is refused in bits_of_expr.
         const slang::ConstantValue cv = fold_const(call, name == "$bits" ? Fold::Required : Fold::Runtime);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);

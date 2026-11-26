@@ -302,6 +302,22 @@ FetchContent_Declare(
   # expression. The value now parses as a data type when it is no expression, and the
   # override reaches the type parameter's builder through the hierarchy override node,
   # keyed by its declarator like a value parameter's (LRM 6.20.3, 23.10.2). Not upstream.
+  # slang-string-unbounded-range: `s inside {["m":$]}` and `case (s) inside ["m":$]`
+  # (IEEE 1800-2023 11.4.13) aborted in ConversionExpression::makeImplicit's assertion:
+  # ValueRangeExpression::propagateType converted the `$` bound to `string`, which
+  # an unbounded literal is not assignable to. A `$` over strings now stays unconverted;
+  # a string has no lowest or highest value, so the side bounds nothing. Not upstream.
+  #
+  # slang-bits-class-handle: `$bits` of an expression that is, or holds, a class handle
+  # (IEEE 1800-2023 20.6.2) folded to the size of the handle's declared class in every
+  # constant context: a parameter, a packed dimension, a generate condition, and Clotho's
+  # own fold of the call. 11.4.14.1 streams the object a handle refers to, and nothing for
+  # a null one, so the value belongs to the object, not to the type: 0 for a null handle,
+  # more for a derived object. Such an operand is now evaluated as a dynamically sized
+  # one is, which a variable has no value for, so it is no constant: slang reports it where
+  # one is required, and Clotho refuses the rest (Lowerer::bits_of_expr). The data-type
+  # form keeps its size. Not upstream.
+  #
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  "-DPATCH_SET_HASH=${clotho_slang_patch_hash}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"

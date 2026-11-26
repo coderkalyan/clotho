@@ -750,3 +750,67 @@ tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
 delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
+
+## 57. Inferred sensitivity through a handle (9.4.2.2, 9.2.2.2.1, 25.9)
+
+9.4.2.2 adds "all nets and variables that are read by the statement" to `@*`, so a
+class property read through a handle (`obj.x`) and a virtual-interface member
+(`vif.a`) wake an `@*` on a change of the member and on a change of the handle, which
+is itself a variable read. 9.2.2.2.1 says "References to class objects and method calls
+of class objects do not add anything to the sensitivity list of an always_comb, except
+for any contributions from argument expressions", so `always_comb` over `obj.x` waits
+on neither the member nor `obj`. A virtual interface is not a class object, so
+`always_comb` over `vif.a` waits on the member and on `vif`. A static property is a
+variable of the class, not a reference through an object, and keeps its own signal. A
+body that reads through a handle cannot be statically subscribed, so it waits in its
+own loop and an `always_comb` of that kind is self-starting and queued late, so its time-zero run is note 44's.
+
+Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it). No oracle parses these designs.
+
+## 58. Event control over a handle's members, in a list (9.4.2, 9.4.2.1, 9.4.2.3, 8.4, 25.9)
+
+9.4.2: "A non-edge implicit event shall be detected on any change in the value of the
+expression. However, an edge event shall be detected only on the LSB of the expression."
+9.4.2.1 makes a list the logical OR of its events, and 9.4.2.3 gates a term with `iff`:
+"This type of expression is evaluated when a changes and not when enable changes." A term
+that reaches a class property or a virtual-interface member names its storage only once its
+handle is read, so the wait cannot be a static subscription or a net driven from time zero.
+Clotho waits in a loop that samples every term of a list made only of such terms, parks on
+everything the terms read (a member's waiter list in the instance a handle names, a
+property's any-change notifier in the object, a signal's bucket) and, on each wake, compares
+every term with its sample: a change of value, or for `posedge`, `negedge` and `edge` the
+Table 9-2 edge of bit 0, with the term's own `iff` evaluated at that point. The list resumes
+when any term fires. A wake does not say which source woke it, so a change that reverts
+before the waiter runs is missed (docs/design/scheduler-rules.md R9). That is why a list
+mixing such a term with a signal or an event is refused for now: the signal's and the event's
+own waits catch what the comparison loses (a pulse that reverts, a second trigger in the step
+the wait began in), and keeping that needs a per-registration fired marker in the wait node.
+`->> @(m) e` and `x <= @(m) y` over such a member are refused for the same reason: they
+register a detached subscription on a signal and edge.
+
+8.4 makes an access through a null object handle illegal, with an indeterminate result that
+"implementations may issue an error", and 25.9 says "Attempting to use a null virtual
+interface shall result in a fatal run-time error". An explicit control evaluates its
+expression where the wait begins, so a null handle in any term of a list, or in a lone
+compound term, is a located fatal at the wait, as for `@(obj.x)`. An inferred `@*` is
+different (note 57): it reads nothing until its body runs, so it waits on the handle.
+
+Code: `src/lower/Timing.cpp` (`lower_expr_wait`), `src/lower/Scans.cpp` (`control_needs_loop`, `WaitPropScan::handle(EventListControl)`). Tests: `tests/event_test.cpp` ("an event list with a class property term wakes on each of its terms" and the three after it), `tests/interface_test.cpp` ("virtual interface: an event list over member expressions" and the four after it). No oracle parses these designs; the plain-signal analogs of the edge and list traces agree with iverilog 13.
+
+## 59. `$bits` of a class data type (20.6.2, 6.24.3)
+
+20.6.2 defines `$bits ( data_type )` and sizes a data type only by example: for a struct of
+`logic valid; bit [8:1] data;` it "shall return 9, the number of data bits needed by a
+variable of type MyType", and "The $bits function can be used as an elaboration-time constant
+when used on fixed-size data types". 6.24.3 lists "Unpacked arrays, structures, or classes of
+the preceding types" among the bit-stream types. Neither gives a class type a size: a handle
+of the type can refer to an object of any derived class, and 11.4.14.1 streams "each data
+member of the referenced object, and not the handle itself", the members of a base class
+first, and skips a null handle. Clotho keeps the value slang gives the type: the bits of its
+properties, the base class's first, so `$bits(B)` is 32 for `class B; int a; endclass` and
+`$bits(D)` is 96 for `class D extends B; int b, c; endclass`, in a statement and as an
+elaboration-time constant. The expression form on a handle has the 11.4.14.1 answer, the
+members of the object it refers to (96 for a `B` handle to a `D` object, 0 for a null one),
+which no type fixes, so it is refused until class-handle streaming exists.
+
+Code: `src/lower/SystemTasks.cpp` (the `$bits` fold in `lower_sysfunc`, `bits_of_expr`). Tests: `tests/sysfunc_test.cpp` ("$bits of a class data type is the bits of its properties, base class first", "$bits of an operand that holds a class handle is refused"). iverilog 13 rejects the class data type ("Invalid data type for $bits()"), so no oracle covers it; the reading keeps slang's value.
