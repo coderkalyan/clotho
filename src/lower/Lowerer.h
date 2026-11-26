@@ -6147,10 +6147,10 @@ private:
         // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
         bool    is_agg = false;
         ir::Ref agg_ty = ir::Ref::Invalid;
-        // A queue output / inout formal whose actual is a BOUNDED queue, passed via a
-        // temp so the copy-back is a whole-queue assignment that truncates to the actual's
-        // bound (the callee only knows its formal's own, usually unbounded, type).
-        bool is_bounded_queue = false;
+        // A container output / inout formal passed via a temp of the formal's type,
+        // so the copy-back is a whole-container assignment to the actual
+        // (container_actual_needs_temp).
+        bool is_container = false;
     };
 
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
@@ -6163,6 +6163,17 @@ private:
     ir::Index agg_input_actual(const Expression& src, ir::Ref pty, ir::Builder& b, ir::SourceLoc l);
 
     void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l);
+
+    bool place_in_container_payload(const Expression& e);
+
+    bool container_actual_needs_temp(const Expression& actual, ir::Ref actual_ty, ir::Ref formal_ty);
+
+    void emit_container_place_copy(ir::Index     dst,
+                                   ir::Ref       dst_ty,
+                                   ir::Index     src,
+                                   ir::Ref       src_ty,
+                                   ir::Builder&  b,
+                                   ir::SourceLoc l);
 
     bool is_whole_ref_actual(const Expression& a);
 
