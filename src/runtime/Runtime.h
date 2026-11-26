@@ -1656,6 +1656,30 @@ void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops,
 // nonblocking-assignment commit path. A no-op when dst == src.
 void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops);
 
+// $readmemh / $readmemb and $fread into an associative array of integral index (LRM 21.4.1,
+// docs/LRM_NOTES.md 63): the elements the file's addresses name are created, and a number is
+// loaded into the leaf of the element at its address, row-major (LRM 21.4.3). `handle` / `ops`
+// are the array and its descriptor, `key_width` the index's width; `stride`, `width`,
+// `inner` / `inner_dims` describe one element as rt_readmem describes a memory's leaves, the
+// z plane `z_off` bytes into a slot. `alloc` locates the allocation of an element and `site`
+// the load's reports. A load that names no start begins at address 0.
+//
+// rt_readmem_assoc `flags`: bit0=hex, bit1=has_start, bit2=has_finish, bit3=four_state,
+// bit4=path_forward, bit5=narrow, bit7=signed index, bit8=names no array (a target that is
+// invalid at run time: nothing is loaded). Returns the number of leaves the load changed, an
+// element it created counting as one.
+uint32_t rt_readmem_assoc(const char* path_buf, uint32_t path_len, rt_assoc* handle, const rt_elem_ops* ops,
+                          uint32_t key_width, uint32_t stride, uint32_t width, uint32_t z_off, const int64_t* inner,
+                          uint32_t inner_dims, int64_t start, int64_t finish, uint32_t flags,
+                          const rt_alloc_site* alloc, const rt_null_site* site);
+
+// rt_fread_assoc `flags`: bit0=has_start, bit1=has_count, bit2=narrow, bit3=four_state,
+// bit4=signed index, bit5=names no array. Returns the number of bytes read; a `start` the
+// index type does not have reads nothing and warns, as rt_fread does for a memory.
+int32_t rt_fread_assoc(int32_t fd, rt_assoc* handle, const rt_elem_ops* ops, uint32_t key_width, uint32_t stride,
+                       uint32_t width, uint32_t z_off, const int64_t* inner, uint32_t inner_dims, int64_t start,
+                       int64_t max_count, uint32_t flags, const rt_alloc_site* alloc, const rt_null_site* site);
+
 // -- SystemVerilog string objects --
 //
 // The dynamic `string` type (LRM §6.16). A string value lives in a fixed

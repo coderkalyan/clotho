@@ -5195,19 +5195,437 @@ TEST_CASE("$readmem warns of a file with fewer or more words than its range unle
     }
 }
 
-// What a memory load still refuses, loudly: an associative array (LRM 21.4.1 makes its
-// addresses keys but does not say where a load that names none starts) and a slice of a
-// queue (7.10.1: a new queue, not a view of the queue).
-TEST_CASE("a memory load into an associative array or a queue slice is still refused") {
-    const auto refused = [](const std::string& body) {
+// LRM 21.4.1: "Loading an address creates an element of that index, if it does not already
+// exist". The number at address n goes to the element of index n, a load that names no address
+// starts at 0 (note 63 of docs/LRM_NOTES.md), and start, finish and `@` work as for a memory.
+// iverilog 13 cannot parse an associative array; its load of the fixed memory [0:31] with the
+// same file, start and finish is the oracle for the words, compared in the design.
+TEST_CASE("$readmemh into an associative array creates the elements the addresses name") {
+    write_file("clotho_readmem_as1.hex", "11 22 33\n@10 aa bb\n@5 cc\n");
+    write_file("clotho_readmem_as2.hex", "01 02 03 04 05 06\n");
+    write_file("clotho_readmem_as3.hex", "01 02 03\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] aa [int];
+            logic [7:0] f [0:31];
+            int k, same;
+            task automatic fresh;
+                aa.delete();
+                for (k = 0; k < 32; k = k + 1) f[k] = 8'hxx;
+            endtask
+            task automatic show;
+                same = 1;
+                foreach (aa[i]) begin
+                    $write("%0d:%h ", i, aa[i]);
+                    if (f[i] !== aa[i]) same = 0;
+                end
+                $display("n=%0d same=%0d", aa.num(), same);
+            endtask
+            initial begin
+                fresh; $readmemh("@A1@", aa);        $readmemh("@A1@", f);         show;
+                fresh; $readmemh("@A2@", aa, 3, 8);  $readmemh("@A2@", f, 3, 8);  show;
+                fresh; $readmemh("@A3@", aa, 9);     $readmemh("@A3@", f, 9, 11); show;
+                fresh; $readmemh("@A3@", aa, 5, 3);  $readmemh("@A3@", f, 5, 3);  show;
+                fresh; $readmemh("@A1@", aa, 0, 20); $readmemh("@A1@", f, 0, 20); show;
+                fresh; aa[1] = 8'h77; aa[40] = 8'h88; $readmemh("@A3@", aa);
+                foreach (aa[i]) $write("%0d:%h ", i, aa[i]);
+                $display("n=%0d", aa.num());
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 3; ++k) {
+        design = with_path(design, "@A" + std::to_string(k) + "@", "clotho_readmem_as" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) == "0:11 1:22 2:33 5:cc 16:aa 17:bb n=6 same=1\n"
+                                 "3:01 4:02 5:03 6:04 7:05 8:06 n=6 same=1\n"
+                                 "9:01 10:02 11:03 n=3 same=1\n"
+                                 "3:03 4:02 5:01 n=3 same=1\n"
+                                 "0:11 1:22 2:33 5:cc 16:aa 17:bb n=6 same=1\n"
+                                 "0:01 1:02 2:03 40:88 n=4\n");
+    CHECK(run_capture_stderr(design).empty());
+    for (int k = 1; k <= 3; ++k) {
+        std::remove(("clotho_readmem_as" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// The addresses are the values of the index type (note 63): the negative ones of a signed index,
+// counting up to the largest of an unsigned one, the numeric values of an enumerated index, the
+// 128-bit values of a wide one and the unsigned values of a wildcard. iverilog 13's load of the
+// fixed memory [-2:5] with the same file gives the words at negative addresses; an address
+// past the index type is the error of note 62 and a number past its largest the warning.
+TEST_CASE("$readmemh into an associative array addresses the values of its index type") {
+    write_file("clotho_readmem_at1.hex", "11 22 33 44\n");
+    write_file("clotho_readmem_at2.hex", "01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12\n");
+    write_file("clotho_readmem_at3.hex", "@1f aa\n");
+    write_file("clotho_readmem_at4.hex", "@1 aa @2 bb @4 cc\n");
+    std::string design = R"(
+        module m;
+            typedef enum { A = 1, B = 2, C = 4 } e_t;
+            int ai [int];
+            byte ab [byte];
+            bit [3:0] au [bit [3:0]];
+            logic [7:0] aw [bit [127:0]];
+            int ae [e_t];
+            int an [*];
+            initial begin
+                $readmemh("@T1@", ai, -2, 1);
+                foreach (ai[k]) $write("%0d:%h ", k, ai[k]);
+                $display("| ai n=%0d", ai.num());
+                $readmemh("@T1@", ab, -1, 2);
+                foreach (ab[k]) $write("%0d:%h ", k, ab[k]);
+                $display("| ab n=%0d", ab.num());
+                $readmemh("@T2@", au, 14);
+                foreach (au[k]) $write("%0d:%h ", k, au[k]);
+                $display("| au n=%0d", au.num());
+                $readmemh("@T1@", au);
+                $readmemh("@T3@", au);
+                foreach (au[k]) $write("%0d:%h ", k, au[k]);
+                $display("| au n=%0d", au.num());
+                $readmemh("@T1@", aw);
+                foreach (aw[k]) $write("%0d:%h ", k, aw[k]);
+                $display("| aw n=%0d", aw.num());
+                $readmemh("@T4@", ae);
+                foreach (ae[k]) $write("%0d:%h ", int'(k), ae[k]);
+                $display("| ae n=%0d", ae.num());
+                $readmemh("@T1@", an);
+                $display("an %h %h n=%0d", an[0], an[1], an.num());
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 4; ++k) {
+        design = with_path(design, "@T" + std::to_string(k) + "@", "clotho_readmem_at" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) == "-2:00000011 -1:00000022 0:00000033 1:00000044 | ai n=4\n"
+                                 "-1:11 0:22 1:33 2:44 | ab n=4\n"
+                                 "14:1 15:2 | au n=2\n"
+                                 "0:1 1:2 2:3 3:4 14:1 15:2 | au n=6\n"
+                                 "0:11 1:22 2:33 3:44 | aw n=4\n"
+                                 "1:000000aa 2:000000bb 4:000000cc | ae n=3\n"
+                                 "an 00000011 00000022 n=4\n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(err.find("warning: $readmemh: 'clotho_readmem_at2.hex' holds more words than the range [14:15]") !=
+          std::string::npos);
+    CHECK(err.find("error: $readmemh: address 31 in 'clotho_readmem_at3.hex' is outside the address range [0:15] "
+                   "of the load") != std::string::npos);
+    CHECK(count_substr(err, "warning:") == 1);
+    CHECK(count_substr(err, "error:") == 1);
+    for (int k = 1; k <= 4; ++k) {
+        std::remove(("clotho_readmem_at" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// The element is the word of a load (21.4.1, 21.4.3): 4-state digits stay, a 2-state element
+// reads x and z as 0 (21.4.2), a wide one takes its digits in full, and an element that is an
+// unpacked array takes the numbers of a row-major run of its leaves, each dimension from its
+// lowest address; a row the data leaves unfinished keeps its other leaves.
+TEST_CASE("$readmem into an associative array of 4-state, 2-state, wide and array elements") {
+    write_file("clotho_readmem_ae1.hex", "x1 z2 3f\n");
+    write_file("clotho_readmem_ae2.hex",
+               "0123456789abcdef0123456789abcdef fedcba9876543210fedcba9876543210\n");
+    write_file("clotho_readmem_ae3.hex", "01 02 03 04 05 06 @5 07 08\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] a4 [int];
+            bit [7:0] a2 [int];
+            logic [127:0] aw [int];
+            bit [127:0] bw [int];
+            logic [7:0] am [int][0:2];
+            logic [7:0] ad [int][2:0];
+            logic [7:0] m2 [int][0:1][0:2];
+            initial begin
+                $readmemh("@E1@", a4);
+                $readmemh("@E1@", a2);
+                foreach (a4[k]) $write("%0d:%h/%h ", k, a4[k], a2[k]);
+                $display("");
+                $readmemh("@E2@", aw);
+                $readmemh("@E2@", bw);
+                foreach (aw[k]) $write("%0d:%h/%h ", k, aw[k], bw[k]);
+                $display("");
+                $readmemh("@E3@", am);
+                foreach (am[k]) $write("%0d:%h%h%h ", k, am[k][0], am[k][1], am[k][2]);
+                $display("n=%0d", am.num());
+                $readmemh("@E3@", ad);
+                foreach (ad[k]) $write("%0d:%h%h%h ", k, ad[k][0], ad[k][1], ad[k][2]);
+                $display("n=%0d", ad.num());
+                $readmemh("@E3@", m2);
+                foreach (m2[k])
+                    $write("%0d:%h%h%h%h%h%h ", k, m2[k][0][0], m2[k][0][1], m2[k][0][2], m2[k][1][0], m2[k][1][1],
+                           m2[k][1][2]);
+                $display("n=%0d", m2.num());
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 3; ++k) {
+        design = with_path(design, "@E" + std::to_string(k) + "@", "clotho_readmem_ae" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) ==
+          "0:x1/01 1:z2/02 2:3f/3f \n"
+          "0:0123456789abcdef0123456789abcdef/0123456789abcdef0123456789abcdef "
+          "1:fedcba9876543210fedcba9876543210/fedcba9876543210fedcba9876543210 \n"
+          "0:010203 1:040506 5:0708xx n=3\n"
+          "0:010203 1:040506 5:0708xx n=3\n"
+          "0:010203040506 5:0708xxxxxxxx n=2\n");
+    CHECK(run_capture_stderr(design).empty());
+    for (int k = 1; k <= 3; ++k) {
+        std::remove(("clotho_readmem_ae" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// An entry of an associative array that is itself an array or an associative array is loaded as
+// the array it is, and created by the load as a store to it would be (7.8.7); its slice
+// is a slice of that array. An x or z key names no array: nothing is created, and the file is
+// not even opened.
+TEST_CASE("$readmemh into an entry of an associative array of arrays or of associative arrays") {
+    write_file("clotho_readmem_ap1.hex", "01 02 03\n");
+    write_file("clotho_readmem_ap2.hex", "11 22\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] am [integer][0:2];
+            int nn [integer][integer];
+            integer k;
+            initial begin
+                $readmemh("@P1@", am[7]);
+                $display("am7 %h %h %h n=%0d", am[7][0], am[7][1], am[7][2], am.num());
+                $readmemh("@P2@", am[9][1:2]);
+                $display("am9 %h %h %h n=%0d", am[9][0], am[9][1], am[9][2], am.num());
+                k = 'x;
+                $readmemh("clotho_readmem_ap_absent.hex", am[k]);
+                $display("n=%0d", am.num());
+                $readmemh("@P1@", nn[3]);
+                foreach (nn[j, i]) $write("%0d.%0d:%0h ", j, i, nn[j][i]);
+                $display("n=%0d inner=%0d", nn.num(), nn[3].num());
+                $readmemh("clotho_readmem_ap_absent.hex", nn[k]);
+                $display("n=%0d", nn.num());
+            end
+        endmodule
+    )";
+    design = with_path(with_path(design, "@P1@", "clotho_readmem_ap1.hex"), "@P2@", "clotho_readmem_ap2.hex");
+    CHECK(run_capture(design) == "am7 01 02 03 n=1\n"
+                                 "am9 xx 11 22 n=2\n"
+                                 "n=2\n"
+                                 "3.0:1 3.1:2 3.2:3 n=1 inner=3\n"
+                                 "n=1\n");
+    CHECK(run_capture_stderr(design).empty());
+    std::remove("clotho_readmem_ap1.hex");
+    std::remove("clotho_readmem_ap2.hex");
+}
+
+// An associative array is a target wherever it lives: a class property (static or not), a
+// member of an unpacked struct or of an element of an array of them, an element of an array
+// or a queue of associative arrays, and a member of an interface a virtual interface handle
+// names, where only that instance gets the elements. A waiter on the array of a class
+// property wakes. A target that is invalid (an index out of range, or with an x) names
+// no array: nothing is loaded. iverilog 13 has no associative array, class or interface: the
+// words are those of the same load of a fixed memory.
+TEST_CASE("$readmemh into an associative array that is a property, a member, an element or an interface member") {
+    write_file("clotho_readmem_ash1.hex", "11 22 33 44\n");
+    write_file("clotho_readmem_ash2.hex", "@1 aa @2 bb @4 cc\n");
+    std::string design = R"(
+        class C;
+            int a;
+            logic [7:0] m [int];
+            static logic [7:0] sm [int];
+            function new(); a = 5; endfunction
+            function void load(string f); $readmemh(f, m); endfunction
+        endclass
+        interface ifc;
+            logic [7:0] m [int];
+        endinterface
+        module m;
+            typedef struct { int a; logic [7:0] m [int]; int b; } s_t;
+            s_t s;
+            s_t sa [0:1];
+            logic [7:0] fa [0:2][int];
+            logic [7:0] qa [$][int];
+            C obj;
+            ifc u1(), u2();
+            virtual ifc v;
+            integer k, at_c = -1;
+            initial begin obj = new; #1; wait (obj.m.num() == 4) at_c = $time; end
+            initial begin
+                #3;
+                $readmemh("@H1@", obj.m);
+                #1;
+                foreach (obj.m[i]) $write("%0d:%h ", i, obj.m[i]);
+                $display("| obj a=%0d at=%0d", obj.a, at_c);
+                $readmemh("@H2@", C::sm);
+                foreach (C::sm[i]) $write("%0d:%h ", i, C::sm[i]);
+                $display("| static");
+                obj = new;
+                obj.load("@H1@");
+                $display("method n=%0d", obj.m.num());
+                s.a = 7; s.b = 9;
+                $readmemh("@H1@", s.m);
+                foreach (s.m[i]) $write("%0d:%h ", i, s.m[i]);
+                $display("| s a=%0d b=%0d", s.a, s.b);
+                $readmemh("@H1@", sa[1].m, 2);
+                foreach (sa[1].m[i]) $write("%0d:%h ", i, sa[1].m[i]);
+                $display("| n0=%0d", sa[0].m.num());
+                $readmemh("@H1@", fa[1]);
+                foreach (fa[j, i]) $write("%0d.%0d:%h ", j, i, fa[j][i]);
+                $display("|");
+                k = 7;
+                $readmemh("@H1@", fa[k]);
+                k = 'x;
+                $readmemh("@H1@", fa[k]);
+                $display("n=%0d", fa[0].num() + fa[1].num() + fa[2].num());
+                qa.push_back(fa[0]);
+                qa.push_back(fa[0]);
+                $readmemh("@H1@", qa[1]);
+                foreach (qa[j, i]) $write("%0d.%0d:%h ", j, i, qa[j][i]);
+                $display("|");
+                v = u2;
+                $readmemh("@H1@", v.m);
+                foreach (u2.m[i]) $write("%0d:%h ", i, u2.m[i]);
+                $display("| u1 n=%0d", u1.m.num());
+            end
+        endmodule
+    )";
+    design = with_path(with_path(design, "@H1@", "clotho_readmem_ash1.hex"), "@H2@", "clotho_readmem_ash2.hex");
+    CHECK(run_capture(design) == "0:11 1:22 2:33 3:44 | obj a=5 at=3\n"
+                                 "1:aa 2:bb 4:cc | static\n"
+                                 "method n=4\n"
+                                 "0:11 1:22 2:33 3:44 | s a=7 b=9\n"
+                                 "2:11 3:22 4:33 5:44 | n0=0\n"
+                                 "1.0:11 1.1:22 1.2:33 1.3:44 |\n"
+                                 "n=4\n"
+                                 "1.0:11 1.1:22 1.2:33 1.3:44 |\n"
+                                 "0:11 1:22 2:33 3:44 | u1 n=0\n");
+    CHECK(run_capture_stderr(design).empty());
+    std::remove("clotho_readmem_ash1.hex");
+    std::remove("clotho_readmem_ash2.hex");
+}
+
+// A load that creates or changes an element wakes whoever waits on the array or on an element,
+// as a store to it does (9.4.2, 9.4.3); one that changes nothing wakes nobody. A `$fread`
+// into an associative array wakes the same way. Oracle: the same waits on a fixed memory in
+// iverilog 13 (see "$readmemh wakes the memory's waiters only when it changes it"); it has
+// no associative array to wait on.
+TEST_CASE("a load into an associative array wakes the waiters of its elements") {
+    write_file("clotho_readmem_aw3.hex", "11 22 33\n");
+    write_file("clotho_readmem_aw4.hex", "11 22 33 44\n");
+    write_file("clotho_fread_aw.bin", "\xaa\xbb\xcc");
+    std::string design = R"(
+        module m;
+            logic [7:0] aa [int];
+            logic [7:0] bb [int];
+            integer at_e = -1, again_e = -1, at_w = -1, at_n = -1, at_n2 = -1, at_f = -1, fd, rc;
+            initial begin #1; @(aa[1]) at_e = $time; @(aa[1]) again_e = $time; end
+            initial begin #1; wait (aa[2] == 8'h33) at_w = $time; end
+            initial begin #1; wait (aa.num() == 3) at_n = $time; end
+            initial begin #7; wait (aa.num() == 4) at_n2 = $time; end
+            initial begin #2; wait (bb[2] == 8'hcc) at_f = $time; end
+            initial begin
+                #5 $readmemh("@W3@", aa);
+                #1 $display("e=%0d w=%0d n=%0d again=%0d", at_e, at_w, at_n, again_e);
+                $readmemh("@W3@", aa);
+                #1 $display("again=%0d n2=%0d", again_e, at_n2);
+                #1 $readmemh("@W4@", aa);
+                #1 $display("n2=%0d aa3=%h again=%0d", at_n2, aa[3], again_e);
+                fd = $fopen("@FB@", "rb");
+                rc = $fread(bb, fd);
+                $fclose(fd);
+                #1 $display("rc=%0d f=%0d", rc, at_f);
+            end
+        endmodule
+    )";
+    design = with_path(with_path(with_path(design, "@W3@", "clotho_readmem_aw3.hex"), "@W4@",
+                                 "clotho_readmem_aw4.hex"),
+                       "@FB@", "clotho_fread_aw.bin");
+    CHECK(run_capture(design) == "e=5 w=5 n=5 again=-1\n"
+                                 "again=-1 n2=-1\n"
+                                 "n2=8 aa3=44 again=-1\n"
+                                 "rc=3 f=9\n");
+    std::remove("clotho_readmem_aw3.hex");
+    std::remove("clotho_readmem_aw4.hex");
+    std::remove("clotho_fread_aw.bin");
+}
+
+// $fread into an associative array (note 63): the bytes of an element are read MSB-first and
+// the elements are those of the addresses from `start` (0 when it is not given), up to `count`
+// of them, never past the largest index, and none is created for the end of the file. An index of
+// a signed type has negative addresses; a start the index type does not have reads nothing and
+// warns, as for a memory.
+TEST_CASE("$fread into an associative array creates the elements the bytes fill") {
+    write_file("clotho_fread_af.bin", "\x11\x22\x33\x44\x55");
+    std::string design = R"(
+        module m;
+            logic [7:0] aa [int];
+            logic [15:0] a16 [int];
+            int ai [int];
+            bit [3:0] au [bit [3:0]];
+            integer fd, rc;
+            initial begin
+                fd = $fopen("@F@", "rb"); rc = $fread(aa, fd); $fclose(fd);
+                foreach (aa[k]) $write("%0d:%h ", k, aa[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(ai, fd); $fclose(fd);
+                foreach (ai[k]) $write("%0d:%h ", k, ai[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(a16, fd, 10, 2); $fclose(fd);
+                foreach (a16[k]) $write("%0d:%h ", k, a16[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(a16, fd, -3); $fclose(fd);
+                foreach (a16[k]) $write("%0d:%h ", k, a16[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(au, fd, 16);
+                $display("rc=%0d n=%0d next=%h", rc, au.num(), $fgetc(fd));
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    design = with_path(design, "@F@", "clotho_fread_af.bin");
+    CHECK(run_capture(design) == "0:11 1:22 2:33 3:44 4:55 rc=5\n"
+                                 "0:11223344 1:55000000 rc=5\n"
+                                 "10:1122 11:3344 rc=4\n"
+                                 "-3:1122 -2:3344 -1:5500 10:1122 11:3344 rc=5\n"
+                                 "rc=0 n=0 next=00000011\n");
+    CHECK(run_capture_stderr(design).find("warning: $fread start address 16 is outside the memory range [0:15]") !=
+          std::string::npos);
+    std::remove("clotho_fread_af.bin");
+}
+
+// A load that names no array or no file creates nothing: an invalid target (an index out of
+// range or with an x) does not open the file, a file that is empty or cannot be opened has no
+// number to create an element for.
+TEST_CASE("a memory load into an associative array that names no element or no file creates none") {
+    write_file("clotho_readmem_ax1.hex", "");
+    std::string design = R"(
+        module m;
+            logic [7:0] fa [0:2][int];
+            logic [7:0] aa [int];
+            integer k;
+            initial begin
+                k = 7;
+                $readmemh("clotho_readmem_ax_absent.hex", fa[k]);
+                k = 'x;
+                $readmemh("clotho_readmem_ax_absent.hex", fa[k]);
+                $readmemh("@X1@", aa);
+                $display("n=%0d", aa.num() + fa[0].num() + fa[1].num() + fa[2].num());
+                $readmemh("clotho_readmem_ax_absent.hex", aa);
+                $display("n=%0d", aa.num());
+            end
+        endmodule
+    )";
+    design                = with_path(design, "@X1@", "clotho_readmem_ax1.hex");
+    const std::string err = run_capture_stderr(design);
+    CHECK(run_capture(design) == "n=0\nn=0\n");
+    CHECK(count_substr(err, "cannot open file 'clotho_readmem_ax_absent.hex'") == 1);
+    std::remove("clotho_readmem_ax1.hex");
+}
+
+// What a memory load still refuses, loudly: a slice of a queue (7.10.1: a new queue, not a
+// view of the queue), and an associative array whose index is not integral, which a `$fread`
+// has no address for (21.4.1; slang rejects it itself for a `$readmem`).
+TEST_CASE("a memory load into a queue slice or an associative array without an integral index is refused") {
+    const auto refused = [](const std::string& body, const char* what) {
         const LowerResult r = lower_text("module m;\n" + body + "\nendmodule\n");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("an associative array or a slice of a queue") != std::string::npos);
+        CHECK(r.diagnostic_text().find(what) != std::string::npos);
     };
-    refused("logic [7:0] a[int]; initial $readmemh(\"f.hex\", a);");
-    refused("logic [7:0] q[$]; initial $readmemb(\"f.hex\", q[1:2]);");
-    refused("logic [7:0] a[int]; integer fd, rc; initial rc = $fread(a, fd);");
-    refused("logic [7:0] q[$]; integer fd, rc; initial rc = $fread(q[1:2], fd);");
+    refused("logic [7:0] q[$]; initial $readmemb(\"f.hex\", q[1:2]);", "a slice of a queue");
+    refused("logic [7:0] q[$]; integer fd, rc; initial rc = $fread(q[1:2], fd);", "a slice of a queue");
+    refused("logic [7:0] a[string]; integer fd, rc; initial rc = $fread(a, fd);", "needs an integral index type");
 }
 
 // Slurp a file written by a file-I/O test.

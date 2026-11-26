@@ -3195,6 +3195,8 @@ private:
     llvm::FunctionCallee sscanf_fn();
     llvm::FunctionCallee readmem_fn();
     llvm::FunctionCallee fread_fn();
+    llvm::FunctionCallee readmem_assoc_fn();
+    llvm::FunctionCallee fread_assoc_fn();
 
     llvm::FunctionCallee vcd_open_fn();
     llvm::FunctionCallee vcd_begin_fn();
@@ -4288,7 +4290,9 @@ private:
     // leaf planes of the first word that exists, the leaf slot's facts, the loaded
     // array's dimensions (the declared bounds of its highest, `inner` for the rest),
     // which of the words of the highest dimension have storage and, for a queue, the
-    // ring they sit in.
+    // ring they sit in. An associative array has no planes to point at (its elements are
+    // created by the load): rt_readmem_assoc / rt_fread_assoc take its handle, its
+    // descriptor and the index's width instead, and the slot facts describe one element.
     struct MemTarget {
         llvm::Value*                      mm_base = nullptr;
         llvm::Value*                      z_base  = nullptr;
@@ -4308,10 +4312,20 @@ private:
         // i64 values: the ring of a queue (see rt_readmem); 0 and 0 for any other array.
         llvm::Value* ring_head = nullptr;
         llvm::Value* ring_cap  = nullptr;
+        // An associative array: its handle (ptr) and descriptor, the index's width and
+        // signedness, the byte offset of the z plane in an element slot, and the i1 that
+        // says the target is valid at run time (null: always).
+        bool            assoc       = false;
+        llvm::Value*    assoc_handle = nullptr;
+        llvm::Constant* assoc_ops    = nullptr;
+        uint32_t        key_width    = 0;
+        bool            key_signed   = false;
+        uint32_t        z_off        = 0;
+        llvm::Value*    assoc_valid  = nullptr;
         // The place the load writes: whose waiters it wakes and what it marks for the
-        // dump. `container` says it is a dynamic array or queue, which wakes through
-        // the container notifier (notify_container_mutation) rather than the waiters of
-        // an array signal.
+        // dump. `container` says it is a dynamic array, queue or associative array, which
+        // wakes through the container notifier (notify_container_mutation) rather than the
+        // waiters of an array signal.
         LValueInfo place;
         bool       container = false;
     };

@@ -891,3 +891,54 @@ iverilog 13 has no slice, so the slice tests take the whole-memory load with the
 addresses as oracle for the words placed, and derive the errors from the clause.
 
 Code: `src/runtime/Io.cpp` (`rt_readmem`), `src/runtime/Reports.cpp` (`mem_load_report`), `src/ir/llvm/SystemTasks.cpp` (`lower_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem ends the load at a file address outside the range the task names", "$readmem into a slice with a start or finish outside its range loads nothing", "$readmem warns of a file with fewer or more words than its range unless it has addresses"). Oracle: iverilog 13 for the first and the third.
+
+## 63. Associative arrays as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 7.8, 21.4.3)
+
+21.4.1: "When loading associative arrays, indices shall be of integral types. Loading an address
+creates an element of that index, if it does not already exist. When an associative array's
+index is of an enumerated type, address entries in the pattern file are in numeric format and
+correspond to the numeric values associated with the elements of the enumerated type." So the
+address of a word is the value of an index: `@h` names the element at index `h`, and the load
+creates it. slang rejects a `$readmem*` of an array with a non-integral index; it does not
+check a `$fread`, so Clotho does (an index with no integral value has no address, 21.3.4.4
+gives it none).
+
+The clause does not say where a load that names no address starts. 21.4 makes the default
+start address "the lowest address in the memory", and an associative array has none: it is
+sparse, and the lowest value of its index type is `-2147483648` for an `int`, where creating an
+element would be absurd. Decided with the user: a load with no `start_addr` and no `@` before
+its first number starts at **address 0** and counts up. With `start_addr` it starts there; with
+`start_addr` and `finish_addr` it goes the way they order (down when `finish_addr` is below),
+as for a memory. `$fread` has the same gap (21.3.4.4: "the lowest numbered location in the
+memory shall be used") and takes the same reading. For an enumerated index, 0 is a number
+whether it is a member or not; Clotho does not check that an address names a member.
+
+The remaining choices are Clotho's, the clause being silent. The addresses are the values of
+the index type: a signed index has the negative ones, and counting stops at its largest value
+(2^W - 1 for an unsigned one), where a further number is the "more words than the range"
+warning of note 62; an `@` address outside the index type is the error of that note. A
+file's `@` address has no sign, so `@ff` is 255, outside a `byte` index, and not -1. The
+tasks take `start`, `finish` and `@` as 64-bit numbers, so the addresses of a wider index
+are its 64-bit values. A wildcard `[*]` index (7.8.1) is an unsigned one of 64 bits. As for
+a memory, a file of fewer words than a bounded range (`start` and `finish` both given) is warned
+of, and one of any length is not for an array whose range has no end.
+
+An element is created by the first number loaded into it, so an empty file or an invalid target
+creates none. One that is itself an unpacked array (`logic [7:0] aa [int][0:2]`) is a word of
+21.4.3: the address names the element, whose leaves the numbers fill row-major, and a row the
+data leaves unfinished keeps its other leaves (note 59). An entry that is itself an array or a
+container (`aa[k]`, `aa[k][1:2]`, `nn[k]` of an `int nn[int][int]`) is loaded as the array
+it is, and is created if it is not there (7.8.7: "the target of an assignment or actual to an
+argument passed by reference"); an x or z key names no array, and nothing is loaded. An
+associative array of associative arrays, dynamic arrays or queues as a whole is still refused
+with the other arrays of containers (note 61).
+
+A load that creates or changes an element wakes whoever waits on the array, as a store to it does
+(9.4.2, 9.4.3), whatever the number of its elements; a load that changes none wakes nobody.
+
+iverilog 13 cannot parse an associative array, so the tests take as oracle its load of the
+fixed memory the same addresses name (the element at address `n` is word `n` of a memory
+`[0:max]`, with the same file and the same start and finish), compared in the design, and derive
+the rest from the clauses above.
+
+Code: `src/runtime/Io.cpp` (`AssocWords`, `load_words`, `read_words`, `rt_readmem_assoc`, `rt_fread_assoc`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `lower_readmem`, `lower_fread_mem`), `src/lower/SystemTasks.cpp` (`is_mem_target_shape`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into an associative array creates the elements the addresses name", "$readmemh into an associative array addresses the values of its index type", "$readmem into an associative array of 4-state, 2-state, wide and array elements", "$readmemh into an entry of an associative array of arrays or of associative arrays", "$readmemh into an associative array that is a property, a member, an element or an interface member", "a load into an associative array wakes the waiters of its elements", "$fread into an associative array creates the elements the bytes fill", "a memory load into an associative array that names no element or no file creates none", "a memory load into a queue slice or an associative array without an integral index is refused").

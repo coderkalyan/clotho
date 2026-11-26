@@ -450,6 +450,25 @@ llvm::FunctionCallee Backend::fread_fn() {
                  { i32, ptr, ptr, i32, i32, i32, ptr, i32, i64, i64, i64, i64, i64, i64, i64, i64, i32, ptr, i64 });
 }
 
+// i32 rt_readmem_assoc(const char* path, i32 path_len, ptr handle, ptr ops, i32 key_width, i32 stride,
+//                      i32 width, i32 z_off, i64* inner, i32 inner_dims, i64 start, i64 finish, i32 flags,
+//                      ptr alloc, ptr site)
+llvm::FunctionCallee Backend::readmem_assoc_fn() {
+    auto* ptr = raw_ptr_ty();
+    auto* i32 = b_.getInt32Ty();
+    auto* i64 = b_.getInt64Ty();
+    return rt_fn("rt_readmem_assoc", i32, { ptr, i32, ptr, ptr, i32, i32, i32, i32, ptr, i32, i64, i64, i32, ptr, ptr });
+}
+
+// i32 rt_fread_assoc(i32 fd, ptr handle, ptr ops, i32 key_width, i32 stride, i32 width, i32 z_off,
+//                    i64* inner, i32 inner_dims, i64 start, i64 max_count, i32 flags, ptr alloc, ptr site)
+llvm::FunctionCallee Backend::fread_assoc_fn() {
+    auto* ptr = raw_ptr_ty();
+    auto* i32 = b_.getInt32Ty();
+    auto* i64 = b_.getInt64Ty();
+    return rt_fn("rt_fread_assoc", i32, { i32, ptr, ptr, i32, i32, i32, i32, ptr, i32, i64, i64, i32, ptr, ptr });
+}
+
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 
 llvm::FunctionCallee Backend::vcd_open_fn() {

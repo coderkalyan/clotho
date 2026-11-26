@@ -102,18 +102,18 @@ ir::Index Lowerer::lower_address_arg(const Expression& expr, ir::Builder& b) {
 }
 
 // Whether the memory argument of $readmem / $fread names what the load can fill
-// (LRM 21.4): a variable holding an unpacked array of fixed size, a dynamic array or a
-// queue; an element of one that is itself an array (a partially indexed
-// multidimensional memory); or a slice of either, with every dimension above the slice
-// indexed. The variable can be a member of an unpacked struct, a property of a class
-// object or a member of the interface a virtual interface handle names (LRM 25.9). An
-// associative array is not loaded yet, and a queue slice is a new queue (LRM 7.10.1),
-// not a view of the queue that a load could fill.
+// (LRM 21.4): a variable holding an unpacked array of fixed size, a dynamic array, a
+// queue or an associative array; an element of one that is itself an array (a partially
+// indexed multidimensional memory); or a slice of either, with every dimension above the
+// slice indexed. The variable can be a member of an unpacked struct, a property of a class
+// object or a member of the interface a virtual interface handle names (LRM 25.9). A queue
+// slice is a new queue (LRM 7.10.1), not a view of the queue that a load could fill.
 bool Lowerer::is_mem_target_shape(const Expression& e) {
     for (const Expression* cur = &e;;) {
         const slang::ast::Type& type = cur->type->getCanonicalType();
         if (type.as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr &&
-            type.as_if<slang::ast::DynamicArrayType>() == nullptr && type.as_if<slang::ast::QueueType>() == nullptr) {
+            type.as_if<slang::ast::DynamicArrayType>() == nullptr && type.as_if<slang::ast::QueueType>() == nullptr &&
+            type.as_if<slang::ast::AssociativeArrayType>() == nullptr) {
             return false;
         }
         switch (cur->kind) {
@@ -180,9 +180,10 @@ Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b
 // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
 // Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory is a
 // whole unpacked array (a plain name or hierarchical reference) of fixed size or a
-// dynamic array or queue, whose size the load does not change (21.4.1), an element of
-// a multidimensional one that is itself an array, or a slice of either (21.4: "The
-// memory_name can be an unpacked array or a partially indexed multidimensional
+// dynamic array or queue, whose size the load does not change (21.4.1), or an
+// associative array of integral index, whose elements the load creates (21.4.1), an
+// element of a multidimensional one that is itself an array, or a slice of either (21.4:
+// "The memory_name can be an unpacked array or a partially indexed multidimensional
 // unpacked array", its lowest dimension sliceable); start and finish then address that
 // array. The filename is a string literal, string-typed expression, or integral value
 // holding packed ASCII (LRM §21.4), and the optional address bounds are general
@@ -201,11 +202,9 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
     }
     const Expression& mem = *mem_arg;
     if (!is_mem_target_shape(mem)) {
-        // TODO: an associative array (LRM 21.4.1: loading an address creates its element,
-        // but nothing says which address a load that names none starts at) and a slice of
-        // a queue as the target.
-        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one, not an "
-             "associative array or a slice of a queue");
+        // TODO: a slice of a queue as the target.
+        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one, not a "
+             "slice of a queue");
     }
     const ir::Index  filename   = lower_expr(*args[0], b);
     const MemTarget  target     = lower_mem_target(mem, b);
@@ -1566,10 +1565,15 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         const Expression& target = *target_arg;
         if (target.type->getCanonicalType().isUnpackedArray()) {
             if (!is_mem_target_shape(target)) {
-                // TODO: an associative array (LRM 21.3.4.4 says nothing of one) and a slice
-                // of a queue as the target.
+                // TODO: a slice of a queue as the target.
                 fail("$fread memory target must be an unpacked array variable, an element of one or a slice of "
-                     "one, not an associative array or a slice of a queue");
+                     "one, not a slice of a queue");
+            }
+            // NOTE: 21.4.1 addresses an associative array by an integral index only. slang checks
+            // that of a $readmem and not of a $fread, so an index it has no address for stops here.
+            if (const auto* aa = target.type->getCanonicalType().as_if<slang::ast::AssociativeArrayType>();
+                aa != nullptr && !aa->hasWildcardIndexType() && !aa->indexType->isIntegral()) {
+                fail("$fread into an associative array needs an integral index type (LRM 21.4.1)");
             }
             const ir::Index  fd        = lower_expr(*args[1], b);
             const MemTarget  mem       = lower_mem_target(target, b);

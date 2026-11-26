@@ -1148,6 +1148,13 @@ std::pair<llvm::Value*, uint32_t> Backend::mem_inner_dims(Ref array_type) {
 // the end of a memory. A queue's words sit in its ring, which the runtime walks from
 // the head slot (rt_readmem).
 //
+// An associative array is the one target that is not storage the load finds: LRM 21.4.1
+// has a loaded address create the element of that index. The load goes through the handle
+// and the array's descriptor (rt_readmem_assoc, rt_fread_assoc), and the slot facts are
+// those of one element, an array of them (an element that is itself an array) being
+// the leaves of one word. An entry that is itself an array or a container, `aa[k]`, is
+// loaded as the array it is, and created if it is not there.
+//
 // A target that can be invalid (a runtime index outside its array, or with an x or z
 // bit) names no word then: the runtime is handed a word count of 0 and a scratch slot
 // to point at, and does nothing.
@@ -1157,10 +1164,15 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
                                                uint32_t    slice,
                                                Index       slice_base,
                                                const char* task) {
-    const Guarded g = lvalue_of(target);
-    if (g.is_assoc || g.is_string) {
-        throw BackendError{ std::string(task) +
-                            " target is an associative array element or an array of strings, which is not supported" };
+    Guarded g = lvalue_of(target);
+    // An entry of an associative array that is itself an array or a container, `aa[k]`, is the
+    // target of the load, which creates it as a store to it would (LRM 7.8.7). An x or z key
+    // names none, which the verdict of the place carries.
+    if (g.is_assoc) {
+        g = assoc_elem_lvalue(g, /*for_write=*/true);
+    }
+    if (g.is_string) {
+        throw BackendError{ std::string(task) + " target is an array of strings, which is not supported" };
     }
     emit_bounds_reports(g, /*is_write=*/true);
 
@@ -1168,7 +1180,8 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
     const Type named_ty  = std::get<Type>(mod_.pool.get(named));
     const Type loaded    = std::get<Type>(mod_.pool.get(type));
     const bool queue     = named_ty.kind == Type::Kind::Queue;
-    const bool container = queue || named_ty.kind == Type::Kind::DynArray;
+    const bool assoc     = named_ty.kind == Type::Kind::Assoc;
+    const bool container = queue || assoc || named_ty.kind == Type::Kind::DynArray;
     if (queue && slice != kMemSliceNone) {
         throw BackendError{ "internal: a slice of a queue is a new queue, not a view that a load can fill" };
     }
@@ -1209,6 +1222,32 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
         four_state       = lay.domain == Domain::Four;
         has_z            = four_state;
         slot_ty          = agg_leaf_slot_ty(leaf);
+    }
+
+    // An associative array has no planes to point at: its elements are created by the load,
+    // which the runtime does through the handle (rt_readmem_assoc, rt_fread_assoc). A
+    // target that can be invalid names no array then, and the runtime does nothing.
+    if (assoc) {
+        const AssocKeyInfo key = assoc_key_info(named);
+        if (key.is_string || key.is_agg) {
+            throw BackendError{ "internal: the index of an associative array a memory load fills is not integral" };
+        }
+        const llvm::DataLayout& dl = env_->llmod.getDataLayout();
+        MemTarget               t;
+        t.assoc        = true;
+        t.assoc_handle = lv_handle_ptr(g, HandleUse::Place);
+        t.assoc_ops    = elem_ops_global(named);
+        t.key_width    = key.W;
+        t.key_signed   = key.is_signed;
+        t.stride       = static_cast<uint32_t>(dl.getTypeAllocSize(slot_ty));
+        t.width        = width;
+        t.four_state   = four_state;
+        t.z_off        = has_z ? static_cast<uint32_t>(dl.getStructLayout(slot_ty)->getElementOffset(1)) : 0;
+        t.inner        = mem_inner_dims(type);
+        t.assoc_valid  = g.valid();
+        t.place        = static_cast<const LValueInfo&>(g);
+        t.container    = true;
+        return t;
     }
 
     // The words of the array `target` names, and of the one the load fills. A dynamic
@@ -1402,6 +1441,23 @@ void Backend::lower_fread_mem(Index i) {
     llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
     const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (!t.four_state ? 4u : 0u);
 
+    if (t.assoc) {
+        // An associative array: its elements are created as the bytes arrive.
+        llvm::Value* aflags = b_.getInt32(flags | (t.four_state ? 8u : 0u) | (t.key_signed ? 16u : 0u));
+        if (t.assoc_valid != nullptr) {
+            aflags = b_.CreateOr(aflags, b_.CreateSelect(t.assoc_valid, b_.getInt32(0), b_.getInt32(32)));
+        }
+        llvm::Value* r = b_.CreateCall(
+          fread_assoc_fn(), { fd, t.assoc_handle, t.assoc_ops, b_.getInt32(t.key_width), b_.getInt32(t.stride),
+                              b_.getInt32(t.width), b_.getInt32(t.z_off), t.inner.first,
+                              b_.getInt32(t.inner.second), start, cnt, aflags,
+                              alloc_site_global(loc_text(i), "associative array"),
+                              null_site_global(loc_text(i), NullKind::Class) });
+        finish_mem_load(t, r, "fread");
+        set_value(i, two_val(r));
+        return;
+    }
+
     // Only a start address the memory does not have is reported, so the site is the
     // call and the time is read once, ahead of the runtime call.
     llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
@@ -1455,6 +1511,22 @@ void Backend::lower_readmem(Index i) {
                            (info.has_finish ? 4u : 0u) | (t.four_state ? 8u : 0u) |
                            (fname_is_str ? 16u : 0u) | (!t.four_state ? 32u : 0u) |
                            (info.slice != kMemSliceNone ? 64u : 0u);
+
+    if (t.assoc) {
+        // An associative array: its elements are created as the numbers arrive.
+        llvm::Value* aflags = b_.getInt32(flags | (t.key_signed ? 128u : 0u));
+        if (t.assoc_valid != nullptr) {
+            aflags = b_.CreateOr(aflags, b_.CreateSelect(t.assoc_valid, b_.getInt32(0), b_.getInt32(256)));
+        }
+        llvm::Value* changed = b_.CreateCall(
+          readmem_assoc_fn(), { path, path_len, t.assoc_handle, t.assoc_ops, b_.getInt32(t.key_width),
+                                b_.getInt32(t.stride), b_.getInt32(t.width), b_.getInt32(t.z_off), t.inner.first,
+                                b_.getInt32(t.inner.second), start, finish, aflags,
+                                alloc_site_global(loc_text(i), "associative array"),
+                                null_site_global(loc_text(i), NullKind::Class) });
+        finish_mem_load(t, changed, "readmem");
+        return;
+    }
 
     llvm::Value* changed =
       b_.CreateCall(readmem_fn(),
