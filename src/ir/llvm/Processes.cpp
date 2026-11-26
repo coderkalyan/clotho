@@ -183,6 +183,7 @@ void Backend::lower_fork_inst(Index i) {
     }
     b_.CreateStore(b_.getInt32(width), b_.CreateStructGEP(rty, rec, 0));
     b_.CreateStore(null, b_.CreateStructGEP(rty, rec, 1));
+    emit_trace_fork(rec, none ? RT_TRACE_JOIN_NONE : any ? RT_TRACE_JOIN_ANY : RT_TRACE_JOIN_ALL, width);
 
     // Ramp arguments, shared by every child: (state, wheel, one pointer per
     // captured enclosing-frame local, rec). Each capture is an ArgDir::Ref
@@ -346,6 +347,10 @@ void Backend::lower_fork_inst(Index i) {
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(cont);
+    }
+    // Past the join point, by not parking or by the wake: the children it waits for have completed.
+    if (!none) {
+        emit_trace_join(rec);
     }
     // Past the join point this body never reads the record again, on any path, so
     // drop our reference — but only for a heap record. A `join` record is a frame

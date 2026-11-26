@@ -2284,17 +2284,42 @@ private:
     // leave (RT_TRACE_ABORT_*).
     void emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind);
 
+    // R22: the body's own activation (null in a function) forks onto the join record `rec`
+    // (`kind`: RT_TRACE_JOIN_*, `width` children); fork child `a` completes into `rec`; the
+    // activation is past the join of `rec`.
+    void emit_trace_fork(llvm::Value* rec, uint32_t kind, uint32_t width);
+    void emit_trace_child_done(llvm::Value* a, llvm::Value* rec);
+    void emit_trace_join(llvm::Value* rec);
+
     // clotho.run_once is about to run the bodies of one region (RT_TRACE_ORG_PREINIT ...), or has.
     void emit_trace_once(uint32_t kind);
 
     // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
     void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
 
+    // What the seed reports of a guarded group's members (S9): each member's own list (`n` entries at
+    // `list`), how many members there are (zero: the group is not guarded) and whether no two events of
+    // the group share a trigger bit.
+    struct TraceMembers {
+        llvm::Value* list;
+        llvm::Value* n;
+        llvm::Value* members;
+        llvm::Value* exact;
+    };
+
     // The seed's reports of one row: the spawn of its handle `h`, its static list (`n` entries at
-    // `list`, from the IR's wait events) and, when `parked_now` (an i1), its park at the static
-    // control `ctl`, which is where a group that is not queued now waits.
+    // `list`, from the IR's wait events), its members and, when `parked_now` (an i1), its park at the
+    // static control `ctl`, which is where a group that is not queued now waits.
     void emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list, llvm::Value* n,
-                             llvm::Value* parked_now);
+                             llvm::Value* parked_now, const TraceMembers& members);
+
+    // Member `index` of the guarded group being lowered starts its body (S9): a thunk row names the
+    // group by its wake pair, a coroutine by its handle.
+    void emit_trace_member(uint32_t index);
+
+    // R16: the generated code armed the inertial record `rec` of site `idx` (the dense id of its target, an
+    // i32) for the decision's `epoch` (an i64), `ticks` (an i64) from now.
+    void emit_trace_inertial_arm(llvm::Value* idx, llvm::Value* rec, llvm::Value* ticks, llvm::Value* epoch);
 
     // One event the seed links a persistent waiter onto joins the static list of the group `h`.
     void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
@@ -2327,8 +2352,19 @@ private:
     llvm::Constant* trace_nba_site(llvm::Module& m, const TraceNba& t, uint32_t path);
 
     // Report the update: created now (`rec` null, `path` RT_TRACE_NBA_BLOCK ... RT_TRACE_NBA_ZERO), or
-    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT).
-    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path);
+    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT);
+    // a timer's delay is `ticks` (an i64).
+    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path, llvm::Value* ticks = nullptr);
+
+    // One event a `<= @e` record waits for: the storage of a signal (`edge` RT_TRACE_POS ...) or an event
+    // object (RT_TRACE_OBJ).
+    struct TraceTrigger {
+        llvm::Value* x;
+        uint32_t     edge;
+    };
+
+    // The events of the `<= @e` record `rec` just armed, and its repeat count `count` (an i32).
+    void emit_trace_nba_events(llvm::Value* rec, llvm::Value* count, llvm::ArrayRef<TraceTrigger> trigs);
 
     // The scheduler enters `region` (RT_TRACE_REG_*).
     void emit_trace_region(uint32_t region);
@@ -3994,7 +4030,7 @@ private:
     void emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
 
     void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count,
-                              llvm::ArrayRef<llvm::Value*> trig_ids);
+                              llvm::ArrayRef<llvm::Value*> trig_ids, llvm::ArrayRef<TraceTrigger> traced);
 
     void emit_intra_commit(Signal sig);
 

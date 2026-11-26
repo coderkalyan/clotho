@@ -264,6 +264,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_dynarr_temps();
             build_agg_elem_temps();
             llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
+            if (takes_flag) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -546,6 +549,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
             llvm::BasicBlock* join = open_guard(guarded, g_, i);
+            if (guarded) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
@@ -1903,6 +1909,9 @@ void Backend::lower_task(FunctionId id) {
         auto*        rty    = fork_record_ty(heap);
         auto*        cntp   = b_.CreateStructGEP(rty, rec, 0);
         llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
+        // The completion is reported to the record before it is counted, so before the wake it may
+        // make (R22).
+        emit_trace_child_done(hdl_, rec);
         b_.CreateStore(cnt, cntp);
         llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(rty, rec, 1));
         llvm::Value* due    = heap
