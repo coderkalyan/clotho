@@ -336,7 +336,10 @@ Milestones, in order; lower ones unblock higher ones:
   copy, equality, argument and `%p` positions; needs a by-value aggregate ABI.
 - [ ] **Whole aggregate element of an associative array in a by-value context** (7.8) — as a
   subroutine argument or a raw rvalue; refused in the backend.
-
+- [ ] **Dynamic array or queue assigned to a fixed-size array** (7.6) — `f = d;` is refused; the
+  sizes have to be compared at run time.
+- [ ] **Fixed-size array bound to a dynamic array or queue formal, and the reverse** (13.5, 7.6)
+  — refused in every direction; the copy-in and copy-out are that assignment.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
   - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an

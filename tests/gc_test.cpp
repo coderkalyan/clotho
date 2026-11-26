@@ -5471,3 +5471,57 @@ TEST_CASE("gc: objects larger than a block survive while held and start zeroed")
     CHECK(st.collections > 10u);
     CHECK(st.owned_bytes == 0u);
 }
+
+// A queue of handles copied out through an output formal into an element of a queue
+// that a promoted object owns, after the task was suspended across young
+// collections. The copy-out is an assignment the caller makes when the task
+// returns, with the barrier of any store into the object's container; the callee
+// used to write through the element's address, which names no owner to log.
+TEST_CASE("gc: a queue copied out through an output formal into a promoted object's container survives") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            class Box;  string name; Cell qq[$][$]; endclass
+            Box  box;
+            Junk sink;
+            function automatic void install();
+                Cell none[$];
+                box      = new;
+                box.name = "long-lived-box";
+                box.qq.push_back(none);
+            endfunction
+            task automatic make(output Cell r[$], input int v);
+                Cell f;
+                #20;
+                f     = new;
+                f.v   = v;
+                f.tag = "copied-out";
+                r.push_back(f);
+                f     = null;
+            endtask
+            initial begin
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                install();
+                #20;
+                make(box.qq[0], 777);
+                #20;
+                $display("%0d %0d %s", box.qq[0].size(), box.qq[0][0].v, box.qq[0][0].tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "1 777 copied-out\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
+}
