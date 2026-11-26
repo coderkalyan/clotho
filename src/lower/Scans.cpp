@@ -254,6 +254,14 @@ const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& cl
         }
         const slang::ast::Type* base = k->getBaseClass();
         k = base != nullptr ? &base->getCanonicalType().as<slang::ast::ClassType>() : nullptr;
+bool is_process_class(const slang::ast::ClassType& clt) {
+    if (clt.name != "process") {
+        return false;
+    }
+    const slang::ast::Scope* pkg = clt.getParentScope();
+    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+}
+
     }
     return nullptr;
 }
@@ -537,7 +545,10 @@ void CalleeReadScan::handle(const CallExpression& call) {
     // function of the two classes reads the FIFO or the key count.
     const bool sync = is_sync_builtin_class(cls);
     const bool weak = depth != 0 && sub.name == "get" && is_weak_reference_class(cls);
-    if ((sync || weak) && seen.insert(&cls).second) {
+    // A thread's state (LRM 9.7), which nothing stores where a notifier could see
+    // it: the thread's own parks and its end change it.
+    const bool status = sub.name == "status" && is_process_class(cls);
+    if ((sync || weak || status) && seen.insert(&cls).second) {
         out->builtins.push_back(&cls);
     }
 }

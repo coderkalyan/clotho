@@ -4935,6 +4935,8 @@ private:
     static constexpr uint32_t kProcWaitFork  = 1u << 12;
 
     llvm::Value* proc_arg();
+    // Announced as WAITING to whatever waits on `status()`: the next park is no news.
+    static constexpr uint32_t kProcSeenWait = 1u << 13;
 
     llvm::Value* pcb_field(llvm::Value* pcb, uint32_t field);
 
@@ -4947,6 +4949,12 @@ private:
     void emit_proc_state(uint32_t from, uint32_t to);
 
     llvm::Value* emit_proc_object(llvm::Value* pcb, Ref class_ref);
+
+    uint32_t proc_status_notify() const;
+
+    void emit_proc_status_notify(llvm::Value* pcb);
+
+    void emit_proc_park_notify();
 
     llvm::Value* proc_pcb_of(llvm::Value* handle, Index at);
 

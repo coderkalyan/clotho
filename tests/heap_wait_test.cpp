@@ -452,3 +452,161 @@ TEST_CASE("an event control over heap state that nothing can sample is refused")
         refused("covergroup cg @(posedge c.get()); coverpoint a; endgroup\ncg g = new;");
     }
 }
+
+// -- Waiting on a process's status (LRM 9.7 over 9.4.2, 9.4.3) --------------------
+//
+// `status()` reads a thread's state, which changes when the thread blocks, ends, is
+// killed, or is suspended or resumed. No store of the design makes any of those
+// changes, so each wait below is woken by the change itself or not at all.
+
+TEST_CASE("wait on process::status() wakes when the thread finishes or is killed") {
+    constexpr std::string_view src = R"(
+        module m;
+          process a, b;
+          initial begin
+            fork
+              begin a = process::self(); #5; end
+              begin b = process::self(); #9; end
+            join_none
+            #1;
+            fork
+              begin wait (a.status() == process::FINISHED); $display("a finished at %0t", $time); end
+              begin wait (b.status() == process::KILLED); $display("b killed at %0t", $time); end
+              begin wait (b.status() != process::WAITING); $display("b not waiting at %0t", $time); end
+            join_none
+            #6 b.kill();
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    // `a` ends at 5. `b` is blocked until the kill at 7 makes it KILLED, which is
+    // also the first time it is not WAITING. Which of the two waiters on `b` runs
+    // first is not fixed.
+    const std::string out = run_capture(src);
+    CHECK_MESSAGE(out.starts_with("a finished at 5\n"), out);
+    CHECK_MESSAGE(out.find("b killed at 7\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.find("b not waiting at 7\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.ends_with("end\n"), out);
+}
+
+// suspend() and resume() change the state from another thread. A thread resumed
+// while it is still blocked goes back to WAITING: resume "shall resensitize the
+// process to the event expression or to wait for the wait condition to become true
+// or for the delay to expire". status() used to read RUNNING from then on.
+TEST_CASE("wait on process::status() wakes on suspend and on resume") {
+    constexpr std::string_view src = R"(
+        module m;
+          process p;
+          initial begin
+            fork
+              begin p = process::self(); #10; end
+            join_none
+            #1;
+            fork
+              begin wait (p.status() == process::SUSPENDED); $display("suspended at %0t", $time); end
+            join_none
+            #1 p.suspend();
+            #1;
+            fork
+              begin wait (p.status() == process::WAITING); $display("waiting at %0t", $time); end
+            join_none
+            #1 p.resume();
+            #1 $display("status %s", p.status().name());
+            wait (p.status() == process::FINISHED);
+            $display("finished at %0t", $time);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "suspended at 2\nwaiting at 4\nstatus WAITING\nfinished at 10\n");
+}
+
+// The state a method reads is what a wait on the method depends on, and `@` over it
+// is a change of the value it returns.
+TEST_CASE("wait and @ reach process::status() through a method") {
+    constexpr std::string_view src = R"(
+        module m;
+          class Job;
+            process p;
+            function bit done();
+              return p != null && p.status() == process::FINISHED;
+            endfunction
+            function int state();
+              return p.status();
+            endfunction
+          endclass
+          Job j = new;
+          initial begin
+            fork
+              begin j.p = process::self(); #3; end
+            join_none
+            #1;
+            fork
+              begin @(j.state()); $display("changed at %0t", $time); end
+            join_none
+            wait (j.done());
+            $display("done at %0t", $time);
+          end
+        endmodule
+    )";
+    const std::string          out = run_capture(src);
+    CHECK_MESSAGE(out.find("changed at 3\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.find("done at 3\n") != std::string::npos, out);
+}
+
+// Two threads that wait on each other's status each block, which is a change of
+// state the other waits on: the second to block wakes the first, which blocks
+// again. Only a change another thread can observe counts (a thread that was
+// blocked, ran and blocks again was never seen running), so the pair settles
+// instead of waking each other for ever.
+TEST_CASE("threads waiting on each other's status do not wake each other for ever") {
+    constexpr std::string_view src = R"(
+        module m;
+          process a, b;
+          bit go;
+          initial begin
+            fork
+              begin
+                a = process::self();
+                wait ((b != null && b.status() == process::FINISHED) || go);
+                $display("a at %0t", $time);
+              end
+              begin
+                b = process::self();
+                wait ((a != null && a.status() == process::FINISHED) || go);
+                $display("b at %0t", $time);
+              end
+            join_none
+            #5 go = 1;
+            #1 $display("end");
+          end
+        endmodule
+    )";
+    const std::string          out = run_capture(src);
+    CHECK_MESSAGE(out.find("a at 5\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.find("b at 5\n") != std::string::npos, out);
+    CHECK_MESSAGE(out.ends_with("end\n"), out);
+}
+
+// An `always` procedure never completes of itself, so a kill is the only thing that
+// ends it. The killed thread unwinds in the time step of the kill, and that is
+// where its KILLED is announced.
+TEST_CASE("wait on process::status() wakes when an always procedure is killed") {
+    constexpr std::string_view src = R"(
+        module m;
+          process p;
+          always begin
+            if (p == null) p = process::self();
+            #1;
+          end
+          initial begin
+            #2;
+            fork
+              begin wait (p.status() == process::KILLED); $display("killed at %0t", $time); end
+            join_none
+            #1 p.kill();
+            #2 $display("end");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "killed at 3\nend\n");
+}

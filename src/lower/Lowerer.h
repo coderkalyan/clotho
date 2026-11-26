@@ -186,6 +186,9 @@ const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& cl
 // Whether `clt` is `std::semaphore` or a `std::mailbox #(T)` (LRM 15.3, 15.4).
 bool is_sync_builtin_class(const slang::ast::ClassType& clt);
 
+// Whether `clt` is `std::process` (LRM 9.7).
+bool is_process_class(const slang::ast::ClassType& clt);
+
 // Whether `sub` is one of weak_reference's four built-in methods.
 bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 

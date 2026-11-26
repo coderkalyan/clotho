@@ -1980,6 +1980,10 @@ enum {
     // The thread is parked in `wait fork`: it is woken when its last live descendant
     // completes.
     RT_PROC_WAIT_FORK = 1u << 12,
+    // Another thread could already have read WAITING off this thread, so its next
+    // park is no change of state to tell a wait on `status()` about. Generated code
+    // sets and clears it; the runtime only preserves it.
+    RT_PROC_SEEN_WAIT = 1u << 13,
 };
 
 // A pooled block for a fork child, linked in as a child of `parent` (which may be
