@@ -149,6 +149,46 @@ std::vector<uint32_t> dag_levels(uint32_t n, const std::vector<std::vector<uint3
     return level;
 }
 
+// Put the body of `call`'s callee in place of the call and delete the callee, which
+// nothing else calls. The blocks move rather than being copied, the arguments become
+// the call's operands, each return continues after the call, and the callee's static
+// allocas join the caller's entry block, where SROA promotes them. This is what LLVM's
+// inliner would do to the call, without its per-call-site cost model and without
+// running the tier-0 function passes over the callee once on its own and again in
+// the caller.
+void absorb_sole_callee(llvm::CallInst* call) {
+    llvm::Function* const callee = call->getCalledFunction();
+    llvm::Function* const caller = call->getFunction();
+    assert(callee != nullptr && callee->hasOneUse() && callee->hasLocalLinkage() && !callee->isDeclaration() &&
+           callee->getReturnType()->isVoidTy() && "a body is merged only into its one caller");
+    llvm::BasicBlock* const before = call->getParent();
+    llvm::BasicBlock* const after  = before->splitBasicBlock(call->getIterator(), "row.done");
+    for (unsigned i = 0; i < callee->arg_size(); ++i) {
+        callee->getArg(i)->replaceAllUsesWith(call->getArgOperand(i));
+    }
+    llvm::BasicBlock* const body = &callee->getEntryBlock();
+    for (auto it = body->begin(); it != body->end();) {
+        llvm::Instruction& inst = *it++;
+        if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(&inst); slot != nullptr && slot->isStaticAlloca()) {
+            slot->moveBefore(caller->getEntryBlock().getFirstInsertionPt());
+        }
+    }
+    llvm::SmallVector<llvm::BasicBlock*, 32> blocks;
+    for (llvm::BasicBlock& bb : *callee) {
+        blocks.push_back(&bb);
+    }
+    caller->splice(after->getIterator(), callee);
+    before->getTerminator()->setSuccessor(0, body);
+    for (llvm::BasicBlock* bb : blocks) {
+        if (auto* ret = llvm::dyn_cast<llvm::ReturnInst>(bb->getTerminator())) {
+            llvm::BranchInst::Create(after, ret->getIterator());
+            ret->eraseFromParent();
+        }
+    }
+    call->eraseFromParent();
+    callee->eraseFromParent();
+}
+
 } // namespace
 
 // S1: how an always process waits for its leading list. The list is a wait at the top of
@@ -865,11 +905,13 @@ void Backend::emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask) {
 // through it, and the wake word through the pointer it is passed.
 //
 // A group of one row is the unit's code: its entry sits in the row's unit
-// module, once per row function however many instances run it, next to a body
-// the inliner may fold into it, and finds its instance's record a constant
-// below the pair it is handed. No code of root is per instance. Several rows
-// span units: the dispatcher is link glue in root, and its calls are the cost of
-// having no code of one unit inline in another.
+// module, once per row function however many instances run it, and finds its
+// instance's record a constant below the pair it is handed. A row that only its
+// entry runs is moved into it once every entry exists (absorb_sole_callee), so the
+// tier-0 pipeline sees one function per group, not a body and a wrapper for its
+// inliner to merge. No code of root is per instance. Several rows span units: the
+// dispatcher is link glue in root, and its calls are the cost of having no code
+// of one unit inline in another.
 //
 // No entry is noalias on its pair: wakers write the wake word through pointers
 // of their own. A row's `ctx` is noalias all the same, because the word reaches
@@ -945,6 +987,13 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
         b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
         b_.CreateRetVoid();
         fns[s] = fn_;
+    }
+    // A row that only its own entry runs becomes that entry's body. A dispatcher in
+    // root calls a row through a declaration, which gave the row external linkage.
+    for (const auto& [row, entry] : unit_entry) {
+        if (row->hasOneUse() && row->hasLocalLinkage()) {
+            absorb_sole_callee(llvm::cast<llvm::CallInst>(row->user_back()));
+        }
     }
     env_ = root_env_.get();
     return fns;
