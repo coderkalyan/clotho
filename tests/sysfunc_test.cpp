@@ -113,9 +113,13 @@ TEST_CASE("$bits of a dynamically sized operand") {
     CHECK(out == "0 0 0 0\n64 24 96 40\n48\n128 96\n40\n144\n12\n");
 }
 
-// `$bits` of a class handle whose object has dynamically sized members would have to
-// walk the referenced object (11.4.14.1, 20.6.2), which Clotho cannot yet do; it is
-// refused rather than measured by the handle's static type.
+// `$bits` of an operand that is, or holds, a class handle counts the bits of the objects
+// the handles refer to: a derived class's members after its base's, nothing for a null
+// handle (LRM 20.6.2 over 11.4.14.1). The size of the handle's declared class is none of
+// that. It was 32 for a null `B h` (LRM: 0) and for a `D` object behind it (LRM: 96), and
+// slang folded it. Measuring the object needs the walk streaming a class handle needs
+// too, so such a call is refused wherever it stands. iverilog 13 parses none of these,
+// so the LRM is the oracle.
 TEST_CASE("$bits of a class handle with dynamic members is refused") {
     const LowerResult r = lower_text(R"(
         module m;
@@ -126,6 +130,47 @@ TEST_CASE("$bits of a class handle with dynamic members is refused") {
     )");
     CHECK_FALSE(r.ok);
     CHECK_MESSAGE(r.diagnostic_text().find("$bits of a class handle") != std::string::npos, r.diagnostic_text());
+}
+
+TEST_CASE("$bits of an operand that holds a class handle is refused") {
+    const std::string decls = "class B; int a; endclass\n class D extends B; int b, c; endclass\n"
+                              "typedef struct { int x; B h; } s_t;\n"
+                              "B h, arr[2], q[$], aa[string]; D d; s_t s, sa[2];\n";
+    // A null and a derived-object handle, a struct and a struct array holding one, an
+    // array, queue and associative array of them, and a member and an element. (An
+    // unpacked union holding one is refused earlier: it takes integral members only.)
+    for (const std::string operand : { "h", "d", "s", "sa", "arr", "q", "aa", "s.h", "arr[1]" }) {
+        CAPTURE(operand);
+        const LowerResult r = lower_text(prog(decls, "d = new; h = d; $display(\"%0d\", $bits(" + operand + "));"));
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find("$bits of a class handle") != std::string::npos, r.diagnostic_text());
+    }
+}
+
+// Slang evaluates `$bits` in a parameter, a packed dimension and a generate condition, and
+// no handle has a value there: the call is no constant, and slang says so.
+TEST_CASE("$bits of a class handle is no elaboration-time constant") {
+    const std::string decl = "class B; int a; endclass B h;";
+    for (const std::string use :
+         { "localparam int N = $bits(h);", "logic [$bits(h)-1:0] v;", "if ($bits(h) == 32) begin : g logic y; end" }) {
+        CAPTURE(use);
+        const LowerResult r = lower_text("module m; " + decl + " " + use + " endmodule\n");
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find("class types are not allowed in constant expressions") !=
+                        std::string::npos,
+                      r.diagnostic_text());
+    }
+}
+
+// What the refusal leaves alone: a class data type, whose size slang takes from the
+// class (the base's members, then the derived class's), and an integral property read
+// through a handle. LRM 20.6.2 defines `$bits(data_type)` and 6.24.3 lists classes among
+// the bit-stream types, but neither says what the size of a class type is. iverilog 13
+// rejects the class data type ("Invalid data type for $bits()").
+TEST_CASE("$bits of a class data type and of an integral property is unchanged") {
+    const std::string out = run_capture(prog("class B; int a; endclass class D extends B; int b, c; endclass B h;",
+                                             "h = new; $display(\"%0d %0d %0d\", $bits(B), $bits(D), $bits(h.a));"));
+    CHECK(out == "32 96 32\n");
 }
 
 // -- $countones -------------------------------------------------------------

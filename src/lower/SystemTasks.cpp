@@ -779,6 +779,30 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
     return b.convert(*total, lower_type(*call.type), call.type->isSigned(), l);
 }
 
+// Whether streaming a value of this type reaches a class handle (LRM 11.4.14.1): it is
+// one, or an unpacked struct, union or array of any kind with one among its members or
+// elements, at any depth.
+static bool holds_class_handle(const slang::ast::Type& t) {
+    const slang::ast::Type& ct = t.getCanonicalType();
+    if (ct.isClass()) {
+        return true;
+    }
+    if (ct.isUnpackedArray()) {
+        return holds_class_handle(*ct.getArrayElementType());
+    }
+    const auto any_field = [](std::span<const slang::ast::FieldSymbol* const> fields) {
+        return std::ranges::any_of(fields,
+                                   [](const slang::ast::FieldSymbol* f) { return holds_class_handle(f->getType()); });
+    };
+    if (ct.isUnpackedStruct()) {
+        return any_field(ct.as<slang::ast::UnpackedStructType>().fields);
+    }
+    if (ct.isUnpackedUnion()) {
+        return any_field(ct.as<slang::ast::UnpackedUnionType>().fields);
+    }
+    return false;
+}
+
 // `$bits(expression)` of an operand slang could not fold (LRM 20.6.2): the number
 // of bits the expression holds as a bit stream (6.24.3), as an unsigned 64-bit
 // value. A fixed-size type has the width of the type, and that is all it takes: the
@@ -792,17 +816,25 @@ ir::Index Lowerer::lower_bit_query(std::string_view      name,
 // concatenation, a conditional, a slice). A function that returns a dynamically
 // sized type is an error in the LRM ("It shall be an error to enclose a function
 // that returns a dynamically sized data type"), as it would have to be evaluated.
+//
+// An operand that is, or holds, a class handle is refused before its type's size is
+// taken: the bits are those of the objects the handles refer to (11.4.14.1), which no type
+// fixes. slang does not fold such an operand either (patches/slang-bits-class-handle.patch),
+// so every one arrives here.
 ir::Index Lowerer::bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceLoc l) {
     const slang::ast::Type& t = *e.type;
+    if (holds_class_handle(t)) {
+        // TODO: measuring the objects handles refer to (11.4.14.1: the members of the
+        // object, base classes first, a null handle streaming nothing) needs the walk of
+        // an object, which streaming a class handle needs too.
+        fail("$bits of a class handle, or of a value holding one, is not supported: it counts the bits of the "
+             "objects the handles refer to (LRM 11.4.14.1), which Clotho does not measure");
+    }
     if (t.isFixedSize()) {
         return b.constant(module_.pool.put_int(make_int_type(64, false), t.getBitstreamWidth()), l);
     }
     const slang::ast::Type& ct   = t.getCanonicalType();
     const Expression&       bare = unwrap_conversion(e);
-    if (ct.isClass()) {
-        // TODO: see bitstream_width: the object behind a handle is not measured.
-        fail("$bits of a class handle whose object has dynamically sized members is not supported");
-    }
     if (is_struct_lvalue_shape(bare)) {
         return bitstream_width(lower_lvalue(bare, b), t, b, l);
     }
@@ -831,7 +863,8 @@ ir::Index Lowerer::bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceL
 //   associative array         the same over the entries, walked by key (7.9.4)
 //   unpacked struct           the sum over the members, in declaration order
 //   fixed-size array          the same over its elements, when they are dynamic
-//   class handle              refused (see below)
+//
+// A class handle is not measured: bits_of_expr refuses it before it gets here.
 ir::Index Lowerer::bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l) {
     using T    = ir::Inst::Tag;
     using Step = ir::Builder::AssocStep;
@@ -873,14 +906,8 @@ ir::Index Lowerer::bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::
         }
         return dynamic ? b.binary(T::Add, *dynamic, count(fixed), l) : count(fixed);
     }
-    if (ct.isClass()) {
-        // TODO: measuring the object a handle refers to (11.4.14.1: the members of the
-        // referenced object, base classes first, a null handle streaming nothing) needs
-        // the walk of that object, which streaming a class handle needs too.
-        fail("$bits of a class handle whose object has dynamically sized members is not supported");
-    }
     if (!ct.isUnpackedArray()) {
-        fail("internal: $bits of a dynamically sized type that is not a string, struct, class or array");
+        fail("internal: $bits of a dynamically sized type that is not a string, struct or array");
     }
 
     const slang::ast::Type& et  = *ct.getArrayElementType();
