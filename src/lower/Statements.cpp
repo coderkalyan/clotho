@@ -208,7 +208,7 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
             infer = true;
             body  = &timed.stmt;
         } else if (is_event_control(timed.timing) && !sensitivity_needs_handle(timed.timing) &&
-                   !event_control_sampled(timed.timing)) {
+                   classify_event_control(timed.timing) == EventWait::Static) {
             iff_guard    = collect_wait_events(timed.timing, wait_events);
             body         = &timed.stmt;
             proc_timing_ = &timed.timing;

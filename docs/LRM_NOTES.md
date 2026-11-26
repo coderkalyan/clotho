@@ -784,18 +784,22 @@ expression. However, an edge event shall be detected only on the LSB of the expr
 "This type of expression is evaluated when a changes and not when enable changes." A term
 that reaches a class property or a virtual-interface member names its storage only once its
 handle is read, so the wait cannot be a static subscription or a net driven from time zero.
-Clotho waits in a loop that samples every term of a list made only of such terms, parks on
+Clotho waits in one loop (`lower_sampled_event_wait`, the one a method call in an event
+control uses too, docs/design/classes.md) that samples every term of a list made only of
+such terms, a property or a member by itself included: it parks on
 everything the terms read (a member's waiter list in the instance a handle names, a
 property's any-change notifier in the object, a signal's bucket) and, on each wake, compares
 every term with its sample: a change of value, or for `posedge`, `negedge` and `edge` the
 Table 9-2 edge of bit 0, with the term's own `iff` evaluated at that point. The list resumes
 when any term fires. A wake does not say which source woke it, so a change that reverts
 before the waiter runs is missed (docs/design/scheduler-rules.md R9). That is why a list
-mixing such a term with a signal or an event is refused for now: the signal's and the event's
+mixing such a term, one that reads a property or a member inside a larger expression, with
+a signal or an event is refused for now: the signal's and the event's
 own waits catch what the comparison loses (a pulse that reverts, a second trigger in the step
 the wait began in), and keeping that needs a per-registration fired marker in the wait node.
-`->> @(m) e` and `x <= @(m) y` over such a member are refused for the same reason: they
-register a detached subscription on a signal and edge.
+A property or a member by itself in a list with signals and events keeps its own wait source
+and the signal's pulse. `->> @(m) e` and `x <= @(m) y` over such a member are refused for the
+same reason: they register a detached subscription on a signal and edge.
 
 8.4 makes an access through a null object handle illegal, with an indeterminate result that
 "implementations may issue an error", and 25.9 says "Attempting to use a null virtual
@@ -804,7 +808,7 @@ expression where the wait begins, so a null handle in any term of a list, or in 
 compound term, is a located fatal at the wait, as for `@(obj.x)`. An inferred `@*` is
 different (note 57): it reads nothing until its body runs, so it waits on the handle.
 
-Code: `src/lower/Timing.cpp` (`lower_expr_wait`), `src/lower/Scans.cpp` (`control_needs_loop`, `WaitPropScan::handle(EventListControl)`). Tests: `tests/event_test.cpp` ("an event list with a class property term wakes on each of its terms" and the three after it), `tests/interface_test.cpp` ("virtual interface: an event list over member expressions" and the four after it). No oracle parses these designs; the plain-signal analogs of the edge and list traces agree with iverilog 13.
+Code: `src/lower/Timing.cpp` (`classify_event_control`, `lower_sampled_event_wait`), `src/lower/Scans.cpp` (`event_expr_reads_heap`, `WaitPropScan::handle(EventListControl)`). Tests: `tests/event_test.cpp` ("an event list with a class property term wakes on each of its terms" and the three after it), `tests/interface_test.cpp` ("virtual interface: an event list over member expressions" and the four after it), `tests/heap_wait_test.cpp` (the four on a list of heap terms). No oracle parses these designs; the plain-signal analogs of the edge and list traces agree with iverilog 13.
 
 ## 59. `$bits` of a class data type (20.6.2, 6.24.3)
 

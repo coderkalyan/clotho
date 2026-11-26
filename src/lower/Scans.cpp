@@ -261,27 +261,6 @@ const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e) {
     return waited_aggregate_prop(e);
 }
 
-// Whether an event expression waits in a loop of its own on the class properties it
-// reads (Lowerer::lower_expr_wait): a compound over properties read through handles,
-// such as `obj.s.f` or `obj.x + 1`. A property named by itself parks on its own notifier
-// (`@(obj.x)`, `@(posedge obj.x)`), an event on the object it holds, a member of a
-// virtual interface on that member's waiter list, a string is refused (event_signal),
-// and an expression that reads a container is refused: a mutation is not a change in
-// value (LRM 9.4.2). The design-wide pre-pass and the lowering MUST agree on this, so
-// both call it and nothing else.
-bool event_reads_props(const Expression& e) {
-    if (e.type->isEvent() || e.type->getCanonicalType().isString() || waited_class_prop(e) != nullptr) {
-        return false;
-    }
-    if (e.kind == ExpressionKind::MemberAccess &&
-        e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface()) {
-        return false;
-    }
-    ClassPropReadScan scan;
-    e.visit(scan);
-    return !scan.notifiable.empty() && !scan.any_container;
-}
-
 bool event_term_reads_member(const Expression& e) {
     if (e.type->isEvent()) {
         return false;
@@ -307,20 +286,33 @@ bool reads_vif(const Expression& e) {
     return scan.found;
 }
 
-// A virtual-interface member by itself: `vif.a`, not `vif.s.f` or `vif.a & vif.b`.
-static bool is_vif_member(const Expression& e) {
+bool is_vif_member(const Expression& e) {
     return e.kind == ExpressionKind::MemberAccess &&
            e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface();
 }
 
-// An event is woken through its own object, so a handle or an index in the expression that
-// names it is no operand to wait on: `@(ev[vif.i])` parks on the event it names right now
-// (LRM 15.5.5), whatever the expression reads.
-bool event_term_needs_loop(const Expression& e) {
-    if (e.type->isEvent()) {
+bool lone_member_term(const Expression& e) {
+    return !e.type->isEvent() &&
+           (waited_class_prop(e) != nullptr || weak_get_call(e) != nullptr || is_vif_member(e));
+}
+
+bool event_expr_reads_heap(const Expression& e, const MethodOverrides& overrides) {
+    if (e.type->isEvent() || lone_member_term(e)) {
         return false;
     }
-    return event_reads_props(e) || (reads_vif(e) && !is_vif_member(e));
+    if (reads_vif(e)) {
+        return true;
+    }
+    ClassPropReadScan props;
+    e.visit(props);
+    if (props.any_prop || !props.weak_gets.empty()) {
+        return true;
+    }
+    if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+        return false;
+    }
+    const CalleeReads called = callee_reads(e, overrides);
+    return called.method_call || !called.props.empty() || !called.builtins.empty();
 }
 
 void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out) {
@@ -337,12 +329,6 @@ void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>
             // An implicit @* names no term of its own, and no other control is a list member.
             return;
     }
-}
-
-bool control_needs_loop(const TimingControl& tc) {
-    std::vector<const SignalEventControl*> terms;
-    event_terms(tc, terms);
-    return std::ranges::any_of(terms, [](const SignalEventControl* t) { return event_term_needs_loop(t->expr); });
 }
 
 bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b) {
@@ -723,31 +709,40 @@ void WaitPropScan::note_callees(const Expression& e) {
     }
 }
 
+// What a sampling wait over `e` needs laid out (Lowerer::lower_sampled_event_wait): the
+// design-wide notifiers of what the subroutines it calls read, and the any-change notifier
+// of each property it reads, of each fork-captured automatic and of each weak reference it
+// reads get() of.
+void WaitPropScan::note_sampled(const Expression& e) {
+    note_callees(e);
+    ClassPropReadScan scan;
+    e.visit(scan);
+    for (const Expression* p : scan.notifiable) {
+        const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*p);
+        if (is_notified_container(prop.getType().getCanonicalType())) {
+            out->add_container(prop);
+        } else {
+            out->add(prop, ir::Edge::Any);
+        }
+    }
+    for (const CallExpression* get : scan.weak_gets) {
+        out->weak_classes.insert(
+          &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
+    }
+    WaitLocalScan locals;
+    locals.out = &out->locals;
+    e.visit(locals);
+}
+
 void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
-    note_callees(ev.expr);
-    // A sampled event control (Lowerer::lower_sampled_event_wait) parks as a wait
-    // does: on the any-change notifier of each property its expression reads, of
-    // each fork-captured automatic, and of each weak reference it reads get() of.
-    // Which controls are sampled is the lowering's to say, with what this pass has
-    // not got; a notifier laid out for one that is not is a field nothing parks on.
+    // A sampled event control parks as a wait does. Which controls are sampled is the
+    // lowering's to say (Lowerer::classify_event_control), with what this pass has not got;
+    // a notifier laid out for one that is not is a field nothing parks on. A property and a
+    // weak reference named by themselves have a notifier of their own, laid out below.
     if (waited_class_prop(ev.expr) == nullptr && weak_get_call(ev.expr) == nullptr) {
-        ClassPropReadScan scan;
-        ev.expr.visit(scan);
-        for (const Expression* e : scan.notifiable) {
-            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
-            if (is_notified_container(prop.getType().getCanonicalType())) {
-                out->add_container(prop);
-            } else {
-                out->add(prop, ir::Edge::Any);
-            }
-        }
-        for (const CallExpression* get : scan.weak_gets) {
-            out->weak_classes.insert(
-              &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
-        }
-        WaitLocalScan locals;
-        locals.out = &out->locals;
-        ev.expr.visit(locals);
+        note_sampled(ev.expr);
+    } else {
+        note_callees(ev.expr);
     }
     if (const auto* prop = waited_class_prop(ev.expr); prop != nullptr) {
         // An edge on a property whose type has no LSB lattice mints no notifier.
@@ -781,14 +776,6 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
                 out->add(*prop, ir::Edge::Any);
                 break;
         }
-    } else if (event_reads_props(ev.expr)) {
-        // A compound over class properties waits in a loop of its own, parked on the
-        // any-change notifier of each property it reads (Lowerer::lower_expr_wait).
-        ClassPropReadScan scan;
-        ev.expr.visit(scan);
-        for (const Expression* e : scan.notifiable) {
-            out->add(*level_waited_prop(*e), ir::Edge::Any);
-        }
     }
     if (const CallExpression* get = weak_get_call(ev.expr); get != nullptr) {
         // `@(w.get())` (LRM 8.30.3): the referent's any-change notifier. A class
@@ -799,29 +786,36 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
     visitDefault(ev);
 }
 
-// An event list with a term that waits in a loop of its own (Lowerer::lower_expr_wait)
-// parks on the any-change notifier of every property any of its terms reads, a property
-// named by itself included: its edge notifier alone would not wake the loop. The leaves
-// are not visited, so such a term mints no edge notifier nothing will use.
+// Whether an expression names an automatic variable, which a fork can capture in a box.
+// The pre-pass cannot tell which are boxed; the lowering does (Lowerer::is_boxed_symbol).
+static bool names_automatic_variable(const Expression& e) {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+    WaitLocalScan                                                scan;
+    scan.out = &named;
+    e.visit(scan);
+    return std::ranges::any_of(named, [](const slang::ast::ValueSymbol* vs) {
+        // A class property is no local, though slang gives it a lifetime too.
+        return (vs->kind == SymbolKind::Variable || vs->kind == SymbolKind::FormalArgument) &&
+               vs->as<slang::ast::VariableSymbol>().lifetime == slang::ast::VariableLifetime::Automatic;
+    });
+}
+
+// An event list some of whose terms are waited on by sampling (Lowerer::classify_event_control)
+// parks on the any-change notifier of every property any of its terms reads, a property named
+// by itself included: its edge notifier alone would not wake the comparison. Whether the list
+// is one of those is the lowering's to say; the terms below still lay out their own notifiers,
+// for a list that is not.
 void WaitPropScan::handle(const slang::ast::EventListControl& list) {
-    if (!control_needs_loop(list)) {
-        visitDefault(list);
-        return;
-    }
     std::vector<const SignalEventControl*> terms;
     event_terms(list, terms);
-    for (const SignalEventControl* term : terms) {
-        ClassPropReadScan scan;
-        term->expr.visit(scan);
-        for (const Expression* e : scan.notifiable) {
-            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
-            if (is_notified_container(prop.getType().getCanonicalType())) {
-                out->add_container(prop);
-            } else {
-                out->add(prop, ir::Edge::Any);
-            }
+    if (std::ranges::any_of(terms, [&](const SignalEventControl* t) {
+            return event_expr_reads_heap(t->expr, out->overrides) || names_automatic_variable(t->expr);
+        })) {
+        for (const SignalEventControl* t : terms) {
+            note_sampled(t->expr);
         }
     }
+    visitDefault(list);
 }
 
 void WaitPropScan::handle(const slang::ast::WaitStatement& w) {

@@ -201,20 +201,18 @@ bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 // names that wait as the way to learn that a weak reference has been cleared.
 const CallExpression* weak_get_call(const Expression& e);
 
-bool event_reads_props(const Expression& e);
-
 // Whether an expression reaches through a virtual interface handle anywhere. Such a place
 // names an instance chosen at run time, which the signal-keyed wait engine cannot subscribe to.
 bool reads_vif(const Expression& e);
 
-// Whether an event term waits in a loop of its own (Lowerer::lower_expr_wait) rather than on
-// one wait source: a compound over class properties or virtual-interface members. A member of
-// a virtual interface by itself (`vif.a`), a class property by itself, an event and a plain
-// signal expression each have a wait source of their own.
-bool event_term_needs_loop(const Expression& e);
+// A virtual-interface member by itself: `vif.a`, not `vif.s.f` or `vif.a & vif.b`.
+bool is_vif_member(const Expression& e);
 
-// The same for a whole event control: true when any term of it, in a list or alone, does.
-bool control_needs_loop(const TimingControl& tc);
+// An event term that has a wait source of its own when it is alone in a control: a class
+// property (its notifier, per edge), a `weak_reference::get()` (the referent's) and a
+// virtual-interface member (its waiter list in the instance the handle names). An event is
+// woken through its own object and is none of these.
+bool lone_member_term(const Expression& e);
 
 // Whether an event term reads a non-static class property or a virtual-interface member
 // (an event is not one: it has its own wait object).
@@ -323,6 +321,15 @@ struct CalleeReadScan : slang::ast::ASTVisitor<CalleeReadScan, VisitFlags::AllGo
 
 CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides);
 
+// Whether an event expression reads state that no wait source of its own covers, so that a
+// process has to wait on it by sampling it (Lowerer::lower_sampled_event_wait): a class
+// property or a virtual-interface member inside a larger expression, a weak reference's
+// referent, a method called on an object, or what a subroutine it calls reads. A term that
+// is lone_member_term, an event, and an expression over signals alone are not. The
+// design-wide pre-pass and the lowering MUST agree on this, so both call it and nothing
+// else; the fork-captured automatic is the one case the pre-pass cannot see.
+bool event_expr_reads_heap(const Expression& e, const MethodOverrides& overrides);
+
 // Which (class property, edge) pairs the whole design waits on. Design-wide because
 // a class's object body must carry the notifiers BEFORE it is laid out, and
 // lower_class_type runs on demand from the first reference under any top -- which
@@ -385,6 +392,9 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
     void handle(const slang::ast::TimedStatement& t);
 
     void note_callees(const Expression& e);
+
+    // What a sampling wait over `e` needs laid out (Lowerer::lower_sampled_event_wait).
+    void note_sampled(const Expression& e);
 };
 
 // The design-wide change notifiers (ir::ChangeNotify::shared): one hidden event per
@@ -2589,10 +2599,6 @@ private:
 
     uint32_t anon_local(ir::Ref type);
 
-    void lower_expr_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
-
-    ir::Index lsb_edge_fired(ir::Index old_v, ir::Index new_v, slang::ast::EdgeKind edge, ir::Builder& b, ir::SourceLoc l);
-
     // What a process waiting on an expression parks on (LRM 9.4.2, 9.4.3): `wait`'s
     // condition, and an event expression that is sampled (lower_sampled_event_wait).
     struct ExprWaitDeps {
@@ -2607,9 +2613,8 @@ private:
         std::vector<const ValueSymbol*> boxed;
         // A fork-captured automatic it names whose type has no notifier, or null.
         const ValueSymbol* unnotified_box = nullptr;
-        // The expression names a property of a type with no notifier (an unpacked
-        // struct or union, a fixed unpacked array) and nothing else that can wake a
-        // process waiting on it.
+        // The expression names a property of a type with no notifier (a covergroup
+        // handle) and nothing else that can wake a process waiting on it.
         bool unwakeable = false;
     };
 
@@ -2619,11 +2624,30 @@ private:
 
     void push_wait_edges(const ExprWaitDeps& deps, ir::Builder& b, ir::SourceLoc l, std::vector<ir::WaitEdge>& edges);
 
+    // Whether the event expression `e` is waited on by sampling it: it reads heap state
+    // (event_expr_reads_heap, or a fork-captured automatic) and something can wake the
+    // process that waits on it.
     bool event_expr_sampled(const Expression& e);
 
-    bool event_member_sampled(const SignalEventControl& ev);
+    // How an event control is waited on (LRM 9.4.2, 9.4.2.1).
+    enum class EventWait : uint8_t {
+        // No term is sampled, so each has a wait source of its own: a signal, an event, a
+        // property or a member by itself, an expression over signals alone
+        // (collect_wait_events). A sampled term that only calls a method beside a plain
+        // one stays here as well (docs/TODO.md).
+        Static,
+        // At least one term is sampled and every other term reads heap state too, so one
+        // loop samples them all (lower_sampled_event_wait).
+        Sampled,
+        // A sampled term that reads a class property or a virtual-interface member, beside
+        // a signal or an event: refused for now. A wake does not say which registration
+        // woke it, so the loop would lose what the plain term's own wait catches (a pulse
+        // that reverts in its step, R8).
+        Mixed,
+    };
 
-    bool event_control_sampled(const TimingControl& tc, std::vector<const SignalEventControl*>* members = nullptr);
+    // `terms` receives the terms of a Sampled control in source order.
+    EventWait classify_event_control(const TimingControl& tc, std::vector<const SignalEventControl*>* terms = nullptr);
 
     ir::Index sampled_event_hit(ir::Index            old,
                                 ir::Index            cur,

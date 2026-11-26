@@ -279,8 +279,9 @@ void Lowerer::refuse_container_event_control(const SignalEventControl& ev) {
 // and the nonblocking trigger `->> @(...) e` register a detached subscription on a signal and
 // edge, which a class property or a virtual-interface member does not have.
 //
-// TODO: these over a member term need a watcher that runs the sampling loop of lower_expr_wait,
-// or a per-registration fired marker in the wait node. They never woke, silently.
+// TODO: these over a member term need a watcher that runs the sampling loop of
+// lower_sampled_event_wait, or a per-registration fired marker in the wait node. They never
+// woke, silently.
 void Lowerer::refuse_detached_member_event(const TimingControl& tc) {
     std::vector<const SignalEventControl*> terms;
     event_terms(tc, terms);
@@ -400,9 +401,10 @@ bool Lowerer::sensitivity_needs_handle(const TimingControl& tc) {
             // issues a static subscription cannot evaluate `c`. So is the notifier
             // of the weak reference `@(w.get())` names. A member of a virtual
             // interface names an instance only once its handle is read, so the same goes
-            // for it and for a compound over either (lower_expr_wait).
+            // for it. What a sampling loop serves stays in the body as well
+            // (lower_procedural_block asks classify_event_control).
             return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr || weak_get_call(e) != nullptr ||
-                   event_reads_props(e) || reads_vif(e);
+                   reads_vif(e);
         }
         case TimingControlKind::EventList:
             for (const TimingControl* e : tc.as<EventListControl>().events) {
@@ -442,7 +444,7 @@ ir::Signal Lowerer::event_signal(const Expression& e) {
         // An event control in a body or in a process's sensitivity list never reaches here
         // with one: a member by itself parks on the member's waiter list in the instance
         // the handle names (collect_wait_events), and a compound waits in a loop that
-        // re-reads the handle (lower_expr_wait). What does is the clock of a clocking block,
+        // re-reads the handle (lower_sampled_event_wait). What does is the clock of a clocking block,
         // a covergroup or a concurrent assertion, and the control of an event-controlled
         // nonblocking trigger. The temp-net path would answer them by dereferencing the
         // handle from a continuous process -- before it is assigned, and then frozen onto
@@ -557,253 +559,6 @@ uint32_t Lowerer::anon_local(ir::Ref type) {
     return idx;
 }
 
-// Whether the least significant bit of a sampled value made the edge `edge` names
-// from `old_v` to `new_v` (LRM 9.4.2, Table 9-2): posedge is 0 to 1, x or z and x
-// or z to 1, negedge 1 to 0, x or z and x or z to 0, and `edge` either. A change
-// between x and z is neither. Only the least significant bit counts, however wide
-// the expression is. The answer is a definite 1-bit value.
-ir::Index Lowerer::lsb_edge_fired(ir::Index               old_v,
-                                  ir::Index               new_v,
-                                  slang::ast::EdgeKind    edge,
-                                  ir::Builder&            b,
-                                  ir::SourceLoc           l) {
-    using T                = ir::Inst::Tag;
-    const ir::Ref logic1   = make_int_type(1, true);
-    // Narrowing to one 4-state bit keeps the least significant bit with its x / z.
-    const ir::Index prior  = b.convert(old_v, logic1, false, l);
-    const ir::Index latest = b.convert(new_v, logic1, false, l);
-    const auto      is     = [&](ir::Index v, uint64_t bit) {
-        return b.binary(T::CaseEq, v, b.constant(module_.pool.put_int(logic1, bit), l), l);
-    };
-    const ir::Index was0       = is(prior, 0);
-    const ir::Index was1       = is(prior, 1);
-    const ir::Index was_x_or_z = b.unary(T::Lnot, b.binary(T::Lor, was0, was1, l), l);
-    const auto      rise       = [&] {
-        const ir::Index from0 = b.binary(T::Land, was0, b.unary(T::Lnot, is(latest, 0), l), l);
-        const ir::Index from_unknown = b.binary(T::Land, was_x_or_z, is(latest, 1), l);
-        return b.binary(T::Lor, from0, from_unknown, l);
-    };
-    const auto fall = [&] {
-        const ir::Index from1 = b.binary(T::Land, was1, b.unary(T::Lnot, is(latest, 1), l), l);
-        const ir::Index from_unknown = b.binary(T::Land, was_x_or_z, is(latest, 0), l);
-        return b.binary(T::Lor, from1, from_unknown, l);
-    };
-    switch (edge) {
-        case slang::ast::EdgeKind::PosEdge:
-            return rise();
-        case slang::ast::EdgeKind::NegEdge:
-            return fall();
-        case slang::ast::EdgeKind::BothEdges: {
-            const ir::Index up = rise();
-            return b.binary(T::Lor, up, fall(), l);
-        }
-        case slang::ast::EdgeKind::None:
-            break;
-    }
-    fail("internal: an edge test for a control with no edge");
-}
-
-// `@(t1 or t2 ...)`, or `@(t)`, where a term has no wait source of its own: a compound over
-// virtual-interface members or class properties (LRM 9.4.2, 9.4.2.1, 9.4.2.3, 25.9, 8.4).
-// The general path synthesizes a net driven by a continuous process, which cannot work
-// through a handle: it would read the handle before it is assigned, and then track whichever
-// instance or object was bound at time zero. So this desugars to what the clause asks for --
-// wait until a term's value changes, or until the least significant bit of it makes the edge
-// its qualifier names, and until its `iff` holds then -- over the waits that do work: a
-// member's waiter list in the instance a virtual interface handle names, the any-change
-// notifier of each class property in the object a handle names, and the bucket of each
-// signal a term reads, a handle included:
-//
-//   sample every term;
-//   forever begin
-//     @(everything the terms read);
-//     for each term, in order begin
-//       cur = term; old = sample; sample = cur;
-//       if (cur !== old) [ or: the edge of cur[0] from old[0] ] begin
-//         if (cond) break;
-//       end
-//     end
-//   end
-//
-// Every term of the list is tested this way: a wake does not say which source woke it, and
-// these sources fire on any change of what they
-// cover, not on a change of a term's value. A term's `cond` is evaluated when the term
-// changes, not when its operands do (LRM 9.4.2.3), so what it reads is no sensitivity. The
-// sample follows every wake: a change `cond` suppresses is still what the next one is
-// measured from.
-//
-// NOTE: a term is evaluated when the loop wakes, not at each update of an operand, so a
-// change that reverts before then is no event. LRM 9.4.2 makes it one
-// (docs/design/scheduler-rules.md R8, R9), and a signal's compound expression has the same gap.
-//
-// NOTE: an explicit control evaluates its expression where the wait begins, so a null class
-// handle in a term is the located fatal of LRM 8.4 and a null virtual interface the one of
-// 25.9. An inferred `@*` is different: it reads nothing until its body runs (LRM_NOTES 57).
-//
-// The samples live in the call frame inside a subroutine (so two activations of one task do
-// not share them) and in module storage in a process body, which is a single coroutine and
-// cannot re-enter its own wait.
-void Lowerer::lower_expr_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
-    enum class Kind : uint8_t { Word, Real, String };
-    struct Term {
-        const SignalEventControl* ev   = nullptr;
-        Kind                      kind = Kind::Word;
-        ir::Ref                   ty   = ir::Ref::Invalid;
-        TempCell                  cell;
-    };
-
-    std::vector<const SignalEventControl*> evs;
-    event_terms(tc, evs);
-    // TODO: a list that mixes a member term with a signal or an event. The loop tests every
-    // term by comparing it with a sample, which loses what a signal's or an event's own wait
-    // catches (a pulse that reverts before the waiter runs, a second trigger in the step the
-    // wait began in). Keeping those needs a per-registration fired marker in the wait node, so
-    // the loop can tell which registration woke it.
-    if (std::ranges::any_of(evs, [](const SignalEventControl* ev) { return !event_term_reads_member(ev->expr); })) {
-        fail("an event list mixing a class-property or virtual-interface member with a signal or an "
-             "event is not supported yet");
-    }
-    std::vector<Term> terms;
-    terms.reserve(evs.size());
-    for (const SignalEventControl* ev : evs) {
-        const Expression& e = ev->expr;
-        refuse_container_event_control(*ev);
-        Term t{ .ev = ev };
-        t.kind = e.type->isFloating() ? Kind::Real : (is_string_expr(e) ? Kind::String : Kind::Word);
-        t.ty   = lower_type(*e.type);
-        t.cell = make_temp_cell(t.ty, "expr_event");
-        terms.push_back(std::move(t));
-    }
-
-    const auto read = [&](const Term& t, ir::Builder& bb) {
-        const Expression& e = t.ev->expr;
-        const ir::Index   v = lower_expr(e, bb);
-        return e.type->isIntegral() ? bb.convert(v, t.ty, e.type->isSigned(), l) : v;
-    };
-    const auto load = [&](const Term& t, ir::Builder& bb) {
-        return bb.unary(ir::Inst::Tag::Load, t.cell.lv(bb, l), l);
-    };
-    const auto store = [&](const Term& t, ir::Index v, ir::Builder& bb) {
-        bb.binary(ir::Inst::Tag::Store, t.cell.lv(bb, l), v, l);
-    };
-    // Runs `then` in a region taken when `pred` holds.
-    const auto when = [&](ir::Index pred, auto&& then, ir::Builder& bb) {
-        bb.open_region();
-        then();
-        const ir::ExtraSlice yes = bb.close_region();
-        bb.open_region();
-        const ir::ExtraSlice no = bb.close_region();
-        bb.cond(pred, yes, no, l);
-    };
-    // Leaves the loop, unless the term's `iff` does not hold.
-    const auto resume = [&](const Term& t, ir::Builder& bb) {
-        if (t.ev->iffCondition == nullptr) {
-            bb.break_(l);
-            return;
-        }
-        when(lower_predicate(*t.ev->iffCondition, bb), [&] { bb.break_(l); }, bb);
-    };
-    // Whether a sampled term changed, or made the edge its qualifier names.
-    const auto changed = [&](const Term& t, ir::Index cur, ir::Index old, ir::Builder& bb) {
-        switch (t.kind) {
-            case Kind::Word:
-                return t.ev->edge == slang::ast::EdgeKind::None
-                         ? bb.unary(ir::Inst::Tag::Lnot, bb.binary(ir::Inst::Tag::CaseEq, cur, old, l), l)
-                         : lsb_edge_fired(old, cur, t.ev->edge, bb, l);
-            case Kind::Real: {
-                // The bit patterns, as a real signal's store compares them: a NaN is the
-                // value it was, and +0.0 is not -0.0.
-                const ir::Ref bits = make_int_type(static_cast<uint32_t>(t.ev->expr.type->getBitWidth()), false);
-                const ir::Index now_bits = bb.float_cvt(ir::Inst::Tag::FBitcast, cur, bits, l);
-                const ir::Index was_bits = bb.float_cvt(ir::Inst::Tag::FBitcast, old, bits, l);
-                return bb.binary(ir::Inst::Tag::Ne, now_bits, was_bits, l);
-            }
-            case Kind::String: {
-                const ir::Index order = bb.binary(ir::Inst::Tag::StrCmp, cur, old, l);
-                return bb.binary(ir::Inst::Tag::Ne, order, iconst(make_int_type(32, false), 0, bb, l), l);
-            }
-        }
-        fail("internal: an unknown sampled term kind");
-    };
-
-    for (const Term& t : terms) {
-        store(t, read(t, b), b);
-    }
-
-    b.open_region();
-    const ir::Index      lpred = true_const(b, l);
-    const ir::ExtraSlice lcond = b.close_region();
-
-    b.open_region();
-    {
-        // What the loop parks on is read here, inside the body, so a handle that was
-        // re-pointed is followed on every pass.
-        std::vector<ir::WaitEdge>                  edges;
-        ankerl::unordered_dense::set<uint32_t>     signals;
-        std::vector<const MemberAccessExpression*> members;
-        // A signal's bucket holds one entry per waiting process, so it is named once however
-        // many terms read it (the handle a term goes through is one). A member's list carries a
-        // node per edge, and a repeat costs only a second node.
-        for (const Term& t : terms) {
-            const Expression& e = t.ev->expr;
-            for (const MemberAccessExpression* ma : vif_member_reads(e)) {
-                if (std::ranges::any_of(members, [&](const MemberAccessExpression* m) {
-                        return same_member_read(*m, *ma);
-                    })) {
-                    continue;
-                }
-                members.push_back(ma);
-                const std::optional<ir::Signal> rep =
-                  vif_member_signal(ma->member, vif_named_body(ma->value()),
-                                    "'" + std::string(ma->member.name) + "'");
-                const ir::Index inst = lower_expr(ma->value(), b);
-                if (rep) {
-                    edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
-                                                  ir::kNoWaitHandle, inst });
-                }
-            }
-            // Class properties the term reads: each parks on its any-change notifier, in
-            // the object its handle names right now. A property is one variable, so a change
-            // anywhere in it wakes this loop, and the comparison below decides whether the
-            // term's own value moved. A container's notifier is a mutation's, which is no
-            // change in value, so a term that reads one was refused above.
-            ClassPropReadScan props;
-            e.visit(props);
-            for (const Expression* pe : props.notifiable) {
-                edges.push_back(ir::WaitEdge{
-                  ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any),
-                  prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
-            }
-            // The handles and indices the term goes through are signals too: a re-pointed
-            // handle is a change of the term (LRM 9.4.2's `@(p.status)` example).
-            std::vector<ir::WaitEvent> reads;
-            collect_expr_reads(e, reads);
-            for (const ir::WaitEvent& r : reads) {
-                if (signals.insert(static_cast<uint32_t>(r.signal)).second) {
-                    edges.push_back(ir::WaitEdge{ r.signal, static_cast<uint32_t>(ir::Edge::Any) });
-                }
-            }
-        }
-        b.wait(edges, l);
-
-        for (const Term& t : terms) {
-            const ir::Index cur = read(t, b);
-            const ir::Index old = load(t, b);
-            // Compared before the sample is overwritten: a string `old` names the sample's
-            // storage, it does not hold a copy of what the sample was.
-            const ir::Index fired = changed(t, cur, old, b);
-            store(t, cur, b);
-            when(fired, [&] { resume(t, b); }, b);
-        }
-    }
-    const ir::ExtraSlice body = b.close_region();
-
-    b.open_region();
-    const ir::ExtraSlice step = b.close_region();
-
-    b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
-}
-
 // `vif.cb.d <= expr` (LRM 14.16 reached through LRM 25.9). Identical to the
 // ordinary synchronous drive -- two stores into the block's per-clockvar
 // pending state, applied by that block's Re-NBA process at the clocking event
@@ -862,17 +617,26 @@ void Lowerer::flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l) {
 
 // Lower an intra-body event control `@(...)` to a Wait instruction. A
 // multi-signal list (@(a or posedge b)) registers the process on every listed
-// (signal, edge) queue at once; it wakes when any of them fires.
+// (signal, edge) queue at once; it wakes when any of them fires. A control some
+// of whose terms read heap state is a sampled wait instead (classify_event_control).
 void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
-    if (control_needs_loop(tc)) {
-        lower_expr_wait(tc, b, l);
-        flush_deferred_on_resume(b, l);
-        return;
-    }
-    if (std::vector<const SignalEventControl*> sampled; event_control_sampled(tc, &sampled)) {
-        lower_sampled_event_wait(sampled, b, l);
-        flush_deferred_on_resume(b, l);
-        return;
+    std::vector<const SignalEventControl*> sampled;
+    switch (classify_event_control(tc, &sampled)) {
+        case EventWait::Sampled:
+            lower_sampled_event_wait(sampled, b, l);
+            flush_deferred_on_resume(b, l);
+            return;
+        case EventWait::Mixed:
+            // TODO: a list that mixes such a term with a signal or an event. The loop
+            // tests every term by comparing it with a sample, which loses what a signal's
+            // or an event's own wait catches (a pulse that reverts before the waiter runs,
+            // a second trigger in the step the wait began in). Keeping those needs a
+            // per-registration fired marker in the wait node, so the loop can tell which
+            // registration woke it.
+            fail("an event list mixing a class-property or virtual-interface member with a signal or an "
+                 "event is not supported yet");
+        case EventWait::Static:
+            break;
     }
     std::vector<ir::WaitEvent> events;
     // Handle expressions in this list lower into `b`, immediately before the
@@ -2177,28 +1941,22 @@ void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
 }
 
 // Whether the event expression `e` has to be sampled by the process that waits on
-// it (lower_sampled_event_wait): it reads heap state. A property, a fork-captured
-// automatic, a method called on an object, or anything a subroutine it calls reads
-// from one. Such an expression cannot be handed to a continuous process to drive a
-// net the wait could subscribe to (synth_event_net): that process would evaluate
-// the handles when it is built, before anything has assigned them, and nothing
-// would run it again when the object changes.
-//
-// Not for an expression through a virtual interface, which lower_vif_expr_wait
-// samples itself, nor for one whose dependencies cannot wake anything, which stays
-// on the path it was on.
+// it (lower_sampled_event_wait): it reads heap state (event_expr_reads_heap, or a
+// fork-captured automatic) and something can wake the process. Such an expression
+// cannot be handed to a continuous process to drive a net the wait could subscribe to
+// (synth_event_net): that process would evaluate the handles when it is built, before
+// anything has assigned them, and nothing would run it again when the object changes.
+// One whose dependencies cannot wake anything stays on the path it was on. A lone class
+// property, weak reference or virtual-interface member is not sampled either, whatever it
+// is reached through: it has a source of its own that fires on exactly the change the
+// control names (push_prop_wait_events, weak_get_call, collect_wait_events), and
+// classify_event_control brings it into a list that is.
 bool Lowerer::event_expr_sampled(const Expression& e) {
-    if (e.type->isEvent() || reads_vif(e)) {
+    if (e.type->isEvent() || lone_member_term(e)) {
         return false;
     }
-    ClassPropReadScan props;
-    e.visit(props);
-    bool heap = props.any_prop || !props.weak_gets.empty();
-    if (!heap && waited_props_ != nullptr &&
-        (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue)) {
-        const CalleeReads called = callee_reads(e, waited_props_->overrides);
-        heap                     = called.method_call || !called.props.empty() || !called.builtins.empty();
-    }
+    static const MethodOverrides no_overrides;
+    bool heap = event_expr_reads_heap(e, waited_props_ != nullptr ? waited_props_->overrides : no_overrides);
     if (!heap) {
         ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
         WaitLocalScan                                                scan;
@@ -2213,46 +1971,36 @@ bool Lowerer::event_expr_sampled(const Expression& e) {
     return !deps.unwakeable && deps.unnotified_box == nullptr;
 }
 
-// Whether one member of an event control is sampled. A lone class property and a
-// lone `weak_reference::get()` are not: each has a notifier of its own that fires
-// on exactly the change the control names (push_prop_wait_events, weak_get_call).
-bool Lowerer::event_member_sampled(const SignalEventControl& ev) {
-    if (waited_class_prop(ev.expr) != nullptr || weak_get_call(ev.expr) != nullptr) {
-        return false;
+// How the event control `tc` is waited on (LRM 9.4.2, 9.4.2.1). A control none of whose
+// terms is sampled keeps the wait sources its terms have (collect_wait_events). One with
+// a sampled term is sampled whole, when every other term reads heap state too: the lone
+// property, weak reference or virtual-interface member that has a source of its own
+// alone is compared with a sample here, like the rest, and a plain signal or an event is
+// not. A woken process cannot tell which term woke it, so it cannot tell an event of a
+// plain term from a wake that left every sample unchanged: such a list is Mixed.
+//
+// Only a sampled term that itself reads a class property or a virtual-interface member
+// makes a list Mixed. A sampled term that only calls a method keeps the path it was on
+// (docs/TODO.md).
+Lowerer::EventWait Lowerer::classify_event_control(const TimingControl&                      tc,
+                                                   std::vector<const SignalEventControl*>* out) {
+    std::vector<const SignalEventControl*> terms;
+    event_terms(tc, terms);
+    const auto sampled = [&](const SignalEventControl* t) { return event_expr_sampled(t->expr); };
+    if (!std::ranges::any_of(terms, sampled)) {
+        return EventWait::Static;
     }
-    return event_expr_sampled(ev.expr);
-}
-
-// Whether `tc` is an event control every member of which is sampled; `members`
-// receives them in source order. A list that mixes sampled members with others is
-// not: a process woken from it cannot tell which member woke it, so it cannot tell
-// an event of an unsampled member from a wake that left every sample unchanged.
-bool Lowerer::event_control_sampled(const TimingControl& tc, std::vector<const SignalEventControl*>* members) {
-    std::vector<const SignalEventControl*> found;
-    std::vector<const TimingControl*>      work{ &tc };
-    while (!work.empty()) {
-        const TimingControl* t = work.back();
-        work.pop_back();
-        if (t->kind == TimingControlKind::SignalEvent) {
-            found.push_back(&t->as<SignalEventControl>());
-        } else if (t->kind == TimingControlKind::EventList) {
-            const auto events = t->as<EventListControl>().events;
-            // Pushed in reverse, so that they come off the stack in source order.
-            for (size_t k = events.size(); k-- > 0;) {
-                work.push_back(events[k]);
-            }
-        } else {
-            return false;
+    if (std::ranges::all_of(terms, [&](const SignalEventControl* t) {
+            return sampled(t) || lone_member_term(t->expr);
+        })) {
+        if (out != nullptr) {
+            *out = std::move(terms);
         }
+        return EventWait::Sampled;
     }
-    if (found.empty() ||
-        !std::ranges::all_of(found, [&](const SignalEventControl* ev) { return event_member_sampled(*ev); })) {
-        return false;
-    }
-    if (members != nullptr) {
-        *members = std::move(found);
-    }
-    return true;
+    const bool member = std::ranges::any_of(
+      terms, [&](const SignalEventControl* t) { return sampled(t) && event_term_reads_member(t->expr); });
+    return member ? EventWait::Mixed : EventWait::Static;
 }
 
 // Whether the change from `old` to `cur`, both of type `ty`, is the event `edge`
@@ -2267,9 +2015,17 @@ ir::Index Lowerer::sampled_event_hit(ir::Index            old,
                                      ir::SourceLoc        l) {
     using T = ir::Inst::Tag;
     if (edge == slang::ast::EdgeKind::None) {
-        // A real compares as a real and a string by its characters; everything
-        // else, a 4-state vector included, bit for bit.
-        const T same = module_.pool.is_float(ty) ? T::FEq : is_string_ref(ty) ? T::Eq : T::CaseEq;
+        if (module_.pool.is_float(ty)) {
+            // The bit patterns, as a real signal's store compares them: a NaN is the
+            // value it was, and +0.0 is not -0.0.
+            const ir::Ref   bits     = make_int_type(module_.pool.layout(ty).width, false);
+            const ir::Index now_bits = b.float_cvt(T::FBitcast, cur, bits, l);
+            const ir::Index was_bits = b.float_cvt(T::FBitcast, old, bits, l);
+            return b.binary(T::Ne, now_bits, was_bits, l);
+        }
+        // A string compares by its characters; everything else, a 4-state vector
+        // included, bit for bit.
+        const T same = is_string_ref(ty) ? T::Eq : T::CaseEq;
         return b.unary(T::Lnot, b.binary(same, cur, old, l), l);
     }
     const ir::Ref   bit  = make_int_type(1, module_.pool.layout(ty).domain == ir::Domain::Four);
@@ -2303,12 +2059,14 @@ ir::Index Lowerer::sampled_event_hit(ir::Index            old,
     }
 }
 
-// `@(...)` every member of which reads heap state (event_control_sampled). LRM
-// 9.4.2: the event of a member is a change in the value of its expression, or the
-// named edge of its least significant bit, and "a change of value in any operand
-// of the expression without a change in the result of the expression shall not be
-// detected as an event". So each member's value is sampled, the process parks on
-// everything any member depends on (expr_wait_deps), and each wake compares:
+// `@(...)` some of whose terms read heap state (classify_event_control): a class property
+// or a virtual-interface member inside a larger expression, a method call, a fork-captured
+// automatic, and any lone property or member that shares the list with one. LRM 9.4.2:
+// the event of a term is a change in the value of its expression, or the named edge of its
+// least significant bit, and "a change of value in any operand of the expression without
+// a change in the result of the expression shall not be detected as an event". 9.4.2.3: its
+// `iff` is tested when the event occurs. So each term's value is sampled, the process parks
+// on everything any term depends on (expr_wait_deps), and each wake compares:
 //
 //   forever begin
 //     s1 = e1; s2 = e2;
@@ -2317,19 +2075,29 @@ ir::Index Lowerer::sampled_event_hit(ir::Index            old,
 //     if (e2 changed from s2 [and its iff holds]) break;
 //   end
 //
-// A wake that changed no member's value parks again, which is what makes the
-// design-wide notifiers of expr_wait_deps sound here: they fire for objects the
-// expression never reads.
+// A wake that changed no term's value parks again, which is what makes the design-wide
+// notifiers of expr_wait_deps sound here: they fire for objects the expression never
+// reads. A property wakes it through its any-change notifier, whatever edge the term
+// names: the edge is the comparison's. A handle or an index a term goes through is a
+// signal it depends on, so a re-pointed handle is a change of the term (LRM 9.4.2's
+// `@(p.status)` example).
 //
-// The samples are values of the loop body, not variables: each pass takes its own
-// before it parks, and nothing runs between a failed compare and the next sample.
-// A value held across a park is the waiting thread's, so several threads forked at
-// one `@` each compare against their own.
+// The samples are values of the loop body, not variables: each pass takes its own before
+// it parks, and nothing runs between a failed compare and the next sample. A value held
+// across a park is the waiting thread's, so several threads forked at one `@` each compare
+// against their own. A string is the exception: reading a string place yields the place,
+// not a copy, so its sample is copied into a cell (a frame local in a subroutine and in a
+// fork child, module storage in a process body, which is a single coroutine).
 //
-// The value compared is the one the expression has when the woken process runs,
-// which is after the process that changed it has suspended. A change that is
-// undone before then is not seen, as it is not by the net synth_event_net drives
-// for an expression over signals.
+// The value compared is the one the expression has when the woken process runs, which is
+// after the process that changed it has suspended. A change that is undone before then is
+// not seen, as it is not by the net synth_event_net drives for an expression over signals
+// (docs/design/scheduler-rules.md R8, R9).
+//
+// An explicit control evaluates its expression where the wait begins, so a null class
+// handle in a term is the located fatal of LRM 8.4 and a null virtual interface the one
+// of 25.9. An inferred `@*` is different: it reads nothing until its body runs
+// (LRM_NOTES 57).
 void Lowerer::lower_sampled_event_wait(std::span<const SignalEventControl* const> members,
                                        ir::Builder&                               b,
                                        ir::SourceLoc                              l) {
@@ -2337,11 +2105,49 @@ void Lowerer::lower_sampled_event_wait(std::span<const SignalEventControl* const
         const SignalEventControl* ev;
         ir::Ref                   ty;
         ExprWaitDeps              deps;
+        // The cell a string sample is copied into.
+        std::optional<TempCell> cell;
     };
     std::vector<Member> ms;
     ms.reserve(members.size());
     for (const SignalEventControl* ev : members) {
-        ms.push_back(Member{ .ev = ev, .ty = lower_type(*ev->expr.type), .deps = expr_wait_deps(ev->expr) });
+        Member m{ .ev = ev, .ty = lower_type(*ev->expr.type), .deps = expr_wait_deps(ev->expr), .cell = std::nullopt };
+        if (is_string_ref(m.ty)) {
+            m.cell = make_temp_cell(m.ty, "event_sample");
+        }
+        ms.push_back(std::move(m));
+    }
+    // One wait over what every term depends on, each source named once: a signal's bucket
+    // holds one entry per waiting process, and a member read through the same handle
+    // variable is one place.
+    ExprWaitDeps all;
+    {
+        ankerl::unordered_dense::set<uint32_t> signals;
+        for (const Member& m : ms) {
+            for (const ir::WaitEvent& r : m.deps.reads) {
+                if (signals.insert(static_cast<uint32_t>(r.signal)).second) {
+                    all.reads.push_back(r);
+                }
+            }
+            for (const MemberAccessExpression* ma : m.deps.vif_reads) {
+                if (std::ranges::none_of(all.vif_reads, [&](const MemberAccessExpression* h) {
+                        return same_member_read(*h, *ma);
+                    })) {
+                    all.vif_reads.push_back(ma);
+                }
+            }
+            all.props.notifiable.insert(
+              all.props.notifiable.end(), m.deps.props.notifiable.begin(), m.deps.props.notifiable.end());
+            all.props.weak_gets.insert(
+              all.props.weak_gets.end(), m.deps.props.weak_gets.begin(), m.deps.props.weak_gets.end());
+            all.props.event_props.insert(
+              all.props.event_props.end(), m.deps.props.event_props.begin(), m.deps.props.event_props.end());
+            for (const ValueSymbol* vs : m.deps.boxed) {
+                if (std::ranges::find(all.boxed, vs) == all.boxed.end()) {
+                    all.boxed.push_back(vs);
+                }
+            }
+        }
     }
     // A string and a real are not vectors for convert to resize; an integral value
     // is brought to the expression's own type, as synth_event_net brings it.
@@ -2360,16 +2166,22 @@ void Lowerer::lower_sampled_event_wait(std::span<const SignalEventControl* const
         std::vector<ir::Index> samples;
         samples.reserve(ms.size());
         for (const Member& m : ms) {
-            samples.push_back(value(m));
+            if (m.cell) {
+                b.binary(ir::Inst::Tag::Store, m.cell->lv(b, l), value(m), l);
+                samples.push_back(ir::Index{});
+            } else {
+                samples.push_back(value(m));
+            }
         }
         std::vector<ir::WaitEdge> edges;
-        for (const Member& m : ms) {
-            push_wait_edges(m.deps, b, l, edges);
-        }
+        push_wait_edges(all, b, l, edges);
         b.wait(edges, l);
         for (size_t k = 0; k < ms.size(); ++k) {
-            const Member&   m   = ms[k];
-            const ir::Index hit = sampled_event_hit(samples[k], value(m), m.ty, m.ev->edge, b, l);
+            const Member&   m = ms[k];
+            // Compared before anything overwrites the cell: a string `old` names the
+            // sample's storage, it does not hold a copy of what the sample was.
+            const ir::Index old = m.cell ? b.unary(ir::Inst::Tag::Load, m.cell->lv(b, l), l) : samples[k];
+            const ir::Index hit = sampled_event_hit(old, value(m), m.ty, m.ev->edge, b, l);
             b.open_region();
             if (m.ev->iffCondition != nullptr) {
                 // LRM 9.4.2.3: the event is detected only if the condition holds

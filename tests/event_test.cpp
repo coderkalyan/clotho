@@ -2836,3 +2836,32 @@ TEST_CASE("a list of signals and events still wakes on a pulse that reverts in i
     )");
     CHECK(out == "1 3\n");
 }
+
+// A property or a virtual-interface member by itself has a wait source of its own, so a
+// list of such terms and signals is no sampled wait and keeps the signal's pulse too: the
+// refusal and the sampling loop are for a term that has no source of its own. Each waiter
+// logs every wake of the list, and `b` pulses 0 -> 1 -> 0 in one step.
+TEST_CASE("a lone property or member beside a signal in a list keeps the signal's pulse") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic clk = 0; endinterface
+        class C; int x; endclass
+        module top;
+          ifc i();
+          virtual ifc vi = i;
+          C obj = new;
+          logic b = 0;
+          int n1 = 0, n2 = 0;
+          initial begin
+            fork
+              forever begin @(obj.x or b) n1++; end
+              forever begin @(posedge vi.clk or b) n2++; end
+            join_none
+            #1 b = 1; b = 0;
+            #1 obj.x = 1;
+            #1 i.clk = 1;
+            #1 $display("%0d %0d", n1, n2);
+          end
+        endmodule
+    )");
+    CHECK(out == "2 2\n");
+}

@@ -404,3 +404,122 @@ TEST_CASE("@ on a fork-captured automatic") {
     CHECK(run_capture(src) == "k=5 at 1\nk=6 at 2\nb0 rose at 3\nb1 rose at 4\n"
                               "task k=7 at 5\ntask k=8 at 6\ndone\n");
 }
+
+// A list whose terms all read heap state is one sampled wait, whatever kinds they are: a
+// method call, a property by itself (woken here by its any-change notifier and compared
+// with its sample, as the others are) and a member of an aggregate property. Each term is
+// its own event (LRM 9.4.2.1), a write that leaves a term's value alone is none, and a
+// store to a sibling member (`s.g`) wakes the loop and is none either. No oracle parses
+// classes; the expectations are the clauses'.
+TEST_CASE("@ over a list of a method call, a property and a member of an aggregate property") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int f; int g; } s_t;
+          class C;
+            int v;
+            int x;
+            s_t s;
+            function int get(); return v; endfunction
+          endclass
+          C      c = new, o = new;
+          string log;
+          initial begin
+            fork
+              forever begin @(c.get() or o.x or o.s.f) log = {log, $sformatf("%0t ", $time)}; end
+            join_none
+            #1 c.v = 1;
+            #1 o.x = 2;
+            #1 o.s.g = 3;
+            #1 o.s.f = 4;
+            #1 c.v = 1;
+            #1 o.x = 2;
+            #1 c.v = 5;
+            #1 $display("%s", log);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 4 7 \n");
+}
+
+// Threads forked at one statement wait on one list, each on the objects its own captured
+// variable names and each against its own samples: a store that changes one thread's term
+// leaves the others' alone.
+TEST_CASE("@ over a list in threads forked at one statement") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C;
+            int v;
+            int w;
+          endclass
+          C objs[3];
+          initial begin
+            foreach (objs[i]) objs[i] = new;
+            for (int i = 0; i < 3; i++) begin
+              fork
+                automatic int j = i;
+                begin @(objs[j].v == 1 or objs[j].w); $display("obj %0d at %0t", j, $time); end
+              join_none
+            end
+            #1 objs[2].v = 1;
+            #1 objs[0].w = 5;
+            #1 objs[1].v = 1;
+            #1 $display("done");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "obj 2 at 1\nobj 0 at 2\nobj 1 at 3\ndone\n");
+}
+
+// Reading a string place yields the place, not a copy, so the sample of a string term is
+// copied: a store of the same text is no event, a store of other text is, and the compare
+// is against what the string was, not against itself.
+TEST_CASE("@ over a list with a string property compares with a copy of the string") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C;
+            string t;
+            int    v;
+            function int get(); return v; endfunction
+          endclass
+          C      c = new;
+          string log;
+          initial begin
+            fork
+              forever begin @(c.get() or c.t) log = {log, $sformatf("%0t ", $time)}; end
+            join_none
+            #1 c.t = "a";
+            #1 c.t = "a";
+            #1 c.t = "b";
+            #1 c.v = 1;
+            #1 $display("%s", log);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 3 4 \n");
+}
+
+// A fork-captured automatic is heap state too, and a property by itself beside it is
+// compared with a sample like the automatic is: either one wakes the list.
+TEST_CASE("@ over a list of a fork-captured automatic and a property") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int x; endclass
+          C o = new;
+          initial begin
+            fork
+              automatic int k = 0;
+              begin @(k or o.x); $display("first k=%0d x=%0d at %0t", k, o.x, $time); end
+              begin #1 k = 5; end
+            join_none
+            #2;
+            fork
+              automatic int k = 0;
+              begin @(k or o.x); $display("second k=%0d x=%0d at %0t", k, o.x, $time); end
+              begin #1 o.x = 3; end
+            join_none
+            #2 $display("done");
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "first k=5 x=0 at 1\nsecond k=0 x=3 at 3\ndone\n");
+}

@@ -878,7 +878,7 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
     // And one into a waited-on class property, or a member or element of one (LRM 9.4.2.2:
     // the property is one variable), fires its any-change notifier, when the bytes change.
     const bool chg_service = !silent_stores_ && dlv.chg != nullptr;
-    if (chg_service && dlv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
+    if (chg_service && !dlv.chg->wants(Edge::Any)) {
         throw BackendError{ "internal: aggregate class property change notifier with no any-change field" };
     }
     llvm::Value* changed = nullptr;
