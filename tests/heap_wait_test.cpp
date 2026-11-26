@@ -595,7 +595,9 @@ TEST_CASE("a real changes when its bit pattern does, for @(r) and a sampled wait
 // process that read the handle once, before anything had assigned it, and never ran
 // again. In a list with a signal or a named event the woken process cannot tell
 // which member woke it; the control of a nonblocking assignment or trigger is a
-// record, and a clocking event is a clock.
+// record, and a clocking event is a clock. A term that reads a property in a list
+// or under `<= @` / `->> @` has a refusal of its own (lower_event_wait,
+// refuse_detached_member_event); these are the ones that reach event_signal.
 TEST_CASE("an event control over heap state that nothing can sample is refused") {
     constexpr std::string_view needle  = "supported only as a procedural `@`";
     constexpr std::string_view head    = R"(
@@ -607,6 +609,7 @@ TEST_CASE("an event control over heap state that nothing can sample is refused")
           C c = new;
           bit sysclk, a, x;
           event e;
+          string s;
     )";
     const auto                 refused = [&](std::string_view item) {
         const std::string err = lower_error(std::string(head) + std::string(item) + "\nendmodule\n");
@@ -614,7 +617,7 @@ TEST_CASE("an event control over heap state that nothing can sample is refused")
     };
     SUBCASE("a list with a signal edge") {
         refused("initial begin @(c.get() or posedge sysclk); end");
-        refused("always @(c.v == 3 or posedge sysclk) x = 1;");
+        refused("always @(c.get() == 3 or posedge sysclk) x = 1;");
     }
     SUBCASE("a list with a named event") {
         refused("initial begin @(c.get() or e); end");
@@ -623,13 +626,17 @@ TEST_CASE("an event control over heap state that nothing can sample is refused")
         refused("initial x <= @(c.get()) 1'b1;");
     }
     SUBCASE("the control of a nonblocking trigger") {
-        refused("initial ->> @(c.v == 3) e;");
+        refused("initial ->> @(c.get()) e;");
     }
     SUBCASE("a clocking block's event") {
         refused("clocking cb @(posedge c.get()); input a; endclocking");
+        refused("clocking cb @(posedge c.clk); input a; endclocking");
     }
     SUBCASE("a covergroup's sampling event") {
         refused("covergroup cg @(posedge c.get()); coverpoint a; endgroup\ncg g = new;");
+    }
+    SUBCASE("a string expression in a list with a signal") {
+        refused("initial begin @({s, \"/\"} or posedge sysclk); end");
     }
 }
 
