@@ -673,6 +673,22 @@ void Backend::build_wait_queues() {
       env_->llmod, llvm::PointerType::getUnqual(ctx_), false, llvm::GlobalValue::InternalLinkage,
       llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
       "clotho.event_pend_head");
+    // The design-wide change notifiers: one handle each, filled by init_state.
+    uint32_t nshared = 0;
+    for (const SignalInfo& s : sigs) {
+        if (s.shared_notify != kNoNotify) {
+            nshared = std::max(nshared, s.shared_notify + 1);
+        }
+    }
+    if (nshared != 0) {
+        chg_shared_ty_ = llvm::ArrayType::get(b_.getInt64Ty(), nshared);
+        chg_shared_gv_ = new llvm::GlobalVariable(env_->llmod,
+                                                  chg_shared_ty_,
+                                                  false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantAggregateZero::get(chg_shared_ty_),
+                                                  "clotho.chg_shared");
+    }
     event_nodes_arr_ty_ = llvm::ArrayType::get(event_node_ty(), nnodes);
     event_nodes_gv_ =
       nnodes == 0 ? nullptr
@@ -1236,7 +1252,7 @@ void Backend::service_change_notify(const LValue& lv,
                                     llvm::Value*  old_z,
                                     llvm::Value*  new_z) {
     const ChangeNotify& cn   = *lv.chg;
-    const auto          have = [&](Edge e) { return cn.field[static_cast<uint32_t>(e)] != kNoNotify; };
+    const auto          have = [&](Edge e) { return cn.wants(e); };
     // `four_state` is "the mm word is the packed must|may pair", which is what
     // emit_edge_facts means by four_state (slot_mm_bits reads the same flag).
     const EdgeFacts                                    f         = emit_edge_facts(old_mm,
@@ -2166,7 +2182,7 @@ llvm::Function* Backend::emit_ref_wake_thunk(const LValueInfo& lv) {
                 std::make_pair(Edge::Negative, neg),
             };
             for (const auto& [edge, fact] : notifiers) {
-                if (lv.chg->field[static_cast<uint32_t>(edge)] == kNoNotify) {
+                if (!lv.chg->wants(edge)) {
                     continue;
                 }
                 auto* body = llvm::BasicBlock::Create(ctx_, "chg.body", th);

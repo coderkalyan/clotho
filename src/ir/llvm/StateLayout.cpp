@@ -1634,6 +1634,18 @@ void Backend::init_state() {
     emit_rows(events, ptr, "clotho.init.events", [&](llvm::Value* row) {
         b_.CreateStore(b_.CreateCall(event_new_fn()), b_.CreateLoad(ptr, row));
     });
+    // A design-wide change notifier is the object one of those events just got
+    // (SignalInfo::shared_notify). Its handle is copied to clotho.chg_shared, where
+    // the store of any unit finds it; the signal keeps the object alive.
+    for (const SignalSlot& s : slots_) {
+        const SignalInfo& info = mod_.signals()[static_cast<size_t>(&s - slots_.data())];
+        if (info.shared_notify == kNoNotify) {
+            continue;
+        }
+        assert(info.is_event && "a design-wide change notifier is an event");
+        llvm::Value* handle = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(s.slot_ty, storage_ptr(s), 0));
+        b_.CreateStore(handle, chg_shared_slot(info.shared_notify));
+    }
 }
 
 // Constant power-on initializer for one state global. Every state struct

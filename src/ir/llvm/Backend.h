@@ -1672,6 +1672,10 @@ private:
 
     void fire_prop_notifier(const LValueInfo& lv, Edge edge);
 
+    // Where the handle of design-wide change notifier `k` is kept
+    // (ir::ChangeNotify::shared): an element of clotho.chg_shared.
+    llvm::Constant* chg_shared_slot(uint32_t k);
+
     llvm::Value* str_chg_snapshot(const Guarded& lv);
 
     void str_chg_after(const Guarded& lv, llvm::Value* snap);
@@ -5718,6 +5722,13 @@ private:
     bool design_uses_intra_event_objs_ = false;
     // Head of the NBA pending chain (clotho.event_pend_head).
     llvm::GlobalVariable*                              event_pend_head_gv_ = nullptr;
+    // The handles of the design-wide change notifiers (clotho.chg_shared), indexed
+    // by ir::ChangeNotify::shared; null in a design that has none. Each is the
+    // object of a hidden event signal (SignalInfo::shared_notify), copied here once
+    // the signal has it, so that the code of any unit can fire it without a way to
+    // the signal.
+    llvm::GlobalVariable* chg_shared_gv_ = nullptr;
+    llvm::ArrayType*      chg_shared_ty_ = nullptr;
     // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).
     // One rather than one-per-event: the timer node carries the handle.
     llvm::Function*                                    event_delay_thunk_ = nullptr;

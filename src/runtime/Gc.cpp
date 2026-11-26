@@ -2275,6 +2275,14 @@ void clear_weak_referents() {
             assert(event != nullptr && is_marked_now(event) && "a weak reference's notifier lives with it");
             rt_internal::event_pend(event);
         }
+        if (map->weak_shared != nullptr) {
+            // The design-wide notifier of this class's referents, which a wait
+            // that reaches get() through a method parks on. A design-wide event
+            // signal holds it, so it is live; pending it twice is pending it once.
+            void* const event = reinterpret_cast<void*>(*map->weak_shared);
+            assert(event != nullptr && is_marked_now(event) && "a design-wide notifier is a root");
+            rt_internal::event_pend(event);
+        }
     }
     g.weak_reached.clear();
 }

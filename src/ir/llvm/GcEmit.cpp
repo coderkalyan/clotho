@@ -628,8 +628,9 @@ llvm::Constant* Backend::class_gc_map_global(Ref class_ref) {
     // is a plain word, so class_handle_offsets left it out, which is the whole of
     // what makes the reference weak; naming it here is what lets the collector
     // clear it. Offset 0 is the vptr, so 0 says "none" for both.
-    uint32_t weak_referent = 0;
-    uint32_t weak_notify   = 0;
+    uint32_t        weak_referent = 0;
+    uint32_t        weak_notify   = 0;
+    llvm::Constant* weak_shared   = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     if (const WeakClass* weak = mod_.weak_class(class_ref); weak != nullptr) {
         const auto*    sl      = env_->llmod.getDataLayout().getStructLayout(class_body_ty(class_ref));
         const uint32_t hdr     = class_header_words(class_ref);
@@ -638,6 +639,11 @@ llvm::Constant* Backend::class_gc_map_global(Ref class_ref) {
         if (cn != nullptr && cn->field[static_cast<uint32_t>(Edge::Any)] != kNoNotify) {
             weak_notify =
               static_cast<uint32_t>(sl->getElementOffset(hdr + cn->field[static_cast<uint32_t>(Edge::Any)]));
+        }
+        if (cn != nullptr && cn->shared != kNoNotify) {
+            // The referents' design-wide notifier, by the address of its handle
+            // (chg_shared_slot): the collector has no other way to the event.
+            weak_shared = chg_shared_slot(cn->shared);
         }
         assert(weak_referent != 0 && "the referent follows the vptr");
     }
@@ -649,7 +655,8 @@ llvm::Constant* Backend::class_gc_map_global(Ref class_ref) {
                                              leaf_arr,
                                              class_finalizer_fn(class_ref),
                                              b_.getInt32(weak_referent),
-                                             b_.getInt32(weak_notify) });
+                                             b_.getInt32(weak_notify),
+                                             weak_shared });
     return new llvm::GlobalVariable(env_->llmod, gc_map_ty(), /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init, nm);
 }
