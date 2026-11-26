@@ -1220,8 +1220,8 @@ TEST_CASE("coverage: cover statements print nothing without --coverage") {
 }
 
 // With the default `option.per_instance = 0` the report lists a covergroup's type line
-// alone (LRM 19.7: instance data is saved only when per_instance is 1 [unverified
-// wording]); get_inst_coverage() still answers. With 1, the instance lines appear.
+// alone (LRM 19.7 Table 19-1: true saves and reports the instance; false does not require
+// it); get_inst_coverage() still answers. With 1, the instance lines appear.
 TEST_CASE("coverage: per-instance lines appear only when option.per_instance is 1") {
     constexpr std::string_view src = R"(
         module top;

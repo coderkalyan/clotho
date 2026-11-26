@@ -624,9 +624,11 @@ database tasks.** Specifically:
 - Ordered by (type index, instance creation order), never by hash or pointer
   order, so two runs of one design diff cleanly.
 - Per-instance lines appear only for a covergroup whose `option.per_instance` is 1
-  (LRM 19.7: instance data is saved only then [unverified wording]). With the default 0
-  the report lists the type line alone (coverage, bins, instance count), and no bin hit
-  counts; `get_inst_coverage()` still answers, because the counters are kept either way.
+  (LRM 19.7 Table 19-1: true "shall be saved ... and included in the coverage report";
+  false, implementations "are not required to save instance-specific information").
+  With the default 0 the report lists the type line alone (coverage, bins, instance
+  count), and no bin hit counts; `get_inst_coverage()` still answers, because the
+  counters are kept either way.
 - Content per instance (per_instance = 1): the instance name (`<scope><type>`, the scope being the
   constructing instance's prefix of §6.2, or whatever
   `set_inst_name` replaced it with), its percentage, then per coverpoint the

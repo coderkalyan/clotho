@@ -700,10 +700,12 @@ LowerResult lower_design(slang::ast::Compilation&                            com
 
     // `-G NAME=value`: slang applies a simple-name override to every top with a
     // parameter of that name and says nothing when none has one, and it does not
-    // skip a localparam, which a command-line override may not change (LRM 6.20.4)
-    // [unverified wording]. Either way the run would not be the design asked for,
-    // so both are errors, as an unknown name is in iverilog (`-P`). A dotted name
-    // is a defparam path, which slang resolves and reports itself.
+    // skip a localparam. The LRM has no command-line override; the nearest rule is 6.20.4
+    // (a localparam cannot be modified by defparam or an instance parameter value
+    // assignment; 23.10 makes a body parameter local when the module has a parameter
+    // port list), which the override follows. Either way the run would not be the design
+    // asked for, so both are errors, as an unknown name is in iverilog (`-P`). A dotted
+    // name is a defparam path, which slang resolves and reports itself.
     bool bad_override = false;
     for (const std::string& opt : comp.getOptions().paramOverrides) {
         const std::string_view whole(opt);

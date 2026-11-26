@@ -4410,7 +4410,8 @@ private:
 
     void emit_defer_gen_bump();
 
-    void emit_defer_gen_bump_at(llvm::Value* gen);
+    // `delta` is 1 at a resume or activation start, kGenDisableBump at a `disable`.
+    void emit_defer_gen_bump_at(llvm::Value* gen, uint64_t delta = 1);
 
     // The report generation of the running thread (LRM 16.4.2), published for the
     // bodies it calls: a process group publishes its own counter at each activation

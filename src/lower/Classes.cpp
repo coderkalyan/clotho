@@ -1287,8 +1287,8 @@ void Lowerer::emit_class_property_inits(const slang::ast::ClassType& clt,
         const Expression* init = prop.getInitializer();
         if (init == nullptr) {
             // A struct-typed property with no initializer of its own still takes
-            // the field-level defaults its struct type declares (LRM 7.2.1), as a
-            // variable of the type does.
+            // the field-level defaults its struct type declares (LRM 7.2.2), as a
+            // variable of the type does (7.2.2 does not mention class properties).
             if (aggregate_has_field_defaults(prop.getType())) {
                 const ir::SourceLoc pl = to_source_loc(prop.location);
                 emit_field_defaults(class_member_lvalue(handle, prop, class_ref, b, pl), prop.getType(), b, pl);

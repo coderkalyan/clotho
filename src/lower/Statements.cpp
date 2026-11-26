@@ -636,7 +636,7 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
         // drops its pending deferred reports. Lexically that procedure IS this
         // one, so the generation counter to bump is this group's own — one
         // instruction, immediately before the exit.
-        b.defer_flush(ir::kNoDisableTarget, loc(s));
+        b.defer_flush(ir::kDisableOwnTarget, loc(s));
     }
 
     b.disable(label, loc(s));

@@ -1955,6 +1955,70 @@ TEST_CASE("unique / priority report: a fork child flushes its own reports at its
     }
 }
 
+// -- `disable` is a flush point of a deferred assertion's report (LRM 16.4.4), not of a violation report --
+//
+// 12.4.2.1 lists two flush points for a unique/priority report and a disable of the outermost scope is
+// neither, so the report matures in the Observed region, also in a process that holds an `assert #0`
+// whose report the same disable drops. A disable of a non-outermost block flushes neither (16.4.4).
+// Expected output is derived from those clauses; no oracle is available (iverilog ignores `unique`).
+TEST_CASE("unique / priority report: a disable of the outermost scope does not flush it") {
+    constexpr std::string_view self = R"(
+        module t;
+          logic a = 1, b = 1;
+          initial begin : blk
+            ASSERT
+            unique if (a) ; else if (b) ;
+            disable blk;
+          end
+        endmodule
+    )";
+    constexpr std::string_view remote = R"(
+        module t;
+          logic a = 1, b = 1;
+          initial begin : blk
+            ASSERT
+            unique if (a) ; else if (b) ;
+            @(posedge a);
+          end
+          initial begin #0; disable blk; end
+        endmodule
+    )";
+    constexpr std::string_view assert_stmt = "assert #0 (a == 0) else $error(\"deferred fail\");";
+    for (const std::string_view design : { self, remote }) {
+        const auto with = [&](std::string_view assertion) {
+            std::string d(design);
+            d.replace(d.find("ASSERT"), 6, assertion);
+
+            return run_capture_stderr(d);
+        };
+        SUBCASE("without a deferred assertion") {
+            CHECK_EQ(count_occ(with(""), "not unique"), 1u);
+        }
+        SUBCASE("with a deferred assertion, whose report the disable drops") {
+            const std::string err = with(assert_stmt);
+            CHECK_EQ(count_occ(err, "not unique"), 1u);
+            CHECK_EQ(count_occ(err, "deferred fail"), 0u);
+        }
+    }
+}
+
+TEST_CASE("unique / priority report: a disable of a non-outermost block flushes no report") {
+    const std::string err = run_capture_stderr(R"(
+        module t;
+          logic a = 1, b = 1;
+          initial begin : outer
+            begin : inner
+              assert #0 (a == 0) else $error("deferred fail");
+              unique if (a) ; else if (b) ;
+              disable inner;
+            end
+          end
+        endmodule
+    )");
+    CHECK_EQ(count_occ(err, "not unique"), 1u);
+    CHECK_EQ(count_occ(err, "deferred fail"), 1u);
+}
+
 // -- A write through a `ref` formal wakes its waiters at the write (LRM 9.4.2, 13.5.2) --
 //
 // 13.5.2 makes the formal the actual itself, so each write is an update event of it. Oracle:
