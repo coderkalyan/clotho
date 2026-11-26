@@ -2796,10 +2796,9 @@ extern "C" void rt_trace_member(void* a_, uint32_t i) {
 }
 
 extern "C" void rt_trace_inertial_decide(uint32_t idx, uint32_t same_pending, uint32_t same_cur, uint64_t epoch) {
-    if (g.halted || g.finished) {
+    if (g.halted || g.finished || !g.counted) {
         return;
     }
-    touch_run();
     if (idx >= g.inert_sites.size()) {
         g.inert_sites.resize(idx + 1);
     }
@@ -2864,10 +2863,9 @@ extern "C" void rt_trace_inertial_arm(uint32_t idx, const void* rec_, uint64_t t
 }
 
 extern "C" void rt_trace_inertial_fire(const void* rec_, uint32_t current) {
-    if (g.halted || g.finished) {
+    if (g.halted || g.finished || !g.counted) {
         return;
     }
-    touch_run();
     const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
     InertRec*       r   = g.inert.find(rec);
     if (r == nullptr || (r->state != IState::Live && r->state != IState::Superseded)) {
@@ -2910,7 +2908,7 @@ extern "C" void rt_trace_inertial_fire(const void* rec_, uint32_t current) {
 }
 
 extern "C" void rt_trace_inertial_applied(const void* rec_) {
-    if (g.halted || g.finished) {
+    if (g.halted || g.finished || !g.counted) {
         return;
     }
     InertRec* r = g.inert.find(reinterpret_cast<uintptr_t>(rec_));
