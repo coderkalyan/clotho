@@ -2389,7 +2389,8 @@ private:
     ir::Index prop_notifier_handle(const Expression&                      e,
                                    const slang::ast::ClassPropertySymbol& prop,
                                    ir::Edge                               edge,
-                                   ir::Builder&                           b);
+                                   ir::Builder&                           b,
+                                   bool                                   null_ok = false);
 
     // True when a `@(...)` on this expression needs a runtime event HANDLE rather
     // than a signal: it is event-typed but is not a plain reference to a declared

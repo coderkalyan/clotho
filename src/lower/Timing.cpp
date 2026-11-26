@@ -270,7 +270,8 @@ void Lowerer::refuse_container_event_control(const SignalEventControl& ev) {
 ir::Index Lowerer::prop_notifier_handle(const Expression&                      e,
                                         const slang::ast::ClassPropertySymbol& prop,
                                         ir::Edge                               edge,
-                                        ir::Builder&                           b) {
+                                        ir::Builder&                           b,
+                                        bool                                   null_ok) {
     const ir::SourceLoc l    = to_source_loc(e.sourceRange.start());
     const auto          slot = prop_notify_.find(&prop);
     if (slot == prop_notify_.end() || slot->second[static_cast<uint32_t>(edge)] == ir::kNoNotify) {
@@ -298,12 +299,34 @@ ir::Index Lowerer::prop_notifier_handle(const Expression&                      e
     } else {
         fail("a bare class property in an event control needs an enclosing method");
     }
-    const ir::Index body = b.handle_deref(handle, cls, span.valid() ? span.start : l);
-    if (span.end != ir::SourceLoc{ 0 }) {
-        b.set_end(body, span.end);
+    const auto notifier = [&] {
+        const ir::Index body = b.handle_deref(handle, cls, span.valid() ? span.start : l);
+        if (span.end != ir::SourceLoc{ 0 }) {
+            b.set_end(body, span.end);
+        }
+        return b.unary(
+          ir::Inst::Tag::Load, b.member_select(body, slot->second[static_cast<uint32_t>(edge)], cls, l), l);
+    };
+    if (!null_ok) {
+        return notifier();
     }
-    return b.unary(
-      ir::Inst::Tag::Load, b.member_select(body, slot->second[static_cast<uint32_t>(edge)], cls, l), l);
+    // An inferred `@*` waits before its body runs (LRM 9.4.2.2), and only the body
+    // dereferences the object (8.4): with a null handle the wait parks on the handle
+    // alone, through an event nothing triggers, and the park that follows the handle's
+    // change names the object. The handle is among the signals read, so it wakes the wait.
+    const ir::Ref    evt  = module_.pool.event_type;
+    const TempCell   cell = make_temp_cell(evt, "notifier");
+    const ir::Signal idle = declare_temp(evt, "null_notifier");
+    b.binary(ir::Inst::Tag::Store, cell.lv(b, l), b.unary(ir::Inst::Tag::Load, b.signal(idle, l), l), l);
+    const ir::Index live =
+      b.binary(ir::Inst::Tag::Ne, handle, b.constant(module_.pool.put_int(make_int_type(64, false), 0), l), l);
+    b.open_region();
+    b.binary(ir::Inst::Tag::Store, cell.lv(b, l), notifier(), l);
+    const ir::ExtraSlice present = b.close_region();
+    b.open_region();
+    const ir::ExtraSlice absent = b.close_region();
+    b.cond(live, present, absent, l);
+    return b.unary(ir::Inst::Tag::Load, cell.lv(b, l), l);
 }
 
 bool Lowerer::event_wait_needs_handle(const Expression& e) {
@@ -811,9 +834,10 @@ void Lowerer::emit_inferred_park(const Statement& body, SensitivityMode mode, ir
         }
     }
     for (const Expression* pe : handles.props) {
-        edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
-                                      static_cast<uint32_t>(ir::Edge::Any),
-                                      prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
+        edges.push_back(
+          ir::WaitEdge{ ir::Signal{ 0 },
+                        static_cast<uint32_t>(ir::Edge::Any),
+                        prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b, /*null_ok=*/true) });
     }
     b.wait(edges, l);
 }

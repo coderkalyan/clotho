@@ -2533,3 +2533,31 @@ TEST_CASE("event member of an aggregate class property") {
         CHECK_MESSAGE(out.find(want) != std::string::npos, want);
     }
 }
+
+// An inferred `@*` waits before its body runs (LRM 9.4.2.2), so a null handle at the wait
+// must not be dereferenced: it parks on the handle alone and subscribes to the property's
+// notifier once the handle is set. LRM-derived; no oracle parses classes.
+TEST_CASE("always @* over a property of a null handle waits on the handle") {
+    const std::string out = run_capture(R"(
+        typedef struct { event e; int f; } s_t;
+        class C; s_t s; endclass
+        module m;
+          C obj; int y;
+          always @* y = obj.s.f;
+          initial begin
+            obj = new;
+            fork
+              begin @(obj.s.e) $display("woke e at %0t", $time); end
+              begin wait (obj.s.f == 1) $display("wait f at %0t", $time); end
+            join_none
+            #1 -> obj.s.e;
+            #1 obj.s.f = 1;
+            #1 $display("y=%0d at %0t", y, $time);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out.find("woke e at 1") != std::string::npos);
+    CHECK(out.find("wait f at 2") != std::string::npos);
+    CHECK(out.find("y=1 at 3") != std::string::npos);
+}
