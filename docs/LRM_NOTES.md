@@ -954,4 +954,30 @@ fixed memory the same addresses name (the element at address `n` is word `n` of 
 `[0:max]`, with the same file and the same start and finish), compared in the design, and derive
 the rest from the clauses above.
 
-Code: `src/runtime/Io.cpp` (`AssocWords`, `load_words`, `read_words`, `rt_readmem_assoc`, `rt_fread_assoc`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `lower_readmem`, `lower_fread_mem`), `src/lower/SystemTasks.cpp` (`is_mem_target_shape`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into an associative array creates the elements the addresses name", "$readmemh into an associative array addresses the values of its index type", "$readmem into an associative array of 4-state, 2-state, wide and array elements", "$readmemh into an entry of an associative array of arrays or of associative arrays", "$readmemh into an associative array that is a property, a member, an element or an interface member", "a load into an associative array wakes the waiters of its elements", "$fread into an associative array creates the elements the bytes fill", "a memory load into an associative array that names no element or no file creates none", "a memory load into a queue slice or an associative array without an integral index is refused").
+Code: `src/runtime/Io.cpp` (`AssocWords`, `load_words`, `read_words`, `rt_readmem_assoc`, `rt_fread_assoc`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `lower_readmem`, `lower_fread_mem`), `src/lower/SystemTasks.cpp` (`is_mem_target_shape`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into an associative array creates the elements the addresses name", "$readmemh into an associative array addresses the values of its index type", "$readmem into an associative array of 4-state, 2-state, wide and array elements", "$readmemh into an entry of an associative array of arrays or of associative arrays", "$readmemh into an associative array that is a property, a member, an element or an interface member", "a load into an associative array wakes the waiters of its elements", "$fread into an associative array creates the elements the bytes fill", "a memory load into an associative array that names no element or no file creates none", "a $fread into an associative array without an integral index is refused").
+
+## 64. An x or z bit of an associative-array index that the cast to the index type drops (7.8.4, 7.8.6)
+
+7.8.4: "The index expression shall be evaluated in terms of a cast to the index type" and "A
+4-state index expression containing x or z is invalid". 7.8.6: a read through an invalid
+index issues a warning and yields the value of a nonexistent entry (Table 7-1), and a write
+through one "shall be ignored" with a warning. Clotho tests the index expression as written,
+before the cast, so an x or z bit that the cast would drop still makes the index invalid:
+`4'b1x01` indexing an `int` array is not entry 9, and a 64-bit `logic` with x in its high
+half indexing an `int` array is not entry 0. The clause does not say whether a bit that only
+the cast removes counts; this reading is the user's. A cast to a 4-state type at least as wide
+as the expression keeps every bit, and the backend finds the key invalid as it always has.
+
+The rule holds wherever an index names an entry: a read, a write, a read-modify-write
+(`a[k]++`, `a[k] += 1`), an entry that is a queue, a struct or another associative array
+(`aq[k].push_back(1)`, `as[k].x = 1`, `n[k][j]`), an actual of a `ref` argument (7.8.7
+allocates the entry of an index that is valid), `exists` (0) and `delete` (nothing is
+removed). The warning is the one every invalid index gets, under `--sanitize=bounds`
+(docs/design/assoc-keys.md, P4b); `exists` and `delete` say nothing, as 7.9.2 has deleting a
+missing entry issue no warning. `first`, `last`, `next` and `prev` take a variable of the
+index type by `ref` (7.9.4-7.9.8) and are not changed.
+
+iverilog 13 cannot parse an associative array, so the tests derive from the clauses above,
+with a 4-state index of the type's own width, which was always invalid, as the control.
+
+Code: `src/lower/Containers.cpp` (`lower_assoc_key`). Tests: `tests/associative_array_test.cpp` ("assoc invalid (x/z) index: the cast to a 2-state or narrower index type does not hide it", "assoc 4-state index without an x or z bit names the entry of its value through the cast", "assoc invalid (x/z) index: literals, queue and struct entries and nested arrays", "assoc invalid (x/z) index into a 2-state index type warns under --sanitize=bounds").

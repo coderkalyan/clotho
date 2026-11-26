@@ -47,6 +47,58 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
+// The same under `config`, with what the run wrote to stderr in `err`: the diagnostics a sanitizer
+// reports.
+std::string run_capture_err(std::string_view source, const ir::SimulationConfig& config, std::string& err) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* out_tmp = std::tmpfile();
+    std::FILE* err_tmp = std::tmpfile();
+    REQUIRE(out_tmp != nullptr);
+    REQUIRE(err_tmp != nullptr);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const int saved_out = dup(fileno(stdout));
+    const int saved_err = dup(fileno(stderr));
+    dup2(fileno(out_tmp), fileno(stdout));
+    dup2(fileno(err_tmp), fileno(stderr));
+
+    ir::run_jit(*r.module, nullptr, config);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    dup2(saved_out, fileno(stdout));
+    dup2(saved_err, fileno(stderr));
+    close(saved_out);
+    close(saved_err);
+
+    const auto slurp = [](std::FILE* f) {
+        std::rewind(f);
+        std::string s;
+        char        buf[256];
+        size_t      n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+            s.append(buf, n);
+        }
+        std::fclose(f);
+        return s;
+    };
+    err = slurp(err_tmp);
+    return slurp(out_tmp);
+}
+
+// Count non-overlapping occurrences of `needle` in `hay`.
+size_t count_substr(const std::string& hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+
 } // namespace
 
 // a[k] write creates the entry; read returns the value; num() counts entries;
@@ -426,6 +478,182 @@ TEST_CASE("assoc invalid (x/z) key: a literal key drops too, not just a runtime 
         endmodule
     )";
     CHECK(run_capture(src) == "num=0\nnum2=1 get=9\n");
+}
+
+// LRM 7.8.4 / 7.8.6: "A 4-state index expression containing x or z is invalid", whatever the
+// index type the expression is cast to. A cast to a 2-state index type, or to a narrower one,
+// used to drop the x and z bits before the key was tested, so `a[x]` silently named an entry
+// that the bits' 0s made up: entry 0, or entry 9 for `4'b1x01` -- read, written, incremented,
+// found by `exists`, removed by `delete` and bound to a `ref` argument alike. The expression as
+// written is tested, so an x or z bit that the cast drops (the high half of a 64-bit index
+// into an `int` array) counts too. A read yields the entry's default, and nothing is written or
+// allocated (7.8.6, 7.8.7). iverilog 13 cannot parse an associative array: derived from the
+// clauses, with `an` (a 4-state index of the type's own width, always invalid) as the control.
+TEST_CASE("assoc invalid (x/z) index: the cast to a 2-state or narrower index type does not hide it") {
+    constexpr std::string_view src = R"(
+        module m;
+            int          ai [int];
+            int          an [integer];
+            int          ab [byte];
+            int          aw [bit [39:0]];
+            int          ax [bit [99:0]];
+            int          al [longint];
+            integer      k;
+            logic [3:0]  p;
+            logic [7:0]  x8;
+            logic [15:0] w16;
+            logic [39:0] x40;
+            logic [63:0] x64;
+            logic [99:0] x100;
+            task automatic bump(ref int r);
+                r = r + 100;
+            endtask
+            initial begin
+                ai[0] = 7; ai[9] = 5; an[0] = 7; ab[0] = 7; aw[0] = 7; ax[0] = 7; al[0] = 7;
+                k = 'x;
+                p = 4'b1x01;
+                x8 = 8'bx;
+                w16 = {8'bx, 8'd0};
+                x40 = 40'bx;
+                x64 = {32'bx, 32'd0};
+                x100 = {1'bx, 99'd0};
+                $display("rd %0d %0d %0d %0d %0d", ai[k], an[k], ai[p], ai[x8], ai[x64]);
+                $display("rd %0d %0d %0d %0d %0d", ab[x8], ab[w16], aw[x40], ax[x100], al[x64]);
+                ai[k] = 1; an[k] = 1; ai[p] = 1; ai[x8] = 1; ai[x64] = 1;
+                ab[x8] = 1; ab[w16] = 1; aw[x40] = 1; ax[x100] = 1; al[x64] = 1;
+                $display("wr %0d %0d %0d %0d %0d %0d %0d, %0d %0d", ai.num(), an.num(), ab.num(), aw.num(),
+                         ax.num(), al.num(), ai[0], ai[9], ab[0]);
+                ai[k] += 5; ai[k]++; an[k] += 5; ai[p] -= 3; --ai[x8]; ai[x64] *= 2; ab[w16] += 1;
+                $display("cp %0d %0d %0d, %0d %0d %0d", ai.num(), an.num(), ab.num(), ai[0], ai[9], ab[0]);
+                $display("ex %0d %0d %0d %0d %0d %0d", ai.exists(k), an.exists(k), ai.exists(p),
+                         ai.exists(x8), ai.exists(x64), ab.exists(w16));
+                ai.delete(k); an.delete(k); ai.delete(p); ai.delete(x8); ai.delete(x64); ab.delete(w16);
+                $display("del %0d %0d %0d, %0d %0d %0d", ai.num(), an.num(), ab.num(), ai[0], ai[9], ab[0]);
+                bump(ai[k]); bump(an[k]); bump(ai[p]); bump(ab[w16]);
+                $display("ref %0d %0d %0d, %0d %0d %0d", ai.num(), an.num(), ab.num(), ai[0], ai[9], ab[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rd 0 0 0 0 0\n"
+                              "rd 0 0 0 0 0\n"
+                              "wr 2 1 1 1 1 1 7, 5 7\n"
+                              "cp 2 1 1, 7 5 7\n"
+                              "ex 0 0 0 0 0 0\n"
+                              "del 2 1 1, 7 5 7\n"
+                              "ref 2 1 1, 7 5 7\n");
+}
+
+// A 4-state index that holds no x or z bit is an index like any other, through the cast to a
+// 2-state or narrower index type: a negative value keeps its sign when the expression is signed
+// and is narrower than the index, an unsigned one does not, a 64-bit one is cut to the width of
+// an `int` and a 16-bit one to that of a `byte`, and a wide one names the entry that a 2-state
+// index of the same value does.
+TEST_CASE("assoc 4-state index without an x or z bit names the entry of its value through the cast") {
+    constexpr std::string_view src = R"(
+        module m;
+            int          ai [int];
+            int          ab [byte];
+            int          ax [bit [99:0]];
+            integer      kv;
+            logic [3:0]  p9;
+            logic signed [7:0] s8;
+            logic [7:0]  u8;
+            logic [63:0] v64;
+            logic [15:0] w200;
+            logic [99:0] v100;
+            initial begin
+                ai[9] = 5; ai[-3] = 11; ai[253] = 12; ab[-56] = 6; ax[100'd5 << 70] = 3;
+                kv = -3; p9 = 4'b1001; s8 = -3; u8 = 8'd253; v64 = 64'd9; w200 = 16'd200; v100 = 100'd5 << 70;
+                $display("%0d %0d %0d %0d %0d %0d %0d", ai[kv], ai[p9], ai[s8], ai[u8], ai[v64], ab[w200], ax[v100]);
+                ai[kv] = 21; ai[u8] += 1; ab[w200]++; ax[v100] = 4;
+                $display("%0d %0d %0d %0d %0d %0d %0d", ai.num(), ab.num(), ax.num(), ai[-3], ai[253], ab[-56],
+                         ax[100'd5 << 70]);
+                $display("%0d %0d %0d", ai.exists(kv), ai.exists(u8), ab.exists(w200));
+                ai.delete(kv); ai.delete(u8); ab.delete(w200);
+                $display("%0d %0d", ai.num(), ab.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "11 5 11 12 5 6 3\n"
+                              "3 1 1 21 13 7 4\n"
+                              "1 1 1\n"
+                              "1 0\n");
+}
+
+// The same rule for a literal with an x or z bit, which slang casts to the index type as it does
+// an expression, and for the places a key reaches that are not a plain element: the entry of an
+// array of queues or of structs, a nested array, an intra-assignment delay, a condition and a
+// concatenation. Each is a read or a write of an invalid index (7.8.6): the default, no entry.
+TEST_CASE("assoc invalid (x/z) index: literals, queue and struct entries and nested arrays") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int x; int y; } xy_t;
+            int    ai [int];
+            int    aq [int][$];
+            xy_t   as [int];
+            int    n2 [int][int];
+            integer k;
+            logic [7:0] k8;
+            initial begin
+                k = 'x; k8 = 8'bx;
+                ai[0] = 7; ai[1] = 8;
+                ai[32'hxxxxxxxx] = 1; ai[32'hzzzzzzzz] = 2; ai['x] = 3; ai[4'b00x1] = 4; ai[4'bz001] = 5;
+                $display("n=%0d a0=%0d a1=%0d", ai.num(), ai[0], ai[1]);
+                $display("rd %0d %0d %0d %0d", ai[32'hxxxxxxxx], ai['x], ai[4'b00x1], ai.exists('x));
+                ai.delete('x);
+                ai.delete(4'b00x1);
+                $display("n=%0d", ai.num());
+                ai[k] = #1 9;
+                $display("ia %0d %0d", ai.num(), ai[0]);
+                aq[0].push_back(3); as[0] = '{1, 2}; n2[0][0] = 4;
+                aq[k].push_back(1); aq[k8].push_back(2);
+                $display("aq %0d %0d %0d", aq.num(), aq[0].size(), aq[k].size());
+                as[k].x = 9; as[k8].y = 8;
+                $display("as %0d %0d %0d %0d", as.num(), as[0].x, as[0].y, as[k].x);
+                n2[k][0] = 1; n2[0][k] = 2; n2[k8][k] = 3;
+                $display("n2 %0d %0d %0d %0d", n2.num(), n2[0].num(), n2[k][0], n2[0][k]);
+                $display("%0d %h", (ai[k] == 0) ? 1 : 2, {ai[k8][3:0], 4'hf});
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=2 a0=7 a1=8\n"
+                              "rd 0 0 0 0\n"
+                              "n=2\n"
+                              "ia 2 7\n"
+                              "aq 1 1 0\n"
+                              "as 1 1 2 0\n"
+                              "n2 1 1 0 0\n"
+                              "1 0f\n");
+}
+
+// The warning 7.8.6 asks for is the one every invalid-index report is: `--sanitize=bounds`
+// (docs/design/assoc-keys.md, P4b). An index the cast to a 2-state type would have hidden
+// reports like a 4-state index of the type's own width does: a read once, a write once and a
+// read-modify-write twice; `exists` and `delete` of such an index say nothing (7.9.2).
+TEST_CASE("assoc invalid (x/z) index into a 2-state index type warns under --sanitize=bounds") {
+    constexpr std::string_view src = R"(
+        module m;
+            int     ai [int];
+            integer k;
+            initial begin
+                ai[0] = 7;
+                k = 'x;
+                $display("rd=%0d", ai[k]);
+                ai[k] = 5;
+                ai[k] += 1;
+                $display("ex=%0d", ai.exists(k));
+                ai.delete(k);
+                $display("num=%0d ai0=%0d", ai.num(), ai[0]);
+            end
+        endmodule
+    )";
+    std::string        err;
+    ir::SimulationConfig config;
+    config.sanitizers = static_cast<uint32_t>(ir::Sanitizer::Bounds);
+    CHECK(run_capture_err(src, config, err) == "rd=0\nex=0\nnum=1 ai0=7\n");
+    CHECK(count_substr(err, "warning: associative array key is invalid (x or z)") == 4);
+    CHECK(count_substr(err, "note: read of ") == 2);
+    CHECK(count_substr(err, "note: write to ") == 2);
 }
 
 // Keys are owned by the map, so a struct-keyed array deep-copies like any other.

@@ -879,7 +879,43 @@ ir::Index Lowerer::lower_assoc_key(const Expression& key, ir::Ref assoc_ty, ir::
              "is not supported");
     }
     if (!is_agg_abi_ref(kr)) {
-        return lower_expr(key, b);
+        // LRM 7.8.4: the index expression is cast to the index type, and a 4-state
+        // expression with an x or z bit is an invalid index (7.8.6). slang does the cast
+        // with implicit conversions around the expression, which to a 2-state or a narrower
+        // type drop such a bit, and the backend can only see the key it is handed. An
+        // expression that could lose one is evaluated once and cast here, and the key is
+        // all-x if it had a bit, so the backend finds it invalid as it does a 4-state
+        // key of the index type.
+        std::vector<const ConversionExpression*> casts;
+        const Expression*                         index = &key;
+        while (index->kind == ExpressionKind::Conversion && index->as<ConversionExpression>().isImplicit()) {
+            casts.push_back(&index->as<ConversionExpression>());
+            index = &casts.back()->operand();
+        }
+        const auto drops_unknown = [](const ConversionExpression* c) {
+            return !c->type->isFourState() || c->type->getBitWidth() < c->operand().type->getBitWidth();
+        };
+        if (!index->type->isIntegral() || !index->type->isFourState() ||
+            std::none_of(casts.begin(), casts.end(), drops_unknown)) {
+            return lower_expr(key, b);
+        }
+        const ir::SourceLoc kl      = loc(key);
+        ir::Index           value   = lower_expr(*index, b);
+        const ir::Index     unknown = b.unary(ir::Inst::Tag::IsUnknown, value, kl);
+        for (auto it = casts.rbegin(); it != casts.rend(); ++it) {
+            const ConversionExpression& c = **it;
+            const bool propagated         = c.conversionKind == ConversionKind::Propagated;
+            value                         = coerce(value,
+                           *c.operand().type,
+                           lower_type(*c.type),
+                           b,
+                           kl,
+                           propagated ? c.type->isSigned() : c.operand().type->isSigned());
+        }
+        const auto    width = static_cast<uint32_t>(key.type->getBitWidth());
+        const ir::Ref four  = make_int_type(width, true);
+        const ir::Index all_x = b.constant(svint_to_ref(slang::SVInt::createFillX(width, false), four), kl);
+        return b.select(unknown, all_x, b.convert(value, four, false, kl), kl);
     }
     const Expression& src = unwrap_conversion(key);
     if (is_struct_lvalue_shape(src)) {
