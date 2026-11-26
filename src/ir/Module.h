@@ -72,6 +72,10 @@ struct SignalInfo {
     // bytes into its state field's static initializer and skips the power-on
     // fill, so materializing a table costs no instructions at any point.
     Ref const_data = Ref::Invalid;
+    // This event is design-wide change notifier number `shared_notify`
+    // (ChangeNotify::shared), or ~0 for any other signal. Carried by the signal so
+    // that it reaches the backend with it, whatever unit the signal lands in.
+    uint32_t shared_notify = ~uint32_t{ 0 };
 
     bool operator==(const SignalInfo&) const = default;
 };
@@ -923,6 +927,14 @@ inline constexpr uint32_t kNoNotify = ~uint32_t{ 0 };
 // rather than stored. It therefore carries a single Any notifier that fires on
 // every MUTATION, which is sound only for the level-sensitive `wait` of LRM
 // 9.4.3 -- see docs/design/classes.md, "Waiting on a container property".
+//
+// A property that a method called from an `@` or `wait` reads has no object for the
+// waiter to name: the method can reach any object. Such a property has a notifier
+// for the whole design instead (`shared`), an event that a change of the property
+// on ANY object fires, which LRM 9.4.2 allows ("An implementation may cause the
+// event expression to be reevaluated when changing the value or size even if the
+// members are not referenced by the method or function"). Its waiters re-evaluate
+// their expression on every wake, so the extra fires cost a re-test each.
 struct ChangeNotify {
     Ref class_ref = Ref::Invalid;
     // Object-body field index of the notified property.
@@ -932,6 +944,14 @@ struct ChangeNotify {
     // The property is a container, so `field[Any]` fires on mutation and the
     // other two are always kNoNotify (`@` over a container is refused).
     bool container = false;
+    // The number of the property's design-wide notifier (SignalInfo::shared_notify),
+    // or kNoNotify.
+    uint32_t shared = kNoNotify;
+
+    // Whether a change of kind `edge` has anything to fire.
+    [[nodiscard]] bool wants(Edge edge) const {
+        return field[static_cast<uint32_t>(edge)] != kNoNotify || (edge == Edge::Any && shared != kNoNotify);
+    }
 };
 
 // A class whose instances are weak references (LRM 8.30): `std::weak_reference
@@ -1205,6 +1225,24 @@ public:
         cn.prop_field                         = prop_field;
         cn.field[static_cast<uint32_t>(edge)] = notify_field;
         cn.container                          = container;
+        change_notifies_.push_back(cn);
+    }
+
+    // Give a class property its design-wide notifier (ChangeNotify::shared).
+    void set_change_notify_shared(Ref class_ref, uint32_t prop_field, uint32_t shared, bool container) {
+        assert(shared != kNoNotify && "a design-wide notifier has a number");
+        for (ChangeNotify& cn : change_notifies_) {
+            if (cn.class_ref == class_ref && cn.prop_field == prop_field) {
+                cn.shared    = shared;
+                cn.container = container;
+                return;
+            }
+        }
+        ChangeNotify cn;
+        cn.class_ref  = class_ref;
+        cn.prop_field = prop_field;
+        cn.shared     = shared;
+        cn.container  = container;
         change_notifies_.push_back(cn);
     }
 

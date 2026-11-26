@@ -207,7 +207,8 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
         if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
             infer = true;
             body  = &timed.stmt;
-        } else if (is_event_control(timed.timing) && !sensitivity_needs_handle(timed.timing)) {
+        } else if (is_event_control(timed.timing) && !sensitivity_needs_handle(timed.timing) &&
+                   !event_control_sampled(timed.timing)) {
             iff_guard    = collect_wait_events(timed.timing, wait_events);
             body         = &timed.stmt;
             proc_timing_ = &timed.timing;
@@ -1450,7 +1451,8 @@ ir::Index Lowerer::foreach_base_lv(const ForeachLoopStatement& f, size_t dim, ir
     ir::Index base = lower_lvalue(f.arrayRef, b);
     for (size_t k = 0; k < dim; ++k) {
         const ir::Ref   cref = foreach_dim_ref(f, k);
-        const ir::Type& cty  = std::get<ir::Type>(module_.pool.get(cref));
+        // Read now: lowering the loop variable below can grow the pool.
+        const bool      is_assoc = std::get<ir::Type>(module_.pool.get(cref)).kind == ir::Type::Kind::Assoc;
         const ForeachLoopStatement::LoopDim& d = f.loopDims[k];
         if (d.loopVar == nullptr) {
             // `foreach (a[, i])` where dimension k is runtime-sized: there is no
@@ -1462,8 +1464,7 @@ ir::Index Lowerer::foreach_base_lv(const ForeachLoopStatement& f, size_t dim, ir
                  "skipped is not supported");
         }
         const ir::Index iter = b.unary(ir::Inst::Tag::Load, value_lvalue(*d.loopVar, b, l), l);
-        base = cty.kind == ir::Type::Kind::Assoc ? b.assoc_select(base, iter, cref, l)
-                                                 : b.elem_select(base, iter, cref, l);
+        base = is_assoc ? b.assoc_select(base, iter, cref, l) : b.elem_select(base, iter, cref, l);
     }
     return base;
 }

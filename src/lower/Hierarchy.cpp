@@ -783,6 +783,8 @@ void Lowerer::lower_globals(const Compilation& comp, const RootSymbol& root) {
     for (const CompilationUnitSymbol* unit : root.compilationUnits) {
         own_static(*unit, "$unit");
     }
+    // Before anything that lays out a class: a class's change notifiers name these.
+    declare_shared_notifiers(root);
     for (const PackageSymbol* pkg : comp.getPackages()) {
         register_global_scope_signals(*pkg);
     }

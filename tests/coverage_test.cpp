@@ -683,11 +683,9 @@ TEST_CASE("a custom sample method is refused by name (LRM 19.8.1)") {
 
 // A coverpoint of a real expression (LRM 19.5, 2023) needs a second bin algebra
 // over floats: real bins partition a range into type_option.real_interval-wide
-// intervals with their own inclusive/exclusive naming. clotho's own guard is in
-// cover_space_of, but slang refuses first at the language version clotho compiles
-// at -- 19.5's floating-point coverpoints are an IEEE 1800-2023 addition, and
-// DeclaredType gates them on that. Either way the construct is refused loudly and
-// never silently sampled, which is what this pins.
+// intervals with their own inclusive/exclusive naming. Refused by clotho's own
+// guard in cover_space_of; before IEEE 1800-2023, where the construct does not
+// exist, slang refuses it first.
 TEST_CASE("a real coverpoint is refused (LRM 19.5)") {
     const std::string d = lower_error(R"(
         module m;
@@ -699,7 +697,7 @@ TEST_CASE("a real coverpoint is refused (LRM 19.5)") {
           initial begin c.sample(); $finish; end
         endmodule
     )");
-    CHECK(d.find("coverage expression") != std::string::npos);
+    CHECK(d.find("a coverpoint of a real expression is not supported") != std::string::npos);
 }
 
 TEST_CASE("a coverpoint iff guard is refused by name (LRM 19.5)") {

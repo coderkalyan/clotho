@@ -1269,7 +1269,7 @@ void* alloc_pool_chunk(size_t bytes) {
 // not follow the link and `->> e` needs no write barrier.
 
 constexpr uint64_t kEventBytes = (sizeof(rt_event) + RT_GC_ALIGN - 1) / RT_GC_ALIGN * RT_GC_ALIGN;
-constexpr rt_gc_map kEventMap   = { kEventBytes, 0, 0, nullptr, nullptr, nullptr, 0, 0 };
+constexpr rt_gc_map kEventMap   = { kEventBytes, 0, 0, nullptr, nullptr, nullptr, 0, 0, nullptr };
 
 // The descriptor: the map pointer, then the bytes that separate it from the word
 // an object's vptr names (rt_gc_map_vptr_offset). Filled by rt_run_init.

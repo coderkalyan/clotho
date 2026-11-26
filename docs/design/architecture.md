@@ -157,6 +157,12 @@ them in step.
   clears the referent of each weak reference it reached whose referent is
   unmarked. Collection timing is then visible to a design, so a collection
   happens at a point that is a function of the run, never of thread timing.
+- Weak references are cleared only by a collection at the scheduler's safepoint. A
+  collection run from inside an allocation keeps every referent, so a design sees
+  a weak reference change only between time steps, and a wait on `get()` is woken
+  at the safepoint, before the next time step runs.
+- The scheduler edge that finds the wheel idle ends the run and is not a
+  safepoint.
 - An object's identity number (`weak_reference::get_id`, the order of an
   associative array keyed by a class handle) is assigned on first request and
   kept in a table beside the heap, so objects that never ask pay nothing; the

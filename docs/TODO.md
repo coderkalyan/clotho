@@ -123,31 +123,30 @@ Milestones, in order; lower ones unblock higher ones:
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
-- [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate and
-  container-valued waits are refused.
-  - [ ] **`@` over a container property expression** (9.4.2) — needs the value
-    snapshotted in the waiter and compared on each wake.
+- [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate
+  waits are refused.
   - [ ] **`wait` on an unpacked struct, union or fixed unpacked-array property**
     (9.4.3) — needs a whole-aggregate change compare.
   - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
     needs DPI.
-  - [ ] **`wait` on a method call that reads properties** (9.4.2) — what the method
-    reads is not waited on, so the condition is not tested again when it changes.
-  - [ ] **`@` over a method call or a compound expression of properties** (9.4.2) —
-    `@(c.get())`, `@(c.v == 3)` and `@(w.get() == null)` are not woken by a change
-    of the property, and are a fatal when the handle is null as the process starts.
+- [~] **Event control and `wait` over a method call or an expression of properties**
+  (9.4.2) — the forms below are accepted and are not woken by the change.
+  - [ ] **Event list mixing such an expression with another event** — `@(c.get() or
+    posedge clk)` needs identification of the waking source.
+  - [ ] **Such an expression as the control of `<= @(...)` or `->> @(...)`, or as a
+    clocking event** — a record or a clock is not a process that can sample it.
+  - [ ] **Method that reads an unpacked struct, union, fixed unpacked-array or `event`
+    property, or a string variable** — those have no change notifier.
+  - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
+    change notifier.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
 - [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
   refused.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
   `wait(vif.q.size())` is not exercised end to end.
-- [~] **Event control and `wait` on a fork-captured automatic** (9.4.2, 9.4.3, 9.3.2) — only
-  scalar-valued `wait` is supported.
-  - [ ] **`@` on a fork-captured automatic** (9.4.2) — needs a value-change
-    classification the capture box does not provide.
-  - [ ] **`wait` on a fork-captured unpacked struct, union, fixed unpacked array or `event`**
-    (9.4.3) — the capture box has no change notifier for these types.
+- [ ] **`@` or `wait` on a fork-captured unpacked struct, union, fixed unpacked array or
+  `event`** (9.4.2, 9.4.3, 9.3.2) — the capture box has no change notifier for these types.
 - [~] **Event-controlled nonblocking trigger** (15.5.1) — `->> @(...) e` forms still refused.
   - [ ] **Non-constant `repeat` count** — `->> repeat(n) @(x) e` with a runtime `n`.
   - [ ] **`iff` on the controlling event** (9.4.2.3) — `->> @(posedge c iff en) e`.
@@ -577,7 +576,6 @@ Milestones, in order; lower ones unblock higher ones:
   action block runs on the monitor's thread, not one of its own.
 - [ ] **Typeless mailbox** (15.4.9) — `dynamic_type` needs a dynamically typed element and a
   run-time type identity for the `get` check and `try_get`'s negative return.
-- [ ] **Class derived from `semaphore` or `mailbox`** — extending a built-in class.
 - [~] **Clocking blocks** (14) — open pieces of clocking-block support.
   - [ ] **Input skew other than `#1step`/`#0`, output skew other than `#0`** — needs a
     per-clockvar history keyed by time; an edge skew needs a second event per block.

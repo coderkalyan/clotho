@@ -154,16 +154,20 @@ void rt_gc_remember(void* obj);
 // weak reference change only between time steps. `weak_notify` is nonzero when
 // some `wait` or `@` in the design reads `get()`: the offset of the handle of the
 // event the clearing pass pends, which the scheduler fires when the collection
-// returns to it, so that such a wait sees the change.
+// returns to it, so that such a wait sees the change. `weak_shared` is non-null
+// when a method that some `wait` or `@` calls reads `get()`: where the handle of the
+// design-wide notifier of this class's referents is kept, an event the clearing
+// pass pends as well (ir::ChangeNotify::shared).
 typedef struct rt_gc_map {
-    uint64_t                    size;
-    uint32_t                    nhandles;
-    uint32_t                    nleaves;
-    const uint32_t*             handles;
-    const struct rt_elem_leaf*  leaves;
-    void                      (*finalize)(void* body);
-    uint32_t weak_referent;
-    uint32_t weak_notify;
+    uint64_t                   size;
+    uint32_t                   nhandles;
+    uint32_t                   nleaves;
+    const uint32_t*            handles;
+    const struct rt_elem_leaf* leaves;
+    void (*finalize)(void* body);
+    uint32_t        weak_referent;
+    uint32_t        weak_notify;
+    const uint64_t* weak_shared;
 } rt_gc_map;
 
 // -- Precise global roots -----------------------------------------------------

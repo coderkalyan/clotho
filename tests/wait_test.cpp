@@ -617,23 +617,24 @@ TEST_CASE("wait on the size of a nested queue wakes on an inner push") {
 
 // LRM 9.4.2: a non-edge implicit event fires on any CHANGE IN THE VALUE of the
 // expression. A mutation notifier is a different predicate -- a push followed by
-// a pop is two mutations and no change -- so handing `@` the container notifier
-// would be an observable WRONG wake, not the harmless extra one `wait` absorbs.
-// Refused rather than silently downgraded.
-TEST_CASE("an event control on a container class property fails loudly") {
-    const std::string err = lower_error(R"(
+// a pop is two mutations and no change -- so the waiter samples the expression,
+// parks on the notifier, and compares on each wake (lower_sampled_event_wait).
+TEST_CASE("an event control on a container class property detects a change of the expression") {
+    constexpr std::string_view src = R"(
         module m;
             class C; int q[$]; endclass
             C c;
             initial begin
                 c = new;
-                fork begin @(c.q.size()); $display("x"); end join_none
+                fork begin @(c.q.size()); $display("size %0t", $time); end join_none
                 #1 c.q.push_back(1);
+                void'(c.q.pop_back());
+                #1 c.q.push_back(2);
                 #1 $finish;
             end
         endmodule
-    )");
-    CHECK(err.find("event control on a container class property") != std::string::npos);
+    )";
+    CHECK(run_capture_finish(src) == "size 2\n");
 }
 
 // A FIXED unpacked array is not in the notified set: its extent never changes, so

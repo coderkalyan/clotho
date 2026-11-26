@@ -1065,12 +1065,15 @@ endmodule
 
 // kernel.md: indices reach the backend as 64-bit offsets, extended by their own
 // signedness, and a wider one is checked and treated as out of range. A 64-bit
-// signed index of -1, INT64_MIN or 2**32 + 1, an unsigned one of 2**63 + 3 or 2**64 - 3
-// (not a negative number), and 65- and 128-bit indices of either signedness whose
-// value is small, huge or negative, into narrow and wide, 2- and 4-state vectors, for
-// reads, blocking and nonblocking writes and indexed part-selects. The expected
-// lines are LRM 11.5.1 worked from the index VALUE: none of these is in range but the
-// small ones (iverilog 13 truncates a wide index and disagrees on them).
+// signed index of -1, INT64_MIN, 2**32 + 1 or -(2**32) - 2, an unsigned one of
+// 2**63 + 3 or 2**64 - 3 (not a negative number), and 65- and 128-bit indices of
+// either signedness whose value is small, huge or negative, into narrow and wide, 2-
+// and 4-state vectors, for reads, blocking and nonblocking writes and indexed
+// part-selects. The expected lines are LRM 11.5.1 worked from the index VALUE: none
+// of these is in range but the small ones (iverilog 13 truncates a wide index and
+// disagrees on them). The unsized literals 4294967296 and its negation keep their
+// value (LRM 5.7.1: an unsized number that needs more than 32 bits has the width
+// to represent it), which before IEEE 1800-2023 slang truncated to 0.
 TEST_CASE("a packed select index of 64 bits or more is compared by its value, not its low bits") {
     CHECK(run_capture(R"(
 module t;
@@ -1130,14 +1133,14 @@ endmodule
            "U4 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
            "W4 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
-           "L5 0 0 1 1 0010 1111111111111111111111111111111111111111111111111111111111111111111111\n"
+           "L5 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
            "U5 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
-           "W5 a5a5a5a5 a5a5a5a5 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd "
-           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffff800000000000000001\n"
-           "L6 x 0 x 0 01xx 11111111111111111111111111111111111111111111111111111111111111111111xx\n"
+           "W5 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
+           "L6 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
            "U6 x 0 x 0 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
            "W6 a5a5a5a5 a5a5a5a5 fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "
-           "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000000000000\n"
+           "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
            "L7 x 0 1 1 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n"
            "U7 x 0 1 1 xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n"
            "W7 a5a5a5a5 a5a5a5a5 7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "

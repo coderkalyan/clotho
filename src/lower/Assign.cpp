@@ -188,7 +188,9 @@ void Lowerer::emit_field_defaults(ir::Index lv, const slang::ast::Type& sv_type,
         return;
     }
     const auto&     arr = ct.as<slang::ast::FixedSizeUnpackedArrayType>();
-    const ir::Type& t   = std::get<ir::Type>(module_.pool.get(ty));
+    // A copy: the loop interns constants and lowers each element, and either can
+    // grow the pool and move what a reference into it would point at.
+    const ir::Type  t   = std::get<ir::Type>(module_.pool.get(ty));
     const uint32_t  n   = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
     for (uint32_t k = 0; k < n; ++k) {
         const int32_t coord =
