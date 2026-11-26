@@ -6421,9 +6421,12 @@ private:
     // initializers with its children's. Whatever Collect / Classify and the code after
     // the walk append goes to the top's own processes. Lazily engaged.
     std::optional<ir::Builder> preinit_;
-    // Live signal -> its Preponed shadow. LRM 16.5: assertion expressions read
-    // sampled values, and what is sampled is the VARIABLE, not the expression.
-    ankerl::unordered_dense::map<uint32_t, ir::Signal> sva_shadows_;
+    // (Sampling scope id << 32 | live signal) -> its Preponed shadow. LRM 16.5:
+    // assertion expressions read sampled values, and what is sampled is the
+    // VARIABLE, not the expression.
+    ankerl::unordered_dense::map<uint64_t, ir::Signal> sva_shadows_;
+    // Per scope id, the shadows of other instances' signals it holds so far.
+    ankerl::unordered_dense::map<uint32_t, uint32_t> sva_foreign_shadows_;
     // In creation order, so the sampling process copies them deterministically.
     std::vector<std::pair<ir::Signal, ir::Signal>> sva_shadow_pairs_;
     // Each clocking block (LRM 14) of the design, by its symbol. Filled in

@@ -2033,36 +2033,36 @@ ir::Signal Lowerer::sva_shadow_of(ir::Signal live) {
     return sampled_shadow_of(live, "a concurrent assertion");
 }
 
-// The Preponed shadow of `live`, allocated once per live signal and shared by
-// every reader. `what` names the construct doing the sampling, for the
-// packed-value refusal below: an assertion (LRM 16.5) and a clocking block
-// input whose skew is `#1step` (LRM 14.4) want the identical value and so
-// share one copy.
+// The Preponed shadow of `live` for the sampling instance, allocated once per
+// (instance, live signal) and shared by every reader there. `what` names the
+// construct doing the sampling, for the packed-value refusal below: an
+// assertion (LRM 16.5) and a clocking block input whose skew is `#1step` (LRM
+// 14.4) want the identical value and so share one copy.
 ir::Signal Lowerer::sampled_shadow_of(ir::Signal live, std::string_view what) {
-    const auto key = static_cast<uint32_t>(live);
-    if (const auto it = sva_shadows_.find(key); it != sva_shadows_.end()) {
-        return it->second;
-    }
-
-    // A shadow is per-instance state, so it belongs to the scope that
-    // declares `live` -- which need not be the scope lowering the
-    // assertion. A hierarchical reference through a directly-instantiated
-    // interface (or any deeper instance path) samples a variable one or
-    // more hops away, and a package / $unit variable belongs to no
-    // instance at all. signal_scope_ (register_signal's own inverse) names
-    // `live`'s declaring scope id regardless of which scope is currently
-    // open; find_scope_node walks the scope tree to the node itself,
-    // which by now is frozen (alloc_assert_control's comment). A miss in
-    // signal_scope_ means `live` was never registered by THIS top's
-    // Lowerer -- a package / $unit-scope variable, always registered by
-    // the standalone globals Lowerer, whose scope_stack_ is always empty.
-    ir::InstanceScope* declaring_scope = nullptr;
-    if (const auto sit = signal_scope_.find(key); sit != signal_scope_.end()) {
-        declaring_scope = find_scope_node(top_scope_, sit->second);
-        if (declaring_scope == nullptr) {
+    // A shadow is per-instance state of the instance that samples: its unit
+    // holds the sampling copy, whatever instance owns `live` -- the same
+    // instance (the common case), a parent whose signal a port is bound to
+    // (bind_value_port), or one a hierarchical reference names. Keeping it there
+    // keeps one unit's assertions out of every other unit's state. State of no
+    // instance (a package / $unit variable, which signal_scope_ does not name)
+    // gets one unscoped shadow, a root-level field beside the live signal.
+    const auto         sit       = signal_scope_.find(static_cast<uint32_t>(live));
+    ir::InstanceScope* own_scope = nullptr;
+    if (sit != signal_scope_.end()) {
+        if (!scope_stack_.empty()) {
+            own_scope = scope_stack_.back();
+        } else {
+            own_scope = find_scope_node(top_scope_, sit->second);
+        }
+        if (own_scope == nullptr) {
             fail("internal: a sampled variable's declaring scope is missing "
                  "from the scope tree");
         }
+    }
+    const uint64_t key = (uint64_t{ own_scope != nullptr ? own_scope->id : ir::Process::no_scope } << 32) |
+                         static_cast<uint32_t>(live);
+    if (const auto it = sva_shadows_.find(key); it != sva_shadows_.end()) {
+        return it->second;
     }
 
     const ir::SignalInfo& live_info = module_.signal(live);
@@ -2078,34 +2078,28 @@ ir::Signal Lowerer::sampled_shadow_of(ir::Signal live, std::string_view what) {
     }
 
     ir::SignalInfo info;
-    // Named under the declaring instance, like every signal it holds: the
-    // instance prefix, then the live signal's name within the instance.
-    const std::string&     prefix = declaring_scope != nullptr ? scope_prefix_.at(declaring_scope->id) : std::string();
-    const std::string_view local  = std::string_view(live_info.name).starts_with(prefix)
-                                      ? std::string_view(live_info.name).substr(prefix.size())
-                                      : std::string_view(live_info.name);
-    info.name                     = prefix + "sva.shadow." + std::string(local);
+    // Named under the sampling instance, like every signal it holds: the
+    // instance prefix, then the live signal's name within the instance, or for a
+    // signal of another instance an ordinal, which every instance of the unit
+    // numbers alike where the other instance's name differs per instance.
+    const std::string& prefix = own_scope != nullptr ? scope_prefix_.at(own_scope->id) : std::string();
+    if (own_scope == nullptr || sit->second == own_scope->id) {
+        const std::string_view local = std::string_view(live_info.name).starts_with(prefix)
+                                         ? std::string_view(live_info.name).substr(prefix.size())
+                                         : std::string_view(live_info.name);
+        info.name                    = prefix + "sva.shadow." + std::string(local);
+    } else {
+        info.name = prefix + "sva.shadow.$" + std::to_string(sva_foreign_shadows_[own_scope->id]++);
+    }
     info.loc  = live_info.loc;
     info.type = live_info.type;
     // Left a variable (is_net stays false): nothing drives a shadow but the
     // sampling process, so it must neither take a net's undriven-z power-up nor
     // join net resolution.
 
-    // Registered in `live`'s OWN declaring scope, not scope_stack_.back()
-    // (the asserting scope): the two coincide for the common same-scope
-    // case, but a hierarchical or package live signal needs its shadow
-    // where the backend already knows how to address it relative to
-    // `live` itself -- the same per-instance state addressing an ordinary
-    // hierarchical read of `live` already uses (Anchor,
-    // src/ir/llvm/Backend.h), unlocked here simply by asking
-    // register_signal to attach the shadow to the right scope rather than
-    // whichever one happens to be open. A null declaring_scope (package /
-    // $unit) leaves the shadow unscoped too, so it becomes a flat
-    // root-level field beside the live signal it shadows (build_state_types)
-    // instead of being pulled into whichever instance is asserting.
     ir::Signal shadow;
-    if (declaring_scope != nullptr) {
-        scope_stack_.push_back(declaring_scope);
+    if (own_scope != nullptr) {
+        scope_stack_.push_back(own_scope);
         shadow = register_signal(std::move(info));
         scope_stack_.pop_back();
     } else {
@@ -2113,7 +2107,6 @@ ir::Signal Lowerer::sampled_shadow_of(ir::Signal live, std::string_view what) {
     }
     sva_shadows_.emplace(key, shadow);
     sva_shadow_pairs_.emplace_back(live, shadow);
-
     return shadow;
 }
 
