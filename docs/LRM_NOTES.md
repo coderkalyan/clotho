@@ -1006,3 +1006,14 @@ keeps note 55 (a start outside reads nothing and warns). Reading before this: th
 on from the clipped address and loaded the words that fell inside.
 
 Code: `src/runtime/Io.cpp` (`rt_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem with a start or finish outside a whole memory loads nothing").
+
+## 67. `next` and `prev` with an x or z index argument (7.9.6, 7.9.7, 7.8.4, 7.8.6)
+
+7.9.6 / 7.9.7 define `next` / `prev` by "the given index argument" and are silent on one with an
+x or z bit; 7.8.4 makes a 4-state index with x or z invalid. Decided reading (with the user): it
+is an invalid index (7.8.6): the call returns 0, leaves the argument unchanged and issues the
+warning other invalid associative indices get (under `--sanitize=bounds`). It used to be read
+as 0 (`next` found the entry after 0). `first` and `last` do not read their argument and are
+unchanged.
+
+Code: `src/ir/llvm/AssocArrays.cpp` (`lower_assoc_traverse`). Tests: `tests/associative_array_test.cpp` ("assoc next/prev with an x or z index argument finds nothing and warns").

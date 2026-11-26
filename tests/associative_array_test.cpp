@@ -2252,3 +2252,35 @@ TEST_CASE("assoc %p rendering (P4d)") {
         CHECK(r.diagnostic_text().find("container or aggregate element") != std::string::npos);
     }
 }
+
+// 7.9.6 / 7.9.7 define `next` / `prev` for an index argument and say nothing of one with an x or z
+// bit; Clotho reads it as an invalid index (7.8.4, 7.8.6): the call finds no entry, returns 0, leaves the
+// argument alone and warns under --sanitize=bounds as any invalid index does (docs/LRM_NOTES.md note 67).
+// `first` and `last` do not read their argument. It used to be taken as 0 (next(x) found the entry
+// after 0). iverilog 13 cannot parse an associative array: derived from the clauses.
+TEST_CASE("assoc next/prev with an x or z index argument finds nothing and warns") {
+    constexpr std::string_view src = R"(
+        module m;
+            int     an [integer];
+            integer ix;
+            int     rc;
+            initial begin
+                an[-5] = 1; an[0] = 2; an[4] = 3;
+                ix = 'x; rc = an.next(ix); $display("next rc=%0d x=%b", rc, ix === 'x);
+                ix = 'z; rc = an.prev(ix); $display("prev rc=%0d z=%b", rc, ix === 'z);
+                ix = 0;  rc = an.next(ix); $display("ok rc=%0d ix=%0d", rc, ix);
+                ix = 'x; rc = an.first(ix); $display("first rc=%0d ix=%0d", rc, ix);
+                ix = 'x; rc = an.last(ix);  $display("last rc=%0d ix=%0d", rc, ix);
+            end
+        endmodule
+    )";
+    std::string          err;
+    ir::SimulationConfig config;
+    config.sanitizers = static_cast<uint32_t>(ir::Sanitizer::Bounds);
+    CHECK(run_capture_err(src, config, err) == "next rc=0 x=1\n"
+                                               "prev rc=0 z=1\n"
+                                               "ok rc=1 ix=4\n"
+                                               "first rc=1 ix=-5\n"
+                                               "last rc=1 ix=4\n");
+    CHECK(count_substr(err, "warning: associative array key is invalid (x or z)") == 2);
+}
