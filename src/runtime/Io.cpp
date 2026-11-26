@@ -1249,7 +1249,7 @@ public:
         const uint64_t n = static_cast<uint64_t>(hi()) - static_cast<uint64_t>(lo()) + 1;
         return n == 0 || n > static_cast<uint64_t>(INT64_MAX) ? INT64_MAX : static_cast<int64_t>(n);
     }
-    // The LRM names no default start for an array with no lowest address (note 63 of
+    // The LRM names no default start for an array with no lowest address (note 70 of
     // docs/LRM_NOTES.md): a load that names none counts up from 0.
     int64_t first() const {
         return 0;
@@ -1678,7 +1678,7 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
 
     // LRM 21.4: with slice syntax, start and finish "shall fall within the bounds of the
     // slice's range". An address outside it names nothing to load, so nothing is loaded. A whole
-    // memory takes the same rule by analogy (docs/LRM_NOTES.md note 66; iverilog 13 agrees).
+    // memory takes the same rule by analogy (docs/LRM_NOTES.md note 73; iverilog 13 agrees).
     {
         const int64_t slice_lo = std::min(decl_left, decl_right);
         const int64_t slice_hi = std::max(decl_left, decl_right);
@@ -1775,7 +1775,7 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
 // `key_width` is the index's width. `flags` bit0=hex, bit1=has_start, bit2=has_finish,
 // bit3=four_state, bit4=path_forward, bit5=narrow, bit7=signed index, bit8=names no array (a
 // target that is invalid at run time: nothing is loaded, as for a word count of 0 in rt_readmem).
-// A load that names no start begins at address 0 (docs/LRM_NOTES.md 63); the other rules
+// A load that names no start begins at address 0 (docs/LRM_NOTES.md 70); the other rules
 // of rt_readmem hold, the addresses being those of the index type. `alloc` locates the
 // allocation of an element and `site` the load's reports. Returns the number of leaves the load
 // changed, an element it created counting as one.

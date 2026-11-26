@@ -2255,7 +2255,7 @@ TEST_CASE("assoc %p rendering (P4d)") {
 
 // 7.9.6 / 7.9.7 define `next` / `prev` for an index argument and say nothing of one with an x or z
 // bit; Clotho reads it as an invalid index (7.8.4, 7.8.6): the call finds no entry, returns 0, leaves the
-// argument alone and warns under --sanitize=bounds as any invalid index does (docs/LRM_NOTES.md note 67).
+// argument alone and warns under --sanitize=bounds as any invalid index does (docs/LRM_NOTES.md note 74).
 // `first` and `last` do not read their argument. It used to be taken as 0 (next(x) found the entry
 // after 0). iverilog 13 cannot parse an associative array: derived from the clauses.
 TEST_CASE("assoc next/prev with an x or z index argument finds nothing and warns") {

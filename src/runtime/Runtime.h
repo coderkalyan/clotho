@@ -1657,7 +1657,7 @@ void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops,
 void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops);
 
 // $readmemh / $readmemb and $fread into an associative array of integral index (LRM 21.4.1,
-// docs/LRM_NOTES.md 63): the elements the file's addresses name are created, and a number is
+// docs/LRM_NOTES.md 70): the elements the file's addresses name are created, and a number is
 // loaded into the leaf of the element at its address, row-major (LRM 21.4.3). `handle` / `ops`
 // are the array and its descriptor, `key_width` the index's width; `stride`, `width`,
 // `inner` / `inner_dims` describe one element as rt_readmem describes a memory's leaves, the

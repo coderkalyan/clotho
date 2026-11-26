@@ -1041,7 +1041,7 @@ void Backend::lower_assoc_traverse(Index i, Inst::Tag tag) {
                                { handle, outptr, outlen });
     } else {
         // next / prev take the current key as a PROBE (LRM 7.9.6 / 7.9.7), which an x or z bit
-        // makes an invalid index (7.8.4, 7.8.6; docs/LRM_NOTES.md note 67): the call finds no
+        // makes an invalid index (7.8.4, 7.8.6; docs/LRM_NOTES.md note 74): the call finds no
         // entry, returns 0, leaves the argument alone and warns as any invalid index does.
         const auto cur = normalize_assoc_key_lvalue(key_lv, aa.assoc_type);
         status =

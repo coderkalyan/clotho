@@ -751,7 +751,7 @@ delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
 
-## 57. Numeric conversion into a `string` destination (21.3.4.3, 21.6, 6.16, 5.7.1)
+## 64. Numeric conversion into a `string` destination (21.3.4.3, 21.6, 6.16, 5.7.1)
 
 `$fscanf`, `$sscanf` and `$value$plusargs` store a `%d`, `%h`, `%o`, `%b` or `%c`
 value into a `string` as an integral-to-string assignment (6.16): the value is cast
@@ -762,7 +762,7 @@ digits need it, with x and z digits read as 0. So `"-5"` under `%d` is the four
 characters FF FF FF FB, the same string as `string'(-5)`, and 16706 is "AB". iverilog
 13 asserts on this case.
 
-## 58. A real under `%c`, `%u` and `%z` (21.2.1.1)
+## 65. A real under `%c`, `%u` and `%z` (21.2.1.1)
 
 21.2.1.1 lets the integer specifiers take integral data, and `%u` / `%z` transfer the
 2-value / 4-value "binary representation of the specified data". For a real argument
@@ -771,7 +771,7 @@ bits are the character, as iverilog does, and `%u` / `%z` of its IEEE 754 bit pa
 64 bits for a real and 32 for a shortreal, with no unknown bits. slang rejects `%u` and
 `%z` of a real in a literal format, so only a runtime format reaches it.
 
-## 59. Addresses of a multidimensional memory in `$readmem*` and `$fread` (21.4, 21.4.3, 21.3.4.4)
+## 66. Addresses of a multidimensional memory in `$readmem*` and `$fread` (21.4, 21.4.3, 21.3.4.4)
 
 21.4.3 fills a multidimensional unpacked array "in row-major order, with each dimension's
 entries ranging from low to high address", whichever way its ranges are declared. 21.4 says
@@ -796,7 +796,7 @@ of truth here, so the tests that name an address are derived from it.
 
 Code: `src/runtime/Io.cpp` (`RowOrder`, `rt_readmem`, `rt_fread`), `src/ir/llvm/SystemTasks.cpp` (`mem_inner_dims`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh fills a whole multi-dimensional memory row-major", "$readmem fills a multi-dimensional 4-state, 2-state and wide memory", "$fread fills a whole multi-dimensional memory row-major", "a data file address names a word of the highest dimension", "$readmem start and finish name words of the highest dimension", "$fread start and count are words of the highest dimension"). Oracle: iverilog 13 where it agrees.
 
-## 60. Slices, elements and invalid targets of `$readmem*` and `$fread` (21.4, 7.4.5, 11.5.1)
+## 67. Slices, elements and invalid targets of `$readmem*` and `$fread` (21.4, 7.4.5, 11.5.1)
 
 21.4 lets `memory_name` be "an unpacked array or a partially indexed multidimensional
 unpacked array that resolves to a lesser dimensioned unpacked array", with "Higher order
@@ -806,7 +806,7 @@ syntax is used ... any start_addr and finish_addr arguments shall fall within th
 of the slice's range". Clotho takes the array the argument names as the memory to load,
 with its own bounds as addresses: `a[2:5]` has addresses 2 to 5, `m[1]` those of its
 dimension, and the default start is the lowest of them, whichever way they are declared
-(note 59 gives the rows of an array of several dimensions). An indexed slice
+(note 66 gives the rows of an array of several dimensions). An indexed slice
 `a[i +: n]` / `a[i -: n]` is the slice `a[i:i+n-1]` / `a[i-n+1:i]` (11.5.1) and has the
 same addresses, the indices it selects: `a[2 +: 4]` and `a[2:5]` are addressed 2 to 5, whatever
 range slang types the slice with. Decided reading (with the user).
@@ -828,7 +828,7 @@ from the clauses above.
 
 Code: `src/lower/SystemTasks.cpp` (`lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`), `src/runtime/Io.cpp` (`rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a constant slice of a memory", "$readmemh into an element or a slice of an element of a multi-dimensional memory", "$readmemh into a slice at a variable position", "$readmemh through an invalid index loads nothing", "$fread into a slice or an element of a memory"), `tests/runtime_test.cpp` ("rt_readmem loads the words that exist and drops the others").
 
-## 61. Dynamic arrays and queues as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 20.7)
+## 68. Dynamic arrays and queues as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 20.7)
 
 21.4.1 says "When loading dynamic arrays and queues, the current size of the array is
 fixed; the array shall not be resized", and nothing of their addresses. 20.7 gives them a
@@ -838,8 +838,8 @@ default start is 0, and `start`, `finish`, `@` addresses and `$fread`'s `start` 
 `count` are indices into it; a number addressed past the last element is dropped with the
 warning a memory's last address gives, and no element is created. 21.3.4.4 names neither
 container, and `$fread` takes the same reading. A dynamic array of fixed arrays is a
-memory of several dimensions whose highest is the array (note 59), and a slice `d[a:b]`
-or `d[i +: n]` of a dynamic array has the addresses and placement note 60 gives a slice of
+memory of several dimensions whose highest is the array (note 66), and a slice `d[a:b]`
+or `d[i +: n]` of a dynamic array has the addresses and placement note 67 gives a slice of
 a fixed array.
 
 A slice of a queue, `q[a:b]`, `q[i +: n]` or `q[i -: n]`, is the elements 7.10.1 gives it:
@@ -851,13 +851,13 @@ fills those of a slice of a fixed array, never resizing `q` (21.4.1). Decided re
 the user): the addresses are the indices of `q`, so `q[2:$]` of six elements has the
 addresses 2 to 5 and its default start is 2, and `start`, `finish` and the `@` addresses of
 the file name indices of `q` that lie in what is left of the slice once the queue has
-clipped it (`q[3:9]` of six is [3:5], note 62). Every slice has one rule (note 60): an
+clipped it (`q[3:9]` of six is [3:5], note 69). Every slice has one rule (note 67): an
 indexed slice of a fixed or dynamic array and of a queue is addressed by the indices it
 selects, as `[a:b]` is. A slice that selects no
 element names no word, as an empty queue does below: nothing is opened or read.
 
 A dynamic array or queue with no element has `$right` -1, which is no address at all: the
-load names no word, as a slice wholly outside its array does (note 60), so no file is
+load names no word, as a slice wholly outside its array does (note 67), so no file is
 opened or read, and `$fread` returns 0 with the file where it was.
 
 A load that changes an element wakes whoever waits on the array or queue, as a store to
@@ -869,7 +869,7 @@ with the same file and arguments, and derive the rest from the clauses above.
 
 Code: `src/lower/SystemTasks.cpp` (`is_mem_target_shape`, `lower_mem_target`, `lower_queue_slice_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `finish_mem_load`), `src/runtime/Io.cpp` (`MemDest`, `rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1", "$fread into a dynamic array or a queue fills the words it holds", "$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements", "$readmemh into a slice of a dynamic array places its words like a fixed memory", "$readmemh into a slice of a queue loads the elements it selects, by queue index", "$readmemh into a slice of a queue that selects no element does nothing", "$readmemh into a slice of a queue takes start, finish and file addresses inside the slice", "$fread into a slice of a queue fills the elements it selects", "$readmem into a slice of a queue of 4-state, 2-state, wide and array elements", "a load into a slice of a queue wakes the waiters of its elements", "$readmem and $fread into a slice of a queue held by a struct, a class, a ref argument or another container", "$readmemh into a dynamic array of fixed arrays, an element or a slice of one", "a load into an empty dynamic array or queue does nothing", "a load into a dynamic array or a queue wakes the waiters of its elements", "a load into a dynamic array local to a task"), `tests/runtime_test.cpp` ("rt_readmem walks the words of a queue's ring from its head slot").
 
-## 62. File addresses and word counts against the range a `$readmem*` names (21.4)
+## 69. File addresses and word counts against the range a `$readmem*` names (21.4)
 
 21.4: "When addressing information is specified both in the system task and in the data file, the
 addresses in the data file shall be within the address range specified by the system task
@@ -898,7 +898,7 @@ more at the first extra word, which is ignored with the rest of the file. The se
 is also issued when the file has addresses, where the clause asks for nothing and the extra
 words have nowhere to go. A file with an `@` address, or a load that an error
 ended, is not short of words. For a memory of several dimensions a word of the file is a
-number, so the range holds one for each leaf of each of its rows (note 59); iverilog counts
+number, so the range holds one for each leaf of each of its rows (note 66); iverilog counts
 the flat leaves and warns differently there.
 
 iverilog 13 has no slice, so the slice tests take the whole-memory load with the same
@@ -906,7 +906,7 @@ addresses as oracle for the words placed, and derive the errors from the clause.
 
 Code: `src/runtime/Io.cpp` (`rt_readmem`), `src/runtime/Reports.cpp` (`mem_load_report`), `src/ir/llvm/SystemTasks.cpp` (`lower_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem ends the load at a file address outside the range the task names", "$readmem into a slice with a start or finish outside its range loads nothing", "$readmem warns of a file with fewer or more words than its range unless it has addresses"). Oracle: iverilog 13 for the first and the third.
 
-## 63. Associative arrays as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 7.8, 21.4.3)
+## 70. Associative arrays as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 7.8, 21.4.3)
 
 21.4.1: "When loading associative arrays, indices shall be of integral types. Loading an address
 creates an element of that index, if it does not already exist. When an associative array's
@@ -930,7 +930,7 @@ whether it is a member or not; Clotho does not check that an address names a mem
 The remaining choices are Clotho's, the clause being silent. The addresses are the values of
 the index type: a signed index has the negative ones, and counting stops at its largest value
 (2^W - 1 for an unsigned one), where a further number is the "more words than the range"
-warning of note 62; an `@` address outside the index type is the error of that note. A
+warning of note 69; an `@` address outside the index type is the error of that note. A
 file's `@` address has no sign, so `@ff` is 255, outside a `byte` index, and not -1. The
 tasks take `start`, `finish` and `@` as 64-bit numbers, so the addresses of a wider index
 are its 64-bit values. A wildcard `[*]` index (7.8.1) is an unsigned one of 64 bits. As for
@@ -940,12 +940,12 @@ of, and one of any length is not for an array whose range has no end.
 An element is created by the first number loaded into it, so an empty file or an invalid target
 creates none. One that is itself an unpacked array (`logic [7:0] aa [int][0:2]`) is a word of
 21.4.3: the address names the element, whose leaves the numbers fill row-major, and a row the
-data leaves unfinished keeps its other leaves (note 59). An entry that is itself an array or a
+data leaves unfinished keeps its other leaves (note 66). An entry that is itself an array or a
 container (`aa[k]`, `aa[k][1:2]`, `nn[k]` of an `int nn[int][int]`) is loaded as the array
 it is, and is created if it is not there (7.8.7: "the target of an assignment or actual to an
 argument passed by reference"); an x or z key names no array, and nothing is loaded. An
 associative array of associative arrays, dynamic arrays or queues as a whole is still refused
-with the other arrays of containers (note 61).
+with the other arrays of containers (note 68).
 
 A load that creates or changes an element wakes whoever waits on the array, as a store to it does
 (9.4.2, 9.4.3), whatever the number of its elements; a load that changes none wakes nobody.
@@ -957,7 +957,7 @@ the rest from the clauses above.
 
 Code: `src/runtime/Io.cpp` (`AssocWords`, `load_words`, `read_words`, `rt_readmem_assoc`, `rt_fread_assoc`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `lower_readmem`, `lower_fread_mem`), `src/lower/SystemTasks.cpp` (`is_mem_target_shape`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into an associative array creates the elements the addresses name", "$readmemh into an associative array addresses the values of its index type", "$readmem into an associative array of 4-state, 2-state, wide and array elements", "$readmemh into an entry of an associative array of arrays or of associative arrays", "$readmemh into an associative array that is a property, a member, an element or an interface member", "a load into an associative array wakes the waiters of its elements", "$fread into an associative array creates the elements the bytes fill", "a memory load into an associative array that names no element or no file creates none", "a $fread into an associative array without an integral index is refused").
 
-## 64. An x or z bit of an associative-array index that the cast to the index type drops (7.8.4, 7.8.6)
+## 71. An x or z bit of an associative-array index that the cast to the index type drops (7.8.4, 7.8.6)
 
 7.8.4: "The index expression shall be evaluated in terms of a cast to the index type" and "A
 4-state index expression containing x or z is invalid". 7.8.6: a read through an invalid
@@ -983,7 +983,7 @@ with a 4-state index of the type's own width, which was always invalid, as the c
 
 Code: `src/lower/Containers.cpp` (`lower_assoc_key`). Tests: `tests/associative_array_test.cpp` ("assoc invalid (x/z) index: the cast to a 2-state or narrower index type does not hide it", "assoc 4-state index without an x or z bit names the entry of its value through the cast", "assoc invalid (x/z) index: literals, queue and struct entries and nested arrays", "assoc invalid (x/z) index into a 2-state index type warns under --sanitize=bounds").
 
-## 65. Bounds of a queue slice read as a value (7.10.1, 11.8.3)
+## 72. Bounds of a queue slice read as a value (7.10.1, 11.8.3)
 
 7.10.1: "If either a or b are 4-state expressions containing x or z values, it yields the empty
 queue {}", `Q[a:b]` with `a < 0` is `Q[0:b]` and with `b > $` is `Q[a:$]`. Each bound is compared
@@ -994,7 +994,7 @@ unsigned narrow bound (read as negative) wrong, so the test is derived from the 
 
 Code: `src/lower/SystemTasks.cpp` (`lower_queue_bounds`), `src/ir/llvm/Containers.cpp` (`lower_queue_append_range`). Tests: `tests/queue_test.cpp` ("queue slice read: x/z bound is empty and a bound keeps its own signedness").
 
-## 66. `$readmem*` start or finish outside a whole memory (21.4)
+## 73. `$readmem*` start or finish outside a whole memory (21.4)
 
 21.4 has start and finish "fall within the bounds of the slice's range" when the memory is a
 slice and is silent for a whole memory. Decided reading (with the user): a whole memory takes the
@@ -1007,7 +1007,7 @@ on from the clipped address and loaded the words that fell inside.
 
 Code: `src/runtime/Io.cpp` (`rt_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem with a start or finish outside a whole memory loads nothing").
 
-## 67. `next` and `prev` with an x or z index argument (7.9.6, 7.9.7, 7.8.4, 7.8.6)
+## 74. `next` and `prev` with an x or z index argument (7.9.6, 7.9.7, 7.8.4, 7.8.6)
 
 7.9.6 / 7.9.7 define `next` / `prev` by "the given index argument" and are silent on one with an
 x or z bit; 7.8.4 makes a 4-state index with x or z invalid. Decided reading (with the user): it

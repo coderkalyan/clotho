@@ -4588,7 +4588,7 @@ TEST_CASE("$readmemh into a slice of a dynamic array places its words like a fix
 // A slice of a queue, `q[a:b]` (LRM 7.10.1), is the elements from `a`, but not below 0, to `b`,
 // but not past `$`; 21.4 lets the lowest dimension of the memory be written "with slice syntax",
 // and the load takes the indices of the queue for its addresses, as it takes those of a slice of a
-// fixed array (note 61 of docs/LRM_NOTES.md). The queue is never resized (21.4.1). The ring wraps
+// fixed array (note 68 of docs/LRM_NOTES.md). The queue is never resized (21.4.1). The ring wraps
 // (its head is slot 6 of 8, so elements 0 and 1 sit on the last two slots), so a slice crosses
 // its end, and starts on its first slot or on a later one. A bound of any width and sign keeps its
 // value, `q[i +: n]` is `q[i:i+n-1]` (11.5.1). Oracle: iverilog 13 takes no queue, so each case is
@@ -4658,7 +4658,7 @@ TEST_CASE("$readmemh into a slice of a queue loads the elements it selects, by q
 }
 
 // A slice of a queue that selects no element (a > b, wholly before or past the queue, an x or z
-// bound, a width of 0, an empty queue) names no word, as an empty queue does (note 61): nothing is
+// bound, a width of 0, an empty queue) names no word, as an empty queue does (note 68): nothing is
 // loaded, and the file is not even opened, which the missing one would report.
 TEST_CASE("$readmemh into a slice of a queue that selects no element does nothing") {
     const std::string design = R"(
@@ -4692,7 +4692,7 @@ TEST_CASE("$readmemh into a slice of a queue that selects no element does nothin
 }
 
 // A slice's range bounds the addresses of a load as a fixed slice's does (21.4: "any start_addr and
-// finish_addr arguments shall fall within the bounds of the slice's range", note 60), and for a
+// finish_addr arguments shall fall within the bounds of the slice's range", note 67), and for a
 // queue slice that range is what is left of it after the queue has clipped it: `q[3:9]` of six is
 // [3:5]. Oracle: iverilog 13, through the load of a memory `s[lo:hi]` for the cases inside the
 // range (it has no slice, so a start or finish outside one is derived from 21.4).
@@ -4797,7 +4797,7 @@ TEST_CASE("$fread into a slice of a queue fills the elements it selects") {
 
 // The element kinds of a queue slice: 4-state values with x and z, a 2-state element (x and z read as
 // 0, LRM 21.4.2), elements wider than 64 bits, and a queue of fixed arrays, whose words are rows
-// (21.4.3, note 59 of docs/LRM_NOTES.md) addressed by their index in the queue. Every ring wraps (its
+// (21.4.3, note 66 of docs/LRM_NOTES.md) addressed by their index in the queue. Every ring wraps (its
 // first element is on its last slot). Oracle: iverilog 13, through the same load of a memory
 // `s[lo:hi]` (it has no 2-state element: derived from 21.4.2).
 TEST_CASE("$readmem into a slice of a queue of 4-state, 2-state, wide and array elements") {
@@ -5001,7 +5001,7 @@ TEST_CASE("$readmem and $fread into a slice of a queue held by a struct, a class
 }
 
 // A dynamic array of fixed arrays is a memory of two dimensions whose highest has the
-// array's size: the file fills it row-major and an address names a row (21.4.3, note 59
+// array's size: the file fills it row-major and an address names a row (21.4.3, note 66
 // of docs/LRM_NOTES.md). The first load has the same output in iverilog 13 for a fixed
 // `m[0:1][0:2]`; the others are derived from 21.4.3 (iverilog takes addresses as leaf
 // indices).
@@ -5037,7 +5037,7 @@ TEST_CASE("$readmemh into a dynamic array of fixed arrays, an element or a slice
 }
 
 // An empty dynamic array or queue has no address, so the load names no word: nothing is
-// opened or read, and `$fread` returns 0 and leaves the file where it was (note 60 of
+// opened or read, and `$fread` returns 0 and leaves the file where it was (note 67 of
 // docs/LRM_NOTES.md gives a fixed array the same rule for a target that names no word).
 TEST_CASE("a load into an empty dynamic array or queue does nothing") {
     write_file("clotho_readmem_dqe_test.hex", "11 22 33 44 55 66\n");
@@ -5136,7 +5136,7 @@ TEST_CASE("a load into a dynamic array local to a task") {
 }
 
 // A queue of fixed arrays is a memory of two dimensions whose highest is the queue: the
-// runtime walks the ring a row at a time (note 59 and 61 of docs/LRM_NOTES.md). The first
+// runtime walks the ring a row at a time (note 66 and 68 of docs/LRM_NOTES.md). The first
 // row is on the ring's last slot, the others start again at its first. Derived from
 // 21.4.3 (iverilog 13 has no queue to load).
 TEST_CASE("$readmemh into a queue of fixed arrays walks its ring a row at a time") {
@@ -5603,7 +5603,7 @@ TEST_CASE("$readmem into an indexed slice is addressed by the indices it selects
 }
 
 // 21.4 has start and finish within the range of a slice; a whole memory takes the rule by analogy
-// (docs/LRM_NOTES.md note 66): a start or finish outside its bounds, in either direction, is a located
+// (docs/LRM_NOTES.md note 73): a start or finish outside its bounds, in either direction, is a located
 // error, nothing is loaded and the simulation goes on. Oracle: iverilog 13 ("Start|Finish address N is
 // out of bounds") for the memory, and the same words for a dynamic array. `$fread` keeps note 55.
 TEST_CASE("$readmem with a start or finish outside a whole memory loads nothing") {
@@ -5649,7 +5649,7 @@ TEST_CASE("$readmem with a start or finish outside a whole memory loads nothing"
 // specifications appear within the data file" (LRM 21.4). Oracle: iverilog 13 warns in the same
 // cases for a memory, and names the same range. It does not for a memory of several
 // dimensions, whose words it counts as flat leaves; here a word of the file is a number, so
-// the range of a row of three holds three (note 59 of docs/LRM_NOTES.md).
+// the range of a row of three holds three (note 66 of docs/LRM_NOTES.md).
 TEST_CASE("$readmem warns of a file with fewer or more words than its range unless it has addresses") {
     write_file("clotho_readmem_wc1.hex", "a1 a2\n");
     write_file("clotho_readmem_wc2.hex", "a1 a2 a3 a4 a5 a6 a7 a8 a9\n");
@@ -5699,7 +5699,7 @@ TEST_CASE("$readmem warns of a file with fewer or more words than its range unle
 
 // LRM 21.4.1: "Loading an address creates an element of that index, if it does not already
 // exist". The number at address n goes to the element of index n, a load that names no address
-// starts at 0 (note 63 of docs/LRM_NOTES.md), and start, finish and `@` work as for a memory.
+// starts at 0 (note 70 of docs/LRM_NOTES.md), and start, finish and `@` work as for a memory.
 // iverilog 13 cannot parse an associative array; its load of the fixed memory [0:31] with the
 // same file, start and finish is the oracle for the words, compared in the design.
 TEST_CASE("$readmemh into an associative array creates the elements the addresses name") {
@@ -5750,11 +5750,11 @@ TEST_CASE("$readmemh into an associative array creates the elements the addresse
     }
 }
 
-// The addresses are the values of the index type (note 63): the negative ones of a signed index,
+// The addresses are the values of the index type (note 70): the negative ones of a signed index,
 // counting up to the largest of an unsigned one, the numeric values of an enumerated index, the
 // 128-bit values of a wide one and the unsigned values of a wildcard. iverilog 13's load of the
 // fixed memory [-2:5] with the same file gives the words at negative addresses; an address
-// past the index type is the error of note 62 and a number past its largest the warning.
+// past the index type is the error of note 69 and a number past its largest the warning.
 TEST_CASE("$readmemh into an associative array addresses the values of its index type") {
     write_file("clotho_readmem_at1.hex", "11 22 33 44\n");
     write_file("clotho_readmem_at2.hex", "01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12\n");
@@ -6043,7 +6043,7 @@ TEST_CASE("a load into an associative array wakes the waiters of its elements") 
     std::remove("clotho_fread_aw.bin");
 }
 
-// $fread into an associative array (note 63): the bytes of an element are read MSB-first and
+// $fread into an associative array (note 70): the bytes of an element are read MSB-first and
 // the elements are those of the addresses from `start` (0 when it is not given), up to `count`
 // of them, never past the largest index, and none is created for the end of the file. An index of
 // a signed type has negative addresses; a start the index type does not have reads nothing and
