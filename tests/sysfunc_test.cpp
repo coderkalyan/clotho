@@ -162,15 +162,27 @@ TEST_CASE("$bits of a class handle is no elaboration-time constant") {
     }
 }
 
-// What the refusal leaves alone: a class data type, whose size slang takes from the
-// class (the base's members, then the derived class's), and an integral property read
-// through a handle. LRM 20.6.2 defines `$bits(data_type)` and 6.24.3 lists classes among
-// the bit-stream types, but neither says what the size of a class type is. iverilog 13
-// rejects the class data type ("Invalid data type for $bits()").
-TEST_CASE("$bits of a class data type and of an integral property is unchanged") {
-    const std::string out = run_capture(prog("class B; int a; endclass class D extends B; int b, c; endclass B h;",
-                                             "h = new; $display(\"%0d %0d %0d\", $bits(B), $bits(D), $bits(h.a));"));
-    CHECK(out == "32 96 32\n");
+// What the refusal leaves alone: a class data type, whose size is slang's -- the bits of the
+// class's properties, the base class's first -- and an integral property read through a
+// handle. LRM 20.6.2 defines `$bits(data_type)` and 6.24.3 lists classes among the bit-stream
+// types, but neither says what the size of a class type is, so the decided reading
+// (LRM_NOTES 59) keeps slang's value: 32 for B and 96 for D, in a statement and as an
+// elaboration-time constant. iverilog 13 rejects the class data type ("Invalid data type for
+// $bits()"), so there is no oracle.
+TEST_CASE("$bits of a class data type is the bits of its properties, base class first") {
+    SUBCASE("in a statement, and of an integral property") {
+        const std::string out = run_capture(prog("class B; int a; endclass class D extends B; int b, c; endclass B h;",
+                                                 "h = new; $display(\"%0d %0d %0d\", $bits(B), $bits(D), $bits(h.a));"));
+        CHECK(out == "32 96 32\n");
+    }
+    SUBCASE("as an elaboration-time constant") {
+        const std::string out = run_capture(prog(
+          "class B; int a; endclass class D extends B; int b, c; endclass\n"
+          "localparam int NB = $bits(B), ND = $bits(D);\n"
+          "logic [$bits(D)-1:0] v; typedef bit [$bits(B):1] bits_t;",
+          "$display(\"%0d %0d %0d %0d\", NB, ND, $bits(v), $bits(bits_t));"));
+        CHECK(out == "32 96 96 32\n");
+    }
 }
 
 // -- $countones -------------------------------------------------------------

@@ -794,3 +794,21 @@ compound term, is a located fatal at the wait, as for `@(obj.x)`. An inferred `@
 different (note 57): it reads nothing until its body runs, so it waits on the handle.
 
 Code: `src/lower/Timing.cpp` (`lower_expr_wait`), `src/lower/Scans.cpp` (`control_needs_loop`, `WaitPropScan::handle(EventListControl)`). Tests: `tests/event_test.cpp` ("an event list with a class property term wakes on each of its terms" and the three after it), `tests/interface_test.cpp` ("virtual interface: an event list over member expressions" and the four after it). No oracle parses these designs; the plain-signal analogs of the edge and list traces agree with iverilog 13.
+
+## 59. `$bits` of a class data type (20.6.2, 6.24.3)
+
+20.6.2 defines `$bits ( data_type )` and sizes a data type only by example: for a struct of
+`logic valid; bit [8:1] data;` it "shall return 9, the number of data bits needed by a
+variable of type MyType", and "The $bits function can be used as an elaboration-time constant
+when used on fixed-size data types". 6.24.3 lists "Unpacked arrays, structures, or classes of
+the preceding types" among the bit-stream types. Neither gives a class type a size: a handle
+of the type can refer to an object of any derived class, and 11.4.14.1 streams "each data
+member of the referenced object, and not the handle itself", the members of a base class
+first, and skips a null handle. Clotho keeps the value slang gives the type: the bits of its
+properties, the base class's first, so `$bits(B)` is 32 for `class B; int a; endclass` and
+`$bits(D)` is 96 for `class D extends B; int b, c; endclass`, in a statement and as an
+elaboration-time constant. The expression form on a handle has the 11.4.14.1 answer, the
+members of the object it refers to (96 for a `B` handle to a `D` object, 0 for a null one),
+which no type fixes, so it is refused until class-handle streaming exists.
+
+Code: `src/lower/SystemTasks.cpp` (the `$bits` fold in `lower_sysfunc`, `bits_of_expr`). Tests: `tests/sysfunc_test.cpp` ("$bits of a class data type is the bits of its properties, base class first", "$bits of an operand that holds a class handle is refused"). iverilog 13 rejects the class data type ("Invalid data type for $bits()"), so no oracle covers it; the reading keeps slang's value.

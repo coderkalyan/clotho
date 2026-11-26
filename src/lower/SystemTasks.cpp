@@ -821,6 +821,9 @@ static bool holds_class_handle(const slang::ast::Type& t) {
 // taken: the bits are those of the objects the handles refer to (11.4.14.1), which no type
 // fixes. slang does not fold such an operand either (patches/slang-bits-class-handle.patch),
 // so every one arrives here.
+//
+// The data-type form `$bits(B)` is no operand: it folds in slang to the size of the class's
+// properties and stays (LRM_NOTES 59).
 ir::Index Lowerer::bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceLoc l) {
     const slang::ast::Type& t = *e.type;
     if (holds_class_handle(t)) {
@@ -1359,6 +1362,12 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         // $bits is "determined without actual evaluation of the expression it
         // encloses" (LRM 20.6.2), so a call inside it never runs and still folds.
         // The others read the operand's value, and a call in it has to run.
+        //
+        // NOTE: `$bits(class_type)` folds here too, to slang's size: the bits of the class's
+        // properties, base class first (32 for `class B; int a;`, 96 for `class D extends B;
+        // int b, c;`). LRM 20.6.2 and 6.24.3 give a class type no size, and keeping slang's
+        // value is LRM_NOTES 59. An operand that is, or holds, a class handle never folds
+        // (patches/slang-bits-class-handle.patch) and is refused in bits_of_expr.
         const slang::ConstantValue cv = fold_const(call, name == "$bits" ? Fold::Required : Fold::Runtime);
         if (cv.isInteger()) {
             return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
