@@ -4868,7 +4868,87 @@ TEST_CASE("$readmem and $fread into a struct member or a member of an array of s
     std::remove("clotho_fread_st_test.bin");
 }
 
-// What a memory load still refuses, loudly: a member of a class or an interface,
+// A class property is an array in the object's body, reached through the handle (a derived
+// class's handle and a method's implicit `this` included), or a shared slot when static.
+// A dynamic array or queue property wakes `wait` through its change notifier. Oracle: the
+// same load of a fixed memory in iverilog 13 (it has no class), compared by value.
+TEST_CASE("$readmem and $fread into a class property, static or not") {
+    write_file("clotho_readmem_cl_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_readmem_cl2_test.hex", "@2 aa bb\n");
+    write_file("clotho_fread_cl_test.bin", std::string("\x11\x22\x33\x44\x55", 5));
+    const std::string src = R"(
+        class C;
+            int a;
+            logic [7:0] mem [0:3];
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            static logic [7:0] smem [0:3];
+            int b;
+            function new();
+                a = 32'h11111111; b = 32'h22222222;
+                d = new[4];
+                q.push_front(8'bx); q.push_back(8'bx); q.push_back(8'bx); q.push_back(8'bx);
+            endfunction
+            function void load(string f);
+                $readmemh(f, mem);
+            endfunction
+        endclass
+        class D extends C;
+            int c;
+        endclass
+        module m;
+            C obj;
+            D dobj;
+            integer i, fd, rc, at_d = -1, at_s = -1;
+            task automatic show(C o);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", o.mem[i]);
+                $write("| ");
+                for (i = 0; i < 4; i = i + 1) $write("%h ", o.d[i]);
+                $write("| ");
+                for (i = 0; i < 4; i = i + 1) $write("%h ", o.q[i]);
+                $display("| a=%h b=%h", o.a, o.b);
+            endtask
+            initial begin #1; wait (obj.d[2] == 8'h33) at_d = $time; end
+            initial begin #1; @(C::smem[1]) at_s = $time; end
+            initial begin
+                obj = new;
+                #5;
+                $readmemh("@A6@", obj.mem);
+                $readmemh("@A6@", obj.d);
+                $readmemh("@A6@", obj.q, 1, 2);
+                show(obj);
+                $readmemh("@A2@", obj.mem);
+                show(obj);
+                obj = new; obj.load("@A6@"); show(obj);
+                dobj = new; $readmemh("@A6@", dobj.mem); $readmemh("@A2@", dobj.d, 1); show(dobj);
+                obj = dobj; $readmemh("@A2@", obj.mem); show(dobj);
+                fd = $fopen("@B5@", "rb"); rc = $fread(obj.d, fd); $fclose(fd);
+                $display("rc=%0d", rc);
+                $readmemh("@A6@", C::smem);
+                $readmemh("@A2@", obj.smem, 1);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", C::smem[i]);
+                $display("");
+                #1 $display("%0d %0d", at_d, at_s);
+            end
+        endmodule
+    )";
+    const std::string design = with_path(with_path(with_path(src, "@A6@", "clotho_readmem_cl_test.hex"), "@A2@",
+                                                   "clotho_readmem_cl2_test.hex"),
+                                         "@B5@", "clotho_fread_cl_test.bin");
+    CHECK(run_capture(design) == "11 22 33 44 | 11 22 33 44 | xx 11 22 xx | a=11111111 b=22222222\n"
+                                 "11 22 aa bb | 11 22 33 44 | xx 11 22 xx | a=11111111 b=22222222\n"
+                                 "11 22 33 44 | xx xx xx xx | xx xx xx xx | a=11111111 b=22222222\n"
+                                 "11 22 33 44 | xx xx aa bb | xx xx xx xx | a=11111111 b=22222222\n"
+                                 "11 22 aa bb | xx xx aa bb | xx xx xx xx | a=11111111 b=22222222\n"
+                                 "rc=4\n"
+                                 "11 22 aa bb \n"
+                                 "5 5\n");
+    std::remove("clotho_readmem_cl_test.hex");
+    std::remove("clotho_readmem_cl2_test.hex");
+    std::remove("clotho_fread_cl_test.bin");
+}
+
+// What a memory load still refuses, loudly: a member of an interface,
 // an associative array (LRM 21.4.1 makes its addresses keys but does not say where a load
 // that names none starts) and a slice of a queue (7.10.1: a new queue, not a view of the
 // queue).
@@ -4882,7 +4962,7 @@ TEST_CASE("a memory load into a member, an associative array or a queue slice is
     refused("logic [7:0] q[$]; initial $readmemb(\"f.hex\", q[1:2]);");
     refused("logic [7:0] a[int]; integer fd, rc; initial rc = $fread(a, fd);");
     refused("logic [7:0] q[$]; integer fd, rc; initial rc = $fread(q[1:2], fd);");
-    refused("class C; logic [7:0] m[0:3]; endclass C c; initial $readmemh(\"f.hex\", c.m);");
+    refused("interface i; logic [7:0] m[0:3]; endinterface i u(); virtual i v; initial $readmemh(\"f.hex\", v.m);");
 }
 
 // Slurp a file written by a file-I/O test.
