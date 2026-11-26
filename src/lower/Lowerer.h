@@ -148,11 +148,14 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e);
 
 bool is_notified_container(const slang::ast::Type& ty);
 
+bool is_notified_aggregate(const slang::ast::Type& ty);
+
 // What a store to a property of this type can classify, and therefore which change
 // notifiers the property may carry (LRM 9.4.2: "any change in the value").
 enum class PropNotify : uint8_t {
-    // Neither an old -> new word nor a mutation surface: an unpacked struct or
-    // union, a FIXED unpacked array. Refused loudly in both constructs.
+    // Neither an old -> new word nor a mutation surface: an event (which has a
+    // waiter list of its own), a covergroup handle. An unpacked struct, union or fixed
+    // array is not this: its leaves are words, and is_notified_aggregate covers it.
     None,
     // The value IS one stored word, so a store compares old against new through
     // the same emit_edge_facts a signal store uses. Every integral type; the three
@@ -176,7 +179,11 @@ const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e);
 
 const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e);
 
+const slang::ast::ClassPropertySymbol* waited_aggregate_prop(const Expression& e);
+
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e);
+
+bool event_reads_props(const Expression& e);
 
 // Every class-property reference in an expression, whether or not it is notifiable.
 // `wait` needs both halves: the notifiable ones become sensitivity, and the mere
@@ -2408,7 +2415,7 @@ private:
 
     uint32_t anon_local(ir::Ref type);
 
-    void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
+    void lower_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
 
     ir::Index lsb_edge_fired(ir::Index old_v, ir::Index new_v, slang::ast::EdgeKind edge, ir::Builder& b, ir::SourceLoc l);
 

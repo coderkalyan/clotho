@@ -161,11 +161,50 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e) 
 // in that order because slang answers isDynamicallySizedArray() for an
 // associative array too (foreach_dim_ref was bitten by exactly that).
 //
-// A FIXED unpacked array is deliberately absent. Its storage never changes
-// extent, so it has no mutation op at all -- every write to one is an element
-// store -- and it is refused rather than given a notifier nothing would fire.
+// A FIXED unpacked array is deliberately absent: its extent never changes, so it has
+// no mutation op, and every write to one is an element store. It is an aggregate
+// (is_notified_aggregate).
 bool is_notified_container(const slang::ast::Type& ty) {
     return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
+}
+
+// Whether an aggregate has an event among its members or elements, at any depth.
+static bool holds_event(const slang::ast::Type& t) {
+    const slang::ast::Type& ct = t.getCanonicalType();
+    if (ct.isEvent()) {
+        return true;
+    }
+    if (ct.isUnpackedArray()) {
+        return holds_event(*ct.getArrayElementType());
+    }
+    const auto any_field = [](std::span<const slang::ast::FieldSymbol* const> fields) {
+        return std::ranges::any_of(fields, [](const slang::ast::FieldSymbol* f) { return holds_event(f->getType()); });
+    };
+    if (ct.isUnpackedStruct()) {
+        return any_field(ct.as<slang::ast::UnpackedStructType>().fields);
+    }
+    if (ct.isUnpackedUnion()) {
+        return any_field(ct.as<slang::ast::UnpackedUnionType>().fields);
+    }
+    return false;
+}
+
+// The aggregates whose members one any-change notifier covers: an unpacked struct, an
+// unpacked union and a FIXED unpacked array. The property is one variable, and LRM
+// 9.4.2.2 adds a variable the statement reads, not a member of it, so a change
+// anywhere in it wakes. A store to a leaf or an element classifies its own old -> new
+// transition, as a scalar property's does, and fires the property's notifier; a copy
+// over the whole of it, and a mutation of a container inside it, fire it too. There is no
+// edge notifier: an edge is the least significant bit of an expression (LRM 9.4.2),
+// which an aggregate has none of, and `@` over a whole aggregate is no legal event
+// expression (9.4.2: "Event expressions shall return singular values").
+//
+// One holding an event has none: a trigger is no store, so the notifier would never
+// fire for a wait on it, and such a wait stays what it is without one.
+bool is_notified_aggregate(const slang::ast::Type& ty) {
+    const bool aggregate =
+      ty.isUnpackedStruct() || ty.isUnpackedUnion() || (ty.isUnpackedArray() && !is_notified_container(ty));
+    return aggregate && !holds_event(ty);
 }
 
 PropNotify prop_notify_kind(const slang::ast::Type& ty) {
@@ -221,13 +260,49 @@ const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e
     return prop;
 }
 
-// Either kind: what a `wait` condition can park on. The design-wide pre-pass and
-// the wait lowering MUST agree on this set, so both call this and nothing else.
+// The AGGREGATE property an expression names. Like a container's, its notifier is for a
+// level-sensitive wait: it fires on a change anywhere in the property, and a wait
+// re-tests its condition. See is_notified_aggregate.
+const slang::ast::ClassPropertySymbol* waited_aggregate_prop(const Expression& e) {
+    const auto* prop = instance_class_prop(e);
+    if (prop == nullptr || !is_notified_aggregate(prop->getType().getCanonicalType())) {
+        return nullptr;
+    }
+    return prop;
+}
+
+// Any of the three kinds: what a `wait` condition, or an inferred `@*`, can park on.
+// The design-wide pre-pass and the wait lowering MUST agree on this set, so both call
+// this and nothing else.
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e) {
     if (const auto* p = waited_class_prop(e); p != nullptr) {
         return p;
     }
-    return waited_container_prop(e);
+    if (const auto* p = waited_container_prop(e); p != nullptr) {
+        return p;
+    }
+    return waited_aggregate_prop(e);
+}
+
+// Whether an event expression waits in a loop of its own on the class properties it
+// reads (Lowerer::lower_expr_wait): a compound over properties read through handles,
+// such as `obj.s.f` or `obj.x + 1`. A property named by itself parks on its own notifier
+// (`@(obj.x)`, `@(posedge obj.x)`), an event on the object it holds, a member of a
+// virtual interface on that member's waiter list, a string is refused (event_signal),
+// and an expression that reads a container is refused: a mutation is not a change in
+// value (LRM 9.4.2). The design-wide pre-pass and the lowering MUST agree on this, so
+// both call it and nothing else.
+bool event_reads_props(const Expression& e) {
+    if (e.type->isEvent() || e.type->getCanonicalType().isString() || waited_class_prop(e) != nullptr) {
+        return false;
+    }
+    if (e.kind == ExpressionKind::MemberAccess &&
+        e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface()) {
+        return false;
+    }
+    ClassPropReadScan scan;
+    e.visit(scan);
+    return !scan.notifiable.empty() && !scan.any_container;
 }
 
 void ClassPropReadScan::take(const Expression& e) {
@@ -358,6 +433,14 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
             default:
                 out->add(*prop, ir::Edge::Any);
                 break;
+        }
+    } else if (event_reads_props(ev.expr)) {
+        // A compound over class properties waits in a loop of its own, parked on the
+        // any-change notifier of each property it reads (Lowerer::lower_expr_wait).
+        ClassPropReadScan scan;
+        ev.expr.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            out->add(*level_waited_prop(*e), ir::Edge::Any);
         }
     }
     visitDefault(ev);
@@ -749,6 +832,31 @@ void SensitivityCollector::mark_written(const ValueSymbol& sym) {
     }
 }
 
+// Whether a place expression is, or selects inside, a class property read through a
+// handle: through struct members, element selects and part selects, down to the
+// property itself.
+static bool roots_at_class_prop(const Expression& e) {
+    const Expression* cur = &e;
+    for (;;) {
+        if (instance_class_prop(*cur) != nullptr) {
+            return true;
+        }
+        switch (cur->kind) {
+            case ExpressionKind::MemberAccess:
+                cur = &cur->as<MemberAccessExpression>().value();
+                break;
+            case ExpressionKind::ElementSelect:
+                cur = &cur->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                cur = &cur->as<RangeSelectExpression>().value();
+                break;
+            default:
+                return false;
+        }
+    }
+}
+
 // Record the write target(s) of an lvalue: the base name is written, but any
 // selector expression on it (an index or a non-constant part-select bound) is
 // a read and is descended into.
@@ -795,6 +903,12 @@ void SensitivityCollector::record_write(const Expression& lhs) {
             const auto& ma = lhs.as<MemberAccessExpression>();
             if (ma.value().type->getCanonicalType().isVirtualInterface() || instance_class_prop(ma) != nullptr) {
                 read_object(ma.value());
+                break;
+            }
+            // A member of a class property (`obj.s.f = ...`) is a write of that property,
+            // which the statement does not read; the handle it goes through is.
+            if (ma.member.kind == SymbolKind::Field && roots_at_class_prop(ma.value())) {
+                record_write(ma.value());
                 break;
             }
             lhs.visit(*this);

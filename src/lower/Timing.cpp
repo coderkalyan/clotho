@@ -347,7 +347,7 @@ bool Lowerer::sensitivity_needs_handle(const TimingControl& tc) {
             // A class property's notifier is reached through the object handle, so
             // `always @(c.p)` has to stay in the body too -- the seed loop that
             // issues a static subscription cannot evaluate `c`.
-            return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr;
+            return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr || event_reads_props(e);
         }
         case TimingControlKind::EventList:
             for (const TimingControl* e : tc.as<EventListControl>().events) {
@@ -556,17 +556,19 @@ ir::Index Lowerer::lsb_edge_fired(ir::Index               old_v,
     fail("internal: an edge test for a control with no edge");
 }
 
-// `@([edge] <expression over virtual interface members> [iff cond])` (LRM 9.4.2 +
-// 25.9). The general path synthesizes a net driven by a continuous process, which
-// cannot work through a handle: it would read the handle before it is assigned,
-// and then track whichever instance was bound at time zero. So this desugars to
-// exactly what the clause asks for -- wait until the expression's value changes,
-// or until the least significant bit of it makes the edge, and until `cond` holds
-// then -- over the per-member waits that do work:
+// `@([edge] <expression over virtual interface members or class properties> [iff cond])`
+// (LRM 9.4.2 + 25.9, 8.4). The general path synthesizes a net driven by a continuous
+// process, which cannot work through a handle: it would read the handle before it is
+// assigned, and then track whichever instance or object was bound at time zero. So this
+// desugars to exactly what the clause asks for -- wait until the expression's value
+// changes, or until the least significant bit of it makes the edge, and until `cond`
+// holds then -- over the waits that do work: a member's waiter list in the instance a
+// virtual interface handle names, and the any-change notifier of each class property in
+// the object a handle names:
 //
 //   sample = expr;
 //   forever begin
-//     @(each member read);
+//     @(each member and property read);
 //     cur = expr; old = sample; sample = cur;
 //     if (cur !== old) [ or: the edge of cur[0] from old[0] ] begin
 //       if (cond) break;
@@ -577,15 +579,19 @@ ir::Index Lowerer::lsb_edge_fired(ir::Index               old_v,
 // 9.4.2.3), so what it reads is no sensitivity. The sample follows every wake: a
 // change `cond` suppresses is still what the next one is measured from.
 //
+// NOTE: the expression is evaluated when the loop wakes, not at each update of an
+// operand, so a change that reverts before then is no event. LRM 9.4.2 makes it one
+// (docs/design/scheduler-rules.md R8, R9); a signal's compound expression has the same gap.
+//
 // The sample lives in the call frame inside a subroutine (so two activations of
 // one task do not share it) and in module storage in a process body, which is a
 // single coroutine and cannot re-enter its own wait.
-void Lowerer::lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l) {
+void Lowerer::lower_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l) {
     const ir::Ref ty = lower_type(*ev.expr.type);
     // The sample's storage, as a maker so each use re-forms the lvalue.
     const bool       in_frame = fn_ctx_ != nullptr;
     const uint32_t   slot     = in_frame ? anon_local(ty) : 0;
-    const ir::Signal tmp      = in_frame ? ir::Signal{ 0 } : declare_temp(ty, "vif_event");
+    const ir::Signal tmp      = in_frame ? ir::Signal{ 0 } : declare_temp(ty, "expr_event");
     const auto       place    = [&](ir::Builder& bb) {
         return in_frame ? bb.local(slot, ty, l) : bb.signal(tmp, l);
     };
@@ -608,6 +614,21 @@ void Lowerer::lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, 
             if (rep) {
                 edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
                                               ir::kNoWaitHandle, inst });
+            }
+        }
+        // Class properties the expression reads: each parks on its any-change notifier,
+        // in the object its handle names right now. A property is one variable, so a
+        // change anywhere in it wakes this loop, and the comparison below decides whether
+        // the expression's own value moved. A container's notifier is a mutation's, which
+        // is no change in value, so none is parked on.
+        ClassPropReadScan props;
+        ev.expr.visit(props);
+        for (const Expression* pe : props.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*pe);
+            if (!is_notified_container(prop.getType().getCanonicalType())) {
+                edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                              static_cast<uint32_t>(ir::Edge::Any),
+                                              prop_notifier_handle(*pe, prop, ir::Edge::Any, b) });
             }
         }
         std::vector<ir::WaitEvent> reads;
@@ -710,8 +731,8 @@ void Lowerer::flush_deferred_on_resume(ir::Builder& b, ir::SourceLoc l) {
 void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
     if (tc.kind == TimingControlKind::SignalEvent) {
         const auto& ev = tc.as<SignalEventControl>();
-        if (reads_vif(ev.expr) && ev.expr.kind != ExpressionKind::MemberAccess) {
-            lower_vif_expr_wait(ev, b, l);
+        if ((reads_vif(ev.expr) && ev.expr.kind != ExpressionKind::MemberAccess) || event_reads_props(ev.expr)) {
+            lower_expr_wait(ev, b, l);
             flush_deferred_on_resume(b, l);
             return;
         }
@@ -1863,7 +1884,8 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
                 continue;
             }
             if (!box_can_notify(vs->getType().getCanonicalType())) {
-                // TODO: same aggregate shapes as the property arm below, plus
+                // TODO: an unpacked struct, union or fixed unpacked array, which a class
+                // property can now carry a notifier for and a capture box cannot, plus
                 // `event`, whose `.triggered` a capture box cannot notify on yet.
                 fail("wait on the fork-captured automatic '" + std::string(vs->name) + "' of type " +
                      vs->getType().toString() +
@@ -1882,22 +1904,19 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
     }
     if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() &&
         prop_reads.event_props.empty() && boxed_reads.empty() && prop_reads.any_prop) {
-        // The condition reads a class property that can carry no notifier -- an
-        // unpacked struct or union, or a FIXED unpacked array -- and nothing else
-        // that can wake this process. Lowering it anyway is what used to happen,
-        // and it produced a suspend with an EMPTY event list: a permanent park
+        // The condition reads a class property that can carry no notifier -- a covergroup
+        // handle, or an unpacked aggregate holding an event, whose trigger is no store --
+        // and nothing else that can wake this process. Lowering it anyway is what used to
+        // happen, and it produced a suspend with an EMPTY event list: a permanent park
         // with no diagnostic, in a design whose author had every reason to expect
         // a working wait. `wait(0)` still parks silently, because that one reads
         // nothing at all and is the documented LRM 9.4.3 behaviour.
         //
-        // TODO: the two aggregate shapes. Both need a comparison over the whole
-        // aggregate rather than over one word: an unpacked struct or union needs
-        // the store path to walk its leaves, and a fixed unpacked array needs the
-        // notifier to survive the element-store descent (agg_member clears it on
-        // purpose today, see ir/llvm/Aggregates.cpp).
+        // TODO: an event inside an unpacked aggregate property (LRM 9.4.3): park on the
+        // event object it holds, as for an event property, beside the property's notifier.
         fail("wait on a class property of a type with no change notifier is not "
-             "supported (an unpacked struct, union or fixed unpacked array "
-             "property cannot be waited on)");
+             "supported (a covergroup handle, or an unpacked aggregate holding an "
+             "event, cannot be waited on)");
     }
 
     // The edges to park on, lowered where the caller has its region open: a handle is

@@ -2476,3 +2476,34 @@ TEST_CASE("always_comb over a virtual-interface member starts as a plain one doe
     CHECK(vif == "first x\nevent 1 at 0\nafter #0 1\nevent #0 1\n");
 }
 
+// An unpacked struct or fixed-array class property is one variable (LRM 9.4.2.2): a change
+// anywhere in it wakes `@*` and `@(obj.s.f)`, a store of the same value wakes nothing. No
+// oracle parses classes or unpacked structs; the expectations are the clauses'.
+TEST_CASE("always @* wakes on a change anywhere in an aggregate class property") {
+    const std::string out = run_capture(R"(
+        typedef struct { int f; int g; string t; } s_t;
+        class C; s_t s; int a[2]; endclass
+        module top;
+          C obj = new, o2 = new; int y;
+          always @* begin $display("W %0t", $time); y = obj.s.f + obj.a[1]; end
+          initial begin
+            #1 obj.s.f = 5; #1 obj.s.f = 5; #1 obj.s.g = 6; #1 obj.a[1] = 2;
+            #1 obj.s.t = "x"; #1 obj.s = o2.s; #1 obj.a = o2.a; #1 $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 3\nW 4\nW 5\nW 6\nW 7\n");
+}
+
+TEST_CASE("@(obj.s.f) wakes only when the member's value changes") {
+    const std::string out = run_capture(R"(
+        typedef struct { int f; int g; } s_t;
+        class C; s_t s; endclass
+        module top;
+          C obj = new;
+          initial begin @(obj.s.f) $display("woke %0t %0d", $time, obj.s.f); $finish; end
+          initial begin #1 obj.s.g = 4; #1 obj.s.f = 7; end
+        endmodule
+    )");
+    CHECK(out.find("woke 2 7") != std::string::npos);
+}
