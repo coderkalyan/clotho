@@ -1137,6 +1137,12 @@ private:
 // word the file's numbers are dropped from, and a load that names no word does
 // nothing, not even open the file.
 //
+// The addresses of the file lie in the range the task names (LRM 21.4): `start` through
+// `finish`, `start` through the highest address of the array when only `start` is given,
+// else all of the array. An `@` address outside it is an error that ends the load, and the
+// words before it stay loaded. For a slice (`flags` bit6) `start` and `finish` themselves
+// have to lie in the slice's range, or nothing is loaded.
+//
 // The words of a queue sit in its ring rather than one after another: a nonzero
 // `ring_cap` makes `mm_base` / `z_base` point at the ring's slot 0 and the first word
 // that exists lie at slot `ring_head`, the next at the slot after it, and so on
@@ -1145,7 +1151,7 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
                                uint32_t stride, uint32_t width, const int64_t* inner, uint32_t inner_dims,
                                int64_t decl_left, int64_t decl_right, int64_t lo_word, int64_t word_count,
                                int64_t ring_head, int64_t ring_cap, int64_t start, int64_t finish,
-                               uint32_t flags) {
+                               uint32_t flags, const rt_null_site* site) {
     const bool hex          = (flags & 1u) != 0;
     const bool has_start    = (flags & 2u) != 0;
     const bool has_finish   = (flags & 4u) != 0;
@@ -1153,8 +1159,30 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     const bool path_forward = (flags & 16u) != 0;
     // A narrow 2-state memory stores a single iW element (no packed must|may word).
     const bool narrow       = (flags & 32u) != 0;
+    const bool slice        = (flags & 64u) != 0;
     if (word_count <= 0) {
         return 0;
+    }
+    const std::string task = hex ? "$readmemh" : "$readmemb";
+
+    // LRM 21.4: with slice syntax, start and finish "shall fall within the bounds of the
+    // slice's range". An address outside it names nothing to load, so nothing is loaded.
+    if (slice) {
+        const int64_t slice_lo = std::min(decl_left, decl_right);
+        const int64_t slice_hi = std::max(decl_left, decl_right);
+        const auto    outside  = [&](bool given, int64_t at, const char* which) {
+            if (!given || (at >= slice_lo && at <= slice_hi)) {
+                return false;
+            }
+            mem_load_report(site, true,
+                            fmt::format("{}: {} address {} is outside the slice range [{}:{}]", task, which, at,
+                                        decl_left, decl_right),
+                            "nothing was loaded");
+            return true;
+        };
+        if (outside(has_start, start, "start") || outside(has_finish, finish, "finish")) {
+            return 0;
+        }
     }
 
     // A string-object filename (path_forward) arrives as its bytes in natural
@@ -1188,6 +1216,12 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     // Loading stops at the finish address (if given) else the highest address; data
     // beyond that bound is ignored with a warning (LRM §21.4).
     const int64_t end = has_finish ? finish : hi_addr;
+    // The range the task names, which an `@` address of the file has to lie in (LRM 21.4). A
+    // start alone loads upward to the highest address, so one above it names no address.
+    const int64_t range_lo = has_finish ? std::min(start, finish) : has_start ? start : lo_addr;
+    const int64_t range_hi = has_finish ? std::max(start, finish) : hi_addr;
+    // Its ends in the order of travel, as the reports name it.
+    const int64_t range_a = has_start ? start : lo_addr;
 
     const int      bits   = hex ? 4 : 1;
     const uint64_t nibble = hex ? 0xFu : 0x1u;
@@ -1270,9 +1304,19 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             for (int d; i < n && (d = hex_digit(buf[i])) >= 0; ++i) {
                 a = a * 16 + static_cast<uint64_t>(d);
             }
+            // The address has to lie in the range the task names (LRM 21.4); one outside it
+            // ends the load, and what was loaded before it stays.
+            const auto at = static_cast<int64_t>(a);
+            if (at < range_lo || at > range_hi) {
+                mem_load_report(site, true,
+                                fmt::format("{}: address {} in '{}' is outside the address range [{}:{}] of the load",
+                                            task, at, path, range_a, end),
+                                "the load stopped there, and the words before it are loaded");
+                break;
+            }
             // An address names a whole word of the highest dimension, so a word that
             // was only partly filled keeps its other leaves (LRM 21.4.3).
-            addr   = static_cast<int64_t>(a);
+            addr   = at;
             in_row = false;
             order.restart();
             continue;
@@ -1324,7 +1368,9 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
         }
         if ((dir > 0 && addr > end) || (dir < 0 && addr < end)) {
             // Past the finish / highest address: the remaining file data is dropped.
-            std::fprintf(stderr, "$readmem: more data than the memory range for '%s'\n", path.c_str());
+            mem_load_report(site, false,
+                            fmt::format("{}: '{}' holds more words than the range [{}:{}]", task, path, range_a, end),
+                            "the extra words are ignored");
             break;
         }
         if (!in_row) {
@@ -1332,7 +1378,9 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
             row_ok = row >= lo_word && row < lo_word + word_count;
             in_row = true;
             if (!row_ok) {
-                std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
+                mem_load_report(site, false,
+                                fmt::format("{}: address {} in '{}' names no element of the array", task, addr, path),
+                                "the words at it are dropped");
             }
         }
         if (row_ok) {

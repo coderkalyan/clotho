@@ -464,6 +464,13 @@ inline size_t mark_width(int32_t column, int32_t end_column) {
     return end_column > column ? static_cast<size_t>(end_column - column) : 1;
 }
 
+// A diagnostic of a $readmemh / $readmemb load (LRM 21.4): `headline` says what is wrong
+// and `note` what the load did about it. An error is one the load ends on (the caller
+// returns), a warning one it goes on after. Located at the task's call (`site`, null where
+// there is none: a unit test), and quiet after a few from one site, as the other run-time
+// reports are.
+void mem_load_report(const rt_null_site* site, bool error, const std::string& headline, const std::string& note);
+
 // ---- Stale `ref` through a restructured container (LRM 13.5.2) ----
 
 // Whether a stale `ref` dereference warns and continues instead of ending the

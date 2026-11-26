@@ -5019,6 +5019,127 @@ TEST_CASE("$readmem and $fread into a member through a virtual interface") {
     std::remove("clotho_fread_vif_test.bin");
 }
 
+// An `@` address of the file outside the range the task names is an error that ends the load,
+// the words before it staying loaded (LRM 21.4: "the addresses in the data file shall be within
+// the address range specified by the system task arguments; otherwise, an error message is
+// issued, and the load operation is terminated"). The range is `start` through `finish`,
+// `start` through the highest address when only `start` is given, else the whole memory.
+// Oracle: iverilog 13 loads the same words and names the same addresses and ranges, for a
+// descending task range, a descending declaration and a memory that starts above 0 too.
+TEST_CASE("$readmem ends the load at a file address outside the range the task names") {
+    write_file("clotho_readmem_ar1.hex", "aa bb\n@1 cc dd\n");
+    write_file("clotho_readmem_ar2.hex", "aa bb\n@6 cc dd\n");
+    write_file("clotho_readmem_ar3.hex", "aa bb\n@9 cc dd\n@3 ee\n");
+    write_file("clotho_readmem_ar4.hex", "@5 aa @2 bb cc\n");
+    write_file("clotho_readmem_ar5.hex", "aa bb\n@1\n");
+    write_file("clotho_readmem_ar6.hex", "@1 aa bb\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] mem [0:7];
+            logic [7:0] desc [7:0];
+            logic [7:0] off [2:9];
+            integer i;
+            task automatic fresh;
+                for (i = 0; i < 8; i = i + 1) begin mem[i] = 8'hxx; desc[i] = 8'hxx; end
+                for (i = 2; i < 10; i = i + 1) off[i] = 8'hxx;
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h ", mem[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; $readmemh("@R1@", mem, 2, 5); show;
+                fresh; $readmemh("@R2@", mem, 2, 5); show;
+                fresh; $readmemh("@R1@", mem, 2); show;
+                fresh; $readmemh("@R2@", desc, 5, 2);
+                for (i = 0; i < 8; i = i + 1) $write("%h ", desc[i]);
+                $display("");
+                fresh; $readmemh("@R3@", mem); show;
+                fresh; $readmemh("@R4@", mem, 2, 5); show;
+                fresh; $readmemh("@R5@", mem, 2, 5); show;
+                fresh; $readmemh("@R6@", off);
+                for (i = 2; i < 10; i = i + 1) $write("%h ", off[i]);
+                $display("");
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 6; ++k) {
+        design = with_path(design, "@R" + std::to_string(k) + "@", "clotho_readmem_ar" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) == "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx xx xx bb aa xx xx \n"
+                                 "aa bb xx xx xx xx xx xx \n"
+                                 "xx xx bb cc xx aa xx xx \n"
+                                 "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx xx xx xx xx xx xx \n");
+    const std::string err = run_capture_stderr(design);
+    const auto        has = [&](const char* file, int addr, const char* range) {
+        return err.find("error: $readmemh: address " + std::to_string(addr) + " in 'clotho_readmem_" + file +
+                        ".hex' is outside the address range " + range + " of the load") != std::string::npos;
+    };
+    CHECK(has("ar1", 1, "[2:5]"));
+    CHECK(has("ar2", 6, "[2:5]"));
+    CHECK(has("ar1", 1, "[2:7]"));
+    CHECK(has("ar2", 6, "[5:2]"));
+    CHECK(has("ar3", 9, "[0:7]"));
+    CHECK(has("ar5", 1, "[2:5]"));
+    CHECK(has("ar6", 1, "[2:9]"));
+    CHECK(count_substr(err, "error:") == 7);
+    for (int k = 1; k <= 6; ++k) {
+        std::remove(("clotho_readmem_ar" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// A slice's own range bounds the addresses of a load (LRM 21.4: "When slice syntax is used in
+// the memory_name argument, any start_addr and finish_addr arguments shall fall within the
+// bounds of the slice's range"), so a start or finish outside it loads nothing and is reported.
+// iverilog 13 has no slice (it errors and loads nothing for a start or finish outside a whole
+// memory); the words a start and finish inside the slice place are those of the same load of a
+// whole memory.
+TEST_CASE("$readmem into a slice with a start or finish outside its range loads nothing") {
+    write_file("clotho_readmem_sl1.hex", "11 22\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] a [0:7];
+            logic [7:0] b [7:0];
+            logic [7:0] d [];
+            integer i, k;
+            task automatic fresh;
+                d = new[8];
+                for (i = 0; i < 8; i = i + 1) begin a[i] = 8'hxx; b[i] = 8'hxx; d[i] = 8'hxx; end
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h%h%h ", a[i], b[i], d[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; $readmemh("@S@", a[2:5], 6); show;
+                fresh; $readmemh("@S@", a[2:5], 1, 4); show;
+                fresh; $readmemh("@S@", a[2:5], 2, 6); show;
+                fresh; k = 1; $readmemh("@S@", a[k +: 3], 3); show;
+                fresh; $readmemh("@S@", b[5:2], 6); show;
+                fresh; $readmemh("@S@", d[2:5], 6); show;
+                fresh; $readmemh("@S@", a[2:5], 3, 4); $readmemh("@S@", b[5:2], 4, 3); $readmemh("@S@", d[2:5], 3, 4);
+                show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@S@", "clotho_readmem_sl1.hex");
+    const std::string none   = "xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx \n";
+    CHECK(run_capture(design) == none + none + none + none + none + none +
+                                   "xxxxxx xxxxxx xxxxxx 112211 221122 xxxxxx xxxxxx xxxxxx \n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [2:5]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address 1 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: finish address 6 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 3 is outside the slice range [0:2]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [5:2]") == 1);
+    CHECK(count_substr(err, "error:") == 6);
+    std::remove("clotho_readmem_sl1.hex");
+}
+
 // What a memory load still refuses, loudly: an associative array (LRM 21.4.1 makes its
 // addresses keys but does not say where a load that names none starts) and a slice of a
 // queue (7.10.1: a new queue, not a view of the queue).

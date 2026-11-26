@@ -931,12 +931,15 @@ void rt_fflush(int32_t desc);
 // the words are in a queue's ring: `mm_base` / `z_base` then point at its slot 0 and
 // the first word that exists is at slot `ring_head`, the next after it, wrapping at
 // `ring_cap` slots (rt_queue_slot). `flags` bit0=hex, bit1=has_start, bit2=has_finish,
-// bit3=four_state, bit4=path_forward, bit5=narrow (a 2-state memory of bare iW
-// leaves). Returns the number of leaves the load changed.
+// bit3=four_state, bit4=path_forward, bit5=narrow (a 2-state memory of bare iW leaves),
+// bit6=slice (`start` and `finish` have to lie in the declared range, or nothing is loaded).
+// An `@` address of the file outside the range the task names ends the load with an error,
+// the words before it staying loaded (LRM 21.4); `site` locates that and the load's other
+// diagnostics at the call (null for none). Returns the number of leaves the load changed.
 uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
                     uint32_t width, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
                     int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t ring_head, int64_t ring_cap,
-                    int64_t start, int64_t finish, uint32_t flags);
+                    int64_t start, int64_t finish, uint32_t flags, const rt_null_site* site);
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 //

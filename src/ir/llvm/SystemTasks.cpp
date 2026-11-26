@@ -1453,13 +1453,15 @@ void Backend::lower_readmem(Index i) {
 
     const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
                            (info.has_finish ? 4u : 0u) | (t.four_state ? 8u : 0u) |
-                           (fname_is_str ? 16u : 0u) | (!t.four_state ? 32u : 0u);
+                           (fname_is_str ? 16u : 0u) | (!t.four_state ? 32u : 0u) |
+                           (info.slice != kMemSliceNone ? 64u : 0u);
 
     llvm::Value* changed =
       b_.CreateCall(readmem_fn(),
                     { path, path_len, t.mm_base, t.z_base, b_.getInt32(t.stride), b_.getInt32(t.width),
                       t.inner.first, b_.getInt32(t.inner.second), t.left, t.right, t.lo_word, t.word_count,
-                      t.ring_head, t.ring_cap, start, finish, b_.getInt32(flags) });
+                      t.ring_head, t.ring_cap, start, finish, b_.getInt32(flags),
+                      null_site_global(loc_text(i), NullKind::Class) });
     finish_mem_load(t, changed, "readmem");
 }
 

@@ -126,7 +126,7 @@ TEST_CASE("rt_readmem with a null z_base loads values without touching z memory"
 
     uint8_t mm[4] = { 0xee, 0xee, 0xee, 0xee };
     rt_readmem(packed.data(), static_cast<uint32_t>(packed.size()), mm, nullptr, 2, 8, nullptr, 0, 0, 1, 0, 2, 0, 0, 0,
-               0, /*flags: hex, 2-state*/ 1);
+               0, /*flags: hex, 2-state*/ 1, nullptr);
 
     // must = may = value for a 2-state load: mm word is val | (val << 8).
     CHECK(mm[0] == 0xa5);
@@ -155,7 +155,7 @@ TEST_CASE("rt_readmem loads the words that exist and drops the others") {
 
     uint8_t mm[8] = { 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee };
     rt_readmem(packed.data(), size, mm + 2, nullptr, 2, 8, nullptr, 0, 0, 3, /*lo_word=*/1, /*word_count=*/2, 0, 0, 0, 0,
-               1);
+               1, nullptr);
     CHECK(mm[0] == 0xee);
     CHECK(mm[1] == 0xee);
     CHECK(mm[2] == 0xa2);
@@ -166,7 +166,7 @@ TEST_CASE("rt_readmem loads the words that exist and drops the others") {
     CHECK(mm[7] == 0xee);
 
     // A load that names no word changes nothing and reports nothing changed.
-    CHECK(rt_readmem(packed.data(), size, mm, nullptr, 2, 8, nullptr, 0, 0, 3, 0, 0, 0, 0, 0, 0, 1) == 0);
+    CHECK(rt_readmem(packed.data(), size, mm, nullptr, 2, 8, nullptr, 0, 0, 3, 0, 0, 0, 0, 0, 0, 1, nullptr) == 0);
     CHECK(mm[0] == 0xee);
     CHECK(mm[2] == 0xa2);
     std::remove(path);
@@ -191,7 +191,7 @@ TEST_CASE("rt_readmem walks the words of a queue's ring from its head slot") {
 
     uint8_t ring[8] = { 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee };
     CHECK(rt_readmem(packed.data(), size, ring, nullptr, 2, 8, nullptr, 0, 0, 2, 0, 3, /*ring_head=*/3, /*ring_cap=*/4,
-                     0, 0, 1) == 3);
+                     0, 0, 1, nullptr) == 3);
     CHECK(ring[0] == 0xa2);
     CHECK(ring[1] == 0xa2);
     CHECK(ring[2] == 0xa3);
@@ -205,7 +205,7 @@ TEST_CASE("rt_readmem walks the words of a queue's ring from its head slot") {
     // first of them on slot 0.
     uint8_t window[8] = { 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee };
     rt_readmem(packed.data(), size, window, nullptr, 2, 8, nullptr, 0, 0, 3, /*lo_word=*/1, /*word_count=*/2,
-               /*ring_head=*/0, /*ring_cap=*/4, 0, 0, 1);
+               /*ring_head=*/0, /*ring_cap=*/4, 0, 0, 1, nullptr);
     CHECK(window[0] == 0xa2);
     CHECK(window[1] == 0xa2);
     CHECK(window[2] == 0xa3);
