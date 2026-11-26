@@ -577,7 +577,6 @@ Milestones, in order; lower ones unblock higher ones:
   action block runs on the monitor's thread, not one of its own.
 - [ ] **Typeless mailbox** (15.4.9) — `dynamic_type` needs a dynamically typed element and a
   run-time type identity for the `get` check and `try_get`'s negative return.
-- [ ] **Class derived from `semaphore` or `mailbox`** — extending a built-in class.
 - [~] **Clocking blocks** (14) — open pieces of clocking-block support.
   - [ ] **Input skew other than `#1step`/`#0`, output skew other than `#0`** — needs a
     per-clockvar history keyed by time; an edge skew needs a second event per block.

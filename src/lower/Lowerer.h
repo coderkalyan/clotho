@@ -1462,6 +1462,18 @@ private:
 
     ir::Ref lower_mailbox_class(const slang::ast::ClassType& clt);
 
+    static uint32_t sync_body_fields(const slang::ast::ClassType& sync);
+
+    void push_sync_body(const slang::ast::ClassType& sync, std::vector<ir::FieldRow>& fields);
+
+    void emit_sync_ctor(const slang::ast::ClassType&       sync,
+                        std::span<const Expression* const> actuals,
+                        ir::Index                          handle,
+                        ir::Ref                            class_ref,
+                        slang::SourceLocation              where,
+                        ir::Builder&                       b,
+                        ir::SourceLoc                      l);
+
     ir::Ref lower_weak_class(const slang::ast::ClassType& clt);
 
     uint32_t weak_body_fields(const slang::ast::ClassType& weak) const;
@@ -1474,7 +1486,7 @@ private:
                         ir::Builder&                       b,
                         ir::SourceLoc                      l);
 
-    std::pair<ir::Index, ir::Ref> weak_receiver(const CallExpression& call, ir::Builder& b);
+    std::pair<ir::Index, ir::Ref> builtin_receiver(const CallExpression& call, ir::Builder& b);
 
     ir::Index weak_notifier_handle(const CallExpression& get, ir::Builder& b);
 
