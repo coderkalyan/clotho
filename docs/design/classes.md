@@ -820,9 +820,9 @@ an unrelated reason.
 ### Not notified this way
 
 - **An unpacked struct / union property**, and **a FIXED unpacked-array property**
-  have no one word to classify. They are waited on as a container is, through a
-  notifier that fires on any store into them ("Aggregate properties" below). `@` on
-  a whole aggregate is rejected by slang (`invalid type 'T' for event expression`).
+  have no one word to classify. Each has one any-change notifier for the whole of
+  it ("Waiting on an aggregate property" below). `@` on a whole aggregate is
+  rejected by slang (`invalid type 'T' for event expression`).
 - **An `event`-typed property** is excluded from the notified set on purpose:
   `@(obj.ev)` parks on the event OBJECT the property names, which is what `-> obj.ev`
   fires, so a notifier here would be a field nothing ever reads. The bare `@e` and
@@ -850,6 +850,23 @@ SystemVerilog offers no way to MAKE a non-null `chandle` without DPI, so the cha
 *transition* is not exercised end to end. What is pinned is that the property is
 notifiable, that its notifier is laid out, and that a `null -> null` store is not a
 change.
+
+## Waiting on an aggregate property (LRM 9.4.2.2 / 9.4.3)
+
+An unpacked struct, union or fixed unpacked-array property is one variable: a change
+anywhere in it wakes `@*` and `wait`. It carries one any-change notifier (no edges).
+`agg_member` keeps the property's notifier while descending, so a store to any leaf
+classifies its own old -> new change through the scalar bracket and fires it; a whole
+copy (`AggCopy`) compares bytes; a container inside fires on every mutation; a `ref`
+actual wakes through the same thunk. `@(obj.s.f)` and other compounds over properties
+wait in `lower_sampled_event_wait` (parked on the notifiers, then compared with a sample),
+which misses a change that reverts before the waiter runs (scheduler-rules R8/R9). `@(obj.s)`
+is no legal event expression (9.4.2: singular values). An event member is an event object
+like an event property's (`@`, `wait(.triggered)`, `->`, `->>` reach it); a trigger fires no
+notifier, its siblings' stores do. An event list with a compound term waits in the same loop,
+every term sampled and compared (LRM_NOTES 58), and each property any of its terms reads, a
+property named by itself included, carries an any-change notifier. A null handle in an
+explicit control is a located fatal where the wait begins (LRM 8.4); only `@*` parks on it.
 
 ## Waiting on an event property (LRM 9.4.2 over 15.5)
 
@@ -960,7 +977,8 @@ things:
   one of these too: the store of another event into it fires its notifier, and
   what a method reads through it (`e.triggered`) changes when an event is
   triggered, so its waiters also park on one notifier that every trigger in the
-  design fires (`Module::trigger_notify`, `emit_event_fire`).
+  design fires (hung on the event type by `declare_shared_notifiers`, fired by
+  `emit_event_fire`).
 - **Built-in classes.** `mailbox::num` and the `try_*` functions read the FIFO,
   `semaphore::try_get` the key count, `weak_reference::get` the referent,
   `process::status` the thread's state. Each class has one design-wide notifier,
@@ -976,21 +994,13 @@ A property nothing reaches through a call has no design-wide notifier and its
 stores are as they were, and a design in which no method reads an event property
 pays nothing at a trigger.
 
-### Aggregate properties
+### Fork-captured aggregates and events
 
-An unpacked struct, an unpacked union and a fixed unpacked array are waited on as
-a container is: one any-change notifier for the whole property, fired on mutation
-with no value compared (`is_notified_container`). The store path reaches it from
-any depth, because a member select below the property keeps the property's
-notifier (`Backend::agg_member`): a leaf store goes through the same bracket a
-store through a `ref` to a container does, a string leaf compares its characters,
-a nested container fires from its own mutation, and a whole-object copy fires
-from `emit_agg_copy`. A fork-captured aggregate automatic is the same thing, its
-box being a one-field object.
-
-Only what re-tests parks on such a notifier. A `wait` does, and an `@` over an
-expression of the aggregate is sampled (below). No `@` names an aggregate whole:
-"event expressions shall return singular values" (9.4.2).
+A capture box is a one-field object, so a fork-captured unpacked struct, union or
+fixed array takes the notifier an aggregate property has ("Waiting on an aggregate
+property" above), and a wait on a member of one parks on it. A captured `event` has
+no notifier and needs none: a wait that reads its `triggered` parks on the object
+it holds, as for an event property.
 
 ### `@` as a sampled wait
 
@@ -1013,21 +1023,27 @@ the new value's least significant bits. `iff` is tested when a member's event is
 detected, and in a list each member has its own sample.
 
 The sample is a value of the loop body, so each thread forked at one `@` has its
-own.
+own. A string is copied into a cell, as reading a string place yields the place. A
+real compares by bit pattern, as a real signal's store does.
 
-A lone property (`@(c.p)`) and a lone `w.get()` are not sampled: each has an
-object notifier that fires on exactly the named change.
+A lone property (`@(c.p)`), a lone `w.get()` and a lone virtual-interface member are
+not sampled alone: each has a source that fires on exactly the named change. In a
+list with a sampled term they are compared with a sample like the rest
+(`classify_event_control`).
 
 ### Not done
 
-Both are refused (`event_signal`):
+Both are refused:
 
-- A list that mixes a sampled member with an unsampled one (`@(c.get() or posedge
-  clk)`). A woken process cannot tell which member woke it, so it cannot tell the
-  clock's edge from a wake that changed no sample.
-- An event control of a nonblocking intra-assignment or of `->>`, and a clocking
-  event of a covergroup or a clocking block, over such an expression. Those are
-  records and clocks, not a process that could sample.
+- A list that mixes a sampled term with a signal or an event (`@(c.get() or posedge
+  clk)`). A woken process cannot tell which term woke it, so it cannot tell the
+  clock's edge from a wake that changed no sample. `lower_event_wait` refuses a term
+  that reads a property or a virtual-interface member, `event_signal` one that only
+  calls a method.
+- An event control of a nonblocking intra-assignment or of `->>`
+  (`refuse_detached_member_event`, `event_signal`), and a clocking event of a
+  covergroup or a clocking block, over such an expression. Those are records and
+  clocks, not a process that could sample.
 
 ## Implementation deviations from the scope-out below
 

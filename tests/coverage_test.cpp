@@ -285,6 +285,48 @@ TEST_CASE("coverpoint weights scale the covergroup average (LRM 19.7, 19.11)") {
     CHECK(out.find("cov=75.000000") != std::string::npos);
 }
 
+// LRM 19.7.1, 19.11.3: type_option.weight is not option.weight.
+// - cgp: a coverpoint's type option weights it only in the merged type form, so
+//   the instance average is (50 + 100)/2 = 75, not (3*50 + 100)/4 = 62.5.
+// - g5: option.weight weights an instance inside its type's average, and the
+//   type's weight in $get_coverage is its type_option.weight (default 1).
+// - g1: option.weight 0 leaves its type nothing to average, so it stays out of
+//   $get_coverage and get_coverage() is 0.0 by 19.11 (b) at type weight 1.
+// $get_coverage is (75 + 50 + 100)/3 = 75; folding the two weights gave 62.5.
+// No oracle: iverilog has no functional coverage; values follow from the clauses.
+TEST_CASE("type_option.weight weights only type coverage (LRM 19.7.1, 19.11.3)") {
+    const std::string out = run_capture(R"(
+        module m;
+          bit a = 0, b = 0;
+          covergroup cgp;
+             cpA: coverpoint a { bins a0 = {0}; bins a1 = {1}; type_option.weight = 3; }
+             cpB: coverpoint b { bins b0 = {0}; }
+          endgroup
+          covergroup g1;
+             option.weight = 0;
+             coverpoint a { bins a0 = {0}; bins a1 = {1}; }
+          endgroup
+          covergroup g5;
+             option.weight = 3;
+             coverpoint a { bins a0 = {0}; bins a1 = {1}; }
+          endgroup
+          covergroup g3;
+             coverpoint b { bins b0 = {0}; }
+          endgroup
+          cgp p = new;
+          g1 c1 = new;
+          g5 c5 = new;
+          g3 c3 = new;
+          initial begin
+             p.sample(); c1.sample(); c5.sample(); c3.sample();
+             $display("inst=%0f g1=%0f all=%0f", p.get_inst_coverage(), c1.get_coverage(), $get_coverage());
+             $finish;
+          end
+        endmodule
+    )");
+    CHECK(out.find("inst=75.000000 g1=0.000000 all=75.000000") != std::string::npos);
+}
+
 // LRM 19.7 Table 19-1: at_least is the minimum hit count for a bin to count as
 // covered, and the covergroup level supplies the default for its coverpoints
 // (Table 19-2).
@@ -754,14 +796,14 @@ TEST_CASE("an unsupported coverage option is refused by name (LRM 19.7)") {
         module m;
           bit [1:0] v;
           covergroup cg;
-             option.comment = "hello";
+             type_option.strobe = 1;
              cp: coverpoint v;
           endgroup
           cg c = new;
           initial begin c.sample(); $finish; end
         endmodule
     )");
-    CHECK(d.find("coverage option 'comment'") != std::string::npos);
+    CHECK(d.find("coverage option 'type_option.strobe'") != std::string::npos);
 }
 
 // The coverage database of LRM 19.9 has no specified format, so the four database
@@ -1220,8 +1262,8 @@ TEST_CASE("coverage: cover statements print nothing without --coverage") {
 }
 
 // With the default `option.per_instance = 0` the report lists a covergroup's type line
-// alone (LRM 19.7: instance data is saved only when per_instance is 1 [unverified
-// wording]); get_inst_coverage() still answers. With 1, the instance lines appear.
+// alone (LRM 19.7 Table 19-1: true saves and reports the instance; false does not require
+// it); get_inst_coverage() still answers. With 1, the instance lines appear.
 TEST_CASE("coverage: per-instance lines appear only when option.per_instance is 1") {
     constexpr std::string_view src = R"(
         module top;
@@ -1242,4 +1284,212 @@ TEST_CASE("coverage: per-instance lines appear only when option.per_instance is 
     CHECK(report.find("type off_cg  coverage  50.00%") != std::string::npos);
     CHECK(report.find("type on_cg  coverage  50.00%") != std::string::npos);
     CHECK(run_capture(src) == "50.000000 50.000000\n");
+}
+
+// -- Coverpoint methods, type-name calls and the remaining options -------------
+
+// LRM 19.8 and 19.11.3: get_coverage() by type name, and the coverpoint forms. Two
+// instances each hit one of the four automatic bins of `cp`, so every instance and
+// the type are at 25%; the type's bin counts are the sums over the instances
+// (covered 2, total 8). Oracle: the clause text and its worked example (iverilog 13
+// has no covergroups).
+TEST_CASE("coverage: get_coverage by type name and on a coverpoint (LRM 19.8)") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x;
+          covergroup cg; cp: coverpoint x; endgroup
+          cg c1 = new, c2 = new;
+          int cov, tot, icov, itot;
+          initial begin
+            x = 0; c1.sample();
+            x = 1; c2.sample();
+            $display("%0.1f %0.1f", cg::get_coverage(), c1.get_coverage());
+            $display("%0.1f %0.1f %0.1f", c1.cp.get_coverage(), c1.cp.get_inst_coverage(), cg::cp::get_coverage());
+            cg::cp::get_coverage(cov, tot);
+            c1.cp.get_inst_coverage(icov, itot);
+            $display("%0d %0d %0d %0d", cov, tot, icov, itot);
+          end
+        endmodule
+    )") == "25.0 25.0\n25.0 25.0 25.0\n2 8 1 4\n");
+}
+
+// start() / stop() on one coverpoint of one instance (LRM 19.8, Table 19-5).
+TEST_CASE("coverage: stop and start on a coverpoint") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x, y;
+          covergroup cg; a: coverpoint x; b: coverpoint y; endgroup
+          cg c = new;
+          initial begin
+            c.a.stop();
+            x = 1; y = 1; c.sample();
+            $display("%0.1f %0.1f", c.a.get_inst_coverage(), c.b.get_inst_coverage());
+            c.a.start();
+            c.sample();
+            $display("%0.1f %0.1f", c.a.get_inst_coverage(), c.b.get_inst_coverage());
+          end
+        endmodule
+    )") == "0.0 25.0\n25.0 25.0\n");
+}
+
+// option.name names the instance, option.comment and type_option.comment appear in
+// the report (LRM 19.7, 19.7.1), and option.get_inst_coverage is accepted and, with
+// merge_instances false, changes nothing (Table 19-1).
+TEST_CASE("coverage: option.name, comments and get_inst_coverage") {
+    const std::string report = report_of(R"(
+        module t;
+          bit [1:0] x;
+          covergroup cg;
+            option.name = "mycg";
+            option.comment = "inst \"c\"";
+            type_option.comment = "type c";
+            option.per_instance = 1;
+            option.get_inst_coverage = 1;
+            cp: coverpoint x { option.comment = "cp c"; type_option.comment = "cp type c"; }
+          endgroup
+          cg c1 = new;
+          initial begin x = 1; c1.sample(); end
+        endmodule
+    )");
+    CHECK(report.find("  instance mycg  coverage  25.00%  bins 1/4  comment \"inst \\\"c\\\"\"") != std::string::npos);
+    CHECK(report.find("    coverpoint cp  coverage  25.00%  bins 1/4  comment \"cp c\"") != std::string::npos);
+    CHECK(report.find("instances 1  comment \"type c\"") != std::string::npos);
+    CHECK(report.find("  type coverpoint cp  coverage  25.00%  bins 1/4  comment \"cp type c\"") != std::string::npos);
+}
+
+// option.detect_overlap warns for two bins sharing a value, once per pair, and not
+// for ignore_bins (LRM 19.7 Table 19-1) or when the option is off.
+TEST_CASE("coverage: detect_overlap warns on overlapping bins") {
+    const std::string src_on = R"(
+        module t;
+          bit [3:0] v;
+          covergroup cg;
+            coverpoint v { option.detect_overlap = 1; bins a = {[0:5]}; bins b = {[3:8]}; bins c = {9};
+                           ignore_bins ig = {[0:2]}; }
+          endgroup
+          cg c1 = new;
+        endmodule
+    )";
+    const LowerResult on = lower_text(src_on);
+    REQUIRE_MESSAGE(on.ok, on.diagnostic_text());
+    const std::string d = on.diagnostic_text();
+    CHECK(d.find("bins 'a' and 'b'") != std::string::npos);
+    CHECK(d.find("values 3:5") != std::string::npos);
+    CHECK(d.find("'ig'") == std::string::npos);
+    const LowerResult off = lower_text(R"(
+        module t;
+          bit [3:0] v;
+          covergroup cg; coverpoint v { bins a = {[0:5]}; bins b = {[3:8]}; } endgroup
+          cg c1 = new;
+        endmodule
+    )");
+    REQUIRE(off.ok);
+    CHECK(off.diagnostic_text().find("overlap") == std::string::npos);
+}
+
+// -- Options assigned after instantiation (LRM 19.7) ---------------------------
+
+// 19.7: "Other instance-specific options can be assigned procedurally after a covergroup
+// has been instantiated", and 19.11: the covergroup's coverage is the weighted average of
+// its coverpoints'. `a` is fully covered and `b` is at 25%, so equal weights give 62.5,
+// weight 3 on b gives (100 + 3*25)/4 = 43.75, and weight 0 on a leaves b alone (25).
+// Oracle: the clause text and equations (iverilog 13 has no covergroups).
+TEST_CASE("coverage: coverpoint weight assigned procedurally (LRM 19.7, 19.11)") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x, y;
+          covergroup cg; a: coverpoint x; b: coverpoint y; endgroup
+          cg c = new;
+          initial begin
+            for (int i = 0; i < 4; i++) begin x = i; y = 0; c.sample(); end
+            $display("%0.2f %0d", c.get_inst_coverage(), c.b.option.weight);
+            c.b.option.weight = 3;
+            $display("%0.2f %0d", c.get_inst_coverage(), c.b.option.weight);
+            c.a.option.weight = 0;
+            $display("%0.2f", c.get_inst_coverage());
+          end
+        endmodule
+    )") == "62.50 1\n43.75 3\n25.00\n");
+}
+
+// at_least on a coverpoint (19.11.1: a bin is covered once hit at_least times), and at the
+// covergroup level it is the default the coverpoints took, so a coverpoint the definition
+// gave its own value keeps it.
+TEST_CASE("coverage: at_least assigned procedurally") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x, y;
+          covergroup cg; a: coverpoint x; b: coverpoint y { option.at_least = 5; } endgroup
+          cg c = new;
+          initial begin
+            x = 1; y = 1; c.sample(); c.sample();
+            $display("%0.1f %0.1f", c.a.get_inst_coverage(), c.b.get_inst_coverage());
+            c.a.option.at_least = 3;
+            $display("%0.1f", c.a.get_inst_coverage());
+            c.a.option.at_least = 2;
+            $display("%0.1f", c.a.get_inst_coverage());
+            c.option.at_least = 4;
+            $display("%0d %0d %0d", c.option.at_least, c.a.option.at_least, c.b.option.at_least);
+          end
+        endmodule
+    )") == "25.0 0.0\n0.0\n25.0\n4 2 5\n");
+}
+
+// Type coverage weights each instance by its own option.weight (19.11.3): c1 is 100%, c2
+// 0% with weight 3, so the type is (1*100 + 3*0) / 4.
+TEST_CASE("coverage: covergroup instance weight assigned procedurally") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x;
+          covergroup cg; cp: coverpoint x; endgroup
+          cg c1 = new, c2 = new;
+          initial begin
+            for (int i = 0; i < 4; i++) begin x = i; c1.sample(); end
+            c2.option.weight = 3;
+            $display("%0.1f %0d %0d", cg::get_coverage(), c2.option.weight, c1.option.weight);
+          end
+        endmodule
+    )") == "25.0 3 1\n");
+}
+
+// name and comment assigned after the fact reach the report, and read back; the options
+// only the definition may set read back as the definition left them.
+TEST_CASE("coverage: name and comment assigned procedurally, immutable options read back") {
+    const std::string src = R"(
+        module t;
+          bit [1:0] x;
+          covergroup cg;
+            option.per_instance = 1;
+            option.get_inst_coverage = 1;
+            cp: coverpoint x { option.auto_bin_max = 2; }
+          endgroup
+          cg c = new;
+          initial begin
+            c.option.name = "renamed";
+            c.option.comment = "late";
+            c.cp.option.comment = "cp late";
+            $display("%s|%s|%s", c.option.name, c.option.comment, c.cp.option.comment);
+            $display("%0d %0d %0d %0d", c.option.per_instance, c.option.get_inst_coverage,
+                     c.cp.option.auto_bin_max, c.option.auto_bin_max);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "renamed|late|cp late\n1 1 2 64\n");
+    const std::string report = report_of(src);
+    CHECK(report.find("  instance renamed  coverage") != std::string::npos);
+    CHECK(report.find("comment \"late\"") != std::string::npos);
+    CHECK(report.find("comment \"cp late\"") != std::string::npos);
+}
+
+// The options only the definition may set (Table 19-2 and 19.7) are a compile error.
+TEST_CASE("coverage: a definition-only option cannot be assigned procedurally") {
+    const LowerResult r = lower_text(R"(
+        module t;
+          bit [1:0] x;
+          covergroup cg; cp: coverpoint x; endgroup
+          cg c = new;
+          initial c.option.per_instance = 1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
 }

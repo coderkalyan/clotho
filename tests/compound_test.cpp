@@ -140,30 +140,111 @@ TEST_CASE("compound assignment as a for-step") {
     CHECK(run_capture(src) == "10\n");
 }
 
-// Unsupported compound-assignment lvalue shapes must fail loudly, not silently
-// mis-lower (PRINCIPLES.md: never silently accept an unimplemented construct).
-TEST_CASE("compound assignment to a concatenation is rejected") {
-    const LowerResult r = lower_text(R"(
+// `{a, b} op= x` is `{a, b} = {a, b} op x` with the operands evaluated once (LRM
+// 11.4.1, 11.4.12): the concatenation reads as one unsigned vector, the result
+// truncates to its width, and the leftmost operand takes the most significant
+// bits. Expected values cross-checked against iverilog 13 (every operator, carry
+// between operands, a signed and a part-selected operand, nesting, and the single
+// evaluation of `mw[i++]`).
+TEST_CASE("compound assignment to a concatenation applies every operator") {
+    constexpr std::string_view src = R"(
         module m;
-            logic [3:0] a, b;
-            initial begin {a, b} += 1; end
+            logic [3:0] a, b, c;
+            logic signed [3:0] sa;
+            logic [7:0] w;
+            logic [7:0] mw [0:3];
+            int i;
+            initial begin
+                a = 4'h2; b = 4'h5; {a, b} += 8'd9;   $display("+= %h%h", a, b);
+                {a, b} -= 8'd100;                      $display("-= %h%h", a, b);
+                a = 4'h1; b = 4'h3; {a, b} *= 8'd5;    $display("*= %h%h", a, b);
+                {a, b} /= 8'd4;                        $display("/= %h%h", a, b);
+                a = 4'h1; b = 4'h3; {a, b} %= 8'd7;    $display("%%= %h%h", a, b);
+                a = 4'hC; b = 4'hA; {a, b} &= 8'h3C;   $display("&= %h%h", a, b);
+                {a, b} |= 8'h81;                       $display("|= %h%h", a, b);
+                {a, b} ^= 8'hFF;                       $display("^= %h%h", a, b);
+                a = 4'h8; b = 4'h1; {a, b} <<= 3;      $display("<<= %h%h", a, b);
+                a = 4'h8; b = 4'h1; {a, b} >>= 3;      $display(">>= %h%h", a, b);
+                a = 4'h8; b = 4'h1; {a, b} <<<= 1;     $display("<<<= %h%h", a, b);
+                a = 4'h8; b = 4'h1; {a, b} >>>= 1;     $display(">>>= %h%h", a, b);
+                a = 4'hF; b = 4'hF; {a, b} += 1;       $display("wrap %h%h", a, b);
+                a = 4'h0; b = 4'hF; {a, b} += 1;       $display("carry %h%h", a, b);
+                a = 4'h1; b = 4'h2; c = 4'h3; {a, b, c} += 12'h0FF; $display("three %h%h%h", a, b, c);
+                sa = -4'sd2; b = 4'h0; {sa, b} += 1;   $display("signed %h%h", sa, b);
+                sa = 4'sh7; b = 4'hF; {sa, b} >>>= 1;  $display("signed>>> %h%h", sa, b);
+                w = 8'h0F; a = 4'h0; {w[7:4], a} += 8'h11; $display("part %h %h", w, a);
+                a = 4'h0; b = 4'hF; c = 4'hF; {a, {b, c}} += 1; $display("nested %h%h%h", a, b, c);
+                mw[0] = 8'h12; mw[1] = 8'h34; b = 4'h0; i = 0;
+                {mw[i++], b} -= 1;                     $display("once %h %h i=%0d", mw[0], b, i);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostic_text().find("compound assignment to a concatenation") != std::string::npos,
-                  r.diagnostic_text());
+    )";
+    CHECK(run_capture(src) ==
+          "+= 2e\n-= ca\n*= 5f\n/= 17\n%= 05\n&= 08\n|= 89\n^= 76\n<<= 08\n>>= 10\n<<<= 02\n>>>= 40\n"
+          "wrap 00\ncarry 10\nthree 222\nsigned e1\nsigned>>> 3f\npart 1f 1\nnested 100\nonce 11 f i=1\n");
 }
 
-TEST_CASE("compound assignment to a string element is rejected") {
-    const LowerResult r = lower_text(R"(
+// `++` / `--` on a concatenation are `{a, b} = {a, b} +/- 1` (LRM 11.4.2): the
+// post form yields the old value, the pre form the new one, and a compound
+// assignment used as a value yields the concatenation after the store (11.3.1).
+// No oracle runs these: iverilog 13 rejects `{a, b}++` and an assignment as an
+// operand, so the values are worked out from the clauses.
+TEST_CASE("increment, decrement and the value of a compound assignment to a concatenation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            int z;
+            initial begin
+                a = 4'h1; b = 4'h2; z = ({a, b} += 8'd1); $display("value %0d %h%h", z, a, b);
+                a = 4'h0; b = 4'hF; {a, b}++;             $display("inc %h%h", a, b);
+                {a, b}--;                                 $display("dec %h%h", a, b);
+                a = 4'h0; b = 4'hF; z = {a, b}++;         $display("post %0d %h%h", z, a, b);
+                a = 4'h0; b = 4'hF; z = ++{a, b};         $display("pre %0d %h%h", z, a, b);
+                a = 4'hF; b = 4'hF; {a, b}++;             $display("wrap %h%h", a, b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "value 19 13\ninc 10\ndec 0f\npost 15 10\npre 16 10\nwrap 00\n");
+}
+
+// `s[i] op= x` is `s[i] = s[i] op x`, a character read being `getc` and a write
+// `putc` (LRM 6.16, 11.4.1): an index outside the string, or a byte of zero written,
+// leaves the string as it was, and the index expression runs once. iverilog 13
+// aborts on a compound assignment to a string element, so the values are worked
+// out from 6.16.2 and 6.16.3: 'h' + 1 = 'i', 'l' - 1 = 'k', 'a' ^ 0x20 = 'A'.
+TEST_CASE("compound assignment to a string element") {
+    constexpr std::string_view src = R"(
         module m;
             string s;
-            initial begin s = "hi"; s[0] += 1; end
+            int i, r;
+            initial begin
+                s = "hal";
+                s[0] += 1;
+                s[2] -= 1;
+                $display("%s", s);
+                i = 1;
+                s[i] ^= 8'h20;
+                $display("%s %0d", s, i);
+                s[5] += 1;
+                s[-1] += 1;
+                $display("%s", s);
+                s = "ab"; i = 0;
+                s[i++] += 1;
+                $display("%s %0d", s, i);
+                s = "a"; r = s[0]++;
+                $display("%s %0d", s, r);
+                r = ++s[0];
+                $display("%s %0d", s, r);
+                r = s[0]--;
+                $display("%s %0d", s, r);
+                s = "\xff"; s[0]++;
+                $display("%0d", s[0] & 8'hff);
+                s = "a"; s[0] <<= 1;
+                $display("%0d", s[0] & 8'hff);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostic_text().find("compound assignment to a string") != std::string::npos,
-                  r.diagnostic_text());
+    )";
+    CHECK(run_capture(src) == "iak\niAk 1\niAk\nbb 1\nb 97\nc 99\nb 99\n255\n194\n");
 }
 
 // An assignment used as an rvalue yields the LHS after the store, truncated to

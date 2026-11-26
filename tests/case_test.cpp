@@ -1232,40 +1232,32 @@ TEST_CASE("unique case inside: overlapping members of the same item is not a vio
     CHECK(run_capture(src) == "A\n");
 }
 
-// A range with a tolerance bound (LRM 11.4.13's `+/-` / `+%-`) is a documented
-// gap -- guarded loudly rather than silently mis-simulated.
-TEST_CASE("case inside: tolerance range bound is reported as unsupported") {
-    const LowerResult r = lower_text(R"(
+// `$` range bounds and string ranges of `case ... inside` (LRM 12.5.4 over
+// 11.4.13): `[$:hi]` is "at most hi", `[lo:$]` "at least lo", a string range is
+// lexicographic (6.16.9). iverilog 13 cannot parse these; expectations are the LRM's.
+TEST_CASE("case inside: unbounded and string range bounds") {
+    constexpr std::string_view src = R"(
         module m;
             int x;
+            string s;
             initial begin
-                x = 5;
-                case (x) inside
-                    [3 +/- 2]: $display("hit");
-                    default:   $display("miss");
+                for (x = 0; x < 20; x += 3)
+                    case (x) inside
+                        [$:3]:   $write("L");
+                        [15:$]:  $write("H");
+                        default: $write(".");
+                    endcase
+                $display("");
+                s = "dog";
+                case (s) inside
+                    ["a":"c"]: $display("a-c");
+                    ["d":"f"]: $display("d-f");
+                    default:   $display("none");
                 endcase
             end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-}
-
-// An unbounded (`$`) range bound is likewise a documented gap.
-TEST_CASE("case inside: unbounded range bound is reported as unsupported") {
-    const LowerResult r = lower_text(R"(
-        module m;
-            int x;
-            initial begin
-                x = 5;
-                case (x) inside
-                    [$:10]:  $display("hit");
-                    default: $display("miss");
-                endcase
-            end
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("unbounded") != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "LL...HH\nd-f\n");
 }
 
 // -- Recursive switch segmentation (find_switch_run) --
@@ -1961,6 +1953,70 @@ TEST_CASE("unique / priority report: a fork child flushes its own reports at its
         )");
         CHECK_EQ(count_occ(err, "not unique"), 1u);
     }
+}
+
+// -- `disable` is a flush point of a deferred assertion's report (LRM 16.4.4), not of a violation report --
+//
+// 12.4.2.1 lists two flush points for a unique/priority report and a disable of the outermost scope is
+// neither, so the report matures in the Observed region, also in a process that holds an `assert #0`
+// whose report the same disable drops. A disable of a non-outermost block flushes neither (16.4.4).
+// Expected output is derived from those clauses; no oracle is available (iverilog ignores `unique`).
+TEST_CASE("unique / priority report: a disable of the outermost scope does not flush it") {
+    constexpr std::string_view self = R"(
+        module t;
+          logic a = 1, b = 1;
+          initial begin : blk
+            ASSERT
+            unique if (a) ; else if (b) ;
+            disable blk;
+          end
+        endmodule
+    )";
+    constexpr std::string_view remote = R"(
+        module t;
+          logic a = 1, b = 1;
+          initial begin : blk
+            ASSERT
+            unique if (a) ; else if (b) ;
+            @(posedge a);
+          end
+          initial begin #0; disable blk; end
+        endmodule
+    )";
+    constexpr std::string_view assert_stmt = "assert #0 (a == 0) else $error(\"deferred fail\");";
+    for (const std::string_view design : { self, remote }) {
+        const auto with = [&](std::string_view assertion) {
+            std::string d(design);
+            d.replace(d.find("ASSERT"), 6, assertion);
+
+            return run_capture_stderr(d);
+        };
+        SUBCASE("without a deferred assertion") {
+            CHECK_EQ(count_occ(with(""), "not unique"), 1u);
+        }
+        SUBCASE("with a deferred assertion, whose report the disable drops") {
+            const std::string err = with(assert_stmt);
+            CHECK_EQ(count_occ(err, "not unique"), 1u);
+            CHECK_EQ(count_occ(err, "deferred fail"), 0u);
+        }
+    }
+}
+
+TEST_CASE("unique / priority report: a disable of a non-outermost block flushes no report") {
+    const std::string err = run_capture_stderr(R"(
+        module t;
+          logic a = 1, b = 1;
+          initial begin : outer
+            begin : inner
+              assert #0 (a == 0) else $error("deferred fail");
+              unique if (a) ; else if (b) ;
+              disable inner;
+            end
+          end
+        endmodule
+    )");
+    CHECK_EQ(count_occ(err, "not unique"), 1u);
+    CHECK_EQ(count_occ(err, "deferred fail"), 1u);
 }
 
 // -- A write through a `ref` formal wakes its waiters at the write (LRM 9.4.2, 13.5.2) --

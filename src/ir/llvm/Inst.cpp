@@ -179,6 +179,7 @@ bool Backend::produces_string_temp(Index i) {
             return true;
         // `p.get_randstate()` renders a fresh string (LRM 9.7); every other
         // process query yields a word.
+        case Inst::Tag::CoverQuery:
         case Inst::Tag::ProcQuery:
             return type_of(i).is_string;
         case Inst::Tag::Constant:
@@ -1984,7 +1985,9 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::DeferFlush:
             // LRM 16.4.4: disabling a procedure's outermost scope drops its
             // pending deferred reports. Same generation bump an activation start
-            // does, so a report queued before this point never matures. A target
+            // does, so a report queued before this point never matures, but into the
+            // counter's high half: a unique/priority violation report compares only
+            // the low half (LRM 12.4.2.1 has no disable flush point). A target
             // id names ANOTHER procedure's counter -- the remote case, where the
             // reports to drop are not this group's.
             if (p.label == kNoDisableTarget && cur_fn_ != nullptr) {
@@ -2004,8 +2007,11 @@ void Backend::lower_inst(Index i) {
                 }
             } else if (p.label == kNoDisableTarget) {
                 emit_defer_gen_bump();
+            } else if (p.label == kDisableOwnTarget) {
+                emit_defer_gen_bump_at(defer_gen_ptr(), kGenDisableBump);
             } else {
-                emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));
+                emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]),
+                                       kGenDisableBump);
             }
             return;
         case Inst::Tag::DisableAbort:

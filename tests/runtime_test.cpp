@@ -125,14 +125,93 @@ TEST_CASE("rt_readmem with a null z_base loads values without touching z memory"
     }
 
     uint8_t mm[4] = { 0xee, 0xee, 0xee, 0xee };
-    rt_readmem(packed.data(), static_cast<uint32_t>(packed.size()), mm, nullptr, 2, 2, 8, 0, 1, 0, 0,
-               /*flags: hex, 2-state*/ 1);
+    rt_readmem(packed.data(), static_cast<uint32_t>(packed.size()), mm, nullptr, 2, 8, nullptr, 0, 0, 1, 0, 2, 0, 0, 0,
+               0, /*flags: hex, 2-state*/ 1, nullptr);
 
     // must = may = value for a 2-state load: mm word is val | (val << 8).
     CHECK(mm[0] == 0xa5);
     CHECK(mm[1] == 0xa5);
     CHECK(mm[2] == 0x3c);
     CHECK(mm[3] == 0x3c);
+    std::remove(path);
+}
+
+TEST_CASE("rt_readmem loads the words that exist and drops the others") {
+    // A memory [0:3] of which only the words at positions 1 and 2 have storage, as a
+    // slice that hangs off its array leaves (LRM 7.4.5): the pointer is at position 1,
+    // and the file's words 0 and 3 fall outside. Two-byte slots, no z word.
+    const std::string path_s =
+      (std::filesystem::temp_directory_path() / (clotho::test::detail::unique_stem() + ".hex")).string();
+    const char* path = path_s.c_str();
+    std::FILE*  f    = std::fopen(path, "wb");
+    REQUIRE(f != nullptr);
+    std::fputs("a1 a2 a3 a4\n", f);
+    std::fclose(f);
+    std::vector<char> packed;
+    for (size_t k = std::strlen(path); k-- > 0;) {
+        packed.push_back(path[k]);
+    }
+    const auto size = static_cast<uint32_t>(packed.size());
+
+    uint8_t mm[8] = { 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee };
+    rt_readmem(packed.data(), size, mm + 2, nullptr, 2, 8, nullptr, 0, 0, 3, /*lo_word=*/1, /*word_count=*/2, 0, 0, 0, 0,
+               1, nullptr);
+    CHECK(mm[0] == 0xee);
+    CHECK(mm[1] == 0xee);
+    CHECK(mm[2] == 0xa2);
+    CHECK(mm[3] == 0xa2);
+    CHECK(mm[4] == 0xa3);
+    CHECK(mm[5] == 0xa3);
+    CHECK(mm[6] == 0xee);
+    CHECK(mm[7] == 0xee);
+
+    // A load that names no word changes nothing and reports nothing changed.
+    CHECK(rt_readmem(packed.data(), size, mm, nullptr, 2, 8, nullptr, 0, 0, 3, 0, 0, 0, 0, 0, 0, 1, nullptr) == 0);
+    CHECK(mm[0] == 0xee);
+    CHECK(mm[2] == 0xa2);
+    std::remove(path);
+}
+
+TEST_CASE("rt_readmem walks the words of a queue's ring from its head slot") {
+    // A queue of three two-byte words in a ring of four slots, whose head is the last:
+    // word 0 is on slot 3, word 1 wraps to slot 0 and word 2 is on slot 1; slot 2 is not
+    // one of its words.
+    const std::string path_s =
+      (std::filesystem::temp_directory_path() / (clotho::test::detail::unique_stem() + ".hex")).string();
+    const char* path = path_s.c_str();
+    std::FILE*  f    = std::fopen(path, "wb");
+    REQUIRE(f != nullptr);
+    std::fputs("a1 a2 a3 a4\n", f);
+    std::fclose(f);
+    std::vector<char> packed;
+    for (size_t k = std::strlen(path); k-- > 0;) {
+        packed.push_back(path[k]);
+    }
+    const auto size = static_cast<uint32_t>(packed.size());
+
+    uint8_t ring[8] = { 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee };
+    CHECK(rt_readmem(packed.data(), size, ring, nullptr, 2, 8, nullptr, 0, 0, 2, 0, 3, /*ring_head=*/3, /*ring_cap=*/4,
+                     0, 0, 1, nullptr) == 3);
+    CHECK(ring[0] == 0xa2);
+    CHECK(ring[1] == 0xa2);
+    CHECK(ring[2] == 0xa3);
+    CHECK(ring[3] == 0xa3);
+    CHECK(ring[4] == 0xee);
+    CHECK(ring[5] == 0xee);
+    CHECK(ring[6] == 0xa1);
+    CHECK(ring[7] == 0xa1);
+
+    // The words that exist may be a window of the array: positions 1 and 2 of [0:3], the
+    // first of them on slot 0.
+    uint8_t window[8] = { 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee };
+    rt_readmem(packed.data(), size, window, nullptr, 2, 8, nullptr, 0, 0, 3, /*lo_word=*/1, /*word_count=*/2,
+               /*ring_head=*/0, /*ring_cap=*/4, 0, 0, 1, nullptr);
+    CHECK(window[0] == 0xa2);
+    CHECK(window[1] == 0xa2);
+    CHECK(window[2] == 0xa3);
+    CHECK(window[3] == 0xa3);
+    CHECK(window[4] == 0xee);
+    CHECK(window[6] == 0xee);
     std::remove(path);
 }
 

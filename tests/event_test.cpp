@@ -2304,3 +2304,562 @@ TEST_CASE("a task that waits cannot be called from always_comb or always_ff") {
     )");
     CHECK(ff.find("blocking timing controls") != std::string::npos);
 }
+
+// An implicit event control `@*` before a statement of a procedural body (LRM
+// 9.4.2.2): wait for a change in any net or variable that statement reads, so a
+// statement that reads nothing gives an empty list and the process never wakes (the
+// LRM names no other outcome; iverilog 13 warns "@* found no sensitivities so it
+// will never trigger"). Expected output from iverilog 13 on each of these four.
+TEST_CASE("implicit @* before a statement that reads nothing parks the process") {
+    const std::string out = run_capture(R"(
+        module top;
+          initial begin
+            $display("before");
+            @* $display("never");
+            $display("after");
+          end
+          initial #10 $display("done %0t", $time);
+        endmodule
+    )");
+    CHECK(out == "before\ndone 10\n");
+}
+
+// The list is what the statement READS, and an identifier that only names the
+// target of an assignment is left out: y is written by another process at 1 without
+// waking the controlled statement, a changes at 2 and does.
+TEST_CASE("implicit @* waits on the operands of the statement it controls") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [3:0] a, b, y;
+          initial begin
+            a = 1; b = 2;
+            @* y = a + b;
+            $display("woke %0t y=%0d", $time, y);
+          end
+          initial begin #1 y = 9; #1 a = 5; end
+        endmodule
+    )");
+    CHECK(out == "woke 2 y=7\n");
+}
+
+// LRM 9.4.2.2 example 3: `@* begin @(i) kid = b; end` is `@(b)`: an identifier that
+// appears only in a timing control inside the statement is not added.
+TEST_CASE("implicit @* leaves out an identifier that only appears in a timing control") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic i = 0, b = 0, kid = 0;
+          initial begin
+            @* begin @(i) kid = b; end
+            $display("kid=%b %0t", kid, $time);
+          end
+          initial begin #1 i = 1; #1 b = 1; #1 i = 0; #1 i = 1; end
+        endmodule
+    )");
+    CHECK(out == "kid=1 3\n");
+}
+
+// LRM 9.4.2.2 example 4: the outer `@*` of the always block is `@(a or b or c or d)`
+// and the inner one, over `x = c ^ d`, is `@(c or d)`.
+TEST_CASE("implicit @* nested in an always @*") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a = 0, b = 0, c = 0, d = 0, x;
+          always @* begin
+            x = a ^ b; $display("outer %0t %b", $time, x);
+            @* x = c ^ d; $display("inner %0t %b", $time, x);
+          end
+          initial begin #1 a = 1; #1 c = 1; #1 b = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "outer 1 1\ninner 2 1\nouter 3 0\n");
+}
+
+// Inferred sensitivity through a handle (LRM 9.4.2.2, 9.2.2.2.1). `always @*` and an
+// `@*` before a statement read every variable the statement reads, so a class property
+// or a virtual-interface member read through a handle wakes on a change of the member
+// and on a change of the handle (re-armed on the object the handle then names).
+// `always_comb` adds the same for a virtual-interface member, but "references to class
+// objects ... do not add anything to the sensitivity list of an always_comb", so a
+// class property read adds neither member nor handle. No oracle parses a class or a
+// virtual interface here; the expectations are the clauses'. Each `W` is a run of the body.
+TEST_CASE("always @* wakes on a class property and on its handle") {
+    const std::string out = run_capture(R"(
+        class C; int x; endclass
+        module top;
+          C obj = new, other = new; int y;
+          always @* begin $display("W %0t", $time); y = obj.x; end
+          initial begin #1 obj.x = 5; #1 obj = other; #1 other.x = 7; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("always @* wakes on a virtual-interface member and on its handle") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0; endinterface
+        module top;
+          ifc i1(), i2(); virtual ifc vif = i1; logic y;
+          always @* begin $display("W %0t", $time); y = vif.a; end
+          initial begin #1 i1.a = 1; #1 vif = i2; #1 i2.a = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("implicit @* before a statement wakes on a class property and on its handle") {
+    const std::string out = run_capture(R"(
+        class C; int x; endclass
+        module top;
+          C obj = new, other = new; int y;
+          initial forever @* begin $display("W %0t", $time); y = obj.x; end
+          initial begin #1 obj.x = 5; #1 obj = other; #1 other.x = 7; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("implicit @* before a statement wakes on a virtual-interface member and on its handle") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0; endinterface
+        module top;
+          ifc i1(), i2(); virtual ifc vif = i1; logic y;
+          initial forever @* begin $display("W %0t", $time); y = vif.a; end
+          initial begin #1 i1.a = 1; #1 vif = i2; #1 i2.a = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("always_comb wakes on a virtual-interface member and on its handle") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic a = 0; endinterface
+        module top;
+          ifc i1(), i2(); virtual ifc vif = i1; logic y;
+          always_comb begin $display("W %0t", $time); y = vif.a; end
+          initial begin #1 i1.a = 1; #1 vif = i2; #1 i2.a = 1; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 0\nW 1\nW 2\nW 3\n");
+}
+
+TEST_CASE("always_comb adds nothing for a class property, handle included") {
+    const std::string out = run_capture(R"(
+        class C; int x; endclass
+        module top;
+          C obj = new, other = new; int y;
+          always_comb begin $display("W %0t", $time); y = obj.x; end
+          initial begin #1 obj.x = 5; #1 obj = other; #1 other.x = 7; #1 $finish; end
+        endmodule
+    )");
+    CHECK(out == "W 0\n");
+}
+
+// The time-zero run of an `always_comb` that reads a virtual-interface member is the
+// one LRM 9.2.2.2 fixes (LRM_NOTES 44), after every initial and always has run to its
+// first suspension -- not in the Inactive region a `#0` stands for. So an initial sees
+// the declaration value (x) before it and the settled one after `#0` and after an
+// `@(y)` armed at time zero, exactly as with an always_comb over a plain signal.
+TEST_CASE("always_comb over a virtual-interface member starts as a plain one does") {
+    const auto design = [](std::string_view decls, std::string_view read) {
+        return std::string("interface ifc; logic a = 1; endinterface\nmodule top;\n") + std::string(decls) +
+               "\n  always_comb y = " + std::string(read) +
+               ";\n  initial begin $display(\"first %b\", y); #0 $display(\"after #0 %b\", y); end\n"
+               "  initial begin @(y) $display(\"event %b at %0t\", y, $time); end\n"
+               "  initial begin @(y) #0 $display(\"event #0 %b\", y); end\n"
+               "endmodule\n";
+    };
+    const std::string vif   = run_capture(design("ifc i(); virtual ifc vif = i; logic y;", "vif.a"));
+    const std::string plain = run_capture(design("logic a = 1; logic y;", "a"));
+    CHECK(vif == plain);
+    CHECK(vif == "first x\nevent 1 at 0\nafter #0 1\nevent #0 1\n");
+}
+
+// An unpacked struct or fixed-array class property is one variable (LRM 9.4.2.2): a change
+// anywhere in it wakes `@*` and `@(obj.s.f)`, a store of the same value wakes nothing. No
+// oracle parses classes or unpacked structs; the expectations are the clauses'.
+TEST_CASE("always @* wakes on a change anywhere in an aggregate class property") {
+    const std::string out = run_capture(R"(
+        typedef struct { int f; int g; string t; } s_t;
+        class C; s_t s; int a[2]; endclass
+        module top;
+          C obj = new, o2 = new; int y;
+          always @* begin $display("W %0t", $time); y = obj.s.f + obj.a[1]; end
+          initial begin
+            #1 obj.s.f = 5; #1 obj.s.f = 5; #1 obj.s.g = 6; #1 obj.a[1] = 2;
+            #1 obj.s.t = "x"; #1 obj.s = o2.s; #1 obj.a = o2.a; #1 $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "W 1\nW 3\nW 4\nW 5\nW 6\nW 7\n");
+}
+
+TEST_CASE("@(obj.s.f) wakes only when the member's value changes") {
+    const std::string out = run_capture(R"(
+        typedef struct { int f; int g; } s_t;
+        class C; s_t s; endclass
+        module top;
+          C obj = new;
+          initial begin @(obj.s.f) $display("woke %0t %0d", $time, obj.s.f); $finish; end
+          initial begin #1 obj.s.g = 4; #1 obj.s.f = 7; end
+        endmodule
+    )");
+    CHECK(out.find("woke 2 7") != std::string::npos);
+}
+
+// An event member of an aggregate class property is an event object like an event
+// property: `@`, `wait(.triggered)` and `->` / `->>` reach it, in a module and in a method
+// (implicit this), and a store to a sibling member still wakes `@*` and `wait`.
+// Refused or silent before. LRM-derived; no oracle parses classes.
+TEST_CASE("event member of an aggregate class property") {
+    const std::string out = run_capture(R"(
+        typedef struct { event e; int f; } s_t;
+        class C; s_t s;
+          task w(); @(s.e) $display("method"); endtask
+          task w2(); wait (s.e.triggered) $display("trig"); endtask
+        endclass
+        module top;
+          C obj = new; int y;
+          initial begin @(obj.s.e) $display("at"); end
+          initial begin wait (obj.s.f == 1) $display("wait f"); end
+          initial begin @(obj.s.e) $display("at nb"); end
+          initial fork obj.w(); obj.w2(); join_none
+          always @* begin y = obj.s.f; $display("W %0t", $time); end
+          initial begin #1 -> obj.s.e; #1 obj.s.f = 1; #1 ->> obj.s.e; #1 $finish; end
+        endmodule
+    )");
+    for (const char* want : { "method", "trig", "at\n", "wait f", "W 2" }) {
+        CHECK_MESSAGE(out.find(want) != std::string::npos, want);
+    }
+}
+
+// An inferred `@*` waits before its body runs (LRM 9.4.2.2), so a null handle at the wait
+// must not be dereferenced: it parks on the handle alone and subscribes to the property's
+// notifier once the handle is set. LRM-derived; no oracle parses classes.
+TEST_CASE("always @* over a property of a null handle waits on the handle") {
+    const std::string out = run_capture(R"(
+        typedef struct { event e; int f; } s_t;
+        class C; s_t s; endclass
+        module m;
+          C obj; int y;
+          always @* y = obj.s.f;
+          initial begin
+            obj = new;
+            fork
+              begin @(obj.s.e) $display("woke e at %0t", $time); end
+              begin wait (obj.s.f == 1) $display("wait f at %0t", $time); end
+            join_none
+            #1 -> obj.s.e;
+            #1 obj.s.f = 1;
+            #1 $display("y=%0d at %0t", y, $time);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out.find("woke e at 1") != std::string::npos);
+    CHECK(out.find("wait f at 2") != std::string::npos);
+    CHECK(out.find("y=1 at 3") != std::string::npos);
+}
+
+// An event list is the OR of its terms (LRM 9.4.2.1), and a term over a class property wakes
+// it, in either position, on a change of the term's value only (9.4.2): a write to a sibling
+// member and a write of the value it already holds are no event. A method names the property
+// through the implicit this, and `always @(list)` re-arms on every term. Before: the compound
+// term never woke, and in a method the lowering crashed. No oracle parses classes or unpacked
+// structs; the expectations are the clauses'.
+TEST_CASE("an event list with a class property term wakes on each of its terms") {
+    SUBCASE("a process, the term in either position") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; int g; } s_t;
+            class C; s_t s; logic k = 0; endclass
+            module top;
+              C obj = new;
+              string fk, kf;
+              initial begin
+                fork
+                  forever begin @(obj.s.f or obj.k) fk = {fk, $sformatf("%0t ", $time)}; end
+                  forever begin @(obj.k or obj.s.f) kf = {kf, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.s.g = 1;
+                #1 obj.s.f = 5;
+                #1 obj.k = 1;
+                #1 obj.s.f = 5;
+                #1 obj.k = 1;
+                #1 obj.s.f = 6;
+                #1 obj.k = 0;
+                #1 $display("fk: %s", fk);
+                $display("kf: %s", kf);
+              end
+            endmodule
+        )");
+        CHECK(out == "fk: 2 3 6 7 \nkf: 2 3 6 7 \n");
+    }
+    SUBCASE("a method") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C;
+              s_t s; logic flag;
+              task automatic watch(int id);
+                @(s.f or flag) $display("w%0d at %0t", id, $time);
+              endtask
+            endclass
+            module top;
+              C obj = new;
+              initial begin
+                fork obj.watch(1); join_none
+                #1 obj.flag = 1;
+                fork obj.watch(2); join_none
+                #1 obj.s.f = 3;
+                #1 $finish;
+              end
+            endmodule
+        )");
+        CHECK(out == "w1 at 1\nw2 at 2\n");
+    }
+    SUBCASE("a process's sensitivity list") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; logic k = 0; endclass
+            module top;
+              C obj = new;
+              int n = 0;
+              always @(obj.s.f or obj.k) n++;
+              initial begin
+                #1 obj.s.f = 1;
+                #1 obj.k = 1;
+                #1 obj.s.f = 1;
+                #1 obj.k = 1;
+                #1 $display("n=%0d", n);
+              end
+            endmodule
+        )");
+        CHECK(out == "n=2\n");
+    }
+}
+
+// An edge on a term is the edge of its least significant bit (Table 9-2), here through an
+// index that is itself a variable the wait watches, and `iff` gates its own term, evaluated
+// when the term changes (9.4.2.3: "evaluated when a changes and not when enable changes").
+// A plain-signal analog of the edge design gave `1 3 4 9` on iverilog 13; the `iff` list is
+// LRM-derived, iverilog does not parse it. Before: the first never woke on the property, and
+// the second was refused (iff on a multi-event control).
+TEST_CASE("an event list over class property terms follows Table 9-2 and iff") {
+    SUBCASE("edges") {
+        const std::string out = run_capture(R"(
+            class C; logic [1:0] a [2]; logic c = 1; endclass
+            module top;
+              C obj = new;
+              int i = 1;
+              string log;
+              initial begin
+                obj.a[0] = 2'b00; obj.a[1] = 2'b00;
+                fork
+                  forever begin @(posedge obj.a[i] or negedge obj.c) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.a[1] = 2'b01;
+                #1 obj.a[1] = 2'b10;
+                #1 obj.a[1] = 2'b11;
+                #1 obj.c = 0;
+                #1 obj.c = 1;
+                #1 obj.a[0] = 2'b01;
+                #1 i = 0;
+                #1 obj.a[0] = 2'b00;
+                #1 obj.a[0] = 2'b01;
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "1 3 4 9 \n");
+    }
+    SUBCASE("iff on each term") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; logic b = 0; endclass
+            module top;
+              C obj = new;
+              logic en = 0, en2 = 0;
+              string log;
+              initial begin
+                fork
+                  forever begin @(obj.s.f iff en or posedge obj.b iff en2) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.s.f = 1;
+                #1 en = 1;
+                #1 obj.s.f = 2;
+                #1 obj.b = 1;
+                #1 obj.b = 0;
+                #1 en2 = 1;
+                #1 obj.b = 1;
+                #1 obj.s.f = 2;
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "3 7 \n");
+    }
+}
+
+// A list mixes terms of every kind a member can have: a compound over a property, and a real
+// and a string property named by themselves (a real by its bit pattern, a string by its
+// content, so a write of the same value is no event). The same terms in a task, whose
+// samples live in its frame. Before: the compound never woke. LRM-derived.
+TEST_CASE("an event list with a real and a string term") {
+    SUBCASE("a process") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; real r; string t; endclass
+            module top;
+              C obj = new;
+              string log;
+              initial begin
+                obj.r = 1.0; obj.t = "a";
+                fork
+                  forever begin @(obj.s.f or obj.r or obj.t) log = {log, $sformatf("%0t ", $time)}; end
+                join_none
+                #1 obj.s.f = 1;
+                #1 obj.r = 1.0;
+                #1 obj.r = 2.5;
+                #1 obj.t = "b";
+                #1 obj.t = "b";
+                #1 $display("%s", log);
+              end
+            endmodule
+        )");
+        CHECK(out == "1 3 4 \n");
+    }
+    SUBCASE("a task") {
+        const std::string out = run_capture(R"(
+            typedef struct { int f; } s_t;
+            class C;
+              s_t s; real r; string t;
+              task automatic watch(int id);
+                @(s.f or r or t) $display("w%0d at %0t f=%0d r=%0f t=%s", id, $time, s.f, r, t);
+              endtask
+            endclass
+            module top;
+              C obj = new;
+              initial begin
+                obj.r = 1.0; obj.t = "a";
+                fork obj.watch(1); join_none
+                #1 obj.t = "a";
+                #1 obj.t = "b";
+                fork obj.watch(2); join_none
+                #1 obj.r = 1.0;
+                #1 obj.r = 3.5;
+                fork obj.watch(3); join_none
+                #1 obj.s.f = 9;
+                #1 $finish;
+              end
+            endmodule
+        )");
+        CHECK(out == "w1 at 2 f=0 r=1.000000 t=b\nw2 at 4 f=0 r=3.500000 t=b\nw3 at 5 f=9 r=3.500000 t=b\n");
+    }
+}
+
+// An explicit control evaluates its expression where the wait begins, so a null class handle
+// in a term of a list, or in a lone compound term, is the located fatal of LRM 8.4 that
+// `@(obj.x)` already gives, at the time the wait is reached (1 s), not at time zero. An
+// inferred `@*` parks on the handle instead (LRM_NOTES 57, 58). Before: the list fataled at
+// time zero, from the net its term was synthesized into, ahead of the first statement. Out of
+// process because the report ends the run.
+TEST_CASE("an event list or compound term over a property of a null handle is a located fatal") {
+    for (const char* control : { "@(obj.s.f or obj.k)", "@(obj.k or obj.s.f)", "@(obj.s.f)" }) {
+        const std::string src = std::string(R"(
+            typedef struct { int f; } s_t;
+            class C; s_t s; int k; endclass
+            module top;
+              C obj;
+              initial begin
+                $display("before");
+                #1 )") + control + R"(;
+                $display("UNREACHABLE");
+              end
+            endmodule
+        )";
+        const test::DesignRun run = test::run_design_captured(src);
+        INFO(control);
+        CHECK(run.out == "before\n");
+        CHECK(test::design_exit_code(run) != 0);
+        CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+        CHECK(run.err.find("the handle holds no object at 1 s") != std::string::npos);
+    }
+}
+
+// Refused for now (docs/TODO.md): a list mixing a property or virtual-interface member with a
+// signal or an event, and `->> @(m) e` / `x <= @(m) y` over a member. The first would lose what
+// the signal's own wait catches (a pulse that reverts before the waiter runs, a second trigger
+// in the step the wait began in); the others register a detached subscription on a signal and
+// edge. Both used to be accepted and never woke on the member (silently).
+TEST_CASE("a class property mixed with a signal or an event in a list, or over a detached control, is refused") {
+    const std::string decls = R"(
+        typedef struct { int f; } s_t;
+        class C; s_t s; int k; endclass
+        module m; C obj = new; logic b; event e, d; int x, y;
+    )";
+    const auto refused = [&](std::string_view body, std::string_view message) {
+        const std::string err = reject(decls + "initial begin " + std::string(body) + " end endmodule");
+        INFO(body);
+        CHECK(err.find(message) != std::string::npos);
+    };
+    constexpr std::string_view mixed = "an event list mixing a class-property or virtual-interface member";
+    constexpr std::string_view detached = "over a class-property or virtual-interface member is not supported yet";
+    refused("@(obj.s.f or b);", mixed);
+    refused("@(b or obj.s.f);", mixed);
+    refused("@(obj.s.f or e);", mixed);
+    refused("@(posedge b or obj.s.f or obj.k);", mixed);
+    refused("->> @(obj.s.f) d;", detached);
+    refused("->> @(obj.k) d;", detached);
+    refused("x <= @(obj.s.f) y;", detached);
+}
+
+// What the refusal leaves alone: a list with no property or member term keeps the static
+// path, and so keeps its store-time classification (LRM 4.6, 9.4.2): a signal that pulses
+// 0 -> 1 -> 0 in one step wakes `@(a or b)` once, as it does `@(posedge b)`. iverilog 13 agrees
+// on this design.
+TEST_CASE("a list of signals and events still wakes on a pulse that reverts in its step") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a = 0, b = 0;
+          event e;
+          int n1 = 0, n2 = 0;
+          initial begin
+            fork
+              forever begin @(a or b) n1++; end
+              forever begin @(posedge b or e) n2++; end
+            join_none
+            #1 b = 1; b = 0;
+            #1 -> e; #0 -> e;
+            #1 $display("%0d %0d", n1, n2);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 3\n");
+}
+
+// A property or a virtual-interface member by itself has a wait source of its own, so a
+// list of such terms and signals is no sampled wait and keeps the signal's pulse too: the
+// refusal and the sampling loop are for a term that has no source of its own. Each waiter
+// logs every wake of the list, and `b` pulses 0 -> 1 -> 0 in one step.
+TEST_CASE("a lone property or member beside a signal in a list keeps the signal's pulse") {
+    const std::string out = run_capture(R"(
+        interface ifc; logic clk = 0; endinterface
+        class C; int x; endclass
+        module top;
+          ifc i();
+          virtual ifc vi = i;
+          C obj = new;
+          logic b = 0;
+          int n1 = 0, n2 = 0;
+          initial begin
+            fork
+              forever begin @(obj.x or b) n1++; end
+              forever begin @(posedge vi.clk or b) n2++; end
+            join_none
+            #1 b = 1; b = 0;
+            #1 obj.x = 1;
+            #1 i.clk = 1;
+            #1 $display("%0d %0d", n1, n2);
+          end
+        endmodule
+    )");
+    CHECK(out == "2 2\n");
+}

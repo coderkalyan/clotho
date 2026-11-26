@@ -966,7 +966,12 @@ private:
                 ref(info.precision);
                 os_ << ", ";
                 ref(info.min_width);
-                os_ << ", \"" << ir_.extra_bytes(info.suffix, info.suffix_len) << '"';
+                if (info.suffix_value != kNoFormatValue) {
+                    os_ << ", ";
+                    ref(info.suffix_value);
+                } else {
+                    os_ << ", \"" << ir_.extra_bytes(info.suffix, info.suffix_len) << '"';
+                }
                 break;
             }
             case Inst::PayloadKind::OpExtra:

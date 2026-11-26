@@ -39,10 +39,9 @@ optional sub-features.
 random stability (already built, §12), and the constraint solver (unrelated —
 18.17 has weights, not constraints).
 
-**Refused, each by name (§14):** two constructs, both deferred deliberately — a
-rule weight wider than 32 bits, which `randcase` shares and must change with, and a
-`rand join` operand that is itself a `rand join`, which LRM 18.17.5's "to depth of
-1" does not describe.
+**Refused, by name (§14):** one construct, deferred deliberately — a `rand join`
+operand that is itself a `rand join`, which LRM 18.17.5's "to depth of 1" does not
+describe.
 
 ---
 
@@ -123,7 +122,7 @@ unconditionally emits `ConstEvalRandValue` and fails.
 | single-rule production | no weight evaluation, no draw | draw counts are observable (§12); a weight is meaningless without alternatives (18.17.1) |
 | unspecified weight | the integer literal 1, at an integer's 32-bit self-determined precision | 18.17.1's "a weight of 1"; folding it into the common width is load-bearing — at the one-bit minimum two default weights sum to zero and neither alternative is ever generated |
 | zero total weight | no rule generated, **no draw consumed** | matches the `randcase` precedent, `src/lower/Random.cpp, lower_randcase` |
-| weight wider than 32 bits | loud refusal, same message shape as randcase | the LRM's multi-draw stitching scheme is not built for randcase either |
+| weight wider than 32 bits | the shared `emit_weight_draw` (`src/lower/Random.cpp`): `⌈w/32⌉` `$urandom` words stitched, masked to the bit length of `sum-1`, redrawn while not below the sum | 18.16: "multiple calls to `$urandom_range()` to handle numbers greater than 32 bits". Rejection keeps the split exactly uniform; a multiply-shift onto the sum would need a multiply wider than the sum |
 | result variables (18.17.7) | frame locals of the production, **default-initialized**, written from a caller temp after each call, at a slot index re-derived from `createRuleVariables`' counting order | slang synthesizes the variables but records **no** occurrence→index map. The temp is needed because an `output` actual is a raw slot and an array element is a composed lvalue |
 | unwritten result variable | the type default (Table 6-7) | 18.17.7 says "undefined value"; the frame's previous contents is the only alternative and is not reproducible |
 | production returning a container | the blocking half of `lower_*_assign`, split out as `emit_container_store` and shared | the deep-copy rules belong in one place; a `return` has an expression and a slot but no `AssignmentExpression` to hand them |
@@ -257,9 +256,10 @@ Per production activation:
 - **N rules.** `gen_weighted_rules` evaluates every rule's `weightExpr` in source
   order, exactly once, each self-determined, defaulting to a literal `1` where
   `weightExpr == nullptr`. Then the `lower_randcase` body verbatim: unsigned wrapping
-  sum at the widest weight's precision, `sum != 0` guard, one `urandom_range(sum-1,
-  0)`, and a cumulative ladder with the rule body in place of randcase's statement.
-  Weights wider than 32 bits get the same loud refusal randcase gives.
+  sum at the widest weight's precision, `sum != 0` guard, one `emit_weight_draw` over
+  `[0, sum-1]`, and a cumulative ladder with the rule body in place of randcase's
+  statement. The draw is one `urandom_range(sum-1, 0)` for a sum of at most 32 bits
+  and the stitched, rejected draw of §12 for a wider one.
 
 The common width folds in **32 for every omitted weight**, not the one-bit minimum:
 the implicit weight is the integer literal 1, and at one bit two of them sum to zero,
@@ -478,7 +478,8 @@ execution order, and emitting `urandom_range` is exactly what delivers that.
 | situation | draws |
 |---|---|
 | production with one rule | 0 |
-| production with N ≥ 2 rules, total weight ≠ 0 | 1 |
+| production with N ≥ 2 rules, total weight ≠ 0, sum of at most 32 bits | 1 |
+| production with N ≥ 2 rules, total weight ≠ 0, sum wider than 32 bits | `⌈w/32⌉` per attempt, one attempt at least and under two on average (an attempt is rejected when the masked draw is not below the sum, which happens less than half the time) |
 | production with N ≥ 2 rules, total weight == 0 | **0**, and no rule is generated |
 | `plan` of an interleaved production | the same as one activation of it |
 | `rand join` | 1 per generated unit, on top of each operand's `plan` |
@@ -529,10 +530,9 @@ inside a `fork` escapes the `ReturnInParallel` check.
 
 | construct | message | site | why still refused |
 |---|---|---|---|
-| a rule weight wider than 32 bits | `randsequence production weight wider than 32 bits is not supported` | `gen_weighted_rules` | `$urandom_range` is one 32-bit draw; LRM 18.16 wants several stitched together. `randcase` carries the identical guard under the same clause, so the two must change together — and stitching shifts how many values a selection takes from the process stream, which §12 makes a contract |
 | a `rand join` operand that is itself a `rand join` | `a randsequence rand join operand that is itself a rand join is not supported` | `check_rand_join_operand` | every other thing an interleaved production holds across its units is a fixed set of variables the driver hoists (§11); an inner `rand join`'s state is an interleaving cursor per inner operand, chosen at its own plan time, so the outer `step` would have to be a resumable driver rather than an indexed one. 18.17.5 interleaves "to depth of 1", which does not describe nesting |
 
-Both are deferrals recorded at the guard, not gaps found later. Everything else in
+This is a deferral recorded at the guard, not a gap found later. Everything else in
 18.17 is implemented: a production may return any type including a container, an
 interleaved production may pass values within its own rules and take arguments of
 any direction, and a block may share an automatic with a detached fork.

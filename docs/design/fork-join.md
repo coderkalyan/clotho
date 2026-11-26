@@ -630,10 +630,12 @@ Adjacent friction cleared since: `$time` / `$stime` / `$realtime` inside a funct
 is supported. The refusal's stated reason ("no wheel pointer in its ABI") was
 always stale — `lower_function` binds `wheel_` to the `clotho.wheel` global, so a
 function reads the clock exactly as a task does — and the timescale objection
-(LRM 20.3.1 scales `$time` to the invoking module's unit, while one shared body
-has a single `time_mul_`) is settled by LRM 3.14.2.3: a read inside a subroutine
-is in the units of the scope that DECLARES it, which is what `function_id` already
-applies to subroutine delays and to `$time` in a task. Cross-checked against
+(LRM 20.3.1 scales `$time` to "the time unit of the module that invoked it", while one
+shared body has a single `time_mul_`) is settled by reading "the module that invoked
+it" as the one whose code contains the call, which for a subroutine body is the
+scope that DECLARES it (3.14.2.3 fixes the unit of each module, program, package or
+interface, so a body is in its declaring definition's unit). That is what `function_id`
+already applies to subroutine delays and to `$time` in a task. Cross-checked against
 iverilog, which scales a package function's `$time` by the package. So `%0t` may
 be printed in the spawning function as well as in the child. `$strobe` /
 `$monitor` in a function are supported too: the pended body is ramped with the

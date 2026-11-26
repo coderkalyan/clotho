@@ -1728,15 +1728,6 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )", "string module ports");
     }
-    SUBCASE("case ... inside with a string range bound") {
-        check_rejected(R"(
-            module m;
-                string s;
-                initial case (s) inside ["a":"z"]: $display("a"); endcase
-            endmodule
-        )",
-                       "string range bound");
-    }
     SUBCASE("string argument to a non-%s specifier") {
         check_rejected(R"(
             module m;

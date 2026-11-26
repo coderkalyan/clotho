@@ -524,16 +524,19 @@ struct LValueInfo {
     Ref          gc_container_type = Ref::Invalid;
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
-    // The notifiers of the class property this place selects, when some `@` / `wait`
-    // in the design waits on it, plus the object body they live in. Null for every
-    // other place -- and null for EVERY place in a design that waits on no property,
+    // The notifiers of the class property this place selects, or lies inside, when some
+    // `@` / `wait` in the design waits on it, plus the object body they live in. Null for
+    // every other place -- and null for EVERY place in a design that waits on no property,
     // which is what makes that design pay nothing.
     //
     // Set at exactly one place, agg_member, off the interned class Ref plus the
-    // property's field index. A blocking store then classifies its own old -> new
-    // transition and wakes the notifiers whose edge it produced -- literally
+    // property's field index, and kept by every select inside an AGGREGATE property
+    // (a member, an element): the property is one variable (LRM 9.4.2.2), and a store to
+    // any leaf of it is a change of it. A blocking store then classifies its own old ->
+    // new transition and wakes the notifiers whose edge it produced -- literally
     // service_wait_queue's job, with the waiter lists reached through the object
-    // instead of through per-signal globals.
+    // instead of through per-signal globals. A whole-object copy (AggCopy) compares the
+    // bytes, and a container inside the aggregate fires on every mutation.
     const ChangeNotify* chg         = nullptr;
     llvm::Value*        chg_body    = nullptr;
     llvm::Type*         chg_body_ty = nullptr;
@@ -2516,6 +2519,8 @@ private:
                                 const std::vector<llvm::Constant*>& rows,
                                 const std::string&                  nm);
 
+    llvm::Constant* cover_string(const std::string& s);
+
     llvm::Constant* cover_config_global();
 
     // Per-(signal, edge) capacities for the two wait queues. Indexed
@@ -3275,6 +3280,8 @@ private:
     llvm::FunctionCallee sscanf_fn();
     llvm::FunctionCallee readmem_fn();
     llvm::FunctionCallee fread_fn();
+    llvm::FunctionCallee readmem_assoc_fn();
+    llvm::FunctionCallee fread_assoc_fn();
 
     llvm::FunctionCallee vcd_open_fn();
     llvm::FunctionCallee vcd_begin_fn();
@@ -3493,10 +3500,16 @@ private:
     llvm::FunctionCallee cover_next_fn();
     llvm::FunctionCallee cover_hit_fn();
     llvm::FunctionCallee cover_start_fn();
+    llvm::FunctionCallee cover_start_point_fn();
+    llvm::FunctionCallee cover_opt_set_fn();
+    llvm::FunctionCallee cover_opt_get_fn();
+    llvm::FunctionCallee cover_opt_set_str_fn();
+    llvm::FunctionCallee cover_opt_get_str_fn();
     llvm::FunctionCallee cover_set_name_fn();
     llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_type_query_fn(const char* name, llvm::Type* ret);
+    llvm::FunctionCallee cover_type_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_design_coverage_fn();
 
     // -- Coroutine frame registry (docs/design/garbage-collection.md §2, F2) -----
@@ -4367,6 +4380,62 @@ private:
     };
     AsciiArg spill_ascii_arg(Index v, const char* name);
 
+    std::pair<llvm::Value*, uint32_t> mem_inner_dims(Ref array_type);
+
+    // The array a $readmem or $fread loads, resolved for rt_readmem / rt_fread: the
+    // leaf planes of the first word that exists, the leaf slot's facts, the loaded
+    // array's dimensions (the declared bounds of its highest, `inner` for the rest),
+    // which of the words of the highest dimension have storage and, for a queue, the
+    // ring they sit in. An associative array has no planes to point at (its elements are
+    // created by the load): rt_readmem_assoc / rt_fread_assoc take its handle, its
+    // descriptor and the index's width instead, and the slot facts describe one element.
+    struct MemTarget {
+        llvm::Value*                      mm_base = nullptr;
+        llvm::Value*                      z_base  = nullptr;
+        uint32_t                          stride  = 0;
+        uint32_t                          width   = 0;
+        bool                              four_state = false;
+        std::pair<llvm::Value*, uint32_t> inner;
+        // i64 values: the declared bounds of the highest dimension. Constants for a
+        // fixed-size array, [0 : size - 1] for a dynamic array or queue, whose size is
+        // read at run time.
+        llvm::Value* left  = nullptr;
+        llvm::Value* right = nullptr;
+        // i64 values: the words at positions [lo_word, lo_word + word_count), counted
+        // from `left`, exist; a count of 0 means the target names none.
+        llvm::Value* lo_word    = nullptr;
+        llvm::Value* word_count = nullptr;
+        // i64 values: the ring of a queue (see rt_readmem); 0 and 0 for any other array.
+        llvm::Value* ring_head = nullptr;
+        llvm::Value* ring_cap  = nullptr;
+        // An associative array: its handle (ptr) and descriptor, the index's width and
+        // signedness, the byte offset of the z plane in an element slot, and the i1 that
+        // says the target is valid at run time (null: always).
+        bool            assoc       = false;
+        llvm::Value*    assoc_handle = nullptr;
+        llvm::Constant* assoc_ops    = nullptr;
+        uint32_t        key_width    = 0;
+        bool            key_signed   = false;
+        uint32_t        z_off        = 0;
+        llvm::Value*    assoc_valid  = nullptr;
+        // The place the load writes: whose waiters it wakes and what it marks for the
+        // dump. `container` says it is a dynamic array, queue or associative array, which
+        // wakes through the container notifier (notify_container_mutation) rather than the
+        // waiters of an array signal.
+        LValueInfo place;
+        bool       container = false;
+    };
+
+    MemTarget resolve_mem_target(Index       target,
+                                 Ref         type,
+                                 Ref         base_type,
+                                 uint32_t    slice,
+                                 Index       slice_base,
+                                 Index       slice_end,
+                                 const char* task);
+
+    void finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix);
+
     void lower_fread_word(Index i);
 
     void lower_fread_mem(Index i);
@@ -4409,7 +4478,8 @@ private:
 
     void emit_defer_gen_bump();
 
-    void emit_defer_gen_bump_at(llvm::Value* gen);
+    // `delta` is 1 at a resume or activation start, kGenDisableBump at a `disable`.
+    void emit_defer_gen_bump_at(llvm::Value* gen, uint64_t delta = 1);
 
     // The report generation of the running thread (LRM 16.4.2), published for the
     // bodies it calls: a process group publishes its own counter at each activation
@@ -6020,6 +6090,8 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).
     ankerl::unordered_dense::map<uint32_t, llvm::StructType*> class_body_ty_;
+    // Memoized unpacked-struct storage mirror per field-type list (see agg_storage_ty).
+    std::map<std::vector<llvm::Type*>, llvm::StructType*> agg_struct_tys_;
     // Memoized reaches_class_handle() per type Ref. Design-wide, not per module: the
     // answer depends only on the intern pool.
     ankerl::unordered_dense::map<uint32_t, bool> reaches_class_handle_;

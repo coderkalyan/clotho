@@ -2303,8 +2303,7 @@ void Backend::lower_call_common(Index               i,
                 // The callee wakes at each write.
             } else if (!is_handle_type(f.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
-            } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
-                       lv.mut_sig_valid) {
+            } else if (lv.chg != nullptr || lv.is_signal || lv.mut_sig_valid) {
                 // A `ref` to a waited-on container property: the callee mutates
                 // through a raw aliased pointer and never copies back, so the
                 // notify can only be at the call's RETURN. The fire is then one
@@ -2324,8 +2323,7 @@ void Backend::lower_call_common(Index               i,
             // ref case above.
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                 emit_gc_barrier_for(alv);
-                if ((alv.chg != nullptr && alv.chg->container) || alv.is_signal ||
-                    alv.mut_sig_valid) {
+                if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
             }
@@ -2561,8 +2559,7 @@ void Backend::lower_task_call_inst(Index i) {
                 // The callee wakes at each write, not at this call's return.
             } else if (!is_handle_type(tf.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
-            } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
-                       lv.mut_sig_valid) {
+            } else if (lv.chg != nullptr || lv.is_signal || lv.mut_sig_valid) {
                 // See the function-call site: a `ref` container is mutated
                 // through a raw pointer, so the notify lands at cont_bb, past
                 // every suspend the task took.
@@ -2575,8 +2572,7 @@ void Backend::lower_task_call_inst(Index i) {
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
                 emit_gc_barrier_for(alv);
-                if ((alv.chg != nullptr && alv.chg->container) || alv.is_signal ||
-                    alv.mut_sig_valid) {
+                if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
             }
@@ -2730,7 +2726,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
                 fv = b_.CreateFPExt(fv, b_.getDoubleTy());
             }
             store_field(sty, elt, 0, b_.getInt32(64));
-            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag));
+            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag | (t.width == 32 ? 0b10000u : 0u)));
             store_field(sty, elt, 2, put(b_.CreateBitCast(fv, i64), 1));
             store_field(sty, elt, 3, null);
             store_field(sty, elt, 4, null);

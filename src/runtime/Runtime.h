@@ -33,6 +33,8 @@ typedef struct rt_arg {
     //        21.2, Table 21-2).
     // Bit 3: the argument is a bare $time / $stime / $realtime call, which
     //        rt_monitor_emit leaves out of its change detection.
+    // Bit 4: with bit 2, the real was a shortreal: only %u / %z tell it from a
+    //        real, since they transfer the representation of the data (32 bits).
     uint32_t flags;
     // Value plane (definitely-1 bits), or an rt_string* / double-bits word per
     // the flags above.
@@ -855,9 +857,9 @@ int32_t rt_ferror_str(int32_t fd, struct rt_string* dst, const rt_alloc_site* si
 // `width` bits are written (x/z parsed digits drop to 0 per LRM 6.3.1) and `z`
 // is null.
 // `flags` bit1: the destination is a `string` object. `str` / `site` are set and
-// the plane fields are null / 0 — the scanned %s token is assigned to the handle
-// verbatim (LRM 21.3.4.3 sanctions only %s into a string; the frontend refuses
-// every other conversion, so the engine never pairs one with this variant).
+// the plane fields are null / 0 — a scanned %s token is assigned to the handle
+// verbatim, and any other conversion stores its value cast to string (LRM 6.16,
+// sized like an unsized literal; docs/LRM_NOTES.md).
 typedef struct rt_scan_arg {
     uint8_t* mm;
     uint8_t* z;
@@ -879,18 +881,26 @@ int32_t rt_sscanf(const char* buf, uint32_t len, int32_t fwd, const char* fmt, u
                   const rt_scan_arg* args);
 
 // $fread(target, fd[, start[, count]]) (LRM §21.3.4): read raw bytes from `fd` into
-// a memory (or a scalar, `count` == 1), MSB-first per element. The destination
-// geometry matches $readmem: element i's planes are at `mm_base` / `z_base` +
-// i*`stride`, `width` bits each, over `count` elements with declared bounds
-// `decl_left` / `decl_right`. `start` / `max_count` (valid per `flags` bit0 / bit1)
-// bound the address range; `flags` bit2 marks a narrow 2-state destination (bare
-// iW elements, null `z_base`). Returns the number of bytes read. `width` must be
+// a memory (or a scalar, a memory of one word), MSB-first per leaf. The destination
+// geometry matches $readmem: leaf i's planes are at `mm_base` / `z_base` +
+// i*`stride`, `width` bits each. `decl_left` / `decl_right` are the declared bounds of
+// the memory's highest dimension, whose words `start` and `max_count` (valid per
+// `flags` bit0 / bit1) address and count; `inner` points at the (left, right) pairs of
+// its `inner_dims` other dimensions, outermost first (null for a memory of one), and a
+// word is the row of leaves they span, filled row-major from the lowest address of
+// each (LRM 21.4.3). Only the words at positions [`lo_word`, `lo_word` + `word_count`)
+// of it, counted from `decl_left`, have storage, `mm_base` / `z_base` pointing at the
+// first: the bytes of a word with none are read and dropped, and with `word_count` 0
+// nothing is read (see rt_readmem). A nonzero `ring_cap` says the words are in a
+// queue's ring (see rt_readmem). `flags` bit2 marks a narrow 2-state destination
+// (bare iW leaves, null `z_base`). Returns the number of bytes read. `width` must be
 // <= 64. A `start` outside the declared range reads nothing and returns 0 after a
 // run-time warning located by `site` (null for the scalar form, which has no start)
 // at simulation time `now`.
-int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
-                 uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right, int64_t start,
-                 int64_t max_count, uint32_t flags, const rt_null_site* site, uint64_t now);
+int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t width,
+                 uint32_t four_state, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
+                 int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t ring_head, int64_t ring_cap,
+                 int64_t start, int64_t max_count, uint32_t flags, const rt_null_site* site, uint64_t now);
 
 // The warning behind rt_fread's out-of-range `start` (docs/LRM_NOTES.md 55). Goes quiet
 // after a few reports from one site, like the divide-by-zero report.
@@ -905,15 +915,31 @@ void rt_fflush(int32_t desc);
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
 // vector, or as bytes in natural order when flags bit4 is set (a string-object
-// filename); `mm_base`/`z_base` point at element 0's must|may and z words in the
-// state buffer, strided by `stride` (`z_base` is null when the memory's slot stores
-// no z word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
-// declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
-// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward. Returns the
-// number of elements whose value the load changed.
+// filename); `mm_base`/`z_base` point at leaf 0's must|may and z words in the state
+// buffer, strided by `stride` (`z_base` is null when the memory's slot stores no z
+// word); `width` is a leaf's width. `decl_left`/`decl_right` are the declared bounds
+// of the memory's highest dimension, the addresses `@addr` and start/finish name; a
+// word of it is the row of leaves the other `inner_dims` dimensions span, whose
+// (left, right) pairs `inner` lists outermost first (null for a memory of one). The
+// file's numbers fill a row row-major, each dimension from its lowest address to its
+// highest (LRM 21.4.3). Only the words at positions [`lo_word`, `lo_word` +
+// `word_count`) of that dimension, counted from `decl_left`, have storage, and
+// `mm_base` / `z_base` point at the first of them: all of the memory, or the part of a
+// slice that lies in its array (a slice may hang off it, or its index be invalid,
+// LRM 7.4.5). A word with none has the file's numbers dropped, with a warning, and a
+// load with `word_count` 0 names no word and does nothing. A nonzero `ring_cap` says
+// the words are in a queue's ring: `mm_base` / `z_base` then point at its slot 0 and
+// the first word that exists is at slot `ring_head`, the next after it, wrapping at
+// `ring_cap` slots (rt_queue_slot). `flags` bit0=hex, bit1=has_start, bit2=has_finish,
+// bit3=four_state, bit4=path_forward, bit5=narrow (a 2-state memory of bare iW leaves),
+// bit6=slice (`start` and `finish` have to lie in the declared range, or nothing is loaded).
+// An `@` address of the file outside the range the task names ends the load with an error,
+// the words before it staying loaded (LRM 21.4); `site` locates that and the load's other
+// diagnostics at the call (null for none). Returns the number of leaves the load changed.
 uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
-                    uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
-                    int64_t finish, uint32_t flags);
+                    uint32_t width, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
+                    int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t ring_head, int64_t ring_cap,
+                    int64_t start, int64_t finish, uint32_t flags, const rt_null_site* site);
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 //
@@ -1097,14 +1123,17 @@ int32_t rt_test_plusargs(const char* s, uint32_t len);
 // returns 0.
 int32_t rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg);
 
-// $value$plusargs(user_string, var) with a `string`-typed var (LRM §21.6). Only
-// the clause's "%s -- string (no conversion)" form reaches here: the remainder
-// is the value, so there is no width to pad or truncate to and no illegal
-// character to reject. On a match the remainder is assigned to `dst` (empty
-// when the plusarg has none, which is the clause's "empty string value") and
-// the function returns nonzero; on no match `dst` is left untouched and it
-// returns 0. `site` locates the assignment for an allocation-failure report.
-int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, struct rt_string* dst,
+// $value$plusargs(user_string, var) with a `string`-typed var (LRM §21.6). For
+// `conv` 's', the clause's "%s -- string (no conversion)" form, the remainder is
+// the value, so there is no width to pad or truncate to and no illegal
+// character to reject. For a numeric `conv` the remainder converts as in
+// rt_value_plusargs and the value is stored cast to string (LRM 6.16), sized like
+// an unsized literal (docs/LRM_NOTES.md). On a match the result is assigned to
+// `dst` (empty when the plusarg has no remainder, which is the clause's "empty
+// string value") and the function returns nonzero; on no match `dst` is left
+// untouched and it returns 0. `site` locates the assignment for an
+// allocation-failure report.
+int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, uint32_t conv, struct rt_string* dst,
                               const rt_alloc_site* site);
 
 // -- Deferred nonblocking writes to unpacked-array elements --
@@ -1209,7 +1238,7 @@ struct rt_elem_ops {
     void (*destroy)(void* slot);
     // rt_elem_queue only: the `[$:N]` max index N of the queue the element IS (0 is
     // unbounded), so copying one over another truncates to what the destination
-    // holds (LRM 7.10.5 [unverified wording]). Appended, like the GC fields.
+    // holds (LRM 7.10.5). Appended, like the GC fields.
     uint64_t bound;
 };
 
@@ -1399,7 +1428,7 @@ static inline uint64_t rt_queue_slot(const rt_queue* h, uint64_t i) {
 void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site* site);
 
 // Destroy the elements of a bounded queue past its limit and keep the first
-// `bound + 1` (LRM 7.10.5 [unverified wording]), then report the overflow at `site`
+// `bound + 1` (LRM 7.10.5: elements beyond the bound are discarded), then report the overflow at `site`
 // (rt_queue_overflow_report). Called only when `bound != 0 && h->len > bound + 1`, for
 // the same reason as rt_queue_grow: the engine tests that itself, and an overflow
 // does not belong in the code a design inlines.
@@ -1411,7 +1440,7 @@ void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, con
 void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_t wanted, uint64_t now);
 
 // Bounded-queue max size argument for the push helpers: `bound` is the `[$:N]`
-// maximum index (max size N+1); 0 means unbounded (LRM §7.10.5 [unverified wording]).
+// maximum index (max size N+1); 0 means unbounded (LRM 7.10.1, 7.10.5).
 //
 // An overflowing push keeps the first `bound + 1` elements, i.e. it always drops
 // from the TAIL. The two directions therefore lose different elements, and the
@@ -1420,8 +1449,9 @@ void rt_queue_overflow_report(const rt_alloc_site* site, uint64_t bound, uint64_
 //     old tail -- the end opposite the push.
 //   - push_back lands the new element at the tail, so the dropped one is the
 //     element just pushed: pushing onto a full bounded queue has no effect.
-// The same rule governs insert(). LRM 7.10.5 does not pin which end an
-// overflowing push sacrifices (docs/LRM_NOTES.md, note 6).
+// The same rule governs insert(). LRM 7.10.5 discards the elements beyond the bound
+// after any write, and 7.10.3 names the highest-numbered element for insert and
+// push_front, so the tail is the end the LRM gives up (docs/LRM_NOTES.md, note 6).
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
 // to the tail / head, growing the ring as needed. `site` is the push's source
@@ -1626,6 +1656,30 @@ void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops,
 // pattern default, take `src`'s map, leave `src` empty. Both epochs advance. The
 // nonblocking-assignment commit path. A no-op when dst == src.
 void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops);
+
+// $readmemh / $readmemb and $fread into an associative array of integral index (LRM 21.4.1,
+// docs/LRM_NOTES.md 70): the elements the file's addresses name are created, and a number is
+// loaded into the leaf of the element at its address, row-major (LRM 21.4.3). `handle` / `ops`
+// are the array and its descriptor, `key_width` the index's width; `stride`, `width`,
+// `inner` / `inner_dims` describe one element as rt_readmem describes a memory's leaves, the
+// z plane `z_off` bytes into a slot. `alloc` locates the allocation of an element and `site`
+// the load's reports. A load that names no start begins at address 0.
+//
+// rt_readmem_assoc `flags`: bit0=hex, bit1=has_start, bit2=has_finish, bit3=four_state,
+// bit4=path_forward, bit5=narrow, bit7=signed index, bit8=names no array (a target that is
+// invalid at run time: nothing is loaded). Returns the number of leaves the load changed, an
+// element it created counting as one.
+uint32_t rt_readmem_assoc(const char* path_buf, uint32_t path_len, rt_assoc* handle, const rt_elem_ops* ops,
+                          uint32_t key_width, uint32_t stride, uint32_t width, uint32_t z_off, const int64_t* inner,
+                          uint32_t inner_dims, int64_t start, int64_t finish, uint32_t flags,
+                          const rt_alloc_site* alloc, const rt_null_site* site);
+
+// rt_fread_assoc `flags`: bit0=has_start, bit1=has_count, bit2=narrow, bit3=four_state,
+// bit4=signed index, bit5=names no array. Returns the number of bytes read; a `start` the
+// index type does not have reads nothing and warns, as rt_fread does for a memory.
+int32_t rt_fread_assoc(int32_t fd, rt_assoc* handle, const rt_elem_ops* ops, uint32_t key_width, uint32_t stride,
+                       uint32_t width, uint32_t z_off, const int64_t* inner, uint32_t inner_dims, int64_t start,
+                       int64_t max_count, uint32_t flags, const rt_alloc_site* alloc, const rt_null_site* site);
 
 // -- SystemVerilog string objects --
 //
