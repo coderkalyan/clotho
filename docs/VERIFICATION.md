@@ -107,8 +107,9 @@ VCD, not only what a test prints.
   an NBA pass, in the order they were pended), R24 (past a `$finish` only the exit that
   follows it runs), R6 (every write a parked waiter lists wakes it, no write that changed
   nothing wakes anyone, and a parked waiter's value read from design memory has not changed
-  at the end of a slot without a wake) and R7 (the edge and change facts of each write are
-  Table 9-2's). It is on by default in such a build, for the suite and for
+  at the end of a slot without a wake), R7 (the edge and change facts of each write are
+  Table 9-2's), and the region, time-zero, timer, program-region and disable/kill rules
+  of phase 4 (R1, R2, R4, R15, R17, R23, R25). It is on by default in such a build, for the suite and for
   `clotho run`; `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status
   99, `clotho: scheduler trace violation:` and a report naming the rule, the time, the
   target or activation, and the cause) and fails the test that ran the design, unless
