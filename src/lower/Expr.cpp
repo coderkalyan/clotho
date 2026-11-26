@@ -169,26 +169,14 @@ ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
         }
         case ExpressionKind::Replication: {
             const ReplicationExpression& r = expr.as<ReplicationExpression>();
-            // DELIBERATE DEVIATION from LRM 11.4.12.1, which requires the
-            // multiplier to be a non-negative, non-x, non-z CONSTANT
-            // expression: a runtime multiplier is accepted when — and only
-            // when — the result is a string. The clause demands a constant
-            // because a concatenation's WIDTH must be known at elaboration;
-            // a string result has no elaboration-time width, so the
-            // restriction's own reason does not apply there. That boundary —
-            // not "UVM needs it" — is what keeps the deviation narrow, though
-            // UVM is why it exists (uvm_printer.svh:1501, `dash = {m{"-"}}`).
-            // iverilog 13 refuses the construct; Verilator 5.050 accepts it.
-            // String-ness is slang's own typing of the expression
-            // (ReplicationExpression::fromSyntax types a non-constant
-            // multiplier over an implicitly-string operand as `string`), not
-            // a syntax pattern. The clause's other two demands bind at RUN
-            // TIME instead: a zero multiplier yields the empty string (the
-            // clause's own zero rule), a negative or x/z multiplier is an
-            // illegal value and a located fatal (rt_string_repl /
-            // rt_string_repl_invalid). A packed result stays refused below.
-            // TODO: MUST BE REVISITED — tracked as the OPEN M3 item
-            // "Non-constant string replication count" in docs/TODO.md.
+            // A runtime multiplier is legal when the result is a string (LRM 11.4.12.2:
+            // "In the case of string replication, a non-constant multiplier is allowed";
+            // 6.16 Table 6-9: "not required to be a constant expression"). A packed
+            // result needs a constant multiplier (11.4.12.1) and stays refused below; slang
+            // types the expression, so String-ness is its decision, not a syntax pattern.
+            // The remaining demands bind at run time: a zero multiplier yields the empty
+            // string (6.16), a negative or x/z multiplier is an illegal value and a located
+            // fatal (rt_string_repl / rt_string_repl_invalid).
             if (is_string_expr(expr)) {
                 const ir::Index text  = lower_expr(r.concat(), b);
                 const ir::Index times = as_signed_number(lower_expr(r.count(), b), *r.count().type, b, l);

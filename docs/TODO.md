@@ -331,8 +331,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **NBA to a class property** — `c.x <= v` and an unqualified `x <= v` inside a method, of
   any type including `string`, are refused; NBA staging is keyed by signal and an object body
   has none. See docs/design/classes.md §8.
-- [ ] **Non-constant string replication count** (11.4.12.1) — deliberate deviation, kept open to
-  revisit: `{m{"-"}}` with a runtime `m` is accepted when the result is a `string`.
 - [ ] **`string` ports** — a string port, including a string reached through a struct member or a
   container element, is refused.
 - [ ] **Queue, dynamic-array or associative-array port** (23.3.3) — a container port connection
@@ -695,8 +693,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Modport expression port** (25.5.4) — reached through a modport-qualified handle.
   - [ ] **Subroutine call through a handle to an interface with no signals or no elaborated
     instance** — refused rather than lowered against an instance layout.
-- [ ] **Property expansion for a class-handle `%p` operand** (21.2.1.6) — a direct operand
-  prints only its class name.
 - [ ] **Handle argument to a runtime `$sformat` format** (21.2.1.6) — the renderer cannot
   tell whether it meets `%p` or a numeric conversion.
 - [ ] **`%p` of a nested container or an aggregate holding a handle** (21.2.1.6) — a queue of

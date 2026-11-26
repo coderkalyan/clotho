@@ -2074,9 +2074,10 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
         bool               is_net = false;
         const ValueSymbol* sym    = force_target(a.left(), &is_net);
         if (sym == nullptr && !stmt_force_site_.contains(&s)) {
-            fail("force is only supported on a whole variable/net or a constant "
-                 "bit/part-select of a net (LRM 10.6.2); a select of a variable, "
-                 "a concatenation, and an aggregate are not yet supported");
+            fail("force of a bit-select or part-select of a variable is illegal (LRM 10.6.2; "
+                 "10.6.1 for assign); force is only supported on a whole variable/net or a "
+                 "constant bit/part-select of a net; a concatenation and an aggregate are not "
+                 "yet supported");
         }
         if (is_net || stmt_force_site_.contains(&s)) {
             // Net force (LRM 10.6.2), whole or a constant bit/part-select: set the

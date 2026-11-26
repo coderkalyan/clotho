@@ -181,12 +181,11 @@ TEST_CASE("string concatenation and replication, including self-append") {
 
 // -- Runtime (non-constant) replication multiplier, string result only --
 //
-// A DELIBERATE DEVIATION from LRM 11.4.12.1, which requires the multiplier to
-// be a non-negative, non-x, non-z constant expression (see lower_expr's
-// Replication case and the OPEN M3 ledger item in docs/TODO.md). The clause
-// demands a constant so a packed result's width is known at elaboration; a
-// string result has no elaboration-time width. iverilog 13 refuses the
-// construct, Verilator 5.050 accepts it; UVM ships it (uvm_printer.svh:1501).
+// LRM 11.4.12.2: "In the case of string replication, a non-constant multiplier is
+// allowed"; 6.16 Table 6-9: the multiplier is "not required to be a constant expression"
+// and a zero multiplier gives the empty string. A packed result still needs a constant
+// (11.4.12.1). iverilog 13 refuses the construct, Verilator 5.050 accepts it; UVM ships
+// it (uvm_printer.svh:1501).
 
 // The exact uvm_printer shape: the `dash.len() < m` guard around `{m{"-"}}`.
 TEST_CASE("string replication with a runtime multiplier (the UVM guard shape)") {
