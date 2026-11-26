@@ -102,12 +102,17 @@ ir::Index Lowerer::lower_address_arg(const Expression& expr, ir::Builder& b) {
 }
 
 // Whether the memory argument of $readmem / $fread names what the load can fill
-// (LRM 21.4): a variable holding an unpacked array, an element of one that is itself
-// an array (a partially indexed multidimensional memory), or a slice of either, with
-// every dimension above the slice indexed.
+// (LRM 21.4): a variable holding an unpacked array of fixed size, a dynamic array or a
+// queue; an element of one that is itself an array (a partially indexed
+// multidimensional memory); or a slice of either, with every dimension above the slice
+// indexed. A member of a struct, a class or an interface is not loaded yet, nor is an
+// associative array, and a queue slice is a new queue (LRM 7.10.1), not a view of the
+// queue that a load could fill.
 bool Lowerer::is_mem_target_shape(const Expression& e) {
     for (const Expression* cur = &e;;) {
-        if (!is_unpacked_array(*cur)) {
+        const slang::ast::Type& type = cur->type->getCanonicalType();
+        if (type.as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr &&
+            type.as_if<slang::ast::DynamicArrayType>() == nullptr && type.as_if<slang::ast::QueueType>() == nullptr) {
             return false;
         }
         switch (cur->kind) {
@@ -117,9 +122,14 @@ bool Lowerer::is_mem_target_shape(const Expression& e) {
             case ExpressionKind::ElementSelect:
                 cur = &cur->as<ElementSelectExpression>().value();
                 break;
-            case ExpressionKind::RangeSelect:
-                cur = &cur->as<RangeSelectExpression>().value();
+            case ExpressionKind::RangeSelect: {
+                const Expression& sliced = cur->as<RangeSelectExpression>().value();
+                if (is_queue(sliced)) {
+                    return false;
+                }
+                cur = &sliced;
                 break;
+            }
             default:
                 return false;
         }
@@ -127,24 +137,31 @@ bool Lowerer::is_mem_target_shape(const Expression& e) {
 }
 
 // The array a $readmem / $fread loads, which is the array lvalue its argument is, but
-// for an indexed slice. `a[i +: n]` / `a[i -: n]` (LRM 7.4.5, 11.5.1) selects n words
-// from a runtime position, so no lvalue names it: it is the array `a` plus the base
-// and direction, and the backend finds the words that exist. A slice with constant
-// bounds is an arr_slice view, like any other use of it. The base is widened by its
-// own signedness, with room for the arithmetic, exactly as emit_indexed_slice_copy
-// does, so an x or z bit and a negative base keep their meaning.
+// for a slice. `a[l:r]`, `a[i +: n]` and `a[i -: n]` (LRM 7.4.5, 11.5.1) select words
+// of `a`, which only the load knows how to place: a slice is the array `a` plus the
+// direction and the coordinate of its first word, and the backend finds the words that
+// exist, so it is the one form of slice a dynamic array has as well as a fixed array
+// (neither has a sub-array a view could name, once `a` is a member of an aggregate or
+// a heap buffer). `a[l:r]` starts at its left bound, going the way the slice does. The
+// base is widened by its own signedness, with room for the arithmetic, exactly as
+// emit_indexed_slice_copy does, so an x or z bit and a negative base keep their
+// meaning.
 Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b) {
     MemTarget t;
     t.type = lower_type(*e.type);
-    if (e.kind == ExpressionKind::RangeSelect &&
-        e.as<RangeSelectExpression>().getSelectionKind() != RangeSelectionKind::Simple) {
+    if (e.kind == ExpressionKind::RangeSelect) {
         const RangeSelectExpression& rs = e.as<RangeSelectExpression>();
         guard_indexed_array_slice(rs);
         const auto    w        = std::max(static_cast<uint32_t>(rs.left().type->getBitWidth()), 32u) + 2;
         const ir::Ref extended = make_int_type(w, rs.left().type->isFourState());
         t.target               = lower_lvalue(rs.value(), b, /*is_write=*/true);
         t.base_type            = lower_type(*rs.value().type);
-        t.slice = rs.getSelectionKind() == RangeSelectionKind::IndexedDown ? ir::kMemSliceDown : ir::kMemSliceUp;
+        if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+            const ir::Type slice_type = std::get<ir::Type>(module_.pool.get(t.type));
+            t.slice = slice_type.left <= slice_type.right ? ir::kMemSliceUp : ir::kMemSliceDown;
+        } else {
+            t.slice = rs.getSelectionKind() == RangeSelectionKind::IndexedDown ? ir::kMemSliceDown : ir::kMemSliceUp;
+        }
         t.slice_base = b.convert(lower_expr(rs.left(), b), extended, rs.left().type->isSigned(), loc(rs.left()));
         return t;
     }
@@ -154,12 +171,13 @@ Lowerer::MemTarget Lowerer::lower_mem_target(const Expression& e, ir::Builder& b
 
 // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
 // Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory is a
-// whole unpacked array (a plain name or hierarchical reference), an element of a
-// multidimensional one that is itself an array, or a slice of either (21.4: "The
+// whole unpacked array (a plain name or hierarchical reference) of fixed size or a
+// dynamic array or queue, whose size the load does not change (21.4.1), an element of
+// a multidimensional one that is itself an array, or a slice of either (21.4: "The
 // memory_name can be an unpacked array or a partially indexed multidimensional
-// unpacked array", its lowest dimension sliceable); start and finish then address
-// that array. The filename is a string literal, string-typed expression, or integral
-// value holding packed ASCII (LRM §21.4), and the optional address bounds are general
+// unpacked array", its lowest dimension sliceable); start and finish then address that
+// array. The filename is a string literal, string-typed expression, or integral value
+// holding packed ASCII (LRM §21.4), and the optional address bounds are general
 // runtime values.
 void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b) {
     const auto args = call.arguments();
@@ -175,9 +193,11 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
     }
     const Expression& mem = *mem_arg;
     if (!is_mem_target_shape(mem)) {
-        // TODO: a member of an unpacked struct, a class property, or a dynamic array,
-        // queue or associative array as the target (LRM 21.4.1).
-        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one");
+        // TODO: a member of a struct, a class or an interface, an associative array (LRM
+        // 21.4.1: loading an address creates its element, but nothing says which address
+        // a load that names none starts at) and a slice of a queue as the target.
+        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one, not a "
+             "member of a struct, class or interface, an associative array or a slice of a queue");
     }
     const ir::Index  filename   = lower_expr(*args[0], b);
     const MemTarget  target     = lower_mem_target(mem, b);
@@ -1519,7 +1539,8 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     }
 
     // $fread(target, fd[, start[, count]]) (LRM §21.3.4): binary read into a
-    // single vector, or an unpacked-array memory: a whole one, an element of a
+    // single vector, or an unpacked-array memory: a whole one (of fixed size, or a
+    // dynamic array or queue, whose size the read does not change), an element of a
     // multidimensional one that is itself an array, or a slice of either. The memory
     // form (like $readmem) takes optional start-address and word-count bounds over
     // the array it names.
@@ -1535,12 +1556,13 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             target_arg = &target_arg->as<AssignmentExpression>().left();
         }
         const Expression& target = *target_arg;
-        if (is_unpacked_array(target)) {
+        if (target.type->getCanonicalType().isUnpackedArray()) {
             if (!is_mem_target_shape(target)) {
-                // TODO: a member of an unpacked struct, a class property, or a dynamic
-                // array, queue or associative array as the target (LRM 21.3.4.4).
-                fail("$fread memory target must be an unpacked array variable, an element of one or a slice "
-                     "of one");
+                // TODO: a member of a struct, a class or an interface, an associative array
+                // (LRM 21.3.4.4 says nothing of one) and a slice of a queue as the target.
+                fail("$fread memory target must be an unpacked array variable, an element of one or a slice of "
+                     "one, not a member of a struct, class or interface, an associative array or a slice of a "
+                     "queue");
             }
             const ir::Index  fd        = lower_expr(*args[1], b);
             const MemTarget  mem       = lower_mem_target(target, b);

@@ -965,34 +965,57 @@ int bin_digit(char c) {
     return (c == '0' || c == '1') ? c - '0' : -1;
 }
 
-// Destination geometry for a bulk memory load, shared by $readmem and $fread:
-// element i's planes live at mm_base / z_base + i*stride, each `width` bits (<=64,
-// enforced by the backend). A 2-state memory (four_state=false) has no z plane and
-// stores x/z as 0. A scalar target is just count == 1.
+// Destination geometry for a bulk memory load, shared by $readmem and $fread: the
+// `count` leaves of the words that exist, each `width` bits in a slot of `stride`
+// bytes whose must|may word is at the slot's start (`mm_base` + its offset) and whose
+// z word is at `z_base` + the same offset. A 2-state memory (four_state=false) has no
+// z plane and stores x/z as 0. A scalar target is just count == 1.
 struct MemDest {
     uint8_t* mm_base;
     uint8_t* z_base;
     uint32_t stride;
-    uint32_t count;
+    int64_t  count;
     uint32_t width;
     bool     four_state;
     // A narrow 2-state memory stores the bare iW value per element (no packed
     // must|may word, no z).
     bool narrow = false;
+    // The words of a queue sit in its ring (`cap` != 0): the leaves come `leaves` to a
+    // word, and the word w places after the first that exists is at ring slot
+    // `head` + w, less `cap` when that reaches it, counted from the plane bases.
+    // Otherwise the leaves are contiguous from the bases.
+    uint64_t leaves = 1;
+    uint64_t head   = 0;
+    uint64_t cap    = 0;
 };
+
+// Byte offset from the plane bases of leaf `idx`, counted from the first leaf that
+// exists. One subtraction wraps the ring, as in rt_queue_slot: a word that exists is
+// one of the queue's `len` <= `cap` elements and `head` < `cap`.
+size_t leaf_offset(const MemDest& d, int64_t idx) {
+    const auto i = static_cast<uint64_t>(idx);
+    if (d.cap == 0) {
+        return i * d.stride;
+    }
+    uint64_t slot = d.head + i / d.leaves;
+    if (slot >= d.cap) {
+        slot -= d.cap;
+    }
+    return (slot * d.leaves + i % d.leaves) * d.stride;
+}
 
 // Write one element's value planes at storage index `idx` (bounds-checked). A null
 // z_base (a never-z / z-elided memory) yields a null z pointer — not an offset from
 // null — so write_word_planes skips the z write.
 void mem_write(const MemDest& d, int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
-    if (idx < 0 || idx >= static_cast<int64_t>(d.count)) {
+    if (idx < 0 || idx >= d.count) {
         return;
     }
     if (!d.four_state) {
         may = must;
         z   = 0;
     }
-    const size_t off = static_cast<size_t>(idx) * d.stride;
+    const size_t off = leaf_offset(d, idx);
     uint8_t*     zp  = d.z_base != nullptr ? d.z_base + off : nullptr;
     write_word_planes(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
 }
@@ -1000,7 +1023,7 @@ void mem_write(const MemDest& d, int64_t idx, uint64_t must, uint64_t may, uint6
 // Wide (> 64-bit element) sibling of mem_write. The planes are little-endian word
 // arrays (plane_words(d.width) words); write_word_planes_wide masks them in place.
 void mem_write_wide(const MemDest& d, int64_t idx, uint64_t* must, uint64_t* may, uint64_t* z) {
-    if (idx < 0 || idx >= static_cast<int64_t>(d.count)) {
+    if (idx < 0 || idx >= d.count) {
         return;
     }
     const uint32_t words = plane_words(d.width);
@@ -1008,7 +1031,7 @@ void mem_write_wide(const MemDest& d, int64_t idx, uint64_t* must, uint64_t* may
         std::memcpy(may, must, words * sizeof(uint64_t));
         std::memset(z, 0, words * sizeof(uint64_t));
     }
-    const size_t off = static_cast<size_t>(idx) * d.stride;
+    const size_t off = leaf_offset(d, idx);
     uint8_t*     zp  = d.z_base != nullptr ? d.z_base + off : nullptr;
     write_word_planes_wide(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
 }
@@ -1113,10 +1136,16 @@ private:
 // the array or the whole of it be invalid (LRM 7.4.5): a word with no storage is a
 // word the file's numbers are dropped from, and a load that names no word does
 // nothing, not even open the file.
+//
+// The words of a queue sit in its ring rather than one after another: a nonzero
+// `ring_cap` makes `mm_base` / `z_base` point at the ring's slot 0 and the first word
+// that exists lie at slot `ring_head`, the next at the slot after it, and so on
+// around the ring (rt_queue_slot).
 extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
                                uint32_t stride, uint32_t width, const int64_t* inner, uint32_t inner_dims,
                                int64_t decl_left, int64_t decl_right, int64_t lo_word, int64_t word_count,
-                               int64_t start, int64_t finish, uint32_t flags) {
+                               int64_t ring_head, int64_t ring_cap, int64_t start, int64_t finish,
+                               uint32_t flags) {
     const bool hex          = (flags & 1u) != 0;
     const bool has_start    = (flags & 2u) != 0;
     const bool has_finish   = (flags & 4u) != 0;
@@ -1178,13 +1207,22 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     RowOrder      order(inner, inner_dims);
     const int64_t leaves = order.leaves();
 
-    const MemDest dest{ mm_base, z_base, stride, static_cast<uint32_t>(word_count * leaves), width, four_state, narrow };
+    const MemDest dest{ mm_base,
+                        z_base,
+                        stride,
+                        word_count * leaves,
+                        width,
+                        four_state,
+                        narrow,
+                        static_cast<uint64_t>(leaves),
+                        static_cast<uint64_t>(ring_head),
+                        static_cast<uint64_t>(ring_cap) };
     // A leaf's slot holds both of its planes, so its `stride` bytes before and after
     // the write tell whether the value changed.
     std::vector<uint8_t> before(stride);
     uint32_t             changed    = 0;
     const auto           write_leaf = [&](int64_t idx) {
-        uint8_t* const slot = mm_base + static_cast<size_t>(idx) * stride;
+        uint8_t* const slot = mm_base + leaf_offset(dest, idx);
         std::memcpy(before.data(), slot, stride);
         if (wide) {
             mem_write_wide(dest, idx, must.data(), may.data(), z.data());
@@ -1310,8 +1348,9 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
 
 extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t width,
                             uint32_t four_state, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
-                            int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t start,
-                            int64_t max_count, uint32_t flags, const rt_null_site* site, uint64_t now) {
+                            int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t ring_head,
+                            int64_t ring_cap, int64_t start, int64_t max_count, uint32_t flags,
+                            const rt_null_site* site, uint64_t now) {
     // $fread (LRM §21.3.4): read raw bytes from `fd` into a memory (or a scalar, a
     // memory of one word), MSB-first per leaf. Fills from the `start` declared address
     // (default the lowest) toward the highest, at most `max_count` words and never
@@ -1346,7 +1385,16 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
         rt_fread_range_report(site, addr, decl_left, decl_right, now);
         return 0;
     }
-    const MemDest dest{ mm_base, z_base, stride, static_cast<uint32_t>(word_count * leaves), width, four_state != 0, narrow };
+    const MemDest dest{ mm_base,
+                        z_base,
+                        stride,
+                        word_count * leaves,
+                        width,
+                        four_state != 0,
+                        narrow,
+                        static_cast<uint64_t>(leaves),
+                        static_cast<uint64_t>(ring_head),
+                        static_cast<uint64_t>(ring_cap) };
 
     // Bytes accumulate into a word array; a <= 64-bit element uses one word and
     // reduces to the scalar (val << 8) | byte path.

@@ -4286,8 +4286,9 @@ private:
 
     // The array a $readmem or $fread loads, resolved for rt_readmem / rt_fread: the
     // leaf planes of the first word that exists, the leaf slot's facts, the loaded
-    // array's dimensions (the declared bounds of its highest, `inner` for the rest) and
-    // which of the words of the highest dimension have storage.
+    // array's dimensions (the declared bounds of its highest, `inner` for the rest),
+    // which of the words of the highest dimension have storage and, for a queue, the
+    // ring they sit in.
     struct MemTarget {
         llvm::Value*                      mm_base = nullptr;
         llvm::Value*                      z_base  = nullptr;
@@ -4295,14 +4296,24 @@ private:
         uint32_t                          width   = 0;
         bool                              four_state = false;
         std::pair<llvm::Value*, uint32_t> inner;
-        int64_t                           left  = 0;
-        int64_t                           right = 0;
+        // i64 values: the declared bounds of the highest dimension. Constants for a
+        // fixed-size array, [0 : size - 1] for a dynamic array or queue, whose size is
+        // read at run time.
+        llvm::Value* left  = nullptr;
+        llvm::Value* right = nullptr;
         // i64 values: the words at positions [lo_word, lo_word + word_count), counted
         // from `left`, exist; a count of 0 means the target names none.
         llvm::Value* lo_word    = nullptr;
         llvm::Value* word_count = nullptr;
-        // The module signal that holds the memory.
-        Signal sig{ 0 };
+        // i64 values: the ring of a queue (see rt_readmem); 0 and 0 for any other array.
+        llvm::Value* ring_head = nullptr;
+        llvm::Value* ring_cap  = nullptr;
+        // The place the load writes: whose waiters it wakes and what it marks for the
+        // dump. `container` says it is a dynamic array or queue, which wakes through
+        // the container notifier (notify_container_mutation) rather than the waiters of
+        // an array signal.
+        LValueInfo place;
+        bool       container = false;
     };
 
     MemTarget resolve_mem_target(Index      target,
@@ -4311,6 +4322,8 @@ private:
                                  uint32_t   slice,
                                  Index      slice_base,
                                  const char* task);
+
+    void finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix);
 
     void lower_fread_word(Index i);
 

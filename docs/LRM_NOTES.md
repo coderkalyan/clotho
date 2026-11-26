@@ -826,3 +826,31 @@ the tests take as oracle its load of the whole memory that places the same words
 from the clauses above.
 
 Code: `src/lower/SystemTasks.cpp` (`lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`), `src/runtime/Io.cpp` (`rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a constant slice of a memory", "$readmemh into an element or a slice of an element of a multi-dimensional memory", "$readmemh into a slice at a variable position", "$readmemh through an invalid index loads nothing", "$fread into a slice or an element of a memory"), `tests/runtime_test.cpp` ("rt_readmem loads the words that exist and drops the others").
+
+## 61. Dynamic arrays and queues as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 20.7)
+
+21.4.1 says "When loading dynamic arrays and queues, the current size of the array is
+fixed; the array shall not be resized", and nothing of their addresses. 20.7 gives them a
+range, `$left` 0 and `$right` the size minus 1 "for a queue or dynamic array dimension",
+so Clotho loads one as the memory `[0:size-1]` at the size it has when the task runs. The
+default start is 0, and `start`, `finish`, `@` addresses and `$fread`'s `start` and
+`count` are indices into it; a number addressed past the last element is dropped with the
+warning a memory's last address gives, and no element is created. 21.3.4.4 names neither
+container, and `$fread` takes the same reading. A dynamic array of fixed arrays is a
+memory of several dimensions whose highest is the array (note 59), and a slice `d[a:b]`
+or `d[i +: n]` of a dynamic array has the addresses and placement note 60 gives a slice of
+a fixed array. A slice of a queue is a new queue (7.10.1), not a view of it, so no load
+fills it and Clotho refuses it.
+
+A dynamic array or queue with no element has `$right` -1, which is no address at all: the
+load names no word, as a slice wholly outside its array does (note 60), so no file is
+opened or read, and `$fread` returns 0 with the file where it was.
+
+A load that changes an element wakes whoever waits on the array or queue, as a store to
+one does (9.4.2, 9.4.3); a load that changes none wakes nobody, as for a memory.
+
+iverilog 13 takes neither container as a memory argument ("$readmemh's second argument
+must be a memory"), so the tests take as oracle its load of the fixed memory `[0:n-1]`
+with the same file and arguments, and derive the rest from the clauses above.
+
+Code: `src/lower/SystemTasks.cpp` (`is_mem_target_shape`, `lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `finish_mem_load`), `src/runtime/Io.cpp` (`MemDest`, `rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1", "$fread into a dynamic array or a queue fills the words it holds", "$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements", "$readmemh into a slice of a dynamic array places its words like a fixed memory", "$readmemh into a dynamic array of fixed arrays, an element or a slice of one", "a load into an empty dynamic array or queue does nothing", "a load into a dynamic array or a queue wakes the waiters of its elements", "a load into a dynamic array local to a task"), `tests/runtime_test.cpp` ("rt_readmem walks the words of a queue's ring from its head slot").

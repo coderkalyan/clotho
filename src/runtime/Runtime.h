@@ -891,15 +891,16 @@ int32_t rt_sscanf(const char* buf, uint32_t len, int32_t fwd, const char* fmt, u
 // each (LRM 21.4.3). Only the words at positions [`lo_word`, `lo_word` + `word_count`)
 // of it, counted from `decl_left`, have storage, `mm_base` / `z_base` pointing at the
 // first: the bytes of a word with none are read and dropped, and with `word_count` 0
-// nothing is read (see rt_readmem). `flags` bit2 marks a narrow 2-state destination
+// nothing is read (see rt_readmem). A nonzero `ring_cap` says the words are in a
+// queue's ring (see rt_readmem). `flags` bit2 marks a narrow 2-state destination
 // (bare iW leaves, null `z_base`). Returns the number of bytes read. `width` must be
 // <= 64. A `start` outside the declared range reads nothing and returns 0 after a
 // run-time warning located by `site` (null for the scalar form, which has no start)
 // at simulation time `now`.
 int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t width,
                  uint32_t four_state, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
-                 int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t start, int64_t max_count,
-                 uint32_t flags, const rt_null_site* site, uint64_t now);
+                 int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t ring_head, int64_t ring_cap,
+                 int64_t start, int64_t max_count, uint32_t flags, const rt_null_site* site, uint64_t now);
 
 // The warning behind rt_fread's out-of-range `start` (docs/LRM_NOTES.md 55). Goes quiet
 // after a few reports from one site, like the divide-by-zero report.
@@ -926,13 +927,16 @@ void rt_fflush(int32_t desc);
 // `mm_base` / `z_base` point at the first of them: all of the memory, or the part of a
 // slice that lies in its array (a slice may hang off it, or its index be invalid,
 // LRM 7.4.5). A word with none has the file's numbers dropped, with a warning, and a
-// load with `word_count` 0 names no word and does nothing. `flags` bit0=hex,
-// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward, bit5=narrow (a
-// 2-state memory of bare iW leaves). Returns the number of leaves the load changed.
+// load with `word_count` 0 names no word and does nothing. A nonzero `ring_cap` says
+// the words are in a queue's ring: `mm_base` / `z_base` then point at its slot 0 and
+// the first word that exists is at slot `ring_head`, the next after it, wrapping at
+// `ring_cap` slots (rt_queue_slot). `flags` bit0=hex, bit1=has_start, bit2=has_finish,
+// bit3=four_state, bit4=path_forward, bit5=narrow (a 2-state memory of bare iW
+// leaves). Returns the number of leaves the load changed.
 uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
                     uint32_t width, const int64_t* inner, uint32_t inner_dims, int64_t decl_left,
-                    int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t start, int64_t finish,
-                    uint32_t flags);
+                    int64_t decl_right, int64_t lo_word, int64_t word_count, int64_t ring_head, int64_t ring_cap,
+                    int64_t start, int64_t finish, uint32_t flags);
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 //
