@@ -904,7 +904,7 @@ TEST_CASE("object randstate round-trips") {
 }
 
 // An object owns a generator iff its class can be the receiver of randomize, srandom,
-// get_randstate or set_randstate (docs/LRM_NOTES.md note 59), rand property or not. So the
+// get_randstate or set_randstate (docs/LRM_NOTES.md note 63), rand property or not. So the
 // pair works on a class with no rand member, srandom seeds it reproducibly, and it works
 // through a base handle to a derived object. Oracle: LRM 18.13.3-18.13.5, 18.14.
 TEST_CASE("object randstate and srandom on a class with no rand property") {

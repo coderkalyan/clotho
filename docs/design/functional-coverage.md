@@ -884,8 +884,8 @@ IEEE 1800-2023 addition gated on the language version.
    other clotho run-time fatal.
 7. **The coverage database is refused rather than invented** (19.9 specifies no
    format), and the report is a deterministic text file instead.
-8. **`option.detect_overlap` warns only between `bins` bins** (docs/LRM_NOTES.md 57).
-9. **`start()` / `stop()` on a coverpoint are independent of the covergroup's** (docs/LRM_NOTES.md 58).
+8. **`option.detect_overlap` warns only between `bins` bins** (docs/LRM_NOTES.md 61).
+9. **`start()` / `stop()` on a coverpoint are independent of the covergroup's** (docs/LRM_NOTES.md 62).
 10. **`option.get_inst_coverage` has no effect without `merge_instances`** (Table 19-1: "Only
     applies when the merge_instances type option is set"); it is validated and dropped.
 

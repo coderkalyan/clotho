@@ -771,4 +771,4 @@ Each test comment names the LRM clause and, where §4 scored it, records
   `get_randstate` or `set_randstate`**, rand property or not: a compile-time scan marks the
   static receiver class of every such call and a class owns one when any class in its base
   chain is marked. Unmarked classes keep no RNG and draw nothing at `new`
-  (docs/LRM_NOTES.md note 59).
+  (docs/LRM_NOTES.md note 63).

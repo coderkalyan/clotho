@@ -761,19 +761,19 @@ delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
 
-## 57. `option.detect_overlap` reports only `bins` bins (19.7, Table 19-1)
+## 61. `option.detect_overlap` reports only `bins` bins (19.7, Table 19-1)
 
 Table 19-1: "When true, a warning is issued if there is an overlap between the range list (or transition list) of two bins of a coverpoint." The clause does not say whether `ignore_bins` and `illegal_bins` are among "two bins". 19.5.5 removes an ignored value from every coverage bin and 19.5.6 flags an illegal one, so sharing values with them is what they are written to do. Clotho warns, once per pair, only between bins declared with `bins`.
 
 Code: `src/lower/Coverage.cpp` (`cover_report_overlaps`). Tests: `tests/coverage_test.cpp` ("coverage: detect_overlap warns on overlapping bins").
 
-## 58. `start()` and `stop()` on a coverpoint (19.8, Table 19-5)
+## 62. `start()` and `stop()` on a coverpoint (19.8, Table 19-5)
 
 Table 19-5 gives `start()` and `stop()` to covergroup, coverpoint and cross, as "Starts collecting coverage information" and "Stops collecting coverage information", and says no more. Clotho reads the covergroup's switch and each coverpoint's as independent: a coverpoint counts a sample only while both are on, and neither call undoes the other.
 
 Code: `src/runtime/Coverage.cpp` (`rt_cover_start_point`, `rt_cover_hit`). Tests: `tests/coverage_test.cpp` ("coverage: stop and start on a coverpoint").
 
-## 59. Which objects own an RNG (18.14.1, 18.14.2, 18.13.3-18.13.5)
+## 63. Which objects own an RNG (18.14.1, 18.14.2, 18.13.3-18.13.5)
 
 18.14.1 gives every object "an independent RNG" seeded at `new` from the creating thread (or the initialization RNG for a static declaration initializer). A generator nothing can observe is not observable, so Clotho gives one only to a class that can be the receiver of `randomize`, `srandom`, `get_randstate` or `set_randstate`: a compile-time scan marks the static receiver type of every such call (an implicit receiver is the enclosing class), and a class owns the generator when any class in its base chain is marked, since a base-typed handle may hold a derived object. Other classes keep no RNG and draw nothing at `new`. This is indistinguishable from giving every object an RNG: the generator is read only through those four methods, and an unmarked class has none of them called on it, while the one draw at `new` comes from the creating thread's stream, which the observable `$urandom` values of an unmarked class's creator would otherwise shift. It differs from "every object draws" in exactly that shift, and only for a design that has no way to see the object's RNG: Clotho keeps the existing pinned streams of such designs.
 

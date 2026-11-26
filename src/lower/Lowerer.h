@@ -261,7 +261,7 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
 // property: the static receiver class of every `randomize`, `srandom`, `get_randstate`
 // and `set_randstate` call in the design. A base-typed handle may hold a derived
 // object, so a class owns one when any class in its base chain is marked. Every other
-// class keeps no generator and draws nothing at `new`. docs/LRM_NOTES.md note 59.
+// class keeps no generator and draws nothing at `new`. docs/LRM_NOTES.md note 63.
 struct RngClasses {
     ankerl::unordered_dense::set<const ClassType*> marked;
 };
