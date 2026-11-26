@@ -2326,12 +2326,10 @@ void Backend::lower_call_common(Index               i,
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             // An out / inout container actual is filled BY THE CALLEE through this
             // handle pointer, which finds the owner from the address when it copies
-            // out (emit_copyout), except for a place inside a container's payload,
-            // which has none the address can name: the barrier stays here for that.
+            // out (emit_copyout). The frontend never hands it a place inside another
+            // container's payload, which has no owner the address can name.
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                if (!alv.epoch_chain.empty()) {
-                    emit_gc_barrier_for(alv);
-                }
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
                 if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
@@ -2533,9 +2531,7 @@ void Backend::lower_task_call_inst(Index i) {
             const Guarded& alv = lvalue_of(args[k]);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
-                if (!alv.epoch_chain.empty()) {
-                    emit_gc_barrier_for(alv);
-                }
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
                 if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
