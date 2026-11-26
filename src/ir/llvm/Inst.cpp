@@ -104,14 +104,15 @@ void Backend::set_str(Index i, llvm::Value* handle) {
 // elem_idx selects it).
 //
 // `use` says WHY, and it has no default on purpose (StringUse). A waited-on
-// string class property notifies from a content comparison around the write, so
-// a `Write` here must sit inside a str_chg_snapshot / str_chg_after bracket;
-// that is checked rather than trusted, because a missing notify is a silent
-// permanent park and the check can only fire for a property someone waits on.
+// string place (a class property with a notifier, part of a signal with waiters)
+// notifies from a content comparison around the write, so a `Write` here must sit
+// inside a str_chg_snapshot / str_chg_after bracket; that is checked rather than
+// trusted, because a missing notify is a silent permanent park and the check can
+// only fire for a place someone waits on.
 llvm::Value* Backend::lv_string_ptr(const Guarded& g, StringUse use) {
-    if (use == StringUse::Write && g.chg != nullptr && str_chg_open_ == 0) {
-        throw BackendError{ "internal: write to a waited-on string class property "
-                            "outside a change-notify bracket (LRM 9.4.2)" };
+    if (use == StringUse::Write && (g.chg != nullptr || str_signal_waited(g)) && str_chg_open_ == 0) {
+        throw BackendError{ "internal: write to a waited-on string outside a change-notify "
+                            "bracket (LRM 9.4.2)" };
     }
     const auto form = [&](const LValue& lv) -> llvm::Value* {
         if (lv.array_ty != nullptr) {
@@ -202,6 +203,10 @@ bool Backend::produces_string_temp(Index i) {
 // a prefix part (s = {s, chunk} appends in place, the O(n^2)->O(n) fix for
 // repeated append); a whole-string leaf target keeps the handle derivable in
 // the prologue, before the leaf instruction itself lowers.
+//
+// Not into a string something waits on: the store is where its waiters are woken,
+// by comparing the characters before and after (str_chg_snapshot), and a concat
+// built in place leaves no "before".
 bool Backend::forwarded_string_store(Index j) {
     if (ir_->tag(j) != Inst::Tag::Store) {
         return false;
@@ -216,12 +221,18 @@ bool Backend::forwarded_string_store(Index j) {
     }
     switch (ir_->tag(p.binary.l)) {
         case Inst::Tag::Signal: {
-            const SignalSlot& s = slot_of(ir_->payload(p.binary.l).signal);
-            return s.is_string && !s.is_array;
+            const Signal      sig = ir_->payload(p.binary.l).signal;
+            const SignalSlot& s   = slot_of(sig);
+            return s.is_string && !s.is_array && !signal_has_waiters(sig);
         }
         case Inst::Tag::Local: {
             const uint32_t idx = ir_->payload(p.binary.l).local.index;
-            return idx < frame_slots_.size() && frame_slots_[idx].is_string;
+            if (idx >= frame_slots_.size() || !frame_slots_[idx].is_string) {
+                return false;
+            }
+            // A `ref` formal's actual may be one (the call passes the thunk that
+            // wakes it, in a design where some ref actual has waiters).
+            return !(frame_slots_[idx].is_ref && design_ref_wake_);
         }
         default:
             return false;
@@ -1010,12 +1021,10 @@ void Backend::lower_inst(Index i) {
                 if (!deferred && forwarded_string_store(i)) {
                     return;
                 }
-                // Deep copy, bracketed by the property's CONTENT compare: a
-                // waited-on `obj.s` fires only when the characters differ (LRM
-                // 9.4.2 over a 6.16 value), so `obj.s = obj.s` and a re-assignment
-                // of equal text from a different handle wake nobody. A string
-                // SIGNAL carries no notifier (refused in the frontend), so this
-                // emits nothing for one.
+                // Deep copy, bracketed by the place's CONTENT compare: a waited-on
+                // string wakes its waiters only when the characters differ (LRM
+                // 9.4.2 over a 6.16 value), so `s = s` and a re-assignment of
+                // equal text from a different handle wake nobody.
                 llvm::Value* snap = str_chg_snapshot(lv);
                 b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv, StringUse::Write), str_of(p.binary.r),
                                                  alloc_site_global(loc_text(i), "string") });

@@ -152,20 +152,25 @@ TEST_CASE("wait on a constant-false condition parks the process forever") {
     CHECK(run_capture_finish(src) == "before\nwatchdog 100\n");
 }
 
-// A string condition would need a string-aware wait queue (string stores skip
-// wait-queue servicing), so it must fail loudly, not silently never re-trigger.
-TEST_CASE("wait on a string condition fails loudly") {
+// A string condition is true when the string is not empty, and a store that changes
+// its characters re-tests it (tests/string_test.cpp has the rest). It was refused:
+// a string store serviced no wait queue.
+TEST_CASE("wait on a string condition resumes when the string becomes non-empty") {
     constexpr std::string_view src = R"(
         module m;
             string s = "";
             initial begin
                 wait(s);
-                $display("x");
+                $display("woke %0t", $time);
+            end
+            initial begin
+                #2 s = "";
+                #1 s = "go";
+                #1 $finish;
             end
         endmodule
     )";
-    const std::string err = lower_error(src);
-    CHECK(err.find("string") != std::string::npos);
+    CHECK(run_capture_finish(src) == "woke 3\n");
 }
 
 // -- wait on a class property (LRM 9.4.3) ------------------------------------

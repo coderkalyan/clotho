@@ -170,12 +170,6 @@ void Lowerer::collect_inferred_sensitivity(const Statement&            body,
         if (mode == SensitivityMode::Comb && c.written.contains(static_cast<uint32_t>(s))) {
             continue;
         }
-        if (is_string_ref(module_.signal(s).type)) {
-            // TODO: string signals in inferred (@*) sensitivity — string
-            // stores skip wait-queue servicing, so the process would
-            // never re-trigger.
-            fail("string in inferred combinational sensitivity is not supported");
-        }
         out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
     }
 }
@@ -418,11 +412,12 @@ ir::Signal Lowerer::event_signal(const Expression& e) {
         // members (LRM 25.9) — needs the synthesized net to re-read the handle.
         fail("an event control on an expression through a virtual interface is not supported");
     }
-    if (is_string_expr(e)) {
-        // TODO: waiting on a string change (needs string-aware wait-queue
-        // servicing; string stores skip edge detection).
-        fail("string in an event control is not supported");
-    }
+    // A string variable is a signal whose stores wake its any-change bucket when
+    // the characters change (Backend::str_chg_after), so it takes the path of any
+    // named signal below. Any other string expression has no net to be put on (the
+    // one synthesized at the end of this function carries a vector) and is sampled
+    // by the process that waits, like one over heap state.
+    const bool named = e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue;
     if (e.kind == ExpressionKind::ArbitrarySymbol) {
         // `@(cb)`: waiting on a clocking block (LRM 14.15) waits on the event
         // the block triggers at its clocking event, NOT on the clock itself --
@@ -440,25 +435,25 @@ ir::Signal Lowerer::event_signal(const Expression& e) {
         // event of the block that declares it -- the same wait as `@(cb)` on it.
         return clocking_state(*gc).event;
     }
-    // An event expression over heap state has to be sampled by the process that
-    // waits on it (lower_sampled_event_wait), and what reaches here is one no
-    // process samples. The temp net at the end of this function would be driven by
-    // a continuous process that evaluates the handles when it is built, before
-    // anything has assigned them, and never runs again when the object changes: a
-    // wait that never wakes.
+    // An event expression over heap state, or a string expression, has to be
+    // sampled by the process that waits on it (lower_sampled_event_wait), and what
+    // reaches here is one no process samples. The temp net at the end of this
+    // function would be driven by a continuous process that evaluates the handles
+    // when it is built, before anything has assigned them, and never runs again
+    // when the object changes: a wait that never wakes.
     //
     // TODO: such an expression in a list with a signal or a named event (the woken
     // process cannot tell which member woke it, so it cannot tell that member's
     // event from a wake that left its own sample unchanged), and as the control of
     // `<= @(...)` or `->> @(...)` or as a clocking event of a clocking block, an
     // assertion or a covergroup, none of which is a process that could sample.
-    if (!e.type->isEvent() && event_expr_reads_heap(e)) {
-        fail("an event control on a method call or on an expression of class properties is "
-             "supported only as a procedural `@`, alone or beside others of its kind: not in "
-             "a list with a signal or a named event, and not as the control of a nonblocking "
-             "assignment, a nonblocking trigger or a clocking event");
+    if ((!e.type->isEvent() && event_expr_reads_heap(e)) || (is_string_expr(e) && !named)) {
+        fail("an event control on a method call, on an expression of class properties or on a "
+             "string expression is supported only as a procedural `@`, alone or beside others "
+             "of its kind: not in a list with a signal or a named event, and not as the control "
+             "of a nonblocking assignment, a nonblocking trigger or a clocking event");
     }
-    if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+    if (named) {
         // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
         // subscribes to the target instance's signal directly. A clockvar
         // (`@(posedge cb.sig)`, LRM 14.15) resolves the same way and lands on
@@ -1711,8 +1706,7 @@ const Lowerer::ClockingBlockState& Lowerer::clocking_state(const ClockingBlockSy
 
 // Everything a process waiting on `e` has to be woken by (LRM 9.4.2, 9.4.3).
 //
-// The signals `e` reads, each as an any-change (level) event; collect_expr_reads
-// fails loudly on a string one, which the wait queues do not serve.
+// The signals `e` reads, each as an any-change (level) event.
 //
 // A member read through a virtual interface is not one of those signals: the
 // collector sees the handle variable, not the member. They are gathered apart and
@@ -1814,11 +1808,7 @@ void Lowerer::add_callee_wait_events(const Expression& e, std::vector<ir::WaitEv
         signals.record_read(*vs);
     }
     for (const ir::Signal sig : signals.reads) {
-        // A string signal has no wait queue to park on (collect_expr_reads
-        // refuses one the expression itself reads).
-        if (!is_string_ref(module_.signal(sig).type)) {
-            add(sig);
-        }
+        add(sig);
     }
 }
 
@@ -1918,18 +1908,27 @@ void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
 }
 
 // Whether the event expression `e` has to be sampled by the process that waits on
-// it (lower_sampled_event_wait): it reads heap state. A property, a fork-captured
-// automatic, a method called on an object, or anything a subroutine it calls reads
-// from one. Such an expression cannot be handed to a continuous process to drive a
-// net the wait could subscribe to (synth_event_net): that process would evaluate
-// the handles when it is built, before anything has assigned them, and nothing
-// would run it again when the object changes.
+// it (lower_sampled_event_wait).
+//
+// It reads heap state: a property, a fork-captured automatic, a method called on an
+// object, or anything a subroutine it calls reads from one. Such an expression
+// cannot be handed to a continuous process to drive a net the wait could subscribe
+// to (synth_event_net): that process would evaluate the handles when it is built,
+// before anything has assigned them, and nothing would run it again when the object
+// changes.
+//
+// Or it is a string that is not a variable of its own (`{s, "/"}`, `names[i]`,
+// `f()`): a net carries a vector, and a string variable's own any-change bucket
+// serves only the variable.
 //
 // Not for an expression through a virtual interface, which lower_vif_expr_wait
-// samples itself, nor for one whose dependencies cannot wake anything, which stays
-// on the path it was on.
+// samples itself, nor for one whose dependencies cannot wake anything.
 bool Lowerer::event_expr_sampled(const Expression& e) {
-    if (e.type->isEvent() || reads_vif(e) || !event_expr_reads_heap(e)) {
+    if (e.type->isEvent() || reads_vif(e)) {
+        return false;
+    }
+    const bool named = e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue;
+    if (!(is_string_expr(e) && !named) && !event_expr_reads_heap(e)) {
         return false;
     }
     const ExprWaitDeps deps = expr_wait_deps(e);

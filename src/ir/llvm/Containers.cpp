@@ -567,9 +567,17 @@ llvm::Constant* Backend::chg_shared_slot(uint32_t k) {
       chg_shared_ty_, sym(chg_shared_gv_), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
 }
 
-// Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on
-// a 6.16 value), or null when nothing waits on this place -- which is every
-// string place in a design that waits on no string property.
+// Whether something waits on the signal a string place belongs to: a string
+// variable, a string member of an aggregate variable, an element of an array of
+// strings. A PreInit store has no waiter yet (service_snapshot).
+bool Backend::str_signal_waited(const LValueInfo& lv) const {
+    return !silent_stores_ && lv.is_signal && signal_has_waiters(lv.sig);
+}
+
+// Pre-write CONTENT snapshot of a waited-on STRING place (LRM 9.4.2 on a 6.16
+// value), or null when nothing waits on it -- which is every string place in a
+// design that waits on no string. The place is a class property with a change
+// notifier, the actual of a `ref` formal, or part of a signal with waiters.
 //
 // A string is the one notified type whose value is NOT the word the place holds.
 // `obj.s = t` replaces the rt_string's buffer, so comparing handles would call
@@ -578,12 +586,12 @@ llvm::Constant* Backend::chg_shared_slot(uint32_t k) {
 // -- re-assigning the same text must fire nothing. So the content is copied out
 // before the write and compared with rt_string_cmp after it.
 //
-// The copy costs a malloc, paid only for a property some `@` / `wait` names. The
+// The copy costs a malloc, paid only for a place some `@` / `wait` depends on. The
 // scratch handle is an ENTRY-block alloca, so a bracket inside a loop reuses one
 // slot rather than growing the stack, and the init / deinit pair is balanced
 // across the bracket so each pass copies into a fresh handle.
 llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
-    if (lv.chg == nullptr && lv.ref_wake_fn == nullptr) {
+    if (lv.chg == nullptr && lv.ref_wake_fn == nullptr && !str_signal_waited(lv)) {
         return nullptr;
     }
     if (lv.chg != nullptr && !lv.chg->wants(Edge::Any)) {
@@ -602,35 +610,34 @@ llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
     return snap;
 }
 
-// Close a str_chg_snapshot bracket: fire the property's any-change notifier iff
-// the characters differ, then release the snapshot.
+// Close a str_chg_snapshot bracket: wake what waits on the place iff the characters
+// differ, then release the snapshot.
 void Backend::str_chg_after(const Guarded& lv, llvm::Value* snap) {
     if (snap == nullptr) {
         return;
     }
     --str_chg_open_;
     llvm::Value* changed =
-      b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }),
-                      b_.getInt32(0));
-    if (lv.ref_wake_fn != nullptr) {
-        // A write through a `ref` formal: the call's thunk wakes what the actual's owner has waiting.
-        auto* f    = b_.GetInsertBlock()->getParent();
-        auto* body = llvm::BasicBlock::Create(ctx_, "refs.body", f);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "refs.cont", f);
-        b_.CreateCondBr(changed, body, cont);
-        b_.SetInsertPoint(body);
-        emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
-        b_.CreateBr(cont);
-        b_.SetInsertPoint(cont);
-        b_.CreateCall(str_deinit_fn(), { snap });
-        return;
-    }
+      b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }), b_.getInt32(0));
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* body = llvm::BasicBlock::Create(ctx_, "chgs.body", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "chgs.cont", fn);
     b_.CreateCondBr(changed, body, cont);
     b_.SetInsertPoint(body);
-    fire_prop_notifier(lv, Edge::Any);
+    if (lv.ref_wake_fn != nullptr) {
+        // A write through a `ref` formal: the call's thunk wakes what the actual's owner has waiting.
+        emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+    } else if (lv.chg != nullptr) {
+        fire_prop_notifier(lv, Edge::Any);
+    } else {
+        // A signal's waiters are all in its Any bucket: a string has no edges
+        // (Table 9-2), so the frontend takes no other subscription on one. The
+        // buckets are the owner's, as for any written signal (service_after_write).
+        lv.when_valid(b_, [&](const LValue& v) {
+            CtxOverride ov(*this, v.vif_ctx, lvalue_ctx_anchor(v));
+            service_signal_container_mutation(v.sig);
+        });
+    }
     b_.CreateBr(cont);
     b_.SetInsertPoint(cont);
     b_.CreateCall(str_deinit_fn(), { snap });
