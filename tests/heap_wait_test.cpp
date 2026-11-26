@@ -988,3 +988,96 @@ TEST_CASE("wait on a method that compares an event property wakes when the prope
     )";
     CHECK(run_capture(src) == "merged at 3\nend\n");
 }
+
+// A string variable a method reads is a value like any other (LRM 9.4.2, 9.4.3): a store of
+// different characters changes it, a store of the same text does not. The stores are blocking
+// and nonblocking, and the waiters sit on a function of a module string, of a class
+// property, and on the string itself. Each waiter's wake falls in a time step of its own.
+TEST_CASE("wait and @ on a function that reads a string variable wake when its characters change") {
+    constexpr std::string_view src = R"(
+        module m;
+          string gs1 = "x", gs2 = "x", gs3 = "x";
+          int n;
+          class C;
+            string s = "a";
+            function bit is_b(); return s == "b"; endfunction
+          endclass
+          function automatic bit is_y1(); return gs1 == "y"; endfunction
+          function automatic bit is_y2(); return gs2 == "y"; endfunction
+          function automatic bit is_z3(); return gs3 == "z"; endfunction
+          C c = new;
+          always @(is_y2()) begin n++; $display("@ is_y2 %0t n=%0d", $time, n); end
+          initial begin
+            fork
+              begin wait (is_y1()); $display("wait gs1 %0t", $time); end
+              begin wait (c.is_b()); $display("wait prop %0t", $time); end
+              begin wait (is_z3()); $display("wait nba %0t", $time); end
+            join_none
+            #5 gs1 = "x";
+            #5 gs1 = "y";
+            #5 gs2 = "y";
+            #5 c.s = "b";
+            #5 gs3 <= "z";
+            #5 gs2 = "q";
+            #1 $display("done %0t n=%0d", $time, n);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "wait gs1 10\n"
+                              "@ is_y2 15 n=1\n"
+                              "wait prop 20\n"
+                              "wait nba 25\n"
+                              "@ is_y2 30 n=2\n"
+                              "done 31 n=2\n");
+}
+
+// `@(s)` and an inferred `@*` over a string: the event is a change of its characters.
+TEST_CASE("@(s) and @* over a string variable detect a change of its characters") {
+    constexpr std::string_view src = R"(
+        module m;
+          string s = "a";
+          int n, k;
+          always @(s) begin n++; $display("@s %0t", $time); end
+          always @* begin k = s.len(); end
+          initial begin
+            #5 s = "a";
+            #5 s = "b";
+            #5 s = "b";
+            #5 s = "cc";
+            #1 $display("n=%0d k=%0d", n, k);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "@s 10\n@s 20\nn=2 k=2\n");
+}
+
+// What a method reads of an `event` property is `e.triggered` (LRM 15.5.3), which a trigger of
+// the event the property names changes, whichever handle the trigger goes through (15.5.5.1
+// merges handles) and whichever property names the event now (an assignment of the handle).
+TEST_CASE("wait and @ on a method that reads an event property wake on a trigger or a new handle") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C;
+            event e;
+            function bit trig(); return e.triggered; endfunction
+          endclass
+          C a = new, b = new, d = new;
+          event g, h;
+          initial begin
+            fork
+              begin wait (a.trig()); $display("wait %0t", $time); end
+              begin #10 @(a.trig()); $display("at %0t", $time); end
+              begin #20 wait (d.trig()); $display("assigned %0t", $time); end
+              begin #30 wait (b.trig()); $display("aliased %0t", $time); end
+            join_none
+            #5  -> a.e;
+            #10 -> a.e;
+            #10 -> g; d.e = g;
+            #1  b.e = h;
+            #9  -> h;
+            #1 $display("done %0t", $time);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "wait 5\nat 15\nassigned 25\naliased 35\ndone 36\n");
+}

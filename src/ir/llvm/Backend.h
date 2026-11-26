@@ -2945,9 +2945,11 @@ private:
                                llvm::Value*  new_z);
 
     void fire_event_trigger(Signal sig, uint32_t edge);
+    void fire_port_trigger(Signal sig, uint32_t edge);
+    llvm::Value* port_trigger_id(Signal sig, uint32_t edge);
     void emit_trigger_fire(llvm::Value* trig_id);
 
-    void emit_release_moment(Signal sig, const EdgeFacts& f);
+    void emit_release_moment(Signal sig, const EdgeFacts& f, bool canon);
 
     // The pieces of a (signal, edge) wake bucket a writer addresses: the static
     // subscribers' base, the dynamic waiters' base and their length cell.
@@ -3350,6 +3352,7 @@ private:
     llvm::FunctionCallee vcd_upscope_fn();
     llvm::FunctionCallee vcd_var_fn();
     llvm::FunctionCallee vcd_array_fn();
+    llvm::FunctionCallee vcd_alias_fn();
     llvm::FunctionCallee vcd_start_fn();
     llvm::FunctionCallee vcd_limit_fn();
     llvm::FunctionCallee vcd_touch_fn();
@@ -3565,6 +3568,10 @@ private:
     llvm::FunctionCallee cover_opt_get_fn();
     llvm::FunctionCallee cover_opt_set_str_fn();
     llvm::FunctionCallee cover_opt_get_str_fn();
+    llvm::FunctionCallee cover_type_opt_set_fn();
+    llvm::FunctionCallee cover_type_opt_get_fn();
+    llvm::FunctionCallee cover_type_opt_set_str_fn();
+    llvm::FunctionCallee cover_type_opt_get_str_fn();
     llvm::FunctionCallee cover_set_name_fn();
     llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);
@@ -4609,6 +4616,7 @@ private:
     void vcd_touch_lvalue(const LValueInfo& lv);
 
     void vcd_touch_signal(Signal sig);
+    bool vcd_touch_bound(Signal sig);
 
     void vcd_touch_array(Signal sig);
 
@@ -4629,10 +4637,11 @@ private:
     void vcd_plan_scope(VcdRows& rows, std::string_view name);
 
     void vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc);
+    void vcd_plan_alias(VcdRows& rows, const InstanceScope::Alias& a);
 
     const char* vcd_unrepresentable(Ref type) const;
 
-    void vcd_plan_var(VcdRows& rows, Signal sig);
+    void vcd_plan_var(VcdRows& rows, Signal sig, bool hidden = false);
 
     // The function of root that registers every dumped signal (lower_dump_vars).
     llvm::Function* vcd_register_fn();
@@ -5372,6 +5381,14 @@ private:
     // every signal of every instance of an interface definition some `virtual`
     // handle names. They keep the canonical type-derived shape.
     std::vector<bool> vif_sig_;
+    // Signals a child's port is bound to (Module::port_bound) with a scalar slot,
+    // set by build_state_types: the code of every unit that reaches one, its
+    // owner's and the bound children's alike, sees one shape and one port layout
+    // (the canonical z word, every wake bucket, every id, see build_ports) and
+    // tests at run time what the design has there, so no unit's code depends on
+    // which signal another unit binds or what waits on it.
+    std::vector<uint8_t> uniform_;
+    bool                 uniform(Signal sig) const;
     // Per (signal, edge): does some `@(edge vif.sig)` park on this member? Set by
     // collect_vif_waits over the representative each such wait names, then spread
     // to every instance of the definition so the state layout stays def-uniform.
@@ -5531,6 +5548,10 @@ private:
     std::vector<std::string>                            dpi_scope_names_;
     ankerl::unordered_dense::map<std::string, uint32_t> dpi_scope_index_;
     std::vector<int32_t>  vcd_index_;
+    // Per signal: 1 when a scope alias names it (InstanceScope::aliases), 2 once
+    // build_vcd_index registered it hidden: storage no scope lists (a temporary a
+    // parent binds to a child's port), dumped under the alias's name only.
+    std::vector<uint8_t> vcd_hidden_;
     // The shared scans (static_scan_fn, static_scan_port_fn) per LLVM module and shape.
     std::map<std::tuple<llvm::Module*, bool, bool, uint32_t>, llvm::Function*> static_scan_fns_;
     std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*>       static_scan_port_fns_;

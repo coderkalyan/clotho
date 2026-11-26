@@ -162,9 +162,11 @@ implementation-dependent. Nothing in `%p` is left knowingly deviating.
   slang's `isIntegral()`. The packed form works in each.
 - `%p` of a queue / dynamic array of tagged unions.
 
-Open, but not loud: `$cast` into a packed tagged union is a bit cast and is not
-tag-checked; VCD dumps a tagged union as one flat anonymous `$var` (LRM 21.7 has no
-tagged-union notion). Tracked in docs/TODO.md.
+Open, but not loud: VCD dumps a tagged union as one flat anonymous `$var` (LRM 21.7
+has no tagged-union notion). Tracked in docs/TODO.md.
+
+`$cast` into a packed tagged union succeeds only when every tag in the source names a
+member (docs/LRM_NOTES.md, note 76); `lower_cast` checks it with `packed_tags_valid`.
 
 ## What SV gives you (the whole surface)
 

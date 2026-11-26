@@ -1348,6 +1348,12 @@ public:
         allow_port_coercion_ = allow;
     }
 
+    // Whether input and output ports may hold no storage of their own
+    // (bind_value_port): off for a design lowered as written.
+    void set_merge_ports(bool merge) {
+        merge_ports_ = merge;
+    }
+
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
     // every call made through this Lowerer.
     // Design-wide: some assignment can retarget an event variable, so no event's
@@ -2025,6 +2031,16 @@ private:
     void build_inout_aliases(const InstanceSymbol& inst);
 
     bool needs_port_coercion(const PortConnection& pc, const PortSymbol& p);
+
+    void bind_value_port(const InstanceSymbol& inst, const PortConnection& pc, const PortSymbol& p);
+
+    bool value_port_bindable(const InstanceSymbol& inst, const PortSymbol& p);
+
+    const ValueSymbol* direct_port_target(const PortConnection& pc, const PortSymbol& p);
+
+    ir::Signal port_temp(const PortSymbol& p);
+
+    bool forced_member(const ValueSymbol& sym);
 
     bool net_is_read(const ValueSymbol& sym);
 
@@ -4374,6 +4390,10 @@ private:
     // instance of its specialization; `text` is then what follows the path. Anywhere
     // else the whole name is static text: package and `$unit` code, which sits under
     // no instance, and a subroutine reached through a virtual interface, which serves
+    // A packed value holding a packed tagged union whose tag names no member is not a value
+    // of the type ($cast, docs/LRM_NOTES.md note 76).
+    bool      packed_has_tagged_union(const slang::ast::Type& ct);
+    ir::Index packed_tags_valid(ir::Index v, const slang::ast::Type& ct, ir::Builder& b, ir::SourceLoc l);
     // every instance.
     struct ScopeName {
         bool        in_instance = false;
@@ -5997,6 +6017,7 @@ private:
     struct CoverOpts {
         uint32_t                   weight         = 1;
         uint32_t                   type_weight    = 1;
+        uint32_t                   type_goal      = 100;
         uint32_t                   goal           = 100;
         uint32_t                   at_least       = 1;
         uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default
@@ -6655,8 +6676,13 @@ private:
     const InferredClockMap* inferred_clocks_ = nullptr;
     // Port coercion (LRM 23.3.3.1); see set_allow_port_coercion.
     bool allow_port_coercion_ = false;
+    // See set_merge_ports.
+    bool merge_ports_ = true;
     // The ports build_inout_aliases coerced to inout: wire_ports copies nothing for them.
     ankerl::unordered_dense::set<const PortSymbol*> coerced_ports_;
+    // The input and output ports bind_value_port bound to the parent's own signal:
+    // wire_ports copies nothing for them. A port bound to a temporary keeps its copy.
+    ankerl::unordered_dense::set<const PortSymbol*> bound_value_ports_;
     // Every write target in this top's hierarchy, by the value symbol it roots at, and
     // the instance body each one is written in.
     ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, std::vector<const Expression*>> writes_;
@@ -6720,9 +6746,12 @@ private:
     // initializers with its children's. Whatever Collect / Classify and the code after
     // the walk append goes to the top's own processes. Lazily engaged.
     std::optional<ir::Builder> preinit_;
-    // Live signal -> its Preponed shadow. LRM 16.5: assertion expressions read
-    // sampled values, and what is sampled is the VARIABLE, not the expression.
-    ankerl::unordered_dense::map<uint32_t, ir::Signal> sva_shadows_;
+    // (Sampling scope id << 32 | live signal) -> its Preponed shadow. LRM 16.5:
+    // assertion expressions read sampled values, and what is sampled is the
+    // VARIABLE, not the expression.
+    ankerl::unordered_dense::map<uint64_t, ir::Signal> sva_shadows_;
+    // Per scope id, the shadows of other instances' signals it holds so far.
+    ankerl::unordered_dense::map<uint32_t, uint32_t> sva_foreign_shadows_;
     // In creation order, so the sampling process copies them deterministically.
     std::vector<std::pair<ir::Signal, ir::Signal>> sva_shadow_pairs_;
     // Each clocking block (LRM 14) of the design, by its symbol. Filled in

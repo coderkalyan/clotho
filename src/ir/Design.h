@@ -104,11 +104,14 @@ struct Import {
 };
 
 // A port of a unit that the instantiating parent binds rather than drives: the
-// LRM 23.3.3 name-binding half of the port boundary. Value-flow ports (input and
-// output) are ordinary local signals the parent's port-copy processes import.
+// LRM 23.3.3 name-binding half of the port boundary. An inout, ref or event port
+// always is; an input or output port is wherever the child's definition lets one
+// storage stand for both sides (Lowerer::bind_value_port), and otherwise a local
+// signal the parent's port-copy process imports.
 struct BoundPort {
     enum class Kind : uint8_t {
-        // An inout, ref or merged-nettype port; the parent binds a signal.
+        // An input, output, inout, ref or merged-nettype port, or a driver's
+        // contribution; the parent binds a signal.
         Signal,
         // An interface port; the parent binds an interface instance.
         Instance,
@@ -116,6 +119,9 @@ struct BoundPort {
 
     std::string name;
     Kind        kind = Kind::Signal;
+    // A port the definition declares, which the instance's scope lists (the VCD
+    // dump names it, bound to what its parent binds), as opposed to a contribution.
+    bool declared = false;
 
     bool operator==(const BoundPort&) const = default;
 };
@@ -150,6 +156,12 @@ struct UnitSignal {
     // VCD dump and the scope tree show. False for storage the compiler adds to
     // a unit without declaring it there, such as a constant table.
     bool scoped = true;
+    // kLocal, or the signal whose storage this local signal names, a local one
+    // or a port the parent binds: it was a pure continuous copy of that signal
+    // or the source of one, and alias_copies removed the copy. It has no storage
+    // of its own; flatten binds every reference to it, imports by name
+    // included, to the target's.
+    uint32_t alias = kLocal;
 
     bool operator==(const UnitSignal&) const = default;
 };
@@ -291,6 +303,27 @@ public:
 // Every field of `f` but its body, which a caller rebases separately: a
 // Function is move-only because its body is.
 Function signature_of(const Function& f);
+
+// Delete the processes of `u` whose `drop` entry is non-zero, renumbering what
+// counts processes (ChildSlot::process_pos, UnitDisableTarget::flush_proc). A
+// process a `disable` target flushes must not be dropped.
+void remove_processes(Unit& u, const std::vector<uint8_t>& drop);
+
+// Remove every continuous assignment that copies one whole signal of a unit
+// into another of the same type, where one of the two can become a name for
+// the other's storage, and record that alias (UnitSignal::alias). Unit-local:
+// a unit's result depends on its own bodies, plus the names other units write
+// through imports, which only ever block an alias. See
+// docs/design/modular-compilation.md, "Copy aliasing".
+void alias_copies(Design& design);
+
+// Remove every process of a module unit whose only effect is storing into the
+// unit's own signals that nothing reads, directly or through other such
+// processes. Unit-local: a port, a signal another unit names, and a signal a
+// child binds are always read. Does nothing for a design that dumps (any
+// $dumpvars), which reads everything. See docs/design/modular-compilation.md,
+// "Unread logic".
+void remove_unread_processes(Design& design);
 
 // Expand `design` into the flat Module: every unit copied once per instance,
 // with each extern declaration resolved to the definition its import names. The

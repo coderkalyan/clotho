@@ -717,6 +717,13 @@ enum class CoverOp : uint32_t {
     // An option assigned after construction: operands (handle, option id, value).
     OptSet,    // an integer option
     OptSetStr, // a string option
+    // A type option (LRM 19.7.1), named by CoverInfo::type_idx and CoverInfo::point
+    // (RT_COVER_OPT_GROUP for the covergroup's own). Read: operand (option id). Assigned:
+    // operands (option id, value).
+    TypeOptGet,    // an integer option -> 64-bit signed
+    TypeOptGetStr, // a string option (comment) -> string
+    TypeOptSet,    // an integer option
+    TypeOptSetStr, // a string option
 };
 
 // Extra payload for the two coverage tags.
@@ -758,6 +765,10 @@ struct CoverInfo {
 constexpr bool cover_op_names_type(CoverOp op) {
     switch (op) {
         case CoverOp::New:
+        case CoverOp::TypeOptGet:
+        case CoverOp::TypeOptGetStr:
+        case CoverOp::TypeOptSet:
+        case CoverOp::TypeOptSetStr:
         case CoverOp::First:
         case CoverOp::TypeCoverage:
         case CoverOp::TypeCovered:

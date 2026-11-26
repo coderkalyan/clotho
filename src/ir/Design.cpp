@@ -161,12 +161,24 @@ private:
             const Unit& u = d_.unit(fi.unit);
             fi.signals.assign(u.signals.size(), kUnresolvedSignal);
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
-                if (u.signals[h].import != kLocal) {
+                if (u.signals[h].import != kLocal || u.signals[h].alias != kLocal) {
                     continue;
                 }
                 SignalInfo info = u.signals[h].info;
                 info.name       = fi.prefix + info.name;
                 fi.signals[h]   = m_.add_signal(std::move(info));
+            }
+            // An alias names its target's storage, which a local target holds
+            // now; one whose target is a port its parent binds resolves with the
+            // imports (resolve_signal).
+            for (uint32_t h = 0; h < u.signals.size(); ++h) {
+                if (u.signals[h].import == kLocal && u.signals[h].alias != kLocal) {
+                    const UnitSignal& target = u.signals[u.signals[h].alias];
+                    assert(target.alias == kLocal && "an alias names a signal that is not itself an alias");
+                    if (target.import == kLocal) {
+                        fi.signals[h] = fi.signals[u.signals[h].alias];
+                    }
+                }
             }
             fi.functions.assign(u.functions.size(), kUnresolvedFunction);
             for (uint32_t h = 0; h < u.functions.size(); ++h) {
@@ -249,7 +261,13 @@ private:
                 return flat;
             }
             chain.emplace_back(ii, h);
-            const Unit&   u   = d_.unit(insts_[ii].unit);
+            const Unit& u = d_.unit(insts_[ii].unit);
+            if (u.signals[h].import == kLocal) {
+                // An alias of a port the parent binds (allocate left it open).
+                assert(u.signals[h].alias != kLocal && "an unresolved local signal is an alias");
+                h = u.signals[h].alias;
+                continue;
+            }
             const Import& imp = u.imports[u.signals[h].import];
             switch (imp.kind) {
                 case Import::Kind::Port: {
@@ -634,11 +652,41 @@ private:
             s.def_name = u.def_name;
             s.unit_key = unit_keys_[static_cast<uint32_t>(fi.unit)];
             s.unit     = static_cast<uint32_t>(fi.unit);
+            // A port the instance declares but its parent supplies the storage of
+            // is a name for what the parent binds, listed first, as ports are.
+            if (fi.parent != kNone) {
+                const std::vector<uint32_t>& bindings = d_.unit(insts_[fi.parent].unit).children[fi.slot].bindings;
+                for (uint32_t k = 0; k < u.bound_ports.size(); ++k) {
+                    const BoundPort& bp = u.bound_ports[k];
+                    if (!bp.declared || bp.kind != BoundPort::Kind::Signal) {
+                        continue;
+                    }
+                    const Signal         target = insts_[fi.parent].signals[bindings[k]];
+                    InstanceScope::Alias a{ .info = m_.signal(target), .target = target, .pos = 0 };
+                    a.info.name = fi.prefix + bp.name;
+                    a.info.loc  = SourceLoc{ 0 };
+                    s.aliases.push_back(std::move(a));
+                }
+            }
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
                 const uint32_t imp = u.signals[h].import;
                 if (imp != kLocal) {
-                    s.externs.push_back(u.imports[imp].kind == Import::Kind::Representative ? InstanceScope::no_extern
-                                                                                            : fi.signals[h]);
+                    const Import::Kind kind = u.imports[imp].kind;
+                    s.externs.push_back(kind == Import::Kind::Representative ? InstanceScope::no_extern : fi.signals[h]);
+                    if (kind == Import::Kind::Port) {
+                        m_.port_bound.resize(m_.signals().size(), 0);
+                        m_.port_bound[static_cast<uint32_t>(fi.signals[h])] = 1;
+                    }
+                    continue;
+                }
+                if (u.signals[h].alias != kLocal) {
+                    if (u.signals[h].scoped) {
+                        InstanceScope::Alias a{ .info = u.signals[h].info,
+                                                .target = fi.signals[h],
+                                                .pos    = static_cast<uint32_t>(s.signals.size()) };
+                        a.info.name = fi.prefix + a.info.name;
+                        s.aliases.push_back(std::move(a));
+                    }
                     continue;
                 }
                 s.locals.push_back(fi.signals[h]);
@@ -738,6 +786,31 @@ private:
 };
 
 } // namespace
+
+void remove_processes(Unit& u, const std::vector<uint8_t>& drop) {
+    assert(drop.size() == u.processes.size());
+    std::vector<uint32_t> kept_before(u.processes.size() + 1, 0);
+    for (uint32_t k = 0; k < u.processes.size(); ++k) {
+        kept_before[k + 1] = kept_before[k] + (drop[k] == 0 ? 1 : 0);
+    }
+    for (ChildSlot& c : u.children) {
+        c.process_pos = kept_before[c.process_pos];
+    }
+    for (UnitDisableTarget& t : u.disable_targets) {
+        if (t.import == kLocal && t.flush_proc != Module::no_flush_proc) {
+            assert(drop[t.flush_proc] == 0);
+            t.flush_proc = kept_before[t.flush_proc];
+        }
+    }
+    std::vector<Process> kept;
+    kept.reserve(kept_before.back());
+    for (uint32_t k = 0; k < u.processes.size(); ++k) {
+        if (drop[k] == 0) {
+            kept.push_back(std::move(u.processes[k]));
+        }
+    }
+    u.processes = std::move(kept);
+}
 
 Function signature_of(const Function& f) {
     return Function{

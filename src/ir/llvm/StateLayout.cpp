@@ -401,6 +401,7 @@ void Backend::build_state_types() {
     const std::vector<bool>& undriven = facts_.undriven;
     compute_vif_reachable();
     collect_vif_waits();
+    uniform_.assign(sigs.size(), 0);
 
     for (uint32_t i = 0; i < sigs.size(); ++i) {
         const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -494,14 +495,18 @@ void Backend::build_state_types() {
         // z word to elide. A 4-state signal keeps it unless the analysis proves it
         // never z -- and always for an actual a callee reaches through a pointer
         // (a `ref` actual, or the out / inout temp of a call; a user signal is
-        // ptr_arg only by being a ref actual, see make_arg_temp), and for a member
+        // ptr_arg only by being a ref actual, see make_arg_temp), for a member
         // reachable through a virtual interface (the access is emitted once per
         // definition against a base chosen at run time, so it cannot depend on what
-        // the analysis proved about one instance's writers, LRM 25.9). Those take
-        // the CANONICAL type-derived shape, the same rule an aggregate leaf follows,
-        // so that both sides of an alias agree without either knowing the other.
+        // the analysis proved about one instance's writers, LRM 25.9), and for the
+        // storage of a bound port (uniform_: a child's code reaches it in every
+        // instance, whichever parent signal it is). Those take the CANONICAL
+        // type-derived shape, the same rule an aggregate leaf follows, so that both
+        // sides of an alias agree without either knowing the other.
+        uniform_[i] = i < mod_.port_bound.size() && mod_.port_bound[i] != 0 && !vif_sig_[i] && !sigs[i].is_event &&
+                      ty.kind != Type::Kind::UnpackedArray;
         slot.has_z  = slot.four_state && (may_z[i] || slot.init_z || !slot.undriven_mask.empty() ||
-                                          ptr_arg[i] || vif_sig_[i]);
+                                          ptr_arg[i] || vif_sig_[i] || uniform_[i] != 0);
         slot.slot_ty = slot_type(slot.width, slot.four_state, slot.has_z);
         if (ty.kind == Type::Kind::UnpackedArray) {
             slot.is_array   = true;
@@ -801,6 +806,11 @@ const PortLayout* Backend::port_of(const SignalSlot& s) const {
         return nullptr;
     }
     return &port_layouts_[port_idx_[si]];
+}
+
+bool Backend::uniform(Signal sig) const {
+    const auto si = static_cast<uint32_t>(sig);
+    return si < uniform_.size() && uniform_[si] != 0 && slots_[si].anchor != SignalSlot::no_anchor;
 }
 
 bool Backend::port_reachable(const SignalSlot& s) {
@@ -1510,6 +1520,18 @@ void Backend::build_ports() {
             }
             f.vcd      = f.vcd || (design_uses_vcd_ && vcd_index_[si] >= 0);
             f.n_shadow = std::max(f.n_shadow, slots_[si].sh_count);
+            if (uniform(sigs[pos])) {
+                // The canonical port of bound storage: every bucket, every id, the
+                // dump-var index whenever the design dumps, and a shadow address
+                // for each field the slot can stage (mm, z, dirty mask), so a
+                // child's code finds one layout whichever signal it is bound to.
+                // What this instance lacks the record leaves null or no_id.
+                f.sta.fill(true);
+                f.dyn.fill(true);
+                f.id.fill(true);
+                f.vcd      = f.vcd || design_uses_vcd_;
+                f.n_shadow = std::max(f.n_shadow, slots_[si].four_state ? 3u : 2u);
+            }
         }
     }
 

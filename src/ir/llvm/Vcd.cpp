@@ -81,6 +81,7 @@ void Backend::build_vcd_index() {
         return;
     }
     vcd_index_.assign(mod_.signals().size(), -1);
+    vcd_hidden_.assign(mod_.signals().size(), 0);
     uint32_t   next = 0;
     const auto tops = mod_.tops();
     if (tops.empty()) {
@@ -88,20 +89,45 @@ void Backend::build_vcd_index() {
             vcd_index_signal(static_cast<Signal>(si), next);
         }
     } else {
+        const auto mark = [&](auto&& self, const InstanceScope& sc) -> void {
+            for (const InstanceScope::Alias& a : sc.aliases) {
+                vcd_hidden_[static_cast<uint32_t>(a.target)] = 1;
+            }
+            for (const InstanceScope& child : sc.children) {
+                self(self, child);
+            }
+        };
+        for (const InstanceScope& top : tops) {
+            mark(mark, top);
+        }
         for (const InstanceScope& top : tops) {
             vcd_index_scope(top, next);
         }
     }
 }
 
+// A scope's dump-var indices: its declared signals in order, then the storage of
+// its own that only an alias names (vcd_hidden_), registered without a $var line
+// of its own. An alias's storage is its instance's or an ancestor's, so it is
+// registered before the alias's scope names it.
 void Backend::vcd_index_scope(const InstanceScope& sc, uint32_t& next) {
     const uint32_t aid =
       sc.id < anchor_of_scope_.size() ? anchor_of_scope_[sc.id] : SignalSlot::no_anchor;
-    for (const Signal sig : sc.signals) {
+    const auto index = [&](Signal sig) {
         const uint32_t before = next;
         vcd_index_signal(sig, next);
         if (next != before && aid != SignalSlot::no_anchor && anchors_[aid].first_vcd < 0) {
             anchors_[aid].first_vcd = static_cast<int32_t>(before);
+        }
+    };
+    for (const Signal sig : sc.signals) {
+        index(sig);
+    }
+    for (const Signal sig : sc.locals) {
+        const auto si = static_cast<uint32_t>(sig);
+        if (vcd_hidden_[si] == 1 && vcd_index_[si] < 0) {
+            index(sig);
+            vcd_hidden_[si] = 2;
         }
     }
     for (const InstanceScope& child : sc.children) {
@@ -169,6 +195,9 @@ void Backend::vcd_touch_lvalue(const LValueInfo& lv) {
     if (!design_uses_vcd_ || silent_stores_ || !lv.is_signal) {
         return;
     }
+    if (vcd_touch_bound(lv.sig)) {
+        return;
+    }
     const int32_t base = vcd_index_[static_cast<uint32_t>(lv.sig)];
     if (base < 0) {
         return;
@@ -201,12 +230,35 @@ void Backend::vcd_touch_signal(Signal sig) {
     if (!design_uses_vcd_) {
         return;
     }
+    if (vcd_touch_bound(sig)) {
+        return;
+    }
     const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
     if (base >= 0) {
         emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
             return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(sig, base) };
         });
     }
+}
+
+// The touch of bound storage written through a binding: whether that instance's
+// signal is dumped is its port's dump-var index, -1 when not, so the writer's
+// code is the same for every instance. False, emitting nothing, for any other
+// write.
+bool Backend::vcd_touch_bound(Signal sig) {
+    const SignalSlot& s = slot_of(sig);
+    if (!uniform(sig) || s.is_array) {
+        return false;
+    }
+    llvm::Value* const port = bound_port(s);
+    if (port == nullptr) {
+        return false;
+    }
+    llvm::Value* const index = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(port_of(s)->ty, port, port_of(s)->vcd));
+    emit_guarded_vcd_touch(
+      vcd_touch_fn(), [&] { return llvm::SmallVector<llvm::Value*, 2>{ index }; },
+      b_.CreateICmpNE(index, b_.getInt32(~0u)));
+    return true;
 }
 
 // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
@@ -299,10 +351,11 @@ void Backend::lower_dump_vars() {
 //
 //   { kind, name length, name, width, flags, value plane, z plane, count, stride, left, right }
 //
-// and the fields a kind does not use are zero. The leaf names are interned: the same
-// `clk` or `valid` of a thousand instances is one string.
+// and the fields a kind does not use are zero. An Alias row's `count` is the dump-var
+// index of the variable it names. The leaf names are interned: the same `clk` or
+// `valid` of a thousand instances is one string.
 struct Backend::VcdRows {
-    enum Kind : uint32_t { Scope, Upscope, Var, Array };
+    enum Kind : uint32_t { Scope, Upscope, Var, Array, Alias };
 
     explicit VcdRows(llvm::Module& m)
       : mod(m)
@@ -393,7 +446,7 @@ llvm::Function* Backend::vcd_register_fn() {
     tb.SetInsertPoint(body);
     llvm::Value* const row   = tb.CreateInBoundsGEP(rows.ty, table, i);
     const auto         field = [&](uint32_t f, llvm::Type* t) { return tb.CreateLoad(t, tb.CreateStructGEP(rows.ty, row, f)); };
-    auto* const        sw    = tb.CreateSwitch(field(0, i32), latch, 4);
+    auto* const        sw    = tb.CreateSwitch(field(0, i32), latch, 5);
     const auto         arm   = [&](VcdRows::Kind kind, const char* name) {
         auto* const bb = block(name);
         sw->addCase(tb.getInt32(kind), bb);
@@ -412,6 +465,9 @@ llvm::Function* Backend::vcd_register_fn() {
     tb.CreateCall(vcd_array_fn(), { field(2, ptr), field(1, i32), field(7, i32), field(3, i32), field(4, i32), field(5, ptr),
                                     field(6, ptr), field(8, i32), field(9, b_.getInt64Ty()), field(10, b_.getInt64Ty()) });
     tb.CreateBr(latch);
+    arm(VcdRows::Alias, "vcd.alias");
+    tb.CreateCall(vcd_alias_fn(), { field(2, ptr), field(1, i32), field(3, i32), field(4, i32), field(7, i32) });
+    tb.CreateBr(latch);
     tb.SetInsertPoint(latch);
     i->addIncoming(tb.CreateAdd(i, tb.getInt32(1)), latch);
     tb.CreateBr(head);
@@ -429,13 +485,62 @@ void Backend::vcd_plan_scope(VcdRows& rows, std::string_view name) {
 
 void Backend::vcd_plan_scope_tree(VcdRows& rows, const InstanceScope& sc) {
     vcd_plan_scope(rows, sc.name);
-    for (const Signal sig : sc.signals) {
-        vcd_plan_var(rows, sig);
+    // Aliases interleave with the signals in declaration order.
+    size_t next_alias = 0;
+    for (uint32_t k = 0; k <= sc.signals.size(); ++k) {
+        for (; next_alias < sc.aliases.size() && sc.aliases[next_alias].pos == k; ++next_alias) {
+            vcd_plan_alias(rows, sc.aliases[next_alias]);
+        }
+        if (k < sc.signals.size()) {
+            vcd_plan_var(rows, sc.signals[k]);
+        }
+    }
+    // The storage only an alias names, in vcd_index_scope's order.
+    for (const Signal sig : sc.locals) {
+        if (vcd_hidden_[static_cast<uint32_t>(sig)] == 2) {
+            vcd_plan_var(rows, sig, /*hidden=*/true);
+        }
     }
     for (const InstanceScope& child : sc.children) {
         vcd_plan_scope_tree(rows, child);
     }
     rows.add(VcdRows::Upscope, {});
+}
+
+// A declared signal with no storage of its own (InstanceScope::aliases: a copy
+// alias, or a port whose parent supplies its storage) dumps as a second $var on
+// its target's identifier code, which LRM 21.7.2.3 allows ("More than one
+// reference name can be mapped to the same identifier code"), so it costs no
+// dump-var index and no touch. Its target has its type, so the target's width,
+// planes and elements describe it; the var type is its own.
+void Backend::vcd_plan_alias(VcdRows& rows, const InstanceScope::Alias& a) {
+    const int32_t index = vcd_index_[static_cast<uint32_t>(a.target)];
+    if (a.info.name.empty() || index < 0) {
+        return;
+    }
+    std::string_view leaf = a.info.name;
+    if (const auto pos = leaf.rfind('.'); pos != std::string_view::npos) {
+        leaf = leaf.substr(pos + 1);
+    }
+    if (mod_.signal(a.target).is_event) {
+        rows.add(VcdRows::Alias, leaf, 1, 16u, nullptr, nullptr, static_cast<uint32_t>(index));
+        return;
+    }
+    const SignalSlot& s     = slot_of(a.target);
+    const uint32_t    flags = (s.four_state ? 1u : 0u) | (a.info.is_net ? 2u : 0u) | (!s.four_state ? 4u : 0u)
+                         | (s.is_real ? 8u : 0u);
+    if (!s.is_array) {
+        rows.add(VcdRows::Alias, leaf, s.width, flags, nullptr, nullptr, static_cast<uint32_t>(index));
+        return;
+    }
+    // One name per element, as rt_vcd_array names the target's (vcd_plan_var
+    // refuses a multidimensional one before the alias is reached).
+    const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(a.target).type));
+    for (uint32_t k = 0; k < s.elem_count; ++k) {
+        const int64_t addr = at.left <= at.right ? at.left + static_cast<int64_t>(k) : at.left - static_cast<int64_t>(k);
+        rows.add(VcdRows::Alias, std::string(leaf) + "[" + std::to_string(addr) + "]", s.width, flags, nullptr,
+                 nullptr, static_cast<uint32_t>(index) + k);
+    }
 }
 
 // Why a signal's type has no $var form, or nullptr when it has one. Mirrors
@@ -475,8 +580,10 @@ const char* Backend::vcd_unrepresentable(Ref type) const {
 // must represent every declared signal, so an unrepresentable one (string,
 // container, aggregate, class handle, multidimensional array) loud-fails rather
 // than being silently omitted (PRINCIPLES.md); an unnamed compiler temporary is not
-// a declared variable and is skipped.
-void Backend::vcd_plan_var(VcdRows& rows, Signal sig) {
+// a declared variable and is skipped. A `hidden` signal registers for its aliases
+// only (vcd_index_scope): RT_VCD_FLAG_HIDDEN, no $var line of its own.
+void Backend::vcd_plan_var(VcdRows& rows, Signal sig, bool hidden) {
+    const uint32_t hide = hidden ? 32u : 0u;
     const SignalInfo& info = mod_.signal(sig);
     if (info.name.empty()) {
         return;
@@ -499,7 +606,8 @@ void Backend::vcd_plan_var(VcdRows& rows, Signal sig) {
         // tick (stamped by emit_event_fire for every trigger form), emitting
         // `1<id>` at each instant the stamp moves. A variable reassigned after
         // `$dumpvars` keeps dumping the object it named then.
-        rows.add(VcdRows::Var, leaf, 1, 16, gep(slot_of(sig).slot_ty, storage_address(slot_of(sig)), { 0, 0 }));
+        rows.add(VcdRows::Var, leaf, 1, 16 | hide,
+                 gep(slot_of(sig).slot_ty, storage_address(slot_of(sig)), { 0, 0 }));
         return;
     }
     const SignalSlot& s = slot_of(sig);
@@ -516,9 +624,9 @@ void Backend::vcd_plan_var(VcdRows& rows, Signal sig) {
         throw BackendError{ std::string("VCD dump of ") + what + " signal '" + info.name + "' is not supported" };
     }
     // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow,
-    // real; the event bit is set on the branch above.
+    // real, hidden; the event bit is set on the branch above.
     const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (!s.four_state ? 4u : 0u)
-                         | (s.is_real ? 8u : 0u);
+                         | (s.is_real ? 8u : 0u) | hide;
     llvm::Constant* storage = storage_address(s);
     if (!s.is_array) {
         rows.add(VcdRows::Var, leaf, s.width, flags, gep(s.slot_ty, storage, { 0, 0 }),

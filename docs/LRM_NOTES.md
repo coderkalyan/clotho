@@ -1161,3 +1161,28 @@ Provisional: the project owner chose the bit-pattern reading for now and may rev
 it.
 
 Code: `src/ir/llvm/Backend.h` (real storage as its bit pattern), `src/lower/Timing.cpp` (`sampled_event_hit`). Tests: `tests/heap_wait_test.cpp` ("a real changes when its bit pattern does, for @(r) and a sampled wait"). Oracle: iverilog 13 differs on `0.0` to `-0.0` (no event).
+
+## 76. `$cast` into a packed tagged union (6.24.2, 6.22.2, 7.3.2)
+
+6.24.2: "If the assignment is invalid, a run-time error occurs, and the destination
+variable is left unchanged" for the task form, and the function form "does not make
+the assignment and returns 0"; the assignment is invalid if the arguments are "not
+cast compatible". 6.22.2(c) makes a packed union equivalent to a vector of the same
+width, signedness and domain, so a vector is cast compatible with a packed tagged
+union. 7.3.2 says a tagged union's "tag and value can only be updated together
+consistently" and that "it is impossible to store a value of one type and
+(mis)interpret the bits as another type"; its packed layout puts the tag in the
+high `ceil(log2 n)` bits.
+
+Clotho's reading: a bit pattern is a value of a packed tagged union only if its tag
+bits name a member (an x or z tag bit names none), so `$cast` succeeds, as a plain
+store, only then. Otherwise the function form returns 0 and leaves the destination
+unchanged, and the task form is the located run-time error of any failed `$cast`.
+The check recurses: a packed tagged union inside a packed struct, a packed union
+member or a packed array element is checked, and so is one nested in a member, but
+only when the outer tag selects that member. The bits between the tag and a narrower
+member are undefined (7.3.2) and are not checked. The static cast `T'(x)` is a
+coercion that always succeeds (6.24.1) and is not checked. slang still warns "will
+always succeed" (`-Wdynamic-cast-const`) for such a `$cast`.
+
+Decided by the project owner. Code: `src/lower/SystemTasks.cpp` (`lower_cast`, `packed_tags_valid`). Tests: `tests/struct_test.cpp` ("$cast into a packed tagged union succeeds only for a tag that names a member (LRM 6.24.2, 7.3.2)"). Oracle: LRM-derived; iverilog 13 does not parse tagged unions.

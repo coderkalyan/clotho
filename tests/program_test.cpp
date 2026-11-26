@@ -575,13 +575,15 @@ TEST_CASE("a design reader of a program-driven net runs in the next Active") {
 // did happen at time 0 and was not deferred a step; and they are ordered, which
 // is the region: `dw` is driven by the module's assign in Active, while `pd` is
 // driven by the program's and so only changes once the active set has settled,
-// putting its design reader in the next Active iteration of the same slot.
+// putting its design reader in the next Active iteration of the same slot. `dw`
+// inverts rather than copies `r`: a copy would be an alias of `r` (docs/design/
+// modular-compilation.md), holding `r`'s initial value with no time-zero change.
 TEST_CASE("a program's continuous assign settles at time zero in Reactive") {
     CHECK(run_capture(R"(
         module t;
-          logic r = 1;
+          logic r = 0;
           wire  dw, pd;
-          assign dw = r;
+          assign dw = ~r;
           always @(dw) $display("[%0t] MODULE dw=%b", $time, dw);
           always @(pd) $display("[%0t] MODULE pd=%b", $time, pd);
           p pi();
