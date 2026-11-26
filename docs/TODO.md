@@ -618,9 +618,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
     `max(at_least)` across instances; `option.get_inst_coverage` then decides what
     `get_inst_coverage()` returns.
-  - [ ] **Procedural read or assignment of `type_option`** (19.7.1) — through a handle it is
-    refused; `gc::type_option.w` and `gc::cp::type_option.w` are accepted but always read 0 and
-    a write to them is dropped.
 - [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
   floats.
 - [ ] **`covergroup extends`** (19.4.1) — slang hides an inherited coverpoint behind a
