@@ -2566,6 +2566,56 @@ TEST_CASE("the unseeded $random stream restarts at power-on for every design") {
     CHECK(first == "303379748\n");
 }
 
+// A design that ends in `$finish` with processes parked on waits and reports still queued
+// leaves nothing for the next design in the process: no stale wake, strobe or deferred
+// report reaches it. Wait queues are state of the design's own JIT module, and the
+// runtime's observed, deferred and strobe queues and its string storage are returned to
+// power-on when a run ends (sim_teardown) and at the start of the next (rt_run_init).
+// Oracle: none needed, the second design's output is its own and nothing else.
+TEST_CASE("a design left mid-wait by $finish leaves no wake or report for the next design") {
+    const std::string left = R"(
+        module top;
+            event e;
+            int   x;
+            string s = "a";
+            function automatic bit is_b(); return s == "b"; endfunction
+            always @(e) $display("stale event");
+            initial begin
+                fork
+                    begin wait (x == 99); $display("stale wait"); end
+                    begin wait (is_b()); $display("stale method wait"); end
+                join_none
+                $strobe("stale strobe");
+                assert #0 (x == 1) else $error("stale deferred report");
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string next = R"(
+        module top;
+            event e;
+            int   x;
+            string s = "a";
+            function automatic bit is_b(); return s == "b"; endfunction
+            always @(e) $display("event %0t", $time);
+            initial begin
+                fork
+                    begin wait (x == 1); $display("wait %0t", $time); end
+                    begin wait (is_b()); $display("method wait %0t", $time); end
+                join_none
+                #1 -> e;
+                #1 x = 1;
+                #1 s = "b";
+                #1 $display("done %0t", $time);
+            end
+        endmodule
+    )";
+    run_capture(left);
+    CHECK(run_capture(next) == "event 1\nwait 2\nmethod wait 3\ndone 4\n");
+    run_capture(left);
+    CHECK(run_capture_stderr(next).empty());
+}
+
 TEST_CASE("$random lowers to an rt_random call") {
     constexpr std::string_view src = R"(
         module m;
