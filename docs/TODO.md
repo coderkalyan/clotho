@@ -543,10 +543,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`rand_mode()` on a subelement** — mode control below a whole property.
   - [ ] **`std::randomize` of a class handle** (18.12) — needs the handle's own virtual
     `randomize`.
-- [ ] **`randcase` and `randsequence` weight wider than 32 bits** (18.16, 18.17) — needs several
-  32-bit draws stitched.
-- [ ] **Object `get_randstate()` / `set_randstate()`** — the object-side randstate pair is
-  refused.
 - [ ] **`randomize()` of a class in a property-type cycle** (18.6) — a call reached while that
   class is still being laid out is refused.
 
@@ -668,11 +664,8 @@ Milestones, in order; lower ones unblock higher ones:
   `default sequence` and overlapping matches.
 - [~] **Coverage options and accounting** — open pieces:
   - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
-    `max(at_least)` across instances.
-  - [ ] **`option.get_inst_coverage`** — refused as a coverage option.
-  - [ ] **`type_option.weight` / `goal` / `comment`, `option.name` / `comment`** — not
-    implemented.
-  - [ ] **`option.detect_overlap`** — no overlap warnings.
+    `max(at_least)` across instances; `option.get_inst_coverage` then decides what
+    `get_inst_coverage()` returns.
 - [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
   floats.
 - [ ] **`covergroup extends`** (19.4.1) — slang hides an inherited coverpoint behind a
@@ -694,8 +687,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Covergroup coverage event** (19.3) — open forms:
   - [ ] **Covergroup declared in a class** (19.4) — its event needs a per-object subscription.
   - [ ] **Event list as the coverage event** — `covergroup cg @(a or b);`.
-- [ ] **Coverpoint-level coverage methods and `cg::get_coverage()`** (19.8) —
-  `cg.cp.get_inst_coverage()` and the type-name form are refused.
 
 ### Foreign interface
 
@@ -725,8 +716,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Virtual interfaces** (25.9) — open pieces; see docs/design/interfaces.md:
   - [ ] **Member or clocking block of an interface instantiated inside the interface a handle
     names** (`vif.i.d`) — the context record does not carry its children's.
-  - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
-    — refused.
   - [ ] **Virtual-interface expression as the clock of a clocking block, covergroup or
     assertion** (14.3, 19.4, 16.5, 25.9) — refused.
   - [ ] **Parameter or other member with no signal storage** — `vif.P`, or a clockvar the

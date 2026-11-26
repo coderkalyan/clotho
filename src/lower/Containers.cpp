@@ -380,9 +380,8 @@ ir::Index Lowerer::lower_fixed_array_order(std::string_view      name,
     const ir::Ref      aty  = lower_type(*recv.type);
     const ir::Ref      er   = std::get<ir::Type>(module_.pool.get(aty)).element;
     // The mirror is a real dynamic array, so its element has to be one a
-    // dynamic array admits. Every element a fixed array can hold is, bar the
-    // handful guard_container_element names -- a virtual-interface element,
-    // say, which 7.12.2 does not exclude but clotho cannot put in a container.
+    // dynamic array admits. A fixed array's element type is one, bar any shape
+    // guard_container_element still refuses, which this call then names.
     guard_container_element(recv.type->getArrayElementType()->getCanonicalType(), er, "fixed-size array ordering");
 
     ir::Type mt;

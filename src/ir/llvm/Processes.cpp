@@ -1113,6 +1113,12 @@ void Backend::lower_proc_query(Index i) {
             set_value(i, two_val(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask))));
             return;
         }
+        case ProcOp::StateFormat: {
+            // obj.get_randstate() (LRM 18.13.4): the same 64 hex digits, from the caller-side copy of the four words.
+            llvm::Value* state = agg_slot_ptr(lvalue_of(args[0]).unguarded());
+            b_.CreateCall(proc_randstate_get_fn(), { str_of(i), state, alloc_site_global(loc_text(i), "string") });
+            return;
+        }
         case ProcOp::RandstateGet: {
             llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(args[0]), i));
             b_.CreateCall(proc_randstate_get_fn(),
@@ -1343,6 +1349,14 @@ void Backend::lower_proc_ctl(Index i) {
             b_.CreateCall(urandom_seed_fn(),
                           { rng, b_.CreateZExt(cast(must_of(args[1]), 32, false),
                                                b_.getInt64Ty()) });
+            return;
+        }
+        case ProcOp::StateParse: {
+            // obj.set_randstate(s) (LRM 18.13.5): parse into the caller-side copy.
+            llvm::Value* state = agg_slot_ptr(lvalue_of(args[0]).unguarded());
+            llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
+            b_.CreateCall(proc_randstate_set_fn(),
+                          { state, str_of(args[1]), null_site_global(loc_text(i), NullKind::Class), now });
             return;
         }
         case ProcOp::RandstateSet: {

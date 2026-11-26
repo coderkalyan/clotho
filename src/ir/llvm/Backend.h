@@ -2517,6 +2517,8 @@ private:
                                 const std::vector<llvm::Constant*>& rows,
                                 const std::string&                  nm);
 
+    llvm::Constant* cover_string(const std::string& s);
+
     llvm::Constant* cover_config_global();
 
     // Per-(signal, edge) capacities for the two wait queues. Indexed
@@ -3494,10 +3496,16 @@ private:
     llvm::FunctionCallee cover_next_fn();
     llvm::FunctionCallee cover_hit_fn();
     llvm::FunctionCallee cover_start_fn();
+    llvm::FunctionCallee cover_start_point_fn();
+    llvm::FunctionCallee cover_opt_set_fn();
+    llvm::FunctionCallee cover_opt_get_fn();
+    llvm::FunctionCallee cover_opt_set_str_fn();
+    llvm::FunctionCallee cover_opt_get_str_fn();
     llvm::FunctionCallee cover_set_name_fn();
     llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_type_query_fn(const char* name, llvm::Type* ret);
+    llvm::FunctionCallee cover_type_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_design_coverage_fn();
 
     // -- Coroutine frame registry (docs/design/garbage-collection.md §2, F2) -----

@@ -361,6 +361,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_cover_next", &rt_cover_next);
     expose("rt_cover_hit", &rt_cover_hit);
     expose("rt_cover_start", &rt_cover_start);
+    expose("rt_cover_start_point", &rt_cover_start_point);
     expose("rt_cover_set_inst_name", &rt_cover_set_inst_name);
     expose("rt_cover_inst_coverage", &rt_cover_inst_coverage);
     expose("rt_cover_inst_covered", &rt_cover_inst_covered);
@@ -371,6 +372,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_cover_type_coverage", &rt_cover_type_coverage);
     expose("rt_cover_type_covered", &rt_cover_type_covered);
     expose("rt_cover_type_total", &rt_cover_type_total);
+    expose("rt_cover_type_point_coverage", &rt_cover_type_point_coverage);
+    expose("rt_cover_type_point_covered", &rt_cover_type_point_covered);
+    expose("rt_cover_type_point_total", &rt_cover_type_point_total);
+    expose("rt_cover_opt_set", &rt_cover_opt_set);
+    expose("rt_cover_opt_get", &rt_cover_opt_get);
+    expose("rt_cover_opt_set_str", &rt_cover_opt_set_str);
+    expose("rt_cover_opt_get_str", &rt_cover_opt_get_str);
     expose("rt_cover_design_coverage", &rt_cover_design_coverage);
     expose("rt_run_init", &rt_run_init);
     expose("rt_event_new", &rt_event_new);

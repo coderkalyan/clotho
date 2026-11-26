@@ -257,9 +257,19 @@ Code: `src/runtime/Random.cpp` (`rt_urandom_seed`). Tests: `tests/sysfunc_test.c
 18.16 forms the weight sum with unsigned addition at the widest weight's
 precision. Clotho applies that literally, so a sum that does not fit wraps
 (`8'd200 + 8'd100` is 44 in 8 bits, and the first branch always wins), and an
-all-zero sum takes no branch.
+all-zero sum takes no branch. The same holds past 32 bits: `64'hFFFF_FFFF_FFFF_FFFF
++ 64'd2` is 1, and a negative `longint` weight is its unsigned value.
 
-Code: `src/lower/Random.cpp` (`lower_randcase`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)").
+The draw over a sum of at most 32 bits is one `$urandom_range(sum - 1, 0)`. A wider
+sum takes the multi-draw scheme 18.16 names ("multiple calls to `$urandom_range()`
+to handle numbers greater than 32 bits") without fixing it: `ceil(width / 32)`
+`$urandom` words are stitched, masked to the bit length of `sum - 1` and redrawn
+while the result is not below the sum, which keeps the split exactly uniform. The
+draw count is then data-dependent (under two attempts on average) but a function of
+the process stream alone, so it stays thread-stable. `randsequence` rule weights
+(18.17.1) share the draw.
+
+Code: `src/lower/Random.cpp` (`lower_randcase`, `emit_weight_draw`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)", "randcase weights wider than 32 bits split by their ratio (LRM 18.16)", "randcase wide weights are unsigned and the sum wraps (LRM 18.16)"), `tests/randsequence_test.cpp` ("randsequence rule weights wider than 32 bits (LRM 18.17.1)").
 
 ## 27. `$bits` of a string (20.6.2)
 
@@ -850,3 +860,21 @@ against the queue's length and yields the empty queue for a width below 1 exactl
 Rejecting it would break designs that run correctly.
 
 Code: `src/lower/Containers.cpp` (`append_queue_pieces`, the indexed range-select case). Tests: `tests/queue_test.cpp` ("queue indexed part-select slice", whose `q[2 +: n]` case has a runtime width). Oracle: none; iverilog 13 crashes compiling any indexed part-select of a queue.
+
+## 61. `option.detect_overlap` reports only `bins` bins (19.7, Table 19-1)
+
+Table 19-1: "When true, a warning is issued if there is an overlap between the range list (or transition list) of two bins of a coverpoint." The clause does not say whether `ignore_bins` and `illegal_bins` are among "two bins". 19.5.5 removes an ignored value from every coverage bin and 19.5.6 flags an illegal one, so sharing values with them is what they are written to do. Clotho warns, once per pair, only between bins declared with `bins`.
+
+Code: `src/lower/Coverage.cpp` (`cover_report_overlaps`). Tests: `tests/coverage_test.cpp` ("coverage: detect_overlap warns on overlapping bins").
+
+## 62. `start()` and `stop()` on a coverpoint (19.8, Table 19-5)
+
+Table 19-5 gives `start()` and `stop()` to covergroup, coverpoint and cross, as "Starts collecting coverage information" and "Stops collecting coverage information", and says no more. Clotho reads the covergroup's switch and each coverpoint's as independent: a coverpoint counts a sample only while both are on, and neither call undoes the other.
+
+Code: `src/runtime/Coverage.cpp` (`rt_cover_start_point`, `rt_cover_hit`). Tests: `tests/coverage_test.cpp` ("coverage: stop and start on a coverpoint").
+
+## 63. Which objects own an RNG (18.14.1, 18.14.2, 18.13.3-18.13.5)
+
+18.14.1 gives every object "an independent RNG" seeded at `new` from the creating thread (or the initialization RNG for a static declaration initializer). A generator nothing can observe is not observable, so Clotho gives one only to a class that can be the receiver of `randomize`, `srandom`, `get_randstate` or `set_randstate`: a compile-time scan marks the static receiver type of every such call (an implicit receiver is the enclosing class), and a class owns the generator when any class in its base chain is marked, since a base-typed handle may hold a derived object. Other classes keep no RNG and draw nothing at `new`. This is indistinguishable from giving every object an RNG: the generator is read only through those four methods, and an unmarked class has none of them called on it, while the one draw at `new` comes from the creating thread's stream, which the observable `$urandom` values of an unmarked class's creator would otherwise shift. It differs from "every object draws" in exactly that shift, and only for a design that has no way to see the object's RNG: Clotho keeps the existing pinned streams of such designs.
+
+Code: `src/lower/Scans.cpp` (`RngReceiverScan`), `src/lower/Classes.cpp` (`lower_class_type`), `src/lower/Lower.cpp`. Tests: `tests/randomize_test.cpp` ("object randstate and srandom on a class with no rand property", "only a class used for randomization draws from the creating thread at new").

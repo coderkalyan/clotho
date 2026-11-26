@@ -1664,3 +1664,128 @@ TEST_CASE("bindings: twin instances reach their own children and a package varia
     )");
     CHECK(out == "2 20\n4 40 44\n");
 }
+
+// LRM 25.9 does not restrict where a virtual interface variable lives, and a handle
+// is one plain word, so a queue, a dynamic array and an associative array each hold
+// one per element: a member read or write, a subroutine call and a pass to a formal
+// all go through the element's word. The three instances differ, so a mixed-up handle
+// shows in the values. Reading an element that does not exist yields the default,
+// `null` (Table 7-1, 7.4.5, 7.8.6), and does not create it. Oracle: the text of
+// LRM 25.9 and 7.4-7.10 (iverilog 13 has no interface support).
+TEST_CASE("virtual interface: queue, dynamic array and associative array elements") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic [7:0] d;
+            task automatic put(input logic [7:0] v); d = v; #1 d = d + 1; endtask
+            function automatic logic [7:0] get(); return d; endfunction
+        endinterface
+        module top;
+            ibus a(), b(), c();
+            virtual ibus q[$];
+            virtual ibus da[];
+            virtual ibus aa[string];
+            task automatic drive(virtual ibus v, input logic [7:0] x);
+                v.d = x;
+            endtask
+            initial begin
+                q.push_back(a);
+                q.push_back(b);
+                da = new[3];
+                da[1] = c;
+                aa["a"] = a;
+                aa["c"] = c;
+                q[0].d  = 8'h11;
+                da[1].d = 8'h33;
+                drive(q[1], 8'h22);
+                $display("%h %h %h", a.d, b.d, c.d);
+                q[1].put(8'h40);
+                aa["c"].put(8'h50);
+                $display("%h %h %h", a.d, b.d, c.d);
+                $display("%h %h", aa["a"].get(), da[1].get());
+                $display("%0d %0d %0d %0d", da[0] == null, da[1] == c, q[0] == a, q[0] == b);
+                $display("%0d %0d %0d", q[5] == null, aa["zz"] == null, aa.num());
+                $display("%0d %0d", q.pop_front() == a, q.size());
+                foreach (da[i]) if (da[i] != null) da[i].d = 8'(i) + 8'd100;
+                $display("%0d", c.d);
+            end
+        endmodule
+    )");
+    CHECK(out == "11 22 33\n11 41 51\n11 51\n1 1 1 0\n1 1 2\n1 1\n101\n");
+}
+
+// An element is a handle value: copying a queue copies the words, so a write through
+// the copy lands in the same instance, and the whole-container operations that move
+// elements (reverse, insert, delete, element swap) move the handles with them.
+// Oracle: LRM 25.9, 7.10.2 and 7.12.2 text.
+TEST_CASE("virtual interface: container elements are copied and reordered as handles") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic [7:0] d; endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus q[$], r[$], tmp;
+            initial begin
+                q.push_back(a);
+                q.push_back(b);
+                q.push_back(a);
+                r = q;
+                r[1].d = 8'h0b;
+                q[2].d = 8'h0a;
+                q[0].d = q[2].d + 8'd1;
+                $display("%h %h", a.d, b.d);
+                q[2] = null;
+                q.reverse();
+                $display("%0d %0d %0d", q[0] == null, q[1] == b, q[2] == a);
+                tmp = q[1]; q[1] = q[2]; q[2] = tmp;
+                $display("%0d %0d", q[1] == a, q[2] == b);
+                q.insert(1, b);
+                $display("%0d %0d %0d", q.size(), q[1] == b, q[3] == b);
+                q.delete(0);
+                $display("%0d %0d", q.size(), q[0] == b);
+                q.delete();
+                $display("%0d", q.size());
+            end
+        endmodule
+    )");
+    CHECK(out == "0b 0b\n1 1 1\n1 1\n4 1 1\n3 1\n0\n");
+}
+
+// The shapes a testbench builds on top of that: a queue of handles as a class
+// property filled by a method and walked by a task, a mailbox of handles, a fixed
+// array of handles reordered in place, and a function that returns an element.
+// Oracle: LRM 25.9, 15.4 and 7.12.2 text.
+TEST_CASE("virtual interface: handles in a class property queue, a mailbox and a fixed array") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic [7:0] d; endinterface
+        class Env;
+            virtual ibus vifs[$];
+            function void add(virtual ibus v); vifs.push_back(v); endfunction
+            task poke(); foreach (vifs[i]) vifs[i].d = 8'(i + 1); endtask
+            function virtual ibus pick(int i); return vifs[i]; endfunction
+        endclass
+        module top;
+            ibus a(), b();
+            virtual ibus pair[2], got, p;
+            mailbox #(virtual ibus) mb = new;
+            initial begin
+                Env e = new;
+                e.add(a); e.add(b);
+                e.poke();
+                $display("%0d %0d", a.d, b.d);
+                got = b;
+                mb.put(got);
+                got = null;
+                mb.get(got);
+                got.d = 8'd9;
+                $display("%0d", b.d);
+                pair[0] = a; pair[1] = b;
+                pair.reverse();
+                pair[0].d = 8'd7;
+                $display("%0d %0d", a.d, b.d);
+                p = e.pick(0);
+                p.d = 8'd5;
+                $display("%0d %0d", a.d, p == a);
+            end
+        endmodule
+    )");
+    CHECK(out == "1 2\n9\n1 7\n5 1\n");
+}

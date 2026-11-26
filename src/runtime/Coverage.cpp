@@ -30,6 +30,7 @@
 #include "Coverage.h"
 
 #include "Runtime.h"
+#include "RuntimeInternal.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -239,28 +240,38 @@ const rt_cover_config* copy_model(Arena& a, const rt_cover_config* src) {
                 }
             }
 
-            const char* pname   = arena_str(a, sp.name);
-            const char* pbanner = arena_str(a, sp.banner);
+            const char* pname    = arena_str(a, sp.name);
+            const char* pbanner  = arena_str(a, sp.banner);
+            const char* pinst    = arena_str(a, sp.inst_comment);
+            const char* ptype    = arena_str(a, sp.type_comment);
             if (points == nullptr) {
                 continue;
             }
-            points[p]        = sp;
-            points[p].name   = pname;
-            points[p].banner = pbanner;
-            points[p].nbins  = nbins;
-            points[p].bins   = bins;
+            points[p]              = sp;
+            points[p].name         = pname;
+            points[p].banner       = pbanner;
+            points[p].nbins        = nbins;
+            points[p].bins         = bins;
+            points[p].inst_comment = pinst;
+            points[p].type_comment = ptype;
         }
 
-        const char* tname   = arena_str(a, st.name);
-        const char* tbanner = arena_str(a, st.banner);
+        const char* tname         = arena_str(a, st.name);
+        const char* tbanner       = arena_str(a, st.banner);
+        const char* tinst_name    = arena_str(a, st.inst_name);
+        const char* tinst_comment = arena_str(a, st.inst_comment);
+        const char* ttype_comment = arena_str(a, st.type_comment);
         if (types == nullptr) {
             continue;
         }
-        types[t]         = st;
-        types[t].name    = tname;
-        types[t].banner  = tbanner;
-        types[t].npoints = npoints;
-        types[t].points  = points;
+        types[t]              = st;
+        types[t].name         = tname;
+        types[t].banner       = tbanner;
+        types[t].npoints      = npoints;
+        types[t].points       = points;
+        types[t].inst_name    = tinst_name;
+        types[t].inst_comment = tinst_comment;
+        types[t].type_comment = ttype_comment;
     }
 
     // Copied too, so the whole configuration is self-contained: the report path
@@ -284,20 +295,50 @@ const rt_cover_config* copy_model(Arena& a, const rt_cover_config* src) {
 // shutdown. The counter array is flat rather than per-coverpoint because a sample
 // touches exactly one coverpoint's slice and the base offset makes that slice one
 // add away.
+// The options of one coverpoint of one instance that the design may assign after the
+// covergroup is built (LRM 19.7: weight, goal, comment and at_least).
+struct PointOpts {
+    uint32_t weight;
+    uint32_t goal;
+    uint32_t at_least;
+    char*    comment; // Owned, or null.
+};
+
 struct Inst {
-    Inst*     next;   // Next instance of the SAME type, in creation order.
-    uint64_t  ctx;    // The enclosing object for a class-embedded covergroup.
-    char*     name;   // Owned: the default below, or set_inst_name's copy.
-    uint64_t* counts; // Trailing array, sum of nbins over the type's coverpoints.
-    uint32_t* base;   // Trailing array, npoints wide: each coverpoint's offset.
-    uint32_t  type_idx;
-    uint32_t  ordinal; // 0-based creation index within the type.
-    uint32_t  ncounts;
-    uint32_t  npoints;
+    Inst*      next;   // Next instance of the SAME type, in creation order.
+    uint64_t   ctx;    // The enclosing object for a class-embedded covergroup.
+    char*      name;   // Owned: option.name, the default below, or set_inst_name's copy.
+    uint64_t*  counts; // Trailing array, sum of nbins over the type's coverpoints.
+    uint32_t*  base;   // Trailing array, npoints wide: each coverpoint's offset.
+    uint8_t*   stopped; // Trailing array, npoints wide: 1 after stop() on that coverpoint alone.
+    PointOpts* popts;  // Trailing array, npoints wide: each coverpoint's assignable options.
+    char*      comment; // option.comment of the covergroup, owned, or null.
+    uint32_t   weight;  // option.weight of the covergroup.
+    int32_t    goal;    // option.goal of the covergroup.
+    // option.at_least at the covergroup level, the default its coverpoints took.
+    uint32_t   at_least;
+    int32_t    cross_num_print_missing; // Kept for reads: no cross reports it.
+    uint32_t   type_idx;
+    uint32_t   ordinal; // 0-based creation index within the type.
+    uint32_t   ncounts;
+    uint32_t   npoints;
     // LRM 19.8: start() and stop() gate a covergroup that is ALREADY collecting,
     // so this starts enabled and nothing has to call start() first.
     int32_t started;
 };
+
+char* dup_str(const char* s) {
+    if (s == nullptr) {
+        return nullptr;
+    }
+    const size_t n    = std::strlen(s);
+    char*        copy = static_cast<char*>(std::malloc(n + 1));
+    if (copy == nullptr) {
+        cover_fatal(nullptr, "out of memory for a covergroup option string", nullptr);
+    }
+    std::memcpy(copy, s, n + 1);
+    return copy;
+}
 
 // Every instance of one covergroup type. The tail pointer is what keeps the list
 // in creation order at O(1) per `new`, and creation order is what makes the
@@ -501,7 +542,7 @@ Ratio point_ratio(const Inst* inst, uint32_t point) {
         }
         r.total += 1;
         // 19.11.1: a bin counts as covered once it has been hit at_least times.
-        if (count[b] >= pt.at_least) {
+        if (count[b] >= inst->popts[point].at_least) {
             r.covered += 1;
         }
     }
@@ -538,14 +579,14 @@ InstResult inst_result(const Inst* inst) {
     Weighted acc;
     Ratio    bins{ 0, 0 };
     for (uint32_t p = 0; p < ty.npoints; ++p) {
-        const rt_cover_point& pt = ty.points[p];
-        const Ratio           r  = point_ratio(inst, p);
+        const Ratio    r  = point_ratio(inst, p);
+        const uint32_t pw = inst->popts[p].weight;
         // 19.11.1 (a): a coverpoint with no bins to measure does not contribute to
         // the covergroup's coverage -- so it is absent from the weight sum too.
         if (r.total == 0) {
             continue;
         }
-        acc.add(ratio_percent(r, pt.weight), pt.weight);
+        acc.add(ratio_percent(r, pw), pw);
         bins.covered += r.covered;
         bins.total += r.total;
     }
@@ -554,8 +595,8 @@ InstResult inst_result(const Inst* inst) {
     out.contributes = !acc.empty();
     // 19.11 (b)-(c): with no weight to divide by, the covergroup reports by its
     // own weight rather than by an average it cannot form.
-    out.coverage = acc.value(ty.weight);
-    out.weight   = ty.weight;
+    out.coverage = acc.value(inst->weight);
+    out.weight   = inst->weight;
     // 19.11 (d): both out-counts are zero in that case.
     out.bins = out.contributes ? bins : Ratio{ 0, 0 };
     return out;
@@ -577,7 +618,8 @@ TypeResult type_result(uint32_t type_idx) {
     const rt_cover_type& ty = g_config->types[type_idx];
 
     // LRM 19.11.3 with merge_instances false: the weighted average of the
-    // instances' coverage, each weighted by its covergroup weight. Every instance
+    // instances' coverage, each weighted by its option.weight (not by
+    // type_option.weight). Every instance
     // of one type carries the same resolved option.weight in this phase, so the
     // sum reduces to a plain average -- written in the weighted form anyway,
     // because that is the form the clause states and the form a per-instance
@@ -597,7 +639,45 @@ TypeResult type_result(uint32_t type_idx) {
 
     TypeResult out;
     out.contributes = !acc.empty();
-    out.coverage    = acc.value(ty.weight);
+    // NOTE: 19.11 (b)-(c) pick 0.0 or 100.0 by "the covergroup's weight" for
+    // get_coverage too; for the type that is read as its type_option.weight,
+    // the weight the type carries one level up.
+    out.coverage    = acc.value(ty.type_weight);
+    out.bins        = out.contributes ? bins : Ratio{ 0, 0 };
+    return out;
+}
+
+// LRM 19.11.3 for one coverpoint: its coverage in every instance of the type, each
+// weighted by that coverpoint's option.weight (the same in every instance while an
+// option is a constant), and the two bin counts summed over the instances that
+// contribute, which is what 19.8 says get_coverage assigns when called on a
+// coverpoint ("aggregated numbers of bins from the same coverpoint or cross in all
+// instances"). An instance whose coverpoint has no bins to measure is absent from
+// both sums (19.11.1 (a)), and with nothing left the weighted average is the
+// zero-denominator case, which reports by the coverpoint's own weight.
+TypeResult point_type_result(uint32_t type_idx, uint32_t point) {
+    assert(g_config != nullptr);
+    assert(type_idx < g_config->ntypes);
+    assert(type_idx < g_nreg && "the registry and the model disagree on the type count");
+    assert(point < g_config->types[type_idx].npoints);
+    const rt_cover_point& pt = g_config->types[type_idx].points[point];
+
+    Weighted acc;
+    Ratio    bins{ 0, 0 };
+    for (const Inst* in = g_reg[type_idx].head; in != nullptr; in = in->next) {
+        const Ratio r = point_ratio(in, point);
+        if (r.total == 0) {
+            continue;
+        }
+        const uint32_t pw = in->popts[point].weight;
+        acc.add(ratio_percent(r, pw), pw);
+        bins.covered += r.covered;
+        bins.total += r.total;
+    }
+
+    TypeResult out;
+    out.contributes = !acc.empty();
+    out.coverage    = acc.value(pt.weight);
     out.bins        = out.contributes ? bins : Ratio{ 0, 0 };
     return out;
 }
@@ -617,6 +697,45 @@ const char* bin_note(const rt_cover_bin& bin) {
             break;
     }
     return bin.nranges == 0 ? "  empty, excluded" : "";
+}
+
+// The `  comment "..."` tail of a report line (LRM 19.7: a comment "is saved in the
+// coverage database and included in the coverage report"), or nothing for an empty
+// one. Quoted, with the quote, the backslash and every control byte escaped, so a
+// comment holding a newline cannot break the report's one-line-per-item shape.
+void print_comment(std::FILE* f, const char* comment) {
+    if (comment == nullptr || comment[0] == '\0') {
+        return;
+    }
+    std::fputs("  comment \"", f);
+    for (const char* p = comment; *p != '\0'; ++p) {
+        const auto c = static_cast<unsigned char>(*p);
+        switch (c) {
+            case '"':
+                std::fputs("\\\"", f);
+                break;
+            case '\\':
+                std::fputs("\\\\", f);
+                break;
+            case '\n':
+                std::fputs("\\n", f);
+                break;
+            case '\r':
+                std::fputs("\\r", f);
+                break;
+            case '\t':
+                std::fputs("\\t", f);
+                break;
+            default:
+                if (c < 0x20 || c == 0x7f) {
+                    std::fprintf(f, "\\x%02x", static_cast<unsigned>(c));
+                } else {
+                    std::fputc(c, f);
+                }
+                break;
+        }
+    }
+    std::fputc('"', f);
 }
 
 } // namespace
@@ -711,21 +830,25 @@ extern "C" void rt_cover_report(void) {
         for (const Inst* in = ty.per_instance != 0 ? g_reg[t].head : nullptr; in != nullptr; in = in->next) {
             const InstResult ir = inst_result(in);
             std::fprintf(f,
-                         "  instance %s  coverage %6.2f%%  bins %u/%u\n",
+                         "  instance %s  coverage %6.2f%%  bins %u/%u",
                          or_else(in->name, "<instance>"),
                          ir.coverage,
                          ir.bins.covered,
                          ir.bins.total);
+            print_comment(f, in->comment);
+            std::fputc('\n', f);
             for (uint32_t p = 0; p < ty.npoints; ++p) {
                 const rt_cover_point& pt    = ty.points[p];
                 const Ratio           r     = point_ratio(in, p);
                 const uint64_t*       count = in->counts + in->base[p];
                 std::fprintf(f,
-                             "    coverpoint %s  coverage %6.2f%%  bins %u/%u\n",
+                             "    coverpoint %s  coverage %6.2f%%  bins %u/%u",
                              or_else(pt.name, "<coverpoint>"),
-                             ratio_percent(r, pt.weight),
+                             ratio_percent(r, in->popts[p].weight),
                              r.covered,
                              r.total);
+                print_comment(f, in->popts[p].comment);
+                std::fputc('\n', f);
                 for (uint32_t b = 0; b < pt.nbins; ++b) {
                     const rt_cover_bin& bin = pt.bins[b];
                     // The bin name is the frontend's rendering of LRM 19.5.1 /
@@ -738,12 +861,32 @@ extern "C" void rt_cover_report(void) {
         }
         const TypeResult tr = type_result(t);
         std::fprintf(f,
-                     "  type %s  coverage %6.2f%%  bins %u/%u  instances %u\n",
+                     "  type %s  coverage %6.2f%%  bins %u/%u  instances %u",
                      or_else(ty.name, "<covergroup>"),
                      tr.coverage,
                      tr.bins.covered,
                      tr.bins.total,
                      g_reg[t].ninst);
+        print_comment(f, ty.type_comment);
+        std::fputc('\n', f);
+        // A coverpoint of the type has no line of its own, so one that carries a
+        // type_option.comment (LRM 19.7.1: it "appears with ... a coverpoint ... of the
+        // covergroup type") gets one here, with its type coverage.
+        for (uint32_t p = 0; p < ty.npoints; ++p) {
+            const rt_cover_point& pt = ty.points[p];
+            if (pt.type_comment == nullptr || pt.type_comment[0] == '\0') {
+                continue;
+            }
+            const TypeResult pr = point_type_result(t, p);
+            std::fprintf(f,
+                         "  type coverpoint %s  coverage %6.2f%%  bins %u/%u",
+                         or_else(pt.name, "<coverpoint>"),
+                         pr.coverage,
+                         pr.bins.covered,
+                         pr.bins.total);
+            print_comment(f, pt.type_comment);
+            std::fputc('\n', f);
+        }
     }
     if (g_config->ntypes != 0) {
         std::fprintf(f, "\ndesign coverage %6.2f%%\n", rt_cover_design_coverage());
@@ -763,6 +906,10 @@ extern "C" void rt_cover_shutdown(void) {
                 // The counter and base arrays are trailing parts of this same
                 // allocation, so the name is the only separate one.
                 Inst* next = in->next;
+                for (uint32_t p = 0; p < in->npoints; ++p) {
+                    std::free(in->popts[p].comment);
+                }
+                std::free(in->comment);
                 std::free(in->name);
                 std::free(in);
                 in = next;
@@ -817,18 +964,23 @@ extern "C" uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const rt_strin
         cover_fatal(ty.banner, "a covergroup has more bins than the runtime can address", note);
     }
 
-    // One block: the header, then the counters (8-aligned, so they come first),
-    // then the base offsets. calloc is what zeroes the counters.
+    // One block: the header, then the counters (8-aligned, so they come first), then
+    // the per-coverpoint options (also 8-aligned, since the counters are whole words),
+    // the base offsets and one stop flag per coverpoint. calloc is what zeroes the
+    // counters and leaves every coverpoint collecting.
     const uint64_t head_bytes  = (sizeof(Inst) + 7u) & ~static_cast<uint64_t>(7u);
     const uint64_t count_bytes = ncounts * sizeof(uint64_t);
+    const uint64_t opts_bytes  = static_cast<uint64_t>(ty.npoints) * sizeof(PointOpts);
     const uint64_t base_bytes  = static_cast<uint64_t>(ty.npoints) * sizeof(uint32_t);
-    void*          raw         = std::calloc(1, static_cast<size_t>(head_bytes + count_bytes + base_bytes));
+    const uint64_t stop_bytes  = ty.npoints;
+    const uint64_t total_bytes = head_bytes + count_bytes + opts_bytes + base_bytes + stop_bytes;
+    void*          raw         = std::calloc(1, static_cast<size_t>(total_bytes));
     if (raw == nullptr) {
         char note[192];
         std::snprintf(note,
                       sizeof(note),
                       "%" PRIu64 " bytes for %" PRIu64 " bins of covergroup '%s'",
-                      head_bytes + count_bytes + base_bytes,
+                      total_bytes,
                       ncounts,
                       or_else(ty.name, "<covergroup>"));
         cover_fatal(ty.banner, "out of memory for a covergroup instance", note);
@@ -839,7 +991,9 @@ extern "C" uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const rt_strin
     inst->next           = nullptr;
     inst->ctx            = ctx;
     inst->counts         = ncounts != 0 ? reinterpret_cast<uint64_t*>(bytes + head_bytes) : nullptr;
-    inst->base           = ty.npoints != 0 ? reinterpret_cast<uint32_t*>(bytes + head_bytes + count_bytes) : nullptr;
+    inst->popts          = ty.npoints != 0 ? reinterpret_cast<PointOpts*>(bytes + head_bytes + count_bytes) : nullptr;
+    inst->base           = ty.npoints != 0 ? reinterpret_cast<uint32_t*>(bytes + head_bytes + count_bytes + opts_bytes) : nullptr;
+    inst->stopped        = ty.npoints != 0 ? bytes + head_bytes + count_bytes + opts_bytes + base_bytes : nullptr;
     inst->type_idx       = type_idx;
     inst->ordinal        = g_reg[type_idx].ninst;
     inst->ncounts        = static_cast<uint32_t>(ncounts);
@@ -852,8 +1006,28 @@ extern "C" uint64_t rt_cover_new(uint32_t type_idx, uint64_t ctx, const rt_strin
         at += ty.points[p].nbins;
     }
     assert(at == inst->ncounts && "the base offsets do not span the counter array");
+    inst->weight   = ty.weight;
+    inst->goal     = static_cast<int32_t>(ty.goal);
+    inst->at_least = ty.at_least;
+    inst->comment  = dup_str(ty.inst_comment);
+    for (uint32_t p = 0; p < ty.npoints; ++p) {
+        inst->popts[p] = PointOpts{ ty.points[p].weight, ty.points[p].goal, ty.points[p].at_least,
+                                    dup_str(ty.points[p].inst_comment) };
+    }
 
-    inst->name = default_name(path, text, text_len, ty, inst->ordinal);
+    if (ty.inst_name != nullptr) {
+        // option.name (LRM 19.7, Table 19-1) is the whole name, as set_inst_name's is: no
+        // instance path in front and no ordinal after it.
+        const size_t n    = std::strlen(ty.inst_name);
+        char*        copy = static_cast<char*>(std::malloc(n + 1));
+        if (copy == nullptr) {
+            cover_fatal(ty.banner, "out of memory for a covergroup instance name", nullptr);
+        }
+        std::memcpy(copy, ty.inst_name, n + 1);
+        inst->name = copy;
+    } else {
+        inst->name = default_name(path, text, text_len, ty, inst->ordinal);
+    }
 
     // Append, so the list is in creation order for the report and for 19.11.3's
     // instance walk.
@@ -916,6 +1090,11 @@ extern "C" void rt_cover_hit(uint64_t h, uint32_t point, uint64_t value, uint64_
     const rt_cover_type& ty = g_config->types[inst->type_idx];
     assert(point < ty.npoints && "a coverpoint outside the published model");
     if (point >= ty.npoints) {
+        return;
+    }
+    // `stop()` on this coverpoint alone (rt_cover_start_point) is the same
+    // sample-without-count as the instance-wide switch above.
+    if (inst->stopped[point] != 0) {
         return;
     }
     const rt_cover_point& pt        = ty.points[point];
@@ -986,6 +1165,15 @@ extern "C" void rt_cover_start(uint64_t h, int32_t on) {
     inst->started = on != 0 ? 1 : 0;
 }
 
+extern "C" void rt_cover_start_point(uint64_t h, uint32_t point, int32_t on) {
+    Inst* inst = inst_of(h);
+    assert(inst != nullptr && "rt_cover_start_point on a null covergroup handle");
+    if (inst == nullptr || point >= inst->npoints) {
+        return;
+    }
+    inst->stopped[point] = on != 0 ? 0 : 1;
+}
+
 extern "C" void rt_cover_set_inst_name(uint64_t h, const char* name, uint64_t len) {
     Inst* inst = inst_of(h);
     assert(inst != nullptr && "rt_cover_set_inst_name on a null covergroup handle");
@@ -1005,6 +1193,142 @@ extern "C" void rt_cover_set_inst_name(uint64_t h, const char* name, uint64_t le
     copy[n] = '\0';
     std::free(inst->name);
     inst->name = copy;
+}
+
+// -- Options assigned after construction (LRM 19.7) -----------------------------
+
+extern "C" void rt_cover_opt_set(uint64_t h, uint32_t point, uint32_t which, int64_t value) {
+    Inst* inst = inst_of(h);
+    if (inst == nullptr) {
+        return;
+    }
+    const rt_cover_type& ty = g_config->types[inst->type_idx];
+    if (which == RT_COVER_OPT_WEIGHT && value < 0) {
+        cover_fatal(point == RT_COVER_OPT_GROUP || point >= ty.npoints ? ty.banner : ty.points[point].banner,
+                    "option.weight must be a non-negative value", "LRM 19.7, Table 19-1");
+    }
+    const uint32_t floor_at_least = value < 0 ? 0u : static_cast<uint32_t>(value);
+    if (point == RT_COVER_OPT_GROUP) {
+        switch (which) {
+            case RT_COVER_OPT_WEIGHT:
+                inst->weight = static_cast<uint32_t>(value);
+                break;
+            case RT_COVER_OPT_GOAL:
+                inst->goal = static_cast<int32_t>(value);
+                break;
+            case RT_COVER_OPT_AT_LEAST:
+                // At the covergroup level at_least is the default of its coverpoints
+                // (Table 19-2): the coverpoints still at the old default take the new one,
+                // and one a definition set to something else keeps its own.
+                for (uint32_t p = 0; p < inst->npoints; ++p) {
+                    if (inst->popts[p].at_least == inst->at_least) {
+                        inst->popts[p].at_least = floor_at_least;
+                    }
+                }
+                inst->at_least = floor_at_least;
+                break;
+            case RT_COVER_OPT_CROSS_NUM_PRINT_MISSING:
+                inst->cross_num_print_missing = static_cast<int32_t>(value);
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+    if (point >= inst->npoints) {
+        return;
+    }
+    PointOpts& po = inst->popts[point];
+    switch (which) {
+        case RT_COVER_OPT_WEIGHT:
+            po.weight = static_cast<uint32_t>(value);
+            break;
+        case RT_COVER_OPT_GOAL:
+            po.goal = static_cast<uint32_t>(value);
+            break;
+        case RT_COVER_OPT_AT_LEAST:
+            po.at_least = floor_at_least;
+            break;
+        default:
+            break;
+    }
+}
+
+extern "C" int64_t rt_cover_opt_get(uint64_t h, uint32_t point, uint32_t which) {
+    const Inst* inst = inst_of(h);
+    if (inst == nullptr) {
+        return 0;
+    }
+    if (point == RT_COVER_OPT_GROUP) {
+        switch (which) {
+            case RT_COVER_OPT_WEIGHT:
+                return inst->weight;
+            case RT_COVER_OPT_GOAL:
+                return inst->goal;
+            case RT_COVER_OPT_AT_LEAST:
+                return inst->at_least;
+            case RT_COVER_OPT_CROSS_NUM_PRINT_MISSING:
+                return inst->cross_num_print_missing;
+            default:
+                return 0;
+        }
+    }
+    if (point >= inst->npoints) {
+        return 0;
+    }
+    const PointOpts& po = inst->popts[point];
+    switch (which) {
+        case RT_COVER_OPT_WEIGHT:
+            return po.weight;
+        case RT_COVER_OPT_GOAL:
+            return static_cast<int32_t>(po.goal);
+        case RT_COVER_OPT_AT_LEAST:
+            return po.at_least;
+        default:
+            return 0;
+    }
+}
+
+extern "C" void rt_cover_opt_set_str(uint64_t h, uint32_t point, uint32_t which, const char* s, uint64_t len) {
+    Inst* inst = inst_of(h);
+    if (inst == nullptr) {
+        return;
+    }
+    if (which == RT_COVER_OPT_NAME) {
+        rt_cover_set_inst_name(h, s, len);
+        return;
+    }
+    if (which != RT_COVER_OPT_COMMENT) {
+        return;
+    }
+    char** slot = point == RT_COVER_OPT_GROUP ? &inst->comment : point < inst->npoints ? &inst->popts[point].comment : nullptr;
+    if (slot == nullptr) {
+        return;
+    }
+    char* copy = static_cast<char*>(std::malloc(static_cast<size_t>(len) + 1));
+    if (copy == nullptr) {
+        cover_fatal(nullptr, "out of memory for a covergroup option string", nullptr);
+    }
+    if (len != 0) {
+        std::memcpy(copy, s, static_cast<size_t>(len));
+    }
+    copy[len] = '\0';
+    std::free(*slot);
+    *slot = copy;
+}
+
+extern "C" void rt_cover_opt_get_str(rt_string* dst, uint64_t h, uint32_t point, uint32_t which,
+                                     const rt_alloc_site* site) {
+    const Inst* inst = inst_of(h);
+    const char* s    = nullptr;
+    if (inst != nullptr) {
+        if (which == RT_COVER_OPT_NAME) {
+            s = inst->name;
+        } else if (which == RT_COVER_OPT_COMMENT) {
+            s = point == RT_COVER_OPT_GROUP ? inst->comment : point < inst->npoints ? inst->popts[point].comment : nullptr;
+        }
+    }
+    rt_internal::str_assign(dst, s != nullptr ? s : "", s != nullptr ? std::strlen(s) : 0, site);
 }
 
 // -- Queries (LRM 19.8, 19.11) ------------------------------------------------
@@ -1089,6 +1413,27 @@ extern "C" int32_t rt_cover_point_total(uint64_t h, uint32_t point) {
     return static_cast<int32_t>(point_ratio(inst, point).total);
 }
 
+extern "C" double rt_cover_type_point_coverage(uint32_t type_idx, uint32_t point) {
+    if (g_config == nullptr || type_idx >= g_config->ntypes || point >= g_config->types[type_idx].npoints) {
+        return 0.0;
+    }
+    return point_type_result(type_idx, point).coverage;
+}
+
+extern "C" int32_t rt_cover_type_point_covered(uint32_t type_idx, uint32_t point) {
+    if (g_config == nullptr || type_idx >= g_config->ntypes || point >= g_config->types[type_idx].npoints) {
+        return 0;
+    }
+    return static_cast<int32_t>(point_type_result(type_idx, point).bins.covered);
+}
+
+extern "C" int32_t rt_cover_type_point_total(uint32_t type_idx, uint32_t point) {
+    if (g_config == nullptr || type_idx >= g_config->ntypes || point >= g_config->types[type_idx].npoints) {
+        return 0;
+    }
+    return static_cast<int32_t>(point_type_result(type_idx, point).bins.total);
+}
+
 extern "C" double rt_cover_design_coverage(void) {
     if (g_config == nullptr) {
         return 100.0;
@@ -1101,7 +1446,7 @@ extern "C" double rt_cover_design_coverage(void) {
         if (!r.contributes) {
             continue;
         }
-        acc.add(r.coverage, g_config->types[t].weight);
+        acc.add(r.coverage, g_config->types[t].type_weight);
     }
     // LRM 19.11's closing sentence: with no covergroup instances at all -- or with
     // every weight zero -- the overall coverage is 100%, not 0%. There is no

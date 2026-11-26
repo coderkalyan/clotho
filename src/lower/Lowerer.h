@@ -412,6 +412,24 @@ struct SharedNotifiers {
     ankerl::unordered_dense::map<const slang::ast::Symbol*, Entry> of;
 };
 
+// The classes whose objects must own an RNG (LRM 18.14.2) though they declare no rand
+// property: the static receiver class of every `randomize`, `srandom`, `get_randstate`
+// and `set_randstate` call in the design. A base-typed handle may hold a derived
+// object, so a class owns one when any class in its base chain is marked. Every other
+// class keeps no generator and draws nothing at `new`. docs/LRM_NOTES.md note 63.
+struct RngClasses {
+    ankerl::unordered_dense::set<const ClassType*> marked;
+};
+
+struct RngReceiverScan : slang::ast::ASTVisitor<RngReceiverScan, VisitFlags::AllGood> {
+    RngClasses*                   out = nullptr;
+    std::vector<const ClassType*> in_class;
+
+    void handle(const slang::ast::CallExpression& call);
+
+    void handle(const ClassType& cls);
+};
+
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out);
 
 bool scope_has_own_real_delay(const Scope& scope);
@@ -1347,6 +1365,10 @@ public:
     // Point this Lowerer at the design-wide waited-on-property table (WaitPropScan).
     // Shared for the same reason ClassIds is, and consulted at exactly one place:
     // lower_class_type, laying out a class's change notifiers.
+    void set_rng_classes(const RngClasses* rc) {
+        rng_classes_ = rc;
+    }
+
     void set_waited_props(const WaitedProps* wp) {
         waited_props_ = wp;
     }
@@ -3825,12 +3847,20 @@ private:
 
     void lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builder& b);
 
+    // One weighted-choice draw: a value below the weight sum and the type it
+    // carries, which is the type a cumulative weight is converted to for the compare.
+    struct WeightDraw {
+        ir::Index value;
+        ir::Ref   type;
+    };
+
+    WeightDraw emit_weight_draw(ir::Index sum, uint32_t width, ir::Builder& b, ir::SourceLoc l);
+
     void lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
                             size_t                               k,
                             ir::Index                            acc,
-                            ir::Index                            draw,
+                            const WeightDraw&                    draw,
                             const std::vector<ir::Index>&        weights,
-                            ir::Ref                              u32,
                             ir::Builder&                         b);
 
     // -- randsequence (LRM 18.17) --
@@ -3989,10 +4019,10 @@ private:
     // must draw at the same point so an interleaved production's stream matches a
     // plain one's).
     //
-    // Same weight domain, sum precision and zero-total rule as randcase (18.16):
-    // unsigned summands at the widest weight's self-determined precision, one draw
-    // over the total, and no draw at all when the total is zero -- there is then no
-    // rule to pick, and drawing would shift the stream.
+    // Same weight domain, sum precision, draw (emit_weight_draw) and zero-total rule
+    // as randcase (18.16): unsigned summands at the widest weight's self-determined
+    // precision, one draw over the total, and no draw at all when the total is zero
+    // -- there is then no rule to pick, and drawing would shift the stream.
     template<typename F>
     void gen_weighted_rules(const RsProd& p, std::span<const RsProd::Rule> rules, ir::Builder& b, F&& emit) {
         const ir::SourceLoc l = to_source_loc(p.location);
@@ -4005,20 +4035,6 @@ private:
         uint32_t width = 1;
         for (const RsProd::Rule& r : rules) {
             width = std::max(width, r.weightExpr != nullptr ? r.weightExpr->type->getBitWidth() : 32u);
-        }
-        if (width > 32) {
-            // TODO: a wider sum needs the LRM's several-draw scheme, stitching
-            // multiple $urandom_range results into one number ("This can result in
-            // multiple calls to $urandom_range() to handle numbers greater than 32
-            // bits", LRM 18.16, whose weight rules 18.17.1 shares).
-            //
-            // Deliberately shared with randcase's identical guard rather than lifted
-            // here alone: the two constructs weigh alternatives by the same clause,
-            // so they must agree, and stitching changes how many values a selection
-            // draws from the process stream -- a documented contract
-            // (docs/design/randsequence.md §12), not an implementation detail. One
-            // change, both sites, one recorded stream shift.
-            fail("randsequence production weight wider than 32 bits is not supported");
         }
         const ir::Ref          wty = make_int_type(width, false);
         std::vector<ir::Index> weights;
@@ -4036,15 +4052,10 @@ private:
             sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
         }
 
-        const ir::Ref   u32  = make_int_type(32, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index wide = b.convert(sum, u32, false, l);
-        const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
-        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
-        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
-        const ir::Index draw = b.urandom_range(top, low, l);
-        gen_rule_arm(rules, 0, zero, draw, weights, u32, b, emit);
+        const WeightDraw draw = emit_weight_draw(sum, width, b, l);
+        gen_rule_arm(rules, 0, zero, draw, weights, b, emit);
         const ir::ExtraSlice pick_region = b.close_region();
         b.open_region();
         const ir::ExtraSlice none_region = b.close_region();
@@ -4056,9 +4067,8 @@ private:
     void gen_rule_arm(std::span<const RsProd::Rule> rules,
                       size_t                        k,
                       ir::Index                     acc,
-                      ir::Index                     draw,
+                      const WeightDraw&             draw,
                       const std::vector<ir::Index>& weights,
-                      ir::Ref                       u32,
                       ir::Builder&                  b,
                       F&                            emit) {
         if (k == weights.size()) {
@@ -4066,14 +4076,14 @@ private:
         }
         const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
         const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw.value, b.convert(next, draw.type, false, l), l);
 
         b.open_region();
         emit(k, b);
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        gen_rule_arm(rules, k + 1, next, draw, weights, u32, b, emit);
+        gen_rule_arm(rules, k + 1, next, draw, weights, b, emit);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, l);
@@ -5916,6 +5926,27 @@ private:
     // of the enclosing object, and `new` for an embedded covergroup is required to
     // sit in the enclosing class's constructor (LRM 19.4).
 
+    // A covergroup's own instance / type options, as far as this phase resolves
+    // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
+    // type set. `weight` is option.weight; `type_weight` is a covergroup's
+    // type_option.weight, which only weights the group in $get_coverage (19.11.3).
+    // `name` is the covergroup's option.name, and `comment` / `type_comment` are the
+    // option.comment / type_option.comment of whichever level the setters belong to.
+    struct CoverOpts {
+        uint32_t                   weight         = 1;
+        uint32_t                   type_weight    = 1;
+        uint32_t                   goal           = 100;
+        uint32_t                   at_least       = 1;
+        uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default
+        bool                       per_instance   = false;
+        bool                       detect_overlap = false;
+        // Read back by `h.option.get_inst_coverage`; it changes no number.
+        bool                       get_inst_coverage = false;
+        std::optional<std::string> name;
+        std::string                comment;
+        std::string                type_comment;
+    };
+
     // What one lowered covergroup declaration owns.
     struct CoverDecl {
         // Index into module_.cover_types.
@@ -5923,22 +5954,40 @@ private:
         // The generated sample body: `void(u64 handle)`, which evaluates every
         // coverpoint expression and hands each value to the coverage runtime.
         ir::FunctionId sample{};
+        // The coverpoints in model order: the position a coverpoint-level method
+        // (`h.cp.get_inst_coverage()`, `cg::cp::get_coverage()`) names its coverpoint by.
+        std::vector<const slang::ast::CoverpointSymbol*> points;
+        // The options the definition resolved to, for the covergroup and each coverpoint,
+        // which the ones nothing assigns at run time are read back from.
+        CoverOpts              group;
+        std::vector<CoverOpts> point_opts;
     };
 
-    // A covergroup's own instance / type options, as far as this phase resolves
-    // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
-    // type set. NOTE: the two sets share the names `weight` and `goal` but are
-    // separate options (19.7.1: a type weight is for the cumulative coverage of the
-    // saved database; 19.11.3 weights instances by `option.weight`), and
-    // cover_apply_option does not tell them apart: a `type_option.weight` or `goal`
-    // setter lands here as the instance option.
-    struct CoverOpts {
-        uint32_t weight       = 1;
-        uint32_t goal         = 100;
-        uint32_t at_least     = 1;
-        uint32_t auto_bin_max = 64; // LRM Table 19-1's default
-        bool     per_instance = false;
+    // Option ids and the covergroup-level point, mirroring src/runtime/Coverage.h.
+    static constexpr uint32_t kCoverOptGroup   = 0xFFFFFFFFu;
+    static constexpr uint32_t kCoverOptWeight  = 0;
+    static constexpr uint32_t kCoverOptGoal    = 1;
+    static constexpr uint32_t kCoverOptAtLeast = 2;
+    static constexpr uint32_t kCoverOptCrossNumPrintMissing = 3;
+    static constexpr uint32_t kCoverOptComment = 4;
+    static constexpr uint32_t kCoverOptName    = 5;
+
+    // `h.option.f` / `h.cp.option.f` (LRM 19.7, 19.10): the covergroup handle, the
+    // coverpoint (or the covergroup's own options) and the field.
+    struct CoverOptRef {
+        const Expression*                 handle = nullptr;
+        const slang::ast::CovergroupType* cgt    = nullptr;
+        uint32_t                          point  = kCoverOptGroup;
+        bool                              is_type  = false;
+        bool                              on_cross = false;
+        std::string_view                  field;
     };
+
+    std::optional<CoverOptRef> cover_option_ref(const Expression& e);
+
+    ir::Index lower_cover_option_read(const MemberAccessExpression& ma, const CoverOptRef& r, ir::Builder& b);
+
+    ir::Index lower_cover_option_write(const AssignmentExpression& a, const CoverOptRef& r, ir::Builder& b);
 
     // The value space a coverpoint's bins live in: what `$` means, and how many
     // automatic bins 19.5.3 would create.
@@ -5953,6 +6002,8 @@ private:
     };
 
     int64_t cover_const(const Expression& e, const char* what);
+
+    std::string cover_const_string(const Expression& e, const char* what);
 
     CoverSpace cover_space_of(const slang::ast::Type& t);
 
@@ -5982,7 +6033,12 @@ private:
 
     uint32_t cover_type_of(const slang::ast::CovergroupType& cgt);
 
-    ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts);
+    ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts,
+                                     CoverOpts& resolved);
+
+    void cover_report_overlaps(const std::vector<const slang::ast::CoverageBinSymbol*>& sources,
+                               const CoverSpace&                                      space,
+                               const ir::CoverPoint&                                  model);
 
     static const slang::ast::Type* cover_enum_type(const Expression& e);
 
@@ -6003,6 +6059,8 @@ private:
                                  ir::Builder&                        b);
 
     static const Expression* cover_receiver(const slang::ast::CallExpression& call);
+
+    const slang::ast::CovergroupType& cover_type_owning(const slang::ast::Scope& owner);
 
     // Cap on the bins one coverpoint may hold. The LRM sets no limit; enumerating
     // `bins b[] = {[0:$]}` on a 32-bit coverpoint would otherwise try to name four
@@ -6381,6 +6439,7 @@ private:
     const WaitedProps* waited_props_ = nullptr;
     // The design-wide change notifiers, or null on a standalone Lowerer.
     SharedNotifiers* shared_notifiers_ = nullptr;
+    const RngClasses*  rng_classes_  = nullptr;
     // (waited-on class property, ir::Edge) -> the object-body field index of its
     // hidden change-notifier event property (ir::ChangeNotify). Filled by
     // lower_class_type at the same time as class_prop_index_, and read by the wait
@@ -6416,6 +6475,11 @@ private:
     static constexpr uint64_t kRandOpModeAll   = 1;
     static constexpr uint64_t kRandOpModeOne   = 2;
     static constexpr uint64_t kRandOpModeQuery = 3;
+    // The randstate pair (LRM 18.13.4, 18.13.5). The state is four 64-bit words and the
+    // call returns one i64, so it crosses a word at a time: StateGet + k returns word k of
+    // it, and StateSet + k stores `arg` into word k.
+    static constexpr uint64_t kRandOpStateGet = 8;
+    static constexpr uint64_t kRandOpStateSet = 12;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ClassRand> class_rand_;
     // A rand property -> its rand ordinal. Design-wide like class_prop_index_ and
     // stable for the same reason: prefix layout gives an inherited property the same

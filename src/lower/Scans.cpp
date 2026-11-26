@@ -885,6 +885,47 @@ void WaitPropScan::handle(const slang::ast::TimedStatement& t) {
 // A package member is deliberately NOT descended into: the caller enumerates
 // packages itself (lower_globals), so that a package's classes are initialized once
 // on the globals Lowerer rather than once per top that imports it.
+void RngReceiverScan::handle(const ClassType& cls) {
+    in_class.push_back(&cls);
+    visitDefault(cls);
+    in_class.pop_back();
+}
+
+void RngReceiverScan::handle(const slang::ast::CallExpression& call) {
+    bool scope_randomize = false;
+    if (call.subroutine.index() == 0) {
+        const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        const Scope*            own = sub.getParentScope();
+        const bool builtin_class = sub.flags.has(slang::ast::MethodFlags::BuiltIn) && own != nullptr &&
+                                   own->asSymbol().kind == SymbolKind::ClassType;
+        if (!builtin_class || (sub.name != "srandom" && sub.name != "get_randstate" && sub.name != "set_randstate")) {
+            visitDefault(call);
+            return;
+        }
+    } else if (call.getSubroutineName() != "randomize") {
+        visitDefault(call);
+        return;
+    } else {
+        const auto args = call.arguments();
+        scope_randomize = !args.empty() && args[0]->kind == ExpressionKind::Assignment;
+    }
+    if (!scope_randomize) {
+        const ClassType* cls = nullptr;
+        if (const Expression* t = call.thisClass()) {
+            cls = t->type->getCanonicalType().as_if<ClassType>();
+        } else if (call.getSubroutineName() == "randomize" && !call.arguments().empty() &&
+                   call.arguments()[0]->type->getCanonicalType().isClass()) {
+            cls = call.arguments()[0]->type->getCanonicalType().as_if<ClassType>();
+        } else if (!in_class.empty()) {
+            cls = in_class.back();
+        }
+        if (cls != nullptr) {
+            out->marked.insert(cls);
+        }
+    }
+    visitDefault(call);
+}
+
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out) {
     for (const Symbol& m : scope.members()) {
         switch (m.kind) {

@@ -617,12 +617,18 @@ enum class ProcOp : uint32_t {
     Self,         // process::self() -> a handle on the calling thread
     Status,       // p.status() -> the `state` enum value
     RandstateGet, // p.get_randstate() -> string
+    // A caller-side copy of an OBJECT's four-word generator state (operand: its lvalue, a
+    // 4-element unpacked array of `bit [63:0]`) rendered as that same string; the object's own
+    // words reach the copy through its class's `$randops`.
+    StateFormat,
     // ProcCtl.
     Kill,         // p.kill(): end p and every descendant
     Suspend,      // p.suspend()
     Resume,       // p.resume()
     Srandom,      // p.srandom(seed)
     RandstateSet, // p.set_randstate(s)
+    // The inverse for an object: parse the string (args: state lvalue, string) into the copy.
+    StateParse,
     DisableFork,  // `disable fork` (LRM 9.6.3): kill every descendant of self
     // ProcWait.
     Await,        // p.await(): park until p completes
@@ -667,11 +673,22 @@ enum class CoverOp : uint32_t {
     TypeCoverage, // cg_type::get_coverage() -> real, over every instance
     TypeCovered,
     TypeTotal,
+    TypePointCoverage, // cg_type::cp::get_coverage() -> real, that coverpoint over every instance
+    TypePointCovered,
+    TypePointTotal,
     DesignCoverage, // $get_coverage() (LRM 19.9)
+    // An option of an instance read back (LRM 19.7): operands (handle, option id), the
+    // coverpoint index in CoverInfo::point or RT_COVER_OPT_GROUP for the covergroup's own.
+    OptGet,    // an integer option -> 64-bit signed
+    OptGetStr, // a string option (comment, name) -> string
     // CoverCtl.
-    Hit,     // one coverpoint's sampled value: match bins and count
-    Start,   // h.start() / h.stop()
-    SetName, // h.set_inst_name(s)
+    Hit,        // one coverpoint's sampled value: match bins and count
+    Start,      // h.start() / h.stop()
+    StartPoint, // h.cp.start() / h.cp.stop()
+    SetName,    // h.set_inst_name(s)
+    // An option assigned after construction: operands (handle, option id, value).
+    OptSet,    // an integer option
+    OptSetStr, // a string option
 };
 
 // Extra payload for the two coverage tags.
@@ -679,7 +696,7 @@ struct CoverInfo {
     // SSA operands, in order: the covergroup handle (absent for the type-level and
     // design-level queries, which name a type index or nothing), then the op's
     // value arguments -- for Hit the sampled value and its unknown-bit mask, for
-    // Start the 1-bit enable, for SetName the string. New takes no handle: its
+    // Start and StartPoint the 1-bit enable, for SetName the string. New takes no handle: its
     // operands are the enclosing object a class-embedded group captures (0
     // otherwise) and, when the group is built inside an instance, that instance's
     // path (an InstPath value, borrowed), which the report names the new instance
@@ -694,7 +711,7 @@ struct CoverInfo {
     // for New and the type-level queries; the instance ops read the type off the
     // instance record instead.
     uint32_t type_idx = 0;
-    // Which coverpoint of that type, for Hit and the coverpoint-level queries.
+    // Which coverpoint of that type, for Hit, StartPoint and the coverpoint-level queries.
     uint32_t point = 0;
     CoverOp  op    = CoverOp::New;
     // New only: the packed bytes of the instance's name prefix after its path -- the
@@ -717,6 +734,9 @@ constexpr bool cover_op_names_type(CoverOp op) {
         case CoverOp::TypeCoverage:
         case CoverOp::TypeCovered:
         case CoverOp::TypeTotal:
+        case CoverOp::TypePointCoverage:
+        case CoverOp::TypePointCovered:
+        case CoverOp::TypePointTotal:
             return true;
         case CoverOp::Ctx:
         case CoverOp::Next:
@@ -729,7 +749,12 @@ constexpr bool cover_op_names_type(CoverOp op) {
         case CoverOp::DesignCoverage:
         case CoverOp::Hit:
         case CoverOp::Start:
+        case CoverOp::StartPoint:
         case CoverOp::SetName:
+        case CoverOp::OptGet:
+        case CoverOp::OptGetStr:
+        case CoverOp::OptSet:
+        case CoverOp::OptSetStr:
             return false;
     }
     return false;

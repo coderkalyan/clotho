@@ -884,6 +884,10 @@ struct CoverPoint {
     bool     is_auto    = false;
     uint32_t auto_total = 0;
     bool     is_signed  = false;
+    // option.comment and type_option.comment (LRM 19.7, 19.7.1), shown in the
+    // coverage report: empty when unset.
+    std::string inst_comment;
+    std::string type_comment;
 
     bool operator==(const CoverPoint&) const = default;
 };
@@ -897,9 +901,19 @@ struct CoverType {
     // names an instance by ("top.u1.") is read when the covergroup is constructed
     // (CoverOp::New), so the instances of one module share the one type.
     std::vector<CoverPoint> points;
+    // option.weight, and type_option.weight (the weight in $get_coverage).
     uint32_t                weight       = 1;
+    uint32_t                type_weight  = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
+    // option.at_least of the covergroup: the default its coverpoints took.
+    uint32_t                at_least     = 1;
+    // option.name (LRM 19.7, Table 19-1): the name each instance starts with, unset
+    // when the group leaves it to the tool.
+    std::optional<std::string> inst_name;
+    // option.comment and type_option.comment of the covergroup, shown in the report.
+    std::string inst_comment;
+    std::string type_comment;
 
     bool operator==(const CoverType&) const = default;
 };

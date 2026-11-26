@@ -748,8 +748,8 @@ ranges, `$`, `[]`, `[N]`, `default`) plus automatic bins including the enum form
 `sample()` called procedurally; `get_inst_coverage` and `get_coverage` in both
 arities; `$get_coverage`; the text report and `--coverage`. Two items moved out of
 P0: the key-widening the plan opened with turned out to be unnecessary (§6.1), and
-`option.name` / `option.comment` are refused rather than carried, because the
-model has no field for report metadata that changes no semantics.
+`option.name` / `option.comment` were refused here and landed with P4 (the name is the
+instance's name, comments show in the report).
 *This is the phase that makes a UVM subscriber-style covergroup work.*
 
 **P1 — the trigger. LANDED.** `@(edge sig)` / `@(event)` coverage events as one
@@ -886,6 +886,10 @@ IEEE 1800-2023 addition gated on the language version.
    other clotho run-time fatal.
 7. **The coverage database is refused rather than invented** (19.9 specifies no
    format), and the report is a deterministic text file instead.
+8. **`option.detect_overlap` warns only between `bins` bins** (docs/LRM_NOTES.md 61).
+9. **`start()` / `stop()` on a coverpoint are independent of the covergroup's** (docs/LRM_NOTES.md 62).
+10. **`option.get_inst_coverage` has no effect without `merge_instances`** (Table 19-1: "Only
+    applies when the merge_instances type option is set"); it is validated and dropped.
 
 ## 14. Open questions
 
