@@ -109,7 +109,7 @@ them in step.
 - A young collection costs what happened since the last collection (allocation,
   logged writes, frames that ran), never the size of the design. **Not yet:**
   each one reads every state root, walks every state-resident container and scans
-  every registered frame, and with a small live set every collection is full.
+  every registered frame.
 - An object is finalized only if it owns a buffer outside the heap when it dies.
   **Not yet:** every dead object with a string or container property runs a
   finalizer.
@@ -136,9 +136,10 @@ them in step.
 - A young collection runs after a fixed amount of allocation (8 MiB, counting
   the buffers objects own).
 - A full collection runs when the old generation has grown by a fixed factor
-  since the last one. The factor is a constant of the build: a collector tuning
-  value becomes a user setting only once a measurement shows it must. **Not
-  yet:** the test compares the committed heap, which includes the young budget.
+  since the last one: what a collection has marked and the buffers it owns, never
+  the committed heap, which includes the young budget. The factor is a constant of
+  the build: a collector tuning value becomes a user setting only once a
+  measurement shows it must.
 - A collection runs at the next boundary between process slices once the budget
   is spent, and inside an allocation only past an overshoot or at the heap's
   ceiling. **Not yet:** the boundary is the end of a time step.

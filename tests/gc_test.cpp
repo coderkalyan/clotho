@@ -75,6 +75,12 @@ constexpr uint64_t nursery_bytes_small = RT_GC_BLOCK_BYTES;
 // the one number that paces collections out of reach.
 constexpr uint64_t nursery_bytes_never = UINT64_MAX;
 
+// The budget a run gets without `--gc-nursery` (SimConfig.h). It fills two 4 MiB chunks,
+// so a run with this budget has a committed heap past the 4 MiB floor of the rule that
+// read the heap, however small its live set is. The cases of the collection kind need
+// that, and nursery_bytes_small cannot give it.
+constexpr uint64_t nursery_bytes_default = 8ull << 20;
+
 // Nonzero `gc_full_every` means "one full collection per N collections"
 // (Gc.h:241-244), so a value no design in this file can reach selects a
 // YOUNG-ONLY run. That is the only configuration in which "a young collection
@@ -3416,6 +3422,115 @@ TEST_CASE("gc: --gc-stress alternates young and full collections") {
     CHECK(st.full_collections >= st.collections / 2u);
     CHECK(st.young_collections >= st.collections / 2u - 1u);
     CHECK(st.promoted > 0u);
+}
+
+// -- 7b. Which kind of collection runs ---------------------------------------
+//
+// architecture.md (Memory): "A full collection runs when the old generation has grown by a
+// fixed factor since the last one." What the old generation holds is the bytes of the
+// objects a collection has marked and of the buffers they own, so what the rule compares
+// is a function of what survived, and the young budget is not in it. Three claims, one
+// case each: a small live set never gets a second full collection; a live set that
+// grows gets one each time it doubles; garbage that was promoted is reclaimed once there
+// is enough of it. Every case runs with `full_every` 0, which is the policy and nothing
+// else, and with the cadence that collects when the nursery budget is spent.
+
+// One object is live at any time and the design allocates 96 MB, so with the shipped
+// budget there are a dozen collections, and the first is the only one that is full. The
+// committed heap is past 4 MiB throughout, which is why this case tells the rule that
+// read the heap (every collection is full) from the one that reads the old generation
+// (a few objects promoted since the first collection).
+TEST_CASE("gc: a design with a small live set takes young collections after the first") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Item; int v; int pad[14]; endclass
+            Item keep;
+            int  n = 0;
+            function automatic void step();
+                for (int i = 0; i < 25000; i++) begin
+                    keep   = new;
+                    keep.v = n;
+                    n      = n + 1;
+                end
+            endfunction
+            initial begin
+                for (int s = 0; s < 48; s++) begin
+                    step();
+                    #1;
+                end
+                $display("%0d %0d", n, keep.v);
+            end
+        endmodule
+    )";
+    const rt_gc_stats          st  = run_stats(src, "1200000 1199999\n", cadence_ordinary, nursery_bytes_default);
+    CHECK(st.collections >= 8u);
+    CHECK(st.full_collections == 1u);
+    CHECK(st.young_collections == st.collections - 1u);
+    // What a collection retains is `keep` and at most a stale word of a frame, so the
+    // old generation is a few objects after a dozen of them.
+    CHECK(st.promoted <= 8u * st.collections);
+}
+
+// 300 objects of 64 KiB are kept, one per time step, in a queue in design state. The old
+// generation is as large as the live set, so the rule says full when it passes the 4 MiB
+// floor, at about 64 objects, and then each time it has doubled: 8 MiB, 16 MiB. Four
+// full collections including the first, and the bound has room for the one that the
+// collection before a threshold shifts. A rule that never takes one reports a single
+// full collection, and one that takes one at every collection reports about 300.
+TEST_CASE("gc: a growing live set takes a full collection each time the old generation doubles") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Big; int v; string tag; int pad[16384]; endclass
+            Big held[$];
+            int sum = 0;
+            initial begin
+                for (int i = 0; i < 300; i++) begin
+                    Big b;
+                    b     = new;
+                    b.v   = i;
+                    b.tag = "kept";
+                    held.push_back(b);
+                    #1;
+                end
+                for (int i = 0; i < held.size(); i++) sum = sum + held[i].v;
+                $display("%0d %0d", held.size(), sum);
+            end
+        endmodule
+    )";
+    const rt_gc_stats          st  = run_stats(src, "300 44850\n", cadence_ordinary);
+    CHECK(st.collections >= 250u);
+    CHECK(st.full_collections >= 3u);
+    CHECK(st.full_collections <= 6u);
+}
+
+// One object of 64 KiB is live at a time, in a handle in design state, and replaced at
+// every time step. A collection finds the current one reachable and promotes it, so each
+// is garbage in the old generation from the step after, which a young collection never
+// reclaims. The old generation passes the floor after about 64 collections and the full
+// collection that follows finalizes what it holds: the 44-character string is what gives
+// the class a finalizer, and `finalized` counts it for a collection only. A rule that
+// never takes a full collection after the first reports none finalized.
+TEST_CASE("gc: promoted garbage is reclaimed by the full collection its growth calls for") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Big; int v; string tag; int pad[16384]; endclass
+            Big cur;
+            initial begin
+                for (int i = 0; i < 300; i++) begin
+                    cur     = new;
+                    cur.v   = i;
+                    cur.tag = "an-old-record-with-a-heap-buffer-of-its-own";
+                    #1;
+                end
+                $display("%0d", cur.v);
+            end
+        endmodule
+    )";
+    const rt_gc_stats          st  = run_stats(src, "299\n", cadence_ordinary);
+    CHECK(st.collections >= 250u);
+    CHECK(st.full_collections >= 4u);
+    CHECK(st.finalized >= 200u);
+    CHECK(st.young_collections > st.full_collections);
 }
 
 // An object whose only root is an INTERFACE-class handle (LRM 8.26). The declared

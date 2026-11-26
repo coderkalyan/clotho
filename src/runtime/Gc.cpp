@@ -166,17 +166,20 @@ constexpr uint64_t kNurseryBytesFloor = RT_GC_BLOCK_BYTES;
 // makes dropping an entry sound. 2^20 entries is 8 MiB of vector.
 constexpr size_t kRememberedMax = 1u << 20;
 
-// The heap-growth rule that picks the kind when cfg.full_every is 0 (§7). A young
+// The growth rule that picks the kind when cfg.full_every is 0 (§7). A young
 // collection cannot reclaim old garbage, so old garbage grows monotonically between
-// full collections; capping the heap at kFullGrowthFactor times the live bytes the
-// LAST FULL collection measured bounds floating garbage at a constant factor of the
-// live set and amortises full-collection cost to O(live) per doubling -- the
-// growth-factor argument, and the shape of BDW's GC_free_space_divisor.
+// full collections; a full collection once the old generation holds kFullGrowthFactor
+// times the live bytes the LAST FULL collection measured bounds floating garbage at a
+// constant factor of the live set and amortises full-collection cost to O(live) per
+// doubling -- the growth-factor argument, and the shape of BDW's GC_free_space_divisor.
+// What is compared is what the old generation holds (GcState::old_bytes), never the
+// committed heap: the heap includes the blocks the young budget was allocated from,
+// so a design with a small live set would find every collection full.
 //
-// The floor is not a tuning knob but a correctness-of-policy fix: the first chunk is
-// committed before anything can be live, so twice the live bytes of a design holding
-// a handful of objects is less than the heap will ever be and every collection would
-// be full, which is exactly the non-generational collector this phase replaces.
+// The floor is what a design with a small live set runs on: a few objects promoted by
+// each young collection double a live set of a few objects at once, and every few
+// collections would be full. Below the floor the old generation is not worth a pass
+// over the whole heap.
 constexpr uint64_t kFullGrowthFactor = 2;
 constexpr uint64_t kFullGrowthFloor  = kChunkBytes;
 
@@ -388,9 +391,18 @@ struct GcState {
     // cleared only by a full collection actually completing.
     int32_t force_full = 0;
     // stats.bytes_live as the last FULL collection measured it -- the whole live set,
-    // which is the baseline the growth rule compares the heap against. A young
-    // collection's bytes_live is only what it visited, so it must not update this.
+    // which is the baseline the growth rule compares the old generation against. A
+    // young collection's bytes_live is only what it visited, so it must not update this.
     uint64_t live_after_full = 0;
+    // The bytes of every object that carries a mark: what the old generation holds,
+    // reachable or not. A collection adds each object it marks, and a full collection
+    // starts again from nothing, since it clears every mark first. Nothing sets or
+    // clears a mark between collections, so the heap walk of rt_gc_verify() finds
+    // exactly this many marked bytes at any time.
+    uint64_t old_bytes = 0;
+    // Of the objects the remembered set made a young collection trace again, the bytes:
+    // old already, so what that collection adds to bytes_live beyond them is promotion.
+    uint64_t retraced_bytes = 0;
 
     // -- Pressure and emergency collection (§6.1, §6.5) --
     //
@@ -2437,6 +2449,7 @@ void remember_object(void* handle) {
 void push_remembered_roots() {
     assert(g.kind == RT_GC_KIND_YOUNG || g.kind == RT_GC_KIND_FULL);
     assert(g.remembered.size() <= kRememberedMax && "the remembered set ran past its bound");
+    assert(g.stats.bytes_live == 0 && "the remembered set is the first root set a collection reads");
     for (void* h : g.remembered) {
         uint8_t* const m = meta_ptr(h);
         assert((*m & RT_GC_META_LOGGED) != 0 && "a remembered entry lost its LOGGED bit");
@@ -2456,6 +2469,8 @@ void push_remembered_roots() {
         // object, so nothing else queues it a second time.
         push_marked(h);
     }
+    // Nothing else has been counted yet, so this is what the entries added: not promotion.
+    g.retraced_bytes = g.stats.bytes_live;
     g.remembered.clear();
     assert(g.remembered.empty() && "the drain must leave the set empty");
 }
@@ -2957,9 +2972,8 @@ void rearm_after_collection() {
 // -- Collection policy (§7) ---------------------------------------------------
 
 // Committed heap bytes: whole chunks plus the mappings of large objects, those kept
-// for reuse included. Large objects belong in it because a young collection does not
-// reclaim an old one either, so a design whose garbage is all large objects would
-// otherwise never take a full collection.
+// for reuse included. What --gc-heap-max limits, and what the stats report; the choice
+// of a full collection does not read it, since the heap includes the young budget.
 uint64_t heap_bytes() {
     const uint64_t chunks = g.chunks.size() * kChunkBytes;
     const uint64_t bytes  = chunks + g.large_mapped;
@@ -2981,15 +2995,20 @@ uint64_t heap_bytes() {
 //      full paths ALTERNATE and a stress run exercises both at every safepoint. Stress is
 //      the strongest correctness mode and a mode that only ever ran one of the two paths
 //      would be the weaker for it.
-//   5. Otherwise heap growth: full once the heap has grown past kFullGrowthFactor times
-//      the live bytes the last FULL collection measured, floored at kFullGrowthFloor. A
-//      young collection cannot reclaim old garbage, so this is the only thing bounding
-//      floating garbage, and it bounds it at a constant factor of the live set. The same
-//      rule is applied to the buffers strings and containers own, which a young collection
-//      cannot free for an old dead object either: a design whose objects are small and
-//      whose strings are large would otherwise never take a full collection, however
-//      much of its memory was dead (§6.5). Reaching --gc-heap-max forces one too: it is
-//      the one situation a young collection can do nothing about at all.
+//   5. Otherwise growth of the old generation: full once what it holds has passed
+//      kFullGrowthFactor times what the last FULL collection left, floored at
+//      kFullGrowthFloor. A young collection cannot reclaim old garbage, so this is the
+//      only thing bounding floating garbage, and it bounds it at a constant factor of
+//      the live set. The old generation is the objects a collection has marked
+//      (GcState::old_bytes) and the buffers their strings and containers own, which a
+//      young collection cannot free for an old dead object either: a design whose
+//      objects are small and whose strings are large would otherwise never take a full
+//      collection, however much of its memory was dead (§6.5). The buffers are counted
+//      as the last collection left them (owned_after_gc), after its finalizers freed
+//      those of the young objects that died; g_owned.live now would hold the young
+//      budget too, and a design with a small live set would find every collection full.
+//      Reaching --gc-heap-max forces one as well: it is the one situation a young
+//      collection can do nothing about at all.
 uint32_t choose_kind() {
     assert(g.initialized != 0 && "the kind is chosen inside an initialized collector");
     assert(g.cfg.full_every >= 0 && "a negative full_every is a configuration bug");
@@ -3004,24 +3023,18 @@ uint32_t choose_kind() {
         const uint64_t n = static_cast<uint64_t>(every);
         return (g.stats.collections % n == 0) ? RT_GC_KIND_FULL : RT_GC_KIND_YOUNG;
     }
-    const uint64_t heap = heap_bytes();
     if (g.cfg.heap_bytes_max != 0 && !heap_may_grow(kChunkBytes)) {
         return RT_GC_KIND_FULL;
     }
     assert(g.live_after_full < (1ull << 62) && "an implausible live-bytes baseline");
-    uint64_t target = g.live_after_full * kFullGrowthFactor;
+    assert(g.owned_after_full < (1ull << 62) && "an implausible owned-bytes baseline");
+    assert(g.old_bytes < (1ull << 62) && "an implausible old-generation size");
+    assert(g.owned_after_gc < (1ull << 62) && "an implausible owned-bytes count");
+    uint64_t target = (g.live_after_full + g.owned_after_full) * kFullGrowthFactor;
     if (target < kFullGrowthFloor) {
         target = kFullGrowthFloor;
     }
-    if (heap > target) {
-        return RT_GC_KIND_FULL;
-    }
-    assert(g.owned_after_full < (1ull << 62) && "an implausible owned-bytes baseline");
-    uint64_t owned_target = g.owned_after_full * kFullGrowthFactor;
-    if (owned_target < kFullGrowthFloor) {
-        owned_target = kFullGrowthFloor;
-    }
-    return (g_owned.live > owned_target) ? RT_GC_KIND_FULL : RT_GC_KIND_YOUNG;
+    return (g.old_bytes + g.owned_after_gc > target) ? RT_GC_KIND_FULL : RT_GC_KIND_YOUNG;
 }
 
 // Every root set, then the mark fixpoint. Extracted from rt_gc_collect_kind so both
@@ -3077,6 +3090,9 @@ void account_collection(uint32_t reason, uint32_t kind) {
         // Only a full collection may write either of these: it is the only one that has
         // measured the WHOLE live set.
         g.live_after_full = g.stats.bytes_live;
+        // The old generation is what survived: every mark was cleared before this
+        // collection, so each object it marked is counted once.
+        g.old_bytes = g.stats.bytes_live;
         // The owned-buffer half of the same baseline. Read at the end of the collection,
         // after the finalizers have freed what the dead objects owned, so it is what the
         // live set holds.
@@ -3084,6 +3100,10 @@ void account_collection(uint32_t reason, uint32_t kind) {
         g.force_full      = 0;
     } else {
         g.stats.young_collections += 1;
+        // What a young collection marks is promoted, and what it traced again from the
+        // remembered set was old already.
+        assert(g.stats.bytes_live >= g.retraced_bytes && "a retraced object is counted live");
+        g.old_bytes += g.stats.bytes_live - g.retraced_bytes;
     }
     assert(g.stats.young_collections + g.stats.full_collections == g.stats.collections &&
            "every collection is either young or full");
@@ -3387,6 +3407,11 @@ void verify_totals(const VerifyTally& tally) {
     assert((exact ? tally.marked_bytes == g.stats.bytes_live
                   : tally.marked_bytes >= g.stats.bytes_live) &&
            "the heap walk disagrees on live bytes");
+    // The old generation's size, which the choice of a full collection reads, is the bytes
+    // of the marked objects the walk finds: exact after every collection and until the
+    // next, since a mark is set by marking and cleared by a full collection and by nothing
+    // else.
+    assert(tally.marked_bytes == g.old_bytes && "the old-generation size disagrees with the walk");
     // The remembered set holds EXACTLY the objects carrying LOGGED, and both directions
     // matter: an object logged but not recorded is an old-to-young edge the next young
     // collection will not trace, and a recorded object whose bit was cleared is a barrier
@@ -3512,6 +3537,8 @@ extern "C" void rt_gc_init(const rt_gc_config* cfg) {
     g.kind            = RT_GC_KIND_FULL;
     g.force_full      = 0;
     g.live_after_full = 0;
+    g.old_bytes       = 0;
+    g.retraced_bytes  = 0;
     // The owned-buffer side of the same fresh start (§6.5), and the emergency threshold the
     // budget implies. Zeroing the count is what makes the clamp in buffer_free matter: a
     // string a previous run left in a runtime global is freed by this one against it.

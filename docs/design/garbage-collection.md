@@ -562,9 +562,9 @@ Large objects follow the same rule. A dead one's mapping is kept, by object size
 and the next object of that size is put in it with nothing mapped; a full
 collection returns, of each size, the mappings beyond the number of objects of
 that size allocated since the last collection. A kept mapping still counts as
-heap, toward the growth that brings a full collection on and against
-`--gc-heap-max`, and the heap gives all of them back before it reports that the
-ceiling or the system has no room.
+heap against `--gc-heap-max`, and the heap gives all of them back before it reports that the
+ceiling or the system has no room. It is not in the old generation, so it does not
+bring a full collection on.
 
 ### 4.3 The allocation fast path
 
@@ -887,8 +887,10 @@ buffer, every free site credits the size it allocated (so the count is exact: it
 zero after a run that frees what it allocates, asserted in `gc_test`), and growth of
 the count by a budget since the last collection raises the request flag, by
 `kEmergencyFactor` budgets makes the next `new` take the slow path where the emergency
-collection runs. The kind policy applies its heap-growth rule to owned bytes too,
-otherwise a young collection never frees an old dead object's strings. An associative
+collection runs. The kind policy compares the old generation, the objects a collection
+has marked and the buffers owned as the last collection left them, with its size at the
+last full collection; otherwise a young collection never frees an old dead object's
+strings. An associative
 array's key strings and hash buckets use `std::allocator` and are not counted.
 
 ### 6.2 Under MT: a rendezvous the scheduler already needs
