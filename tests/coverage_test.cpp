@@ -1518,3 +1518,80 @@ TEST_CASE("wait and @ on a covergroup-handle class property wake when it is assi
         endmodule
     )") == "wait 5\nat 10\ndone 15\n");
 }
+
+// LRM 19.7.1, 19.10: type_option is a static member of the covergroup, each coverpoint and each
+// cross; weight, goal and comment "can be assigned procedurally at any time during simulation".
+// Reads see the definition's value (Table 19-3 defaults: 1, 100, ""). A coverpoint's own
+// type_option is separate from the covergroup's (Table 19-4: no defaulting downward).
+// No oracle: iverilog has no functional coverage; the lines apply the clauses.
+TEST_CASE("type_option weight, goal and comment read and assign procedurally (LRM 19.7.1)") {
+    CHECK(run_capture(R"(
+        module t;
+          bit [1:0] x;
+          covergroup cg;
+            type_option.goal = 90;
+            a: coverpoint x { type_option.comment = "pt"; }
+            b: coverpoint x;
+          endgroup
+          cg h = new;
+          initial begin
+            $display("def w=%0d g=%0d c=[%s] a: w=%0d g=%0d c=[%s]", cg::type_option.weight,
+                     cg::type_option.goal, cg::type_option.comment, cg::a::type_option.weight,
+                     cg::a::type_option.goal, cg::a::type_option.comment);
+            cg::type_option.weight = 3;
+            cg::type_option.goal = 80;
+            cg::type_option.comment = "hi";
+            cg::a::type_option.weight = 5;
+            cg::b::type_option.goal = 70;
+            $display("set w=%0d g=%0d c=[%s] a.w=%0d b.g=%0d b.w=%0d", cg::type_option.weight,
+                     cg::type_option.goal, cg::type_option.comment, cg::a::type_option.weight,
+                     cg::b::type_option.goal, cg::b::type_option.weight);
+            h.type_option.weight = 4;
+            $display("via handle w=%0d", h.type_option.weight);
+          end
+        endmodule
+    )") == "def w=1 g=90 c=[] a: w=1 g=100 c=[pt]\n"
+           "set w=3 g=80 c=[hi] a.w=5 b.g=70 b.w=1\n"
+           "via handle w=4\n");
+}
+
+// The type weight is the covergroup's weight in $get_coverage (19.11.3): it is read when the
+// number is computed, so an assignment during the run changes it. Weight 0 leaves the type out.
+TEST_CASE("assigning type_option.weight changes $get_coverage (LRM 19.7.1, 19.11.3)") {
+    CHECK(run_capture(R"(
+        module t;
+          bit a = 0;
+          covergroup ga; coverpoint a { bins a0 = {0}; } endgroup
+          covergroup gb; coverpoint a { bins b0 = {0}; bins b1 = {1}; } endgroup
+          ga x = new;
+          gb y = new;
+          initial begin
+            x.sample(); y.sample();
+            $display("%0f", $get_coverage());
+            gb::type_option.weight = 3;
+            $display("%0f", $get_coverage());
+            gb::type_option.weight = 0;
+            $display("%0f", $get_coverage());
+          end
+        endmodule
+    )") == "75.000000\n62.500000\n100.000000\n");
+}
+
+// 19.7.1: strobe and real_interval can only be set in the definition. merge_instances and
+// distribute_first have no implementation yet (docs/TODO.md), so assigning them is refused.
+TEST_CASE("type_option strobe and real_interval cannot be assigned procedurally (LRM 19.7.1)") {
+    CHECK(lower_error(R"(
+        module t;
+          bit x;
+          covergroup cg; coverpoint x; endgroup
+          initial cg::type_option.strobe = 1;
+        endmodule
+    )").find("cannot be modified outside of the covergroup definition") != std::string::npos);
+    CHECK(lower_error(R"(
+        module t;
+          bit x;
+          covergroup cg; coverpoint x; endgroup
+          initial cg::type_option.merge_instances = 1;
+        endmodule
+    )").find("type_option.merge_instances' is not supported") != std::string::npos);
+}

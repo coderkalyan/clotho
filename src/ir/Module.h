@@ -888,6 +888,9 @@ struct CoverPoint {
     // coverage report: empty when unset.
     std::string inst_comment;
     std::string type_comment;
+    // type_option.weight and type_option.goal of the coverpoint (LRM 19.7.1).
+    uint32_t type_weight = 1;
+    uint32_t type_goal   = 100;
 
     bool operator==(const CoverPoint&) const = default;
 };
@@ -914,6 +917,8 @@ struct CoverType {
     // option.comment and type_option.comment of the covergroup, shown in the report.
     std::string inst_comment;
     std::string type_comment;
+    // type_option.goal (LRM 19.7.1).
+    uint32_t type_goal = 100;
 
     bool operator==(const CoverType&) const = default;
 };

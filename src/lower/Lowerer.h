@@ -6001,6 +6001,7 @@ private:
     struct CoverOpts {
         uint32_t                   weight         = 1;
         uint32_t                   type_weight    = 1;
+        uint32_t                   type_goal      = 100;
         uint32_t                   goal           = 100;
         uint32_t                   at_least       = 1;
         uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default
