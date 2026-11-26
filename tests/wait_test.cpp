@@ -282,27 +282,21 @@ TEST_CASE("wait on a property of an assoc-array element resumes when it changes"
     CHECK(run_capture_finish(src) == "woke 1\n");
 }
 
-// A property whose type carries neither an old -> new WORD to classify nor a
-// mutation surface gets no notifier, so there is nothing to park on. It must be
-// REFUSED: lowering it anyway is what produced the silent permanent park this
-// whole feature exists to remove. `wait(0)` is unaffected -- it reads no property
-// at all and keeps the documented LRM 9.4.3 behaviour (the case above).
-//
-// An unpacked struct is what is left after the scalar rung: comparing one needs a
-// walk over its leaves, not a word compare, which is a different mechanism.
-TEST_CASE("wait on a class property with no change notifier fails loudly") {
-    const std::string err = lower_error(R"(
+// An unpacked struct property is one variable: a store to any member wakes a `wait`
+// in a method (refused on main: "no change notifier"). LRM-derived; no oracle parses it.
+TEST_CASE("wait on an unpacked-struct class property in a method") {
+    const std::string out = run_capture_finish(R"(
         module m;
             typedef struct { int a; int b; } pair_t;
             class C;
                 pair_t p;
-                task w(); wait(p.a == 1); $display("x"); endtask
+                task w(); wait(p.a == 1); $display("x %0t", $time); endtask
             endclass
             C c;
-            initial begin c = new; c.w(); end
+            initial begin c = new; fork c.w(); join_none #1 c.p.b = 3; #1 c.p.a = 1; #1 $finish; end
         endmodule
     )");
-    CHECK(err.find("no change notifier") != std::string::npos);
+    CHECK(out.find("x 2") != std::string::npos);
 }
 
 // -- wait on a CONTAINER class property (LRM 9.4.3) --------------------------
@@ -637,21 +631,20 @@ TEST_CASE("an event control on a container class property detects a change of th
     CHECK(run_capture_finish(src) == "size 2\n");
 }
 
-// A FIXED unpacked array is not in the notified set: its extent never changes, so
-// it has no mutation op, and the element store that would have to fire the
-// notifier descends through agg_member, which clears it. Refused, not hung.
-TEST_CASE("wait on a fixed unpacked-array class property fails loudly") {
-    const std::string err = lower_error(R"(
+// A fixed unpacked array property: an element store fires the property's notifier
+// (refused on main).
+TEST_CASE("wait on a fixed unpacked-array class property in a method") {
+    const std::string out = run_capture_finish(R"(
         module m;
             class C;
                 int a[4];
-                task w(); wait(a[0] == 1); $display("x"); endtask
+                task w(); wait(a[0] == 1); $display("x %0t", $time); endtask
             endclass
             C c;
-            initial begin c = new; c.w(); end
+            initial begin c = new; fork c.w(); join_none #1 c.a[0] = 1; #1 $finish; end
         endmodule
     )");
-    CHECK(err.find("no change notifier") != std::string::npos);
+    CHECK(out.find("x 1") != std::string::npos);
 }
 
 // -- wait on a SCALAR class property (LRM 9.4.3) -----------------------------
@@ -1316,4 +1309,30 @@ TEST_CASE("a write through a ref to a container element wakes its waiter at the 
     CHECK(out.find("d 3\n") != std::string::npos);
     CHECK(out.find("s 4\n") != std::string::npos);
     CHECK(out.find("n 5\n") != std::string::npos);
+}
+
+// `wait` over a struct or fixed-array class property wakes on a store to any leaf, a whole
+// copy, a string member and a container member (LRM 9.4.3). LRM-derived; no oracle parses it.
+TEST_CASE("wait on aggregate class properties") {
+    const std::string out = run_capture_finish(R"(
+        typedef struct { int f; string t; int q[$]; } s_t;
+        class C; s_t s; int a[3]; task w(); wait (s.f == 9) $display("m %0t", $time); endtask endclass
+        module top;
+          C obj = new, o2 = new;
+          initial begin wait (obj.s.f == 5) $display("a %0t", $time); end
+          initial begin wait (obj.a[2] == 7) $display("b %0t", $time); end
+          initial begin wait (obj.s.t == "hi") $display("c %0t", $time); end
+          initial begin wait (obj.s.q.size() == 2) $display("d %0t", $time); end
+          initial obj.w();
+          initial begin
+            #1 obj.s.f = 5; #1 obj.a[2] = 7; #1 obj.s.t = "hi";
+            #1 obj.s.q.push_back(1); obj.s.q.push_back(2); o2.s.f = 9; #1 obj.s = o2.s; #1 $finish;
+          end
+        endmodule
+    )");
+    CHECK(out.find("a 1") != std::string::npos);
+    CHECK(out.find("b 2") != std::string::npos);
+    CHECK(out.find("c 3") != std::string::npos);
+    CHECK(out.find("d 4") != std::string::npos);
+    CHECK(out.find("m 5") != std::string::npos);
 }

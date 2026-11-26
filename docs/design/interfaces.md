@@ -250,16 +250,20 @@ and a different `ctx_ty`, and would otherwise GEP the wrong layout off the recor
 `def_relative_for` now gates on `owner.anchor == ctx_override_anchor_`, which turns
 the hazard into a compile-time invariant.
 
-**An event control on an EXPRESSION over members** (`@(vif.a & vif.b)`) is
-desugared rather than synthesized into a net: sample the expression, park on each
-member the way `wait` already does, re-evaluate, loop until it changes. A
-continuous net would read the handle before it was assigned and freeze onto
-whichever instance was bound at time zero.
+**An event control on an EXPRESSION over members** (`@(vif.a & vif.b)`) is desugared rather
+than synthesized into a net: sample the expression, park on each member the way `wait`
+already does, re-evaluate, loop until it changes. A continuous net would read the handle
+before it was assigned and freeze onto whichever instance was bound at time zero.
 
-An `edge` or an `iff` qualifier on such an expression (`@(posedge (vif.a &
-vif.b))`, LRM 9.4.2 takes the edge of the LSB) stays guarded loud: the change form
-is the one that occurs, and the qualifier would need the sample compared bit-wise
-rather than for inequality.
+An `edge` or an `iff` qualifier on such an expression (`@(posedge (vif.a & vif.b))`, LRM
+9.4.2 takes the edge of the LSB) compares the sample bit-wise for the edge instead of for
+inequality, and evaluates `iff` when the expression changes. The same loop serves an event
+list made only of such terms (`@(vif.a & vif.b or obj.s.f)`, `@(posedge (vif.a & vif.b) iff
+vif.en or vif.c)`): every term is sampled, the loop parks on everything they read, and each
+wake tests every term (LRM_NOTES 58). A list that also holds a signal or an event is refused.
+A process's sensitivity list over members (`always @(posedge vif.clk or negedge vif.rst_n)`)
+stays in the body as a wait on each member. The same member read through two handles is two
+parks, one in each instance. A null handle in a term is the 25.9 fatal at the wait.
 
 **A member of an interface the design never instantiates.** The handle can only
 ever be null, so the access is an unconditional run-time fatal, and the compiler

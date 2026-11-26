@@ -80,6 +80,16 @@ void Lowerer::guard_container_element(const slang::ast::Type& et, ir::Ref er, st
     if (et.isClass() || et.isCHandle()) {
         return;
     }
+    // A virtual interface handle (LRM 25.9) is the same plain 64-bit word: the
+    // address of one elaborated instance's context record, which lives for the
+    // whole run, so an element needs no lifecycle beyond the POD copy, `null` is
+    // the all-zero power-on default Table 7-1 asks for, and `==` is the word
+    // compare. lower_type gives it Kind::VirtualIface, whose layout is the
+    // handle shape, and types::is_object_handle lists only Class and Event, so
+    // the collector never traces one -- it did not allocate the record.
+    if (et.isVirtualInterface()) {
+        return;
+    }
     // An unpacked struct / union or fixed unpacked array element: the slot holds
     // the recursive storage image and `q[i]` is a heap-anchored aggregate lvalue
     // (dyn_agg_elem_lvalue), so member / element selects and whole-element copies
@@ -1348,8 +1358,7 @@ void Lowerer::collect_scope_signals(
                             // TODO: rise/fall/turn-off net delay
                             // (`wire #(a,b,c) w;`), LRM 28.16 — same gap as
                             // the continuous-assign / gate delay triple.
-                            fail("net delay rise/fall/turn-off triples (wire #(a,b,c)) are "
-                                 "not supported");
+                            fail(std::string(kNetDelayTriple));
                         }
                         if (is_aggregate(vs.getType()) || vs.getType().getCanonicalType().isUnpackedArray()) {
                             // TODO: net delay on an unpacked array or aggregate
@@ -1405,7 +1414,7 @@ void Lowerer::collect_scope_signals(
                     // WireRes, so a delayed wand/wor net still resolves by
                     // value instead of by the wrong reducer.
                     if (nsym.getDelay() != nullptr && nsym.getInitializer() == nullptr) {
-                        net_delay_[static_cast<uint32_t>(sig)] = single_delay_expr(*nsym.getDelay());
+                        net_delay_[static_cast<uint32_t>(sig)] = net_delay_of(nsym);
                         if (resolved_nets_.insert(static_cast<uint32_t>(sig)).second) {
                             net_resolve_op_[static_cast<uint32_t>(sig)] = net_resolve_tag(nk);
                         }

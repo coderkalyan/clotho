@@ -290,7 +290,16 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
         rand.props.clear();
     }
     uint32_t block = idx;
-    if (!rand.props.empty()) {
+    // A class owns the generator when it has a rand property, or when something can call
+    // randomize / srandom / get_randstate / set_randstate on it or on a base of it (a
+    // base-typed handle may hold this class's object); see RngClasses.
+    bool owns_rng = !rand.props.empty();
+    if (rng_classes_ != nullptr) {
+        for (const slang::ast::ClassType* k : chain) {
+            owns_rng = owns_rng || rng_classes_->marked.contains(k);
+        }
+    }
+    if (owns_rng) {
         rand.present    = true;
         rand.rng_field  = block++;
         rand.mode_field = block++;
@@ -1287,8 +1296,8 @@ void Lowerer::emit_class_property_inits(const slang::ast::ClassType& clt,
         const Expression* init = prop.getInitializer();
         if (init == nullptr) {
             // A struct-typed property with no initializer of its own still takes
-            // the field-level defaults its struct type declares (LRM 7.2.1), as a
-            // variable of the type does.
+            // the field-level defaults its struct type declares (LRM 7.2.2), as a
+            // variable of the type does (7.2.2 does not mention class properties).
             if (aggregate_has_field_defaults(prop.getType())) {
                 const ir::SourceLoc pl = to_source_loc(prop.location);
                 emit_field_defaults(class_member_lvalue(handle, prop, class_ref, b, pl), prop.getType(), b, pl);

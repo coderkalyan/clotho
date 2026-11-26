@@ -1827,8 +1827,10 @@ ir::FunctionId Lowerer::build_action_body(const Statement&        body,
         failure = e;
     }
     const ir::SourceLoc el = loc(body);
-    // The action block of an `expect` is part of the statement (LRM 16.17 [unverified wording]):
-    // the process blocked on it resumes when the block has finished, which may be after the block
+    // The action block of an `expect` is part of the statement (LRM 16.17, Syntax 16-20:
+    // `expect ( property_spec ) action_block`), and the clause does not say what a block that suspends
+    // does to the statement after it, so that statement waits for the block as it does for any
+    // statement: the process resumes when the block has finished, which may be after the block
     // suspended, so the block wakes the waiters at its end rather than the monitor at the verdict.
     if (expect_monitor.has_value()) {
         b.expect_wake(true_const(b, el), *expect_monitor, el);

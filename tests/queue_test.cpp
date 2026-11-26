@@ -331,7 +331,7 @@ TEST_CASE("a queue element select has no remainder in its address") {
     CHECK(ir.find("udiv") == std::string::npos);
 }
 
-// A bounded queue `q[$:N]` holds at most N+1 elements (LRM 7.10.4). A push onto
+// A bounded queue `q[$:N]` holds at most N+1 elements (LRM 7.10.1, 7.10.5). A push onto
 // a full queue keeps the first N+1 elements: push_back drops the just-pushed
 // element, push_front drops the old tail. Oracle-matched vs iverilog.
 TEST_CASE("queue bounded push drops excess") {
@@ -782,7 +782,7 @@ TEST_CASE("queue declaration initializer from a fixed-size array or a dynamic ar
                               "dynarr s=4 4 7\n");
 }
 
-// A queue slice `q[a:b]` (LRM 7.10.4) yields a new queue. Bounds clamp to
+// A queue slice `q[a:b]` (LRM 7.10.1) yields a new queue. Bounds clamp to
 // [0, size-1]; a>b is empty. A self-slice `q = q[a:b]` is alias-safe. Verified
 // against verilator.
 TEST_CASE("queue slice") {
@@ -859,8 +859,9 @@ TEST_CASE("queue $ slice bound and empty-literal clear") {
           "emptysrc s=0\n");
 }
 
-// Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 11.5.1, extended to
-// queues by 7.10.4). Unlike a fixed/packed array, a queue's width `n` need
+// Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 7.4.5 and 7.4.6 give a
+// slice `A[i+:c]` a constant width `c`; 7.10.1 lets a queue slice's bounds be
+// non-constant). Unlike a fixed/packed array, a queue's width `n` need
 // not be a compile-time constant. Both bounds clamp against the queue's
 // actual length exactly like the `a:b` form (`queue slice`, above), and the
 // base index may itself spell `$` (the last valid index). No iverilog
@@ -907,7 +908,7 @@ TEST_CASE("queue indexed part-select slice") {
 }
 
 // A bounded queue built from a too-long concatenation keeps the first N+1
-// elements (LRM 7.10.4). No verilator oracle (it miscompiles bounded-queue
+// elements (LRM 10.10, 7.10.5). No verilator oracle (it miscompiles bounded-queue
 // concat); hand-checked against the LRM.
 TEST_CASE("queue slice/concat into a bounded queue drops the tail") {
     constexpr std::string_view src = R"(
@@ -2888,4 +2889,53 @@ TEST_CASE("a ref formal bound to a bounded queue class property enforces the pro
     const Captured r = run_capture_both(src);
     CHECK(r.out == "3 4\n");
     CHECK(count_of_text(r.err, "warning: bounded queue") == 1);
+}
+
+// A queue slice `q[a:b]` read as a value (LRM 7.10.1): an x or z bit in either bound yields the
+// empty queue, and a bound compares by its own signedness and width (11.8.3), so an unsigned
+// `bit [7:0]` holding 200 is 200 (b > $ is `q[a:$]`), not -56, and a `byte` holding -2 is below 0
+// (`q[a:b]` with a < 0 is `q[0:b]`). The indexed forms follow from 11.5.1. iverilog 13 gets the
+// first two wrong (an x bound gives 4 elements, the unsigned bound 0), so the cases are derived
+// from the clauses.
+TEST_CASE("queue slice read: x/z bound is empty and a bound keeps its own signedness") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$] = '{0, 1, 2, 3, 4, 5, 6, 7};
+            int r[$];
+            integer xi = 'x, zi = 'z;
+            bit [7:0] two = 2, u = 200;
+            byte sb = -2;
+            bit [99:0] wbig = 100'd1 << 80;
+            task automatic show;
+                foreach (r[i]) $write("%0d ", r[i]);
+                $display("n=%0d", r.size());
+            endtask
+            initial begin
+                r = q[xi:3];      show;
+                r = q[3:zi];      show;
+                r = q[xi +: 2];   show;
+                r = q[1 +: xi];   show;
+                r = q[two:u];     show;
+                r = q[sb:1];      show;
+                r = q[u:two];     show;
+                r = q[1 +: two];  show;
+                r = q[u -: two];  show;
+                r = q[two:wbig];  show;
+                r = q[wbig:$];    show;
+                r = {q[xi:3], 9}; show;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=0\n"
+                              "n=0\n"
+                              "n=0\n"
+                              "n=0\n"
+                              "2 3 4 5 6 7 n=6\n"
+                              "0 1 n=2\n"
+                              "n=0\n"
+                              "1 2 n=2\n"
+                              "n=0\n"
+                              "2 3 4 5 6 7 n=6\n"
+                              "n=0\n"
+                              "9 n=1\n");
 }

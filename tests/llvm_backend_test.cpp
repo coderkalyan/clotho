@@ -2461,7 +2461,7 @@ TEST_CASE("unsplit emission verifies the code instances share against root's for
 // instance that shares it, into scratch modules, and must leave nothing behind:
 // the emitted modules and the run are the same with it on and off. The design
 // has what the lowering registers or names besides code: nonblocking blocks, an
-// array and a struct (types made at each use), a string constant, a function
+// array and a struct, a string constant, a function
 // copy and a name per instance (which keep their groups per instance).
 TEST_CASE("verifying shared code changes nothing in the emitted modules or the run") {
     constexpr std::string_view src = R"(
@@ -3608,6 +3608,15 @@ void write_file(const char* path, std::string_view text) {
     std::fclose(f);
 }
 
+// `source` with every `token` replaced by `path`: the file a test wrote, named in the
+// design that reads it.
+std::string with_path(std::string source, std::string_view token, std::string_view path) {
+    for (size_t at = source.find(token); at != std::string::npos; at = source.find(token, at + path.size())) {
+        source.replace(at, token.size(), path);
+    }
+    return source;
+}
+
 // $readmemh fills the memory from the file, honoring @address jumps and skipping
 // // and /* */ comments; untouched words keep their X startup value (LRM §21.4).
 // Cross-checked against Icarus Verilog.
@@ -3828,6 +3837,2291 @@ TEST_CASE("$readmemh default fill honors a descending declared range") {
     )";
     CHECK(run_capture(src) == "xx c3 0f f0\n");
     std::remove(path);
+}
+
+// A memory of several unpacked dimensions is filled row-major, each dimension from its
+// lowest address to its highest, whichever way its range is declared (LRM 21.4.3).
+// Oracle: iverilog 13, which agrees for a load that names no address. A load that took
+// the highest dimension's bounds for the whole memory filled 3 of the 12 words of `a`.
+TEST_CASE("$readmemh fills a whole multi-dimensional memory row-major") {
+    const char* path = "clotho_readmem_md_test.hex";
+    write_file(path, "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:2][0:3];
+            logic [7:0] d [2:0][3:0];
+            logic [7:0] x [0:1][1:0][0:2];
+            integer i, j;
+            initial begin
+                $readmemh(")") + path + R"(", a);
+                $readmemh(")" + path + R"(", d);
+                $readmemh(")" + path + R"(", x);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h | %h %h %h %h", a[i][0], a[i][1], a[i][2], a[i][3],
+                             d[i][0], d[i][1], d[i][2], d[i][3]);
+                for (i = 0; i < 2; i = i + 1)
+                    for (j = 0; j < 2; j = j + 1)
+                        $display("%h %h %h", x[i][j][0], x[i][j][1], x[i][j][2]);
+                // The last word of every dimension, declared high to low.
+                $display("%h %h", d[2][3], x[1][0][2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "01 02 03 04 | 01 02 03 04\n"
+                              "05 06 07 08 | 05 06 07 08\n"
+                              "09 0a 0b 0c | 09 0a 0b 0c\n"
+                              "01 02 03\n"
+                              "04 05 06\n"
+                              "07 08 09\n"
+                              "0a 0b 0c\n"
+                              "0c 09\n");
+    std::remove(path);
+}
+
+// The same fill for the other element kinds: 4-state values with x and z, a 2-state
+// memory (x and z read as 0, LRM 21.4.2) and elements wider than 64 bits. Oracle:
+// iverilog 13.
+TEST_CASE("$readmem fills a multi-dimensional 4-state, 2-state and wide memory") {
+    const char* bin  = "clotho_readmem_mdb_test.bin";
+    const char* hex2 = "clotho_readmem_md2_test.hex";
+    const char* hexw = "clotho_readmem_mdw_test.hex";
+    write_file(bin, "01x1 zzzz 1010\n0000 1111 xxxx\n");
+    write_file(hex2, "ff a5 zz 3x\n");
+    write_file(hexw,
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n"
+               "0123456789abcdef0123456789abcdef\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [3:0]   f [0:1][0:2];
+            bit   [7:0]   g [1:0][0:1];
+            logic [127:0] w [0:1][1:0];
+            integer i, j;
+            initial begin
+                $readmemb(")") + bin + R"(", f);
+                $readmemh(")" + hex2 + R"(", g);
+                $readmemh(")" + hexw + R"(", w);
+                for (i = 0; i < 2; i = i + 1)
+                    $display("%b %b %b", f[i][0], f[i][1], f[i][2]);
+                for (i = 0; i < 2; i = i + 1)
+                    $display("%h %h", g[i][0], g[i][1]);
+                for (i = 0; i < 2; i = i + 1)
+                    for (j = 0; j < 2; j = j + 1)
+                        $display("%h_%h", w[i][j][127:64], w[i][j][63:0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "01x1 zzzz 1010\n"
+                              "0000 1111 xxxx\n"
+                              "ff a5\n"
+                              "00 30\n"
+                              "deadbeefcafebabe_0123456789abcdef\n"
+                              "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                              "0000000000000000_0000000000000042\n"
+                              "0123456789abcdef_0123456789abcdef\n");
+    std::remove(bin);
+    std::remove(hex2);
+    std::remove(hexw);
+}
+
+// $fread fills a whole multi-dimensional memory the same way, byte by byte MSB-first
+// per leaf, and a short file leaves the rest alone. Oracle: iverilog 13.
+TEST_CASE("$fread fills a whole multi-dimensional memory row-major") {
+    const char* path7 = "clotho_fread_md7_test.bin";
+    const char* path8 = "clotho_fread_md8_test.bin";
+    const char* path4 = "clotho_fread_md4_test.bin";
+    write_file(path7, std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    write_file(path8, std::string("\x01\x02\x03\x04\x05\x06\x07\x08", 8));
+    write_file(path4, std::string("\x11\x22\x33\x44", 4));
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0]  r [0:1][0:2];
+            logic [7:0]  q [1:0][2:0];
+            bit   [15:0] h [0:1][1:0];
+            logic [7:0]  s [0:1][0:2];
+            integer fd, rc;
+            initial begin
+                fd = $fopen(")") + path7 + R"(", "rb");
+                rc = $fread(r, fd);
+                $display("rc=%0d %h %h %h %h %h %h", rc, r[0][0], r[0][1], r[0][2], r[1][0], r[1][1], r[1][2]);
+                $fclose(fd);
+                fd = $fopen(")" + path7 + R"(", "rb");
+                rc = $fread(q, fd);
+                $display("rc=%0d %h %h %h %h %h %h", rc, q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2]);
+                $fclose(fd);
+                fd = $fopen(")" + path8 + R"(", "rb");
+                rc = $fread(h, fd);
+                $display("rc=%0d %h %h %h %h", rc, h[0][0], h[0][1], h[1][0], h[1][1]);
+                $fclose(fd);
+                fd = $fopen(")" + path4 + R"(", "rb");
+                rc = $fread(s, fd);
+                $display("rc=%0d %h %h %h %h %h %h", rc, s[0][0], s[0][1], s[0][2], s[1][0], s[1][1], s[1][2]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=6 11 22 33 44 55 66\n"
+                              "rc=6 11 22 33 44 55 66\n"
+                              "rc=8 0102 0304 0506 0708\n"
+                              "rc=4 11 22 33 44 xx xx\n");
+    std::remove(path7);
+    std::remove(path8);
+    std::remove(path4);
+}
+
+// An address in a data file names a word of the memory's highest dimension, and the
+// words below it follow in order (LRM 21.4.3: "Address entries in the file exclusively
+// address the highest dimension's words"). A word the file leaves unfinished keeps its
+// other leaves. LRM-derived: iverilog 13 reads `@1` as the flat leaf 1.
+TEST_CASE("a data file address names a word of the highest dimension") {
+    const char* path_a = "clotho_readmem_mda_test.hex";
+    const char* path_b = "clotho_readmem_mdb2_test.hex";
+    write_file(path_a, "@1 a1 a2 a3 a4\n@0 b1 b2\n");
+    write_file(path_b, "@1 a1 a2 a3 a4 a5 a6\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:2][0:3];
+            logic [7:0] b [0:2][0:3];
+            integer i;
+            initial begin
+                $readmemh(")") + path_a + R"(", a);
+                $readmemh(")" + path_b + R"(", b);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", a[i][0], a[i][1], a[i][2], a[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", b[i][0], b[i][1], b[i][2], b[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "b1 b2 xx xx\n"
+                              "a1 a2 a3 a4\n"
+                              "xx xx xx xx\n"
+                              "xx xx xx xx\n"
+                              "a1 a2 a3 a4\n"
+                              "a5 a6 xx xx\n");
+    std::remove(path_a);
+    std::remove(path_b);
+}
+
+// start and finish name words of the highest dimension, a finish below the start loads
+// downward, and the data runs on into the next word (LRM 21.4, 21.4.3). `d` declares
+// the highest dimension high to low. LRM-derived: iverilog 13 takes them as flat leaf
+// addresses.
+TEST_CASE("$readmem start and finish name words of the highest dimension") {
+    const char* path = "clotho_readmem_mds_test.hex";
+    write_file(path, "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3];
+            logic [7:0] m2 [0:2][0:3];
+            logic [7:0] m3 [0:2][0:3];
+            logic [7:0] d  [2:0][0:3];
+            integer i;
+            initial begin
+                $readmemh(")") + path + R"(", m1, 1);
+                $readmemh(")" + path + R"(", m2, 2, 1);
+                $readmemh(")" + path + R"(", m3, 1, 1);
+                $readmemh(")" + path + R"(", d, 1, 2);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m1[i][0], m1[i][1], m1[i][2], m1[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m2[i][0], m2[i][1], m2[i][2], m2[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m3[i][0], m3[i][1], m3[i][2], m3[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", d[i][0], d[i][1], d[i][2], d[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx xx\n01 02 03 04\n05 06 07 08\n"
+                              "xx xx xx xx\n05 06 07 08\n01 02 03 04\n"
+                              "xx xx xx xx\n01 02 03 04\nxx xx xx xx\n"
+                              "xx xx xx xx\n01 02 03 04\n05 06 07 08\n");
+    std::remove(path);
+}
+
+// $fread's start is a word of the highest dimension and its count a number of those
+// words (LRM 21.3.4.4, 21.4.3); a file that ends inside a word leaves the word's other
+// leaves alone. LRM-derived: iverilog 13 takes both in leaves.
+TEST_CASE("$fread start and count are words of the highest dimension") {
+    const char* path = "clotho_fread_mds_test.bin";
+    write_file(path, std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3];
+            logic [7:0] m2 [0:2][0:3];
+            logic [7:0] m3 [0:2][0:3];
+            logic [7:0] d  [2:0][0:3];
+            integer fd, rc, i;
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                rc = $fread(m1, fd, 1, 1);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(m2, fd, 2);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(m3, fd, 0, 2);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(d, fd, 1);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m1[i][0], m1[i][1], m1[i][2], m1[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m2[i][0], m2[i][1], m2[i][2], m2[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", m3[i][0], m3[i][1], m3[i][2], m3[i][3]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h %h %h %h", d[i][0], d[i][1], d[i][2], d[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=4\nrc=4\nrc=7\nrc=7\n"
+                              "xx xx xx xx\n11 22 33 44\nxx xx xx xx\n"
+                              "xx xx xx xx\nxx xx xx xx\n11 22 33 44\n"
+                              "11 22 33 44\n55 66 77 xx\nxx xx xx xx\n"
+                              "xx xx xx xx\n11 22 33 44\n55 66 77 xx\n");
+    std::remove(path);
+}
+
+// A slice of a memory is the array a load fills, and start, finish and @ addresses are
+// in the slice's own bounds (LRM 21.4: "any start_addr and finish_addr arguments shall
+// fall within the bounds of the slice's range"). The default start is the slice's
+// lowest address, so a descending `d[5:2]` fills upward too. iverilog 13 takes no
+// slice here ("Array cannot be indexed by a range"); the oracle is its equivalent
+// load of the whole memory, `a[2:5]` as `a` with start 2 and finish 5, and so on.
+TEST_CASE("$readmemh into a constant slice of a memory") {
+    const char* w6 = "clotho_readmem_sl6_test.hex";
+    const char* at = "clotho_readmem_slat_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    write_file(at, "@3 aa bb\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:7], b [0:7], c [0:7], e [0:7];
+            logic [7:0] d [7:0], g [7:0];
+            integer i;
+            initial begin
+                $readmemh(")") + w6 + R"(", a[2:5]);
+                $readmemh(")" + w6 + R"(", b[2:5], 3);
+                $readmemh(")" + w6 + R"(", c[2:5], 5, 4);
+                $readmemh(")" + w6 + R"(", d[5:2]);
+                $readmemh(")" + at + R"(", e[2:5]);
+                $readmemh(")" + w6 + R"(", g[5:2], 4, 3);
+                for (i = 0; i < 8; i = i + 1)
+                    $display("%h %h %h %h %h %h", a[i], b[i], c[i], d[i], e[i], g[i]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx xx xx xx\n"
+                              "xx xx xx xx xx xx\n"
+                              "01 xx xx 01 xx xx\n"
+                              "02 01 xx 02 aa 02\n"
+                              "03 02 02 03 bb 01\n"
+                              "04 03 01 04 xx xx\n"
+                              "xx xx xx xx xx xx\n"
+                              "xx xx xx xx xx xx\n");
+    std::remove(w6);
+    std::remove(at);
+}
+
+// An element of a multidimensional memory that is itself an array is a target, with
+// the addresses of the array it names, and so is a slice of it (LRM 21.4: "a partially
+// indexed multidimensional unpacked array that resolves to a lesser dimensioned
+// unpacked array", its lowest dimension sliceable). The index may be a variable.
+// Oracle: iverilog 13 takes none of these shapes, so each is its equivalent load of the
+// whole memory by flat leaf numbers (`m[1]` is leaves 4..7), which has the same
+// placement when the load names no address, and `start` / `finish` are written there
+// as the leaves they come to.
+TEST_CASE("$readmemh into an element or a slice of an element of a multi-dimensional memory") {
+    const char* w6  = "clotho_readmem_pi6_test.hex";
+    const char* w12 = "clotho_readmem_pi12_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    write_file(w12, "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3], m2 [0:2][0:3], m3 [0:2][0:3], m4 [0:2][0:3];
+            logic [7:0] x1 [0:1][1:0][0:2], x2 [0:1][1:0][0:2];
+            integer i, j, k;
+            initial begin
+                $readmemh(")") + w6 + R"(", m1[1]);
+                $readmemh(")" + w6 + R"(", m2[1][1:2]);
+                k = 2;
+                $readmemh(")" + w6 + R"(", m3[k]);
+                $readmemh(")" + w6 + R"(", m4[1], 2);
+                $readmemh(")" + w12 + R"(", x1[1]);
+                $readmemh(")" + w12 + R"(", x2[0][1]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h%h%h%h %h%h%h%h %h%h%h%h %h%h%h%h", m1[i][0], m1[i][1], m1[i][2], m1[i][3],
+                             m2[i][0], m2[i][1], m2[i][2], m2[i][3], m3[i][0], m3[i][1], m3[i][2], m3[i][3],
+                             m4[i][0], m4[i][1], m4[i][2], m4[i][3]);
+                for (i = 0; i < 2; i = i + 1)
+                    for (j = 0; j < 2; j = j + 1)
+                        $display("%h%h%h %h%h%h", x1[i][j][0], x1[i][j][1], x1[i][j][2], x2[i][j][0], x2[i][j][1],
+                                 x2[i][j][2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx\n"
+                              "01020304 xx0102xx xxxxxxxx xxxx0102\n"
+                              "xxxxxxxx xxxxxxxx 01020304 xxxxxxxx\n"
+                              "xxxxxx xxxxxx\n"
+                              "xxxxxx 010203\n"
+                              "010203 xxxxxx\n"
+                              "040506 xxxxxx\n");
+    std::remove(w6);
+    std::remove(w12);
+}
+
+// A slice whose position is a variable, `a[i +: n]` and `a[i -: n]` (LRM 7.4.5, 11.5.1),
+// is the slice `a[i:i+n-1]`, whose addresses are the indices it selects (21.4), so `start`
+// is 3 for its second word at i = 2. Its words that lie outside the array
+// are dropped where they are, not the rest shifted into them, as a write of a slice
+// does (7.4.5: writing through an invalid index is a no-operation), and a load whose
+// index has an x or z bit, or whose slice is wholly outside the array, loads nothing.
+// Oracle: iverilog 13 for the slices inside the array (the equivalent load of the
+// whole memory, `a[i +: 3]` for i = 2 as `a` with start 2 and finish 4); LRM-derived
+// for `h`, `z` and `u`.
+TEST_CASE("$readmemh into a slice at a variable position") {
+    const char* w6 = "clotho_readmem_vs6_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:7], b [0:7], c [0:7], d [0:7], h [0:7], z [0:7], u [0:7];
+            logic [7:0] q [7:0];
+            logic [3:0] xi = 4'bx;
+            integer i, k;
+            initial begin
+                i = 2;  $readmemh(")") + w6 + R"(", a[i +: 3]);
+                i = 5;  $readmemh(")" + w6 + R"(", b[i -: 3]);
+                i = 2;  $readmemh(")" + w6 + R"(", q[i +: 3]);
+                i = 6;  $readmemh(")" + w6 + R"(", c[i +: 4]);
+                i = 2;  $readmemh(")" + w6 + R"(", d[i +: 3], 3);
+                i = 1;  $readmemh(")" + w6 + R"(", h[i -: 3]);
+                        $readmemh(")" + w6 + R"(", z[xi +: 3]);
+                i = 20; $readmemh(")" + w6 + R"(", u[i +: 3]);
+                for (k = 0; k < 8; k = k + 1)
+                    $display("%h %h %h %h %h %h %h %h", a[k], b[k], q[k], c[k], d[k], h[k], z[k], u[k]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx xx xx 02 xx xx\n"
+                              "xx xx xx xx xx 03 xx xx\n"
+                              "01 xx 01 xx xx xx xx xx\n"
+                              "02 01 02 xx 01 xx xx xx\n"
+                              "03 02 03 xx 02 xx xx xx\n"
+                              "xx 03 xx xx xx xx xx xx\n"
+                              "xx xx xx 01 xx xx xx xx\n"
+                              "xx xx xx 02 xx xx xx xx\n");
+    std::remove(w6);
+}
+
+// A variable index that is outside the array, or has an x or z bit, makes an element
+// target invalid, and a load through it does nothing (LRM 7.4.5).
+TEST_CASE("$readmemh through an invalid index loads nothing") {
+    const char* w6 = "clotho_readmem_inv_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] m1 [0:2][0:3];
+            logic [3:0] xi = 4'bx;
+            integer i;
+            initial begin
+                i = 3;  $readmemh(")") + w6 + R"(", m1[i]);
+                i = -1; $readmemh(")" + w6 + R"(", m1[i]);
+                        $readmemh(")" + w6 + R"(", m1[xi]);
+                $display("%h %h %h", m1[0][0], m1[1][0], m1[2][0]);
+                i = 1;  $readmemh(")" + w6 + R"(", m1[i]);
+                $display("%h %h %h", m1[0][0], m1[1][0], m1[2][0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx xx\nxx 01 xx\n");
+    std::remove(w6);
+}
+
+// A load into an element or a slice wakes what waits on the memory, as a load of the
+// whole memory does, and only if it changed something.
+TEST_CASE("$readmemh into an element wakes the memory's waiters") {
+    const char* w4 = "clotho_readmem_wk_test.hex";
+    write_file(w4, "01 02 03 04\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:2][0:3];
+            logic [7:0] y, z;
+            integer n = 0;
+            always_comb y = mem[1][0];
+            always_comb z = mem[2][3];
+            always @(mem[1][3]) n = n + 1;
+            initial begin
+                #5 $readmemh(")") + w4 + R"(", mem[1]);
+                #1 $display("%h %h %0d", y, z, n);
+                $readmemh(")" + w4 + R"(", mem[1]);
+                #1 $display("%h %h %0d", y, z, n);
+                $readmemh(")" + w4 + R"(", mem[2][0:3]);
+                #1 $display("%h %h %0d", y, z, n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "01 xx 1\n01 xx 1\n01 04 1\n");
+    std::remove(w4);
+}
+
+// The element kinds in a slice: 4-state values with x and z, a 2-state memory (x and z
+// read as 0, LRM 21.4.2) and elements wider than 64 bits. Oracle: iverilog 13, through
+// the equivalent load of the whole memory.
+TEST_CASE("$readmem into a slice of a 4-state, 2-state and wide memory") {
+    const char* bin = "clotho_readmem_sle_test.bin";
+    const char* hx2 = "clotho_readmem_sle2_test.hex";
+    const char* hxw = "clotho_readmem_slew_test.hex";
+    write_file(bin, "0x01 1zzz 1010 xx11 0000\n");
+    write_file(hx2, "ff z1 3x 77\n");
+    write_file(hxw,
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [3:0]   f [0:5];
+            bit   [7:0]   g [0:3];
+            logic [127:0] w [0:3];
+            integer i;
+            initial begin
+                $readmemb(")") + bin + R"(", f[2:4]);
+                $readmemh(")" + hx2 + R"(", g[1:3]);
+                $readmemh(")" + hxw + R"(", w[1:2]);
+                for (i = 0; i < 6; i = i + 1) $display("%b", f[i]);
+                for (i = 0; i < 4; i = i + 1) $display("%h", g[i]);
+                for (i = 0; i < 4; i = i + 1) $display("%h_%h", w[i][127:64], w[i][63:0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xxxx\nxxxx\n0x01\n1zzz\n1010\nxxxx\n"
+                              "00\nff\n01\n30\n"
+                              "xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx\n"
+                              "deadbeefcafebabe_0123456789abcdef\n"
+                              "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                              "xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx\n");
+    std::remove(bin);
+    std::remove(hx2);
+    std::remove(hxw);
+}
+
+// The same targets through a hierarchical reference and a block-local array.
+TEST_CASE("$readmemh into a slice of a hierarchical or block-local memory") {
+    const char* w6 = "clotho_readmem_hl_test.hex";
+    write_file(w6, "01 02 03 04 05 06\n");
+    const std::string src = std::string(R"(
+        module sub;
+            logic [7:0] mem [0:3];
+        endmodule
+        module m;
+            sub u();
+            integer i;
+            initial begin
+                logic [7:0] loc [0:3];
+                $readmemh(")") + w6 + R"(", u.mem[1:2]);
+                $readmemh(")" + w6 + R"(", loc[2:3]);
+                for (i = 0; i < 4; i = i + 1) $display("%h %h", u.mem[i], loc[i]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx xx\n01 xx\n02 01\nxx 02\n");
+    std::remove(w6);
+}
+
+// $fread takes the same targets. Its start and count are words of the array it names,
+// a target that names no word reads nothing and leaves the file where it was, and an
+// index outside the array is such a target. Oracle: iverilog 13 through the equivalent
+// $fread of the whole memory (`a[2:5]` as `a` with start 2 and count 4).
+TEST_CASE("$fread into a slice or an element of a memory") {
+    const char* path = "clotho_fread_sl_test.bin";
+    write_file(path, std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] a [0:7], c [0:7], d [0:7];
+            logic [7:0] b [0:2][0:3], b2 [0:2][0:3];
+            integer fd, rc, i;
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                rc = $fread(a[2:5], fd);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(b[1], fd);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(b2[1], fd, 2, 1);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                i = 2;
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(c[i +: 3], fd);
+                $display("rc=%0d", rc);
+                $fclose(fd);
+                i = 20;
+                fd = $fopen(")" + path + R"(", "rb");
+                rc = $fread(d[i +: 3], fd);
+                $display("rc=%0d first=%0h", rc, $fgetc(fd));
+                $fclose(fd);
+                for (i = 0; i < 8; i = i + 1) $display("%h %h %h", a[i], c[i], d[i]);
+                for (i = 0; i < 3; i = i + 1)
+                    $display("%h%h%h%h %h%h%h%h", b[i][0], b[i][1], b[i][2], b[i][3], b2[i][0], b2[i][1],
+                             b2[i][2], b2[i][3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=4\nrc=4\nrc=1\nrc=3\nrc=0 first=11\n"
+                              "xx xx xx\nxx xx xx\n11 11 xx\n22 22 xx\n33 33 xx\n44 xx xx\nxx xx xx\nxx xx xx\n"
+                              "xxxxxxxx xxxxxxxx\n11223344 xxxx11xx\nxxxxxxxx xxxxxxxx\n");
+    std::remove(path);
+}
+
+// LRM 21.4.1: "When loading dynamic arrays and queues, the current size of the array is
+// fixed; the array shall not be resized", so an address is an index from 0 to size - 1,
+// and the words past the end are dropped as they are past the end of a memory (21.4).
+// The queue sits in a ring that wraps (`push_front` first puts element 0 on its last
+// slot), and the load keeps its order. Oracle: iverilog 13 takes neither as a memory
+// argument, so each case is the same load of a fixed memory [0:n-1] there, whose output
+// is the expectation.
+TEST_CASE("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1") {
+    write_file("clotho_readmem_dq6_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_readmem_dqat_test.hex", "@2 aa bb\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            logic [7:0] x0, x1, x2, x3;
+            integer i;
+            task automatic show_d;
+                for (i = 0; i < d.size(); i = i + 1) $write("%h ", d[i]);
+                $display("size=%0d", d.size());
+            endtask
+            task automatic show_q;
+                for (i = 0; i < q.size(); i = i + 1) $write("%h ", q[i]);
+                $display("size=%0d", q.size());
+            endtask
+            task automatic fresh_q(int n);
+                q.delete();
+                q.push_front(8'bx);
+                repeat (n - 1) q.push_back(8'bx);
+            endtask
+            initial begin
+                d = new[4]; $readmemh("@A6@", d);        show_d;
+                d = new[4]; $readmemh("@A6@", d, 1);     show_d;
+                d = new[4]; $readmemh("@A6@", d, 1, 2);  show_d;
+                d = new[4]; $readmemh("@A6@", d, 3, 1);  show_d;
+                d = new[4]; $readmemh("@AT@", d);        show_d;
+                d = new[2]; $readmemh("@AT@", d);        show_d;
+                fresh_q(4); $readmemh("@A6@", q);        show_q;
+                fresh_q(4); $readmemh("@A6@", q, 1);     show_q;
+                fresh_q(4); $readmemh("@A6@", q, 1, 2);  show_q;
+                fresh_q(4); $readmemh("@A6@", q, 3, 1);  show_q;
+                fresh_q(4); $readmemh("@AT@", q);        show_q;
+                fresh_q(2); $readmemh("@AT@", q);        show_q;
+                fresh_q(4); $readmemh("@A6@", q);
+                x0 = q.pop_front(); x1 = q.pop_back(); x2 = q.pop_front(); x3 = q.pop_front();
+                $display("%h %h %h %h size=%0d", x0, x1, x2, x3, q.size());
+            end
+        endmodule
+    )";
+    const std::string design =
+      with_path(with_path(src, "@A6@", "clotho_readmem_dq6_test.hex"), "@AT@", "clotho_readmem_dqat_test.hex");
+    const std::string loads = "11 22 33 44 size=4\n"
+                              "xx 11 22 33 size=4\n"
+                              "xx 11 22 xx size=4\n"
+                              "xx 33 22 11 size=4\n"
+                              "xx xx aa bb size=4\n"
+                              "xx xx size=2\n";
+    CHECK(run_capture(design) == loads + loads + "11 44 22 33 size=0\n");
+    std::remove("clotho_readmem_dq6_test.hex");
+    std::remove("clotho_readmem_dqat_test.hex");
+}
+
+// $fread fills a dynamic array or a queue the same way: LRM 21.3.4.4 gives it the
+// memory of $readmem, `start` the first address (the lowest by default) and `count` the
+// most locations loaded. Oracle: iverilog 13, through the same read of a fixed memory.
+TEST_CASE("$fread into a dynamic array or a queue fills the words it holds") {
+    write_file("clotho_fread_dq_test.bin", std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = R"(
+        module m;
+            logic [7:0]  d [];
+            logic [7:0]  q [$];
+            logic [15:0] w [];
+            integer i, k, fd, rc;
+            task automatic show_d;
+                for (i = 0; i < d.size(); i = i + 1) $write("%h ", d[i]);
+                $display("size=%0d", d.size());
+            endtask
+            task automatic show_q;
+                for (i = 0; i < q.size(); i = i + 1) $write("%h ", q[i]);
+                $display("size=%0d", q.size());
+            endtask
+            task automatic fresh_q;
+                q.delete();
+                q.push_front(8'bx);
+                repeat (3) q.push_back(8'bx);
+            endtask
+            initial begin
+                d = new[4]; fd = $fopen("@B7@", "rb"); rc = $fread(d, fd);       $fclose(fd); $write("rc=%0d ", rc); show_d;
+                d = new[4]; fd = $fopen("@B7@", "rb"); rc = $fread(d, fd, 1);    $fclose(fd); $write("rc=%0d ", rc); show_d;
+                d = new[4]; fd = $fopen("@B7@", "rb"); rc = $fread(d, fd, 1, 2); $fclose(fd); $write("rc=%0d ", rc); show_d;
+                d = new[4]; fd = $fopen("@B7@", "rb"); rc = $fread(d, fd, 0, 3); $fclose(fd); $write("rc=%0d ", rc); show_d;
+                fresh_q; fd = $fopen("@B7@", "rb"); rc = $fread(q, fd);       $fclose(fd); $write("rc=%0d ", rc); show_q;
+                fresh_q; fd = $fopen("@B7@", "rb"); rc = $fread(q, fd, 1);    $fclose(fd); $write("rc=%0d ", rc); show_q;
+                fresh_q; fd = $fopen("@B7@", "rb"); rc = $fread(q, fd, 1, 2); $fclose(fd); $write("rc=%0d ", rc); show_q;
+                fresh_q; fd = $fopen("@B7@", "rb"); rc = $fread(q, fd, 0, 3); $fclose(fd); $write("rc=%0d ", rc); show_q;
+                d = new[4]; fd = $fopen("@B7@", "rb"); rc = $fread(d[1:2], fd);  $fclose(fd); $write("rc=%0d ", rc); show_d;
+                d = new[4]; k = 3; fd = $fopen("@B7@", "rb"); rc = $fread(d[k +: 3], fd); $fclose(fd); $write("rc=%0d ", rc); show_d;
+                w = new[3]; fd = $fopen("@B7@", "rb"); rc = $fread(w, fd);       $fclose(fd);
+                $display("rc=%0d %h %h %h size=%0d", rc, w[0], w[1], w[2], w.size());
+            end
+        endmodule
+    )";
+    const std::string reads = "rc=4 11 22 33 44 size=4\n"
+                              "rc=3 xx 11 22 33 size=4\n"
+                              "rc=2 xx 11 22 xx size=4\n"
+                              "rc=3 11 22 33 xx size=4\n";
+    CHECK(run_capture(with_path(src, "@B7@", "clotho_fread_dq_test.bin")) ==
+          reads + reads + "rc=2 xx 11 22 xx size=4\nrc=3 xx xx xx 11 size=4\n" + "rc=6 1122 3344 5566 size=3\n");
+    std::remove("clotho_fread_dq_test.bin");
+}
+
+// The element kinds of a dynamic array or a queue: 4-state values with x and z, a 2-state
+// element (x and z read as 0, LRM 21.4.2) and elements wider than 64 bits, the last two
+// in a queue whose ring wraps. Oracle: iverilog 13, through the same load of a fixed
+// memory (it has no 2-state element: the expectation there is derived from 21.4.2).
+TEST_CASE("$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements") {
+    write_file("clotho_readmem_dqk4_test.bin", "0x01 1zzz 1010 xx11\n");
+    write_file("clotho_readmem_dqk2_test.hex", "ff z1 3x 77\n");
+    write_file("clotho_readmem_dqkw_test.hex",
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n");
+    const std::string src = R"(
+        module m;
+            logic [3:0]   f [];
+            bit   [7:0]   g [$];
+            logic [127:0] w [$];
+            integer i;
+            initial begin
+                f = new[4];
+                $readmemb("@K4@", f);
+                for (i = 0; i < 4; i = i + 1) $write("%b ", f[i]);
+                $write("\n");
+                g.push_front(8'hee);
+                repeat (3) g.push_back(8'hee);
+                $readmemh("@K2@", g);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", g[i]);
+                $write("\n");
+                w.push_front('x);
+                repeat (2) w.push_back('x);
+                $readmemh("@KW@", w);
+                for (i = 0; i < 3; i = i + 1) $display("%h_%h", w[i][127:64], w[i][63:0]);
+            end
+        endmodule
+    )";
+    const std::string design = with_path(
+      with_path(with_path(src, "@K4@", "clotho_readmem_dqk4_test.bin"), "@K2@", "clotho_readmem_dqk2_test.hex"),
+      "@KW@", "clotho_readmem_dqkw_test.hex");
+    CHECK(run_capture(design) == "0x01 1zzz 1010 xx11 \n"
+                                 "ff 01 30 77 \n"
+                                 "deadbeefcafebabe_0123456789abcdef\n"
+                                 "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                                 "0000000000000000_0000000000000042\n");
+    std::remove("clotho_readmem_dqk4_test.bin");
+    std::remove("clotho_readmem_dqk2_test.hex");
+    std::remove("clotho_readmem_dqkw_test.hex");
+}
+
+// A slice of a dynamic array: its words are the array's, at the positions of the slice
+// (LRM 21.4: the lowest dimension can be sliced, addresses are those of the slice), and
+// a word outside the array is dropped as 7.4.5 drops a write through an invalid index.
+// The array is 0-based and ascending (7.5), so a load of `d[...]` is the load of a fixed
+// memory [0:n-1] of the same size, which the test compares with. iverilog 13 takes no
+// slice as a memory argument; the values are derived from the clauses above.
+TEST_CASE("$readmemh into a slice of a dynamic array places its words like a fixed memory") {
+    write_file("clotho_readmem_dqs_test.hex", "11 22 33 44 55 66\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] f [0:3];
+            logic [7:0] d [];
+            integer i, k, same;
+            task automatic fresh;
+                for (i = 0; i < 4; i = i + 1) f[i] = 8'bx;
+                d = new[4];
+            endtask
+            task automatic show;
+                same = 1;
+                for (i = 0; i < 4; i = i + 1) begin
+                    $write("%h ", d[i]);
+                    if (f[i] !== d[i]) same = 0;
+                end
+                $display("same=%0d", same);
+            endtask
+            initial begin
+                fresh; $readmemh("@A6@", f[1:2]); $readmemh("@A6@", d[1:2]); show;
+                fresh; k = 3;  $readmemh("@A6@", f[k +: 2]); $readmemh("@A6@", d[k +: 2]); show;
+                fresh; k = 1;  $readmemh("@A6@", f[k -: 3]); $readmemh("@A6@", d[k -: 3]); show;
+                fresh; k = -1; $readmemh("@A6@", f[k +: 2]); $readmemh("@A6@", d[k +: 2]); show;
+                fresh; k = 'x; $readmemh("@A6@", f[k +: 2]); $readmemh("@A6@", d[k +: 2]); show;
+                fresh; $readmemh("@A6@", f[0:3], 2); $readmemh("@A6@", d[0:3], 2); show;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(src, "@A6@", "clotho_readmem_dqs_test.hex")) ==
+          "xx 11 22 xx same=1\n"
+          "xx xx xx 11 same=1\n"
+          "22 33 xx xx same=1\n"
+          "22 xx xx xx same=1\n"
+          "xx xx xx xx same=1\n"
+          "xx xx 11 22 same=1\n");
+    std::remove("clotho_readmem_dqs_test.hex");
+}
+
+// A slice of a queue, `q[a:b]` (LRM 7.10.1), is the elements from `a`, but not below 0, to `b`,
+// but not past `$`; 21.4 lets the lowest dimension of the memory be written "with slice syntax",
+// and the load takes the indices of the queue for its addresses, as it takes those of a slice of a
+// fixed array (note 68 of docs/LRM_NOTES.md). The queue is never resized (21.4.1). The ring wraps
+// (its head is slot 6 of 8, so elements 0 and 1 sit on the last two slots), so a slice crosses
+// its end, and starts on its first slot or on a later one. A bound of any width and sign keeps its
+// value, `q[i +: n]` is `q[i:i+n-1]` (11.5.1). Oracle: iverilog 13 takes no queue, so each case is
+// the load of a memory `s[lo:hi]` of the elements that are left, from the same file with the same
+// arguments, laid over the queue by the design that ran it; the cases that clip are derived from 7.10.1.
+TEST_CASE("$readmemh into a slice of a queue loads the elements it selects, by queue index") {
+    write_file("clotho_readmem_qs6_test.hex", "11 22 33 44 55 66\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] q [$];
+            integer i, k;
+            logic [3:0] lo4;
+            byte        sb;
+            bit  [7:0]  hi8;
+            bit  [99:0] w3, wbig;
+            task automatic fresh;
+                q.delete();
+                repeat (6) q.push_back(8'bx);
+                repeat (2) q.push_front(q.pop_back());
+            endtask
+            task automatic show;
+                for (i = 0; i < q.size(); i = i + 1) $write("%h ", q[i]);
+                $display("size=%0d", q.size());
+            endtask
+            initial begin
+                fresh; $readmemh("@A6@", q[1:3]);    show;
+                fresh; $readmemh("@A6@", q[2:$]);    show;
+                fresh; $readmemh("@A6@", q[0:$-1]);  show;
+                fresh; $readmemh("@A6@", q[$:$]);    show;
+                fresh; $readmemh("@A6@", q[-2:1]);   show;
+                fresh; $readmemh("@A6@", q[4:9]);    show;
+                fresh; $readmemh("@A6@", q[-9:9]);   show;
+                fresh; k = 1;  $readmemh("@A6@", q[k +: 3]); show;
+                fresh; k = 4;  $readmemh("@A6@", q[k -: 3]); show;
+                fresh; k = -1; $readmemh("@A6@", q[k +: 3]); show;
+                fresh; k = 4;  $readmemh("@A6@", q[k +: 5]); show;
+                fresh; k = 7;  $readmemh("@A6@", q[k -: 3]); show;
+                fresh; lo4 = 4'd2;   $readmemh("@A6@", q[lo4:$]);  show;
+                fresh; sb = -2;      $readmemh("@A6@", q[sb:1]);   show;
+                fresh; hi8 = 8'd200; $readmemh("@A6@", q[1:hi8]);  show;
+                fresh; w3 = 100'd3;  $readmemh("@A6@", q[w3:$]);   show;
+                fresh; wbig = 100'd1 << 80; $readmemh("@A6@", q[1:wbig]); show;
+                fresh; $readmemh("@A6@", q[wbig:$]); show;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(src, "@A6@", "clotho_readmem_qs6_test.hex")) ==
+          "xx 11 22 33 xx xx size=6\n"
+          "xx xx 11 22 33 44 size=6\n"
+          "11 22 33 44 55 xx size=6\n"
+          "xx xx xx xx xx 11 size=6\n"
+          "11 22 xx xx xx xx size=6\n"
+          "xx xx xx xx 11 22 size=6\n"
+          "11 22 33 44 55 66 size=6\n"
+          "xx 11 22 33 xx xx size=6\n"
+          "xx xx 11 22 33 xx size=6\n"
+          "11 22 xx xx xx xx size=6\n"
+          "xx xx xx xx 11 22 size=6\n"
+          "xx xx xx xx xx 11 size=6\n"
+          "xx xx 11 22 33 44 size=6\n"
+          "11 22 xx xx xx xx size=6\n"
+          "xx 11 22 33 44 55 size=6\n"
+          "xx xx xx 11 22 33 size=6\n"
+          "xx 11 22 33 44 55 size=6\n"
+          "xx xx xx xx xx xx size=6\n");
+    std::remove("clotho_readmem_qs6_test.hex");
+}
+
+// A slice of a queue that selects no element (a > b, wholly before or past the queue, an x or z
+// bound, a width of 0, an empty queue) names no word, as an empty queue does (note 68): nothing is
+// loaded, and the file is not even opened, which the missing one would report.
+TEST_CASE("$readmemh into a slice of a queue that selects no element does nothing") {
+    const std::string design = R"(
+        module m;
+            logic [7:0] q [$];
+            integer i, k;
+            task automatic fresh;
+                q.delete();
+                repeat (6) q.push_back(8'bx);
+                repeat (2) q.push_front(q.pop_back());
+            endtask
+            task automatic show;
+                for (i = 0; i < q.size(); i = i + 1) $write("%h ", q[i]);
+                $display("size=%0d", q.size());
+            endtask
+            initial begin
+                fresh; $readmemh("clotho_readmem_qs_missing.hex", q[3:1]);   show;
+                fresh; $readmemh("clotho_readmem_qs_missing.hex", q[7:9]);   show;
+                fresh; $readmemh("clotho_readmem_qs_missing.hex", q[-3:-1]); show;
+                fresh; k = 'x; $readmemh("clotho_readmem_qs_missing.hex", q[k:3]);  show;
+                fresh; k = 'z; $readmemh("clotho_readmem_qs_missing.hex", q[1:k]);  show;
+                fresh; k = 'x; $readmemh("clotho_readmem_qs_missing.hex", q[k +: 2]); show;
+                fresh; k = 1;  $readmemh("clotho_readmem_qs_missing.hex", q[k +: 0]); show;
+                q.delete(); $readmemh("clotho_readmem_qs_missing.hex", q[0:$]); show;
+            end
+        endmodule
+    )";
+    const std::string none = "xx xx xx xx xx xx size=6\n";
+    CHECK(run_capture(design) == none + none + none + none + none + none + none + "size=0\n");
+    CHECK(count_substr(run_capture_stderr(design), "cannot open file") == 0);
+}
+
+// A slice's range bounds the addresses of a load as a fixed slice's does (21.4: "any start_addr and
+// finish_addr arguments shall fall within the bounds of the slice's range", note 67), and for a
+// queue slice that range is what is left of it after the queue has clipped it: `q[3:9]` of six is
+// [3:5]. Oracle: iverilog 13, through the load of a memory `s[lo:hi]` for the cases inside the
+// range (it has no slice, so a start or finish outside one is derived from 21.4).
+TEST_CASE("$readmemh into a slice of a queue takes start, finish and file addresses inside the slice") {
+    write_file("clotho_readmem_qsa6_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_readmem_qsat_test.hex", "@2 aa bb\n");
+    write_file("clotho_readmem_qsa2_test.hex", "a1 a2\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] q [$];
+            integer i;
+            task automatic fresh;
+                q.delete();
+                repeat (6) q.push_back(8'bx);
+                repeat (2) q.push_front(q.pop_back());
+            endtask
+            task automatic show;
+                for (i = 0; i < q.size(); i = i + 1) $write("%h ", q[i]);
+                $display("size=%0d", q.size());
+            endtask
+            initial begin
+                fresh; $readmemh("@AT@", q[1:4]);        show;
+                fresh; $readmemh("@AT@", q[3:5]);        show;
+                fresh; $readmemh("@A6@", q[1:4], 2);     show;
+                fresh; $readmemh("@A6@", q[1:4], 3, 2);  show;
+                fresh; $readmemh("@A6@", q[1:4], 2, 4);  show;
+                fresh; $readmemh("@A6@", q[1:4], 5);     show;
+                fresh; $readmemh("@A6@", q[1:4], 2, 5);  show;
+                fresh; $readmemh("@A6@", q[3:9], 8);     show;
+                fresh; $readmemh("@A6@", q[3:9], 4);     show;
+                fresh; $readmemh("@A2@", q[1:3]);        show;
+            end
+        endmodule
+    )";
+    const std::string design =
+      with_path(with_path(with_path(src, "@A6@", "clotho_readmem_qsa6_test.hex"), "@AT@", "clotho_readmem_qsat_test.hex"),
+                "@A2@", "clotho_readmem_qsa2_test.hex");
+    const std::string none = "xx xx xx xx xx xx size=6\n";
+    CHECK(run_capture(design) == "xx xx aa bb xx xx size=6\n" + none +
+                                   "xx xx 11 22 33 xx size=6\n"
+                                   "xx xx 22 11 xx xx size=6\n"
+                                   "xx xx 11 22 33 xx size=6\n" +
+                                   none + none + none +
+                                   "xx xx xx xx 11 22 size=6\n"
+                                   "xx a1 a2 xx xx xx size=6\n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: address 2 in 'clotho_readmem_qsat_test.hex' is outside the address "
+                            "range [3:5] of the load") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 5 is outside the slice range [1:4]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: finish address 5 is outside the slice range [1:4]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 8 is outside the slice range [3:5]") == 1);
+    CHECK(count_substr(err, "error:") == 4);
+    CHECK(count_substr(err, "holds fewer words than the range [1:3]") == 1);
+    std::remove("clotho_readmem_qsa6_test.hex");
+    std::remove("clotho_readmem_qsat_test.hex");
+    std::remove("clotho_readmem_qsa2_test.hex");
+}
+
+// $fread fills the slice the same way (21.3.4.4: `start` is the address of the first element, in the
+// array the memory argument names, and `count` the most locations loaded): from the lowest address
+// of the slice by default, never past its highest, and a start outside it reads nothing, warns and
+// leaves the file where it was, as for a memory. A slice that selects no element names no word, so it
+// returns 0 and leaves the file too. Oracle: iverilog 13, through the same read of a memory `s[lo:hi]`.
+TEST_CASE("$fread into a slice of a queue fills the elements it selects") {
+    write_file("clotho_fread_qs_test.bin", std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = R"(
+        module m;
+            logic [7:0] q [$];
+            integer i, k, fd, rc;
+            task automatic fresh;
+                q.delete();
+                repeat (6) q.push_back(8'bx);
+                repeat (2) q.push_front(q.pop_back());
+            endtask
+            task automatic show;
+                for (i = 0; i < q.size(); i = i + 1) $write("%h ", q[i]);
+                $display("size=%0d", q.size());
+            endtask
+            initial begin
+                fresh; fd = $fopen("@B7@", "rb"); rc = $fread(q[1:3], fd);       $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+                fresh; fd = $fopen("@B7@", "rb"); rc = $fread(q[2:$], fd, 3);    $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+                fresh; fd = $fopen("@B7@", "rb"); rc = $fread(q[1:4], fd, 2, 2); $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+                fresh; fd = $fopen("@B7@", "rb"); rc = $fread(q[1:3], fd, 4);    $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+                fresh; fd = $fopen("@B7@", "rb"); rc = $fread(q[-2:9], fd);      $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+                fresh; k = 'x; fd = $fopen("@B7@", "rb"); rc = $fread(q[k:3], fd);     $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+                fresh; k = 3;  fd = $fopen("@B7@", "rb"); rc = $fread(q[k -: 2], fd);  $write("rc=%0d first=%0h ", rc, $fgetc(fd)); $fclose(fd); show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@B7@", "clotho_fread_qs_test.bin");
+    CHECK(run_capture(design) == "rc=3 first=44 xx 11 22 33 xx xx size=6\n"
+                                 "rc=3 first=44 xx xx xx 11 22 33 size=6\n"
+                                 "rc=2 first=33 xx xx 11 22 xx xx size=6\n"
+                                 "rc=0 first=11 xx xx xx xx xx xx size=6\n"
+                                 "rc=6 first=77 11 22 33 44 55 66 size=6\n"
+                                 "rc=0 first=11 xx xx xx xx xx xx size=6\n"
+                                 "rc=2 first=33 xx xx 11 22 xx xx size=6\n");
+    CHECK(count_substr(run_capture_stderr(design), "warning: $fread start address 4 is outside the memory range [1:3]") ==
+          1);
+    std::remove("clotho_fread_qs_test.bin");
+}
+
+// The element kinds of a queue slice: 4-state values with x and z, a 2-state element (x and z read as
+// 0, LRM 21.4.2), elements wider than 64 bits, and a queue of fixed arrays, whose words are rows
+// (21.4.3, note 66 of docs/LRM_NOTES.md) addressed by their index in the queue. Every ring wraps (its
+// first element is on its last slot). Oracle: iverilog 13, through the same load of a memory
+// `s[lo:hi]` (it has no 2-state element: derived from 21.4.2).
+TEST_CASE("$readmem into a slice of a queue of 4-state, 2-state, wide and array elements") {
+    write_file("clotho_readmem_qsk4_test.bin", "0x01 1zzz 1010 xx11\n");
+    write_file("clotho_readmem_qsk2_test.hex", "ff z1 3x 77\n");
+    write_file("clotho_readmem_qskw_test.hex",
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n");
+    write_file("clotho_readmem_qskn_test.hex", "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = R"(
+        module m;
+            logic [3:0]   f [$];
+            bit   [7:0]   g [$];
+            logic [127:0] w [$];
+            logic [7:0]   qn [$][0:2];
+            logic [7:0]   row [0:2];
+            integer i, j;
+            initial begin
+                f.push_front(4'bx);
+                repeat (3) f.push_back(4'bx);
+                $readmemb("@K4@", f[1:3]);
+                for (i = 0; i < 4; i = i + 1) $write("%b ", f[i]);
+                $write("\n");
+                g.push_front(8'hee);
+                repeat (3) g.push_back(8'hee);
+                $readmemh("@K2@", g[1:2]);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", g[i]);
+                $write("\n");
+                w.push_front('x);
+                repeat (3) w.push_back('x);
+                $readmemh("@KW@", w[1:$]);
+                for (i = 0; i < 4; i = i + 1) $display("%h_%h", w[i][127:64], w[i][63:0]);
+                row = '{default: 8'bx};
+                qn.push_front(row);
+                repeat (3) qn.push_back(row);
+                $readmemh("@KN@", qn[1:2]);
+                for (i = 0; i < 4; i = i + 1) begin
+                    for (j = 0; j < 3; j = j + 1) $write("%h", qn[i][j]);
+                    $write(" ");
+                end
+                $display("size=%0d", qn.size());
+            end
+        endmodule
+    )";
+    const std::string design = with_path(
+      with_path(with_path(with_path(src, "@K4@", "clotho_readmem_qsk4_test.bin"), "@K2@",
+                          "clotho_readmem_qsk2_test.hex"),
+                "@KW@", "clotho_readmem_qskw_test.hex"),
+      "@KN@", "clotho_readmem_qskn_test.hex");
+    CHECK(run_capture(design) == "xxxx 0x01 1zzz 1010 \n"
+                                 "ee ff 01 ee \n"
+                                 "xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx\n"
+                                 "deadbeefcafebabe_0123456789abcdef\n"
+                                 "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                                 "0000000000000000_0000000000000042\n"
+                                 "xxxxxx 010203 040506 xxxxxx size=4\n");
+    std::remove("clotho_readmem_qsk4_test.bin");
+    std::remove("clotho_readmem_qsk2_test.hex");
+    std::remove("clotho_readmem_qskw_test.hex");
+    std::remove("clotho_readmem_qskn_test.hex");
+}
+
+// A load into a slice is a write of the queue, so it wakes what waits on an element, as a load of the
+// whole queue does, and only if it changed a leaf (LRM 9.4.2, 9.4.3): an element the slice does not
+// select is not changed, so its waiter sleeps on. Oracle: the same waits on a fixed memory in iverilog
+// 13 (see "$readmemh wakes the memory's waiters only when it changes it"); iverilog has no queue slice.
+TEST_CASE("a load into a slice of a queue wakes the waiters of its elements") {
+    write_file("clotho_readmem_qsw_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_qsw_test.bin", "\xaa\xbb\xcc\xdd");
+    const std::string src = R"(
+        module m;
+            logic [7:0] q [$];
+            integer at2 = -1, again2 = -1, atw = -1, at_far = -1, at_f = -1, fd, rc;
+            initial begin
+                repeat (6) q.push_back(8'bx);
+                repeat (2) q.push_front(q.pop_back());
+            end
+            initial begin #1; @(q[2]) at2 = $time; @(q[2]) again2 = $time; end
+            initial begin #1; wait (q[3] == 8'h22) atw = $time; end
+            initial begin #1; @(q[5]) at_far = $time; end
+            initial begin #8; @(q[1]) at_f = $time; end
+            initial begin
+                #5 $readmemh("@A6@", q[2:3]);
+                #1 $display("%0d %0d %0d", at2, atw, at_far);
+                $readmemh("@A6@", q[2:3]);
+                #1 $display("%0d", again2);
+                #3 fd = $fopen("@AA@", "rb");
+                rc = $fread(q[1:2], fd);
+                $fclose(fd);
+                #1 $display("rc=%0d at_f=%0d %h", rc, at_f, q[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_qsw_test.hex"), "@AA@",
+                                "clotho_fread_qsw_test.bin")) == "5 5 -1\n-1\nrc=2 at_f=10 aa\n");
+    std::remove("clotho_readmem_qsw_test.hex");
+    std::remove("clotho_fread_qsw_test.bin");
+}
+
+// A queue that is a member of an unpacked struct (alone or in an array of them), a property of a
+// class object (static too), a member of the interface a virtual interface handle names, a queue
+// of another instance, a `ref` argument, a local of a task, an element of a queue of queues or an
+// entry of an associative array is a queue like any other, and a slice of it is loaded where the
+// queue is. An entry of an associative array is created by the load as by a store (LRM 7.8.7).
+// Oracle: the same loads of a fixed memory `s[lo:hi]` in iverilog 13 for the placement (it has none
+// of these homes for a queue).
+TEST_CASE("$readmem and $fread into a slice of a queue held by a struct, a class, a ref argument or another "
+          "container") {
+    write_file("clotho_readmem_qsh_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_qsh_test.bin", std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = R"(
+        interface bus_if;
+            logic [7:0] q [$];
+        endinterface
+        module sub;
+            logic [7:0] q [$];
+        endmodule
+        module m;
+            typedef struct { logic [7:0] pad; logic [7:0] q [$]; } s_t;
+            class C;
+                logic [7:0] q [$];
+                static logic [7:0] sq [$];
+            endclass
+            bus_if bi();
+            virtual bus_if vi;
+            sub u();
+            s_t s, sa [0:1];
+            C c;
+            logic [7:0] qq [$][$];
+            logic [7:0] aa [int][$];
+            logic [7:0] loc [$];
+            integer i, fd, rc;
+            task automatic fresh(ref logic [7:0] r [$]);
+                r.delete();
+                repeat (6) r.push_back(8'bx);
+                repeat (2) r.push_front(r.pop_back());
+            endtask
+            task automatic show(ref logic [7:0] r [$]);
+                for (i = 0; i < r.size(); i = i + 1) $write("%h ", r[i]);
+                $display("size=%0d", r.size());
+            endtask
+            task automatic load(ref logic [7:0] r [$]);
+                $readmemh("@A6@", r[1:3]);
+            endtask
+            task automatic local_load;
+                logic [7:0] l [$];
+                fresh(l);
+                $readmemh("@A6@", l[2:$]);
+                show(l);
+            endtask
+            initial begin
+                c = new;
+                fresh(s.q);     $readmemh("@A6@", s.q[1:3]);     show(s.q);
+                fresh(sa[1].q); $readmemh("@A6@", sa[1].q[2:$]); show(sa[1].q);
+                fresh(c.q);     $readmemh("@A6@", c.q[1:3]);     show(c.q);
+                fresh(C::sq);   $readmemh("@A6@", C::sq[0:1]);   show(C::sq);
+                fresh(loc);     load(loc);                       show(loc);
+                local_load;
+                qq.delete(); qq.push_back(loc); qq.push_back(loc); fresh(qq[1]);
+                $readmemh("@A6@", qq[1][1:3]); show(qq[1]);
+                fresh(aa[3]);   $readmemh("@A6@", aa[3][1:3]);   show(aa[3]);
+                $display("%0d", aa.num());
+                aa.delete(); $readmemh("@A6@", aa[5][0:1]); show(aa[5]);
+                $display("%0d %0d", aa.num(), aa[5].size());
+                fd = $fopen("@B7@", "rb"); rc = $fread(c.q[4:$], fd); $fclose(fd);
+                $write("rc=%0d ", rc); show(c.q);
+                bi.q.push_front(8'bx); repeat (3) bi.q.push_back(8'bx);
+                u.q.push_front(8'bx);  repeat (3) u.q.push_back(8'bx);
+                vi = bi;
+                $readmemh("@A6@", vi.q[1:2]);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", bi.q[i]);
+                $display("size=%0d", bi.q.size());
+                $readmemh("@A6@", u.q[2:$]);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", u.q[i]);
+                $display("size=%0d", u.q.size());
+                fd = $fopen("@B7@", "rb"); rc = $fread(vi.q[0:1], fd); $fclose(fd);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", bi.q[i]);
+                $display("rc=%0d", rc);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_qsh_test.hex"), "@B7@",
+                                "clotho_fread_qsh_test.bin")) == "xx 11 22 33 xx xx size=6\n"
+                                                                  "xx xx 11 22 33 44 size=6\n"
+                                                                  "xx 11 22 33 xx xx size=6\n"
+                                                                  "11 22 xx xx xx xx size=6\n"
+                                                                  "xx 11 22 33 xx xx size=6\n"
+                                                                  "xx xx 11 22 33 44 size=6\n"
+                                                                  "xx 11 22 33 xx xx size=6\n"
+                                                                  "xx 11 22 33 xx xx size=6\n"
+                                                                  "1\n"
+                                                                  "size=0\n"
+                                                                  "1 0\n"
+                                                                  "rc=2 xx 11 22 33 11 22 size=6\n"
+                                                                  "xx 11 22 xx size=4\n"
+                                                                  "xx xx 11 22 size=4\n"
+                                                                  "11 22 22 xx rc=2\n");
+    std::remove("clotho_readmem_qsh_test.hex");
+    std::remove("clotho_fread_qsh_test.bin");
+}
+
+// A dynamic array of fixed arrays is a memory of two dimensions whose highest has the
+// array's size: the file fills it row-major and an address names a row (21.4.3, note 66
+// of docs/LRM_NOTES.md). The first load has the same output in iverilog 13 for a fixed
+// `m[0:1][0:2]`; the others are derived from 21.4.3 (iverilog takes addresses as leaf
+// indices).
+TEST_CASE("$readmemh into a dynamic array of fixed arrays, an element or a slice of one") {
+    write_file("clotho_readmem_dqn_test.hex", "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] d [][0:2];
+            integer i, j;
+            task automatic show;
+                for (i = 0; i < d.size(); i = i + 1) begin
+                    for (j = 0; j < 3; j = j + 1) $write("%h", d[i][j]);
+                    $write(" ");
+                end
+                $display("size=%0d", d.size());
+            endtask
+            initial begin
+                d = new[2]; $readmemh("@T12@", d);         show;
+                d = new[2]; $readmemh("@T12@", d[1]);      show;
+                d = new[2]; $readmemh("@T12@", d, 1);      show;
+                d = new[2]; $readmemh("@T12@", d[0][1:2]); show;
+                d = new[2]; $readmemh("@T12@", d[5]);      show;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(src, "@T12@", "clotho_readmem_dqn_test.hex")) ==
+          "010203 040506 size=2\n"
+          "xxxxxx 010203 size=2\n"
+          "xxxxxx 010203 size=2\n"
+          "xx0102 xxxxxx size=2\n"
+          "xxxxxx xxxxxx size=2\n");
+    std::remove("clotho_readmem_dqn_test.hex");
+}
+
+// An empty dynamic array or queue has no address, so the load names no word: nothing is
+// opened or read, and `$fread` returns 0 and leaves the file where it was (note 67 of
+// docs/LRM_NOTES.md gives a fixed array the same rule for a target that names no word).
+TEST_CASE("a load into an empty dynamic array or queue does nothing") {
+    write_file("clotho_readmem_dqe_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_dqe_test.bin", std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = R"(
+        module m;
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            integer fd, rc;
+            initial begin
+                $readmemh("@A6@", d);
+                $readmemh("@A6@", q);
+                fd = $fopen("@B7@", "rb");
+                rc = $fread(d, fd);
+                $display("%0d %0d %0d first=%0h", d.size(), q.size(), rc, $fgetc(fd));
+                rc = $fread(q, fd);
+                $display("rc=%0d first=%0h", rc, $fgetc(fd));
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_dqe_test.hex"), "@B7@",
+                                "clotho_fread_dqe_test.bin")) == "0 0 0 first=11\nrc=0 first=22\n");
+    std::remove("clotho_readmem_dqe_test.hex");
+    std::remove("clotho_fread_dqe_test.bin");
+}
+
+// A load is a write of the dynamic array or queue, so it wakes what waits on an
+// element: an event control, a level wait, whichever the load, and only if it changed a
+// leaf (LRM 9.4.2, 9.4.3). The wake is the container's, as an element store's. Oracle:
+// the same waits on a fixed memory in iverilog 13 (see "$readmemh wakes the memory's
+// waiters only when it changes it"); iverilog has no dynamic array to wait on.
+TEST_CASE("a load into a dynamic array or a queue wakes the waiters of its elements") {
+    write_file("clotho_readmem_dqw_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_dqw_test.bin", "\xaa\xbb\xcc\xdd");
+    const std::string src = R"(
+        module m;
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            integer at_d = -1, again_d = -1, at_q = -1, again_q = -1, at_wd = -1, at_wq = -1, at_f = -1, fd, rc;
+            initial begin
+                d = new[3];
+                q.push_front(8'bx);
+                q.push_back(8'bx);
+                q.push_back(8'bx);
+            end
+            initial begin #1; @(d[1]) at_d = $time; @(d[1]) again_d = $time; end
+            initial begin #1; @(q[1]) at_q = $time; @(q[1]) again_q = $time; end
+            initial begin #1; wait (d[2] == 8'h33) at_wd = $time; end
+            initial begin #1; wait (q[2] == 8'h33) at_wq = $time; end
+            initial begin #8; @(d[0]) at_f = $time; end
+            initial begin
+                #5 $readmemh("@A6@", d);
+                $readmemh("@A6@", q);
+                #1 $display("%0d %0d %0d %0d", at_d, at_q, at_wd, at_wq);
+                $readmemh("@A6@", d);
+                $readmemh("@A6@", q);
+                #1 $display("%0d %0d", again_d, again_q);
+                #3 fd = $fopen("@AA@", "rb");
+                rc = $fread(d, fd);
+                $fclose(fd);
+                #1 $display("rc=%0d at_f=%0d %h", rc, at_f, d[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_dqw_test.hex"), "@AA@",
+                                "clotho_fread_dqw_test.bin")) == "5 5 5 5\n-1 -1\nrc=3 at_f=10 aa\n");
+    std::remove("clotho_readmem_dqw_test.hex");
+    std::remove("clotho_fread_dqw_test.bin");
+}
+
+// A dynamic array that is a local of a task is a target like any other.
+TEST_CASE("a load into a dynamic array local to a task") {
+    write_file("clotho_readmem_dql_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_dql_test.bin", std::string("\x11\x22\x33\x44\x55\x66\x77", 7));
+    const std::string src = R"(
+        module m;
+            task automatic load(string f);
+                logic [7:0] loc [];
+                int fd, rc;
+                loc = new[3];
+                $readmemh(f, loc);
+                $display("%h %h %h", loc[0], loc[1], loc[2]);
+                fd = $fopen("@B7@", "rb");
+                rc = $fread(loc, fd);
+                $fclose(fd);
+                $display("rc=%0d %h %h %h", rc, loc[0], loc[1], loc[2]);
+            endtask
+            initial load("@A6@");
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_dql_test.hex"), "@B7@",
+                                "clotho_fread_dql_test.bin")) == "11 22 33\nrc=3 11 22 33\n");
+    std::remove("clotho_readmem_dql_test.hex");
+    std::remove("clotho_fread_dql_test.bin");
+}
+
+// A queue of fixed arrays is a memory of two dimensions whose highest is the queue: the
+// runtime walks the ring a row at a time (note 66 and 68 of docs/LRM_NOTES.md). The first
+// row is on the ring's last slot, the others start again at its first. Derived from
+// 21.4.3 (iverilog 13 has no queue to load).
+TEST_CASE("$readmemh into a queue of fixed arrays walks its ring a row at a time") {
+    write_file("clotho_readmem_qn_test.hex", "01 02 03 04 05 06 07 08 09 0a 0b 0c\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] qn [$][0:2];
+            logic [7:0] row [0:2];
+            integer i, j;
+            task automatic show;
+                for (i = 0; i < qn.size(); i = i + 1) begin
+                    for (j = 0; j < 3; j = j + 1) $write("%h", qn[i][j]);
+                    $write(" ");
+                end
+                $display("size=%0d", qn.size());
+            endtask
+            task automatic fresh;
+                qn.delete();
+                row = '{default: 8'bx};
+                qn.push_front(row);
+                qn.push_back(row);
+                qn.push_back(row);
+            endtask
+            initial begin
+                fresh; $readmemh("@T12@", qn);         show;
+                fresh; $readmemh("@T12@", qn, 2);      show;
+                fresh; $readmemh("@T12@", qn[1]);      show;
+                fresh; $readmemh("@T12@", qn[2][1:2]); show;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(src, "@T12@", "clotho_readmem_qn_test.hex")) ==
+          "010203 040506 070809 size=3\n"
+          "xxxxxx xxxxxx 010203 size=3\n"
+          "xxxxxx 010203 xxxxxx size=3\n"
+          "xxxxxx xxxxxx xx0102 size=3\n");
+    std::remove("clotho_readmem_qn_test.hex");
+}
+
+// An array that is a local of a task, or is bound to a `ref` argument, is loaded where it
+// is; a waiter on the actual of a `ref` argument hears the load, as it hears a store
+// through the argument. Oracle: iverilog 13 for the local (it has no `ref` array).
+TEST_CASE("a load into a fixed array local to a task or bound to a ref argument") {
+    write_file("clotho_readmem_ref_test.hex", "11 22 33 44 55 66\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] mem [0:3];
+            logic [7:0] watched [0:3];
+            integer at = -1;
+            task automatic local_load;
+                logic [7:0] loc [0:3];
+                $readmemh("@A6@", loc);
+                $display("%h %h %h %h", loc[0], loc[1], loc[2], loc[3]);
+            endtask
+            task automatic load(ref logic [7:0] a [0:3]);
+                $readmemh("@A6@", a);
+            endtask
+            initial begin #1; @(watched[1]) at = $time; end
+            initial begin
+                local_load;
+                load(mem);
+                $display("%h %h %h %h", mem[0], mem[1], mem[2], mem[3]);
+                #5 load(watched);
+                #1 $display("%h %h %h %h at=%0d", watched[0], watched[1], watched[2], watched[3], at);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(src, "@A6@", "clotho_readmem_ref_test.hex")) ==
+          "11 22 33 44\n11 22 33 44\n11 22 33 44 at=5\n");
+    std::remove("clotho_readmem_ref_test.hex");
+}
+
+// A member of an unpacked struct, or of an element of an array of them, is an array like
+// any other, laid out inside the struct: the load must leave the neighbouring members
+// alone, and the waiters of the struct hear it. Oracle: the same load of a fixed memory in
+// iverilog 13 (it has no unpacked struct), compared in the design; z digits are read back
+// to pin the may-z seed of a struct signal.
+TEST_CASE("$readmem and $fread into a struct member or a member of an array of structs") {
+    write_file("clotho_readmem_st_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_readmem_stz_test.bin", "0x01 1zzz\n");
+    write_file("clotho_fread_st_test.bin", std::string("\x11\x22\x33\x44\x55", 5));
+    const std::string src = R"(
+        module m;
+            typedef struct { int a; logic [7:0] mem [0:3]; shortint b; } s_t;
+            typedef struct { int a; logic [3:0] z [0:1]; } z_t;
+            s_t s;
+            s_t sa [0:2];
+            z_t zs;
+            logic [7:0] f [0:3];
+            integer i, k, same, fd, rc, at_e = -1, at_w = -1, at_sa = -1;
+            task automatic fresh;
+                s.a = 'haaaa5555; s.b = 16'h1234;
+                for (i = 0; i < 3; i = i + 1) begin sa[i].a = int'(i + 1); sa[i].b = 16'(i + 10); end
+                for (i = 0; i < 4; i = i + 1) begin s.mem[i] = 8'bx; f[i] = 8'bx; sa[0].mem[i] = 8'bx; sa[1].mem[i] = 8'bx; sa[2].mem[i] = 8'bx; end
+            endtask
+            task automatic show_s;
+                same = 1;
+                for (i = 0; i < 4; i = i + 1) begin
+                    $write("%h ", s.mem[i]);
+                    if (f[i] !== s.mem[i]) same = 0;
+                end
+                $display("same=%0d a=%h b=%h", same, s.a, s.b);
+            endtask
+            task automatic show_sa;
+                for (k = 0; k < 3; k = k + 1) begin
+                    for (i = 0; i < 4; i = i + 1) $write("%h", sa[k].mem[i]);
+                    $write("/%0d/%0d ", sa[k].a, sa[k].b);
+                end
+                $display("");
+            endtask
+            initial begin #1; @(s.mem[1]) at_e = $time; end
+            initial begin #1; @(sa[2].mem[3]) at_w = $time; end
+            initial begin
+                #5;
+                fresh; $readmemh("@A6@", s.mem); $readmemh("@A6@", f); show_s;
+                fresh; $readmemh("@A6@", s.mem, 1, 2); $readmemh("@A6@", f, 1, 2); show_s;
+                fresh; $readmemh("@A6@", s.mem, 3, 1); $readmemh("@A6@", f, 3, 1); show_s;
+                fresh; k = 3; $readmemh("@A6@", s.mem[k +: 2]); $readmemh("@A6@", f[k +: 2]); show_s;
+                fresh; $readmemh("@A6@", sa[2].mem); show_sa;
+                fresh; k = 7; $readmemh("@A6@", sa[k].mem); show_sa;
+                fresh; fd = $fopen("@B5@", "rb"); rc = $fread(s.mem, fd); $fclose(fd); $write("rc=%0d ", rc); show_s;
+                $readmemb("@Z@", zs.z);
+                $display("%b %b", zs.z[0], zs.z[1]);
+                $readmemh("@A6@", sa[2].mem);
+                #1 $display("%0d %0d", at_e, at_w);
+            end
+        endmodule
+    )";
+    const std::string design = with_path(with_path(with_path(src, "@A6@", "clotho_readmem_st_test.hex"), "@Z@",
+                                                   "clotho_readmem_stz_test.bin"),
+                                         "@B5@", "clotho_fread_st_test.bin");
+    CHECK(run_capture(design) ==
+          "11 22 33 44 same=1 a=aaaa5555 b=1234\n"
+          "xx 11 22 xx same=1 a=aaaa5555 b=1234\n"
+          "xx 33 22 11 same=1 a=aaaa5555 b=1234\n"
+          "xx xx xx 11 same=1 a=aaaa5555 b=1234\n"
+          "xxxxxxxx/1/10 xxxxxxxx/2/11 11223344/3/12 \n"
+          "xxxxxxxx/1/10 xxxxxxxx/2/11 xxxxxxxx/3/12 \n"
+          "rc=4 11 22 33 44 same=0 a=aaaa5555 b=1234\n"
+          "0x01 1zzz\n"
+          "5 5\n");
+    std::remove("clotho_readmem_st_test.hex");
+    std::remove("clotho_readmem_stz_test.bin");
+    std::remove("clotho_fread_st_test.bin");
+}
+
+// A class property is an array in the object's body, reached through the handle (a derived
+// class's handle and a method's implicit `this` included), or a shared slot when static.
+// A dynamic array or queue property wakes `wait` through its change notifier. Oracle: the
+// same load of a fixed memory in iverilog 13 (it has no class), compared by value.
+TEST_CASE("$readmem and $fread into a class property, static or not") {
+    write_file("clotho_readmem_cl_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_readmem_cl2_test.hex", "@2 aa bb\n");
+    write_file("clotho_fread_cl_test.bin", std::string("\x11\x22\x33\x44\x55", 5));
+    const std::string src = R"(
+        class C;
+            int a;
+            logic [7:0] mem [0:3];
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            static logic [7:0] smem [0:3];
+            int b;
+            function new();
+                a = 32'h11111111; b = 32'h22222222;
+                d = new[4];
+                q.push_front(8'bx); q.push_back(8'bx); q.push_back(8'bx); q.push_back(8'bx);
+            endfunction
+            function void load(string f);
+                $readmemh(f, mem);
+            endfunction
+        endclass
+        class D extends C;
+            int c;
+        endclass
+        module m;
+            C obj;
+            D dobj;
+            integer i, fd, rc, at_d = -1, at_s = -1;
+            task automatic show(C o);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", o.mem[i]);
+                $write("| ");
+                for (i = 0; i < 4; i = i + 1) $write("%h ", o.d[i]);
+                $write("| ");
+                for (i = 0; i < 4; i = i + 1) $write("%h ", o.q[i]);
+                $display("| a=%h b=%h", o.a, o.b);
+            endtask
+            initial begin #1; wait (obj.d[2] == 8'h33) at_d = $time; end
+            initial begin #1; @(C::smem[1]) at_s = $time; end
+            initial begin
+                obj = new;
+                #5;
+                $readmemh("@A6@", obj.mem);
+                $readmemh("@A6@", obj.d);
+                $readmemh("@A6@", obj.q, 1, 2);
+                show(obj);
+                $readmemh("@A2@", obj.mem);
+                show(obj);
+                obj = new; obj.load("@A6@"); show(obj);
+                dobj = new; $readmemh("@A6@", dobj.mem); $readmemh("@A2@", dobj.d, 1); show(dobj);
+                obj = dobj; $readmemh("@A2@", obj.mem); show(dobj);
+                fd = $fopen("@B5@", "rb"); rc = $fread(obj.d, fd); $fclose(fd);
+                $display("rc=%0d", rc);
+                $readmemh("@A6@", C::smem);
+                $readmemh("@A2@", obj.smem, 1);
+                for (i = 0; i < 4; i = i + 1) $write("%h ", C::smem[i]);
+                $display("");
+                #1 $display("%0d %0d", at_d, at_s);
+            end
+        endmodule
+    )";
+    const std::string design = with_path(with_path(with_path(src, "@A6@", "clotho_readmem_cl_test.hex"), "@A2@",
+                                                   "clotho_readmem_cl2_test.hex"),
+                                         "@B5@", "clotho_fread_cl_test.bin");
+    CHECK(run_capture(design) == "11 22 33 44 | 11 22 33 44 | xx 11 22 xx | a=11111111 b=22222222\n"
+                                 "11 22 aa bb | 11 22 33 44 | xx 11 22 xx | a=11111111 b=22222222\n"
+                                 "11 22 33 44 | xx xx xx xx | xx xx xx xx | a=11111111 b=22222222\n"
+                                 "11 22 33 44 | xx xx aa bb | xx xx xx xx | a=11111111 b=22222222\n"
+                                 "11 22 aa bb | xx xx aa bb | xx xx xx xx | a=11111111 b=22222222\n"
+                                 "rc=4\n"
+                                 "11 22 aa bb \n"
+                                 "5 5\n");
+    std::remove("clotho_readmem_cl_test.hex");
+    std::remove("clotho_readmem_cl2_test.hex");
+    std::remove("clotho_fread_cl_test.bin");
+}
+
+// A member of an interface instance reached through a virtual interface handle (LRM 25.9)
+// is loaded in the instance the handle names, and only there: a waiter that named the
+// instance directly and one that waits through a handle both hear the load, the twin's
+// does not. Whole memory, start and finish, a slice at a variable position, a row of a
+// two-dimensional memory, a dynamic array, a queue, an array inside a struct member and
+// `$fread` take the words a fixed memory takes (LRM 21.4, 21.3.4.4; iverilog 13 has no
+// interface, so the values are those of the same load of a fixed memory). A container
+// member's waiter hears the load as it hears a mutation (9.4.3).
+TEST_CASE("$readmem and $fread into a member through a virtual interface") {
+    write_file("clotho_readmem_vif_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_vif_test.bin", std::string("\x11\x22\x33\x44\x55", 5));
+    const std::string src = R"(
+        interface ifc;
+            int a;
+            logic [7:0] mem [0:3];
+            int b;
+            logic [7:0] mm [0:1][0:2];
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            typedef struct { int x; logic [7:0] sm [0:1]; } s_t;
+            s_t st;
+        endinterface
+        module m;
+            ifc u1(), u2();
+            virtual ifc v, v2;
+            integer at_d = -1, at_v = -1, at_o = -1, at_w = -1, fd, rc, k;
+            task automatic show(string s, virtual ifc h);
+                $display("%s %h %h %h %h a=%0d b=%0d", s, h.mem[0], h.mem[1], h.mem[2], h.mem[3], h.a, h.b);
+            endtask
+            initial begin u1.a = 1; u1.b = 2; u2.a = 3; u2.b = 4; u2.d = new[3]; u2.q = {8'bx, 8'bx, 8'bx}; end
+            initial begin v2 = u2; #1; @(v2.mem[1]) at_v = $time; end
+            initial begin #1; @(u2.mem[1]) at_d = $time; end
+            initial begin #1; @(u1.mem[1]) at_o = $time; end
+            initial begin #1; wait (u2.d[1] == 8'h22) at_w = $time; end
+            initial begin
+                v = u2; #5;
+                $readmemh("@A6@", v.mem);
+                #1 show("u1", u1); show("u2", v);
+                $display("at %0d %0d %0d", at_d, at_v, at_o);
+                $readmemh("@A6@", v.mem, 1, 2); show("u2s", v);
+                k = 2; $readmemh("@A6@", v.mem[k +: 2]); show("u2k", v);
+                $readmemh("@A6@", v.mm[1]); $display("mm %h %h %h %h", u2.mm[1][0], u2.mm[1][1], u2.mm[1][2], u2.mm[0][0]);
+                $readmemh("@A6@", v.d); #1 $display("d %h %h %h at_w=%0d", u2.d[0], u2.d[1], u2.d[2], at_w);
+                $readmemh("@A6@", v.q, 1); $display("q %h %h %h", u2.q[0], u2.q[1], u2.q[2]);
+                $readmemh("@A6@", v.st.sm); $display("sm %h %h x=%0d", u2.st.sm[0], u2.st.sm[1], u2.st.x);
+                fd = $fopen("@B5@", "rb"); rc = $fread(v.mem, fd, 1, 2); $fclose(fd);
+                $display("rc=%0d", rc); show("fr", v);
+                #2 v = u1; $readmemh("@A6@", v.mem); show("u1", u1);
+                #1 $display("at %0d %0d %0d", at_d, at_v, at_o);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_vif_test.hex"), "@B5@",
+                                "clotho_fread_vif_test.bin")) ==
+          "u1 xx xx xx xx a=1 b=2\n"
+          "u2 11 22 33 44 a=3 b=4\n"
+          "at 5 5 -1\n"
+          "u2s 11 11 22 44 a=3 b=4\n"
+          "u2k 11 11 11 22 a=3 b=4\n"
+          "mm 11 22 33 xx\n"
+          "d 11 22 33 at_w=6\n"
+          "q xx 11 22\n"
+          "sm 11 22 x=0\n"
+          "rc=2\n"
+          "fr 11 11 22 22 a=3 b=4\n"
+          "u1 11 22 33 44 a=1 b=2\n"
+          "at 5 5 9\n");
+    std::remove("clotho_readmem_vif_test.hex");
+    std::remove("clotho_fread_vif_test.bin");
+}
+
+// An `@` address of the file outside the range the task names is an error that ends the load,
+// the words before it staying loaded (LRM 21.4: "the addresses in the data file shall be within
+// the address range specified by the system task arguments; otherwise, an error message is
+// issued, and the load operation is terminated"). The range is `start` through `finish`,
+// `start` through the highest address when only `start` is given, else the whole memory.
+// Oracle: iverilog 13 loads the same words and names the same addresses and ranges, for a
+// descending task range, a descending declaration and a memory that starts above 0 too.
+TEST_CASE("$readmem ends the load at a file address outside the range the task names") {
+    write_file("clotho_readmem_ar1.hex", "aa bb\n@1 cc dd\n");
+    write_file("clotho_readmem_ar2.hex", "aa bb\n@6 cc dd\n");
+    write_file("clotho_readmem_ar3.hex", "aa bb\n@9 cc dd\n@3 ee\n");
+    write_file("clotho_readmem_ar4.hex", "@5 aa @2 bb cc\n");
+    write_file("clotho_readmem_ar5.hex", "aa bb\n@1\n");
+    write_file("clotho_readmem_ar6.hex", "@1 aa bb\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] mem [0:7];
+            logic [7:0] desc [7:0];
+            logic [7:0] off [2:9];
+            integer i;
+            task automatic fresh;
+                for (i = 0; i < 8; i = i + 1) begin mem[i] = 8'hxx; desc[i] = 8'hxx; end
+                for (i = 2; i < 10; i = i + 1) off[i] = 8'hxx;
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h ", mem[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; $readmemh("@R1@", mem, 2, 5); show;
+                fresh; $readmemh("@R2@", mem, 2, 5); show;
+                fresh; $readmemh("@R1@", mem, 2); show;
+                fresh; $readmemh("@R2@", desc, 5, 2);
+                for (i = 0; i < 8; i = i + 1) $write("%h ", desc[i]);
+                $display("");
+                fresh; $readmemh("@R3@", mem); show;
+                fresh; $readmemh("@R4@", mem, 2, 5); show;
+                fresh; $readmemh("@R5@", mem, 2, 5); show;
+                fresh; $readmemh("@R6@", off);
+                for (i = 2; i < 10; i = i + 1) $write("%h ", off[i]);
+                $display("");
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 6; ++k) {
+        design = with_path(design, "@R" + std::to_string(k) + "@", "clotho_readmem_ar" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) == "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx xx xx bb aa xx xx \n"
+                                 "aa bb xx xx xx xx xx xx \n"
+                                 "xx xx bb cc xx aa xx xx \n"
+                                 "xx xx aa bb xx xx xx xx \n"
+                                 "xx xx xx xx xx xx xx xx \n");
+    const std::string err = run_capture_stderr(design);
+    const auto        has = [&](const char* file, int addr, const char* range) {
+        return err.find("error: $readmemh: address " + std::to_string(addr) + " in 'clotho_readmem_" + file +
+                        ".hex' is outside the address range " + range + " of the load") != std::string::npos;
+    };
+    CHECK(has("ar1", 1, "[2:5]"));
+    CHECK(has("ar2", 6, "[2:5]"));
+    CHECK(has("ar1", 1, "[2:7]"));
+    CHECK(has("ar2", 6, "[5:2]"));
+    CHECK(has("ar3", 9, "[0:7]"));
+    CHECK(has("ar5", 1, "[2:5]"));
+    CHECK(has("ar6", 1, "[2:9]"));
+    CHECK(count_substr(err, "error:") == 7);
+    // A load that an error ended, or whose file has addresses, is not short of words.
+    CHECK(err.find("holds fewer") == std::string::npos);
+    for (int k = 1; k <= 6; ++k) {
+        std::remove(("clotho_readmem_ar" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// A slice's own range bounds the addresses of a load (LRM 21.4: "When slice syntax is used in
+// the memory_name argument, any start_addr and finish_addr arguments shall fall within the
+// bounds of the slice's range"), so a start or finish outside it loads nothing and is reported.
+// iverilog 13 has no slice (it errors and loads nothing for a start or finish outside a whole
+// memory); the words a start and finish inside the slice place are those of the same load of a
+// whole memory.
+TEST_CASE("$readmem into a slice with a start or finish outside its range loads nothing") {
+    write_file("clotho_readmem_sl1.hex", "11 22\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] a [0:7];
+            logic [7:0] b [7:0];
+            logic [7:0] d [];
+            integer i, k;
+            task automatic fresh;
+                d = new[8];
+                for (i = 0; i < 8; i = i + 1) begin a[i] = 8'hxx; b[i] = 8'hxx; d[i] = 8'hxx; end
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h%h%h ", a[i], b[i], d[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; $readmemh("@S@", a[2:5], 6); show;
+                fresh; $readmemh("@S@", a[2:5], 1, 4); show;
+                fresh; $readmemh("@S@", a[2:5], 2, 6); show;
+                fresh; k = 1; $readmemh("@S@", a[k +: 3], 4); show;
+                fresh; $readmemh("@S@", b[5:2], 6); show;
+                fresh; $readmemh("@S@", d[2:5], 6); show;
+                fresh; $readmemh("@S@", a[2:5], 3, 4); $readmemh("@S@", b[5:2], 4, 3); $readmemh("@S@", d[2:5], 3, 4);
+                show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@S@", "clotho_readmem_sl1.hex");
+    const std::string none   = "xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx \n";
+    CHECK(run_capture(design) == none + none + none + none + none + none +
+                                   "xxxxxx xxxxxx xxxxxx 112211 221122 xxxxxx xxxxxx xxxxxx \n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [2:5]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address 1 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: finish address 6 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 4 is outside the slice range [1:3]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [5:2]") == 1);
+    CHECK(count_substr(err, "error:") == 6);
+    std::remove("clotho_readmem_sl1.hex");
+}
+
+// One rule for the addresses of a slice: `a[2 +: 4]` is `a[2:5]` (LRM 11.5.1) and 21.4 has start
+// and finish "fall within the bounds of the slice's range", so both spellings are addressed 2 to 5
+// (for a descending array `b[5 -: 4]` is `b[5:2]`), for a fixed array and a dynamic array alike.
+// Oracle: iverilog 13 has no slice; each case is the load of the whole memory with the same start
+// and finish, and a start or finish outside the range is derived from 21.4.
+TEST_CASE("$readmem into an indexed slice is addressed by the indices it selects") {
+    write_file("clotho_readmem_ix_test.hex", "01 02 03 04 05 06\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] a [0:7];
+            logic [7:0] b [7:0];
+            logic [7:0] d [];
+            integer i, k;
+            task automatic fresh;
+                d = new[8];
+                for (i = 0; i < 8; i = i + 1) begin a[i] = 8'hxx; b[i] = 8'hxx; d[i] = 8'hxx; end
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h%h%h ", a[i], b[i], d[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; k = 2; $readmemh("@F@", a[k +: 4], 4);    show;
+                fresh; k = 2; $readmemh("@F@", a[k +: 4], 5, 3); show;
+                fresh; k = 5; $readmemh("@F@", b[k -: 4], 3);    show;
+                fresh; k = 2; $readmemh("@F@", d[k +: 4], 4);    show;
+                fresh; k = 2; $readmemh("@F@", a[k +: 4], 1);    show;
+                fresh; k = 2; $readmemh("@F@", d[k +: 4], 2, 6); show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@F@", "clotho_readmem_ix_test.hex");
+    const std::string none = "xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx \n";
+    CHECK(run_capture(design) == "xxxxxx xxxxxx xxxxxx xxxxxx 01xxxx 02xxxx xxxxxx xxxxxx \n"
+                                 "xxxxxx xxxxxx xxxxxx 03xxxx 02xxxx 01xxxx xxxxxx xxxxxx \n"
+                                 "xxxxxx xxxxxx xxxxxx xx01xx xx02xx xx03xx xxxxxx xxxxxx \n"
+                                 "xxxxxx xxxxxx xxxxxx xxxxxx xxxx01 xxxx02 xxxxxx xxxxxx \n" +
+                                   none + none);
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: start address 1 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: finish address 6 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error:") == 2);
+    std::remove("clotho_readmem_ix_test.hex");
+}
+
+// 21.4 has start and finish within the range of a slice; a whole memory takes the rule by analogy
+// (docs/LRM_NOTES.md note 73): a start or finish outside its bounds, in either direction, is a located
+// error, nothing is loaded and the simulation goes on. Oracle: iverilog 13 ("Start|Finish address N is
+// out of bounds") for the memory, and the same words for a dynamic array. `$fread` keeps note 55.
+TEST_CASE("$readmem with a start or finish outside a whole memory loads nothing") {
+    write_file("clotho_readmem_wm_test.hex", "11 22 33 44 55 66\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] s [0:7];
+            logic [7:0] d [];
+            integer i;
+            task automatic fresh;
+                d = new[8];
+                for (i = 0; i < 8; i = i + 1) begin s[i] = 8'bx; d[i] = 8'bx; end
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h%h ", s[i], d[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; $readmemh("@F@", s, 2, 10); $readmemh("@F@", d, 2, 10); show;
+                fresh; $readmemh("@F@", s, -1, 3); $readmemh("@F@", d, -1, 3); show;
+                fresh; $readmemh("@F@", s, 10, 2); $readmemh("@F@", d, 10, 2); show;
+                fresh; $readmemh("@F@", s, 3, -1); $readmemh("@F@", d, 3, -1); show;
+                fresh; $readmemh("@F@", s, 9);     $readmemh("@F@", d, 9);     show;
+                fresh; $readmemh("@F@", s, 2, 4);  $readmemh("@F@", d, 2, 4);  show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@F@", "clotho_readmem_wm_test.hex");
+    const std::string none   = "xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx \n";
+    CHECK(run_capture(design) == none + none + none + none + none +
+                                   "xxxx xxxx 1111 2222 3333 xxxx xxxx xxxx \n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: finish address 10 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address -1 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address 10 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: finish address -1 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address 9 is outside the memory range [0:7]") == 2);
+    std::remove("clotho_readmem_wm_test.hex");
+}
+
+// A warning "shall be issued if the number of data words in the file differs from the number
+// of words in the range implied by the start through finish addresses and no address
+// specifications appear within the data file" (LRM 21.4). Oracle: iverilog 13 warns in the same
+// cases for a memory, and names the same range. It does not for a memory of several
+// dimensions, whose words it counts as flat leaves; here a word of the file is a number, so
+// the range of a row of three holds three (note 66 of docs/LRM_NOTES.md).
+TEST_CASE("$readmem warns of a file with fewer or more words than its range unless it has addresses") {
+    write_file("clotho_readmem_wc1.hex", "a1 a2\n");
+    write_file("clotho_readmem_wc2.hex", "a1 a2 a3 a4 a5 a6 a7 a8 a9\n");
+    write_file("clotho_readmem_wc3.hex", "@1 a1 a2\n");
+    write_file("clotho_readmem_wc4.hex", "a1 a2 a3 a4 a5 a6\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] mem [0:7];
+            logic [7:0] a [0:7];
+            logic [7:0] m2 [0:1][0:2];
+            initial begin
+                $readmemh("@W1@", mem);
+                $readmemh("@W2@", mem);
+                $readmemh("@W1@", mem, 3);
+                $readmemh("@W2@", mem, 3);
+                $readmemh("@W3@", mem, 0, 7);
+                $readmemh("@W1@", mem, 4, 5);
+                $readmemh("@W1@", mem, 5, 2);
+                $readmemh("@W1@", a[2:5]);
+                $readmemh("@W4@", m2);
+                $readmemh("@W1@", m2);
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 4; ++k) {
+        design = with_path(design, "@W" + std::to_string(k) + "@", "clotho_readmem_wc" + std::to_string(k) + ".hex");
+    }
+    const std::string err = run_capture_stderr(design);
+    const auto        has = [&](const char* kind, const char* file, const char* range) {
+        return err.find(std::string("warning: $readmemh: 'clotho_readmem_") + file + ".hex' holds " + kind +
+                        " words than the range " + range) != std::string::npos;
+    };
+    CHECK(has("fewer", "wc1", "[0:7]"));
+    CHECK(has("more", "wc2", "[0:7]"));
+    CHECK(has("fewer", "wc1", "[3:7]"));
+    CHECK(has("more", "wc2", "[3:7]"));
+    CHECK(has("fewer", "wc1", "[5:2]"));
+    CHECK(has("fewer", "wc1", "[2:5]"));
+    CHECK(has("fewer", "wc1", "[0:1]"));
+    CHECK(count_substr(err, "warning:") == 7);
+    CHECK(count_substr(err, "holds fewer") == 5);
+    CHECK(count_substr(err, "holds more") == 2);
+    for (int k = 1; k <= 4; ++k) {
+        std::remove(("clotho_readmem_wc" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// LRM 21.4.1: "Loading an address creates an element of that index, if it does not already
+// exist". The number at address n goes to the element of index n, a load that names no address
+// starts at 0 (note 70 of docs/LRM_NOTES.md), and start, finish and `@` work as for a memory.
+// iverilog 13 cannot parse an associative array; its load of the fixed memory [0:31] with the
+// same file, start and finish is the oracle for the words, compared in the design.
+TEST_CASE("$readmemh into an associative array creates the elements the addresses name") {
+    write_file("clotho_readmem_as1.hex", "11 22 33\n@10 aa bb\n@5 cc\n");
+    write_file("clotho_readmem_as2.hex", "01 02 03 04 05 06\n");
+    write_file("clotho_readmem_as3.hex", "01 02 03\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] aa [int];
+            logic [7:0] f [0:31];
+            int k, same;
+            task automatic fresh;
+                aa.delete();
+                for (k = 0; k < 32; k = k + 1) f[k] = 8'hxx;
+            endtask
+            task automatic show;
+                same = 1;
+                foreach (aa[i]) begin
+                    $write("%0d:%h ", i, aa[i]);
+                    if (f[i] !== aa[i]) same = 0;
+                end
+                $display("n=%0d same=%0d", aa.num(), same);
+            endtask
+            initial begin
+                fresh; $readmemh("@A1@", aa);        $readmemh("@A1@", f);         show;
+                fresh; $readmemh("@A2@", aa, 3, 8);  $readmemh("@A2@", f, 3, 8);  show;
+                fresh; $readmemh("@A3@", aa, 9);     $readmemh("@A3@", f, 9, 11); show;
+                fresh; $readmemh("@A3@", aa, 5, 3);  $readmemh("@A3@", f, 5, 3);  show;
+                fresh; $readmemh("@A1@", aa, 0, 20); $readmemh("@A1@", f, 0, 20); show;
+                fresh; aa[1] = 8'h77; aa[40] = 8'h88; $readmemh("@A3@", aa);
+                foreach (aa[i]) $write("%0d:%h ", i, aa[i]);
+                $display("n=%0d", aa.num());
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 3; ++k) {
+        design = with_path(design, "@A" + std::to_string(k) + "@", "clotho_readmem_as" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) == "0:11 1:22 2:33 5:cc 16:aa 17:bb n=6 same=1\n"
+                                 "3:01 4:02 5:03 6:04 7:05 8:06 n=6 same=1\n"
+                                 "9:01 10:02 11:03 n=3 same=1\n"
+                                 "3:03 4:02 5:01 n=3 same=1\n"
+                                 "0:11 1:22 2:33 5:cc 16:aa 17:bb n=6 same=1\n"
+                                 "0:01 1:02 2:03 40:88 n=4\n");
+    CHECK(run_capture_stderr(design).empty());
+    for (int k = 1; k <= 3; ++k) {
+        std::remove(("clotho_readmem_as" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// The addresses are the values of the index type (note 70): the negative ones of a signed index,
+// counting up to the largest of an unsigned one, the numeric values of an enumerated index, the
+// 128-bit values of a wide one and the unsigned values of a wildcard. iverilog 13's load of the
+// fixed memory [-2:5] with the same file gives the words at negative addresses; an address
+// past the index type is the error of note 69 and a number past its largest the warning.
+TEST_CASE("$readmemh into an associative array addresses the values of its index type") {
+    write_file("clotho_readmem_at1.hex", "11 22 33 44\n");
+    write_file("clotho_readmem_at2.hex", "01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12\n");
+    write_file("clotho_readmem_at3.hex", "@1f aa\n");
+    write_file("clotho_readmem_at4.hex", "@1 aa @2 bb @4 cc\n");
+    std::string design = R"(
+        module m;
+            typedef enum { A = 1, B = 2, C = 4 } e_t;
+            int ai [int];
+            byte ab [byte];
+            bit [3:0] au [bit [3:0]];
+            logic [7:0] aw [bit [127:0]];
+            int ae [e_t];
+            int an [*];
+            initial begin
+                $readmemh("@T1@", ai, -2, 1);
+                foreach (ai[k]) $write("%0d:%h ", k, ai[k]);
+                $display("| ai n=%0d", ai.num());
+                $readmemh("@T1@", ab, -1, 2);
+                foreach (ab[k]) $write("%0d:%h ", k, ab[k]);
+                $display("| ab n=%0d", ab.num());
+                $readmemh("@T2@", au, 14);
+                foreach (au[k]) $write("%0d:%h ", k, au[k]);
+                $display("| au n=%0d", au.num());
+                $readmemh("@T1@", au);
+                $readmemh("@T3@", au);
+                foreach (au[k]) $write("%0d:%h ", k, au[k]);
+                $display("| au n=%0d", au.num());
+                $readmemh("@T1@", aw);
+                foreach (aw[k]) $write("%0d:%h ", k, aw[k]);
+                $display("| aw n=%0d", aw.num());
+                $readmemh("@T4@", ae);
+                foreach (ae[k]) $write("%0d:%h ", int'(k), ae[k]);
+                $display("| ae n=%0d", ae.num());
+                $readmemh("@T1@", an);
+                $display("an %h %h n=%0d", an[0], an[1], an.num());
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 4; ++k) {
+        design = with_path(design, "@T" + std::to_string(k) + "@", "clotho_readmem_at" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) == "-2:00000011 -1:00000022 0:00000033 1:00000044 | ai n=4\n"
+                                 "-1:11 0:22 1:33 2:44 | ab n=4\n"
+                                 "14:1 15:2 | au n=2\n"
+                                 "0:1 1:2 2:3 3:4 14:1 15:2 | au n=6\n"
+                                 "0:11 1:22 2:33 3:44 | aw n=4\n"
+                                 "1:000000aa 2:000000bb 4:000000cc | ae n=3\n"
+                                 "an 00000011 00000022 n=4\n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(err.find("warning: $readmemh: 'clotho_readmem_at2.hex' holds more words than the range [14:15]") !=
+          std::string::npos);
+    CHECK(err.find("error: $readmemh: address 31 in 'clotho_readmem_at3.hex' is outside the address range [0:15] "
+                   "of the load") != std::string::npos);
+    CHECK(count_substr(err, "warning:") == 1);
+    CHECK(count_substr(err, "error:") == 1);
+    for (int k = 1; k <= 4; ++k) {
+        std::remove(("clotho_readmem_at" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// The element is the word of a load (21.4.1, 21.4.3): 4-state digits stay, a 2-state element
+// reads x and z as 0 (21.4.2), a wide one takes its digits in full, and an element that is an
+// unpacked array takes the numbers of a row-major run of its leaves, each dimension from its
+// lowest address; a row the data leaves unfinished keeps its other leaves.
+TEST_CASE("$readmem into an associative array of 4-state, 2-state, wide and array elements") {
+    write_file("clotho_readmem_ae1.hex", "x1 z2 3f\n");
+    write_file("clotho_readmem_ae2.hex",
+               "0123456789abcdef0123456789abcdef fedcba9876543210fedcba9876543210\n");
+    write_file("clotho_readmem_ae3.hex", "01 02 03 04 05 06 @5 07 08\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] a4 [int];
+            bit [7:0] a2 [int];
+            logic [127:0] aw [int];
+            bit [127:0] bw [int];
+            logic [7:0] am [int][0:2];
+            logic [7:0] ad [int][2:0];
+            logic [7:0] m2 [int][0:1][0:2];
+            initial begin
+                $readmemh("@E1@", a4);
+                $readmemh("@E1@", a2);
+                foreach (a4[k]) $write("%0d:%h/%h ", k, a4[k], a2[k]);
+                $display("");
+                $readmemh("@E2@", aw);
+                $readmemh("@E2@", bw);
+                foreach (aw[k]) $write("%0d:%h/%h ", k, aw[k], bw[k]);
+                $display("");
+                $readmemh("@E3@", am);
+                foreach (am[k]) $write("%0d:%h%h%h ", k, am[k][0], am[k][1], am[k][2]);
+                $display("n=%0d", am.num());
+                $readmemh("@E3@", ad);
+                foreach (ad[k]) $write("%0d:%h%h%h ", k, ad[k][0], ad[k][1], ad[k][2]);
+                $display("n=%0d", ad.num());
+                $readmemh("@E3@", m2);
+                foreach (m2[k])
+                    $write("%0d:%h%h%h%h%h%h ", k, m2[k][0][0], m2[k][0][1], m2[k][0][2], m2[k][1][0], m2[k][1][1],
+                           m2[k][1][2]);
+                $display("n=%0d", m2.num());
+            end
+        endmodule
+    )";
+    for (int k = 1; k <= 3; ++k) {
+        design = with_path(design, "@E" + std::to_string(k) + "@", "clotho_readmem_ae" + std::to_string(k) + ".hex");
+    }
+    CHECK(run_capture(design) ==
+          "0:x1/01 1:z2/02 2:3f/3f \n"
+          "0:0123456789abcdef0123456789abcdef/0123456789abcdef0123456789abcdef "
+          "1:fedcba9876543210fedcba9876543210/fedcba9876543210fedcba9876543210 \n"
+          "0:010203 1:040506 5:0708xx n=3\n"
+          "0:010203 1:040506 5:0708xx n=3\n"
+          "0:010203040506 5:0708xxxxxxxx n=2\n");
+    CHECK(run_capture_stderr(design).empty());
+    for (int k = 1; k <= 3; ++k) {
+        std::remove(("clotho_readmem_ae" + std::to_string(k) + ".hex").c_str());
+    }
+}
+
+// An entry of an associative array that is itself an array or an associative array is loaded as
+// the array it is, and created by the load as a store to it would be (7.8.7); its slice
+// is a slice of that array. An x or z key names no array: nothing is created, and the file is
+// not even opened.
+TEST_CASE("$readmemh into an entry of an associative array of arrays or of associative arrays") {
+    write_file("clotho_readmem_ap1.hex", "01 02 03\n");
+    write_file("clotho_readmem_ap2.hex", "11 22\n");
+    std::string design = R"(
+        module m;
+            logic [7:0] am [integer][0:2];
+            int nn [integer][integer];
+            integer k;
+            initial begin
+                $readmemh("@P1@", am[7]);
+                $display("am7 %h %h %h n=%0d", am[7][0], am[7][1], am[7][2], am.num());
+                $readmemh("@P2@", am[9][1:2]);
+                $display("am9 %h %h %h n=%0d", am[9][0], am[9][1], am[9][2], am.num());
+                k = 'x;
+                $readmemh("clotho_readmem_ap_absent.hex", am[k]);
+                $display("n=%0d", am.num());
+                $readmemh("@P1@", nn[3]);
+                foreach (nn[j, i]) $write("%0d.%0d:%0h ", j, i, nn[j][i]);
+                $display("n=%0d inner=%0d", nn.num(), nn[3].num());
+                $readmemh("clotho_readmem_ap_absent.hex", nn[k]);
+                $display("n=%0d", nn.num());
+            end
+        endmodule
+    )";
+    design = with_path(with_path(design, "@P1@", "clotho_readmem_ap1.hex"), "@P2@", "clotho_readmem_ap2.hex");
+    CHECK(run_capture(design) == "am7 01 02 03 n=1\n"
+                                 "am9 xx 11 22 n=2\n"
+                                 "n=2\n"
+                                 "3.0:1 3.1:2 3.2:3 n=1 inner=3\n"
+                                 "n=1\n");
+    CHECK(run_capture_stderr(design).empty());
+    std::remove("clotho_readmem_ap1.hex");
+    std::remove("clotho_readmem_ap2.hex");
+}
+
+// An associative array is a target wherever it lives: a class property (static or not), a
+// member of an unpacked struct or of an element of an array of them, an element of an array
+// or a queue of associative arrays, and a member of an interface a virtual interface handle
+// names, where only that instance gets the elements. A waiter on the array of a class
+// property wakes. A target that is invalid (an index out of range, or with an x) names
+// no array: nothing is loaded. iverilog 13 has no associative array, class or interface: the
+// words are those of the same load of a fixed memory.
+TEST_CASE("$readmemh into an associative array that is a property, a member, an element or an interface member") {
+    write_file("clotho_readmem_ash1.hex", "11 22 33 44\n");
+    write_file("clotho_readmem_ash2.hex", "@1 aa @2 bb @4 cc\n");
+    std::string design = R"(
+        class C;
+            int a;
+            logic [7:0] m [int];
+            static logic [7:0] sm [int];
+            function new(); a = 5; endfunction
+            function void load(string f); $readmemh(f, m); endfunction
+        endclass
+        interface ifc;
+            logic [7:0] m [int];
+        endinterface
+        module m;
+            typedef struct { int a; logic [7:0] m [int]; int b; } s_t;
+            s_t s;
+            s_t sa [0:1];
+            logic [7:0] fa [0:2][int];
+            logic [7:0] qa [$][int];
+            C obj;
+            ifc u1(), u2();
+            virtual ifc v;
+            integer k, at_c = -1;
+            initial begin obj = new; #1; wait (obj.m.num() == 4) at_c = $time; end
+            initial begin
+                #3;
+                $readmemh("@H1@", obj.m);
+                #1;
+                foreach (obj.m[i]) $write("%0d:%h ", i, obj.m[i]);
+                $display("| obj a=%0d at=%0d", obj.a, at_c);
+                $readmemh("@H2@", C::sm);
+                foreach (C::sm[i]) $write("%0d:%h ", i, C::sm[i]);
+                $display("| static");
+                obj = new;
+                obj.load("@H1@");
+                $display("method n=%0d", obj.m.num());
+                s.a = 7; s.b = 9;
+                $readmemh("@H1@", s.m);
+                foreach (s.m[i]) $write("%0d:%h ", i, s.m[i]);
+                $display("| s a=%0d b=%0d", s.a, s.b);
+                $readmemh("@H1@", sa[1].m, 2);
+                foreach (sa[1].m[i]) $write("%0d:%h ", i, sa[1].m[i]);
+                $display("| n0=%0d", sa[0].m.num());
+                $readmemh("@H1@", fa[1]);
+                foreach (fa[j, i]) $write("%0d.%0d:%h ", j, i, fa[j][i]);
+                $display("|");
+                k = 7;
+                $readmemh("@H1@", fa[k]);
+                k = 'x;
+                $readmemh("@H1@", fa[k]);
+                $display("n=%0d", fa[0].num() + fa[1].num() + fa[2].num());
+                qa.push_back(fa[0]);
+                qa.push_back(fa[0]);
+                $readmemh("@H1@", qa[1]);
+                foreach (qa[j, i]) $write("%0d.%0d:%h ", j, i, qa[j][i]);
+                $display("|");
+                v = u2;
+                $readmemh("@H1@", v.m);
+                foreach (u2.m[i]) $write("%0d:%h ", i, u2.m[i]);
+                $display("| u1 n=%0d", u1.m.num());
+            end
+        endmodule
+    )";
+    design = with_path(with_path(design, "@H1@", "clotho_readmem_ash1.hex"), "@H2@", "clotho_readmem_ash2.hex");
+    CHECK(run_capture(design) == "0:11 1:22 2:33 3:44 | obj a=5 at=3\n"
+                                 "1:aa 2:bb 4:cc | static\n"
+                                 "method n=4\n"
+                                 "0:11 1:22 2:33 3:44 | s a=7 b=9\n"
+                                 "2:11 3:22 4:33 5:44 | n0=0\n"
+                                 "1.0:11 1.1:22 1.2:33 1.3:44 |\n"
+                                 "n=4\n"
+                                 "1.0:11 1.1:22 1.2:33 1.3:44 |\n"
+                                 "0:11 1:22 2:33 3:44 | u1 n=0\n");
+    CHECK(run_capture_stderr(design).empty());
+    std::remove("clotho_readmem_ash1.hex");
+    std::remove("clotho_readmem_ash2.hex");
+}
+
+// A load that creates or changes an element wakes whoever waits on the array or on an element,
+// as a store to it does (9.4.2, 9.4.3); one that changes nothing wakes nobody. A `$fread`
+// into an associative array wakes the same way. Oracle: the same waits on a fixed memory in
+// iverilog 13 (see "$readmemh wakes the memory's waiters only when it changes it"); it has
+// no associative array to wait on.
+TEST_CASE("a load into an associative array wakes the waiters of its elements") {
+    write_file("clotho_readmem_aw3.hex", "11 22 33\n");
+    write_file("clotho_readmem_aw4.hex", "11 22 33 44\n");
+    write_file("clotho_fread_aw.bin", "\xaa\xbb\xcc");
+    std::string design = R"(
+        module m;
+            logic [7:0] aa [int];
+            logic [7:0] bb [int];
+            integer at_e = -1, again_e = -1, at_w = -1, at_n = -1, at_n2 = -1, at_f = -1, fd, rc;
+            initial begin #1; @(aa[1]) at_e = $time; @(aa[1]) again_e = $time; end
+            initial begin #1; wait (aa[2] == 8'h33) at_w = $time; end
+            initial begin #1; wait (aa.num() == 3) at_n = $time; end
+            initial begin #7; wait (aa.num() == 4) at_n2 = $time; end
+            initial begin #2; wait (bb[2] == 8'hcc) at_f = $time; end
+            initial begin
+                #5 $readmemh("@W3@", aa);
+                #1 $display("e=%0d w=%0d n=%0d again=%0d", at_e, at_w, at_n, again_e);
+                $readmemh("@W3@", aa);
+                #1 $display("again=%0d n2=%0d", again_e, at_n2);
+                #1 $readmemh("@W4@", aa);
+                #1 $display("n2=%0d aa3=%h again=%0d", at_n2, aa[3], again_e);
+                fd = $fopen("@FB@", "rb");
+                rc = $fread(bb, fd);
+                $fclose(fd);
+                #1 $display("rc=%0d f=%0d", rc, at_f);
+            end
+        endmodule
+    )";
+    design = with_path(with_path(with_path(design, "@W3@", "clotho_readmem_aw3.hex"), "@W4@",
+                                 "clotho_readmem_aw4.hex"),
+                       "@FB@", "clotho_fread_aw.bin");
+    CHECK(run_capture(design) == "e=5 w=5 n=5 again=-1\n"
+                                 "again=-1 n2=-1\n"
+                                 "n2=8 aa3=44 again=-1\n"
+                                 "rc=3 f=9\n");
+    std::remove("clotho_readmem_aw3.hex");
+    std::remove("clotho_readmem_aw4.hex");
+    std::remove("clotho_fread_aw.bin");
+}
+
+// $fread into an associative array (note 70): the bytes of an element are read MSB-first and
+// the elements are those of the addresses from `start` (0 when it is not given), up to `count`
+// of them, never past the largest index, and none is created for the end of the file. An index of
+// a signed type has negative addresses; a start the index type does not have reads nothing and
+// warns, as for a memory.
+TEST_CASE("$fread into an associative array creates the elements the bytes fill") {
+    write_file("clotho_fread_af.bin", "\x11\x22\x33\x44\x55");
+    std::string design = R"(
+        module m;
+            logic [7:0] aa [int];
+            logic [15:0] a16 [int];
+            int ai [int];
+            bit [3:0] au [bit [3:0]];
+            integer fd, rc;
+            initial begin
+                fd = $fopen("@F@", "rb"); rc = $fread(aa, fd); $fclose(fd);
+                foreach (aa[k]) $write("%0d:%h ", k, aa[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(ai, fd); $fclose(fd);
+                foreach (ai[k]) $write("%0d:%h ", k, ai[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(a16, fd, 10, 2); $fclose(fd);
+                foreach (a16[k]) $write("%0d:%h ", k, a16[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(a16, fd, -3); $fclose(fd);
+                foreach (a16[k]) $write("%0d:%h ", k, a16[k]);
+                $display("rc=%0d", rc);
+                fd = $fopen("@F@", "rb"); rc = $fread(au, fd, 16);
+                $display("rc=%0d n=%0d next=%h", rc, au.num(), $fgetc(fd));
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    design = with_path(design, "@F@", "clotho_fread_af.bin");
+    CHECK(run_capture(design) == "0:11 1:22 2:33 3:44 4:55 rc=5\n"
+                                 "0:11223344 1:55000000 rc=5\n"
+                                 "10:1122 11:3344 rc=4\n"
+                                 "-3:1122 -2:3344 -1:5500 10:1122 11:3344 rc=5\n"
+                                 "rc=0 n=0 next=00000011\n");
+    CHECK(run_capture_stderr(design).find("warning: $fread start address 16 is outside the memory range [0:15]") !=
+          std::string::npos);
+    std::remove("clotho_fread_af.bin");
+}
+
+// A load that names no array or no file creates nothing: an invalid target (an index out of
+// range or with an x) does not open the file, a file that is empty or cannot be opened has no
+// number to create an element for.
+TEST_CASE("a memory load into an associative array that names no element or no file creates none") {
+    write_file("clotho_readmem_ax1.hex", "");
+    std::string design = R"(
+        module m;
+            logic [7:0] fa [0:2][int];
+            logic [7:0] aa [int];
+            integer k;
+            initial begin
+                k = 7;
+                $readmemh("clotho_readmem_ax_absent.hex", fa[k]);
+                k = 'x;
+                $readmemh("clotho_readmem_ax_absent.hex", fa[k]);
+                $readmemh("@X1@", aa);
+                $display("n=%0d", aa.num() + fa[0].num() + fa[1].num() + fa[2].num());
+                $readmemh("clotho_readmem_ax_absent.hex", aa);
+                $display("n=%0d", aa.num());
+            end
+        endmodule
+    )";
+    design                = with_path(design, "@X1@", "clotho_readmem_ax1.hex");
+    const std::string err = run_capture_stderr(design);
+    CHECK(run_capture(design) == "n=0\nn=0\n");
+    CHECK(count_substr(err, "cannot open file 'clotho_readmem_ax_absent.hex'") == 1);
+    std::remove("clotho_readmem_ax1.hex");
+}
+
+// What a memory load still refuses, loudly: an associative array whose index is not integral,
+// which a `$fread` has no address for (21.4.1; slang rejects it itself for a `$readmem`).
+TEST_CASE("a $fread into an associative array without an integral index is refused") {
+    const LowerResult r = lower_text("module m;\nlogic [7:0] a[string]; integer fd, rc; initial rc = $fread(a, fd);\nendmodule\n");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("needs an integral index type") != std::string::npos);
 }
 
 // Slurp a file written by a file-I/O test.
@@ -4409,20 +6703,24 @@ TEST_CASE("$fscanf %s into a string object from a file") {
     std::remove(path);
 }
 
-// A string destination is sanctioned for %s alone: the integer specifiers "may
-// be used to read into any of the integral data types" (LRM 21.3.4.3), which a
-// string object is not, and storing them would need 6.16's integral-to-string
-// conversion the scan engine does not do. Loud frontend refusal, per specifier.
-TEST_CASE("a non-%s conversion into a string destination is rejected") {
-    for (const char* conv : { "%d", "%h", "%c" }) {
-        const LowerResult r = lower_text(
-          std::string("module m; string s; int n; initial n = $sscanf(\"A\", \"") + conv +
-          "\", s); endmodule");
-        CHECK(!r.ok);
-        CHECK(r.diagnostic_text().find(std::string("$fscanf / $sscanf ") + conv +
-                                       " into a string object is not supported") !=
-              std::string::npos);
-    }
+// A numeric conversion into a string destination stores its value cast to string
+// (LRM 6.16), sized like an unsized literal (docs/LRM_NOTES.md): at least 32 bits,
+// signed for %d. LRM-derived (iverilog 13 asserts on this): 16706 is 0x4142, "AB";
+// %c of 'A' is "A"; -5 is FF FF FF FB.
+TEST_CASE("a non-%s conversion into a string destination stores the value cast to string") {
+    CHECK(run_capture(R"(
+        module m;
+            string a, b, c, d;
+            int n;
+            initial begin
+                n = $sscanf("16706", "%d", a);
+                n = $sscanf("4142", "%h", b);
+                n = $sscanf("A", "%c", c);
+                n = $sscanf("-5", "%d", d);
+                $display("[%s] [%s] [%s] %0d %h", a, b, c, d.len(), {d[0], d[1], d[2], d[3]});
+            end
+        endmodule
+    )") == "[AB] [AB] [A] 4 fffffffb\n");
 }
 
 // An unpacked aggregate destination: the integer specifiers "shall not be used

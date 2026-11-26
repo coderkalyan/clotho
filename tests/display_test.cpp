@@ -1000,19 +1000,22 @@ TEST_CASE("%p of a chandle / event / virtual-interface handle (LRM 21.2.1.6)") {
         )");
         CHECK(out == "q: '{chandle, null}\n");
     }
-    // A virtual-interface handle in a container is the one shape still refused at
-    // TYPE lowering (LRM 25.9; guard_container_element does not admit it), pinned
-    // so the diagnostic stays the accurate one and does not silently become a
-    // `%p` refusal instead.
-    SUBCASE("a queue of virtual-interface handles is refused by the container, not by %p") {
-        check_rejected(R"(
+    // A queue of virtual-interface handles renders each element as a direct
+    // operand does: the interface name, or null.
+    SUBCASE("a queue of virtual-interface handles renders its elements") {
+        const std::string out = run_capture(R"(
             interface some_if; logic d; endinterface
             module m;
                 some_if bus();
                 virtual some_if q [$];
-                initial $display("%p", q);
+                initial begin
+                    q.push_back(bus);
+                    q.push_back(null);
+                    $display("q: %p", q);
+                end
             endmodule
-        )", "queue element type is not supported");
+        )");
+        CHECK(out == "q: '{some_if, null}\n");
     }
     // A RUNTIME format string marshals its arguments through `rt_arg`, which carries
     // one integral / real / string value, and the frontend cannot know which specifier

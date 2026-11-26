@@ -1,0 +1,61 @@
+diff --git a/source/ast/builtins/QueryFuncs.cpp b/source/ast/builtins/QueryFuncs.cpp
+index 6d94e688c..f53935ffc 100644
+--- a/source/ast/builtins/QueryFuncs.cpp
++++ b/source/ast/builtins/QueryFuncs.cpp
+@@ -12,6 +12,7 @@
+ #include "slang/ast/SystemSubroutine.h"
+ #include "slang/ast/expressions/MiscExpressions.h"
+ #include "slang/ast/symbols/ParameterSymbols.h"
++#include "slang/ast/types/AllTypes.h"
+ #include "slang/ast/types/TypePrinter.h"
+ #include "slang/diagnostics/ConstEvalDiags.h"
+ #include "slang/diagnostics/SysFuncsDiags.h"
+@@ -20,6 +21,33 @@ namespace slang::ast::builtins {
+ 
+ using namespace syntax;
+ 
++// Whether a value of this type is, or streams through, a class handle: an unpacked
++// struct, union or array of any kind with one among its members or elements. Streaming
++// a non-null handle walks the object it refers to and skips a null one (IEEE 1800-2023
++// 11.4.14.1), so such a value has as many bits as the objects have, which no type fixes.
++static bool streamsClassHandle(const Type& type) {
++    auto& ct = type.getCanonicalType();
++    if (ct.isClass())
++        return true;
++
++    if (ct.isUnpackedArray())
++        return streamsClassHandle(*ct.getArrayElementType());
++
++    if (ct.isUnpackedStruct()) {
++        for (auto field : ct.as<UnpackedStructType>().fields) {
++            if (streamsClassHandle(field->getType()))
++                return true;
++        }
++    }
++    else if (ct.isUnpackedUnion()) {
++        for (auto field : ct.as<UnpackedUnionType>().fields) {
++            if (streamsClassHandle(field->getType()))
++                return true;
++        }
++    }
++    return false;
++}
++
+ class BitsFunction : public SystemSubroutine {
+ public:
+     BitsFunction() : SystemSubroutine(KnownSystemName::Bits, SubroutineKind::Function) {}
+@@ -62,7 +90,13 @@ public:
+             return nullptr;
+ 
+         uint64_t width;
+-        if (args[0]->type->isFixedSize()) {
++        // The size of a class handle's type is not what $bits counts (see
++        // streamsClassHandle), so an operand that streams one is no elaboration-time
++        // constant even when its type has a fixed size: it is evaluated as a dynamically
++        // sized operand is, and a variable has no constant value. A data type has no
++        // object, and keeps its size.
++        if (args[0]->type->isFixedSize() &&
++            (args[0]->kind == ExpressionKind::DataType || !streamsClassHandle(*args[0]->type))) {
+             width = args[0]->type->getBitstreamWidth();
+         }
+         else {

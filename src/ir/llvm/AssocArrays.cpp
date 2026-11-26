@@ -1037,12 +1037,27 @@ void Backend::lower_assoc_traverse(Index i, Inst::Tag tag) {
         status = b_.CreateCall(assoc_end_fn(tag == Inst::Tag::AssocLast),
                                { handle, outptr, outlen });
     } else {
-        // next / prev take the current key as a PROBE (LRM 7.9.4 allows one that
-        // is not present), so an x/z probe is normalized as its must bits rather
-        // than gated -- the clause defines no invalid-probe behaviour.
+        // next / prev take the current key as a PROBE (LRM 7.9.6 / 7.9.7), which an x or z bit
+        // makes an invalid index (7.8.4, 7.8.6; docs/LRM_NOTES.md note 74): the call finds no
+        // entry, returns 0, leaves the argument alone and warns as any invalid index does.
         const auto cur = normalize_assoc_key_lvalue(key_lv, aa.assoc_type);
         status =
           b_.CreateCall(assoc_step_fn(tag == Inst::Tag::AssocPrev), { handle, cur.ptr, cur.len, outptr, outlen });
+        if (cur.valid != nullptr) {
+            if (sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+                const Guarded arr = lvalue_of(p.op);
+                emit_bounds_report(BoundsCheck{
+                                     .inrange = cur.valid,
+                                     .index   = b_.getInt64(0),
+                                     .unknown = b_.getInt1(true),
+                                     .extent  = b_.getInt64(0),
+                                     .site    = bounds_site_global(loc_text(i), loc_text(i), bounds_name(arr),
+                                                                   BoundsWhat::AssocKey, 0, 0),
+                                   },
+                                   /*is_write=*/false);
+            }
+            status = b_.CreateSelect(cur.valid, status, zero(32));
+        }
     }
     auto* got  = b_.CreateICmpNE(status, zero(32));
     auto* fn   = b_.GetInsertBlock()->getParent();

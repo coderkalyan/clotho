@@ -20,6 +20,16 @@ llvm::StructType* Backend::agg_leaf_slot_ty(Ref type) {
 // and a leaf slot for each scalar / string / real. Unlike the flat memory
 // path this does NOT flatten array dimensions, so arbitrary nesting
 // (array-of-struct, struct-with-array-member, ...) is a direct mirror.
+//
+// NOTE: one StructType per list of field types, as slot_type is one per shape,
+// not one per struct type or per use. scope_type gives the instances of a
+// definition one state struct only when their field types are the same objects,
+// and the pool does not merge struct types with the same members: each
+// declaration the front end lowers interns its own. A type per use gave each
+// instance with an unpacked struct member a state struct of its own, so the
+// port layout that the instances of a definition share split, and code a
+// virtual interface handle runs against the representative's layout read
+// another instance's record.
 llvm::Type* Backend::agg_storage_ty(Ref type) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::UnpackedArray) {
@@ -30,7 +40,11 @@ llvm::Type* Backend::agg_storage_ty(Ref type) {
         for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
             fields.push_back(agg_storage_ty(f.type));
         }
-        return llvm::StructType::create(ctx_, fields, "clotho.agg");
+        const auto [it, fresh] = agg_struct_tys_.try_emplace(std::move(fields), nullptr);
+        if (fresh) {
+            it->second = llvm::StructType::create(ctx_, it->first, "clotho.agg");
+        }
+        return it->second;
     }
     if (t.kind == Type::Kind::String) {
         return str_slot_ty();
@@ -169,16 +183,21 @@ Guarded Backend::agg_member(Guarded lv, Ref struct_type, uint32_t field_index) {
     lv.agg_path.push_back(b_.getInt32(field_index + class_header_words(struct_type)));
     lv.agg_field_path.push_back(field_index);
     // The change notifiers of a waited-on class property (LRM 9.4.2), resolved
-    // here because this is the one member-GEP chokepoint. Only for a property off
-    // the body, so `chg_body` is that body and a notifier is a sibling field of
-    // it. Assigned unconditionally, so descending into an interior aggregate
-    // clears it: a notifier belongs to the whole property, not to a leaf in it.
-    lv.chg = off_body ? mod_.change_notify(struct_type, field_index) : nullptr;
-    if (lv.chg != nullptr) {
-        // Only a property off the body, where no select has been applied yet, so the
-        // place cannot be invalid and the body pointer is the root itself.
-        lv.chg_body    = lv.unguarded().base;
-        lv.chg_body_ty = lv.root_ty;
+    // here because this is the one member-GEP chokepoint. Found only for a property off
+    // the body, so `chg_body` is that body and a notifier is a sibling field of it.
+    // Descending into an aggregate property KEEPS it: the property is one variable (LRM
+    // 9.4.2.2), so a store to any member of it is a change of it, classified on the leaf
+    // by the bracket a scalar property's store rides. Nothing else has one to keep: a
+    // scalar has no member, and a container's elements are selected through ElemSelect,
+    // which builds a fresh place.
+    if (off_body) {
+        lv.chg = mod_.change_notify(struct_type, field_index);
+        if (lv.chg != nullptr) {
+            // Only a property off the body, where no select has been applied yet, so the
+            // place cannot be invalid and the body pointer is the root itself.
+            lv.chg_body    = lv.unguarded().base;
+            lv.chg_body_ty = lv.root_ty;
+        }
     }
     // The write barrier's precision knob (§7): a member that cannot reach a class
     // handle cannot be the store that needs remembering, so `obj.count = 5` and
@@ -876,10 +895,16 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
     // the change with a memcmp of old dest vs new source *before* the copy.
     const bool service = !silent_stores_ && dlv.is_signal &&
                          signal_has_waiters(dlv.sig);
-    // A whole-object copy into a `ref` formal wakes through the call's thunk, when the bytes change.
+    // A blocking whole-object copy into a `ref` formal wakes through the call's thunk, when the bytes change.
     const bool ref_service = !silent_stores_ && dlv.ref_wake_fn != nullptr;
+    // And one into a waited-on class property, or a member or element of one (LRM 9.4.2.2:
+    // the property is one variable), fires its any-change notifier, when the bytes change.
+    const bool chg_service = !silent_stores_ && dlv.chg != nullptr;
+    if (chg_service && !dlv.chg->wants(Edge::Any)) {
+        throw BackendError{ "internal: aggregate class property change notifier with no any-change field" };
+    }
     llvm::Value* changed = nullptr;
-    if (service || ref_service) {
+    if (service || ref_service || chg_service) {
         auto cmp = rt_fn("memcmp", b_.getInt32Ty(),
                          { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
         changed   = b_.CreateICmpNE(
@@ -902,6 +927,15 @@ void Backend::emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const Gu
         b_.CreateCondBr(changed, svc, cont);
         b_.SetInsertPoint(svc);
         emit_ref_wake_call(dlv.ref_wake_fn, dlv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    } else if (chg_service) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* svc  = llvm::BasicBlock::Create(ctx_, "aggcopy.chg", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "aggcopy.cont", fn);
+        b_.CreateCondBr(changed, svc, cont);
+        b_.SetInsertPoint(svc);
+        fire_prop_notifier(dlv, Edge::Any);
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }

@@ -456,9 +456,9 @@ llvm::Value* Backend::lv_handle_ptr(const Guarded& g, HandleUse use) {
     return g.pointer_or(b_, form, sink);
 }
 
-// Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or
-// emit nothing at all when the property carries none -- which is every property
-// in a design that waits on no container.
+// Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or that of the
+// aggregate property the container is a member of, or emit nothing at all when the
+// property carries none -- which is every property in a design that waits on no container.
 //
 // UNCONDITIONAL, unlike the integral service_change_notify: the property's value
 // is the container's CONTENTS, and `q.size()` is computed rather than stored, so
@@ -505,9 +505,9 @@ void Backend::notify_container_mutation(const LValueInfo& lv) {
         }
         return;
     }
-    if (!lv.chg->container) {
-        return;
-    }
+    // A container property's own notifier, or that of the aggregate property the container
+    // is a member of: either way the property changed, and every such property carries an
+    // any-change notifier.
     if (!lv.chg->wants(Edge::Any)) {
         throw BackendError{ "internal: container change notifier with no any-change field" };
     }
@@ -1150,9 +1150,13 @@ void Backend::lower_queue_append_range(Index i) {
     const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
     const uint64_t bound_v = std::get<Type>(mod_.pool.get(qs.queue_type)).left;
     llvm::Value* bound = queue_bound_of(lvalue_of(p.op), bound_v);
-    // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
-    llvm::Value* lo = cast(must_of(qs.lo), 64, /*sign=*/true);
-    llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
+    // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); the lowering widened each by
+    // its own signedness. An x or z bit in either makes the slice empty (LRM 7.10.1: lo > hi).
+    llvm::Value* lo = select_index(value_of(qs.lo), type_of(qs.lo));
+    llvm::Value* hi = select_index(value_of(qs.hi), type_of(qs.hi));
+    llvm::Value* bad = b_.CreateOr(any_unknown(qs.lo), any_unknown(qs.hi));
+    lo               = b_.CreateSelect(bad, b_.getInt64(1), lo);
+    hi               = b_.CreateSelect(bad, b_.getInt64(0), hi);
     // A slice append copies a range of elements in. See lower_queue_push.
     emit_gc_barrier_for(lvalue_of(p.op));
     queue_engine_call(queue_append_range_fn(),

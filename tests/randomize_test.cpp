@@ -869,32 +869,89 @@ TEST_CASE("unimplemented rand forms are refused, each by its own message") {
         CHECK(s.err.find("rand properties of this type are not supported") != std::string::npos);
         CHECK(s.out.find("unreachable") == std::string::npos);
     }
+}
 
-    CHECK(lower_error(R"(
+// LRM 18.13.4 / 18.13.5 on an object: a state captured and restored replays the same
+// draws, an object seeded alike draws alike, and the string is the 64 hex digits the
+// process form gives. Also through a base handle to a derived class. Oracle: the LRM
+// contract (the string's format is implementation-defined); iverilog 13 has no classes
+// with randomize.
+TEST_CASE("object randstate round-trips") {
+    constexpr std::string_view src = R"(
         module m;
-            class C;
-                rand bit [3:0] x;
-            endclass
+            class C; rand bit [31:0] v; endclass
+            class D extends C; rand bit [7:0] w; endclass
             initial begin
-                automatic C c = new();
-                string s;
+                C c = new();
+                C b;
+                D d = new();
+                string s, t;
+                bit [31:0] x, y, z;
                 s = c.get_randstate();
+                void'(c.randomize()); x = c.v;
+                c.set_randstate(s);
+                void'(c.randomize()); y = c.v;
+                b = d;
+                t = b.get_randstate();
+                void'(b.randomize()); z = d.v;
+                b.set_randstate(t);
+                void'(b.randomize());
+                $display("%0d %0d %0d", s.len(), x == y, z == d.v);
             end
         endmodule
-    )")
-            .find("get_randstate / set_randstate are not supported")
-          != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "64 1 1\n");
+}
 
-    CHECK(lower_error(R"(
+// An object owns a generator iff its class can be the receiver of randomize, srandom,
+// get_randstate or set_randstate (docs/LRM_NOTES.md note 63), rand property or not. So the
+// pair works on a class with no rand member, srandom seeds it reproducibly, and it works
+// through a base handle to a derived object. Oracle: LRM 18.13.3-18.13.5, 18.14.
+TEST_CASE("object randstate and srandom on a class with no rand property") {
+    constexpr std::string_view src = R"(
         module m;
-            class C;
-                rand bit [3:0] x;
-            endclass
-            initial begin automatic C c = new(); c.set_randstate("z"); end
+            class B; int x; endclass
+            class D extends B; int y; endclass
+            initial begin
+                B b = new();
+                D d = new();
+                B h;
+                string s, t, u, v;
+                b.srandom(5); s = b.get_randstate();
+                b.srandom(9); t = b.get_randstate();
+                b.srandom(5); u = b.get_randstate();
+                b.set_randstate(t); v = b.get_randstate();
+                h = d;
+                h.srandom(3); s = h.get_randstate();
+                d.srandom(7); d.srandom(3); t = d.get_randstate();
+                h.srandom(4); h.set_randstate(t);
+                $display("%0d %0d %0d %0d", u.len(), v == b.get_randstate(), s == t, h.get_randstate() == t);
+            end
         endmodule
-    )")
-            .find("get_randstate / set_randstate are not supported")
-          != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "64 1 1 1\n");
+}
+
+// A class nothing calls randomize / srandom / get_randstate / set_randstate on keeps no
+// generator and draws nothing from the creating thread at `new`; one that is used that way
+// draws exactly one value (docs/design/constrained-randomization.md section 9.1).
+TEST_CASE("only a class used for randomization draws from the creating thread at new") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Free; int x; endclass
+            class Used; int x; endclass
+            initial begin
+                Free f;
+                Used u;
+                int a, b, c, r;
+                r = $urandom(11); a = $urandom;
+                r = $urandom(11); f = new(); b = $urandom;
+                r = $urandom(11); u = new(); u.srandom(1); c = $urandom;
+                $display("%0d %0d", a == b, a == c);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 0\n");
 }
 
 // srandom on a class with no rand property is a no-op rather than a refusal: the

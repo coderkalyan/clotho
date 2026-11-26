@@ -159,13 +159,17 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             return { scratch.data(), 1 };
 
         case Inst::PayloadKind::TimeFormat: {
-            // timeformat: units / precision / min_width are SSA operands; the
-            // suffix bytes are not.
+            // timeformat: units / precision / min_width are SSA operands, and so is
+            // a runtime suffix; a literal suffix's bytes are not.
             const auto info = extra_data<TimeFormatInfo>(p.extra);
             scratch[0]      = info.units;
             scratch[1]      = info.precision;
             scratch[2]      = info.min_width;
-            return { scratch.data(), 3 };
+            if (info.suffix_value == kNoFormatValue) {
+                return { scratch.data(), 3 };
+            }
+            scratch[3] = info.suffix_value;
+            return { scratch.data(), 4 };
         }
 
         case Inst::PayloadKind::OpExtra:
@@ -235,12 +239,14 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[1]     = dps.offset;
                 return { scratch.data(), 2 };
             }
-            // fread_mem exposes its fd value plus the optional start / count
-            // operands; the target memory is a Signal handle, not an operand.
+            // fread_mem exposes its fd value, its target lvalue and the optional start
+            // / count operands; the base of an indexed slice is a tail operand
+            // (ExtraOperandTail::MemSliceBase).
             if (tag == Inst::Tag::FreadMem) {
                 const auto fm = extra_data<FreadMemInfo>(p.op_extra.extra);
                 size_t     n  = 0;
                 scratch[n++]  = p.op_extra.op;
+                scratch[n++]  = fm.target;
                 if (fm.has_start) {
                     scratch[n++] = fm.start;
                 }
@@ -249,12 +255,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 }
                 return { scratch.data(), n };
             }
-            // read_mem exposes its filename value plus the optional start / finish
-            // address operands; the target memory is a Signal handle, not an operand.
+            // read_mem exposes its filename value, its target lvalue and the optional
+            // start / finish address operands.
             if (tag == Inst::Tag::ReadMem) {
                 const auto rm = extra_data<ReadMemInfo>(p.op_extra.extra);
                 size_t     n  = 0;
                 scratch[n++]  = p.op_extra.op;
+                scratch[n++]  = rm.target;
                 if (rm.has_start) {
                     scratch[n++] = rm.start;
                 }
@@ -465,7 +472,9 @@ Ir Ir::rebased(HandleMapper& m) const {
 
     const auto sig = [&](Signal s) { return static_cast<Signal>(m.map(F::Signal, static_cast<uint32_t>(s))); };
     const auto fn = [&](FunctionId f) { return static_cast<FunctionId>(m.map(F::Function, static_cast<uint32_t>(f))); };
-    const auto target = [&](uint32_t id) { return id == kNoDisableTarget ? id : m.map(F::DisableTarget, id); };
+    const auto target = [&](uint32_t id) {
+        return id == kNoDisableTarget || id == kDisableOwnTarget ? id : m.map(F::DisableTarget, id);
+    };
 
     // Records are read from this body and written into the copy, so a record two
     // instructions share is rebased once, not twice.
@@ -569,24 +578,17 @@ Ir Ir::rebased(HandleMapper& m) const {
                 put_extra(extra, p.op_extra.extra, info);
                 break;
             }
-            case T::ReadMem: {
-                auto info   = extra_data<ReadMemInfo>(p.op_extra.extra);
-                info.target = sig(info.target);
-                put_extra(extra, p.op_extra.extra, info);
-                break;
-            }
-            case T::FreadMem: {
-                auto info = extra_data<FreadMemInfo>(p.op_extra.extra);
-                info.mem  = sig(info.mem);
-                put_extra(extra, p.op_extra.extra, info);
-                break;
-            }
             case T::NamedBlock: {
                 auto info  = extra_data<BlockInfo>(p.extra);
                 info.label = target(info.label);
                 put_extra(extra, p.extra, info);
                 break;
             }
+            // The target is an lvalue operand, remapped through its own Signal
+            // instruction, so these records hold no table handle.
+            case T::ReadMem:
+            case T::FreadMem:
+                break;
             // A wait site is an identity within its body (SyncInfo::site), not a
             // handle into any table.
             case T::SyncWait:

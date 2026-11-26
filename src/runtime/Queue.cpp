@@ -250,7 +250,7 @@ extern "C" void rt_queue_grow(rt_queue* h, uint64_t stride, uint64_t need, const
 //   - push_back puts the new element at logical len, so what gets dropped is the
 //     element just pushed, and the push has no visible effect.
 // Both fall out of "keep the first bound + 1"; neither direction is special-
-// cased below. LRM 7.10.5 does not pin the choice (docs/LRM_NOTES.md, note 6).
+// cased below. LRM 7.10.5 discards what lies beyond the bound (docs/LRM_NOTES.md, note 6).
 extern "C" void rt_queue_drop_tail(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const rt_alloc_site* site) {
     assert(bound != 0 && "an unbounded queue drops nothing");
     assert(h->len > bound + 1 && "only a queue past its bound drops its tail");

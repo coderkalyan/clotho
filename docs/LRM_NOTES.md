@@ -48,12 +48,15 @@ Code: `src/lower/Expr.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slic
 
 ## 6. Overflowing a bounded queue (7.10.5)
 
-7.10.5 does not say which end an overflowing write gives up [unverified wording; the
-LRM PDF was not at hand for the section number]. Clotho always keeps the first
-`bound + 1` elements, on every write: whole assignment (from a queue, a dynamic or
-fixed array, a slice, a concatenation or pattern, a function result, a task output
-copied back, a nonblocking assignment, an input formal's copy-in, an element of a
-container of bounded queues), `push_back`, `push_front` and `insert`. So `push_front`
+7.10.5 says a write to a bounded queue behaves "exactly as if the queue were unbounded
+except that if, after any operation that writes to a bounded queue variable, that
+variable has any elements beyond its bound, then all such out-of-bounds elements shall be
+discarded and a warning shall be issued", and 7.10.3 says `insert` or `push_front` on a
+bounded queue deletes "the highest-numbered element" when the new size exceeds the bound.
+Clotho keeps the first `bound + 1` elements, on every write: whole assignment (from a
+queue, a dynamic or fixed array, a slice, a concatenation or pattern, a function result,
+a task output copied back, a nonblocking assignment, an input formal's copy-in, an element
+of a container of bounded queues), `push_back`, `push_front` and `insert`. So `push_front`
 drops the old tail, `push_back` onto a full queue has no effect, and `insert` follows
 the same rule. Every overflowing operation prints one run-time warning on stderr, never
 suppressed, naming the queue (when it is a design variable) and giving the element count
@@ -159,9 +162,15 @@ Code: `src/lower/Statements.cpp` (`lower_predicate`), `src/lower/Expr.cpp` (`low
 ## 18. `unique` and `priority` violation reports (12.4.2, 12.5.3)
 
 12.4.2 and 12.5.3 defer a violation report to the Observed region, and 12.4.2.1
-clears a pending report when its process reaches a flush point first. Clotho
-queues the report and issues it in the Observed region, and drops it if its thread
-reached a flush point of 16.4.2 meanwhile: an activation start, or a resume from an
+(which 12.5.3.1 applies to `case`) discards a pending report when its process reaches
+a violation report flush point first: a resume after suspending on an event control or
+`wait`, or an `always_comb` / `always_latch` resumed by a dependent signal. These are
+the first two flush points of 16.4.2; its third, disabling the process's outermost
+scope, is not one for violation reports: a report whose process is disabled still
+matures in the Observed region, though a deferred assertion's report is dropped there
+(16.4.4). The two share one generation counter per process; a `disable` bumps its
+high half, which a violation report ignores. Clotho queues the report and issues it in the Observed region, and drops it if its thread
+reached a flush point meanwhile: an activation start, or a resume from an
 event control or `wait`, including one inside a task or function-called task the
 thread entered (the generation travels with the call, docs/design/disable.md). So a
 zero-delay glitch of the condition reports nothing, as a deferred assertion's does.
@@ -248,9 +257,19 @@ Code: `src/runtime/Random.cpp` (`rt_urandom_seed`). Tests: `tests/sysfunc_test.c
 18.16 forms the weight sum with unsigned addition at the widest weight's
 precision. Clotho applies that literally, so a sum that does not fit wraps
 (`8'd200 + 8'd100` is 44 in 8 bits, and the first branch always wins), and an
-all-zero sum takes no branch.
+all-zero sum takes no branch. The same holds past 32 bits: `64'hFFFF_FFFF_FFFF_FFFF
++ 64'd2` is 1, and a negative `longint` weight is its unsigned value.
 
-Code: `src/lower/Random.cpp` (`lower_randcase`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)").
+The draw over a sum of at most 32 bits is one `$urandom_range(sum - 1, 0)`. A wider
+sum takes the multi-draw scheme 18.16 names ("multiple calls to `$urandom_range()`
+to handle numbers greater than 32 bits") without fixing it: `ceil(width / 32)`
+`$urandom` words are stitched, masked to the bit length of `sum - 1` and redrawn
+while the result is not below the sum, which keeps the split exactly uniform. The
+draw count is then data-dependent (under two attempts on average) but a function of
+the process stream alone, so it stays thread-stable. `randsequence` rule weights
+(18.17.1) share the draw.
+
+Code: `src/lower/Random.cpp` (`lower_randcase`, `emit_weight_draw`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)", "randcase weights wider than 32 bits split by their ratio (LRM 18.16)", "randcase wide weights are unsigned and the sum wraps (LRM 18.16)"), `tests/randsequence_test.cpp` ("randsequence rule weights wider than 32 bits (LRM 18.17.1)").
 
 ## 27. `$bits` of a string (20.6.2)
 
@@ -739,9 +758,10 @@ Code: `src/runtime/Io.cpp` (`rt_fread`), `src/runtime/Reports.cpp` (`rt_fread_ra
 
 ## 56. Negative, NaN and infinite real delays (9.4.1, 6.12.1)
 
-9.4.1 reads a negative delay as a two's-complement unsigned time, and a real
-delay is first rounded to the time precision, ties away from zero (6.12.1). Clotho
-applies both in that order, so `#(-1.5)` under a 1ns precision rounds to -2 and
+9.4.1 reads a negative delay as a two's-complement unsigned time, and 3.14.1 rounds a
+delay to the time precision before use but does not say how a tie rounds, so Clotho
+takes 6.12.1's rule for a real converted to an integer, away from zero. It rounds
+first and then applies 9.4.1, so `#(-1.5)` under a 1ns precision rounds to -2 and
 waits 2**64 - 2 ticks, which never fires, and `#(-0.4)` rounds to 0 and fires at
 once. The LRM says nothing of NaN or infinity. Clotho reads NaN as 0, as LLVM's
 saturating float-to-integer conversion gives, and saturates an infinity, like any
@@ -750,3 +770,394 @@ tick count beyond 63 bits, at the largest count of its sign, so `#(1.0/0.0)` and
 delays and continuous-assignment delays alike.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`, `saturating_ticks`), `src/ir/llvm/Ops.cpp` (`lower_ftoi`). Tests: `tests/real_test.cpp` ("a negative or NaN real delay reads as an unsigned time after rounding", "a real delay beyond 2**63 ticks saturates instead of wrapping into an early event"). Oracle: iverilog 13 for the negative and runtime NaN cases; its runtime and constant answers disagree for NaN and infinity.
+
+## 57. Inferred sensitivity through a handle (9.4.2.2, 9.2.2.2.1, 25.9)
+
+9.4.2.2 adds "all nets and variables that are read by the statement" to `@*`, so a
+class property read through a handle (`obj.x`) and a virtual-interface member
+(`vif.a`) wake an `@*` on a change of the member and on a change of the handle, which
+is itself a variable read. 9.2.2.2.1 says "References to class objects and method calls
+of class objects do not add anything to the sensitivity list of an always_comb, except
+for any contributions from argument expressions", so `always_comb` over `obj.x` waits
+on neither the member nor `obj`. A method call of a class object is the same: the
+handle it is called on adds nothing, and neither does anything the method's body reads
+(a module variable included), while its argument expressions do, and so does what only
+selects the object (`objs[i].get()` waits on `i`). `@*`, `wait` and `@(expr)` read the
+handle of such a call as they read any variable (9.4.2.2, 9.4.3). A virtual interface is
+not a class object, so `always_comb` over `vif.a` waits on the member and on `vif`, and
+a method called through one is a hierarchical call, analyzed as a normal function. A
+static property is a variable of the class, not a reference through an object, and
+keeps its own signal, and a static method called by its class scope is a normal
+function too. A body that reads through a handle cannot be statically subscribed, so it
+waits in its own loop and an `always_comb` of that kind is self-starting and queued late,
+so its time-zero run is note 44's. iverilog 13 runs an always_comb that calls a method
+again when the handle or a variable the method reads changes, against the clause; the
+decision follows the clause.
+
+Code: `src/lower/Scans.cpp` (`SensitivityCollector::handle(MemberAccessExpression)`, `handle(CallExpression)`), `src/lower/Timing.cpp` (`emit_inferred_park`, `lower_inferred_loop`). Tests: `tests/event_test.cpp` ("always @* wakes on a class property and on its handle" and the five after it), `tests/class_test.cpp` (the two on a method call and an always_comb). No oracle parses the property and virtual-interface designs; iverilog 13 parses the method-call ones and disagrees, as said.
+
+## 58. Event control over a handle's members, in a list (9.4.2, 9.4.2.1, 9.4.2.3, 8.4, 25.9)
+
+9.4.2: "A non-edge implicit event shall be detected on any change in the value of the
+expression. However, an edge event shall be detected only on the LSB of the expression."
+9.4.2.1 makes a list the logical OR of its events, and 9.4.2.3 gates a term with `iff`:
+"This type of expression is evaluated when a changes and not when enable changes." A term
+that reaches a class property or a virtual-interface member names its storage only once its
+handle is read, so the wait cannot be a static subscription or a net driven from time zero.
+Clotho waits in one loop (`lower_sampled_event_wait`, the one a method call in an event
+control uses too, docs/design/classes.md) that samples every term of a list made only of
+such terms, a property or a member by itself included: it parks on
+everything the terms read (a member's waiter list in the instance a handle names, a
+property's any-change notifier in the object, a signal's bucket) and, on each wake, compares
+every term with its sample: a change of value, or for `posedge`, `negedge` and `edge` the
+Table 9-2 edge of bit 0, with the term's own `iff` evaluated at that point. The list resumes
+when any term fires. A wake does not say which source woke it, so a change that reverts
+before the waiter runs is missed (docs/design/scheduler-rules.md R9). That is why a list
+mixing such a term, one that reads a property or a member inside a larger expression, with
+a signal or an event is refused for now: the signal's and the event's
+own waits catch what the comparison loses (a pulse that reverts, a second trigger in the step
+the wait began in), and keeping that needs a per-registration fired marker in the wait node.
+A property or a member by itself in a list with signals and events keeps its own wait source
+and the signal's pulse. `->> @(m) e` and `x <= @(m) y` over such a member are refused for the
+same reason: they register a detached subscription on a signal and edge.
+
+8.4 makes an access through a null object handle illegal, with an indeterminate result that
+"implementations may issue an error", and 25.9 says "Attempting to use a null virtual
+interface shall result in a fatal run-time error". An explicit control evaluates its
+expression where the wait begins, so a null handle in any term of a list, or in a lone
+compound term, is a located fatal at the wait, as for `@(obj.x)`. An inferred `@*` is
+different (note 57): it reads nothing until its body runs, so it waits on the handle.
+
+Code: `src/lower/Timing.cpp` (`classify_event_control`, `lower_sampled_event_wait`), `src/lower/Scans.cpp` (`event_expr_reads_heap`, `WaitPropScan::handle(EventListControl)`). Tests: `tests/event_test.cpp` ("an event list with a class property term wakes on each of its terms" and the three after it), `tests/interface_test.cpp` ("virtual interface: an event list over member expressions" and the four after it), `tests/heap_wait_test.cpp` (the four on a list of heap terms). No oracle parses these designs; the plain-signal analogs of the edge and list traces agree with iverilog 13.
+
+## 59. `$bits` of a class data type (20.6.2, 6.24.3)
+
+20.6.2 defines `$bits ( data_type )` and sizes a data type only by example: for a struct of
+`logic valid; bit [8:1] data;` it "shall return 9, the number of data bits needed by a
+variable of type MyType", and "The $bits function can be used as an elaboration-time constant
+when used on fixed-size data types". 6.24.3 lists "Unpacked arrays, structures, or classes of
+the preceding types" among the bit-stream types. Neither gives a class type a size: a handle
+of the type can refer to an object of any derived class, and 11.4.14.1 streams "each data
+member of the referenced object, and not the handle itself", the members of a base class
+first, and skips a null handle. Clotho keeps the value slang gives the type: the bits of its
+properties, the base class's first, so `$bits(B)` is 32 for `class B; int a; endclass` and
+`$bits(D)` is 96 for `class D extends B; int b, c; endclass`, in a statement and as an
+elaboration-time constant. The expression form on a handle has the 11.4.14.1 answer, the
+members of the object it refers to (96 for a `B` handle to a `D` object, 0 for a null one),
+which no type fixes, so it is refused until class-handle streaming exists.
+
+Code: `src/lower/SystemTasks.cpp` (the `$bits` fold in `lower_sysfunc`, `bits_of_expr`). Tests: `tests/sysfunc_test.cpp` ("$bits of a class data type is the bits of its properties, base class first", "$bits of an operand that holds a class handle is refused"). iverilog 13 rejects the class data type ("Invalid data type for $bits()"), so no oracle covers it; the reading keeps slang's value.
+
+## 60. A runtime width on an indexed queue slice (7.4.5, 7.10.1)
+
+Deliberate deviation. 7.4.5 says "The size of the part-select or slice shall be constant, but the
+position can be variable", and 7.4.6 writes the slice `A[i+:c]` with a constant `c`. 7.10.1 exempts a
+queue's `Q[a:b]` only: "the slice bounds may be arbitrary integral expressions and, in particular,
+are not required to be constant expressions". It does not mention `Q[i +: n]`. Clotho also accepts a
+runtime width `n` there (slang accepts it too). The slice is well defined for any `n`: it is the
+`Q[a:b]` slice with `a = i`, `b = i + n - 1` for `+:` and `a = i - n + 1`, `b = i` for `-:`, so it clamps
+against the queue's length and yields the empty queue for a width below 1 exactly as `Q[a:b]` does.
+Rejecting it would break designs that run correctly.
+
+Code: `src/lower/Containers.cpp` (`append_queue_pieces`, the indexed range-select case). Tests: `tests/queue_test.cpp` ("queue indexed part-select slice", whose `q[2 +: n]` case has a runtime width). Oracle: none; iverilog 13 crashes compiling any indexed part-select of a queue.
+
+## 61. `option.detect_overlap` reports only `bins` bins (19.7, Table 19-1)
+
+Table 19-1: "When true, a warning is issued if there is an overlap between the range list (or transition list) of two bins of a coverpoint." The clause does not say whether `ignore_bins` and `illegal_bins` are among "two bins". 19.5.5 removes an ignored value from every coverage bin and 19.5.6 flags an illegal one, so sharing values with them is what they are written to do. Clotho warns, once per pair, only between bins declared with `bins`.
+
+Code: `src/lower/Coverage.cpp` (`cover_report_overlaps`). Tests: `tests/coverage_test.cpp` ("coverage: detect_overlap warns on overlapping bins").
+
+## 62. `start()` and `stop()` on a coverpoint (19.8, Table 19-5)
+
+Table 19-5 gives `start()` and `stop()` to covergroup, coverpoint and cross, as "Starts collecting coverage information" and "Stops collecting coverage information", and says no more. Clotho reads the covergroup's switch and each coverpoint's as independent: a coverpoint counts a sample only while both are on, and neither call undoes the other.
+
+Code: `src/runtime/Coverage.cpp` (`rt_cover_start_point`, `rt_cover_hit`). Tests: `tests/coverage_test.cpp` ("coverage: stop and start on a coverpoint").
+
+## 63. Which objects own an RNG (18.14.1, 18.14.2, 18.13.3-18.13.5)
+
+18.14.1 gives every object "an independent RNG" seeded at `new` from the creating thread (or the initialization RNG for a static declaration initializer). A generator nothing can observe is not observable, so Clotho gives one only to a class that can be the receiver of `randomize`, `srandom`, `get_randstate` or `set_randstate`: a compile-time scan marks the static receiver type of every such call (an implicit receiver is the enclosing class), and a class owns the generator when any class in its base chain is marked, since a base-typed handle may hold a derived object. Other classes keep no RNG and draw nothing at `new`. This is indistinguishable from giving every object an RNG: the generator is read only through those four methods, and an unmarked class has none of them called on it, while the one draw at `new` comes from the creating thread's stream, which the observable `$urandom` values of an unmarked class's creator would otherwise shift. It differs from "every object draws" in exactly that shift, and only for a design that has no way to see the object's RNG: Clotho keeps the existing pinned streams of such designs.
+
+Code: `src/lower/Scans.cpp` (`RngReceiverScan`), `src/lower/Classes.cpp` (`lower_class_type`), `src/lower/Lower.cpp`. Tests: `tests/randomize_test.cpp` ("object randstate and srandom on a class with no rand property", "only a class used for randomization draws from the creating thread at new").
+
+## 64. Numeric conversion into a `string` destination (21.3.4.3, 21.6, 6.16, 5.7.1)
+
+`$fscanf`, `$sscanf` and `$value$plusargs` store a `%d`, `%h`, `%o`, `%b` or `%c`
+value into a `string` as an integral-to-string assignment (6.16): the value is cast
+to string, each successive 8 bits a character, and every "\0" is dropped. No clause
+gives the value's width, and the cast needs it. Decided reading: the value is sized
+like an unsized literal (5.7.1), at least 32 bits, signed for `%d`, wider when its
+digits need it, with x and z digits read as 0. So `"-5"` under `%d` is the four
+characters FF FF FF FB, the same string as `string'(-5)`, and 16706 is "AB". iverilog
+13 asserts on this case.
+
+## 65. A real under `%c`, `%u` and `%z` (21.2.1.1)
+
+21.2.1.1 lets the integer specifiers take integral data, and `%u` / `%z` transfer the
+2-value / 4-value "binary representation of the specified data". For a real argument
+Clotho takes `%c` of its rounded integer (6.12.1, ties away from zero), whose low 8
+bits are the character, as iverilog does, and `%u` / `%z` of its IEEE 754 bit pattern,
+64 bits for a real and 32 for a shortreal, with no unknown bits. slang rejects `%u` and
+`%z` of a real in a literal format, so only a runtime format reaches it.
+
+## 66. Addresses of a multidimensional memory in `$readmem*` and `$fread` (21.4, 21.4.3, 21.3.4.4)
+
+21.4.3 fills a multidimensional unpacked array "in row-major order, with each dimension's
+entries ranging from low to high address", whichever way its ranges are declared. 21.4 says
+"The start_addr and finish_addr arguments apply to the addresses of the unpacked array
+selected by memory_name. This address range represents the highest dimension of data in
+the filename", and 21.4.3 that "Address entries in the file exclusively address the highest
+dimension's words". 21.3.4.4 gives `$fread` the same memory: `start` is "the address of the
+first element" and `count` "the maximum number of locations in mem".
+
+Decided reading (with the user): `start` and `finish` of `$readmemh` / `$readmemb`, `@`
+addresses in the data file, and `start` and `count` of `$fread` all address the highest
+dimension. A word of it is a row of the lower dimensions, whole, filled row-major, so
+`$fread`'s `count` is a number of rows and a finish below the start loads rows downward. A
+row the data leaves unfinished keeps its other leaves ("the remaining subwords are left
+unchanged"), and an `@` address abandons the row in progress. For one dimension this is the
+old behaviour.
+
+iverilog 13 agrees for a load that names no address, and differs when one is given: it
+takes `start`, `finish`, `count` and `@` as flat leaf indices (`$readmemh(f, m, 1, 2)` on
+`m[0:2][0:3]` loads leaves 1 and 2, where Clotho loads rows 1 and 2). The LRM is the source
+of truth here, so the tests that name an address are derived from it.
+
+Code: `src/runtime/Io.cpp` (`RowOrder`, `rt_readmem`, `rt_fread`), `src/ir/llvm/SystemTasks.cpp` (`mem_inner_dims`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh fills a whole multi-dimensional memory row-major", "$readmem fills a multi-dimensional 4-state, 2-state and wide memory", "$fread fills a whole multi-dimensional memory row-major", "a data file address names a word of the highest dimension", "$readmem start and finish name words of the highest dimension", "$fread start and count are words of the highest dimension"). Oracle: iverilog 13 where it agrees.
+
+## 67. Slices, elements and invalid targets of `$readmem*` and `$fread` (21.4, 7.4.5, 11.5.1)
+
+21.4 lets `memory_name` be "an unpacked array or a partially indexed multidimensional
+unpacked array that resolves to a lesser dimensioned unpacked array", with "Higher order
+dimensions ... specified with an index" and the lowest "with slice syntax". The addresses
+"apply to the addresses of the unpacked array selected by memory_name", and "When slice
+syntax is used ... any start_addr and finish_addr arguments shall fall within the bounds
+of the slice's range". Clotho takes the array the argument names as the memory to load,
+with its own bounds as addresses: `a[2:5]` has addresses 2 to 5, `m[1]` those of its
+dimension, and the default start is the lowest of them, whichever way they are declared
+(note 66 gives the rows of an array of several dimensions). An indexed slice
+`a[i +: n]` / `a[i -: n]` is the slice `a[i:i+n-1]` / `a[i-n+1:i]` (11.5.1) and has the
+same addresses, the indices it selects: `a[2 +: 4]` and `a[2:5]` are addressed 2 to 5, whatever
+range slang types the slice with. Decided reading (with the user).
+
+7.4.5 makes writing an array through an invalid index a no-operation, and says nothing of
+a slice that is partly outside its array, or of a load. Clotho applies the rule to each
+word, as it does to a write of a slice, so the words of a slice outside the array are
+dropped where they fall and the others keep their place: `a[1 -: 3]` of `a[0:7]` takes
+its second word for `a[0]`. A file's word that falls outside is reported by `$readmem*`
+and its bytes are read and dropped by `$fread`. A target that names no word at all, an
+element index outside the array or with an x or z bit, a slice whose base has one, or a
+slice wholly outside the array, loads nothing: no file is opened, no byte is read, and
+`$fread` returns 0.
+
+iverilog 13 accepts none of these target shapes ("Array cannot be indexed by a range"), so
+the tests take as oracle its load of the whole memory that places the same words
+(`a[2:5]` is `a` with start 2 and finish 5, `m[1]` leaves 4 to 7), and derive the rest
+from the clauses above.
+
+Code: `src/lower/SystemTasks.cpp` (`lower_mem_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`), `src/runtime/Io.cpp` (`rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a constant slice of a memory", "$readmemh into an element or a slice of an element of a multi-dimensional memory", "$readmemh into a slice at a variable position", "$readmemh through an invalid index loads nothing", "$fread into a slice or an element of a memory"), `tests/runtime_test.cpp` ("rt_readmem loads the words that exist and drops the others").
+
+## 68. Dynamic arrays and queues as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 20.7)
+
+21.4.1 says "When loading dynamic arrays and queues, the current size of the array is
+fixed; the array shall not be resized", and nothing of their addresses. 20.7 gives them a
+range, `$left` 0 and `$right` the size minus 1 "for a queue or dynamic array dimension",
+so Clotho loads one as the memory `[0:size-1]` at the size it has when the task runs. The
+default start is 0, and `start`, `finish`, `@` addresses and `$fread`'s `start` and
+`count` are indices into it; a number addressed past the last element is dropped with the
+warning a memory's last address gives, and no element is created. 21.3.4.4 names neither
+container, and `$fread` takes the same reading. A dynamic array of fixed arrays is a
+memory of several dimensions whose highest is the array (note 66), and a slice `d[a:b]`
+or `d[i +: n]` of a dynamic array has the addresses and placement note 67 gives a slice of
+a fixed array.
+
+A slice of a queue, `q[a:b]`, `q[i +: n]` or `q[i -: n]`, is the elements 7.10.1 gives it:
+from the first bound, but not below 0, to the last, but not past `$`, and none when that
+range is empty or a bound has an x or z bit (`q[i +: n]` is `q[i:i+n-1]` and `q[i -: n]` is
+`q[i-n+1:i]`, 11.5.1). As a value it is a new queue, but 21.4 lets the memory be written
+"with slice syntax", and the load fills the elements of `q` that the slice selects, as it
+fills those of a slice of a fixed array, never resizing `q` (21.4.1). Decided reading (with
+the user): the addresses are the indices of `q`, so `q[2:$]` of six elements has the
+addresses 2 to 5 and its default start is 2, and `start`, `finish` and the `@` addresses of
+the file name indices of `q` that lie in what is left of the slice once the queue has
+clipped it (`q[3:9]` of six is [3:5], note 69). Every slice has one rule (note 67): an
+indexed slice of a fixed or dynamic array and of a queue is addressed by the indices it
+selects, as `[a:b]` is. A slice that selects no
+element names no word, as an empty queue does below: nothing is opened or read.
+
+A dynamic array or queue with no element has `$right` -1, which is no address at all: the
+load names no word, as a slice wholly outside its array does (note 67), so no file is
+opened or read, and `$fread` returns 0 with the file where it was.
+
+A load that changes an element wakes whoever waits on the array or queue, as a store to
+one does (9.4.2, 9.4.3); a load that changes none wakes nobody, as for a memory.
+
+iverilog 13 takes neither container as a memory argument ("$readmemh's second argument
+must be a memory"), so the tests take as oracle its load of the fixed memory `[0:n-1]`
+with the same file and arguments, and derive the rest from the clauses above.
+
+Code: `src/lower/SystemTasks.cpp` (`is_mem_target_shape`, `lower_mem_target`, `lower_queue_slice_target`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `finish_mem_load`), `src/runtime/Io.cpp` (`MemDest`, `rt_readmem`, `rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into a dynamic array or a queue takes the addresses 0 to size - 1", "$fread into a dynamic array or a queue fills the words it holds", "$readmem into a dynamic array or a queue of 4-state, 2-state and wide elements", "$readmemh into a slice of a dynamic array places its words like a fixed memory", "$readmemh into a slice of a queue loads the elements it selects, by queue index", "$readmemh into a slice of a queue that selects no element does nothing", "$readmemh into a slice of a queue takes start, finish and file addresses inside the slice", "$fread into a slice of a queue fills the elements it selects", "$readmem into a slice of a queue of 4-state, 2-state, wide and array elements", "a load into a slice of a queue wakes the waiters of its elements", "$readmem and $fread into a slice of a queue held by a struct, a class, a ref argument or another container", "$readmemh into a dynamic array of fixed arrays, an element or a slice of one", "a load into an empty dynamic array or queue does nothing", "a load into a dynamic array or a queue wakes the waiters of its elements", "a load into a dynamic array local to a task"), `tests/runtime_test.cpp` ("rt_readmem walks the words of a queue's ring from its head slot").
+
+## 69. File addresses and word counts against the range a `$readmem*` names (21.4)
+
+21.4: "When addressing information is specified both in the system task and in the data file, the
+addresses in the data file shall be within the address range specified by the system task
+arguments; otherwise, an error message is issued, and the load operation is terminated." Clotho
+takes the range the task names as `start` through `finish` (either order), `start` through the
+highest address of the array when only `start` is given, and all of the array when it names
+no address. An `@` address of the file outside it is an error, located at the call
+(`$readmemh: address 1 in 'f.hex' is outside the address range [2:5] of the load`), and ends
+the load. "Terminated" is not a rollback: the words loaded before the address stay, wake the
+array's waiters, and the rest of the file is not read. iverilog 13 does the same, for a
+descending range, a descending declaration and an array that starts above 0 too.
+
+"When slice syntax is used in the memory_name argument, any start_addr and finish_addr arguments
+shall fall within the bounds of the slice's range". A `start` or `finish` outside the range of
+a slice (`a[2:5]`, `a[i +: 3]`, a slice of a dynamic array) is an error, and nothing is loaded:
+no file is opened. For a `start` or `finish` outside a whole memory or a row of a
+multi-dimensional one the clause says nothing, and that load is unchanged: the words whose
+address has no element are dropped, with a warning per address.
+
+21.4 also asks for a warning when "the number of data words in the file differs from the number
+of words in the range implied by the start through finish addresses and no address
+specifications appear within the data file", the words the file holds being loaded from the
+start address and the others left unmodified. Clotho warns of a file with fewer words once it
+has read it (`$readmemh: 'f.hex' holds fewer words than the range [0:7]`), and of one with
+more at the first extra word, which is ignored with the rest of the file. The second
+is also issued when the file has addresses, where the clause asks for nothing and the extra
+words have nowhere to go. A file with an `@` address, or a load that an error
+ended, is not short of words. For a memory of several dimensions a word of the file is a
+number, so the range holds one for each leaf of each of its rows (note 66); iverilog counts
+the flat leaves and warns differently there.
+
+iverilog 13 has no slice, so the slice tests take the whole-memory load with the same
+addresses as oracle for the words placed, and derive the errors from the clause.
+
+Code: `src/runtime/Io.cpp` (`rt_readmem`), `src/runtime/Reports.cpp` (`mem_load_report`), `src/ir/llvm/SystemTasks.cpp` (`lower_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem ends the load at a file address outside the range the task names", "$readmem into a slice with a start or finish outside its range loads nothing", "$readmem warns of a file with fewer or more words than its range unless it has addresses"). Oracle: iverilog 13 for the first and the third.
+
+## 70. Associative arrays as the target of `$readmem*` and `$fread` (21.4.1, 21.3.4.4, 7.8, 21.4.3)
+
+21.4.1: "When loading associative arrays, indices shall be of integral types. Loading an address
+creates an element of that index, if it does not already exist. When an associative array's
+index is of an enumerated type, address entries in the pattern file are in numeric format and
+correspond to the numeric values associated with the elements of the enumerated type." So the
+address of a word is the value of an index: `@h` names the element at index `h`, and the load
+creates it. slang rejects a `$readmem*` of an array with a non-integral index; it does not
+check a `$fread`, so Clotho does (an index with no integral value has no address, 21.3.4.4
+gives it none).
+
+The clause does not say where a load that names no address starts. 21.4 makes the default
+start address "the lowest address in the memory", and an associative array has none: it is
+sparse, and the lowest value of its index type is `-2147483648` for an `int`, where creating an
+element would be absurd. Decided with the user: a load with no `start_addr` and no `@` before
+its first number starts at **address 0** and counts up. With `start_addr` it starts there; with
+`start_addr` and `finish_addr` it goes the way they order (down when `finish_addr` is below),
+as for a memory. `$fread` has the same gap (21.3.4.4: "the lowest numbered location in the
+memory shall be used") and takes the same reading. For an enumerated index, 0 is a number
+whether it is a member or not; Clotho does not check that an address names a member.
+
+The remaining choices are Clotho's, the clause being silent. The addresses are the values of
+the index type: a signed index has the negative ones, and counting stops at its largest value
+(2^W - 1 for an unsigned one), where a further number is the "more words than the range"
+warning of note 69; an `@` address outside the index type is the error of that note. A
+file's `@` address has no sign, so `@ff` is 255, outside a `byte` index, and not -1. The
+tasks take `start`, `finish` and `@` as 64-bit numbers, so the addresses of a wider index
+are its 64-bit values. A wildcard `[*]` index (7.8.1) is an unsigned one of 64 bits. As for
+a memory, a file of fewer words than a bounded range (`start` and `finish` both given) is warned
+of, and one of any length is not for an array whose range has no end.
+
+An element is created by the first number loaded into it, so an empty file or an invalid target
+creates none. One that is itself an unpacked array (`logic [7:0] aa [int][0:2]`) is a word of
+21.4.3: the address names the element, whose leaves the numbers fill row-major, and a row the
+data leaves unfinished keeps its other leaves (note 66). An entry that is itself an array or a
+container (`aa[k]`, `aa[k][1:2]`, `nn[k]` of an `int nn[int][int]`) is loaded as the array
+it is, and is created if it is not there (7.8.7: "the target of an assignment or actual to an
+argument passed by reference"); an x or z key names no array, and nothing is loaded. An
+associative array of associative arrays, dynamic arrays or queues as a whole is still refused
+with the other arrays of containers (note 68).
+
+A load that creates or changes an element wakes whoever waits on the array, as a store to it does
+(9.4.2, 9.4.3), whatever the number of its elements; a load that changes none wakes nobody.
+
+iverilog 13 cannot parse an associative array, so the tests take as oracle its load of the
+fixed memory the same addresses name (the element at address `n` is word `n` of a memory
+`[0:max]`, with the same file and the same start and finish), compared in the design, and derive
+the rest from the clauses above.
+
+Code: `src/runtime/Io.cpp` (`AssocWords`, `load_words`, `read_words`, `rt_readmem_assoc`, `rt_fread_assoc`), `src/ir/llvm/SystemTasks.cpp` (`resolve_mem_target`, `lower_readmem`, `lower_fread_mem`), `src/lower/SystemTasks.cpp` (`is_mem_target_shape`). Tests: `tests/llvm_backend_test.cpp` ("$readmemh into an associative array creates the elements the addresses name", "$readmemh into an associative array addresses the values of its index type", "$readmem into an associative array of 4-state, 2-state, wide and array elements", "$readmemh into an entry of an associative array of arrays or of associative arrays", "$readmemh into an associative array that is a property, a member, an element or an interface member", "a load into an associative array wakes the waiters of its elements", "$fread into an associative array creates the elements the bytes fill", "a memory load into an associative array that names no element or no file creates none", "a $fread into an associative array without an integral index is refused").
+
+## 71. An x or z bit of an associative-array index that the cast to the index type drops (7.8.4, 7.8.6)
+
+7.8.4: "The index expression shall be evaluated in terms of a cast to the index type" and "A
+4-state index expression containing x or z is invalid". 7.8.6: a read through an invalid
+index issues a warning and yields the value of a nonexistent entry (Table 7-1), and a write
+through one "shall be ignored" with a warning. Clotho tests the index expression as written,
+before the cast, so an x or z bit that the cast would drop still makes the index invalid:
+`4'b1x01` indexing an `int` array is not entry 9, and a 64-bit `logic` with x in its high
+half indexing an `int` array is not entry 0. The clause does not say whether a bit that only
+the cast removes counts; this reading is the user's. A cast to a 4-state type at least as wide
+as the expression keeps every bit, and the backend finds the key invalid as it always has.
+
+The rule holds wherever an index names an entry: a read, a write, a read-modify-write
+(`a[k]++`, `a[k] += 1`), an entry that is a queue, a struct or another associative array
+(`aq[k].push_back(1)`, `as[k].x = 1`, `n[k][j]`), an actual of a `ref` argument (7.8.7
+allocates the entry of an index that is valid), `exists` (0) and `delete` (nothing is
+removed). The warning is the one every invalid index gets, under `--sanitize=bounds`
+(docs/design/assoc-keys.md, P4b); `exists` and `delete` say nothing, as 7.9.2 has deleting a
+missing entry issue no warning. `first`, `last`, `next` and `prev` take a variable of the
+index type by `ref` (7.9.4-7.9.8) and are not changed.
+
+iverilog 13 cannot parse an associative array, so the tests derive from the clauses above,
+with a 4-state index of the type's own width, which was always invalid, as the control.
+
+Code: `src/lower/Containers.cpp` (`lower_assoc_key`). Tests: `tests/associative_array_test.cpp` ("assoc invalid (x/z) index: the cast to a 2-state or narrower index type does not hide it", "assoc 4-state index without an x or z bit names the entry of its value through the cast", "assoc invalid (x/z) index: literals, queue and struct entries and nested arrays", "assoc invalid (x/z) index into a 2-state index type warns under --sanitize=bounds").
+
+## 72. Bounds of a queue slice read as a value (7.10.1, 11.8.3)
+
+7.10.1: "If either a or b are 4-state expressions containing x or z values, it yields the empty
+queue {}", `Q[a:b]` with `a < 0` is `Q[0:b]` and with `b > $` is `Q[a:$]`. Each bound is compared
+by its own signedness and width (11.8.3): an unsigned `bit [7:0]` holding 200 is 200, a `byte`
+holding -2 is below 0. The same holds for `q[i +: n]` and `q[i -: n]` (an x or z bit in `i` or `n`
+makes the slice empty). iverilog 13 gets an x bound (all the elements up to the other bound) and an
+unsigned narrow bound (read as negative) wrong, so the test is derived from the clauses.
+
+Code: `src/lower/SystemTasks.cpp` (`lower_queue_bounds`), `src/ir/llvm/Containers.cpp` (`lower_queue_append_range`). Tests: `tests/queue_test.cpp` ("queue slice read: x/z bound is empty and a bound keeps its own signedness").
+
+## 73. `$readmem*` start or finish outside a whole memory (21.4)
+
+21.4 has start and finish "fall within the bounds of the slice's range" when the memory is a
+slice and is silent for a whole memory. Decided reading (with the user): a whole memory takes the
+same rule by analogy. A start or finish outside its bounds, in either direction (`mem[0:7]` with
+2, 10 or -1, 3 or 10, 2), is a located error, nothing is loaded and the simulation goes on
+(`start address 10 is outside the memory range [0:7]`). This holds for a dynamic array or queue
+(`[0:size-1]`) too. iverilog 13 agrees ("Start|Finish address N is out of bounds"). `$fread`
+keeps note 55 (a start outside reads nothing and warns). Reading before this: the load went
+on from the clipped address and loaded the words that fell inside.
+
+Code: `src/runtime/Io.cpp` (`rt_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem with a start or finish outside a whole memory loads nothing").
+
+## 74. `next` and `prev` with an x or z index argument (7.9.6, 7.9.7, 7.8.4, 7.8.6)
+
+7.9.6 / 7.9.7 define `next` / `prev` by "the given index argument" and are silent on one with an
+x or z bit; 7.8.4 makes a 4-state index with x or z invalid. Decided reading (with the user): it
+is an invalid index (7.8.6): the call returns 0, leaves the argument unchanged and issues the
+warning other invalid associative indices get (under `--sanitize=bounds`). It used to be read
+as 0 (`next` found the entry after 0). `first` and `last` do not read their argument and are
+unchanged.
+
+Code: `src/ir/llvm/AssocArrays.cpp` (`lower_assoc_traverse`). Tests: `tests/associative_array_test.cpp` ("assoc next/prev with an x or z index argument finds nothing and warns").
+
+## 75. What counts as a change of a `real` (9.4.2, 6.12)
+
+9.4.2 wakes an event control on a change of its operand's value, and 6.12 makes a
+`real` an IEEE 754 double, but no clause says whether two values that compare equal
+yet differ in bits (`0.0` and `-0.0`), or a NaN stored over the same NaN, are a
+change. Clotho compares bit patterns, at a real variable's store (whose slot is the
+bit pattern) and in a sampled wait alike: `0.0` to `-0.0` is a change, which `1.0/r`
+can tell apart, and a NaN stored again over the same NaN is not. Comparing with `==`
+would instead make `0.0` to `-0.0` no change, as iverilog 13 does for `@(r)`, and a
+NaN a change at every comparison.
+
+Provisional: the project owner chose the bit-pattern reading for now and may revisit
+it.
+
+Code: `src/ir/llvm/Backend.h` (real storage as its bit pattern), `src/lower/Timing.cpp` (`sampled_event_hit`). Tests: `tests/heap_wait_test.cpp` ("a real changes when its bit pattern does, for @(r) and a sampled wait"). Oracle: iverilog 13 differs on `0.0` to `-0.0` (no event).

@@ -82,6 +82,109 @@ TEST_CASE("$bits as an elaboration-time constant") {
     CHECK(out == "32 32\n");
 }
 
+// $bits of an operand whose size is only known at run time (LRM 20.6.2, 6.24.3): the
+// bits of its stream as it is now, and 0 for a dynamically sized operand that is
+// empty. A queue, dynamic array or
+// associative array is its element count times the element size, a sum over its
+// elements when those have none of their own (a string, a queue); a struct is the
+// sum over its members. iverilog 13 answers 1 for every such
+// operand, so the expectations are worked out from the clauses: 32 bits per int,
+// 8 per byte, 8 per character.
+TEST_CASE("$bits of a dynamically sized operand") {
+    const std::string out = run_capture(prog(
+      "int q[$]; byte d[]; int aa[string]; string sq[$]; string sa[3]; int qq[$][2]; int qd[$][$]; int t[$];"
+      "string sm[int]; logic [11:0] hx;"
+      "typedef struct { int a; string s; int q[$]; } st_t; st_t st;"
+      "",
+      "$display(\"%0d %0d %0d %0d\", $bits(q), $bits(d), $bits(aa), $bits(sq));"
+      "q.push_back(1); q.push_back(2); d = new[3]; aa[\"x\"] = 1; aa[\"y\"] = 2; aa[\"z\"] = 3;"
+      "sq.push_back(\"ab\"); sq.push_back(\"cde\");"
+      "$display(\"%0d %0d %0d %0d\", $bits(q), $bits(d), $bits(aa), $bits(sq));"
+      "sa[0] = \"a\"; sa[1] = \"bc\"; sa[2] = \"def\";"
+      "$display(\"%0d\", $bits(sa));"
+      "qq.push_back('{1, 2}); qq.push_back('{3, 4});"
+      "t = '{1, 2}; qd.push_back(t); t = '{3}; qd.push_back(t);"
+      "$display(\"%0d %0d\", $bits(qq), $bits(qd));"
+      "sm[1] = \"abc\"; sm[2] = \"de\";"
+      "$display(\"%0d\", $bits(sm));"
+      "st.s = \"hi\"; st.q = '{1, 2, 3};"
+      "$display(\"%0d\", $bits(st));"
+      "$display(\"%0d\", $bits(m.hx));"));
+    CHECK(out == "0 0 0 0\n64 24 96 40\n48\n128 96\n40\n144\n12\n");
+}
+
+// `$bits` of an operand that is, or holds, a class handle counts the bits of the objects
+// the handles refer to: a derived class's members after its base's, nothing for a null
+// handle (LRM 20.6.2 over 11.4.14.1). The size of the handle's declared class is none of
+// that. It was 32 for a null `B h` (LRM: 0) and for a `D` object behind it (LRM: 96), and
+// slang folded it. Measuring the object needs the walk streaming a class handle needs
+// too, so such a call is refused wherever it stands. iverilog 13 parses none of these,
+// so the LRM is the oracle.
+TEST_CASE("$bits of a class handle with dynamic members is refused") {
+    const LowerResult r = lower_text(R"(
+        module m;
+          class C; int x; string s; endclass
+          C c;
+          initial begin c = new; $display("%0d", $bits(c)); end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.diagnostic_text().find("$bits of a class handle") != std::string::npos, r.diagnostic_text());
+}
+
+TEST_CASE("$bits of an operand that holds a class handle is refused") {
+    const std::string decls = "class B; int a; endclass\n class D extends B; int b, c; endclass\n"
+                              "typedef struct { int x; B h; } s_t;\n"
+                              "B h, arr[2], q[$], aa[string]; D d; s_t s, sa[2];\n";
+    // A null and a derived-object handle, a struct and a struct array holding one, an
+    // array, queue and associative array of them, and a member and an element. (An
+    // unpacked union holding one is refused earlier: it takes integral members only.)
+    for (const std::string operand : { "h", "d", "s", "sa", "arr", "q", "aa", "s.h", "arr[1]" }) {
+        CAPTURE(operand);
+        const LowerResult r = lower_text(prog(decls, "d = new; h = d; $display(\"%0d\", $bits(" + operand + "));"));
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find("$bits of a class handle") != std::string::npos, r.diagnostic_text());
+    }
+}
+
+// Slang evaluates `$bits` in a parameter, a packed dimension and a generate condition, and
+// no handle has a value there: the call is no constant, and slang says so.
+TEST_CASE("$bits of a class handle is no elaboration-time constant") {
+    const std::string decl = "class B; int a; endclass B h;";
+    for (const std::string use :
+         { "localparam int N = $bits(h);", "logic [$bits(h)-1:0] v;", "if ($bits(h) == 32) begin : g logic y; end" }) {
+        CAPTURE(use);
+        const LowerResult r = lower_text("module m; " + decl + " " + use + " endmodule\n");
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find("class types are not allowed in constant expressions") !=
+                        std::string::npos,
+                      r.diagnostic_text());
+    }
+}
+
+// What the refusal leaves alone: a class data type, whose size is slang's -- the bits of the
+// class's properties, the base class's first -- and an integral property read through a
+// handle. LRM 20.6.2 defines `$bits(data_type)` and 6.24.3 lists classes among the bit-stream
+// types, but neither says what the size of a class type is, so the decided reading
+// (LRM_NOTES 59) keeps slang's value: 32 for B and 96 for D, in a statement and as an
+// elaboration-time constant. iverilog 13 rejects the class data type ("Invalid data type for
+// $bits()"), so there is no oracle.
+TEST_CASE("$bits of a class data type is the bits of its properties, base class first") {
+    SUBCASE("in a statement, and of an integral property") {
+        const std::string out = run_capture(prog("class B; int a; endclass class D extends B; int b, c; endclass B h;",
+                                                 "h = new; $display(\"%0d %0d %0d\", $bits(B), $bits(D), $bits(h.a));"));
+        CHECK(out == "32 96 32\n");
+    }
+    SUBCASE("as an elaboration-time constant") {
+        const std::string out = run_capture(prog(
+          "class B; int a; endclass class D extends B; int b, c; endclass\n"
+          "localparam int NB = $bits(B), ND = $bits(D);\n"
+          "logic [$bits(D)-1:0] v; typedef bit [$bits(B):1] bits_t;",
+          "$display(\"%0d %0d %0d %0d\", NB, ND, $bits(v), $bits(bits_t));"));
+        CHECK(out == "32 96 96 32\n");
+    }
+}
+
 // -- $countones -------------------------------------------------------------
 
 // Only definite-1 bits count; x/z never do (matches `=== 1'b1`). Constant and
@@ -116,6 +219,40 @@ TEST_CASE("$countbits over each control class") {
                                              " $countbits(c, 1'bx), $countbits(c, 1'bz),"
                                              " $countbits(c, 1'bx, 1'bz));"));
     CHECK(out == "3 2 2 1 3\n");
+}
+
+// A control bit that is a variable (LRM 20.9: "The control bit arguments to
+// $countbits may be variables"): which of 0 / 1 / x / z it names is a run-time
+// fact, a control wider than one bit contributes only its LSB, and a value named
+// twice counts once, whether by two variables or by a variable and a constant.
+// Expected values from iverilog 13, which agrees on every line; the operand is
+// 8'b101x_z01x (ones 3, zeros 2, x 2, z 1).
+TEST_CASE("$countbits with a control bit known only at run time") {
+    const std::string out = run_capture(prog(
+      "logic [7:0] v; logic c, d; logic [3:0] wide; bit two; logic [1:0] bad_bits; int n;",
+      "v = 8'b101x_z01x;"
+      "c = 1'b1; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'b0; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'bx; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'bz; $display(\"%0d\", $countbits(v, c));"
+      "c = 1'b1; d = 1'bz; $display(\"%0d\", $countbits(v, c, d));"
+      "c = 1'b1; d = 1'b1; $display(\"%0d\", $countbits(v, c, d));"
+      "c = 1'b0; $display(\"%0d\", $countbits(v, c, 1'b1));"
+      "c = 1'b1; $display(\"%0d\", $countbits(v, c, 1'b1));"
+      "wide = 4'b0101; $display(\"%0d\", $countbits(v, wide));"
+      "wide = 4'b0110; $display(\"%0d\", $countbits(v, wide));"
+      "wide = 4'b010x; $display(\"%0d\", $countbits(v, wide));"
+      "wide = 4'b001z; $display(\"%0d\", $countbits(v, wide));"
+      "two = 1'b1; $display(\"%0d\", $countbits(v, two));"
+      "two = 1'b0; $display(\"%0d\", $countbits(v, two));"
+      "bad_bits[0] = 1'bx; bad_bits[1] = 1'bz;"
+      "$display(\"%0d\", $countbits(v, bad_bits[0], bad_bits[1]));"
+      "bad_bits[0] = 1'bx; bad_bits[1] = 1'bx;"
+      "$display(\"%0d\", $countbits(v, bad_bits[0], bad_bits[1]));"
+      "n = $countbits(8'hFF, c) + $countbits(8'h0F, d);"
+      "$display(\"%0d\", n);"
+      "v = 8'b0000_0000; c = 1'b0; $display(\"%0d\", $countbits(v, c));"));
+    CHECK(out == "3\n2\n2\n1\n4\n3\n5\n3\n3\n2\n2\n1\n3\n2\n3\n2\n12\n8\n");
 }
 
 // -- $onehot / $onehot0 -----------------------------------------------------

@@ -653,14 +653,71 @@ TEST_CASE("randsequence rand join operands may return values (LRM 18.17.5 / 18.1
     CHECK(run_capture(src) == "11 22\n");
 }
 
-// A weight sum wider than 32 bits would need the LRM's several-draw stitching
-// scheme (18.16, whose weight rules 18.17.1 shares); guarded loud, exactly as
-// randcase guards its own.
-TEST_CASE("randsequence with a 64-bit weight fails loudly") {
-    CHECK(lower_error("module m; longint w; initial begin w = 5;\n"
-                      " randsequence(A) A : B := w | C := 1 ; B : {} ; C : {} ; endsequence end\n"
-                      "endmodule")
-            .find("weight wider than 32 bits") != std::string::npos);
+// A rule weight wider than 32 bits takes the same stitched draw as randcase's
+// (LRM 18.16, whose weight rules 18.17.1 shares). The weights 3 << 40 and 1 << 40
+// have no bit below bit 40, so a weight or draw truncated to 32 bits would take
+// neither rule; an omitted weight is the 32-bit literal 1 and folds into the
+// 64-bit sum without shifting it measurably. Oracle: 18.17.1's weight rule;
+// iverilog 13 has no randsequence.
+TEST_CASE("randsequence rule weights wider than 32 bits (LRM 18.17.1)") {
+    constexpr std::string_view src = R"(
+        module m;
+            longint unsigned w;
+            int a, d;
+            initial begin
+                w = 64'd1 << 40;
+                for (int i = 0; i < 4000; i++) begin
+                    randsequence( first )
+                        first : add := (3 * w) | dec := w ;
+                        add : { a++; };
+                        dec : { d++; };
+                    endsequence
+                end
+                $display("%0d %0d", a + d, a > 2800 && a < 3200);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4000 1\n");
+}
+
+// The pick takes one draw from a sum of at most 32 bits, as before, and none for a
+// zero sum of any width (docs/design/randsequence.md section 12). Draw counts are
+// read off the process stream: a draw taken after $urandom(seed) leaves the next
+// value fixed, so equal values mean equal counts.
+TEST_CASE("randsequence rule pick draws once, and not at all for a zero wide sum") {
+    constexpr std::string_view src = R"(
+        module m;
+            longint unsigned z;
+            int a, r0, r1, r2, r3, r4, t;
+            initial begin
+                z  = 0;
+                r0 = $urandom(5);
+                r1 = $urandom;
+                r0 = $urandom(5);
+                randsequence( first )
+                    first : one := 3 | two := 5 ;
+                    one : { a = 1; };
+                    two : { a = 2; };
+                endsequence
+                r2 = $urandom;
+                r0 = $urandom(5);
+                t  = $urandom_range(7, 0);
+                r3 = $urandom;
+                r0 = $urandom(5);
+                randsequence( first )
+                    first : one := z | two := z ;
+                    one : { a = 8; };
+                    two : { a = 9; };
+                endsequence
+                r4 = $urandom;
+                // `a` still holds the first pick: the zero-sum sequence ran no rule.
+                $display("%0d %0d %0d", r2 == r3, a == (t < 3 ? 1 : 2), r1 == r4);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1 1\n");
 }
 
 // LRM 18.17.7 over 18.17.5: an interleaved production's rule holds its implicit

@@ -700,10 +700,12 @@ LowerResult lower_design(slang::ast::Compilation&                            com
 
     // `-G NAME=value`: slang applies a simple-name override to every top with a
     // parameter of that name and says nothing when none has one, and it does not
-    // skip a localparam, which a command-line override may not change (LRM 6.20.4)
-    // [unverified wording]. Either way the run would not be the design asked for,
-    // so both are errors, as an unknown name is in iverilog (`-P`). A dotted name
-    // is a defparam path, which slang resolves and reports itself.
+    // skip a localparam. The LRM has no command-line override; the nearest rule is 6.20.4
+    // (a localparam cannot be modified by defparam or an instance parameter value
+    // assignment; 23.10 makes a body parameter local when the module has a parameter
+    // port list), which the override follows. Either way the run would not be the design
+    // asked for, so both are errors, as an unknown name is in iverilog (`-P`). A dotted
+    // name is a defparam path, which slang resolves and reports itself.
     bool bad_override = false;
     for (const std::string& opt : comp.getOptions().paramOverrides) {
         const std::string_view whole(opt);
@@ -879,6 +881,29 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     // The design-wide change notifiers the scan asked for: declared by `globals`
     // below, read by every Lowerer.
     SharedNotifiers shared_notifiers;
+    // Which classes own an RNG though they declare no rand property (LRM 18.14.2):
+    // the receivers of randomize / srandom / get_randstate / set_randstate. The
+    // class-side calls are found by walking every class body, which the AST visit
+    // alone does not reach for a generic class's specializations.
+    RngClasses      rng_classes;
+    RngReceiverScan rng_scan;
+    rng_scan.out = &rng_classes;
+    root.visit(rng_scan);
+    {
+        std::vector<const ClassType*> all_classes;
+        for (const PackageSymbol* pkg : comp.getPackages()) {
+            collect_class_types(*pkg, all_classes);
+        }
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            collect_class_types(*unit, all_classes);
+        }
+        for (const InstanceSymbol* top : root.topInstances) {
+            collect_class_types(top->body, all_classes);
+        }
+        for (const ClassType* cls : all_classes) {
+            cls->visit(rng_scan);
+        }
+    }
     UnitOwners unit_owners;
     ForeignCalls foreign_calls;
     // Every variable a force / procedural assign targets, before anything lowers:
@@ -897,6 +922,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_pca_targets(&pca_targets);
         globals.set_waited_props(&waited_props);
         globals.set_shared_notifiers(&shared_notifiers);
+        globals.set_rng_classes(&rng_classes);
         globals.set_unit_owners(&unit_owners);
         globals.set_foreign_calls(&foreign_calls);
         globals.lower_globals(comp, root);
@@ -914,6 +940,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
             lw.set_shared_notifiers(&shared_notifiers);
+            lw.set_rng_classes(&rng_classes);
             lw.set_unit_owners(&unit_owners);
             lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);

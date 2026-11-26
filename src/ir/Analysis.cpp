@@ -892,9 +892,11 @@ struct Structural {
                     mark_partial(ir, p.op_extra.op);
                     break;
                 case Inst::Tag::ReadMem: {
-                    const Signal target                   = ir.extra_data<ReadMemInfo>(p.op_extra.extra).target;
-                    driven[static_cast<uint32_t>(target)] = true;
-                    mark_sig_whole(static_cast<uint32_t>(target));
+                    // The load writes the array its target lvalue names, whole or a
+                    // part of it.
+                    const Index target = ir.extra_data<ReadMemInfo>(p.op_extra.extra).target;
+                    mark_driven_root(ir, target);
+                    mark_partial(ir, target);
                     break;
                 }
                 case Inst::Tag::TaskCall: {
@@ -970,7 +972,12 @@ struct Structural {
                     // the calling thread's block, and the status stores at every park.
                     // A design that never mentions `process` emits none of it
                     // (docs/design/process-class.md §9).
-                    uses.process = true;
+                    // The object state codec reads no control block, so it alone does not
+                    // turn the machinery on.
+                    if (const ProcOp o = ir.extra_data<ProcCtlInfo>(p.extra).op;
+                        o != ProcOp::StateFormat && o != ProcOp::StateParse) {
+                        uses.process = true;
+                    }
                     if (const ProcOp op = ir.extra_data<ProcCtlInfo>(p.extra).op;
                         op == ProcOp::Srandom || op == ProcOp::RandstateGet ||
                         op == ProcOp::RandstateSet) {
@@ -1665,11 +1672,20 @@ struct ValueSweep {
 
                 case Inst::Tag::ReadMem: {
                     // Seed 3: the file may contain x and z digits. A 2-state memory
-                    // reads x/z as 0 and stays clean.
+                    // reads x/z as 0 and stays clean. A signal that holds the memory as
+                    // a member of a struct, or is a dynamic array or queue, has no
+                    // domain of its own, so what decides is a 4-state leaf anywhere
+                    // under its type. A class property and an interface member are not
+                    // rooted at a signal and report conservatively (HandleDeref,
+                    // IfaceSignal).
                     const ReadMemInfo info = ir.extra_data<ReadMemInfo>(p.op_extra.extra);
-                    if (m.pool.layout(m.signal(info.target).type).domain == Domain::Four) {
-                        mark(sig_z[static_cast<uint32_t>(info.target)]);
-                        mark(sig_x[static_cast<uint32_t>(info.target)]);
+                    const Index       root = lvalue_root(ir, info.target).root;
+                    if (ir.tag(root) == Inst::Tag::Signal) {
+                        const auto sig = static_cast<uint32_t>(ir.payload(root).signal);
+                        if (types::has_four_state_leaf(m.pool, m.signal(ir.payload(root).signal).type)) {
+                            mark(sig_z[sig]);
+                            mark(sig_x[sig]);
+                        }
                     }
                     val_x[raw] = 0;
                     break;

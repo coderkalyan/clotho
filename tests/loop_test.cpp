@@ -138,6 +138,45 @@ TEST_CASE("for loop with multiple loop variables, later reads earlier") {
     CHECK(run_capture(src) == "0 10\n1 11\n2 12\n");
 }
 
+// 12.7.1, A.6.8: a for_step may be a function_subroutine_call, alone or among
+// assignments, in order. A function's value, if it has one, is discarded, a task
+// may wait in the step, and `continue` still reaches it. iverilog 13 rejects a call
+// in the step list, so the values are worked out from the clause.
+TEST_CASE("for loop step that calls a subroutine") {
+    constexpr std::string_view src = R"(
+        module m;
+            int i, k, steps;
+            function void bump(); k += 10; endfunction
+            function int adv(); steps++; return steps; endfunction
+            task automatic tick(); #1; i++; endtask
+            initial begin
+                k = 0;
+                for (i = 0; i < 3; bump()) begin $display("a %0d %0d", i, k); i++; end
+                $display("a end %0d %0d", i, k);
+                k = 0;
+                for (i = 0; i < 3; i++, bump()) $display("b %0d %0d", i, k);
+                $display("b end %0d %0d", i, k);
+                steps = 0;
+                for (i = 0; i < 2; i++, adv()) ;
+                $display("c %0d %0d", i, steps);
+                for (i = 0; i < 3; tick()) $display("d %0t %0d", $time, i);
+                $display("d end %0t %0d", $time, i);
+                k = 0;
+                for (i = 0; i < 4; i++, bump()) begin
+                    if (i == 1) continue;
+                    $display("e %0d %0d", i, k);
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "a 0 0\na 1 10\na 2 20\na end 3 30\n"
+          "b 0 0\nb 1 10\nb 2 20\nb end 3 30\n"
+          "c 2 2\n"
+          "d 0 0\nd 1 1\nd 2 2\nd end 3 3\n"
+          "e 0 0\ne 2 20\ne 3 30\n");
+}
+
 // The loop accumulates into a module signal; the final value is observable.
 TEST_CASE("for loop accumulates into a signal") {
     constexpr std::string_view src = R"(

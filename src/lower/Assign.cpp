@@ -1628,6 +1628,7 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_event(const Assign
     if (!is_event_control(*evt)) {
         fail("nonblocking intra-assignment requires a delay or event control");
     }
+    refuse_detached_member_event(*evt);
     std::vector<ir::WaitEvent> events;
     if (collect_wait_events(*evt, events) != nullptr) {
         // TODO: `iff` on a nonblocking intra-assignment event trigger —
@@ -1781,6 +1782,10 @@ void Lowerer::check_subroutine_nba_target(const Expression& lhs) {
 // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
 // Statement callers discard the return.
 ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+    // `h.option.f = e` (LRM 19.7): runtime state of a covergroup instance, not a variable.
+    if (const auto opt = cover_option_ref(a.left())) {
+        return lower_cover_option_write(a, *opt, b);
+    }
     // Gate ordinary writes to a forced/assigned variable (LRM 10.6.2). The write
     // predicate is "is this lvalue's root a force target?" — the root, not the
     // written shape, carries the site state, so a whole-variable write, a
@@ -2184,36 +2189,112 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
 }
 
 // Lower the right-hand side slang synthesized for `lhs op= rhs` (LRM 11.4.1)
-// against an already-bound LHS lvalue: `a.right()` is `op(LValueReference,
-// rhs)`, and the embedded LValueReference reads back through `lv`, so the
-// lvalue is evaluated exactly once. Shared with the force-gated write path,
+// against an already-bound target: `a.right()` is `op(LValueReference, rhs)`,
+// and the embedded LValueReference reads the target back through `read`, so the
+// target is evaluated exactly once. Shared with the force-gated write path,
 // which needs the same read-modify-write with only the store-back gated.
+ir::Index Lowerer::lower_compound_rhs(const AssignmentExpression& a, const CompoundRead& read, ir::Builder& b) {
+    const Restore<const CompoundRead*> scope(compound_read_, &read);
+    return lower_expr(a.right(), b);
+}
+
+// The same for a single lvalue `lv`, which the reference loads.
 ir::Index Lowerer::lower_compound_rhs(const AssignmentExpression& a, ir::Index lv, ir::Builder& b) {
-    const std::optional<ir::Index> saved = compound_lv_;
-    compound_lv_                         = lv;
-    const ir::Index rhs                  = lower_expr(a.right(), b);
-    compound_lv_                         = saved;
-    return rhs;
+    const CompoundRead read = [lv](ir::Builder& bb, ir::SourceLoc l) { return bb.unary(ir::Inst::Tag::Load, lv, l); };
+    return lower_compound_rhs(a, read, b);
+}
+
+// A read-modify-write target that is not one lvalue (LRM 11.4.1, 11.4.2). Each
+// piece of it is bound to an lvalue here, once, and `read` and `write` go through
+// those, so an index expression in the target (`{mem[i++], b} += 1`, `s[i++] += 1`)
+// runs a single time however many reads and writes the operator makes.
+std::optional<Lowerer::RmwPlace> Lowerer::bind_rmw_place(const Expression& target, ir::Builder& b) {
+    using T = ir::Inst::Tag;
+    if (target.kind == ExpressionKind::Concatenation) {
+        // `{a, b} op= x` is `{a, b} = {a, b} op x` (LRM 11.4.1 with 11.4.12): the
+        // concatenation reads as one unsigned vector and scatters back the way
+        // `{a, b} = v` does, leftmost operand taking the most significant bits.
+        const auto&                    cc = target.as<ConcatenationExpression>();
+        std::vector<const Expression*> leaves;
+        // The leaf operands in source order, each as the expression that names its
+        // storage (an operand may be an assignment whose left is the lvalue); a
+        // nested concatenation recurses.
+        const auto collect = [&](auto&& self, std::span<const Expression* const> ops) -> void {
+            for (const Expression* e : ops) {
+                const Expression& op = unwrap_lvalue_elem(*e);
+                if (op.kind == ExpressionKind::Concatenation) {
+                    self(self, op.as<ConcatenationExpression>().operands());
+                } else {
+                    leaves.push_back(&op);
+                }
+            }
+        };
+        collect(collect, cc.operands());
+        const auto bound = std::make_shared<ConcatLvalues>();
+        for (const Expression* leaf : leaves) {
+            if (is_string_expr(*leaf)) {
+                fail("string operand in an lvalue concatenation is not supported");
+            }
+            bound->emplace(leaf, lower_lvalue(*leaf, b, /*is_write=*/true));
+        }
+        // The value of one concatenation level: its operands' current values,
+        // joined most significant first. A leaf is narrowed to its declared type
+        // for the reason LValueReference narrows (narrow_to_declared).
+        const auto read_ops = [this, bound](auto&& self, std::span<const Expression* const> ops, ir::Builder& bb,
+                                            ir::SourceLoc l) -> ir::Index {
+            std::vector<ir::Index> parts;
+            parts.reserve(ops.size());
+            for (const Expression* e : ops) {
+                const Expression& op = unwrap_lvalue_elem(*e);
+                if (op.kind == ExpressionKind::Concatenation) {
+                    parts.push_back(self(self, op.as<ConcatenationExpression>().operands(), bb, l));
+                } else {
+                    parts.push_back(narrow_to_declared(bb.unary(T::Load, bound->at(&op), l), *op.type, bb, l));
+                }
+            }
+            return parts.size() == 1 ? parts.front() : bb.concat(parts, l);
+        };
+        return RmwPlace{ .read  = [read_ops, &cc](ir::Builder& bb,
+                                                  ir::SourceLoc l) { return read_ops(read_ops, cc.operands(), bb, l); },
+                         .write = [this, bound, &cc](ir::Index val, ir::Builder& bb, ir::SourceLoc l) {
+                             store_concat(cc, val, T::Store, bb, l, nullptr, bound.get());
+                         } };
+    }
+    if (target.kind == ExpressionKind::ElementSelect &&
+        is_string_expr(target.as<ElementSelectExpression>().value())) {
+        // `s[i] op= x` is `s[i] = s[i] op x`: a character read is `getc`, a write
+        // is `putc` (LRM 6.16.2, 6.16.3), and an index outside the string, or a
+        // zero byte written, leaves the string unchanged, so the read-modify-write
+        // needs no guard of its own.
+        const auto&     es  = target.as<ElementSelectExpression>();
+        const ir::Index str = lower_lvalue(es.value(), b, /*is_write=*/true);
+        const ir::Index idx = lower_index(es.selector(), b);
+        return RmwPlace{ .read = [str, idx](ir::Builder& bb,
+                                            ir::SourceLoc l) { return bb.binary(T::StrGetc, bb.unary(T::Load, str, l), idx, l); },
+                         .write = [str, idx](ir::Index val, ir::Builder& bb, ir::SourceLoc l) {
+                             bb.str_putc(str, idx, val, l);
+                         } };
+    }
+    return std::nullopt;
 }
 
 // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
 // rewritten a.right() into `BinaryExpression(LValueReference, rhs, op)` with
 // width/sign/conversion already resolved, so lowering it after binding the
-// LHS lvalue yields `op(load(lhs), rhs)`. The LHS lvalue is evaluated exactly
-// once and reused for the embedded LValueReference (single-evaluation, so
-// `mem[i++] += 1` bumps i once).
+// LHS yields `op(read(lhs), rhs)`. The LHS is evaluated exactly once and reused
+// for the embedded LValueReference (single-evaluation, so `mem[i++] += 1` bumps
+// i once).
 ir::Index Lowerer::lower_compound_assign(const AssignmentExpression& a, ir::Builder& b) {
     const ir::SourceLoc l = loc(a);
-    if (a.left().kind == ExpressionKind::Concatenation) {
-        // TODO: compound assignment to a concatenation lvalue ({a,b} += x).
-        // Needs the LValueReference to read the concat and store_concat to
-        // scatter the result.
-        fail("compound assignment to a concatenation is not supported");
+    if (const std::optional<RmwPlace> place = bind_rmw_place(a.left(), b)) {
+        const ir::Index rhs = lower_compound_rhs(a, place->read, b);
+        place->write(rhs, b, l);
+        return rhs;
     }
-    if (is_string_expr(a.left()) || (a.left().kind == ExpressionKind::ElementSelect &&
-                                     is_string_expr(a.left().as<ElementSelectExpression>().value()))) {
-        // TODO: compound assignment to a string / string element (the lvalue
-        // path below is packed-only; a string char write uses str_putc).
+    if (is_string_expr(a.left())) {
+        // The LRM defines the assignment operators over numeric operands (11.4.1,
+        // Table 11-1), so `s += x` is not LRM source; slang rejects it as a
+        // non-standard string concatenation unless that diagnostic is downgraded.
         fail("compound assignment to a string is not supported");
     }
     // A compound assignment reads then writes the same member, so one guard
@@ -2229,14 +2310,17 @@ ir::Index Lowerer::lower_compound_assign(const AssignmentExpression& a, ir::Buil
 // widths partition the RHS bits. Lowered to one store per operand: the slice
 // is `rhs >> offset` truncated to the operand width via resize (the upper bits
 // are discarded by the narrowing store). The RHS is sampled once by the caller,
-// so a nonblocking concat assignment keeps single-evaluation semantics.
+// so a nonblocking concat assignment keeps single-evaluation semantics. `bound`,
+// when given, holds the lvalues of the leaf operands already evaluated (a
+// compound assignment's), which the scatter must not evaluate again.
 void Lowerer::store_concat(const ConcatenationExpression& cc,
                            ir::Index                      rhs,
                            ir::Inst::Tag                  tag,
                            ir::Builder&                   b,
                            ir::SourceLoc                  l,
-                           const IntraNbTiming*           nbt) {
-    store_concat_ops(cc.operands(), rhs, tag, b, l, nbt);
+                           const IntraNbTiming*           nbt,
+                           const ConcatLvalues*           bound) {
+    store_concat_ops(cc.operands(), rhs, tag, b, l, nbt, bound);
 }
 
 // Shared slice-and-scatter loop for a packed concatenation lvalue (LRM
@@ -2251,7 +2335,8 @@ void Lowerer::store_concat_ops(std::span<const Expression* const> ops,
                                ir::Inst::Tag                      tag,
                                ir::Builder&                       b,
                                ir::SourceLoc                      l,
-                               const IntraNbTiming*               nbt) {
+                               const IntraNbTiming*               nbt,
+                               const ConcatLvalues*               bound) {
     uint32_t offset = 0;
     for (size_t k = ops.size(); k-- > 0;) {
         const Expression& op = unwrap_lvalue_elem(*ops[k]);
@@ -2265,7 +2350,7 @@ void Lowerer::store_concat_ops(std::span<const Expression* const> ops,
         }
         const ir::Index val = b.convert(chunk, lower_type(*op.type), op.type->isSigned(), l);
         if (op.kind == ExpressionKind::Concatenation) {
-            store_concat(op.as<ConcatenationExpression>(), val, tag, b, l, nbt);
+            store_concat(op.as<ConcatenationExpression>(), val, tag, b, l, nbt, bound);
         } else if (const auto* nested = as_assignment_pattern(op)) {
             if (op.kind != ExpressionKind::SimpleAssignmentPattern) {
                 fail_keyed_pattern_lvalue();
@@ -2276,7 +2361,8 @@ void Lowerer::store_concat_ops(std::span<const Expression* const> ops,
             // gates per operand: a forced operand keeps its forced value while
             // its siblings still take their slice (LRM 10.6.2, matching
             // iverilog 13). Unforced operands lower to a plain store.
-            store_or_gate(pca_info_of_lvalue(op), tag, lower_lvalue(op, b, /*is_write=*/true), val, b, l, nbt);
+            const ir::Index lv = bound != nullptr ? bound->at(&op) : lower_lvalue(op, b, /*is_write=*/true);
+            store_or_gate(pca_info_of_lvalue(op), tag, lv, val, b, l, nbt);
         }
         offset += op.type->getBitWidth();
     }
