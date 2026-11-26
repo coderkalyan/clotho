@@ -523,3 +523,35 @@ TEST_CASE("@ over a list of a fork-captured automatic and a property") {
     )";
     CHECK(run_capture(src) == "first k=5 x=0 at 1\nsecond k=0 x=3 at 3\ndone\n");
 }
+
+// A method that reads an aggregate property (an unpacked struct, union or fixed array) is
+// waited on through the property's design-wide notifier, as for a scalar one: a store to
+// any member of it wakes `wait` and `@`, and `@` compares the method's value. No oracle
+// parses classes or unpacked structs; the expectations are the clauses'.
+TEST_CASE("wait and @ on a method that reads an aggregate property") {
+    constexpr std::string_view src = R"(
+        module m;
+          typedef struct { int f; int g; } s_t;
+          class C;
+            s_t s;
+            int a[2];
+            function int get_f(); return s.f; endfunction
+            function int get_a(); return a[1]; endfunction
+          endclass
+          C c = new;
+          initial begin
+            fork
+              begin wait (c.get_f() == 1); $display("wait f %0t", $time); end
+              begin @(c.get_f()); $display("at f %0t", $time); end
+              begin @(c.get_a()); $display("at a %0t", $time); end
+            join_none
+            #1 c.s.g = 7;
+            #1 c.s.f = 1;
+            #1 c.a[0] = 3;
+            #1 c.a[1] = 4;
+            #1 $display("done %0t", $time);
+          end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "wait f 2\nat f 2\nat a 4\ndone 5\n");
+}

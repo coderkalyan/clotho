@@ -475,6 +475,10 @@ bool box_can_notify(const slang::ast::Type& ty) {
     return prop_notify_kind(ct) != PropNotify::None || is_notified_container(ct);
 }
 
+bool prop_can_notify(const slang::ast::Type& ty) {
+    return box_can_notify(ty) || is_notified_aggregate(ty.getCanonicalType());
+}
+
 void WaitLocalScan::handle(const slang::ast::NamedValueExpression& e) {
     out->insert(&e.symbol);
     visitDefault(e);
@@ -698,9 +702,9 @@ CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides) 
 void WaitPropScan::note_callees(const Expression& e) {
     const CalleeReads reads = callee_reads(e, out->overrides);
     for (const slang::ast::ClassPropertySymbol* prop : reads.props) {
-        // A property of a type that has no notifier (an unpacked struct or union,
-        // a fixed unpacked array) has no design-wide one either.
-        if (box_can_notify(prop->getType())) {
+        // A property of a type that has no notifier (an event, a covergroup handle) has
+        // no design-wide one either.
+        if (prop_can_notify(prop->getType())) {
             out->add_shared(*prop);
         }
     }

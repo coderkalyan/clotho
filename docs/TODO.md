@@ -131,8 +131,8 @@ Milestones, in order; lower ones unblock higher ones:
     posedge clk)` needs identification of the waking source.
   - [ ] **Method call as the control of `<= @(...)` or `->> @(...)`, or as a clocking
     event** — a record or a clock is not a process that can sample it.
-  - [ ] **Method that reads an unpacked struct, union, fixed unpacked-array or `event`
-    property, or a string variable** — those have no change notifier.
+  - [ ] **Method that reads an `event` property or a string variable** — those have no
+    change notifier.
   - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
     change notifier.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a

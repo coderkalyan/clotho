@@ -1024,9 +1024,7 @@ list with a sampled term they are compared with a sample like the rest
 - An event control of a nonblocking intra-assignment or of `->>`, and a clocking
   event of an assertion, a covergroup or a clocking block, over such an
   expression. Those are records and clocks, not a process that could sample.
-- A callee that reads a property of a type with no notifier (an unpacked struct or
-  union, a fixed unpacked array, an `event`), a string variable, or
-  `process::status()`.
+- A callee that reads an `event` property, a string variable, or `process::status()`.
 
 ## Implementation deviations from the scope-out below
 

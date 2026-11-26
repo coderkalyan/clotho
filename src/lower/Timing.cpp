@@ -1824,7 +1824,7 @@ void Lowerer::add_callee_wait_events(const Expression& e, std::vector<ir::WaitEv
     for (const slang::ast::ClassPropertySymbol* prop : called.props) {
         // As the pre-pass: a property of a type that has no notifier has no
         // design-wide one (WaitPropScan::note_callees).
-        if (box_can_notify(prop->getType())) {
+        if (prop_can_notify(prop->getType())) {
             shared(*prop);
         }
     }

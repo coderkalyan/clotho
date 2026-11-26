@@ -256,6 +256,10 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
 
 bool box_can_notify(const slang::ast::Type& ty);
 
+// Whether an instance class property of this type can carry a change notifier: a word,
+// a string, a container or an aggregate (box_can_notify, and is_notified_aggregate).
+bool prop_can_notify(const slang::ast::Type& ty);
+
 // Every value symbol a `wait` condition names. The design-wide pre-pass uses it to
 // decide which capture boxes are minted WITH a notifier; a symbol that turns out to
 // be a signal or a class property is simply never asked about again.
