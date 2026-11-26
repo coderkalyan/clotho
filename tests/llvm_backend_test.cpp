@@ -4948,11 +4948,81 @@ TEST_CASE("$readmem and $fread into a class property, static or not") {
     std::remove("clotho_fread_cl_test.bin");
 }
 
-// What a memory load still refuses, loudly: a member of an interface,
-// an associative array (LRM 21.4.1 makes its addresses keys but does not say where a load
-// that names none starts) and a slice of a queue (7.10.1: a new queue, not a view of the
-// queue).
-TEST_CASE("a memory load into a member, an associative array or a queue slice is still refused") {
+// A member of an interface instance reached through a virtual interface handle (LRM 25.9)
+// is loaded in the instance the handle names, and only there: a waiter that named the
+// instance directly and one that waits through a handle both hear the load, the twin's
+// does not. Whole memory, start and finish, a slice at a variable position, a row of a
+// two-dimensional memory, a dynamic array, a queue, an array inside a struct member and
+// `$fread` take the words a fixed memory takes (LRM 21.4, 21.3.4.4; iverilog 13 has no
+// interface, so the values are those of the same load of a fixed memory). A container
+// member's waiter hears the load as it hears a mutation (9.4.3).
+TEST_CASE("$readmem and $fread into a member through a virtual interface") {
+    write_file("clotho_readmem_vif_test.hex", "11 22 33 44 55 66\n");
+    write_file("clotho_fread_vif_test.bin", std::string("\x11\x22\x33\x44\x55", 5));
+    const std::string src = R"(
+        interface ifc;
+            int a;
+            logic [7:0] mem [0:3];
+            int b;
+            logic [7:0] mm [0:1][0:2];
+            logic [7:0] d [];
+            logic [7:0] q [$];
+            typedef struct { int x; logic [7:0] sm [0:1]; } s_t;
+            s_t st;
+        endinterface
+        module m;
+            ifc u1(), u2();
+            virtual ifc v, v2;
+            integer at_d = -1, at_v = -1, at_o = -1, at_w = -1, fd, rc, k;
+            task automatic show(string s, virtual ifc h);
+                $display("%s %h %h %h %h a=%0d b=%0d", s, h.mem[0], h.mem[1], h.mem[2], h.mem[3], h.a, h.b);
+            endtask
+            initial begin u1.a = 1; u1.b = 2; u2.a = 3; u2.b = 4; u2.d = new[3]; u2.q = {8'bx, 8'bx, 8'bx}; end
+            initial begin v2 = u2; #1; @(v2.mem[1]) at_v = $time; end
+            initial begin #1; @(u2.mem[1]) at_d = $time; end
+            initial begin #1; @(u1.mem[1]) at_o = $time; end
+            initial begin #1; wait (u2.d[1] == 8'h22) at_w = $time; end
+            initial begin
+                v = u2; #5;
+                $readmemh("@A6@", v.mem);
+                #1 show("u1", u1); show("u2", v);
+                $display("at %0d %0d %0d", at_d, at_v, at_o);
+                $readmemh("@A6@", v.mem, 1, 2); show("u2s", v);
+                k = 2; $readmemh("@A6@", v.mem[k +: 2]); show("u2k", v);
+                $readmemh("@A6@", v.mm[1]); $display("mm %h %h %h %h", u2.mm[1][0], u2.mm[1][1], u2.mm[1][2], u2.mm[0][0]);
+                $readmemh("@A6@", v.d); #1 $display("d %h %h %h at_w=%0d", u2.d[0], u2.d[1], u2.d[2], at_w);
+                $readmemh("@A6@", v.q, 1); $display("q %h %h %h", u2.q[0], u2.q[1], u2.q[2]);
+                $readmemh("@A6@", v.st.sm); $display("sm %h %h x=%0d", u2.st.sm[0], u2.st.sm[1], u2.st.x);
+                fd = $fopen("@B5@", "rb"); rc = $fread(v.mem, fd, 1, 2); $fclose(fd);
+                $display("rc=%0d", rc); show("fr", v);
+                #2 v = u1; $readmemh("@A6@", v.mem); show("u1", u1);
+                #1 $display("at %0d %0d %0d", at_d, at_v, at_o);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(with_path(with_path(src, "@A6@", "clotho_readmem_vif_test.hex"), "@B5@",
+                                "clotho_fread_vif_test.bin")) ==
+          "u1 xx xx xx xx a=1 b=2\n"
+          "u2 11 22 33 44 a=3 b=4\n"
+          "at 5 5 -1\n"
+          "u2s 11 11 22 44 a=3 b=4\n"
+          "u2k 11 11 11 22 a=3 b=4\n"
+          "mm 11 22 33 xx\n"
+          "d 11 22 33 at_w=6\n"
+          "q xx 11 22\n"
+          "sm 11 22 x=0\n"
+          "rc=2\n"
+          "fr 11 11 22 22 a=3 b=4\n"
+          "u1 11 22 33 44 a=1 b=2\n"
+          "at 5 5 9\n");
+    std::remove("clotho_readmem_vif_test.hex");
+    std::remove("clotho_fread_vif_test.bin");
+}
+
+// What a memory load still refuses, loudly: an associative array (LRM 21.4.1 makes its
+// addresses keys but does not say where a load that names none starts) and a slice of a
+// queue (7.10.1: a new queue, not a view of the queue).
+TEST_CASE("a memory load into an associative array or a queue slice is still refused") {
     const auto refused = [](const std::string& body) {
         const LowerResult r = lower_text("module m;\n" + body + "\nendmodule\n");
         CHECK_FALSE(r.ok);
@@ -4962,7 +5032,6 @@ TEST_CASE("a memory load into a member, an associative array or a queue slice is
     refused("logic [7:0] q[$]; initial $readmemb(\"f.hex\", q[1:2]);");
     refused("logic [7:0] a[int]; integer fd, rc; initial rc = $fread(a, fd);");
     refused("logic [7:0] q[$]; integer fd, rc; initial rc = $fread(q[1:2], fd);");
-    refused("interface i; logic [7:0] m[0:3]; endinterface i u(); virtual i v; initial $readmemh(\"f.hex\", v.m);");
 }
 
 // Slurp a file written by a file-I/O test.

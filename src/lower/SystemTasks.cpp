@@ -105,9 +105,10 @@ ir::Index Lowerer::lower_address_arg(const Expression& expr, ir::Builder& b) {
 // (LRM 21.4): a variable holding an unpacked array of fixed size, a dynamic array or a
 // queue; an element of one that is itself an array (a partially indexed
 // multidimensional memory); or a slice of either, with every dimension above the slice
-// indexed. A member of an interface is not loaded yet, nor is an
-// associative array, and a queue slice is a new queue (LRM 7.10.1), not a view of the
-// queue that a load could fill.
+// indexed. The variable can be a member of an unpacked struct, a property of a class
+// object or a member of the interface a virtual interface handle names (LRM 25.9). An
+// associative array is not loaded yet, and a queue slice is a new queue (LRM 7.10.1),
+// not a view of the queue that a load could fill.
 bool Lowerer::is_mem_target_shape(const Expression& e) {
     for (const Expression* cur = &e;;) {
         const slang::ast::Type& type = cur->type->getCanonicalType();
@@ -120,10 +121,11 @@ bool Lowerer::is_mem_target_shape(const Expression& e) {
             case ExpressionKind::HierarchicalValue:
                 return true;
             case ExpressionKind::MemberAccess:
-                // A member of an unpacked struct, itself possibly an element of an array of them.
+                // A member of an unpacked struct, itself possibly an element of an array of them,
+                // of a class object, or of the interface a virtual interface handle names.
                 {
                     const slang::ast::Type& base = cur->as<MemberAccessExpression>().value().type->getCanonicalType();
-                    return base.isUnpackedStruct() || base.isClass();
+                    return base.isUnpackedStruct() || base.isClass() || base.isVirtualInterface();
                 }
             case ExpressionKind::ElementSelect:
                 cur = &cur->as<ElementSelectExpression>().value();
@@ -199,11 +201,11 @@ void Lowerer::lower_readmem(const CallExpression& call, bool hex, ir::Builder& b
     }
     const Expression& mem = *mem_arg;
     if (!is_mem_target_shape(mem)) {
-        // TODO: a member of an interface, an associative array (LRM
-        // 21.4.1: loading an address creates its element, but nothing says which address
-        // a load that names none starts at) and a slice of a queue as the target.
-        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one, not a "
-             "member of an interface, an associative array or a slice of a queue");
+        // TODO: an associative array (LRM 21.4.1: loading an address creates its element,
+        // but nothing says which address a load that names none starts at) and a slice of
+        // a queue as the target.
+        fail("$readmem target must be an unpacked array variable, an element of one or a slice of one, not an "
+             "associative array or a slice of a queue");
     }
     const ir::Index  filename   = lower_expr(*args[0], b);
     const MemTarget  target     = lower_mem_target(mem, b);
@@ -1564,11 +1566,10 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         const Expression& target = *target_arg;
         if (target.type->getCanonicalType().isUnpackedArray()) {
             if (!is_mem_target_shape(target)) {
-                // TODO: a member of an interface, an associative array
-                // (LRM 21.3.4.4 says nothing of one) and a slice of a queue as the target.
+                // TODO: an associative array (LRM 21.3.4.4 says nothing of one) and a slice
+                // of a queue as the target.
                 fail("$fread memory target must be an unpacked array variable, an element of one or a slice of "
-                     "one, not a member of an interface, an associative array or a slice of a "
-                     "queue");
+                     "one, not an associative array or a slice of a queue");
             }
             const ir::Index  fd        = lower_expr(*args[1], b);
             const MemTarget  mem       = lower_mem_target(target, b);
