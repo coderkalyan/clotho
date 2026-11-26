@@ -5974,3 +5974,108 @@ TEST_CASE("gc: a queue copied out through an output formal into a promoted objec
     CHECK(yg.young_collections > 0u);
     CHECK(yg.promoted > 0u);
 }
+
+// -- 10. Containers of design state are walked by the ones mutated (docs/design/garbage-collection.md §7) --
+//
+// A young collection walks the containers of design state that a mutation logged since the last collection
+// and no others. Each case puts one young object into a container by the writer under test, after the first
+// (full) collection and with young collections only, and holds it by that container alone while junk is
+// allocated over whatever is freed. Where an operation must log by itself, a pause before it lets a
+// collection clear whatever an earlier operation logged; where it copies from another container, nothing
+// pauses between, so the copy is not of an object a collection has already made old.
+
+namespace {
+
+void check_container_store(const std::string& src, const std::string& expected) {
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.state_containers_logged > 0u);
+}
+
+constexpr std::string_view make_cell = "Cell c; c = new; c.v = 4242; c.tag = \"stored\"; ";
+
+} // namespace
+
+TEST_CASE("gc: a young object pushed onto a state queue survives young collections") {
+    check_container_store(
+      state_store_design("Cell q[$];",
+                         std::string("begin ") + std::string(make_cell) + "q.push_back(c); c = null; end",
+                         "$display(\"%0d %s\", q[0].v, q[0].tag);"),
+      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object stored into an element of a state queue survives") {
+    check_container_store(state_store_design("Cell q[$];",
+                                             std::string("q.push_back(null); q.push_back(null); #10; begin ") +
+                                               std::string(make_cell) + "q[1] = c; c = null; end",
+                                             "$display(\"%0d %s %0d\", q[1].v, q[1].tag, q[0] == null);"),
+                          "4242 stored 1\n");
+}
+
+TEST_CASE("gc: a state queue assigned a queue of young objects survives") {
+    check_container_store(state_store_design("Cell q[$]; Cell src[$];",
+                                             std::string("begin ") + std::string(make_cell) +
+                                               "src.push_back(c); c = null; q = src; src.delete(); end",
+                                             "$display(\"%0d %s\", q[0].v, q[0].tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a state dynamic array made by new[n](old) from young objects survives") {
+    check_container_store(state_store_design("Cell d[]; Cell s[];",
+                                             std::string("begin ") + std::string(make_cell) +
+                                               "s = new[1]; s[0] = c; c = null; d = new[1](s); s.delete(); end",
+                                             "$display(\"%0d %s\", d[0].v, d[0].tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object inserted into a state associative array as a value survives") {
+    check_container_store(state_store_design("Cell a[int];",
+                                             std::string("begin ") + std::string(make_cell) + "a[7] = c; c = null; end",
+                                             "$display(\"%0d %s\", a[7].v, a[7].tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object inserted into a state associative array as a key survives") {
+    check_container_store(state_store_design("int k[Cell];",
+                                             std::string("begin ") + std::string(make_cell) + "k[c] = 1; c = null; end",
+                                             "foreach (k[x]) $display(\"%0d %s\", x.v, x.tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object pushed onto a queue nested in a state queue survives") {
+    check_container_store(state_store_design("Cell qq[$][$]; Cell row[$];",
+                                             std::string("qq.push_back(row); #10; begin ") + std::string(make_cell) +
+                                               "qq[0].push_back(c); c = null; end",
+                                             "$display(\"%0d %s\", qq[0][0].v, qq[0][0].tag);"),
+                          "4242 stored\n");
+}
+
+// What the flags are for: a young collection walks the containers mutated and not the others. A queue of
+// twenty thousand objects that nothing mutates again sits beside the slot a churn stores to, in the same
+// card, and no collection after the first walks it.
+TEST_CASE("gc: a young collection walks no state container nothing mutated") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Cell; int v; endclass
+            Cell q[$];
+            Cell keep;
+            int  n;
+            initial begin
+                repeat (20000) begin keep = new; q.push_back(keep); end
+                repeat (60) begin
+                    repeat (200) begin keep = new; keep.v = n; n++; end
+                    #1;
+                end
+                $display("%0d %0d", q.size(), n);
+            end
+        endmodule
+    )";
+    const rt_gc_stats yg = run_stats(src, "20000 12000\n", cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 1u);
+    CHECK(yg.state_containers_read == 0u);
+    const rt_gc_stats full = run_stats(src, "20000 12000\n", cadence_ordinary, nursery_bytes_small, 1);
+    CHECK(full.state_containers_read == 1u);
+}

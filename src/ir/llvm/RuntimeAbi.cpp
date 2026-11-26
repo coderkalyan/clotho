@@ -1405,18 +1405,26 @@ llvm::StructType* Backend::gc_map_ty() {
     return gc_map_ty_;
 }
 
-// rt_gc_roots (Gc.h): { ptr base, i32 nhandles, i32 bytes, ptr offsets, i32 cards, i32 reserved }.
+// rt_gc_roots (Gc.h): { ptr base, i32 nhandles, i32 bytes, ptr offsets, i32 cards, i32 flags,
+// i32 ncontainers, i32 reserved, ptr containers }.
 llvm::StructType* Backend::gc_roots_ty() {
     if (gc_roots_ty_ == nullptr) {
-        gc_roots_ty_ = llvm::StructType::create(
-          ctx_,
-          { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() },
-          "clotho.gcroots");
+        gc_roots_ty_ = llvm::StructType::create(ctx_,
+                                                { raw_ptr_ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  raw_ptr_ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  raw_ptr_ty() },
+                                                "clotho.gcroots");
     }
     return gc_roots_ty_;
 }
 
-// rt_gc_container (Gc.h:249-254): { i64 offset, i32 kind, i32 reserved, ptr ops }.
+// rt_gc_container (Gc.h): { i64 offset, i32 kind, i32 flag, ptr ops }.
 // `ops` is the container's OWN descriptor (kind 2 / 3 / 5), so ops->kind equals
 // `kind` and ops->inner describes the element -- the convention nested container
 // elements already use, which is what lets the collector treat a root entry, a
@@ -1428,17 +1436,6 @@ llvm::StructType* Backend::gc_container_ty() {
           "clotho.gccontainer");
     }
     return gc_container_ty_;
-}
-
-// rt_gc_container_table (Gc.h:256-261):
-// { ptr base, i32 count, i32 reserved, ptr entries }.
-llvm::StructType* Backend::gc_container_table_ty() {
-    if (gc_container_table_ty_ == nullptr) {
-        gc_container_table_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
-          "clotho.gccontainers");
-    }
-    return gc_container_table_ty_;
 }
 
 llvm::StructType* Backend::gc_frame_ty() {
@@ -1556,13 +1553,9 @@ llvm::FunctionCallee Backend::gc_nba_container_add_fn() {
                  { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
 }
 
-// The container-root ABI (Gc.h:263-268). rt_gc_containers_add takes a constant
-// rt_gc_container_table for state-resident storage; the add / remove pair takes a
-// live rt_dynarr / rt_queue / rt_assoc address for a frame local or a body
-// temporary.
-llvm::FunctionCallee Backend::gc_containers_add_fn() {
-    return rt_fn("rt_gc_containers_add", b_.getVoidTy(), { raw_ptr_ty() });
-}
+// The container-root ABI (Gc.h). The containers of design state are entries of a region's root
+// table; the add / remove pair takes a live rt_dynarr / rt_queue / rt_assoc address for a frame
+// local or a body temporary.
 
 llvm::FunctionCallee Backend::gc_container_add_fn() {
     return rt_fn("rt_gc_container_add", b_.getVoidTy(),

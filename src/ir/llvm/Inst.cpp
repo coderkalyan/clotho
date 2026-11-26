@@ -675,8 +675,10 @@ void Backend::lower_inst(Index i) {
             // further member selection is party to it -- so it cannot ride the
             // value path's owner. assoc_elem_lvalue emits the barrier beside the
             // put_ptr that writes the key.
-            el.assoc_key_handle =
-              (el.gc_owner != nullptr || el.gc_ref_slot != nullptr) && assoc_key_is_class_handle(aa.assoc_type);
+            el.assoc_put_handle =
+              (el.gc_owner != nullptr || el.gc_ref_slot != nullptr || el.gc_state_base != nullptr) &&
+              (assoc_key_is_class_handle(aa.assoc_type) ||
+               reaches_class_handle(std::get<Type>(mod_.pool.get(aa.assoc_type)).element));
             if (e.is_agg) {
                 // Aggregate value: a deferred is_agg lvalue. A following
                 // MemberSelect / ElemSelect rides along (agg_member / agg_elem

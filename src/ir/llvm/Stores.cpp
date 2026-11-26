@@ -1567,7 +1567,7 @@ void Backend::emit_handle_whole_nba(Index i) {
     // Signal-keyed like the deferred store family (handle_buf_idx(dlv.sig)), so the destination is
     // design state, whose card is logged here, at the staging (see StoreNbDelay).
     assert(dlv.gc_owner == nullptr && "a whole-container NBA targets a signal");
-    emit_gc_barrier_for(dlv);
+    emit_gc_container_barrier(dlv);
     auto*             rt   = handle_rec_ty(qa.queue_type);
     const auto        strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      rec  = b_.CreateCall(nba_arr_slot_fn(),

@@ -352,7 +352,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // Handle-bearing containers (§3.3): a container's payload is malloc'd, so
     // neither root path finds the handles inside it and the container itself has
     // to be a root when its storage is one.
-    expose("rt_gc_containers_add", &rt_gc_containers_add);
     expose("rt_gc_container_add", &rt_gc_container_add);
     expose("rt_gc_container_remove", &rt_gc_container_remove);
     // Functional coverage (LRM 19; docs/design/functional-coverage.md). Exposed
