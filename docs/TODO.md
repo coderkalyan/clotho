@@ -243,7 +243,7 @@ Milestones, in order; lower ones unblock higher ones:
   target** (21.3) — refused.
 - [ ] **`$fread` into a part-select** (21.3.4.4) — refused.
 - [~] **`$fscanf` / `$sscanf`** (21.3.4.3) — missing pieces:
-  - [ ] **Target wider than 64 bits or not a whole variable**.
+  - [ ] **Bit-select or part-select target** — `$sscanf(s, "%h", v[7:0])` is refused.
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination**.
   - [ ] **`%t`, `%u`, `%z`, `%v` and `%m` conversions**.
   - [ ] **`%s` into an unpacked array of `byte`** — needs an element-ordered store
@@ -298,8 +298,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Cross-top hierarchical reference** — `top2.sig` from `top1`; each top lowers with its
   own signal map. Calls into another top work; `$unit` code or a method calling `top.f()` is
   refused, and so is a later top's function returning a class handle.
-- [ ] **Hierarchical path through a generate-block instance or an instance-array element**
-  — `g.u.sig` and `arr[i].sig` fail at elaboration.
 - [~] **`inout` / `ref` port aliasing** (23.2.2.1, 23.3.3) — a port and its connection must be
   one whole net each, of one width; missing pieces:
   - [ ] **Port that is a select, or connection that is a select or concatenation** — needs
@@ -392,8 +390,6 @@ Milestones, in order; lower ones unblock higher ones:
   container kind with the clause's element type.
 - [ ] **Array query dimension argument beyond 1 on a dynamically sized operand** (20.7) — a nested
   dynamic dimension, as in a queue of queues, is refused.
-- [ ] **Bounded queue `[$:N]` under whole assignment** — `qb = other` from a queue, dynamic array
-  or fixed array keeps every source element instead of truncating to the bound.
 - [~] **Whole queue and dynamic-array assignment** (7.5, 7.10) — source and region shapes still
   refused.
   - [ ] **Nonblocking form from a literal, a fixed array or another container kind** (10.4.2)
@@ -463,8 +459,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Classes (basic OOP)
 
-- [ ] **Bare instance-method call with no receiver in scope** (8.7) — refused when neither
-  an object under construction nor an enclosing method supplies `this`.
 - [ ] **Monomorphic inline cache for virtual calls (performance)** (8.20) — every virtual
   call dispatches through the method table; benchmark a per-call-site cache keyed on the class.
 
@@ -500,8 +494,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
   fails to lower aborts the whole compilation instead of stubbing that one method.
-- [~] **Class scope and nesting** — open pieces of class scope resolution.
-  - [ ] **`::` on a parameterized class specialization** — `C#(args)::` resolution.
 - [ ] **`$cast` to a `chandle` destination** (6.24.2) — refused; a chandle carries no type
   identity to test.
 - [ ] **Deeply nested class inheritance** (8.13) — a chain past a fixed depth limit is
@@ -563,12 +555,7 @@ Milestones, in order; lower ones unblock higher ones:
 ### Concurrent assertions (SVA)
 
 - [~] **Sequence and property operators** (16.9, 16.12) — open operator shapes:
-  - [ ] **Abort over a multi-cycle implication antecedent** — an attempt whose antecedent dies
-    on the abort tick is dropped, so no failure is reported.
-  - [ ] **`disable iff` inside a named property** — refused.
   - [ ] **Repetition with a zero lower bound** — it admits the empty sequence.
-  - [ ] **Goto and non-consecutive repetition over a compound sequence** — only
-    single-expression operands lower.
   - [ ] **Property operator over an operand that raises its own obligation** — a monitor has
     one trigger; only `nexttime[n]` and `always [m:n]` operands lower.
   - [ ] **Non-packed sampled variable** (16.5, 16.6) — aggregate, container, string and
@@ -580,7 +567,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Sampled value functions** (16.9.3) — open pieces:
   - [ ] **Explicit clocking argument** (16.12.14) — refused on `$past`, `$rose`, `$fell`,
     `$stable` and `$changed`; unclocked contexts such as `disable iff` need it.
-  - [ ] **Non-constant `$past` tick count** — refused.
   - [ ] **Operand that is an expression** — the operand must be a plain variable.
   - [ ] **Use outside an assertion expression** — refused.
 - [~] **Function calls in assertion expressions** (16.9.1, 4.4.2) — open pieces:
@@ -730,13 +716,9 @@ Milestones, in order; lower ones unblock higher ones:
   `$timeskew`, `$fullskew`, `$nochange`, and `$setuphold` with notifiers.
 - [ ] **SDF annotation** — `$sdf_annotate`.
 - [ ] **Pulse-style controls** — pulse filtering control in specify blocks.
-- [ ] **Hierarchical and fractional time units** — full per-scope `timeunit` /
-  `timeprecision` and precision-correct rounding of fractional delays.
 
 ### Configuration & checkers
 
-- [ ] **Library maps and configurations** — `library`, `config`, `design`, `cell` and
-  `instance` binding, `liblist` and `use`.
 - [ ] **Checkers** — `checker` / `endchecker` declarations, their assertions, free
   variables and instantiation.
 - [ ] **Nested `rand join`** (18.17.5) — a `rand join` operand that is itself a `rand join`.
@@ -751,8 +733,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Recursive properties** — a property that instantiates itself.
 - [ ] **Full constraint language** — array reduction methods and functions in
   constraints, `disable soft`, iterative constraints, constraint inheritance.
-- [ ] **Coverage corners** — real coverpoints, type coverage, cross `binsof`
-  expressions, coverage merge and database; see docs/design/functional-coverage.md.
 - [ ] **Attributes** — semantic meaning for `(* ... *)` attributes beyond
   parse-through.
 - [ ] **Protected envelopes** (34) — encrypted source cannot be decrypted, so it is refused.
@@ -771,6 +751,3 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **VPI** — object-model access (`vpi_handle`, `vpi_get`, `vpi_get_value`),
   value-change and start/end-of-simulation callbacks, `vpi_put_value`.
 - [ ] **Assertion and coverage APIs** — the VPI assertion and coverage extensions.
-- [ ] **Compiler directive semantics** — `` `define `` with arguments, conditionals,
-  `` `include ``, `` `line ``, `` `resetall ``, `` `default_nettype ``, `` `celldefine `` and
-  `` `pragma `` are not verified to take their semantic effect.
