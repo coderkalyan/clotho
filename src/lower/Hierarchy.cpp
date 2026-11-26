@@ -1599,12 +1599,6 @@ void Lowerer::collect_expr_reads(const Expression& expr, std::vector<ir::WaitEve
         if (c.written.contains(static_cast<uint32_t>(s))) {
             continue;
         }
-        if (is_string_ref(module_.signal(s).type)) {
-            // TODO: string signals in inferred sensitivity — string stores
-            // skip wait-queue servicing, so the process would never
-            // re-trigger.
-            fail("string in inferred sensitivity is not supported");
-        }
         out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
     }
 }

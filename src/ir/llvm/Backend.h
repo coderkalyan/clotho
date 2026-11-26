@@ -524,16 +524,19 @@ struct LValueInfo {
     Ref          gc_container_type = Ref::Invalid;
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
-    // The notifiers of the class property this place selects, when some `@` / `wait`
-    // in the design waits on it, plus the object body they live in. Null for every
-    // other place -- and null for EVERY place in a design that waits on no property,
+    // The notifiers of the class property this place selects, or lies inside, when some
+    // `@` / `wait` in the design waits on it, plus the object body they live in. Null for
+    // every other place -- and null for EVERY place in a design that waits on no property,
     // which is what makes that design pay nothing.
     //
     // Set at exactly one place, agg_member, off the interned class Ref plus the
-    // property's field index. A blocking store then classifies its own old -> new
-    // transition and wakes the notifiers whose edge it produced -- literally
+    // property's field index, and kept by every select inside an AGGREGATE property
+    // (a member, an element): the property is one variable (LRM 9.4.2.2), and a store to
+    // any leaf of it is a change of it. A blocking store then classifies its own old ->
+    // new transition and wakes the notifiers whose edge it produced -- literally
     // service_wait_queue's job, with the waiter lists reached through the object
-    // instead of through per-signal globals.
+    // instead of through per-signal globals. A whole-object copy (AggCopy) compares the
+    // bytes, and a container inside the aggregate fires on every mutation.
     const ChangeNotify* chg         = nullptr;
     llvm::Value*        chg_body    = nullptr;
     llvm::Type*         chg_body_ty = nullptr;
@@ -1676,6 +1679,8 @@ private:
     // (ir::ChangeNotify::shared): an element of clotho.chg_shared.
     llvm::Constant* chg_shared_slot(uint32_t k);
 
+    bool str_signal_waited(const LValueInfo& lv) const;
+
     llvm::Value* str_chg_snapshot(const Guarded& lv);
 
     void str_chg_after(const Guarded& lv, llvm::Value* snap);
@@ -2279,17 +2284,42 @@ private:
     // leave (RT_TRACE_ABORT_*).
     void emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind);
 
+    // R22: the body's own activation (null in a function) forks onto the join record `rec`
+    // (`kind`: RT_TRACE_JOIN_*, `width` children); fork child `a` completes into `rec`; the
+    // activation is past the join of `rec`.
+    void emit_trace_fork(llvm::Value* rec, uint32_t kind, uint32_t width);
+    void emit_trace_child_done(llvm::Value* a, llvm::Value* rec);
+    void emit_trace_join(llvm::Value* rec);
+
     // clotho.run_once is about to run the bodies of one region (RT_TRACE_ORG_PREINIT ...), or has.
     void emit_trace_once(uint32_t kind);
 
     // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
     void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
 
+    // What the seed reports of a guarded group's members (S9): each member's own list (`n` entries at
+    // `list`), how many members there are (zero: the group is not guarded) and whether no two events of
+    // the group share a trigger bit.
+    struct TraceMembers {
+        llvm::Value* list;
+        llvm::Value* n;
+        llvm::Value* members;
+        llvm::Value* exact;
+    };
+
     // The seed's reports of one row: the spawn of its handle `h`, its static list (`n` entries at
-    // `list`, from the IR's wait events) and, when `parked_now` (an i1), its park at the static
-    // control `ctl`, which is where a group that is not queued now waits.
+    // `list`, from the IR's wait events), its members and, when `parked_now` (an i1), its park at the
+    // static control `ctl`, which is where a group that is not queued now waits.
     void emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list, llvm::Value* n,
-                             llvm::Value* parked_now);
+                             llvm::Value* parked_now, const TraceMembers& members);
+
+    // Member `index` of the guarded group being lowered starts its body (S9): a thunk row names the
+    // group by its wake pair, a coroutine by its handle.
+    void emit_trace_member(uint32_t index);
+
+    // R16: the generated code armed the inertial record `rec` of site `idx` (the dense id of its target, an
+    // i32) for the decision's `epoch` (an i64), `ticks` (an i64) from now.
+    void emit_trace_inertial_arm(llvm::Value* idx, llvm::Value* rec, llvm::Value* ticks, llvm::Value* epoch);
 
     // One event the seed links a persistent waiter onto joins the static list of the group `h`.
     void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
@@ -2322,8 +2352,19 @@ private:
     llvm::Constant* trace_nba_site(llvm::Module& m, const TraceNba& t, uint32_t path);
 
     // Report the update: created now (`rec` null, `path` RT_TRACE_NBA_BLOCK ... RT_TRACE_NBA_ZERO), or
-    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT).
-    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path);
+    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT);
+    // a timer's delay is `ticks` (an i64).
+    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path, llvm::Value* ticks = nullptr);
+
+    // One event a `<= @e` record waits for: the storage of a signal (`edge` RT_TRACE_POS ...) or an event
+    // object (RT_TRACE_OBJ).
+    struct TraceTrigger {
+        llvm::Value* x;
+        uint32_t     edge;
+    };
+
+    // The events of the `<= @e` record `rec` just armed, and its repeat count `count` (an i32).
+    void emit_trace_nba_events(llvm::Value* rec, llvm::Value* count, llvm::ArrayRef<TraceTrigger> trigs);
 
     // The scheduler enters `region` (RT_TRACE_REG_*).
     void emit_trace_region(uint32_t region);
@@ -2513,6 +2554,8 @@ private:
     llvm::Constant* cover_array(llvm::StructType*                   row_ty,
                                 const std::vector<llvm::Constant*>& rows,
                                 const std::string&                  nm);
+
+    llvm::Constant* cover_string(const std::string& s);
 
     llvm::Constant* cover_config_global();
 
@@ -3275,6 +3318,8 @@ private:
     llvm::FunctionCallee sscanf_fn();
     llvm::FunctionCallee readmem_fn();
     llvm::FunctionCallee fread_fn();
+    llvm::FunctionCallee readmem_assoc_fn();
+    llvm::FunctionCallee fread_assoc_fn();
 
     llvm::FunctionCallee vcd_open_fn();
     llvm::FunctionCallee vcd_begin_fn();
@@ -3494,10 +3539,16 @@ private:
     llvm::FunctionCallee cover_next_fn();
     llvm::FunctionCallee cover_hit_fn();
     llvm::FunctionCallee cover_start_fn();
+    llvm::FunctionCallee cover_start_point_fn();
+    llvm::FunctionCallee cover_opt_set_fn();
+    llvm::FunctionCallee cover_opt_get_fn();
+    llvm::FunctionCallee cover_opt_set_str_fn();
+    llvm::FunctionCallee cover_opt_get_str_fn();
     llvm::FunctionCallee cover_set_name_fn();
     llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_type_query_fn(const char* name, llvm::Type* ret);
+    llvm::FunctionCallee cover_type_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_design_coverage_fn();
 
     // -- Coroutine frame registry (docs/design/garbage-collection.md §2, F2) -----
@@ -3982,7 +4033,7 @@ private:
     void emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
 
     void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count,
-                              llvm::ArrayRef<llvm::Value*> trig_ids);
+                              llvm::ArrayRef<llvm::Value*> trig_ids, llvm::ArrayRef<TraceTrigger> traced);
 
     void emit_intra_commit(Signal sig);
 
@@ -4368,6 +4419,62 @@ private:
     };
     AsciiArg spill_ascii_arg(Index v, const char* name);
 
+    std::pair<llvm::Value*, uint32_t> mem_inner_dims(Ref array_type);
+
+    // The array a $readmem or $fread loads, resolved for rt_readmem / rt_fread: the
+    // leaf planes of the first word that exists, the leaf slot's facts, the loaded
+    // array's dimensions (the declared bounds of its highest, `inner` for the rest),
+    // which of the words of the highest dimension have storage and, for a queue, the
+    // ring they sit in. An associative array has no planes to point at (its elements are
+    // created by the load): rt_readmem_assoc / rt_fread_assoc take its handle, its
+    // descriptor and the index's width instead, and the slot facts describe one element.
+    struct MemTarget {
+        llvm::Value*                      mm_base = nullptr;
+        llvm::Value*                      z_base  = nullptr;
+        uint32_t                          stride  = 0;
+        uint32_t                          width   = 0;
+        bool                              four_state = false;
+        std::pair<llvm::Value*, uint32_t> inner;
+        // i64 values: the declared bounds of the highest dimension. Constants for a
+        // fixed-size array, [0 : size - 1] for a dynamic array or queue, whose size is
+        // read at run time.
+        llvm::Value* left  = nullptr;
+        llvm::Value* right = nullptr;
+        // i64 values: the words at positions [lo_word, lo_word + word_count), counted
+        // from `left`, exist; a count of 0 means the target names none.
+        llvm::Value* lo_word    = nullptr;
+        llvm::Value* word_count = nullptr;
+        // i64 values: the ring of a queue (see rt_readmem); 0 and 0 for any other array.
+        llvm::Value* ring_head = nullptr;
+        llvm::Value* ring_cap  = nullptr;
+        // An associative array: its handle (ptr) and descriptor, the index's width and
+        // signedness, the byte offset of the z plane in an element slot, and the i1 that
+        // says the target is valid at run time (null: always).
+        bool            assoc       = false;
+        llvm::Value*    assoc_handle = nullptr;
+        llvm::Constant* assoc_ops    = nullptr;
+        uint32_t        key_width    = 0;
+        bool            key_signed   = false;
+        uint32_t        z_off        = 0;
+        llvm::Value*    assoc_valid  = nullptr;
+        // The place the load writes: whose waiters it wakes and what it marks for the
+        // dump. `container` says it is a dynamic array, queue or associative array, which
+        // wakes through the container notifier (notify_container_mutation) rather than the
+        // waiters of an array signal.
+        LValueInfo place;
+        bool       container = false;
+    };
+
+    MemTarget resolve_mem_target(Index       target,
+                                 Ref         type,
+                                 Ref         base_type,
+                                 uint32_t    slice,
+                                 Index       slice_base,
+                                 Index       slice_end,
+                                 const char* task);
+
+    void finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix);
+
     void lower_fread_word(Index i);
 
     void lower_fread_mem(Index i);
@@ -4410,7 +4517,8 @@ private:
 
     void emit_defer_gen_bump();
 
-    void emit_defer_gen_bump_at(llvm::Value* gen);
+    // `delta` is 1 at a resume or activation start, kGenDisableBump at a `disable`.
+    void emit_defer_gen_bump_at(llvm::Value* gen, uint64_t delta = 1);
 
     // The report generation of the running thread (LRM 16.4.2), published for the
     // bodies it calls: a process group publishes its own counter at each activation
@@ -4938,6 +5046,8 @@ private:
     static constexpr uint32_t kProcSelfPark  = 1u << 11;
     // Parked in `wait fork`, woken when the last live descendant completes.
     static constexpr uint32_t kProcWaitFork  = 1u << 12;
+    // Announced as WAITING to whatever waits on `status()`: the next park is no news.
+    static constexpr uint32_t kProcSeenWait = 1u << 13;
 
     llvm::Value* proc_arg();
 
@@ -4950,6 +5060,12 @@ private:
     llvm::Value* program_root_pcb(llvm::Value* inst);
 
     void emit_proc_state(uint32_t from, uint32_t to);
+
+    uint32_t proc_status_notify() const;
+
+    void emit_proc_status_notify(llvm::Value* pcb);
+
+    void emit_proc_park_notify();
 
     llvm::Value* emit_proc_object(llvm::Value* pcb, Ref class_ref);
 
@@ -6027,6 +6143,8 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).
     ankerl::unordered_dense::map<uint32_t, llvm::StructType*> class_body_ty_;
+    // Memoized unpacked-struct storage mirror per field-type list (see agg_storage_ty).
+    std::map<std::vector<llvm::Type*>, llvm::StructType*> agg_struct_tys_;
     // Memoized reaches_class_handle() per type Ref. Design-wide, not per module: the
     // answer depends only on the intern pool.
     ankerl::unordered_dense::map<uint32_t, bool> reaches_class_handle_;

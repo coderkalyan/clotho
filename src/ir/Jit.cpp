@@ -231,6 +231,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_fscanf", &rt_fscanf);
     expose("rt_sscanf", &rt_sscanf);
     expose("rt_fread", &rt_fread);
+    expose("rt_fread_assoc", &rt_fread_assoc);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
@@ -270,6 +271,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_sim_run", &rt_sim_run);
     expose("rt_fflush", &rt_fflush);
     expose("rt_readmem", &rt_readmem);
+    expose("rt_readmem_assoc", &rt_readmem_assoc);
     expose("rt_random", &rt_random);
     expose("rt_dist_uniform", &rt_dist_uniform);
     expose("rt_dist_normal", &rt_dist_normal);
@@ -362,6 +364,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_cover_next", &rt_cover_next);
     expose("rt_cover_hit", &rt_cover_hit);
     expose("rt_cover_start", &rt_cover_start);
+    expose("rt_cover_start_point", &rt_cover_start_point);
     expose("rt_cover_set_inst_name", &rt_cover_set_inst_name);
     expose("rt_cover_inst_coverage", &rt_cover_inst_coverage);
     expose("rt_cover_inst_covered", &rt_cover_inst_covered);
@@ -372,6 +375,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_cover_type_coverage", &rt_cover_type_coverage);
     expose("rt_cover_type_covered", &rt_cover_type_covered);
     expose("rt_cover_type_total", &rt_cover_type_total);
+    expose("rt_cover_type_point_coverage", &rt_cover_type_point_coverage);
+    expose("rt_cover_type_point_covered", &rt_cover_type_point_covered);
+    expose("rt_cover_type_point_total", &rt_cover_type_point_total);
+    expose("rt_cover_opt_set", &rt_cover_opt_set);
+    expose("rt_cover_opt_get", &rt_cover_opt_get);
+    expose("rt_cover_opt_set_str", &rt_cover_opt_set_str);
+    expose("rt_cover_opt_get_str", &rt_cover_opt_get_str);
     expose("rt_cover_design_coverage", &rt_cover_design_coverage);
     expose("rt_run_init", &rt_run_init);
     expose("rt_event_new", &rt_event_new);
@@ -551,12 +561,19 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_trace_region", &rt_trace_region);
     expose("rt_trace_nba_create", &rt_trace_nba_create);
     expose("rt_trace_nba_stage", &rt_trace_nba_stage);
+    expose("rt_trace_nba_event", &rt_trace_nba_event);
     expose("rt_trace_nba_pass", &rt_trace_nba_pass);
     expose("rt_trace_pend", &rt_trace_pend);
     expose("rt_trace_trigger", &rt_trace_trigger);
     expose("rt_trace_block", &rt_trace_block);
     expose("rt_trace_disable", &rt_trace_disable);
     expose("rt_trace_abort", &rt_trace_abort);
+    expose("rt_trace_fork", &rt_trace_fork);
+    expose("rt_trace_child_done", &rt_trace_child_done);
+    expose("rt_trace_join", &rt_trace_join);
+    expose("rt_trace_members", &rt_trace_members);
+    expose("rt_trace_member", &rt_trace_member);
+    expose("rt_trace_inertial_arm", &rt_trace_inertial_arm);
     expose("rt_trace_once", &rt_trace_once);
 #endif
     // libc mem* helpers that LLVM's loop-idiom pass synthesizes under -O (a

@@ -7,6 +7,13 @@
 #include <queue>
 #include <set>
 
+#include <llvm/Analysis/CaptureTracking.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/MDBuilder.h>
+#include <llvm/IR/Operator.h>
+
 namespace clotho::ir::backend {
 
 namespace {
@@ -147,6 +154,147 @@ std::vector<uint32_t> dag_levels(uint32_t n, const std::vector<std::vector<uint3
         }
     }
     return level;
+}
+
+// Whether every address `ptr` can be is based on `actual`, none is, or the walk cannot
+// tell: followed back through GEPs, phis and selects to `actual` or to a value that is
+// not based on it -- a global, an alloca, an argument of the merged function, or a
+// loaded pointer, which is never based on an argument the body does not capture.
+enum class Based : uint8_t { Yes, No, Unknown };
+
+Based based_on(llvm::Value* ptr, const llvm::Value* actual) {
+    constexpr size_t                    kMaxWalk = 64;
+    llvm::SmallVector<llvm::Value*, 8>  work{ ptr };
+    llvm::SmallPtrSet<llvm::Value*, 16> seen;
+    bool                                yes = false;
+    bool                                no  = false;
+    while (!work.empty()) {
+        llvm::Value* const v = work.pop_back_val();
+        if (!seen.insert(v).second) {
+            continue;
+        }
+        if (seen.size() > kMaxWalk) {
+            return Based::Unknown;
+        }
+        if (v == actual) {
+            yes = true;
+        } else if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(v)) {
+            work.push_back(gep->getPointerOperand());
+        } else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(v)) {
+            work.append(phi->incoming_values().begin(), phi->incoming_values().end());
+        } else if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+            work.push_back(sel->getTrueValue());
+            work.push_back(sel->getFalseValue());
+        } else if (llvm::isa<llvm::GlobalValue, llvm::AllocaInst, llvm::Argument, llvm::LoadInst>(v)) {
+            no = true;
+        } else {
+            return Based::Unknown;
+        }
+    }
+    return yes && !no ? Based::Yes : !yes && no ? Based::No : Based::Unknown;
+}
+
+// The address operands of a memory access, or none for anything else.
+llvm::SmallVector<llvm::Value*, 2> access_pointers(llvm::Instruction& inst) {
+    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        return { load->getPointerOperand() };
+    }
+    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        return { store->getPointerOperand() };
+    }
+    if (auto* copy = llvm::dyn_cast<llvm::MemTransferInst>(&inst)) {
+        return { copy->getRawDest(), copy->getRawSource() };
+    }
+    if (auto* set = llvm::dyn_cast<llvm::MemSetInst>(&inst)) {
+        return { set->getRawDest() };
+    }
+    return {};
+}
+
+// Put the body of `call`'s callee in place of the call and delete the callee, which
+// nothing else calls. The blocks move rather than being copied, the arguments become
+// the call's operands, each return continues after the call, and the callee's static
+// allocas join the caller's entry block, where SROA promotes them. This is what LLVM's
+// inliner would do to the call, without its per-call-site cost model and without
+// running the tier-0 function passes over the callee once on its own and again in
+// the caller.
+//
+// A noalias argument becomes what the inliner keeps of it: a scope that every access
+// based on the argument is in and every access that cannot be based on it is
+// `!noalias` to, declared where the body starts. Only for an argument the body does not
+// capture, so that no pointer it loads can be one based on the argument; the inliner
+// asks the same question instruction by instruction.
+void absorb_sole_callee(llvm::CallInst* call) {
+    llvm::Function* const callee = call->getCalledFunction();
+    llvm::Function* const caller = call->getFunction();
+    assert(callee != nullptr && callee->hasOneUse() && callee->hasLocalLinkage() && !callee->isDeclaration() &&
+           callee->getReturnType()->isVoidTy() && "a body is merged only into its one caller");
+    llvm::LLVMContext& ctx = callee->getContext();
+    struct Scoped {
+        llvm::Value*  actual;
+        llvm::MDNode* scopes;
+    };
+    llvm::SmallVector<Scoped, 1> scoped;
+    llvm::MDBuilder              mdb(ctx);
+    for (llvm::Argument& arg : callee->args()) {
+        if (arg.hasNoAliasAttr() && !llvm::PointerMayBeCaptured(&arg, /*ReturnCaptures=*/false)) {
+            llvm::MDNode* const domain = mdb.createAnonymousAliasScopeDomain(callee->getName());
+            llvm::MDNode* const scope  = mdb.createAnonymousAliasScope(domain, arg.getName());
+            scoped.push_back({ call->getArgOperand(arg.getArgNo()), llvm::MDNode::get(ctx, { scope }) });
+        }
+    }
+    llvm::BasicBlock* const before = call->getParent();
+    llvm::BasicBlock* const after  = before->splitBasicBlock(call->getIterator(), "row.done");
+    for (unsigned i = 0; i < callee->arg_size(); ++i) {
+        callee->getArg(i)->replaceAllUsesWith(call->getArgOperand(i));
+    }
+    llvm::BasicBlock* const body = &callee->getEntryBlock();
+    for (auto it = body->begin(); it != body->end();) {
+        llvm::Instruction& inst = *it++;
+        if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(&inst); slot != nullptr && slot->isStaticAlloca()) {
+            slot->moveBefore(caller->getEntryBlock().getFirstInsertionPt());
+        }
+    }
+    llvm::SmallVector<llvm::BasicBlock*, 32> blocks;
+    for (llvm::BasicBlock& bb : *callee) {
+        blocks.push_back(&bb);
+    }
+    caller->splice(after->getIterator(), callee);
+    before->getTerminator()->setSuccessor(0, body);
+    for (llvm::BasicBlock* bb : blocks) {
+        if (auto* ret = llvm::dyn_cast<llvm::ReturnInst>(bb->getTerminator())) {
+            llvm::BranchInst::Create(after, ret->getIterator());
+            ret->eraseFromParent();
+        }
+    }
+    call->eraseFromParent();
+    callee->eraseFromParent();
+
+    for (const Scoped& s : scoped) {
+        for (llvm::BasicBlock* bb : blocks) {
+            for (llvm::Instruction& inst : *bb) {
+                const llvm::SmallVector<llvm::Value*, 2> ptrs = access_pointers(inst);
+                if (ptrs.empty()) {
+                    continue;
+                }
+                Based all = based_on(ptrs.front(), s.actual);
+                for (size_t k = 1; k < ptrs.size(); ++k) {
+                    if (based_on(ptrs[k], s.actual) != all) {
+                        all = Based::Unknown;
+                    }
+                }
+                if (all == Based::Unknown) {
+                    continue;
+                }
+                const unsigned kind = all == Based::Yes ? llvm::LLVMContext::MD_alias_scope : llvm::LLVMContext::MD_noalias;
+                inst.setMetadata(kind, llvm::MDNode::concatenate(inst.getMetadata(kind), s.scopes));
+            }
+        }
+        llvm::IRBuilder<> decl(body, body->getFirstInsertionPt());
+        decl.CreateCall(
+          llvm::Intrinsic::getOrInsertDeclaration(caller->getParent(), llvm::Intrinsic::experimental_noalias_scope_decl),
+          { llvm::MetadataAsValue::get(ctx, s.scopes) });
+    }
 }
 
 } // namespace
@@ -865,11 +1013,13 @@ void Backend::emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask) {
 // through it, and the wake word through the pointer it is passed.
 //
 // A group of one row is the unit's code: its entry sits in the row's unit
-// module, once per row function however many instances run it, next to a body
-// the inliner may fold into it, and finds its instance's record a constant
-// below the pair it is handed. No code of root is per instance. Several rows
-// span units: the dispatcher is link glue in root, and its calls are the cost of
-// having no code of one unit inline in another.
+// module, once per row function however many instances run it, and finds its
+// instance's record a constant below the pair it is handed. A row that only its
+// entry runs is moved into it once every entry exists (absorb_sole_callee), so the
+// tier-0 pipeline sees one function per group, not a body and a wrapper for its
+// inliner to merge. No code of root is per instance. Several rows span units: the
+// dispatcher is link glue in root, and its calls are the cost of having no code
+// of one unit inline in another.
 //
 // No entry is noalias on its pair: wakers write the wake word through pointers
 // of their own. A row's `ctx` is noalias all the same, because the word reaches
@@ -945,6 +1095,13 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
         b_.CreateStore(b_.getInt64(0), flag); // re-arm: ready to be woken
         b_.CreateRetVoid();
         fns[s] = fn_;
+    }
+    // A row that only its own entry runs becomes that entry's body. A dispatcher in
+    // root calls a row through a declaration, which gave the row external linkage.
+    for (const auto& [row, entry] : unit_entry) {
+        if (row->hasOneUse() && row->hasLocalLinkage()) {
+            absorb_sole_callee(llvm::cast<llvm::CallInst>(row->user_back()));
+        }
     }
     env_ = root_env_.get();
     return fns;

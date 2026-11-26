@@ -624,9 +624,11 @@ database tasks.** Specifically:
 - Ordered by (type index, instance creation order), never by hash or pointer
   order, so two runs of one design diff cleanly.
 - Per-instance lines appear only for a covergroup whose `option.per_instance` is 1
-  (LRM 19.7: instance data is saved only then [unverified wording]). With the default 0
-  the report lists the type line alone (coverage, bins, instance count), and no bin hit
-  counts; `get_inst_coverage()` still answers, because the counters are kept either way.
+  (LRM 19.7 Table 19-1: true "shall be saved ... and included in the coverage report";
+  false, implementations "are not required to save instance-specific information").
+  With the default 0 the report lists the type line alone (coverage, bins, instance
+  count), and no bin hit counts; `get_inst_coverage()` still answers, because the
+  counters are kept either way.
 - Content per instance (per_instance = 1): the instance name (`<scope><type>`, the scope being the
   constructing instance's prefix of §6.2, or whatever
   `set_inst_name` replaced it with), its percentage, then per coverpoint the
@@ -746,8 +748,8 @@ ranges, `$`, `[]`, `[N]`, `default`) plus automatic bins including the enum form
 `sample()` called procedurally; `get_inst_coverage` and `get_coverage` in both
 arities; `$get_coverage`; the text report and `--coverage`. Two items moved out of
 P0: the key-widening the plan opened with turned out to be unnecessary (§6.1), and
-`option.name` / `option.comment` are refused rather than carried, because the
-model has no field for report metadata that changes no semantics.
+`option.name` / `option.comment` were refused here and landed with P4 (the name is the
+instance's name, comments show in the report).
 *This is the phase that makes a UVM subscriber-style covergroup work.*
 
 **P1 — the trigger. LANDED.** `@(edge sig)` / `@(event)` coverage events as one
@@ -884,6 +886,10 @@ IEEE 1800-2023 addition gated on the language version.
    other clotho run-time fatal.
 7. **The coverage database is refused rather than invented** (19.9 specifies no
    format), and the report is a deterministic text file instead.
+8. **`option.detect_overlap` warns only between `bins` bins** (docs/LRM_NOTES.md 61).
+9. **`start()` / `stop()` on a coverpoint are independent of the covergroup's** (docs/LRM_NOTES.md 62).
+10. **`option.get_inst_coverage` has no effect without `merge_instances`** (Table 19-1: "Only
+    applies when the merge_instances type option is set"); it is validated and dropped.
 
 ## 14. Open questions
 

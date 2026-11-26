@@ -69,7 +69,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Slice of an array with struct or array elements** — refused.
   - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
     or as the receiver of an array method (`a[i +: 2].sum()`) is refused.
-- [ ] **Sliced memory target for `$readmem*` / `$fread`** — a slice destination is refused.
 - [ ] **Whole-array or slice assignment from a concatenation or streaming result** (10.10,
   11.4.14) — an unpacked-array source that is not a variable, pattern or call is refused.
 
@@ -93,9 +92,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Thousands of straight-line statements over wide values** — LLVM's type legalizer
   recurses once per store of a value above 128 bits (a 4-state vector above 64 bits) in one
   block and overflows the compile thread's stack, so the JIT dies with SIGSEGV.
-- [ ] **Subroutine call as a `for` step** (12.7.1) — a `function_subroutine_call` in the step
-  list is refused.
-
 ## M2 — Icarus Verilog parity
 
 ### Time-consuming procedural code
@@ -123,30 +119,18 @@ Milestones, in order; lower ones unblock higher ones:
   identification of the waking source.
 - [ ] **More than 1024 concurrent detached `fork` children** — past the activation
   bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
-- [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate
-  waits are refused.
-  - [ ] **`wait` on an unpacked struct, union or fixed unpacked-array property**
-    (9.4.3) — needs a whole-aggregate change compare.
-  - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
-    needs DPI.
-- [~] **Event control and `wait` over a method call or an expression of properties**
-  (9.4.2) — the forms below are accepted and are not woken by the change.
-  - [ ] **Event list mixing such an expression with another event** — `@(c.get() or
-    posedge clk)` needs identification of the waking source.
-  - [ ] **Such an expression as the control of `<= @(...)` or `->> @(...)`, or as a
-    clocking event** — a record or a clock is not a process that can sample it.
-  - [ ] **Method that reads an unpacked struct, union, fixed unpacked-array or `event`
-    property, or a string variable** — those have no change notifier.
-  - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
-    change notifier.
+- [ ] **Non-null `chandle` property transition** (9.4.2, 9.4.3) — not exercised end to end;
+  making one needs DPI.
+- [~] **Event control over a method call, an expression of class properties or
+  virtual-interface members, or a string expression** (9.4.2) — the forms below are refused.
+  - [ ] **In a list with a signal or a named event** — `@(c.get() or posedge clk)` needs a
+    per-registration fired marker in the wait node, to tell which term woke the process.
+  - [ ] **As the control of `<= @(...)` or `->> @(...)`, or as a clocking event** (15.5.1,
+    9.4.5) — a record or a clock is not a process that can sample it.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
-- [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
-  refused.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
   `wait(vif.q.size())` is not exercised end to end.
-- [ ] **`@` or `wait` on a fork-captured unpacked struct, union, fixed unpacked array or
-  `event`** (9.4.2, 9.4.3, 9.3.2) — the capture box has no change notifier for these types.
 - [~] **Event-controlled nonblocking trigger** (15.5.1) — `->> @(...) e` forms still refused.
   - [ ] **Non-constant `repeat` count** — `->> repeat(n) @(x) e` with a runtime `n`.
   - [ ] **`iff` on the controlling event** (9.4.2.3) — `->> @(posedge c iff en) e`.
@@ -158,19 +142,18 @@ Milestones, in order; lower ones unblock higher ones:
   inside a task, with `p` a formal, is refused.
 - [ ] **`fork` child reading an `output` or `inout` formal of its subroutine** (9.3.2, 13.5) —
   writes made through the capture would not reach the formal's copy-out.
+- [ ] **`fork` child reading its function's return variable or a randsequence production's
+  formal** (9.3.2, 13.4.1, 18.17) — neither has a capture box.
 
 ### Continuous / structural timing
 
 - [~] **Continuous assignment delay** (10.3.3) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — `assign #(r, f)` and `assign #(r, f, t)`.
   - [ ] **Delay on a select, concatenation or aggregate target**.
-  - [ ] **Delay on a partial driver of a resolved net** — its slot powers up all-x, so the
-    undriven bits would fold as x instead of z.
 - [~] **Gate delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — `#(r, f)` and `#(r, f, t)` on any gate or
     switch, including `cmos` / `rcmos` and the turn-off delay of tri-state gates (28.6).
   - [ ] **Delayed gate with a bit-addressed output on a single-driver net**.
-  - [ ] **Delayed gate as a partial driver of a resolved net**.
 - [~] **Net delay** (28.16) — missing pieces:
   - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
     declaration assignment `wire #(r, f) w = e;` (10.3.3).
@@ -205,7 +188,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Concurrent fractional-delay timers (performance)** (3.14) — fine-tick periods past
   the wheel window spill to the overflow heap; needs a hierarchical wheel or a coarser tick.
-- [ ] **`%c`, `%u` and `%z` of a real argument**.
 
 ### Observability & debug
 
@@ -221,8 +203,6 @@ Milestones, in order; lower ones unblock higher ones:
   one `$var` per leaf.
 - [ ] **VCD of a container or class-handle signal** — a dump over a queue, dynamic array,
   associative array or class handle is refused.
-- [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
-  string-literal suffix is accepted.
 - [ ] **Freeing a finished simulation** — frames and allocations of processes still
   suspended when a simulation ends are not freed, so a host running several leaks them.
 - [ ] **Debugger breakpoints and stepping** — the DAP adapter refuses every stop-shaped
@@ -274,15 +254,12 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Part-select destination** — refused for every conversion.
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination** — needs an ASCII-to-real
     scan and a real write-back.
-  - [ ] **Numeric conversion into a `string` destination** — `%d` and friends must store the
-    converted value as an integral-to-string assignment (6.16).
   - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
 - [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
   returned to power-on between designs in one process (docs/design/cooperative-finish.md).
 - [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
   - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
   - [ ] **Aggregate or container argument** — refused at compile time.
-  - [ ] **Operand wider than 64 bits under `%e`, `%f`, `%g`**.
   - [ ] **Empty argument (adjacent commas)** (21.2.1) — contributes format text, which is
     unknown at compile time.
   - [ ] **Format held in an unpacked array of `byte`** (21.3.3) — refused.
@@ -292,8 +269,6 @@ Milestones, in order; lower ones unblock higher ones:
 ### Structural primitives
 
 - [~] **Gate output terminals** — missing pieces:
-  - [ ] **Member of a packed-struct net driven by a single gate** — `s.lo[0]` has no static
-    terminal; only the multi-driver resolved form works.
   - [ ] **Concatenation or part-select output**.
 - [ ] **Bit-select gate output (performance)** — each update rewrites the whole word and
   drops thunk/fusion eligibility; needs per-bit packed-signal fusion.
@@ -308,14 +283,11 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **`trireg` nets** — strength and charge storage; also refused as the simulated net of
   an inout port collapse (23.3.3.7).
-- [ ] **Net delay on an inout port net that dominates the net it connects to** (23.3.3.7,
-  28.16) — the delay needs the declaring module's time unit.
 - [~] **Multiple-driver net resolution** (6.6) — missing pieces:
   - [ ] **Unpacked-array and unpacked-struct nets** — needs per-element slots and resolvers.
   - [ ] **Concatenation-operand driver** — needs a split into per-net stores.
 - [~] **Drive strengths** — missing pieces:
   - [ ] **Drive strength on `wand` / `wor` nets**.
-  - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
   - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the
     r-variants do not reduce it; refused when the output net is resolved against a
     driver or weak pull and the strengths do not order as strong (LRM_NOTES note 38).
@@ -344,8 +316,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Port coercion to inout of a port that is not a whole net of its own width** (23.3.3.1)
   — with `--allow-port-coercion`, a connection to a select, concatenation, expression or net
   of another width is refused.
-- [ ] **Initializer on a select port whose variable is declared apart from the port** (23.2.2.2)
-  — `output x = 1;` with a later `reg [3:0] x;` under `module m(x[3:2])` is refused.
 
 ### Timing checks (basic)
 
@@ -374,11 +344,10 @@ Milestones, in order; lower ones unblock higher ones:
   copy, equality, argument and `%p` positions; needs a by-value aggregate ABI.
 - [ ] **Whole aggregate element of an associative array in a by-value context** (7.8) — as a
   subroutine argument or a raw rvalue; refused in the backend.
-- [ ] **String event control / sensitivity** — `@(s)` and inferred sensitivity on a string are
-  refused.
-- [ ] **`case ... inside` string range bound** (11.4.13) — a `[lo:hi]` item over a string selector
-  is refused.
-- [ ] **Enum `next` / `prev` with a non-constant step** — only a constant step is lowered.
+- [ ] **Dynamic array or queue assigned to a fixed-size array** (7.6) — `f = d;` is refused; the
+  sizes have to be compared at run time.
+- [ ] **Fixed-size array bound to a dynamic array or queue formal, and the reverse** (13.5, 7.6)
+  — refused in every direction; the copy-in and copy-out are that assignment.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
   - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an
@@ -457,15 +426,9 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Operators & expressions
 
-- [ ] **Concatenation as a compound-assignment target** — `{a, b} += x` is refused.
-- [ ] **String element as a compound-assignment target** — `s[i] += c` is refused.
 - [~] **`inside` operator** (11.4.13) — missing set-member and range forms:
-  - [ ] **Associative-array set member** — needs the first/next key walk (7.9.4) rather
-    than an index loop.
-  - [ ] **Queue or dynamic-array set member with non-singular elements** — refused.
-  - [ ] **Tolerance ranges** — `[c +/- d]` and `[c +%- d]` are refused.
-  - [ ] **Unbounded `$` range bounds** — `[$:a]` and `[a:$]` are refused.
-  - [ ] **Unpacked array of strings as a set member** — refused.
+  - [ ] **Queue, dynamic-array or associative-array set member with non-singular elements** —
+    refused.
 - [~] **Streaming operators** (11.4.14) — forms that need a bit-level stream buffer:
   - [ ] **`with` clause on a stream operand** — refused.
   - [ ] **Width not a multiple of the destination granule** — e.g. `bit [5:0] q[$]` into a
@@ -475,18 +438,14 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Unpack from a dynamically sized source** (11.4.14.3) — `{>>{q}} = s` is refused.
   - [ ] **Associative-array operand or member** (11.4.14.1) — streamed in index-sorted order;
     refused.
-  - [ ] **Non-integral leaf or element in a streamed aggregate or container** (11.4.14.1) — a
-    string leaf of an unpacked struct or array, a class handle, and a container whose
-    elements are aggregates or containers are refused, packing and unpacking.
+  - [ ] **Non-integral leaf or element in a streamed aggregate or container** (11.4.14.1, 20.6.2)
+    — a string leaf, a class handle (also under `$bits`) and a container of aggregates or
+    containers are refused, packing and unpacking.
   - [ ] **Unpack into a nested `{<<S{...}}` or with a slice size that does not divide the
     target** (11.4.14.3) — refused.
 
 ### Procedural control
 
-- [ ] **`case … inside` tolerance ranges** (12.5.4) — `[a +/- b]` and `[a +%- b]` labels
-  are refused.
-- [ ] **`case … inside` unbounded range bounds** (12.5.4) — `[$:a]` and `[a:$]` labels are
-  refused.
 - [ ] **`always_ff` non-sequential body warning** (9.2.2.4) — no diagnostic is issued when
   the body does not describe sequential logic.
 - [ ] **`foreach` skipping an outer dimension over a nested runtime one** (12.7.3) —
@@ -524,7 +483,6 @@ Milestones, in order; lower ones unblock higher ones:
     assertion is refused `wait fork` and `wait_order`.
   - [ ] **Action block scheduled in the Reactive region** — the report matures through the
     deferred queue instead of scheduling the action block in Reactive.
-- [ ] **`$countbits` with a non-constant control bit** — refused.
 - [ ] **`$isunbounded` of a hierarchical reference** — refused; slang does not
   constant-evaluate it.
 
@@ -571,10 +529,6 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`rand_mode()` on a subelement** — mode control below a whole property.
   - [ ] **`std::randomize` of a class handle** (18.12) — needs the handle's own virtual
     `randomize`.
-- [ ] **`randcase` and `randsequence` weight wider than 32 bits** (18.16, 18.17) — needs several
-  32-bit draws stitched.
-- [ ] **Object `get_randstate()` / `set_randstate()`** — the object-side randstate pair is
-  refused.
 - [ ] **`randomize()` of a class in a property-type cycle** (18.6) — a call reached while that
   class is still being laid out is refused.
 
@@ -696,11 +650,8 @@ Milestones, in order; lower ones unblock higher ones:
   `default sequence` and overlapping matches.
 - [~] **Coverage options and accounting** — open pieces:
   - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
-    `max(at_least)` across instances.
-  - [ ] **`option.get_inst_coverage`** — refused as a coverage option.
-  - [ ] **`type_option.weight` / `goal` / `comment`, `option.name` / `comment`** — not
-    implemented.
-  - [ ] **`option.detect_overlap`** — no overlap warnings.
+    `max(at_least)` across instances; `option.get_inst_coverage` then decides what
+    `get_inst_coverage()` returns.
 - [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
   floats.
 - [ ] **`covergroup extends`** (19.4.1) — slang hides an inherited coverpoint behind a
@@ -722,8 +673,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Covergroup coverage event** (19.3) — open forms:
   - [ ] **Covergroup declared in a class** (19.4) — its event needs a per-object subscription.
   - [ ] **Event list as the coverage event** — `covergroup cg @(a or b);`.
-- [ ] **Coverpoint-level coverage methods and `cg::get_coverage()`** (19.8) —
-  `cg.cp.get_inst_coverage()` and the type-name form are refused.
 
 ### Foreign interface
 
@@ -753,12 +702,8 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Virtual interfaces** (25.9) — open pieces; see docs/design/interfaces.md:
   - [ ] **Member or clocking block of an interface instantiated inside the interface a handle
     names** (`vif.i.d`) — the context record does not carry its children's.
-  - [ ] **`edge` / `iff` qualifier on an event control over an expression of members** —
-    refused.
-  - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
-    — refused.
-  - [ ] **Composite expression of members outside a lone procedural event control** —
-    e.g. one operand of an event list, `@(vif.a & vif.b or c)`.
+  - [ ] **Virtual-interface expression as the clock of a clocking block, covergroup or
+    assertion** (14.3, 19.4, 16.5, 25.9) — refused.
   - [ ] **Parameter or other member with no signal storage** — `vif.P`, or a clockvar the
     interface's instances do not provide.
   - [ ] **Modport expression port** (25.5.4) — reached through a modport-qualified handle.
@@ -817,7 +762,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Complete system task / function library
 
-- [ ] **`$bits` over every type** — the remaining query-function operand types.
 - [ ] **Extended VCD** — the `$dumpports` family.
 - [ ] **`$writememh` / `$writememb`** — writing memory contents to a file.
 - [ ] **PLA modeling tasks** — `$async$and$array`, `$sync$nand$plane` and the rest of

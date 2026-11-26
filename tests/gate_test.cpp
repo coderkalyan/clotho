@@ -336,20 +336,23 @@ TEST_CASE("cmos rise/fall/turn-off delay triples are reported as unsupported") {
     CHECK(r.diagnostic_text().find("rise/fall/turn-off") != std::string::npos);
 }
 
-// Guard: a delayed PARTIAL driver of a resolved net would fold as x rather than
-// z in the bits it does not drive for the whole initial window, because the slot
-// powers up all-x and the delay defers its first Z-background store.
-TEST_CASE("gate delay on a bit of a multiply-driven net is reported as unsupported") {
-    const LowerResult r = lower_text(R"(
+// A delayed PARTIAL driver of a resolved net powers up as x in its own bit and z
+// elsewhere, so the other driver's bit folds with x until the delay lands.
+// Oracle: iverilog 13.
+TEST_CASE("gate delay on a bit of a multiply-driven net") {
+    const std::string out = run_capture(R"(
         module m;
             wire [3:0] y;
-            reg a, b, c;
+            reg a = 1, b = 1, c = 1;
             and #2 g1 (y[1], a, b);
             and    g2 (y[1], a, c);
+            initial begin
+                #1 $display("%b", y);
+                #2 $display("%b", y);
+            end
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("partial driver of a multiply-driven") != std::string::npos);
+    CHECK(out == "zzxz\nzz1z\n");
 }
 
 TEST_CASE("gate drive strengths lower (resolution covered in net_resolution_test)") {
@@ -880,19 +883,25 @@ TEST_CASE("gate driving a 2-state member of a 4-state packed net resolves") {
     CHECK(out == "zzz1\nzzzx\nzzz0\nzzzx\n");
 }
 
-// The remaining gate-output shapes stay guarded loud: a struct/union MEMBER is
-// not a static (signal, bit) terminal, so a lone gate driving one has no slot to
-// stage into and no bit-addressed store path.
-TEST_CASE("a single gate driving a packed-net member is rejected") {
-    const LowerResult r = lower_text(R"(
+// A struct MEMBER is a (signal, bit) terminal through its packed offset (LRM 7.2.1),
+// so a lone gate drives it directly; the other bits stay z, and a 2-state member
+// converts x to 0. Oracle: iverilog 13 for the 4-state member; the 2-state one is
+// the conversion of the case above.
+TEST_CASE("a single gate driving a packed-struct member") {
+    const std::string out = run_capture(R"(
         module top;
             logic a, b;
             wire struct packed { bit [3:0] lo; logic [3:0] hi; } s;
             and g0(s.lo[0], a, b);
+            and g1(s.hi[3], a, b);
+            initial begin
+                a = 1; b = 1; #1 $display("%b", s);
+                a = 1'bx;     #1 $display("%b", s);
+            end
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("unsupported gate output terminal") != std::string::npos);
+    // lo is the high half: s.lo[0] is bit 4 and s.hi[3] is bit 3.
+    CHECK(out == "zzz11zzz\nzzz0xzzz\n");
 }
 
 // LRM 28.13 / 28.14: a MOS switch passes the strength of its data input to its

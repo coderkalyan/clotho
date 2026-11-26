@@ -1018,14 +1018,8 @@ Index Builder::fread_word(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::FreadWord, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
-Index Builder::fread_mem(Index     fd,
-                         Signal    mem,
-                         Index     start,
-                         Index     count,
-                         bool      has_start,
-                         bool      has_count,
-                         SourceLoc loc) {
-    const ExtraIndex extra = add_extra(FreadMemInfo{ mem, start, count, has_start ? 1u : 0u, has_count ? 1u : 0u });
+Index Builder::fread_mem(Index fd, const FreadMemInfo& info, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(info);
 
     return emit({ Inst::Tag::FreadMem, Inst::Payload{ .op_extra = { fd, extra } } }, loc);
 }
@@ -1087,16 +1081,8 @@ Index Builder::fflush(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fflush, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
-Index Builder::read_mem(Signal    target,
-                        Index     filename,
-                        Index     start,
-                        Index     finish,
-                        bool      hex,
-                        bool      has_start,
-                        bool      has_finish,
-                        SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(ReadMemInfo{ target, start, finish, hex ? 1u : 0u, has_start ? 1u : 0u, has_finish ? 1u : 0u });
+Index Builder::read_mem(Index filename, const ReadMemInfo& info, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(info);
 
     return emit({ Inst::Tag::ReadMem, Inst::Payload{ .op_extra = { filename, extra } } }, loc);
 }
@@ -1105,8 +1091,15 @@ Index Builder::timeformat(Index units, Index precision, std::string_view suffix,
     // Order in the extra buffer: suffix bytes, then the TimeFormatInfo record
     // pointing at them. The three operands are plain SSA indices in the record.
     const ExtraIndex suffix_at = add_bytes(suffix);
+    const ExtraIndex extra     = add_extra(TimeFormatInfo{
+      units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()), kNoFormatValue });
+
+    return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::timeformat(Index units, Index precision, Index suffix_value, Index min_width, SourceLoc loc) {
     const ExtraIndex extra =
-      add_extra(TimeFormatInfo{ units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()) });
+      add_extra(TimeFormatInfo{ units, precision, min_width, add_bytes(std::string_view()), 0, suffix_value });
 
     return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::extra, extra) }, loc);
 }

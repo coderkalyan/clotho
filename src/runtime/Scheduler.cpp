@@ -322,7 +322,10 @@ extern "C" void* rt_inertial_buf(uint32_t idx, uint32_t nbytes) {
     return inertial_bufs[idx].get();
 }
 
-extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint32_t same_as_pending, uint32_t same_as_cur) {
+namespace {
+
+// The decision of rt_inertial_decide, before the trace is told of it.
+uint64_t inertial_decide(uint32_t idx, uint32_t same_as_pending, uint32_t same_as_cur) {
     if (idx >= inertial_states.size()) {
         inertial_states.resize(idx + 1);
     }
@@ -347,9 +350,24 @@ extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint32_t same_as_pending, u
     return s.epoch;
 }
 
+} // namespace
+
+extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint32_t same_as_pending, uint32_t same_as_cur) {
+    const uint64_t epoch = inertial_decide(idx, same_as_pending, same_as_cur);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Whether this is LRM 10.3.3 is the trace's to say (docs/design/scheduler-trace.md, R16).
+    rt_trace_inertial_decide(idx, same_as_pending, same_as_cur, epoch);
+#endif
+    return epoch;
+}
+
 extern "C" void rt_inertial_cb(rt_timer* timer, void* /*ctx*/) {
-    auto* rec = reinterpret_cast<rt_intra_rec*>(timer);
-    if (rec->idx < inertial_states.size() && rec->epoch == inertial_states[rec->idx].epoch) {
+    auto*      rec     = reinterpret_cast<rt_intra_rec*>(timer);
+    const bool current = rec->idx < inertial_states.size() && rec->epoch == inertial_states[rec->idx].epoch;
+#ifdef CLOTHO_EXTRA_ASSERTS
+    rt_trace_inertial_fire(rec, current ? 1 : 0);
+#endif
+    if (current) {
         intra_ready_push(rec); // still current -> commit this instant (pre-active for CA)
         return;
     }
@@ -511,6 +529,10 @@ extern "C" void rt_intra_release(uint32_t idx, uint32_t n) {
     rt_intra_total -= n;
     void* const* recs = site.ready.data();
     for (uint32_t i = 0; i < n; ++i) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+        // An inertial record this commit applied (docs/design/scheduler-trace.md, R16).
+        rt_trace_inertial_applied(recs[i]);
+#endif
         site.freelist.push_back(recs[i]);
     }
     if (n == total) { // the usual case: nothing was released during the commit

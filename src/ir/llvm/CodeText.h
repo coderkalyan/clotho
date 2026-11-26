@@ -23,8 +23,8 @@ namespace clotho::ir::backend {
 //   - the private constants the function names (strings, descriptors), whose
 //     names and slot numbers count the constants their module holds, by their
 //     contents;
-//   - named struct types, whose names count the types created before them
-//     (agg_storage_ty makes a new `%clotho.agg` at each use), by their bodies;
+//   - named struct types, whose names count the types created before them, by
+//     their bodies;
 //   - the numbering of attribute groups, and the comment that restates them.
 // Everything else the function names -- a global another module defines, a
 // constant operand, the order and the types of the instructions -- stays as it

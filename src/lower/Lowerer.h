@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -147,11 +148,14 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e);
 
 bool is_notified_container(const slang::ast::Type& ty);
 
+bool is_notified_aggregate(const slang::ast::Type& ty);
+
 // What a store to a property of this type can classify, and therefore which change
 // notifiers the property may carry (LRM 9.4.2: "any change in the value").
 enum class PropNotify : uint8_t {
-    // Neither an old -> new word nor a mutation surface: an unpacked struct or
-    // union, a FIXED unpacked array. Refused loudly in both constructs.
+    // Neither an old -> new word nor a mutation surface: an event (which has a
+    // waiter list of its own), a covergroup handle. An unpacked struct, union or fixed
+    // array is not this: its leaves are words, and is_notified_aggregate covers it.
     None,
     // The value IS one stored word, so a store compares old against new through
     // the same emit_edge_facts a signal store uses. Every integral type; the three
@@ -175,6 +179,8 @@ const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e);
 
 const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e);
 
+const slang::ast::ClassPropertySymbol* waited_aggregate_prop(const Expression& e);
+
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e);
 
 // Whether `clt` is `std::weak_reference #(T)` itself (LRM 8.30), and the weak
@@ -186,6 +192,9 @@ const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& cl
 // Whether `clt` is `std::semaphore` or a `std::mailbox #(T)` (LRM 15.3, 15.4).
 bool is_sync_builtin_class(const slang::ast::ClassType& clt);
 
+// Whether `clt` is `std::process` (LRM 9.7).
+bool is_process_class(const slang::ast::ClassType& clt);
+
 // Whether `sub` is one of weak_reference's four built-in methods.
 bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 
@@ -194,6 +203,26 @@ bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 // is, so `wait (w.get() == null)` parks on the referent's change notifier: 8.30.3
 // names that wait as the way to learn that a weak reference has been cleared.
 const CallExpression* weak_get_call(const Expression& e);
+
+// Whether an expression reaches through a virtual interface handle anywhere. Such a place
+// names an instance chosen at run time, which the signal-keyed wait engine cannot subscribe to.
+bool reads_vif(const Expression& e);
+
+// A virtual-interface member by itself: `vif.a`, not `vif.s.f` or `vif.a & vif.b`.
+bool is_vif_member(const Expression& e);
+
+// An event term that has a wait source of its own when it is alone in a control: a class
+// property (its notifier, per edge), a `weak_reference::get()` (the referent's) and a
+// virtual-interface member (its waiter list in the instance the handle names). An event is
+// woken through its own object and is none of these.
+bool lone_member_term(const Expression& e);
+
+// Whether an event term reads a non-static class property or a virtual-interface member
+// (an event is not one: it has its own wait object).
+bool event_term_reads_member(const Expression& e);
+
+// The terms of an event control in source order: its one term, or every term of its list.
+void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out);
 
 // Every class-property reference in an expression, whether or not it is notifiable.
 // `wait` needs both halves: the notifiable ones become sensitivity, and the mere
@@ -221,9 +250,18 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     void handle(const slang::ast::HierarchicalValueExpression& e);
     void handle(const MemberAccessExpression& ma);
     void handle(const CallExpression& call);
+    void handle(const slang::ast::ElementSelectExpression& es);
+
+    // An event member or element of an aggregate class property, which `wait` parks on
+    // like an event property (event_props).
+    void take_event_place(const Expression& e);
 };
 
 bool box_can_notify(const slang::ast::Type& ty);
+
+// Whether an instance class property of this type can carry a change notifier: a word,
+// a string, a container or an aggregate (box_can_notify, and is_notified_aggregate).
+bool prop_can_notify(const slang::ast::Type& ty);
 
 // Every value symbol a `wait` condition names. The design-wide pre-pass uses it to
 // decide which capture boxes are minted WITH a notifier; a symbol that turns out to
@@ -290,6 +328,15 @@ struct CalleeReadScan : slang::ast::ASTVisitor<CalleeReadScan, VisitFlags::AllGo
 
 CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides);
 
+// Whether an event expression reads state that no wait source of its own covers, so that a
+// process has to wait on it by sampling it (Lowerer::lower_sampled_event_wait): a class
+// property or a virtual-interface member inside a larger expression, a weak reference's
+// referent, a method called on an object, or what a subroutine it calls reads. A term that
+// is lone_member_term, an event, and an expression over signals alone are not. The
+// design-wide pre-pass and the lowering MUST agree on this, so both call it and nothing
+// else; the fork-captured automatic is the one case the pre-pass cannot see.
+bool event_expr_reads_heap(const Expression& e, const MethodOverrides& overrides);
+
 // Which (class property, edge) pairs the whole design waits on. Design-wide because
 // a class's object body must carry the notifiers BEFORE it is laid out, and
 // lower_class_type runs on demand from the first reference under any top -- which
@@ -305,7 +352,7 @@ struct WaitedProps {
     };
     ankerl::unordered_dense::map<const slang::ast::ClassPropertySymbol*, Waited> props;
     // Every value symbol some `wait` condition in the design names. Consulted when a
-    // capture box is minted (box_one_capture / install_fork_decl_box): a box whose
+    // capture box is minted (box_one_capture / emit_decl_box): a box whose
     // symbol is here carries a change notifier so the wait can be woken. A superset
     // of the symbols that end up boxed -- signals and class properties land here too
     // and are simply never asked about.
@@ -345,9 +392,16 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
 
     void handle(const slang::ast::SignalEventControl& ev);
 
+    void handle(const slang::ast::EventListControl& list);
+
     void handle(const slang::ast::WaitStatement& w);
 
+    void handle(const slang::ast::TimedStatement& t);
+
     void note_callees(const Expression& e);
+
+    // What a sampling wait over `e` needs laid out (Lowerer::lower_sampled_event_wait).
+    void note_sampled(const Expression& e);
 };
 
 // The design-wide change notifiers (ir::ChangeNotify::shared): one hidden event per
@@ -359,6 +413,24 @@ struct SharedNotifiers {
         ir::Signal signal{};
     };
     ankerl::unordered_dense::map<const slang::ast::Symbol*, Entry> of;
+};
+
+// The classes whose objects must own an RNG (LRM 18.14.2) though they declare no rand
+// property: the static receiver class of every `randomize`, `srandom`, `get_randstate`
+// and `set_randstate` call in the design. A base-typed handle may hold a derived
+// object, so a class owns one when any class in its base chain is marked. Every other
+// class keeps no generator and draws nothing at `new`. docs/LRM_NOTES.md note 63.
+struct RngClasses {
+    ankerl::unordered_dense::set<const ClassType*> marked;
+};
+
+struct RngReceiverScan : slang::ast::ASTVisitor<RngReceiverScan, VisitFlags::AllGood> {
+    RngClasses*                   out = nullptr;
+    std::vector<const ClassType*> in_class;
+
+    void handle(const slang::ast::CallExpression& call);
+
+    void handle(const ClassType& cls);
 };
 
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out);
@@ -419,6 +491,26 @@ enum class SensitivityMode : uint8_t {
     ImplicitEvent,
 };
 
+// Whether two reads of a member through a handle name the same storage whatever the
+// handle holds: the same member through the same handle variable. Any other pair of
+// handle expressions (`vifs[i].a`, `get().a`) counts as two, which costs at most a
+// second park; counting `v0.a` and `v1.a` as one parked on one instance only.
+bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b);
+
+// What an inferred sensitivity reads that is not a signal of the module: members
+// of a virtual interface (LRM 25.9, a signal of whichever instance the handle names)
+// and non-static class properties (heap storage with a change notifier). A process's
+// static subscription cannot name either, so a body that reads one waits in its own
+// code (Lowerer::emit_inferred_park).
+struct HandleReads {
+    std::vector<const MemberAccessExpression*> vif;
+    std::vector<const Expression*>             props;
+
+    bool any() const {
+        return !vif.empty() || !props.empty();
+    }
+};
+
 // Collects the reads and writes that build a process's inferred sensitivity
 // (an `always_comb`, `always_latch`, `always @*`, or continuous assign): the
 // signals the body reads to compute a result, and the ones it writes. Whether
@@ -446,6 +538,8 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // User functions already descended into, so a function called from several
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
+    // Members read through a handle; see HandleReads.
+    HandleReads handles;
 
     // Creates a STATIC class property's module-signal storage and returns it
     // (Lowerer::declare_static_prop). That storage is minted LAZILY -- at the first
@@ -490,6 +584,14 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     void handle(const ForLoopStatement& f);
 
     void handle(const CallExpression& c);
+
+    void handle(const MemberAccessExpression& ma);
+
+    // The object expression of a member read or written through a handle: a plain read
+    // of the handle, except that `always_comb` adds nothing for a class object
+    // (LRM 9.2.2.2.1: "References to class objects and method calls of class objects
+    // do not add anything to the sensitivity list of an always_comb").
+    void read_object(const Expression& obj);
 };
 
 // Whether an expression may be evaluated even when its value turns out not to
@@ -652,15 +754,16 @@ inline void for_each_fork_stmt(const BlockStatement& blk, F&& fn) {
     }
 }
 
-// Symbols a fork's children reference anywhere in a subroutine body, which is the set
-// whose frame locals have to be boxed (docs/design/fork-join.md V4). Run before the
-// frame is laid out, because a boxed local is boxed for every access in the activation
-// -- including accesses lowered before the `fork` is reached.
+// Every symbol a fork child references anywhere in a body: the candidates for a
+// capture box (docs/design/fork-join.md V4). Run over a body before it is lowered,
+// because a boxed variable is boxed for every access, the ones before the `fork`
+// included, and so has to be known when its declaration is reached.
 //
-// Deliberately an over-approximation: it collects every reference, not just the ones
-// that turn out to be this frame's locals, so it needs no notion of storage class at a
-// point where storage does not exist yet. A module signal or a static in the set is
-// never a frame local, so it never boxes.
+// Deliberately an over-approximation: it collects every reference, a module signal,
+// a static and a variable the child itself declares among them. What boxes is decided
+// where the body's own formals are known (install_capture_boxes) and where one of its
+// automatics is declared (box_if_captured), and neither is reached for a symbol that
+// is not the body's own.
 //
 // EVERY fork kind, `join` included. The storage a capture needs is not a property of
 // the join kind -- it is a property of the capture, and the fat `ArgDir::Ref` ABI could
@@ -669,8 +772,7 @@ inline void for_each_fork_stmt(const BlockStatement& blk, F&& fn) {
 // outlives every child" also has one real counterexample: `kill` on a joining parent
 // (docs/design/process-class.md §11), which left a child holding a pointer into a freed
 // coroutine frame. One storage rule for all three kinds retires both problems, and
-// costs nothing in a design whose forks capture nothing -- which includes every fork in
-// a PROCESS body, where the parent's variables are module signals.
+// costs nothing in a body whose forks capture nothing.
 struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
     ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> candidates;
     // A child reads a class property of the enclosing method through the implicit
@@ -678,11 +780,6 @@ struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
     // ValueSymbol this scan can name (it hangs off the SubroutineSymbol), so it travels
     // as a flag and install_capture_boxes resolves it against `sub.thisVar`.
     bool implicit_this = false;
-
-    // The declared variables of every fork body walked here -- the fork's OWN
-    // block_item_declarations, which are not per-activation captures. Subtracted by
-    // install_capture_boxes.
-    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> fork_scope_decls;
 
     void handle(const BlockStatement& blk);
 };
@@ -1272,6 +1369,10 @@ public:
     // Point this Lowerer at the design-wide waited-on-property table (WaitPropScan).
     // Shared for the same reason ClassIds is, and consulted at exactly one place:
     // lower_class_type, laying out a class's change notifiers.
+    void set_rng_classes(const RngClasses* rc) {
+        rng_classes_ = rc;
+    }
+
     void set_waited_props(const WaitedProps* wp) {
         waited_props_ = wp;
     }
@@ -1962,6 +2063,25 @@ private:
 
     void finalize_sim_nets();
 
+    // A net's own net delay (LRM 28.16): its single delay-value expression and the
+    // multipliers of the time unit of the module that declares the net (LRM 3.14.1),
+    // as time_mul_ / prec_over_tick_ hold them while that module is lowered.
+    // emit_wire_resolvers lowers the delay after the whole top is walked, when the
+    // unit of no one instance is current.
+    struct NetDelay {
+        const Expression* expr;
+        uint64_t          time_mul;
+        uint64_t          prec_over_tick;
+    };
+
+    // fail()'s text for a net delay of rise / fall / turn-off values.
+    static constexpr std::string_view kNetDelayTriple =
+      "net delay rise/fall/turn-off triples (wire #(a,b,c)) are not supported";
+
+    NetDelay net_delay_of(const NetSymbol& net);
+
+    ir::Index scaled_net_delay(const NetDelay& d, ir::Builder& b);
+
     static bool is_modeled_net_kind(NetType::NetKind kind);
 
     // fail()'s text for a net type is_modeled_net_kind refuses.
@@ -2162,7 +2282,8 @@ private:
 
     void reject_concat_resolved_driver(const Expression& lhs);
 
-    void store_driver_slot(const Expression& left,
+    void store_driver_slot(ir::Signal        net,
+                           const Expression& left,
                            ir::Signal        slot,
                            ir::Index         val,
                            const Expression* delay_expr,
@@ -2415,13 +2536,27 @@ private:
     // which is any expression. A part-select bound is always Required.
     std::optional<GateTerm> gate_static_term(const Expression& e, Fold mode);
 
+    // The (signal, bit) a 1-bit constant select of a packed signal names through any
+    // chain of selects and packed-struct members (LRM 7.2.1), which gate_static_term
+    // does not follow. Output terminals only: the indexes fold as Required.
+    std::optional<GateTerm> gate_packed_term(const Expression& lhs);
+
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index);
 
     GateTerm lower_gate_output(const Expression& conn);
 
     void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up);
 
-    void emit_pull_driver(const ValueSymbol& net, bool up, uint8_t level, ir::SourceLoc l, bool program_driver);
+    void lower_pull_terminal(const Expression& term, bool up, uint8_t level, ir::SourceLoc l);
+
+    // `part` is the bit- or part-select of `net` a pullup / pulldown names, or null
+    // for the whole net.
+    void emit_pull_driver(const ValueSymbol& net,
+                          const Expression*  part,
+                          bool               up,
+                          uint8_t            level,
+                          ir::SourceLoc      l,
+                          bool               program_driver);
 
     void lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver);
 
@@ -2490,7 +2625,10 @@ private:
                                   const Expression*&          iff,
                                   uint32_t&                   n_events);
 
-    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode, std::vector<ir::WaitEvent>& out);
+    void collect_inferred_sensitivity(const Statement&            body,
+                                      SensitivityMode             mode,
+                                      std::vector<ir::WaitEvent>& out,
+                                      HandleReads*                handles = nullptr);
 
     static ir::Edge to_edge(slang::ast::EdgeKind edge);
 
@@ -2500,10 +2638,15 @@ private:
 
     void refuse_container_event_control(const SignalEventControl& ev);
 
+    bool event_expr_on_heap(const Expression& e);
+
+    void refuse_detached_member_event(const TimingControl& tc);
+
     ir::Index prop_notifier_handle(const Expression&                      e,
                                    const slang::ast::ClassPropertySymbol& prop,
                                    ir::Edge                               edge,
-                                   ir::Builder&                           b);
+                                   ir::Builder&                           b,
+                                   bool                                   null_ok = false);
 
     // True when a `@(...)` on this expression needs a runtime event HANDLE rather
     // than a signal: it is event-typed but is not a plain reference to a declared
@@ -2524,8 +2667,6 @@ private:
     // empty event list is complete rather than malformed (lower_event_wait).
     bool wait_dead_ = false;
 
-    static bool reads_vif(const Expression& e);
-
     static std::vector<const MemberAccessExpression*> vif_member_reads(const Expression& e);
 
     ir::Signal event_signal(const Expression& e);
@@ -2533,8 +2674,6 @@ private:
     ir::Signal synth_event_net(const Expression& e);
 
     uint32_t anon_local(ir::Ref type);
-
-    void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
 
     // What a process waiting on an expression parks on (LRM 9.4.2, 9.4.3): `wait`'s
     // condition, and an event expression that is sampled (lower_sampled_event_wait).
@@ -2550,9 +2689,8 @@ private:
         std::vector<const ValueSymbol*> boxed;
         // A fork-captured automatic it names whose type has no notifier, or null.
         const ValueSymbol* unnotified_box = nullptr;
-        // The expression names a property of a type with no notifier (an unpacked
-        // struct or union, a fixed unpacked array) and nothing else that can wake a
-        // process waiting on it.
+        // The expression names a property of a type with no notifier (a covergroup
+        // handle) and nothing else that can wake a process waiting on it.
         bool unwakeable = false;
     };
 
@@ -2562,11 +2700,30 @@ private:
 
     void push_wait_edges(const ExprWaitDeps& deps, ir::Builder& b, ir::SourceLoc l, std::vector<ir::WaitEdge>& edges);
 
+    // Whether the event expression `e` is waited on by sampling it: it reads heap state
+    // (event_expr_reads_heap, or a fork-captured automatic) and something can wake the
+    // process that waits on it.
     bool event_expr_sampled(const Expression& e);
 
-    bool event_member_sampled(const SignalEventControl& ev);
+    // How an event control is waited on (LRM 9.4.2, 9.4.2.1).
+    enum class EventWait : uint8_t {
+        // No term is sampled, so each has a wait source of its own: a signal, an event, a
+        // property or a member by itself, an expression over signals alone
+        // (collect_wait_events). A sampled term that only calls a method beside a plain
+        // one stays here as well (docs/TODO.md).
+        Static,
+        // At least one term is sampled and every other term reads heap state too, so one
+        // loop samples them all (lower_sampled_event_wait).
+        Sampled,
+        // A sampled term that reads a class property or a virtual-interface member, beside
+        // a signal or an event: refused for now. A wake does not say which registration
+        // woke it, so the loop would lose what the plain term's own wait catches (a pulse
+        // that reverts in its step, R8).
+        Mixed,
+    };
 
-    bool event_control_sampled(const TimingControl& tc, std::vector<const SignalEventControl*>* members = nullptr);
+    // `terms` receives the terms of a Sampled control in source order.
+    EventWait classify_event_control(const TimingControl& tc, std::vector<const SignalEventControl*>* terms = nullptr);
 
     ir::Index sampled_event_hit(ir::Index            old,
                                 ir::Index            cur,
@@ -2587,6 +2744,12 @@ private:
                                   ir::Builder& b);
 
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l);
+
+    void lower_implicit_event_wait(const Statement& body, ir::Builder& b, ir::SourceLoc l);
+
+    void emit_inferred_park(const Statement& body, SensitivityMode mode, ir::Builder& b, ir::SourceLoc l);
+
+    void lower_inferred_loop(const Statement& body, bool comb, ir::Builder& b, ir::SourceLoc l);
 
     void lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b);
 
@@ -3562,6 +3725,29 @@ private:
 
     static bool is_unbounded_bound(const Expression& e);
 
+    // A range bound of `inside` / `case ... inside` as comparison operands in the
+    // common type `ty` (LRM 11.4.13): a plain bound converted, `$` the lowest or
+    // highest value of `ty`, and a tolerance range `[a +/- b]` / `[a +%- b]`
+    // expanded to its low and high bounds, swapped if need be.
+    struct InsideBounds {
+        ir::Index lo;
+        ir::Index hi;
+    };
+
+    InsideBounds inside_range_bounds(const ValueRangeExpression& vr, ir::Ref ty, bool is_signed, ir::Builder& b);
+
+    // The same range over a real selector: `sel >= lo && sel <= hi` at `real`.
+    ir::Index inside_real_range_pred(const ValueRangeExpression& vr, ir::Index sel, ir::Ref rty, ir::Builder& b);
+
+    ir::Index type_extreme(ir::Ref ty, bool is_signed, bool high, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index inside_assoc_pred(const Expression& m,
+                                ir::Index         sel,
+                                ir::Ref           ty,
+                                bool              real,
+                                ir::Builder&      b,
+                                ir::SourceLoc     l);
+
     CaseCompareType common_inside_type(const CaseStatement& c);
 
     ir::Index lower_inside_label_pred(const Expression& label,
@@ -3711,12 +3897,20 @@ private:
 
     void lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builder& b);
 
+    // One weighted-choice draw: a value below the weight sum and the type it
+    // carries, which is the type a cumulative weight is converted to for the compare.
+    struct WeightDraw {
+        ir::Index value;
+        ir::Ref   type;
+    };
+
+    WeightDraw emit_weight_draw(ir::Index sum, uint32_t width, ir::Builder& b, ir::SourceLoc l);
+
     void lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
                             size_t                               k,
                             ir::Index                            acc,
-                            ir::Index                            draw,
+                            const WeightDraw&                    draw,
                             const std::vector<ir::Index>&        weights,
-                            ir::Ref                              u32,
                             ir::Builder&                         b);
 
     // -- randsequence (LRM 18.17) --
@@ -3773,6 +3967,9 @@ private:
         ir::Ref            this_class = ir::Ref::Invalid;
         // Productions are coroutines exactly when the randsequence sits in one.
         bool is_task = false;
+        // What the fork children inside the block's code reference (BoxCandidateScan):
+        // every production body takes it as its FnCtx::fork_refs.
+        ankerl::unordered_dense::set<const ValueSymbol*> fork_refs;
         // A production named as a `rand join` operand (LRM 18.17.5) additionally
         // gets two entry points, because interleaving has to advance a sequence one
         // depth-1 unit at a time and a plain call runs it to completion: `plan`
@@ -3875,10 +4072,10 @@ private:
     // must draw at the same point so an interleaved production's stream matches a
     // plain one's).
     //
-    // Same weight domain, sum precision and zero-total rule as randcase (18.16):
-    // unsigned summands at the widest weight's self-determined precision, one draw
-    // over the total, and no draw at all when the total is zero -- there is then no
-    // rule to pick, and drawing would shift the stream.
+    // Same weight domain, sum precision, draw (emit_weight_draw) and zero-total rule
+    // as randcase (18.16): unsigned summands at the widest weight's self-determined
+    // precision, one draw over the total, and no draw at all when the total is zero
+    // -- there is then no rule to pick, and drawing would shift the stream.
     template<typename F>
     void gen_weighted_rules(const RsProd& p, std::span<const RsProd::Rule> rules, ir::Builder& b, F&& emit) {
         const ir::SourceLoc l = to_source_loc(p.location);
@@ -3891,20 +4088,6 @@ private:
         uint32_t width = 1;
         for (const RsProd::Rule& r : rules) {
             width = std::max(width, r.weightExpr != nullptr ? r.weightExpr->type->getBitWidth() : 32u);
-        }
-        if (width > 32) {
-            // TODO: a wider sum needs the LRM's several-draw scheme, stitching
-            // multiple $urandom_range results into one number ("This can result in
-            // multiple calls to $urandom_range() to handle numbers greater than 32
-            // bits", LRM 18.16, whose weight rules 18.17.1 shares).
-            //
-            // Deliberately shared with randcase's identical guard rather than lifted
-            // here alone: the two constructs weigh alternatives by the same clause,
-            // so they must agree, and stitching changes how many values a selection
-            // draws from the process stream -- a documented contract
-            // (docs/design/randsequence.md §12), not an implementation detail. One
-            // change, both sites, one recorded stream shift.
-            fail("randsequence production weight wider than 32 bits is not supported");
         }
         const ir::Ref          wty = make_int_type(width, false);
         std::vector<ir::Index> weights;
@@ -3922,15 +4105,10 @@ private:
             sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
         }
 
-        const ir::Ref   u32  = make_int_type(32, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index wide = b.convert(sum, u32, false, l);
-        const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
-        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
-        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
-        const ir::Index draw = b.urandom_range(top, low, l);
-        gen_rule_arm(rules, 0, zero, draw, weights, u32, b, emit);
+        const WeightDraw draw = emit_weight_draw(sum, width, b, l);
+        gen_rule_arm(rules, 0, zero, draw, weights, b, emit);
         const ir::ExtraSlice pick_region = b.close_region();
         b.open_region();
         const ir::ExtraSlice none_region = b.close_region();
@@ -3942,9 +4120,8 @@ private:
     void gen_rule_arm(std::span<const RsProd::Rule> rules,
                       size_t                        k,
                       ir::Index                     acc,
-                      ir::Index                     draw,
+                      const WeightDraw&             draw,
                       const std::vector<ir::Index>& weights,
-                      ir::Ref                       u32,
                       ir::Builder&                  b,
                       F&                            emit) {
         if (k == weights.size()) {
@@ -3952,14 +4129,14 @@ private:
         }
         const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
         const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.convert(next, u32, false, l), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw.value, b.convert(next, draw.type, false, l), l);
 
         b.open_region();
         emit(k, b);
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        gen_rule_arm(rules, k + 1, next, draw, weights, u32, b, emit);
+        gen_rule_arm(rules, k + 1, next, draw, weights, b, emit);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, l);
@@ -4134,6 +4311,27 @@ private:
 
     ir::Index lower_address_arg(const Expression& expr, ir::Builder& b);
 
+    // The array a $readmem / $fread loads (LRM 21.4, 21.3.4.4), as ReadMemInfo and
+    // FreadMemInfo name it: `target` the array lvalue, or the one an indexed slice
+    // selects from, and `type` the array the load fills. `slice_end` is the last index
+    // of a slice of a queue, whose first is `slice_base`.
+    struct MemTarget {
+        ir::Index target;
+        ir::Ref   type;
+        ir::Ref   base_type  = ir::Ref::Invalid;
+        ir::Index slice_base = ir::Index{ 0 };
+        ir::Index slice_end  = ir::Index{ 0 };
+        uint32_t  slice      = ir::kMemSliceNone;
+    };
+
+    static bool is_mem_target_shape(const Expression& e);
+
+    MemTarget lower_mem_target(const Expression& e, ir::Builder& b);
+
+    void lower_queue_slice_target(const RangeSelectExpression& rs, MemTarget& t, ir::Builder& b);
+
+    std::pair<ir::Index, ir::Index> lower_queue_bounds(const RangeSelectExpression& rs, ir::Builder& b);
+
     std::vector<char> scan_conversion_chars(std::string_view fmt);
 
     ir::Index lower_scanf(const CallExpression& call, bool is_sscanf, ir::Builder& b, ir::SourceLoc l);
@@ -4165,12 +4363,16 @@ private:
 
     std::string format_typename(const slang::ast::Type& type);
 
-    uint32_t count_control_class(const Expression& ctrl);
+    std::optional<uint32_t> count_control_class(const Expression& ctrl);
 
     ir::Index lower_bit_query(std::string_view      name,
                               const CallExpression& call,
                               ir::Builder&          b,
                               const ir::SourceLoc   l);
+
+    ir::Index bits_of_expr(const Expression& e, ir::Builder& b, ir::SourceLoc l);
+
+    ir::Index bitstream_width(ir::Index lv, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l);
 
     void emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l);
 
@@ -4547,19 +4749,43 @@ private:
 
     ir::Index lower_compound_assign(const AssignmentExpression& a, ir::Builder& b);
 
+    // A read-modify-write target with no single lvalue to Load and Store through
+    // (a concatenation, a string character): `read` yields the target's current
+    // value, `write` stores a new one, and both go through lvalues bound once when
+    // the place was made, so a compound assignment or `++`/`--` evaluates its
+    // target's index expressions exactly once (LRM 11.4.1, 11.4.2).
+    using CompoundRead  = std::function<ir::Index(ir::Builder&, ir::SourceLoc)>;
+    using CompoundWrite = std::function<void(ir::Index, ir::Builder&, ir::SourceLoc)>;
+
+    struct RmwPlace {
+        CompoundRead  read;
+        CompoundWrite write;
+    };
+
+    // Null for an ordinary single-lvalue target.
+    std::optional<RmwPlace> bind_rmw_place(const Expression& target, ir::Builder& b);
+
+    ir::Index lower_compound_rhs(const AssignmentExpression& a, const CompoundRead& read, ir::Builder& b);
+
+    // The lvalue each leaf operand of an lvalue concatenation evaluated to, bound
+    // ahead of a scatter that must not evaluate them again.
+    using ConcatLvalues = ankerl::unordered_dense::map<const Expression*, ir::Index>;
+
     void store_concat(const ConcatenationExpression& cc,
                       ir::Index                      rhs,
                       ir::Inst::Tag                  tag,
                       ir::Builder&                   b,
                       ir::SourceLoc                  l,
-                      const IntraNbTiming*           nbt = nullptr);
+                      const IntraNbTiming*           nbt   = nullptr,
+                      const ConcatLvalues*           bound = nullptr);
 
     void store_concat_ops(std::span<const Expression* const> ops,
                           ir::Index                          rhs,
                           ir::Inst::Tag                      tag,
                           ir::Builder&                       b,
                           ir::SourceLoc                      l,
-                          const IntraNbTiming*               nbt = nullptr);
+                          const IntraNbTiming*               nbt   = nullptr,
+                          const ConcatLvalues*               bound = nullptr);
 
     [[noreturn]] void fail_keyed_pattern_lvalue();
 
@@ -5159,16 +5385,19 @@ private:
         // of its box rather than out of Local 0.
         const ValueSymbol* this_var = nullptr;
         // Captured automatics that live in a GC box rather than in the frame, so a
-        // detached fork child can share them after this activation is gone (LRM 9.3.2
-        // makes an enclosing automatic ONE variable; docs/design/fork-join.md V4).
-        // Consulted by value_lvalue BEFORE localmap: a boxed symbol keeps its localmap
-        // entry so ForkCaptureDetector still sees it as this frame's, but every access
-        // goes through the box.
+        // fork child can share them after this activation is gone (LRM 9.3.2,
+        // docs/design/fork-join.md V4). Consulted by value_lvalue BEFORE localmap: a
+        // boxed formal keeps its localmap entry, the ABI's copy-in slot, but every
+        // access goes through the box.
         struct Boxed {
             uint32_t local; // frame Local holding the box handle
             ir::Ref  cls;   // the box's one-field synthetic class
         };
         ankerl::unordered_dense::map<const ValueSymbol*, Boxed> boxed;
+        // Every symbol a fork child in this body references (BoxCandidateScan). An
+        // automatic of this body found here is boxed where it is declared
+        // (box_if_captured).
+        ankerl::unordered_dense::set<const ValueSymbol*> fork_refs;
         // Set while lowering a randsequence production body (LRM 18.17). The two
         // synthesized `output` formals: `$abort`, which a `break` with no enclosing
         // loop raises and every caller tests (18.17.6), and `$result`, which a
@@ -5198,11 +5427,10 @@ private:
     ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_notified_;
     ankerl::unordered_dense::set<uint32_t>                     notified_box_refs_;
 
-    // The per-entry box of a fork-scope declaration in a PROCESS body, where there is
-    // no frame to hold the handle (an initial/always block's own variables are design
-    // state, not frame locals -- docs/design/garbage-collection.md 5.4). Keyed by the
-    // declared symbol, which belongs to exactly one fork block, so entries never
-    // collide; in a subroutine the home is a frame slot and FnCtx::boxed carries it
+    // The box of a captured automatic of a PROCESS body, where there is no frame to
+    // hold the handle (an initial/always block's own variables are design state, not
+    // frame locals -- docs/design/garbage-collection.md 5.4). Keyed by the declared
+    // symbol; in a subroutine the home is a frame slot and FnCtx::boxed carries it
     // instead. Consulted by value_lvalue after the frame path, which is why a fork
     // CHILD -- which has a frame of its own and receives the handle as a formal --
     // resolves through its own `boxed` entry rather than through this map.
@@ -5211,6 +5439,8 @@ private:
         ir::Ref    cls; // the box's one-field synthetic class
     };
     ankerl::unordered_dense::map<const ValueSymbol*, ProcForkBox> proc_fork_boxes_;
+    // FnCtx::fork_refs for the procedural block being lowered, which has no FnCtx.
+    ankerl::unordered_dense::set<const ValueSymbol*> proc_fork_refs_;
 
     ir::Ref box_class_type(ir::Ref inner);
 
@@ -5234,13 +5464,13 @@ private:
 
     void install_capture_boxes(const SubroutineSymbol& sub, const Statement& body, ir::Builder& b);
 
-    void box_one_capture(const ValueSymbol& vs, bool copy_in, ir::Builder& b, ir::SourceLoc l);
+    void box_one_capture(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l);
 
-    void install_fork_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l);
+    void box_if_captured(const VariableSymbol& vs, bool force_frame, ir::Builder& b);
+
+    void emit_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l);
 
     ir::Index capture_handle(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l);
-
-    std::vector<const ValueSymbol*> body_automatics(const SubroutineSymbol& sub, const Statement& body);
 
     // The static-lifetime locals `sub` declares through declaration statements, in
     // source order: the variables lower_var_decl gives persistent storage (a `for`
@@ -5774,6 +6004,27 @@ private:
     // of the enclosing object, and `new` for an embedded covergroup is required to
     // sit in the enclosing class's constructor (LRM 19.4).
 
+    // A covergroup's own instance / type options, as far as this phase resolves
+    // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
+    // type set. `weight` is option.weight; `type_weight` is a covergroup's
+    // type_option.weight, which only weights the group in $get_coverage (19.11.3).
+    // `name` is the covergroup's option.name, and `comment` / `type_comment` are the
+    // option.comment / type_option.comment of whichever level the setters belong to.
+    struct CoverOpts {
+        uint32_t                   weight         = 1;
+        uint32_t                   type_weight    = 1;
+        uint32_t                   goal           = 100;
+        uint32_t                   at_least       = 1;
+        uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default
+        bool                       per_instance   = false;
+        bool                       detect_overlap = false;
+        // Read back by `h.option.get_inst_coverage`; it changes no number.
+        bool                       get_inst_coverage = false;
+        std::optional<std::string> name;
+        std::string                comment;
+        std::string                type_comment;
+    };
+
     // What one lowered covergroup declaration owns.
     struct CoverDecl {
         // Index into module_.cover_types.
@@ -5781,19 +6032,40 @@ private:
         // The generated sample body: `void(u64 handle)`, which evaluates every
         // coverpoint expression and hands each value to the coverage runtime.
         ir::FunctionId sample{};
+        // The coverpoints in model order: the position a coverpoint-level method
+        // (`h.cp.get_inst_coverage()`, `cg::cp::get_coverage()`) names its coverpoint by.
+        std::vector<const slang::ast::CoverpointSymbol*> points;
+        // The options the definition resolved to, for the covergroup and each coverpoint,
+        // which the ones nothing assigns at run time are read back from.
+        CoverOpts              group;
+        std::vector<CoverOpts> point_opts;
     };
 
-    // A covergroup's own instance / type options, as far as this phase resolves
-    // them. LRM 19.7 Table 19-1 for the instance set, 19.7.1 Table 19-3 for the
-    // type set; the two share `weight` and `goal`, and a type option is not an
-    // independent knob here because merge_instances is refused (19.11.3).
-    struct CoverOpts {
-        uint32_t weight       = 1;
-        uint32_t goal         = 100;
-        uint32_t at_least     = 1;
-        uint32_t auto_bin_max = 64; // LRM Table 19-1's default
-        bool     per_instance = false;
+    // Option ids and the covergroup-level point, mirroring src/runtime/Coverage.h.
+    static constexpr uint32_t kCoverOptGroup   = 0xFFFFFFFFu;
+    static constexpr uint32_t kCoverOptWeight  = 0;
+    static constexpr uint32_t kCoverOptGoal    = 1;
+    static constexpr uint32_t kCoverOptAtLeast = 2;
+    static constexpr uint32_t kCoverOptCrossNumPrintMissing = 3;
+    static constexpr uint32_t kCoverOptComment = 4;
+    static constexpr uint32_t kCoverOptName    = 5;
+
+    // `h.option.f` / `h.cp.option.f` (LRM 19.7, 19.10): the covergroup handle, the
+    // coverpoint (or the covergroup's own options) and the field.
+    struct CoverOptRef {
+        const Expression*                 handle = nullptr;
+        const slang::ast::CovergroupType* cgt    = nullptr;
+        uint32_t                          point  = kCoverOptGroup;
+        bool                              is_type  = false;
+        bool                              on_cross = false;
+        std::string_view                  field;
     };
+
+    std::optional<CoverOptRef> cover_option_ref(const Expression& e);
+
+    ir::Index lower_cover_option_read(const MemberAccessExpression& ma, const CoverOptRef& r, ir::Builder& b);
+
+    ir::Index lower_cover_option_write(const AssignmentExpression& a, const CoverOptRef& r, ir::Builder& b);
 
     // The value space a coverpoint's bins live in: what `$` means, and how many
     // automatic bins 19.5.3 would create.
@@ -5808,6 +6080,8 @@ private:
     };
 
     int64_t cover_const(const Expression& e, const char* what);
+
+    std::string cover_const_string(const Expression& e, const char* what);
 
     CoverSpace cover_space_of(const slang::ast::Type& t);
 
@@ -5837,7 +6111,12 @@ private:
 
     uint32_t cover_type_of(const slang::ast::CovergroupType& cgt);
 
-    ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts);
+    ir::CoverPoint cover_point_model(const slang::ast::CoverpointSymbol& cp, const CoverOpts& gopts,
+                                     CoverOpts& resolved);
+
+    void cover_report_overlaps(const std::vector<const slang::ast::CoverageBinSymbol*>& sources,
+                               const CoverSpace&                                      space,
+                               const ir::CoverPoint&                                  model);
 
     static const slang::ast::Type* cover_enum_type(const Expression& e);
 
@@ -5859,6 +6138,8 @@ private:
 
     static const Expression* cover_receiver(const slang::ast::CallExpression& call);
 
+    const slang::ast::CovergroupType& cover_type_owning(const slang::ast::Scope& owner);
+
     // Cap on the bins one coverpoint may hold. The LRM sets no limit; enumerating
     // `bins b[] = {[0:$]}` on a 32-bit coverpoint would otherwise try to name four
     // billion of them.
@@ -5877,10 +6158,10 @@ private:
         // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
         bool    is_agg = false;
         ir::Ref agg_ty = ir::Ref::Invalid;
-        // A queue output / inout formal whose actual is a BOUNDED queue, passed via a
-        // temp so the copy-back is a whole-queue assignment that truncates to the actual's
-        // bound (the callee only knows its formal's own, usually unbounded, type).
-        bool is_bounded_queue = false;
+        // A container output / inout formal passed via a temp of the formal's type,
+        // so the copy-back is a whole-container assignment to the actual
+        // (container_actual_needs_temp).
+        bool is_container = false;
     };
 
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
@@ -5893,6 +6174,17 @@ private:
     ir::Index agg_input_actual(const Expression& src, ir::Ref pty, ir::Builder& b, ir::SourceLoc l);
 
     void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l);
+
+    bool place_in_container_payload(const Expression& e);
+
+    bool container_actual_needs_temp(const Expression& actual, ir::Ref actual_ty, ir::Ref formal_ty);
+
+    void emit_container_place_copy(ir::Index     dst,
+                                   ir::Ref       dst_ty,
+                                   ir::Index     src,
+                                   ir::Ref       src_ty,
+                                   ir::Builder&  b,
+                                   ir::SourceLoc l);
 
     bool is_whole_ref_actual(const Expression& a);
 
@@ -6111,12 +6403,12 @@ private:
     };
     ankerl::unordered_dense::map<uint32_t, PullInfo> net_pull_;
     // Nets declared with a plain net delay (`wire #5 w;`, no net_decl_assignment
-    // — LRM 28.16), keyed by signal id: the single delay-value expression,
-    // lowered lazily by emit_wire_resolvers once every driver has registered
-    // its slot. Distinct from a delay embedded in a net-declaration ASSIGNMENT
-    // (`wire #5 w = expr;`), which LRM 10.3.3 treats as that one driver's own
-    // continuous-assign delay instead and lowers through lower_net_initializer.
-    ankerl::unordered_dense::map<uint32_t, const Expression*> net_delay_;
+    // — LRM 28.16), keyed by signal id, lowered lazily by emit_wire_resolvers once
+    // every driver has registered its slot. Distinct from a delay embedded in a
+    // net-declaration ASSIGNMENT (`wire #5 w = expr;`), which LRM 10.3.3 treats as
+    // that one driver's own continuous-assign delay instead and lowers through
+    // lower_net_initializer.
+    ankerl::unordered_dense::map<uint32_t, NetDelay> net_delay_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
@@ -6236,6 +6528,7 @@ private:
     const WaitedProps* waited_props_ = nullptr;
     // The design-wide change notifiers, or null on a standalone Lowerer.
     SharedNotifiers* shared_notifiers_ = nullptr;
+    const RngClasses*  rng_classes_  = nullptr;
     // (waited-on class property, ir::Edge) -> the object-body field index of its
     // hidden change-notifier event property (ir::ChangeNotify). Filled by
     // lower_class_type at the same time as class_prop_index_, and read by the wait
@@ -6271,6 +6564,11 @@ private:
     static constexpr uint64_t kRandOpModeAll   = 1;
     static constexpr uint64_t kRandOpModeOne   = 2;
     static constexpr uint64_t kRandOpModeQuery = 3;
+    // The randstate pair (LRM 18.13.4, 18.13.5). The state is four 64-bit words and the
+    // call returns one i64, so it crosses a word at a time: StateGet + k returns word k of
+    // it, and StateSet + k stores `arg` into word k.
+    static constexpr uint64_t kRandOpStateGet = 8;
+    static constexpr uint64_t kRandOpStateSet = 12;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ClassRand> class_rand_;
     // A rand property -> its rand ordinal. Design-wide like class_prop_index_ and
     // stable for the same reason: prefix layout gives an inherited property the same
@@ -6396,10 +6694,11 @@ private:
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
-    // The LHS lvalue of the compound assignment currently being lowered, read by
-    // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
-    // outside a compound assignment.
-    std::optional<ir::Index> compound_lv_;
+    // How the LValueReferenceExpression slang embeds in a compound assignment's
+    // rewritten RHS reads its target: through the lvalue lower_compound_rhs bound,
+    // or through a read-modify-write place. Null outside a compound assignment;
+    // scoped by Restore, never assigned bare.
+    const CompoundRead* compound_read_ = nullptr;
     // The value an output port's connection assigns, read by the EmptyArgument
     // slang leaves for it in the connection's right-hand side (lower_port_output).
     // Nullopt outside one; scoped by Restore, never assigned bare.

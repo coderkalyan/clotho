@@ -324,6 +324,23 @@ subroutine args. Body temporaries and function-frame locals are bracketed by
 init/deinit at body exits exactly as string temps are. State teardown deinits
 every handle on both the natural-drain and `$finish` paths.
 
+A container formal is handed its actual's own handle: the callee deep-copies it in
+(input, inout) and copies its frame handle back out through it when it returns
+(output, inout). Three actuals are not a handle the callee can do that with, and go
+through a caller temp of the formal's type that the caller assigns from the actual
+before the call and to the actual after it (`build_call_args`,
+`container_actual_needs_temp`, LRM 13.5):
+
+- a bounded queue, whose bound the callee does not know;
+- a dynamic array for a queue formal or the reverse, which are different records;
+- for output and inout, a place inside another container's payload (`qq[0]`,
+  `sq[i].q`): a task can suspend, and the payload can have moved when it returns.
+  The copy-out is then an ordinary store, with the store's change notification and
+  collector barrier.
+
+A fixed-size array for a container formal, or the reverse, is refused (LRM 7.6
+needs a size check at run time; `docs/TODO.md`).
+
 ## 6. Runtime surface
 
 New `rt_*` functions, C-ABI, every handle passed by pointer (like `rt_string`):

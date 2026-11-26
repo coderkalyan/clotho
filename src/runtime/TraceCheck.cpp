@@ -65,6 +65,10 @@ enum class Ev : uint8_t {
     Block,
     Disable,
     Abort,
+    Fork,
+    ChildDone,
+    Join,
+    Member,
 };
 
 struct Entry {
@@ -93,6 +97,24 @@ struct Mark {
 struct AbortOwed {
     uintptr_t act;
     uintptr_t target;
+};
+
+// One entry of a member's own list in a guarded group (S9): the member lists the storage at `x` for `edge`.
+struct MEntry {
+    uintptr_t x;
+    uint32_t  edge;
+    uint32_t  member;
+};
+
+// What a member of a guarded group did in the activation under way: bit 0, a write of its own list owes
+// it a run (and what the write was); bit 1, it ran.
+constexpr uint8_t kMemberOwed = 1;
+constexpr uint8_t kMemberRan  = 2;
+
+struct MState {
+    uint8_t   bits = 0;
+    uintptr_t x    = 0;
+    uint32_t  edge = 0;
 };
 
 struct Act {
@@ -134,6 +156,19 @@ struct Act {
     std::vector<uintptr_t>  blocks;
     std::vector<uintptr_t>  inherits;
     std::vector<Mark>       marks;
+    // R22: the join record of this activation's latest fork, whose children it creates next; the record
+    // of the fork this activation is a child of; whether it completed into it.
+    uintptr_t               forked    = 0;
+    uintptr_t               member_of = 0;
+    bool                    completed = false;
+    // S9: how many members a guarded group has (zero: it is not one), each member's own list sorted by
+    // storage, what each did in this activation, whether no two events of the group share a trigger bit,
+    // and whether a wake in this activation named no trigger, which sets every bit and runs every member.
+    uint32_t                members = 0;
+    bool                    exact   = false;
+    bool                    all_ok  = false;
+    std::vector<MEntry>     mentries;
+    std::vector<MState>     mstate;
 };
 
 // A table from an address to a value, by open addressing: an activation per frame
@@ -244,6 +279,12 @@ constexpr uint32_t words_of(uint32_t bits) {
     return (bits + 63) / 64;
 }
 
+// An event a `<= @e` record waits for (R11): a signal's storage and an edge, or an event object.
+struct EWait {
+    uintptr_t x;
+    uint32_t  edge;
+};
+
 // One nonblocking update from its creation until a pass applies it: where it goes and the bits it
 // writes, as the code stores them. Updates are applied in the order they were created.
 struct Upd {
@@ -261,6 +302,12 @@ struct Upd {
     uint32_t                 region = 0;
     // Plane 0's value, then its mask, then plane 1's: each `words_of` the plane's bits.
     std::vector<uint64_t>    w;
+    // A `<= #d` record's deadline; a `<= @e` record's count, the occurrences of its control seen since it
+    // was armed, and the events it waits for (R11).
+    uint64_t                 deadline = 0;
+    uint32_t                 count    = 0;
+    uint32_t                 occ      = 0;
+    std::vector<EWait>       waits;
 
     uint32_t        bits(int p) const { return p == 0 ? site->bits0 : site->bits1; }
     const uint64_t* val(int p) const { return w.data() + (p == 0 ? 0 : 2 * words_of(site->bits0)); }
@@ -275,6 +322,13 @@ struct Key {
     // A forced target, or one whose bits the trace does not know: not compared.
     bool                  skip;
     std::vector<uint64_t> base;
+};
+
+// A `<= @e` record that waits for occurrences of one event: its address, and the arm that made it (the
+// address is reused by the next arm of its site).
+struct EWatch {
+    uintptr_t rec;
+    uint64_t  arm;
 };
 
 // A `->>` linked onto the pend chain and not yet triggered.
@@ -294,12 +348,45 @@ struct ChgFacts {
     bool     any  = false;
 };
 
-// A wake that a change owes to an activation parked as it was at that moment (R6.1).
+// A wake that a change owes to an activation parked as it was at that moment (R6.1), or that the
+// completion of a fork's child owes to its parent parked at the join (`join`, R22.3: `x` is the record).
 struct Owed {
     uintptr_t act;
     uint64_t  seq;
     uintptr_t x;
     uint64_t  edge;
+    bool      join = false;
+};
+
+// A fork on its join record (R22): who forked, how it joins, how many children it announced, and how
+// many have been created and have completed since.
+struct Fork {
+    uintptr_t parent  = 0;
+    uint8_t   kind    = RT_TRACE_JOIN_ALL;
+    uint32_t  width   = 0;
+    uint32_t  spawned = 0;
+    uint32_t  done    = 0;
+};
+
+// An inertial record (R16) from the arm that made it until its update is applied or it is dropped: Live until a
+// later store supersedes it or the wheel fires it, Fired (and waiting for its site's commit) once the runtime
+// took it for the latest of its site, Done after.
+enum class IState : uint8_t { Live, Superseded, Fired, Done };
+
+struct InertRec {
+    uint32_t idx      = 0;
+    IState   state    = IState::Done;
+    uint64_t armed_at = 0;
+    uint64_t deadline = 0;
+    uint64_t epoch    = 0;
+};
+
+// What the checker holds of an inertial site (the dense id of its target): the record its latest arm made,
+// which nothing has superseded or fired, and the epoch its last decision asked a record to be armed with until
+// the arm that does.
+struct InertSite {
+    uintptr_t live   = 0;
+    uint64_t  expect = 0;
 };
 
 struct Checker {
@@ -336,6 +423,10 @@ struct Checker {
     // armed in.
     AddrMap<Upd>         armed;
     uint64_t             arm_seq = 0;
+    // R11: the armed `<= @e` records that wait for each event or signal, by its address, and the records the
+    // last occurrence of whose control has come and that nothing has created yet.
+    AddrMap<std::vector<EWatch>> ewatch;
+    std::vector<EWatch>          rel_owed;
     // The `->>` linked and not yet triggered, oldest first.
     std::deque<Pend>     pends;
     // The word buffers of retired updates, so that a design that stages an update every cycle
@@ -364,6 +455,15 @@ struct Checker {
     AddrMap<std::vector<uintptr_t>> occ;
     AddrMap<std::vector<uintptr_t>> ramp;
     std::vector<AbortOwed>          abort_owed;
+    // R22: the forks, by join record (a new fork on an address starts a new one).
+    AddrMap<Fork>                   forks;
+    // R16: the inertial records by address and the sites by dense id; how many records are Live, how many fired
+    // and wait for a commit, and how many of those the wheel fired (they are due before the Active region).
+    AddrMap<InertRec>               inert;
+    std::vector<InertSite>          inert_sites;
+    int32_t                         inert_live          = 0;
+    int32_t                         inert_waiting       = 0;
+    int32_t                         inert_wheel_waiting = 0;
 };
 
 Checker g;
@@ -494,6 +594,10 @@ const char* ev_name(Ev ev) {
         case Ev::Block: return "block";
         case Ev::Disable: return "disable";
         case Ev::Abort: return "abort";
+        case Ev::Fork: return "fork";
+        case Ev::ChildDone: return "child done";
+        case Ev::Join: return "join";
+        case Ev::Member: return "member";
     }
     return "?";
 }
@@ -509,7 +613,11 @@ bool is_act_event(Ev ev) {
         case Ev::End:
         case Ev::Block:
         case Ev::Disable:
-        case Ev::Abort: return true;
+        case Ev::Abort:
+        case Ev::Fork:
+        case Ev::ChildDone:
+        case Ev::Join:
+        case Ev::Member: return true;
         default: return false;
     }
 }
@@ -592,6 +700,19 @@ const char* rule_title(const char* rule) {
         { "R23.5", "force wake" },
         { "R25.1", "home region" },
         { "R25.2", "continuous before program" },
+        { "R22.1", "child start" },
+        { "R22.2", "child completion" },
+        { "R22.3", "join wake" },
+        { "R22.4", "join" },
+        { "R5.5", "member run" },
+        { "R6.4", "member run owed" },
+        { "R16.1", "inertial decision" },
+        { "R16.2", "inertial arm" },
+        { "R16.3", "inertial fire" },
+        { "R16.4", "inertial supersede" },
+        { "R16.5", "inertial apply" },
+        { "R11.1", "timed update" },
+        { "R11.2", "event update" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -625,6 +746,15 @@ const char* queue_name(uint32_t q) {
         case RT_TRACE_QUEUE_ACTIVE: return "active";
         case RT_TRACE_QUEUE_REACTIVE: return "reactive";
         case RT_TRACE_QUEUE_CONT: return "reactive continuous";
+    }
+    return "?";
+}
+
+const char* join_name(uint32_t kind) {
+    switch (kind) {
+        case RT_TRACE_JOIN_ALL: return "join";
+        case RT_TRACE_JOIN_ANY: return "join_any";
+        case RT_TRACE_JOIN_NONE: return "join_none";
     }
     return "?";
 }
@@ -724,6 +854,10 @@ std::string rec_text(const Rec& r) {
         case Ev::Abort:
             out += r.cause == RT_TRACE_ABORT_KILL ? ": marked by a kill" : ": marked by a disable of the list at " + address_text(r.x);
             break;
+        case Ev::Fork: out += std::string(": ") + join_name(r.cause) + " on the record at " + address_text(r.x); break;
+        case Ev::ChildDone: out += " into the record at " + address_text(r.x); break;
+        case Ev::Join: out += " past the join of the record at " + address_text(r.x); break;
+        case Ev::Member: appendf(out, ": member %llu starts", static_cast<unsigned long long>(r.x)); break;
         default: break;
     }
     return out;
@@ -816,6 +950,28 @@ bool listed(const std::vector<Entry>& v, const void* x, uint32_t fact) {
 // side naming none says nothing.
 bool other_record(const Act& act, const void* x) {
     return act.rec != 0 && x != nullptr && reinterpret_cast<uintptr_t>(x) != act.rec;
+}
+
+// Whether the completion just counted is the one the join of `f` is due to wake its parent at: the
+// last of a `join`, the first of a `join_any`, and none of a `join_none`, whose parent never parks.
+bool join_due(const Fork& f) {
+    return f.kind == RT_TRACE_JOIN_ALL ? f.done == f.width : (f.kind == RT_TRACE_JOIN_ANY && f.done == 1);
+}
+
+// Why the child may not be resumed at its creation, or empty (R22.1): a `join_none` child starts when
+// its parent blocks or ends, and a `join_any` sibling is not run once the parent is due to go on.
+std::string child_start_refusal(const Act& act) {
+    const Fork* f = act.member_of != 0 ? g.forks.find(act.member_of) : nullptr;
+    if (f == nullptr) {
+        return "";
+    }
+    if (f->kind == RT_TRACE_JOIN_NONE) {
+        return "a join_none child ran at the fork: it starts when its parent blocks or ends";
+    }
+    if (f->kind == RT_TRACE_JOIN_ANY && f->done != 0) {
+        return "a join_any sibling ran after the first child had completed: the parent goes on, and the others start when it blocks or ends";
+    }
+    return "";
 }
 
 // Empty when `cause` may wake `act`, parked as it is; otherwise why not.
@@ -1286,6 +1442,39 @@ void settle_pass() {
     g.sorted_keys = 0;
 }
 
+// The first inertial record that fired and waits for its site's commit, for a report.
+std::string inert_waiting_text() {
+    std::string out;
+    g.inert.for_each([&](uintptr_t, InertRec& r) {
+        if (out.empty() && r.state == IState::Fired) {
+            appendf(out, "site %u: armed at tick %llu for tick %llu, fired, not applied", r.idx,
+                    static_cast<unsigned long long>(r.armed_at), static_cast<unsigned long long>(r.deadline));
+        }
+    });
+    return out;
+}
+
+// R16: at the end of a slot, a record whose deadline is this tick or past and that neither the wheel fired nor a
+// later store superseded was lost by the wheel. Returns whether it failed.
+bool poll_inertial() {
+    if (g.inert_live == 0 || g.finished) {
+        return false;
+    }
+    bool failed = false;
+    g.inert.for_each([&](uintptr_t, InertRec& r) {
+        if (failed || r.state != IState::Live || r.deadline == UINT64_MAX || r.deadline > g.now) {
+            return;
+        }
+        std::string text;
+        appendf(text, "site %u: armed at tick %llu for tick %llu, and the slot of tick %llu is over", r.idx,
+                static_cast<unsigned long long>(r.armed_at), static_cast<unsigned long long>(r.deadline),
+                static_cast<unsigned long long>(g.now));
+        fail("R16.3", "an inertial record was never fired at its deadline: the wheel lost it", 0, text);
+        failed = true;
+    });
+    return failed;
+}
+
 // Nothing may be pending at a point the regions that apply NBAs and trigger `->>` are behind:
 // `what` names it. With `active_only`, only what the Active set created is owed (the Reactive
 // set's Re-NBA region is still ahead). Returns whether it failed.
@@ -1306,6 +1495,10 @@ bool closure(const char* what, bool active_only) {
             fail("R20.3", std::string("a `->>` is still untriggered when ") + what, 0, cause);
             return true;
         }
+    }
+    if (!active_only && g.inert_waiting > 0 && !g.finished) {
+        fail("R16.5", std::string("an inertial update that was fired is still unapplied when ") + what, 0, inert_waiting_text());
+        return true;
     }
     return false;
 }
@@ -1427,6 +1620,70 @@ void watch_add(const void* x_, uintptr_t a) {
     v.push_back(a);
 }
 
+// The entries of member `i`'s own list, for a report.
+std::string member_list_text(const Act& act, uint32_t i) {
+    std::string out;
+    int         n = 0;
+    for (const MEntry& e : act.mentries) {
+        if (e.member != i) {
+            continue;
+        }
+        if (n++ == 8) {
+            return out + ", ...";
+        }
+        out += n == 1 ? "" : ", ";
+        out += std::string(edge_name(e.edge)) + " " + signal_text(reinterpret_cast<const void*>(e.x));
+    }
+    return n == 0 ? "nothing" : out;
+}
+
+// A write of `x` satisfies the entries of the guarded group's members that it satisfies: each such member is
+// owed a run in this activation, unless it has run in it already (S9). A fused group runs its producers before
+// its consumers, so a write that comes after a member ran finds it past, and owes it nothing in this activation.
+void owe_members(Act& act, uintptr_t x, bool pos, bool neg, bool any) {
+    const auto first = std::lower_bound(act.mentries.begin(), act.mentries.end(), x,
+                                        [](const MEntry& e, uintptr_t v) { return e.x < v; });
+    for (auto it = first; it != act.mentries.end() && it->x == x; ++it) {
+        const bool hit = (it->edge == RT_TRACE_ANY && any) || (it->edge == RT_TRACE_POS && pos) ||
+                         (it->edge == RT_TRACE_NEG && neg);
+        if (!hit || it->member >= act.members) {
+            continue;
+        }
+        MState& s = act.mstate[it->member];
+        if (act.state == State::Running && (s.bits & kMemberRan) != 0) {
+            continue;
+        }
+        if ((s.bits & kMemberOwed) == 0) {
+            s.x    = x;
+            s.edge = it->edge;
+        }
+        s.bits |= kMemberOwed;
+    }
+}
+
+// The activation of a guarded group parks at its static control again: every member that a write owed a run
+// has run (R6.4), and the next activation starts from nothing. Returns false after a violation.
+bool settle_members(uintptr_t a, Act& act) {
+    bool ok = true;
+    for (uint32_t j = 0; j < act.members && ok && !g.finished; ++j) {
+        const MState& s = act.mstate[j];
+        if ((s.bits & (kMemberOwed | kMemberRan)) == kMemberOwed) {
+            std::string what;
+            appendf(what, "member %u of the %u members of a fused group did not run before the group went back to sleep", j,
+                    act.members);
+            fail("R6.4", what, a,
+                 std::string(edge_name(s.edge)) + " " + signal_text(reinterpret_cast<const void*>(s.x)) +
+                   " changed while the group ran or waited, and the member lists it (" + member_list_text(act, j) + ")");
+            ok = false;
+        }
+    }
+    for (MState& s : act.mstate) {
+        s = MState{};
+    }
+    act.all_ok = false;
+    return ok;
+}
+
 // A write (or, for `obj`, a trigger) of `x`: each activation parked at a control that lists an
 // entry the change satisfies is owed a wake before the next dispatch, park or region.
 void owe(const void* x_, bool pos, bool neg, bool any, bool obj) {
@@ -1436,7 +1693,10 @@ void owe(const void* x_, bool pos, bool neg, bool any, bool obj) {
         return;
     }
     for (const uintptr_t a : *v) {
-        const Act* act = g.acts.find(a);
+        Act* act = g.acts.find(a);
+        if (act != nullptr && act->members != 0 && !obj) {
+            owe_members(*act, x, pos, neg, any);
+        }
         if (act == nullptr || act->state != State::Parked || act->park == nullptr) {
             continue;
         }
@@ -1471,16 +1731,89 @@ void settle_aborts() {
          "the list at " + address_text(o.target) + " held it, and the walk of that list marked no such activation");
 }
 
+// An occurrence of the control of the armed `<= @e` records that wait for `x`: a write that satisfies the
+// edge of an entry, or a trigger of the event object (R11.2). A record counts an occurrence once, however
+// many of its entries it satisfies, and the one that completes its count is owed its release at once.
+void count_occurrence(uintptr_t x, bool pos, bool neg, bool any, bool obj) {
+    const auto* v = g.finished ? nullptr : g.ewatch.find(x);
+    if (v == nullptr) {
+        return;
+    }
+    for (const EWatch& w : *v) {
+        Upd* u = g.armed.find(w.rec);
+        if (u == nullptr || u->site == nullptr || u->arm != w.arm || u->count == 0 || u->occ >= u->count) {
+            continue;
+        }
+        bool hit = false;
+        for (const EWait& e : u->waits) {
+            hit = hit || (e.x == x && (obj ? e.edge == RT_TRACE_OBJ
+                                           : ((e.edge == RT_TRACE_ANY && any) || (e.edge == RT_TRACE_POS && pos) ||
+                                              (e.edge == RT_TRACE_NEG && neg))));
+        }
+        if (hit && ++u->occ == u->count) {
+            g.rel_owed.push_back(w);
+        }
+    }
+}
+
+// R11.1: at the end of a slot, a `<= #d` record whose delay ended in it or before has been released by its
+// timer. Returns whether it failed.
+bool poll_timers() {
+    if (g.finished) {
+        return false;
+    }
+    bool failed = false;
+    g.armed.for_each([&](uintptr_t, Upd& u) {
+        if (failed || u.site == nullptr || u.path != RT_TRACE_NBA_TIMER || u.deadline == UINT64_MAX || u.deadline > g.now) {
+            return;
+        }
+        std::string text = "armed: " + upd_text(u);
+        appendf(text, "; its delay ends at tick %llu, and the slot of tick %llu is over", static_cast<unsigned long long>(u.deadline),
+                static_cast<unsigned long long>(g.now));
+        fail("R11.1", "the delay of a `<= #d` update elapsed and no update was created: its timer never released it", 0, text);
+        failed = true;
+    });
+    return failed;
+}
+
+// The point a `<= @e` record whose count an occurrence completed must have been created by: the next
+// dispatch, park or region (R11.2).
+void settle_releases() {
+    for (const EWatch& o : g.rel_owed) {
+        const Upd* u = g.armed.find(o.rec);
+        if (u != nullptr && u->site != nullptr && u->arm == o.arm) {
+            std::string what;
+            appendf(what, "the last of the %u occurrences a `<= @e` update counts came, and the update was not created", u->count);
+            g.rel_owed.clear();
+            fail("R11.2", what, 0, "armed: " + upd_text(*u));
+            return;
+        }
+    }
+    g.rel_owed.clear();
+}
+
 // The point a write's wakes must have been made by: every activation still parked as it was is a
 // violation.
 void settle_owed() {
     settle_aborts();
+    if (g.halted) {
+        return;
+    }
+    settle_releases();
     if (g.halted || g.owed.empty()) {
         return;
     }
     for (const Owed& o : g.owed) {
         const Act* act = g.acts.find(o.act);
         if (act != nullptr && act->state == State::Parked && act->park_seq == o.seq) {
+            if (o.join) {
+                const Fork* f     = g.forks.find(o.x);
+                std::string cause = "the completion that a ";
+                cause += f != nullptr ? join_name(f->kind) : "join";
+                cause += " is due to wake its parent at came, and the parent was still parked at the join when the next dispatch, park or region came";
+                fail("R22.3", "the parent of a fork was not woken by the completion its join is due at", o.act, cause);
+                break;
+            }
             std::string cause = std::string(edge_name(o.edge)) + " " + signal_text(reinterpret_cast<const void*>(o.x)) +
                                 " changed, and the activation was still parked when the next dispatch, park or region came";
             fail("R6.1", "an activation parked on a change that happened was not woken", o.act, cause);
@@ -1648,6 +1981,8 @@ extern "C" void rt_trace_begin(void) {
     g.acts.clear();
     g.names.clear();
     g.armed.clear();
+    g.ewatch.clear();
+    g.rel_owed.clear();
     g.now     = 0;
     g.halted  = false;
     g.seq     = 0;
@@ -1689,6 +2024,12 @@ extern "C" void rt_trace_begin(void) {
     g.occ.clear();
     g.ramp.clear();
     g.abort_owed.clear();
+    g.forks.clear();
+    g.inert.clear();
+    g.inert_sites.clear();
+    g.inert_live          = 0;
+    g.inert_waiting       = 0;
+    g.inert_wheel_waiting = 0;
 }
 
 extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* parent) {
@@ -1729,6 +2070,14 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
     act.blocks.clear();
     act.inherits.clear();
     act.marks.clear();
+    act.forked    = 0;
+    act.member_of = 0;
+    act.completed = false;
+    act.members = 0;
+    act.exact   = false;
+    act.all_ok  = false;
+    act.mentries.clear();
+    act.mstate.clear();
     // A thread's home is a program's or a design's by where it starts (R25); what it forks or
     // calls takes the home of the thread that does.
     switch (kind_of(origin)) {
@@ -1753,6 +2102,15 @@ extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* p
         ++g.strobes_owed;
     }
     record(Ev::Spawn, a, 0, origin, 0, 0);
+    // A fork child belongs to the latest fork of its creator (R22).
+    if (kind_of(origin) == RT_TRACE_ORG_FORK && act.parent != 0) {
+        const Act* creator = g.acts.find(act.parent);
+        Fork*      f       = creator != nullptr && creator->forked != 0 ? g.forks.find(creator->forked) : nullptr;
+        if (f != nullptr) {
+            ++f->spawned;
+            act.member_of = creator->forked;
+        }
+    }
     // The lists its ramp linked it on before this event announced it.
     if (std::vector<uintptr_t>* linked = g.ramp.find(a); linked != nullptr) {
         for (const uintptr_t t : *linked) {
@@ -1831,6 +2189,10 @@ extern "C" void rt_trace_park(void* a_, const rt_trace_control* c, uint64_t arg)
              a,
              m.kind == RT_TRACE_ABORT_KILL ? std::string("marked by a kill of its thread")
                                            : "marked by a disable of the list at " + address_text(m.target));
+        return;
+    }
+    // A guarded group goes back to sleep: the members its writes owed a run have run (R6.4).
+    if (act->members != 0 && kind == RT_TRACE_CTL_STATIC && !settle_members(a, *act)) {
         return;
     }
     count(*act, -1);
@@ -1923,6 +2285,17 @@ extern "C" void rt_trace_wake(void* a_, uint32_t cause_word, const void* x, uint
             return;
         }
     }
+    // The wake of a parent parked at a join comes at the completion its join is due at (R22.3).
+    if (cause == RT_TRACE_CHILD && !g.finished) {
+        if (const Fork* f = g.forks.find(reinterpret_cast<uintptr_t>(x)); f != nullptr && !join_due(*f)) {
+            std::string text;
+            appendf(text, "%u of the %u children had completed; a join is woken by the last and a join_any by the first", f->done,
+                    f->width);
+            fail("R22.3", std::string("the parent of a ") + join_name(f->kind) + " was woken by a completion its join is not due at", a,
+                 text);
+            return;
+        }
+    }
     // Past a `$finish` only the completions that make each frame leave wake anything (R24).
     if (g.finished && !completion_cause(cause)) {
         fail("R24.1", "wake after $finish: code of the finishing thread, or of something it woke, ran on", a,
@@ -1955,6 +2328,10 @@ extern "C" void rt_trace_wake(void* a_, uint32_t cause_word, const void* x, uint
     act->ring         = queue;
     act->queued_at    = g.seq;
     act->queued_cause = static_cast<uint8_t>(cause);
+    // A wake that names no trigger sets every bit of a guarded group, which then runs every member (S9).
+    if (act->members != 0 && cause != RT_TRACE_STATIC) {
+        act->all_ok = true;
+    }
     count(*act, +1);
     // A procedure the seed queues has to run before a late group's first run (R17).
     if (cause == RT_TRACE_SEED && has_fact(*act, RT_TRACE_ORG_PROCEDURE) && !act->proc_owed) {
@@ -2031,6 +2408,12 @@ extern "C" int32_t rt_trace_dispatch(void* a_, uint32_t how) {
         fail("R4.1", "a body the scheduler runs once ran outside the region it belongs to", a,
              std::string("the scheduler is in the ") + region_name(g.region) + " region");
         return 0;
+    } else if (how == RT_TRACE_INLINE) {
+        const std::string why = child_start_refusal(*act);
+        if (!why.empty()) {
+            fail("R22.1", why, a, "dispatched inline");
+            return 0;
+        }
     }
     if (!act->dispatched) {
         act->dispatched = true;
@@ -2250,6 +2633,305 @@ extern "C" void rt_trace_abort(void* a_, const void* target, uint32_t kind) {
     act->marks.push_back(Mark{ t, static_cast<uint8_t>(kind) });
 }
 
+extern "C" void rt_trace_fork(void* a_, const void* rec_, uint32_t kind, uint32_t width) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.forks;
+    ++g.total.forks;
+    const uintptr_t a   = norm(a_);
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    Act*            act = nullptr;
+    if (a != 0) {
+        act = find("R5.3", a, "fork");
+        if (act == nullptr) {
+            return;
+        }
+    }
+    record(Ev::Fork, a, rec, act != nullptr ? act->park : nullptr, static_cast<uint8_t>(kind), 0);
+    g.forks.at(rec) = Fork{ a, static_cast<uint8_t>(kind), width, 0, 0 };
+    if (act != nullptr) {
+        act->forked = rec;
+    }
+}
+
+extern "C" void rt_trace_child_done(void* a_, const void* rec_) {
+    if (g.halted) {
+        return;
+    }
+    const uintptr_t a   = norm(a_);
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    Act*            act = find("R5.3", a, "child completion");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::ChildDone, a, rec, act->park, 0, 0);
+    Fork* f = g.forks.find(rec);
+    if (f == nullptr) {
+        if (!g.finished) {
+            fail("R22.2", "a fork child completes into a record that no fork announced: a fork the trace does not report", a,
+                 "the record at " + address_text(rec));
+        }
+        return;
+    }
+    if (!g.finished) {
+        if (act->member_of != 0 && act->member_of != rec) {
+            fail("R22.2", "a fork child completes into the record of another fork: its count would be wrong, and so would the wake", a,
+                 "created for the record at " + address_text(act->member_of) + ", completes into the one at " + address_text(rec));
+            return;
+        }
+        if (act->completed) {
+            fail("R22.2", "a fork child completes twice: the join would count it twice", a, "the record at " + address_text(rec));
+            return;
+        }
+    }
+    act->completed = true;
+    ++f->done;
+    if (g.finished || f->parent == 0 || !join_due(*f)) {
+        return;
+    }
+    // This is the completion the parent's join is due at: if the parent is parked at it, it is woken
+    // before anything else runs.
+    const Act* parent = g.acts.find(f->parent);
+    if (parent != nullptr && parent->state == State::Parked && parent->park != nullptr && parent->park->kind == RT_TRACE_CTL_JOIN &&
+        parent->rec == rec) {
+        g.owed.push_back(Owed{ f->parent, parent->park_seq, rec, 0, true });
+    }
+}
+
+extern "C" void rt_trace_join(void* a_, const void* rec_) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.joins;
+    ++g.total.joins;
+    const uintptr_t a   = norm(a_);
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    Act*            act = find("R5.3", a, "join");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::Join, a, rec, act->park, 0, 0);
+    if (g.finished) {
+        return;
+    }
+    const Fork* f = g.forks.find(rec);
+    if (f == nullptr) {
+        fail("R22.4", "a join of a record that no fork announced: a fork the trace does not report", a, "the record at " + address_text(rec));
+        return;
+    }
+    if (f->parent != a) {
+        fail("R22.4", "an activation passes the join of a fork that another made", a,
+             "the record at " + address_text(rec) + " was forked by " + address_text(f->parent));
+        return;
+    }
+    std::string text;
+    if (f->spawned != f->width) {
+        appendf(text, "the fork announced %u children and had created %u when its parent joined", f->width, f->spawned);
+        fail("R22.4", "a join passed before every child of its fork was created: the count it waits on can never reach its due value", a, text);
+        return;
+    }
+    const bool ok = f->kind == RT_TRACE_JOIN_ALL ? f->done == f->width : (f->kind == RT_TRACE_JOIN_ANY ? f->done >= 1 : true);
+    if (!ok) {
+        appendf(text, "%u of the %u children had completed", f->done, f->width);
+        fail("R22.4", std::string("the parent of a ") + join_name(f->kind) + " went on before its children had completed", a, text);
+    }
+}
+
+extern "C" void rt_trace_members(void* a_, const rt_trace_member_entry* list, uint32_t n, uint32_t members, uint32_t exact) {
+    if (g.halted) {
+        return;
+    }
+    Act* act = find("R5.3", norm(a_), "member list");
+    if (act == nullptr) {
+        return;
+    }
+    act->members = members;
+    act->exact   = exact != 0;
+    act->all_ok  = false;
+    act->mentries.clear();
+    for (uint32_t i = 0; i < n; ++i) {
+        act->mentries.push_back(MEntry{ reinterpret_cast<uintptr_t>(list[i].x), list[i].edge, list[i].member });
+    }
+    std::sort(act->mentries.begin(), act->mentries.end(), [](const MEntry& l, const MEntry& r) { return l.x < r.x; });
+    act->mstate.assign(members, MState{});
+}
+
+extern "C" void rt_trace_member(void* a_, uint32_t i) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    const uintptr_t a   = norm(a_);
+    Act*            act = find("R5.3", a, "member run");
+    if (act == nullptr) {
+        return;
+    }
+    record(Ev::Member, a, i, act->park, 0, 0);
+    if (i >= act->members) {
+        std::string what;
+        appendf(what, "member %u", i);
+        fail("R5.3", "a member of a guarded group runs, and the seed did not report its members: a group the trace does not report",
+             a, what);
+        return;
+    }
+    ++g.run.member_runs;
+    ++g.total.member_runs;
+    if (g.finished) {
+        return;
+    }
+    MState& s = act->mstate[i];
+    // The guard lets a member through on a bit of its own, or on every bit a wake that names no trigger sets;
+    // where two events of the group share a bit, a sibling's event does the same (S9).
+    if (!act->all_ok && act->exact && (s.bits & kMemberOwed) == 0) {
+        std::string what;
+        appendf(what, "member %u of the %u members of a fused group ran, and none of its own events fired in this activation: its guard let it through", i,
+                act->members);
+        fail("R5.5", what, a, "the member lists " + member_list_text(*act, i));
+        return;
+    }
+    s.bits = static_cast<uint8_t>((s.bits & ~kMemberOwed) | kMemberRan);
+}
+
+extern "C" void rt_trace_inertial_decide(uint32_t idx, uint32_t same_pending, uint32_t same_cur, uint64_t epoch) {
+    if (g.halted || g.finished || !g.counted) {
+        return;
+    }
+    if (idx >= g.inert_sites.size()) {
+        g.inert_sites.resize(idx + 1);
+    }
+    InertSite&  s = g.inert_sites[idx];
+    std::string text;
+    appendf(text, "site %u: equal to the pending value %u, equal to the current value %u, epoch asked %llu", idx, same_pending,
+            same_cur, static_cast<unsigned long long>(epoch));
+    // The same value again keeps the timer of the pending update running: nothing is armed (LRM 10.3.3 b).
+    if (s.live != 0 && same_pending != 0) {
+        if (epoch != 0) {
+            fail("R16.1", "a store that evaluated to the value its pending update already holds armed a new record: the timer restarted",
+                 0, text);
+        }
+        return;
+    }
+    // Any other value supersedes the pending update, which is how a pulse shorter than the delay is rejected ...
+    if (s.live != 0) {
+        if (InertRec* r = g.inert.find(s.live); r != nullptr) {
+            r->state = IState::Superseded;
+            --g.inert_live;
+        }
+        s.live = 0;
+    }
+    // ... and schedules a new one, unless the value is the target's current one (c, d). A record the runtime still
+    // takes for pending after it fired is tolerated: it keeps a value that the net already holds.
+    if (same_cur != 0) {
+        if (epoch != 0) {
+            fail("R16.1", "a store that evaluated to the target's current value armed an update: the pending one is cancelled and nothing is scheduled",
+                 0, text);
+            return;
+        }
+    } else if (epoch == 0 && same_pending == 0) {
+        fail("R16.1", "a store that evaluated to a new value armed no update: the net would never take it", 0, text);
+        return;
+    }
+    s.expect = epoch;
+}
+
+extern "C" void rt_trace_inertial_arm(uint32_t idx, const void* rec_, uint64_t ticks, uint64_t epoch) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    touch_run();
+    if (idx >= g.inert_sites.size()) {
+        g.inert_sites.resize(idx + 1);
+    }
+    InertSite& s = g.inert_sites[idx];
+    if (epoch == 0 || epoch != s.expect) {
+        std::string text;
+        appendf(text, "site %u: armed for epoch %llu, the store's decision asked for %llu", idx, static_cast<unsigned long long>(epoch),
+                static_cast<unsigned long long>(s.expect));
+        fail("R16.2", "an inertial record was armed that the store's decision did not ask for", 0, text);
+        return;
+    }
+    s.expect            = 0;
+    ++g.run.inertial_arms;
+    ++g.total.inertial_arms;
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    g.inert.at(rec)     = InertRec{ idx, IState::Live, g.now, ticks > UINT64_MAX - g.now ? UINT64_MAX : g.now + ticks, epoch };
+    s.live              = rec;
+    ++g.inert_live;
+}
+
+extern "C" void rt_trace_inertial_fire(const void* rec_, uint32_t current) {
+    if (g.halted || g.finished || !g.counted) {
+        return;
+    }
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    InertRec*       r   = g.inert.find(rec);
+    if (r == nullptr || (r->state != IState::Live && r->state != IState::Superseded)) {
+        fail("R16.3", "an inertial record fired that no store armed, or that had fired already", 0, "the record at " + address_text(rec));
+        return;
+    }
+    std::string text;
+    appendf(text, "site %u: armed at tick %llu for tick %llu", r->idx, static_cast<unsigned long long>(r->armed_at),
+            static_cast<unsigned long long>(r->deadline));
+    if (r->deadline != UINT64_MAX && g.now != r->deadline) {
+        std::string what;
+        appendf(what, "an inertial record fired at tick %llu, and was armed for tick %llu", static_cast<unsigned long long>(g.now),
+                static_cast<unsigned long long>(r->deadline));
+        fail("R16.3", what, 0, text);
+        return;
+    }
+    const bool live = r->state == IState::Live;
+    if ((current != 0) != live) {
+        fail("R16.4",
+             current != 0 ? "a record that a later store superseded was applied: a pulse shorter than the delay got through"
+                          : "a record that no later store had superseded was dropped: its update is lost",
+             0, text);
+        return;
+    }
+    if (live) {
+        --g.inert_live;
+        if (InertSite& s = g.inert_sites[r->idx]; s.live == rec) {
+            s.live = 0;
+        }
+    }
+    if (current == 0) {
+        r->state = IState::Done;
+        return;
+    }
+    r->state = IState::Fired;
+    ++g.inert_waiting;
+    if (r->deadline > r->armed_at) {
+        ++g.inert_wheel_waiting;
+    }
+}
+
+extern "C" void rt_trace_inertial_applied(const void* rec_) {
+    if (g.halted || g.finished || !g.counted) {
+        return;
+    }
+    InertRec* r = g.inert.find(reinterpret_cast<uintptr_t>(rec_));
+    if (r == nullptr || r->state != IState::Fired) {
+        return;
+    }
+    // The wheel's records are applied by the commit at the top of their slot, before the Active region (S26); a
+    // zero delay cannot arm the wheel, and its update lands in the NBA region of the slot.
+    const bool wheel = r->deadline > r->armed_at;
+    if (wheel ? g.region != RT_TRACE_REG_PREPONED : !g.in_pass) {
+        fail("R16.5",
+             wheel ? "an inertial update the wheel fired was applied outside the commit at the top of its slot"
+                   : "a zero-delay inertial update was applied outside an NBA pass",
+             0, std::string("the scheduler is in the ") + region_name(g.region) + " region");
+        return;
+    }
+    r->state = IState::Done;
+    --g.inert_waiting;
+    if (wheel) {
+        --g.inert_wheel_waiting;
+    }
+}
+
 extern "C" void rt_trace_once(uint32_t kind) {
     if (g.halted) {
         return;
@@ -2286,6 +2968,9 @@ extern "C" void rt_trace_slot_end(void) {
         return;
     }
     if (closure("the slot ends", false)) {
+        return;
+    }
+    if (poll_inertial() || poll_timers()) {
         return;
     }
     // Time advances only when every region is empty (R1.2). A slot with no region reported (a hand-built
@@ -2351,6 +3036,14 @@ extern "C" void rt_trace_region(uint32_t region) {
                  std::string("the ") + region_name(region) + " region begins after the " + region_name(from) +
                    " region, which it does not follow",
                  0, "");
+            return;
+        }
+        // The commit at the top of the slot has applied every inertial update the wheel fired, before the Active
+        // region reads the nets (S26).
+        if (region == RT_TRACE_REG_ACTIVE && from == RT_TRACE_REG_PREPONED && g.inert_wheel_waiting > 0) {
+            fail("R16.5",
+                 "an inertial update that the wheel fired was not applied before the Active region began: its readers would see the old value",
+                 0, inert_waiting_text());
             return;
         }
         // A region begins with every earlier one empty (R1.2), and a batch of `#0` is promoted whole
@@ -2453,8 +3146,8 @@ extern "C" void rt_trace_nba_create(const rt_trace_nba_site* site, void* dst0, v
     g.pending.push_back(std::move(u));
 }
 
-extern "C" void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* site, void* dst0, void* dst1, const void* val0,
-                                   const void* mask0, const void* val1, const void* mask1) {
+extern "C" void rt_trace_nba_stage(const void* rec, uint64_t ticks, const rt_trace_nba_site* site, void* dst0, void* dst1,
+                                   const void* val0, const void* mask0, const void* val1, const void* mask1) {
     if (g.halted) {
         return;
     }
@@ -2472,6 +3165,8 @@ extern "C" void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* sit
     u.tick   = g.now;
     u.region = g.region;
     u.arm    = ++g.arm_seq;
+    // A timer releases the update when its delay ends (R11.1).
+    u.deadline = path == RT_TRACE_NBA_TIMER ? (ticks > UINT64_MAX - g.now ? UINT64_MAX : g.now + ticks) : 0;
     if (g.finished) {
         fail("R24.1", "an NBA statement ran after $finish: code of the finishing thread, or of something it woke, ran on", 0,
              "armed: " + upd_text(u));
@@ -2485,6 +3180,47 @@ extern "C" void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* sit
     Upd& slot = g.armed.at(reinterpret_cast<uintptr_t>(rec));
     retire(slot);
     slot = std::move(u);
+}
+
+extern "C" void rt_trace_nba_event(const void* rec_, uint32_t count, const void* x_, uint32_t edge) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    touch_run();
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    const uintptr_t x   = reinterpret_cast<uintptr_t>(x_);
+    Upd*            u   = g.armed.find(rec);
+    if (u == nullptr || u->site == nullptr || u->path != RT_TRACE_NBA_EVENT) {
+        fail("R11.2", "an event was reported for a record that no `<= @e` statement armed", 0, "the record at " + address_text(rec));
+        return;
+    }
+    u->count    = count == 0 ? 1 : count;
+    bool listed = false;
+    for (const EWait& w : u->waits) {
+        listed = listed || (w.x == x && w.edge == edge);
+    }
+    if (!listed) {
+        u->waits.push_back(EWait{ x, edge });
+    }
+    std::vector<EWatch>& v = g.ewatch.at(x);
+    for (const EWatch& w : v) {
+        if (w.rec == rec && w.arm == u->arm) {
+            return;
+        }
+    }
+    // Watchers whose record has been released since are dropped as the list grows.
+    const size_t n = v.size();
+    if (n >= 16 && (n & (n - 1)) == 0) {
+        size_t kept = 0;
+        for (const EWatch& w : v) {
+            const Upd* o = g.armed.find(w.rec);
+            if (o != nullptr && o->site != nullptr && o->arm == w.arm) {
+                v[kept++] = w;
+            }
+        }
+        v.resize(kept);
+    }
+    v.push_back(EWatch{ rec, u->arm });
 }
 
 extern "C" void rt_trace_nba_release(const void* rec, uint32_t path, uint32_t moment) {
@@ -2503,6 +3239,24 @@ extern "C" void rt_trace_nba_release(const void* rec, uint32_t path, uint32_t mo
              std::string("a record armed for ") + path_name(armed->path) + " was released as " + path_name(path), 0,
              "armed: " + upd_text(*armed));
         return;
+    }
+    // The timer releases it at the tick its delay ends, and an event when the last occurrence it counts
+    // comes (R11); a record the trace was told no event of is not asked.
+    if (!g.finished) {
+        if (path == RT_TRACE_NBA_TIMER && armed->deadline != UINT64_MAX && g.now != armed->deadline) {
+            std::string what;
+            appendf(what, "a `<= #d` update was created at tick %llu, and its delay ends at tick %llu",
+                    static_cast<unsigned long long>(g.now), static_cast<unsigned long long>(armed->deadline));
+            fail("R11.1", what, 0, "armed: " + upd_text(*armed));
+            return;
+        }
+        if (path == RT_TRACE_NBA_EVENT && !armed->waits.empty() && armed->occ < armed->count) {
+            std::string what;
+            appendf(what, "a `<= @e` update was created before the last occurrence of its control that it counts: %u of the %u occurrences had come",
+                    armed->occ, armed->count);
+            fail("R11.2", what, 0, "armed: " + upd_text(*armed));
+            return;
+        }
     }
     Upd u = std::move(*armed);
     armed->site = nullptr;
@@ -2619,6 +3373,7 @@ extern "C" void rt_trace_trigger(const void* obj, uint32_t kind) {
              "event " + signal_text(obj));
         return;
     }
+    count_occurrence(o, false, false, false, true);
     owe(obj, false, false, false, true);
     if (kind != RT_TRACE_TRIGGER_NB) {
         return;
@@ -2714,6 +3469,7 @@ extern "C" void rt_trace_change(const rt_trace_change_site* site, const void* x,
     }
     if (x != nullptr) {
         g.chg.at(reinterpret_cast<uintptr_t>(x)) = ChgFacts{ g.step, pos, neg, any };
+        count_occurrence(reinterpret_cast<uintptr_t>(x), pos, neg, any, false);
         owe(x, pos, neg, any, false);
     }
 }

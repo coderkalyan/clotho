@@ -23,15 +23,15 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// A wait on a fork-captured automatic event: legal SystemVerilog Clotho refuses
+// A nonblocking assignment to a class property: legal SystemVerilog Clotho refuses
 // with a located `unsupported-construct` error. Line 5, column 5 is the refusal.
 constexpr std::string_view kRefused = R"(module top;
-  task automatic t;
-    event e;
-    fork begin #1 -> e; end join_none
-    wait (e.triggered);
-  endtask
-  initial t();
+  class C; int v; endclass
+  C c = new;
+  initial begin
+    c.v <= 1;
+    #1 $display(c.v);
+  end
 endmodule
 )";
 
@@ -82,7 +82,7 @@ TEST_CASE("a Clotho refusal carries its source line and a caret") {
     CHECK(d.origin == DiagnosticOrigin::Unsupported);
     CHECK(contains(d.rendered, ":5:5: error: "));
     CHECK(contains(d.rendered, "[unsupported-construct]"));
-    CHECK(contains(d.rendered, "\n    wait (e.triggered);\n    ^"));
+    CHECK(contains(d.rendered, "\n    c.v <= 1;\n    ^"));
     CHECK(d.rendered == r.diagnostic_text());
 }
 
@@ -113,7 +113,7 @@ TEST_CASE("--color-diagnostics colours slang's items and Clotho's, and absence l
         const LowerResult colour = lower_args({ "--color-diagnostics", refused });
         REQUIRE_FALSE(colour.ok);
         CHECK(contains(colour.diagnostic_text(), kEsc));
-        CHECK(contains(colour.diagnostics[0].message, "wait on the fork-captured"));
+        CHECK(contains(colour.diagnostics[0].message, "nonblocking assignment to a class property"));
         CHECK_FALSE(contains(colour.diagnostics[0].message, kEsc));
     }
     SUBCASE("a slang warning") {
@@ -140,13 +140,13 @@ TEST_CASE("--diag-source, --diag-column and --diag-location shape a refusal like
         const LowerResult r = lower_args({ "--diag-source=false", refused });
         REQUIRE_FALSE(r.ok);
         CHECK(contains(r.diagnostic_text(), ":5:5: error: "));
-        CHECK_FALSE(contains(r.diagnostic_text(), "wait (e.triggered);"));
+        CHECK_FALSE(contains(r.diagnostic_text(), "c.v <= 1;"));
     }
     SUBCASE("--diag-column=false drops the column") {
         const LowerResult r = lower_args({ "--diag-column=false", refused });
         REQUIRE_FALSE(r.ok);
         CHECK(contains(r.diagnostic_text(), ":5: error: "));
-        CHECK(contains(r.diagnostic_text(), "wait (e.triggered);"));
+        CHECK(contains(r.diagnostic_text(), "c.v <= 1;"));
     }
     SUBCASE("--diag-location=false drops the location") {
         const LowerResult r = lower_args({ "--diag-location=false", refused });

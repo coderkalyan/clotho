@@ -473,10 +473,10 @@ TEST_CASE("extra_operand_tail classifies exactly the tags whose operands overflo
     }
 }
 
-// Exactly nine tags, named. The count is the claim the header comment makes, so
-// pin it: a tenth appearing means someone widened a record without extending
+// Exactly eleven tags, named. The count is the claim the header comment makes, so
+// pin it: a twelfth appearing means someone widened a record without extending
 // the walk, and one disappearing means the walk got a capability nobody noticed.
-TEST_CASE("exactly nine tags hold operands back from the span") {
+TEST_CASE("exactly eleven tags hold operands back from the span") {
     std::set<ir::Inst::Tag> tailed;
     for (unsigned v = 0; v <= 0xFF; ++v) {
         const auto tag = static_cast<ir::Inst::Tag>(v);
@@ -502,7 +502,13 @@ TEST_CASE("exactly nine tags hold operands back from the span") {
                                                // names the instance by its path, a
                                                // string VALUE the banner is joined
                                                // around when the report is issued.
-                                               ir::Inst::Tag::Severity };
+                                               ir::Inst::Tag::Severity,
+                                               // ReadMem / FreadMem: the runtime base
+                                               // (and a queue slice's end) of a sliced
+                                               // memory target, beside the span's
+                                               // filename, target and addresses.
+                                               ir::Inst::Tag::ReadMem,
+                                               ir::Inst::Tag::FreadMem };
     CHECK(tailed == expected);
 }
 

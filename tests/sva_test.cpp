@@ -6309,9 +6309,10 @@ TEST_CASE("%m in a concurrent assertion's action block names its scope and label
     CHECK(action_scope("plbl: assert property (x) else $display(\"%m\");", true) == "top.pblk.plbl\n");
 }
 
-// LRM 16.17 [unverified wording]: the action block is part of the expect statement, so the statement
-// after the `expect` runs only once the action block has finished, including when it suspended. No
-// available simulator implements `expect`, so the expected output is derived from the clause. The
+// LRM 16.17, Syntax 16-20: the action block is part of the expect statement (`expect ( property_spec )
+// action_block`). The clause does not say what a block that suspends does to the statement after
+// the `expect`; it runs only once the block has finished, as after any statement. No available
+// simulator implements `expect`, so the expected output is derived from that reading. The
 // verdict is at t=15 (see "an expect blocks its process until the property resolves").
 TEST_CASE("the statement after an expect waits for an action block that suspends") {
     CHECK(expect_run(R"(

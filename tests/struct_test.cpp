@@ -1044,11 +1044,12 @@ TEST_CASE("static local struct field default applies once") {
     CHECK(out == "6 7\n");  // init once to 5, ++ each call -> 6, 7
 }
 
-// LRM 7.2.1: a struct type's member defaults apply to every variable of the type
-// declared with no initializer of its own, so to each element of an array of it,
-// and to a class property of it, static or not. No oracle: iverilog 13 does not
-// support unpacked structs; the expected values follow from 7.2.1 (the member
-// with no default keeps its type's default, 0 for an int).
+// LRM 7.2.2: "packet1 p1; // initialization defined by the typedef" -- a struct type's member
+// defaults apply to a variable of the type declared with no initializer of its own. Clotho reads that
+// as covering each element of an array of the type and a class property of it, static or not (the
+// clause says nothing of either). No oracle: iverilog 13 does not support unpacked structs; the
+// expected values follow from 7.2.2 (the member with no default keeps its type's default,
+// Table 6-7: 0 for an int).
 TEST_CASE("struct member defaults apply to array elements and class properties") {
     CHECK(run_capture(R"(
         module m;

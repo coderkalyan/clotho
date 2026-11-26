@@ -104,14 +104,15 @@ void Backend::set_str(Index i, llvm::Value* handle) {
 // elem_idx selects it).
 //
 // `use` says WHY, and it has no default on purpose (StringUse). A waited-on
-// string class property notifies from a content comparison around the write, so
-// a `Write` here must sit inside a str_chg_snapshot / str_chg_after bracket;
-// that is checked rather than trusted, because a missing notify is a silent
-// permanent park and the check can only fire for a property someone waits on.
+// string place (a class property with a notifier, part of a signal with waiters)
+// notifies from a content comparison around the write, so a `Write` here must sit
+// inside a str_chg_snapshot / str_chg_after bracket; that is checked rather than
+// trusted, because a missing notify is a silent permanent park and the check can
+// only fire for a place someone waits on.
 llvm::Value* Backend::lv_string_ptr(const Guarded& g, StringUse use) {
-    if (use == StringUse::Write && g.chg != nullptr && str_chg_open_ == 0) {
-        throw BackendError{ "internal: write to a waited-on string class property "
-                            "outside a change-notify bracket (LRM 9.4.2)" };
+    if (use == StringUse::Write && (g.chg != nullptr || str_signal_waited(g)) && str_chg_open_ == 0) {
+        throw BackendError{ "internal: write to a waited-on string outside a change-notify "
+                            "bracket (LRM 9.4.2)" };
     }
     const auto form = [&](const LValue& lv) -> llvm::Value* {
         if (lv.array_ty != nullptr) {
@@ -178,6 +179,7 @@ bool Backend::produces_string_temp(Index i) {
             return true;
         // `p.get_randstate()` renders a fresh string (LRM 9.7); every other
         // process query yields a word.
+        case Inst::Tag::CoverQuery:
         case Inst::Tag::ProcQuery:
             return type_of(i).is_string;
         case Inst::Tag::Constant:
@@ -202,6 +204,10 @@ bool Backend::produces_string_temp(Index i) {
 // a prefix part (s = {s, chunk} appends in place, the O(n^2)->O(n) fix for
 // repeated append); a whole-string leaf target keeps the handle derivable in
 // the prologue, before the leaf instruction itself lowers.
+//
+// Not into a string something waits on: the store is where its waiters are woken,
+// by comparing the characters before and after (str_chg_snapshot), and a concat
+// built in place leaves no "before".
 bool Backend::forwarded_string_store(Index j) {
     if (ir_->tag(j) != Inst::Tag::Store) {
         return false;
@@ -216,12 +222,18 @@ bool Backend::forwarded_string_store(Index j) {
     }
     switch (ir_->tag(p.binary.l)) {
         case Inst::Tag::Signal: {
-            const SignalSlot& s = slot_of(ir_->payload(p.binary.l).signal);
-            return s.is_string && !s.is_array;
+            const Signal      sig = ir_->payload(p.binary.l).signal;
+            const SignalSlot& s   = slot_of(sig);
+            return s.is_string && !s.is_array && !signal_has_waiters(sig);
         }
         case Inst::Tag::Local: {
             const uint32_t idx = ir_->payload(p.binary.l).local.index;
-            return idx < frame_slots_.size() && frame_slots_[idx].is_string;
+            if (idx >= frame_slots_.size() || !frame_slots_[idx].is_string) {
+                return false;
+            }
+            // A `ref` formal's actual may be one (the call passes the thunk that
+            // wakes it, in a design where some ref actual has waiters).
+            return !(frame_slots_[idx].is_ref && design_ref_wake_);
         }
         default:
             return false;
@@ -1010,12 +1022,10 @@ void Backend::lower_inst(Index i) {
                 if (!deferred && forwarded_string_store(i)) {
                     return;
                 }
-                // Deep copy, bracketed by the property's CONTENT compare: a
-                // waited-on `obj.s` fires only when the characters differ (LRM
-                // 9.4.2 over a 6.16 value), so `obj.s = obj.s` and a re-assignment
-                // of equal text from a different handle wake nobody. A string
-                // SIGNAL carries no notifier (refused in the frontend), so this
-                // emits nothing for one.
+                // Deep copy, bracketed by the place's CONTENT compare: a waited-on
+                // string wakes its waiters only when the characters differ (LRM
+                // 9.4.2 over a 6.16 value), so `s = s` and a re-assignment of
+                // equal text from a different handle wake nobody.
                 llvm::Value* snap = str_chg_snapshot(lv);
                 b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv, StringUse::Write), str_of(p.binary.r),
                                                  alloc_site_global(loc_text(i), "string") });
@@ -1258,8 +1268,18 @@ void Backend::lower_inst(Index i) {
             for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
                 ids.push_back(trigger_id_value(tr.signal, tr.edge));
             }
+            // The events the checker is told the record waits for: an event object the variable names now, or
+            // the storage of a signal.
+            llvm::SmallVector<TraceTrigger, 4> traced;
+            if (trace_on()) {
+                for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
+                    const bool is_event = mod_.signal(tr.signal).is_event;
+                    traced.push_back({ is_event ? event_obj_for(tr.signal) : storage_ptr(slot_of(tr.signal)),
+                                       is_event ? static_cast<uint32_t>(RT_TRACE_OBJ) : static_cast<uint32_t>(tr.edge) });
+                }
+            }
             // Out-of-range variable index: register nothing (see StoreNbDelay).
-            lv.when_valid(b_, [&](const LValue& v) { emit_intra_event_arm(v, rhs, count, ids); });
+            lv.when_valid(b_, [&](const LValue& v) { emit_intra_event_arm(v, rhs, count, ids, traced); });
             return;
         }
 
@@ -1975,7 +1995,9 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::DeferFlush:
             // LRM 16.4.4: disabling a procedure's outermost scope drops its
             // pending deferred reports. Same generation bump an activation start
-            // does, so a report queued before this point never matures. A target
+            // does, so a report queued before this point never matures, but into the
+            // counter's high half: a unique/priority violation report compares only
+            // the low half (LRM 12.4.2.1 has no disable flush point). A target
             // id names ANOTHER procedure's counter -- the remote case, where the
             // reports to drop are not this group's.
             if (p.label == kNoDisableTarget && cur_fn_ != nullptr) {
@@ -1995,8 +2017,11 @@ void Backend::lower_inst(Index i) {
                 }
             } else if (p.label == kNoDisableTarget) {
                 emit_defer_gen_bump();
+            } else if (p.label == kDisableOwnTarget) {
+                emit_defer_gen_bump_at(defer_gen_ptr(), kGenDisableBump);
             } else {
-                emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));
+                emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]),
+                                       kGenDisableBump);
             }
             return;
         case Inst::Tag::DisableAbort:

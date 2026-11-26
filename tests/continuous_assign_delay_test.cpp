@@ -193,14 +193,20 @@ TEST_CASE("inertial CA delay: delayed driver of a multiply-driven net") {
     CHECK(run_capture_finish(src) == "t=1 w=x\nt=6 w=0\nt=10 w=0\nt=12 w=1\nt=13 w=x\nt=14 w=1\nt=24 w=1\n");
 }
 
-// Guard: a delayed PARTIAL driver of a resolved net would fold as x (not z) in
-// its undriven bits for the whole initial window, because its slot powers up
-// all-x and the delay defers the first Z-background store.
-TEST_CASE("inertial CA delay: partial driver of a resolved net is rejected") {
-    const std::string err = lower_error(R"(
-        module m; logic [1:0] a, b; wire [3:0] v;
-        assign #5 v[1:0] = a; assign v[1:0] = b; endmodule)");
-    CHECK(err.find("partial driver of a multiply-driven") != std::string::npos);
+// A delayed PARTIAL driver of a resolved net powers up as x in its own bits and z
+// elsewhere, so the undriven bits fold as z and its own bits as x against the other
+// driver until the delay lands (28.16, 10.3.3).
+TEST_CASE("inertial CA delay: partial driver of a resolved net seeds x in its bits") {
+    constexpr std::string_view src = R"(
+        module m; logic [1:0] a = 2'b01, b = 2'b01; wire [3:0] v;
+        assign #5 v[1:0] = a; assign v[1:0] = b;
+        initial begin
+            #1 $display("%b", v);
+            #5 $display("%b", v);
+            $finish;
+        end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "zzxx\nzz01\n");
 }
 
 // A delayed driver's slot on a resolved net also carries no width limit — a

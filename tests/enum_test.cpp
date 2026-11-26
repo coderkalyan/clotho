@@ -178,16 +178,39 @@ TEST_CASE("enum name with a base type wider than 64 bits") {
     CHECK(out == "[A]\n[B]\n[C]\n[]\n");
 }
 
-TEST_CASE("enum methods are rejected") {
-    // A runtime (non-constant) step to next/prev is not supported.
-    check_rejected(R"(
+// next(N) / prev(N) with a step known only at run time (LRM 6.19.5.3, 6.19.5.4): the
+// Nth member after / before the current one, wrapping; N is an `int unsigned`, so it
+// may exceed the member count, and a receiver that is no member gets the enum's
+// default initial value (Table 6-7: 0 for a 2-state base, x for a 4-state one).
+// Expected values from iverilog 13, which agrees on every line.
+TEST_CASE("enum next / prev with a run-time step") {
+    const std::string out = run_capture(R"(
         module m;
-          typedef enum {A, B} e_t;
-          e_t x; int k;
-          initial begin x = A; k = 1; $display("%0d", x.next(k)); end
+          typedef enum {A, B, C, D, E} e_t;
+          typedef enum logic [2:0] {P=1, Q=3, R=6} f_t;
+          e_t e, g, h;
+          f_t f, k;
+          int unsigned n;
+          int j;
+          initial begin
+            e = B;
+            for (n = 0; n < 7; n++) begin
+              g = e.next(n); h = e.prev(n);
+              $display("%0d %s %s", n, g.name(), h.name());
+            end
+            n = 32'hFFFFFFFF; g = e.next(n); h = e.prev(n); $display("max %s %s", g.name(), h.name());
+            n = 32'hFFFFFFFE; g = e.next(n); h = e.prev(n); $display("max-1 %s %s", g.name(), h.name());
+            j = 3; g = e.next(j + 1); h = e.prev(j - 1); $display("expr %s %s", g.name(), h.name());
+            e = e_t'(7); n = 2; g = e.next(n); h = e.prev(n); $display("nonmember %0d %0d", g, h);
+            f = Q; n = 2; k = f.next(n); $display("f next2 %0d", k);
+            n = 1; k = f.prev(n); $display("f prev1 %0d", k);
+            f = f_t'(3'd2); n = 1; k = f.next(n); $display("f nonmember %b", k);
+          end
         endmodule
-    )",
-                   "non-constant step");
+    )");
+    CHECK(out ==
+          "0 B B\n1 C A\n2 D E\n3 E D\n4 A C\n5 B B\n6 C A\n"
+          "max B B\nmax-1 A C\nexpr A E\nnonmember 0 0\nf next2 1\nf prev1 1\nf nonmember xxx\n");
 }
 
 // $cast (LRM 6.24.2 / 8.16): numeric + enum destinations. Returns 1 and assigns

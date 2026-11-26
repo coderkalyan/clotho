@@ -43,13 +43,6 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
-// Confirm lowering fails loudly for an unsupported construct.
-std::string lower_error(std::string_view source) {
-    const LowerResult r = lower_text(source);
-    REQUIRE_FALSE(r.ok);
-    return r.diagnostic_text();
-}
-
 } // namespace
 
 // The LRM 18.16 example: weights 3 / 1 / 4 give probabilities 0.375 / 0.125 /
@@ -235,11 +228,187 @@ TEST_CASE("randcase in a function and in a task") {
     CHECK(run_capture(src) == "2 7\n");
 }
 
-// A sum wider than 32 bits would need several stitched $urandom_range draws
-// (LRM 18.16); guarded loud instead of silently truncating the weights.
-TEST_CASE("randcase with a 64-bit weight fails loudly") {
-    CHECK(lower_error("module m; longint w; int x;\n"
-                      " initial begin w = 5; randcase w : x = 1; 1 : x = 2; endcase end\n"
-                      "endmodule")
-            .find("32 bits") != std::string::npos);
+// A weight wider than 32 bits takes several stitched draws (LRM 18.16: "This can
+// result in multiple calls to $urandom_range() to handle numbers greater than 32
+// bits"). Two weights of 2^32 sum to 2^33: a single 32-bit draw would always land
+// under the first weight, so a 50/50 split shows the high word is drawn too.
+// Oracle: the probability rule of 18.16 (weight / sum); iverilog 13 has no
+// randcase.
+TEST_CASE("randcase weights wider than 32 bits split by their ratio (LRM 18.16)") {
+    constexpr std::string_view src = R"(
+        module m;
+            longint unsigned a, b;
+            int x, i, c1;
+            initial begin
+                a = 64'h1_0000_0000;
+                b = 64'h1_0000_0000;
+                for (i = 0; i < 4000; i++) begin
+                    randcase
+                        a : x = 1;
+                        b : x = 2;
+                    endcase
+                    if (x == 1) c1++;
+                end
+                $display("%0d", c1 > 1800 && c1 < 2200);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n");
+}
+
+// 3 : 1 with every weight bit above bit 39: a draw or a sum truncated to 32 bits
+// would see 0 and take no branch at all. Oracle: 18.16's probability rule.
+TEST_CASE("randcase 3 to 1 at 64 bits (LRM 18.16)") {
+    constexpr std::string_view src = R"(
+        module m;
+            longint unsigned a, b;
+            int x, i, c1, c2;
+            initial begin
+                a = 64'd3 << 40;
+                b = 64'd1 << 40;
+                for (i = 0; i < 4000; i++) begin
+                    x = 0;
+                    randcase
+                        a : x = 1;
+                        b : x = 2;
+                    endcase
+                    if (x == 1) c1++;
+                    if (x == 2) c2++;
+                end
+                $display("%0d %0d", c1 + c2, c1 > 2800 && c1 < 3200);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4000 1\n");
+}
+
+// A width that is not a multiple of 32 and one past 64: the draw is masked to the
+// sum's bit length, so no bit above it can skew the split. The weights 2^63, 2^63
+// and 2^62 sum to 5 * 2^62, which fits 65 bits, and split 0.4 / 0.4 / 0.2.
+// The 100-bit pair is 50/50. Oracle: 18.16's probability rule.
+TEST_CASE("randcase weights of 65 and 100 bits (LRM 18.16)") {
+    constexpr std::string_view src = R"(
+        module m;
+            bit [64:0] a, b, c;
+            bit [99:0] p, q;
+            int x, i, c1, c2, c3, d1;
+            initial begin
+                a = 65'd1 << 63;
+                b = 65'd1 << 63;
+                c = 65'd1 << 62;
+                p = 100'd1 << 98;
+                q = 100'd1 << 98;
+                for (i = 0; i < 4000; i++) begin
+                    randcase
+                        a : x = 1;
+                        b : x = 2;
+                        c : x = 3;
+                    endcase
+                    if (x == 1) c1++;
+                    if (x == 2) c2++;
+                    if (x == 3) c3++;
+                    randcase
+                        p : x = 1;
+                        q : x = 2;
+                    endcase
+                    if (x == 1) d1++;
+                end
+                $display("%0d %0d %0d %0d", c1 > 1400 && c1 < 1800, c2 > 1400 && c2 < 1800,
+                         c3 > 650 && c3 < 950, d1 > 1800 && d1 < 2200);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1 1 1\n");
+}
+
+// 18.16's precision rules carry over to a wide sum: each weight is unsigned, so a
+// negative longint is 2^64 - 1 and wins every draw, and the sum wraps at 64 bits
+// (2^64 - 1 plus 2 is 1, so the draw is 0 and the first branch always wins), as
+// the 8-bit case does (docs/LRM_NOTES.md, note 26). Oracle: 18.16's text; iverilog
+// 13 has no randcase.
+TEST_CASE("randcase wide weights are unsigned and the sum wraps (LRM 18.16)") {
+    constexpr std::string_view src = R"(
+        module m;
+            longint          s;
+            longint unsigned a, b;
+            int              x, i, miss, wrap_miss;
+            initial begin
+                s = -1;
+                a = 64'hFFFF_FFFF_FFFF_FFFF;
+                b = 2;
+                for (i = 0; i < 200; i++) begin
+                    randcase
+                        s : x = 1;
+                        0 : x = 2;
+                    endcase
+                    if (x != 1) miss++;
+                    randcase
+                        a : x = 1;
+                        b : x = 2;
+                    endcase
+                    if (x != 1) wrap_miss++;
+                end
+                $display("%0d %0d", miss, wrap_miss);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 0\n");
+}
+
+// Zero total at 64 bits: no branch runs and, as for a narrow sum, no draw is taken
+// from the process stream, so the value after the randcase is the one without it.
+// Oracle: 18.16 ("no branch is taken"); the draw count is the contract of
+// docs/design/randsequence.md section 12.
+TEST_CASE("randcase with an all-zero wide sum takes no branch and no draw") {
+    constexpr std::string_view src = R"(
+        module m;
+            longint unsigned z;
+            int              x, r0, r1, r2;
+            initial begin
+                z  = 0;
+                x  = 99;
+                r0 = $urandom(7);
+                r1 = $urandom;
+                r0 = $urandom(7);
+                randcase
+                    z : x = 1;
+                    z : x = 2;
+                endcase
+                r2 = $urandom;
+                $display("x=%0d same=%0d", x, r1 == r2);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "x=99 same=1\n");
+}
+
+// A sum of at most 32 bits takes exactly one draw, the same one $urandom_range
+// (sum - 1, 0) takes: the wide path must not move a narrow randcase's stream
+// (docs/design/randsequence.md section 12). The randcase here picks branch 2 or
+// 1 from the same draw as the range call, so both leave the stream in one state.
+TEST_CASE("randcase over a narrow sum draws once") {
+    constexpr std::string_view src = R"(
+        module m;
+            int x, r0, r1, r2, t;
+            initial begin
+                r0 = $urandom(11);
+                randcase
+                    8'd3 : x = 1;
+                    8'd5 : x = 2;
+                endcase
+                r1 = $urandom;
+                r0 = $urandom(11);
+                t  = $urandom_range(7, 0);
+                r2 = $urandom;
+                $display("%0d %0d", r1 == r2, x == (t < 3 ? 1 : 2));
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1\n");
 }

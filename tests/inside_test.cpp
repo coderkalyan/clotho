@@ -1,20 +1,23 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
 
 namespace {
 
-// JIT-run a module's initial blocks and return everything written to stdout.
-std::string run_capture(std::string_view source) {
-    const LowerResult r = lower_text(source);
+// JIT-run an already lowered design and return everything written to stdout.
+std::string run_lowered(const LowerResult& r) {
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
@@ -39,6 +42,27 @@ std::string run_capture(std::string_view source) {
         out.append(buf, n);
     }
     std::fclose(tmp);
+    return out;
+}
+
+// JIT-run a module's initial blocks and return everything written to stdout.
+std::string run_capture(std::string_view source) {
+    return run_lowered(lower_text(source));
+}
+
+// The same for a design compiled at the IEEE 1800-2023 language level, which the
+// tolerance ranges of LRM 11.4.13 need: lower_text parses at the default, 1800-2017.
+std::string run_capture_2023(std::string_view source) {
+    const std::filesystem::path path =
+      std::filesystem::temp_directory_path() / (clotho::test::detail::unique_stem() + ".sv");
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(source.data(), static_cast<std::streamsize>(source.size()));
+    }
+    const std::string                   file = path.string();
+    const std::vector<std::string_view> args = { "--std", "1800-2023", file };
+    const std::string                   out  = run_lowered(lower_sources(args));
+    std::filesystem::remove(path);
     return out;
 }
 
@@ -238,19 +262,165 @@ TEST_CASE("inside: a string left operand against string members and a range") {
     )");
     CHECK(out == "1 0 1\n");
 }
+// A range of the tolerance forms `[a +/- b]` and `[a +%- b]` (LRM 11.4.13) is
+// [a - type(a)'(b) : a + type(a)'(b)] and [a - type(a)'(a*b/100.0) : a +
+// type(a)'(a*b/100.0)], the two bounds swapped when need be; a real tolerance
+// converts to an integral type by truncation, not rounding. The worked values are
+// the LRM's own (a = 7 at 25% is [6:8], a = -7 is [-8:-6]), and each line prints
+// the answer for a run of selector values. iverilog 13 cannot parse the forms,
+// so the expectations come from the clause.
+TEST_CASE("inside: tolerance ranges (LRM 11.4.13)") {
+    const std::string out = run_capture_2023(R"(
+        module m;
+          int x;
+          real r;
+          initial begin
+            for (x = 5; x <= 15; x++) $write("%b", x inside {[10 +/- 3]});   $display("");
+            for (x = 5; x <= 15; x++) $write("%b", x inside {[10 +%- 25]});  $display("");
+            for (x = 5; x <= 15; x++) $write("%b", x inside {[10 +/- -3]});  $display("");
+            for (x = 5; x <= 9; x++) $write("%b", x inside {[7 +%- 25]});    $display("");
+            for (x = -9; x <= -5; x++) $write("%b", x inside {[-7 +%- 25]}); $display("");
+            for (x = -13; x <= -7; x++) $write("%b", x inside {[-10 +%- 25]}); $display("");
+            r = 5.25; $write("%b", r inside {[7.0 +%- 25]});
+            r = 8.75; $write("%b", r inside {[7.0 +%- 25]});
+            r = 5.0;  $write("%b", r inside {[7.0 +%- 25]});
+            r = 9.0;  $write("%b", r inside {[7.0 +%- 25]});                 $display("");
+            for (x = 5; x <= 9; x++) $write("%b", x inside {[7.0 +/- 1.5]}); $display("");
+            for (x = 6; x <= 14; x++) $write("%b", x inside {[10 +/- 2.9]}); $display("");
+            for (x = 8; x <= 12; x++) $write("%b", x inside {[10 +%- 12.5]}); $display("");
+            for (x = 5; x <= 9; x++) $write("%b", x inside {1, [7 +/- 1], 20}); $display("");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "00111111100\n00011111000\n00111111100\n01110\n01110\n0111110\n1100\n01110\n001111100\n01110\n01110\n");
+}
+
+// A tolerance range runs the same arithmetic in a constant expression, which slang
+// evaluates on its own: one function, called from a localparam (slang's evaluation)
+// and at run time (Clotho's lowering), must give every selector the same answer.
+// The operand types are mixed on purpose -- an unsigned selector against signed
+// literals, a narrow signed one, (slang's own evaluator rounds a real absolute tolerance where 11.4.13 truncates, so none is swept).
+TEST_CASE("inside: a tolerance range agrees with slang's constant evaluation") {
+    const std::string out = run_capture_2023(R"(
+        module m;
+          function automatic bit [39:0] sweep(int a, int b);
+            bit [39:0] bits;
+            logic [7:0] u;
+            logic signed [7:0] s;
+            for (int i = 0; i < 10; i++) begin
+              u = i * 3; s = i * 3 - 12;
+              bits[i]      = int'(u) inside {[a +/- b]};
+              bits[10 + i] = int'(s) inside {[a +%- b]};
+              bits[20 + i] = u inside {[a +/- b]};
+              bits[30 + i] = s inside {[a +/- 2]};
+            end
+            return bits;
+          endfunction
+          localparam bit [39:0] FOLDED = sweep(9, 4);
+          bit [39:0] ran;
+          int a = 9, b = 4;
+          initial begin
+            ran = sweep(a, b);
+            $display("%0d %b", ran == FOLDED, ran == 40'd0);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0\n");
+}
+
+// A `$` range bound (LRM 11.4.13) stands for the lowest or highest value of the
+// type of the left operand, so `[$:hi]` is "at most hi" and `[lo:$]` "at least lo",
+// whatever the width and signedness of the operand, and for a real. iverilog 13
+// cannot parse the form: the expectations come from the clause.
+TEST_CASE("inside: unbounded range bounds (LRM 11.4.13)") {
+    const std::string out = run_capture(R"(
+        module m;
+          int x;
+          logic [7:0] u;
+          byte sb;
+          real r;
+          initial begin
+            for (x = 6; x <= 9; x++) $write("%b", x inside {[$:7]}); $display("");
+            for (x = 6; x <= 9; x++) $write("%b", x inside {[8:$]}); $display("");
+            x = 2147483647;       $write("%b", x inside {[5:$]});
+            x = -2147483647 - 1;  $write("%b", x inside {[$:5]}); $write("%b", x inside {[5:$]}); $display("");
+            u = 200; $write("%b", u inside {[100:$]}); $write("%b", u inside {[$:100]});
+            u = 0;   $write("%b", u inside {[$:0]});                                    $display("");
+            sb = -128; $write("%b", sb inside {[$:-100]});
+            sb = 127;  $write("%b", sb inside {[100:$]});
+            sb = -1;   $write("%b", sb inside {[0:$]});                                 $display("");
+            r = 1.0e30;  $write("%b", r inside {[5.0:$]});
+            r = -1.0e30; $write("%b", r inside {[$:5.0]});
+            r = 4.0;     $write("%b", r inside {[5.0:$]});                              $display("");
+            x = 3;  $write("%b", x inside {1, [10:$]});
+            x = 11; $write("%b", x inside {1, [10:$]});
+            x = 1;  $write("%b", x inside {1, [10:$]});                                 $display("");
+          end
+        endmodule
+    )");
+    CHECK(out == "1100\n0011\n110\n101\n110\n110\n011\n");
+}
+
+// A set member that is a container of strings (LRM 11.4.13: "descending into the
+// array until reaching a singular value"): a queue, a dynamic array, a fixed-size
+// array (nested too) and an associative array, alone and beside other members, plus
+// the associative array of ints that had no key walk either. The comparison is the
+// content equality of 6.16.9. iverilog 13 cannot compile `inside` at all, so the
+// expectations come from the clause.
+TEST_CASE("inside: a container of strings as a set member") {
+    const std::string out = run_capture(R"(
+        module m;
+          string q[$]; string d[]; string fa [0:2]; string fn [0:1][0:1]; string aa[int]; string ee[$];
+          string s;
+          int amap [string];
+          int a;
+          initial begin
+            q = '{"ab", "cd"};
+            d = new[2]; d[0] = "x"; d[1] = "y";
+            fa = '{"p", "q", "r"};
+            fn[0][0] = "a"; fn[0][1] = "b"; fn[1][0] = "c"; fn[1][1] = "d";
+            aa[5] = "m"; aa[9] = "n";
+            s = "cd"; $display("%b %b", s inside {q}, s inside {"zz", q});
+            s = "ef"; $display("%b", s inside {q});
+            s = "y";   $display("%b %b", s inside {d}, s inside {fa});
+            s = "q";   $display("%b %b", s inside {d}, s inside {fa});
+            s = "c";   $display("%b", s inside {fn});
+            s = "e";   $display("%b", s inside {fn});
+            s = "n";   $display("%b %b", s inside {aa}, s inside {ee});
+            s = "o";   $display("%b", s inside {aa});
+            s = "pq";  $display("%b", s inside {["a":"z"], q});
+            s = "m";   $display("%b", s inside {aa, "zz"});
+            amap["k"] = 2; a = 2;
+            $display("%b %b", a inside {amap}, 3 inside {amap});
+          end
+        endmodule
+    )");
+    CHECK(out == "1 1\n0\n1 0\n0 1\n1\n0\n1 0\n0\n1\n1\n1 0\n");
+}
+
+// A `$` bound over strings (LRM 11.4.13) used to abort in slang
+// (patches/slang-string-unbounded-range.patch). A string has no lowest or highest
+// value, so `["m":$]` is "at least m" and `[$:"m"]` "at most m". No oracle parses
+// this form; the expectations are the clause's.
+TEST_CASE("inside: an unbounded bound over strings") {
+    const std::string out = run_capture(R"(
+        module m;
+          string s;
+          initial begin
+            s = "q"; $display("%b %b", s inside {["m":$]}, s inside {[$:"m"]});
+            s = "c"; $display("%b %b", s inside {["m":$]}, s inside {[$:"m"]});
+            s = "q";
+            case (s) inside ["m":$]: $display("hi"); default: $display("lo"); endcase
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0\n0 1\nhi\n");
+}
 
 // Unsupported forms fail loudly (PRINCIPLES.md: never silently accept).
 TEST_CASE("inside: unsupported forms are rejected") {
 
-    // An associative array has no index walk to share with the ordered
-    // containers; its traversal is the first/next key pair (LRM 7.9.4).
-    check_rejected(R"(
-        module m;
-          int a; int amap [string];
-          initial begin a = 2; amap["k"] = 2; $display("%b", a inside {amap}); end
-        endmodule
-    )",
-                   "associative-array set member");
 
     // Descending into a non-singular element of a VARIABLE-size member needs the
     // walk nested inside itself; the fixed-size member recurses instead.
