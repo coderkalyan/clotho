@@ -2565,36 +2565,35 @@ TEST_CASE("always @* over a property of a null handle waits on the handle") {
 // An event list is the OR of its terms (LRM 9.4.2.1), and a term over a class property wakes
 // it, in either position, on a change of the term's value only (9.4.2): a write to a sibling
 // member and a write of the value it already holds are no event. A method names the property
-// through the implicit this, and `always @(list)` re-arms on every term. Before: the property
+// through the implicit this, and `always @(list)` re-arms on every term. Before: the compound
 // term never woke, and in a method the lowering crashed. No oracle parses classes or unpacked
 // structs; the expectations are the clauses'.
 TEST_CASE("an event list with a class property term wakes on each of its terms") {
     SUBCASE("a process, the term in either position") {
         const std::string out = run_capture(R"(
             typedef struct { int f; int g; } s_t;
-            class C; s_t s; endclass
+            class C; s_t s; logic k = 0; endclass
             module top;
               C obj = new;
-              logic b = 0;
-              string fb, bf;
+              string fk, kf;
               initial begin
                 fork
-                  forever begin @(obj.s.f or b) fb = {fb, $sformatf("%0t ", $time)}; end
-                  forever begin @(b or obj.s.f) bf = {bf, $sformatf("%0t ", $time)}; end
+                  forever begin @(obj.s.f or obj.k) fk = {fk, $sformatf("%0t ", $time)}; end
+                  forever begin @(obj.k or obj.s.f) kf = {kf, $sformatf("%0t ", $time)}; end
                 join_none
                 #1 obj.s.g = 1;
                 #1 obj.s.f = 5;
-                #1 b = 1;
+                #1 obj.k = 1;
                 #1 obj.s.f = 5;
-                #1 b = 1;
+                #1 obj.k = 1;
                 #1 obj.s.f = 6;
-                #1 b = 0;
-                #1 $display("fb: %s", fb);
-                $display("bf: %s", bf);
+                #1 obj.k = 0;
+                #1 $display("fk: %s", fk);
+                $display("kf: %s", kf);
               end
             endmodule
         )");
-        CHECK(out == "fb: 2 3 6 7 \nbf: 2 3 6 7 \n");
+        CHECK(out == "fk: 2 3 6 7 \nkf: 2 3 6 7 \n");
     }
     SUBCASE("a method") {
         const std::string out = run_capture(R"(
@@ -2621,17 +2620,16 @@ TEST_CASE("an event list with a class property term wakes on each of its terms")
     SUBCASE("a process's sensitivity list") {
         const std::string out = run_capture(R"(
             typedef struct { int f; } s_t;
-            class C; s_t s; endclass
+            class C; s_t s; logic k = 0; endclass
             module top;
               C obj = new;
-              logic b = 0;
               int n = 0;
-              always @(obj.s.f or b) n++;
+              always @(obj.s.f or obj.k) n++;
               initial begin
                 #1 obj.s.f = 1;
-                #1 b = 1;
+                #1 obj.k = 1;
                 #1 obj.s.f = 1;
-                #1 b = 1;
+                #1 obj.k = 1;
                 #1 $display("n=%0d", n);
               end
             endmodule
@@ -2643,28 +2641,27 @@ TEST_CASE("an event list with a class property term wakes on each of its terms")
 // An edge on a term is the edge of its least significant bit (Table 9-2), here through an
 // index that is itself a variable the wait watches, and `iff` gates its own term, evaluated
 // when the term changes (9.4.2.3: "evaluated when a changes and not when enable changes").
-// The plain-signal analog of the edge design gave `1 3 4 9` on iverilog 13; the `iff` list
-// is LRM-derived, iverilog does not parse it. Before: the first never woke on the property,
-// and the second was refused (iff on a multi-event control).
+// A plain-signal analog of the edge design gave `1 3 4 9` on iverilog 13; the `iff` list is
+// LRM-derived, iverilog does not parse it. Before: the first never woke on the property, and
+// the second was refused (iff on a multi-event control).
 TEST_CASE("an event list over class property terms follows Table 9-2 and iff") {
     SUBCASE("edges") {
         const std::string out = run_capture(R"(
-            class C; logic [1:0] a [2]; endclass
+            class C; logic [1:0] a [2]; logic c = 1; endclass
             module top;
               C obj = new;
               int i = 1;
-              logic c = 1;
               string log;
               initial begin
                 obj.a[0] = 2'b00; obj.a[1] = 2'b00;
                 fork
-                  forever begin @(posedge obj.a[i] or negedge c) log = {log, $sformatf("%0t ", $time)}; end
+                  forever begin @(posedge obj.a[i] or negedge obj.c) log = {log, $sformatf("%0t ", $time)}; end
                 join_none
                 #1 obj.a[1] = 2'b01;
                 #1 obj.a[1] = 2'b10;
                 #1 obj.a[1] = 2'b11;
-                #1 c = 0;
-                #1 c = 1;
+                #1 obj.c = 0;
+                #1 obj.c = 1;
                 #1 obj.a[0] = 2'b01;
                 #1 i = 0;
                 #1 obj.a[0] = 2'b00;
@@ -2678,22 +2675,22 @@ TEST_CASE("an event list over class property terms follows Table 9-2 and iff") {
     SUBCASE("iff on each term") {
         const std::string out = run_capture(R"(
             typedef struct { int f; } s_t;
-            class C; s_t s; endclass
+            class C; s_t s; logic b = 0; endclass
             module top;
               C obj = new;
-              logic b = 0, en = 0, en2 = 0;
+              logic en = 0, en2 = 0;
               string log;
               initial begin
                 fork
-                  forever begin @(obj.s.f iff en or posedge b iff en2) log = {log, $sformatf("%0t ", $time)}; end
+                  forever begin @(obj.s.f iff en or posedge obj.b iff en2) log = {log, $sformatf("%0t ", $time)}; end
                 join_none
                 #1 obj.s.f = 1;
                 #1 en = 1;
                 #1 obj.s.f = 2;
-                #1 b = 1;
-                #1 b = 0;
+                #1 obj.b = 1;
+                #1 obj.b = 0;
                 #1 en2 = 1;
-                #1 b = 1;
+                #1 obj.b = 1;
                 #1 obj.s.f = 2;
                 #1 $display("%s", log);
               end
@@ -2703,37 +2700,33 @@ TEST_CASE("an event list over class property terms follows Table 9-2 and iff") {
     }
 }
 
-// A list mixes terms of every kind: a compound over a property, a real and a string property
-// named by themselves (a real by its bit pattern, a string by its content, so a write of the
-// same value is no event), and a named event, which wakes it on a trigger in a later step
-// too. The same terms in a task, whose samples live in its frame. Before: the compound
-// never woke. LRM-derived; no oracle parses classes.
-TEST_CASE("an event list with a real, a string and an event term") {
+// A list mixes terms of every kind a member can have: a compound over a property, and a real
+// and a string property named by themselves (a real by its bit pattern, a string by its
+// content, so a write of the same value is no event). The same terms in a task, whose
+// samples live in its frame. Before: the compound never woke. LRM-derived.
+TEST_CASE("an event list with a real and a string term") {
     SUBCASE("a process") {
         const std::string out = run_capture(R"(
             typedef struct { int f; } s_t;
             class C; s_t s; real r; string t; endclass
             module top;
               C obj = new;
-              event ev;
               string log;
               initial begin
                 obj.r = 1.0; obj.t = "a";
                 fork
-                  forever begin @(obj.s.f or obj.r or obj.t or ev) log = {log, $sformatf("%0t ", $time)}; end
+                  forever begin @(obj.s.f or obj.r or obj.t) log = {log, $sformatf("%0t ", $time)}; end
                 join_none
                 #1 obj.s.f = 1;
                 #1 obj.r = 1.0;
                 #1 obj.r = 2.5;
                 #1 obj.t = "b";
-                #1 -> ev;
-                #1 -> ev;
                 #1 obj.t = "b";
                 #1 $display("%s", log);
               end
             endmodule
         )");
-        CHECK(out == "1 3 4 5 6 \n");
+        CHECK(out == "1 3 4 \n");
     }
     SUBCASE("a task") {
         const std::string out = run_capture(R"(
@@ -2771,12 +2764,12 @@ TEST_CASE("an event list with a real, a string and an event term") {
 // time zero, from the net its term was synthesized into, ahead of the first statement. Out of
 // process because the report ends the run.
 TEST_CASE("an event list or compound term over a property of a null handle is a located fatal") {
-    for (const char* control : { "@(obj.s.f or b)", "@(b or obj.s.f)", "@(obj.s.f)" }) {
+    for (const char* control : { "@(obj.s.f or obj.k)", "@(obj.k or obj.s.f)", "@(obj.s.f)" }) {
         const std::string src = std::string(R"(
             typedef struct { int f; } s_t;
-            class C; s_t s; endclass
+            class C; s_t s; int k; endclass
             module top;
-              C obj; logic b;
+              C obj;
               initial begin
                 $display("before");
                 #1 )") + control + R"(;
@@ -2791,4 +2784,55 @@ TEST_CASE("an event list or compound term over a property of a null handle is a 
         CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
         CHECK(run.err.find("the handle holds no object at 1 s") != std::string::npos);
     }
+}
+
+// Refused for now (docs/TODO.md): a list mixing a property or virtual-interface member with a
+// signal or an event, and `->> @(m) e` / `x <= @(m) y` over a member. The first would lose what
+// the signal's own wait catches (a pulse that reverts before the waiter runs, a second trigger
+// in the step the wait began in); the others register a detached subscription on a signal and
+// edge. Both used to be accepted and never woke on the member (silently).
+TEST_CASE("a class property mixed with a signal or an event in a list, or over a detached control, is refused") {
+    const std::string decls = R"(
+        typedef struct { int f; } s_t;
+        class C; s_t s; int k; endclass
+        module m; C obj = new; logic b; event e, d; int x, y;
+    )";
+    const auto refused = [&](std::string_view body, std::string_view message) {
+        const std::string err = reject(decls + "initial begin " + std::string(body) + " end endmodule");
+        INFO(body);
+        CHECK(err.find(message) != std::string::npos);
+    };
+    constexpr std::string_view mixed = "an event list mixing a class-property or virtual-interface member";
+    constexpr std::string_view detached = "over a class-property or virtual-interface member is not supported yet";
+    refused("@(obj.s.f or b);", mixed);
+    refused("@(b or obj.s.f);", mixed);
+    refused("@(obj.s.f or e);", mixed);
+    refused("@(posedge b or obj.s.f or obj.k);", mixed);
+    refused("->> @(obj.s.f) d;", detached);
+    refused("->> @(obj.k) d;", detached);
+    refused("x <= @(obj.s.f) y;", detached);
+}
+
+// What the refusal leaves alone: a list with no property or member term keeps the static
+// path, and so keeps its store-time classification (LRM 4.6, 9.4.2): a signal that pulses
+// 0 -> 1 -> 0 in one step wakes `@(a or b)` once, as it does `@(posedge b)`. iverilog 13 agrees
+// on this design.
+TEST_CASE("a list of signals and events still wakes on a pulse that reverts in its step") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a = 0, b = 0;
+          event e;
+          int n1 = 0, n2 = 0;
+          initial begin
+            fork
+              forever begin @(a or b) n1++; end
+              forever begin @(posedge b or e) n2++; end
+            join_none
+            #1 b = 1; b = 0;
+            #1 -> e; #0 -> e;
+            #1 $display("%0d %0d", n1, n2);
+          end
+        endmodule
+    )");
+    CHECK(out == "1 3\n");
 }

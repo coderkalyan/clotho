@@ -126,6 +126,9 @@ Milestones, in order; lower ones unblock higher ones:
     snapshotted in the waiter and compared on each wake.
   - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
     needs DPI.
+- [ ] **Event control mixing a class-property or virtual-interface member with a signal or
+  event, and `->> @(m) e` / `x <= @(m) y` over such a member** (9.4.2, 15.5.1, 9.4.5) — refused;
+  needs a per-registration fired marker in the wait node.
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
@@ -724,9 +727,8 @@ Milestones, in order; lower ones unblock higher ones:
     names** (`vif.i.d`) — the context record does not carry its children's.
   - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
     — refused.
-  - [ ] **Virtual-interface expression as a clock or a nonblocking event control** — the
-    clock of a clocking block, covergroup or assertion, and `->> @(vif.a)` or `x <= @(vif.a) y`
-    (14.3, 19.4, 15.5.1, 9.4.5, 25.9).
+  - [ ] **Virtual-interface expression as the clock of a clocking block, covergroup or
+    assertion** (14.3, 19.4, 16.5, 25.9) — refused.
   - [ ] **Parameter or other member with no signal storage** — `vif.P`, or a clockvar the
     interface's instances do not provide.
   - [ ] **Modport expression port** (25.5.4) — reached through a modport-qualified handle.

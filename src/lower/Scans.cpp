@@ -282,6 +282,18 @@ bool event_reads_props(const Expression& e) {
     return !scan.notifiable.empty() && !scan.any_container;
 }
 
+bool event_term_reads_member(const Expression& e) {
+    if (e.type->isEvent()) {
+        return false;
+    }
+    if (reads_vif(e)) {
+        return true;
+    }
+    ClassPropReadScan scan;
+    e.visit(scan);
+    return scan.any_prop;
+}
+
 bool reads_vif(const Expression& e) {
     struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
         bool found = false;

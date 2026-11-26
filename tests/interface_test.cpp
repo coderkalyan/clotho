@@ -568,41 +568,39 @@ TEST_CASE("virtual interface: an edge or an iff on an event control over member 
 
 // An event list over expressions of members (LRM 9.4.2.1, 25.9) is the OR of its terms, in
 // either order, and a term over an expression is a change of its value, so a write that
-// leaves `a & b` alone is no event. A property and a plain signal can sit in the same list.
-// iverilog 13 gave `2 3 4 5 8` for each waiter on the plain-signal analog of the first design;
+// leaves `a & b` alone is no event. A property can sit in the same list.
+// iverilog 13 gave `2 3 4 5 7` for each waiter on the plain-signal analog of the first design;
 // it parses neither a virtual interface nor a class, so the mixed list is LRM-derived.
 // Before: refused ("an event control on an expression through a virtual interface").
 TEST_CASE("virtual interface: an event list over member expressions") {
-    SUBCASE("a member expression and a signal, in either order") {
+    SUBCASE("two member terms, in either order") {
         const std::string out = run_capture(R"(
             interface ifc; logic a = 0, b = 0, c = 0; endinterface
             module top;
               ifc i();
               virtual ifc vi;
-              logic d = 0;
               string x1, x2;
               initial begin
                 vi = i;
                 fork
-                  forever begin @(vi.a & vi.b or d) x1 = {x1, $sformatf("%0t ", $time)}; end
-                  forever begin @(d or vi.a & vi.b) x2 = {x2, $sformatf("%0t ", $time)}; end
+                  forever begin @(vi.a & vi.b or vi.c) x1 = {x1, $sformatf("%0t ", $time)}; end
+                  forever begin @(vi.c or vi.a & vi.b) x2 = {x2, $sformatf("%0t ", $time)}; end
                 join_none
                 #1 i.a = 1;
                 #1 i.b = 1;
-                #1 d = 1;
+                #1 i.c = 1;
                 #1 i.a = 0;
                 #1 i.a = 1;
                 #1 i.c = 1;
-                #1 d = 1;
-                #1 d = 0;
+                #1 i.c = 0;
                 #1 $display("x1: %s", x1);
                 $display("x2: %s", x2);
               end
             endmodule
         )");
-        CHECK(out == "x1: 2 3 4 5 8 \nx2: 2 3 4 5 8 \n");
+        CHECK(out == "x1: 2 3 4 5 7 \nx2: 2 3 4 5 7 \n");
     }
-    SUBCASE("a member expression, a class property and a signal") {
+    SUBCASE("a member expression and a class property") {
         const std::string out = run_capture(R"(
             interface ifc; logic a = 0, b = 0; endinterface
             typedef struct { int f; } s_t;
@@ -611,23 +609,21 @@ TEST_CASE("virtual interface: an event list over member expressions") {
               ifc i();
               virtual ifc vi = i;
               C obj = new;
-              logic d = 0;
               string log;
               initial begin
                 fork
-                  forever begin @(vi.a & vi.b or obj.s.f or d) log = {log, $sformatf("%0t ", $time)}; end
+                  forever begin @(vi.a & vi.b or obj.s.f) log = {log, $sformatf("%0t ", $time)}; end
                 join_none
                 #1 i.a = 1;
                 #1 i.b = 1;
                 #1 obj.s.f = 1;
-                #1 d = 1;
                 #1 i.b = 0;
                 #1 obj.s.f = 1;
                 #1 $display("%s", log);
               end
             endmodule
         )");
-        CHECK(out == "2 3 4 5 \n");
+        CHECK(out == "2 3 4 \n");
     }
 }
 
@@ -637,24 +633,23 @@ TEST_CASE("virtual interface: an event list over member expressions") {
 // `iff`. Before: refused.
 TEST_CASE("virtual interface: an edge or an iff on a term of an event list") {
     const std::string out = run_capture(R"(
-        interface ifc; logic a = 0, b = 0, en = 0; endinterface
+        interface ifc; logic a = 0, b = 0, en = 0, c = 1; endinterface
         module top;
           ifc i();
           virtual ifc vi;
-          logic d = 1;
           string log;
           initial begin
             vi = i;
             fork
-              forever begin @(posedge (vi.a & vi.b) iff vi.en or negedge d) log = {log, $sformatf("%0t ", $time)}; end
+              forever begin @(posedge (vi.a & vi.b) iff vi.en or negedge vi.c) log = {log, $sformatf("%0t ", $time)}; end
             join_none
             #1 i.a = 1;
             #1 i.b = 1;
             #1 i.a = 0;
             #1 i.en = 1;
             #1 i.a = 1;
-            #1 d = 0;
-            #1 d = 1;
+            #1 i.c = 0;
+            #1 i.c = 1;
             #1 i.a = 0;
             #1 i.a = 1;
             #1 $display("%s", log);
@@ -665,9 +660,8 @@ TEST_CASE("virtual interface: an edge or an iff on a term of an event list") {
 }
 
 // A process's own sensitivity list over members cannot be a static subscription either: it
-// names an instance only once the handle is read, so it stays in the body as a loop. Each
-// term is a member by itself here, so the edges are those of the members. LRM-derived.
-// Before: refused.
+// names an instance only once the handle is read, so it stays in the body. Each term is a
+// member by itself here, so the edges are those of the members. LRM-derived. Before: refused.
 TEST_CASE("virtual interface: a process's sensitivity list over members") {
     const std::string out = run_capture(R"(
         interface ifc; logic clk = 0, rst_n = 1; endinterface
@@ -718,16 +712,15 @@ TEST_CASE("virtual interface: the members of two handles in one expression park 
     }
     SUBCASE("a list") {
         const std::string out = run_capture(R"(
-            interface ifc; logic a = 0; endinterface
+            interface ifc; logic a = 0, b = 0; endinterface
             module top;
               ifc i0(), i1();
               virtual ifc v0 = i0, v1 = i1;
-              logic d = 0;
               string ex;
               initial begin
                 i0.a = 1;
                 fork
-                  begin @(v0.a & v1.a or d) ex = $sformatf("list at %0t", $time); end
+                  begin @(v0.a & v1.a or v0.b) ex = $sformatf("list at %0t", $time); end
                 join_none
                 #1 i1.a = 1;
                 #1 $display("%s", ex);
@@ -747,10 +740,9 @@ TEST_CASE("virtual interface: a null handle in an event list term is a located f
                                      "module top;\n"
                                      "    ifc i();\n"
                                      "    virtual ifc vi;\n"
-                                     "    logic d = 0;\n"
                                      "    initial begin\n"
                                      "        $display(\"before\");\n"
-                                     "        #1 @(vi.a & vi.b or d);\n"
+                                     "        #1 @(vi.a & vi.b or vi.a);\n"
                                      "        $display(\"UNREACHABLE\");\n"
                                      "    end\n"
                                      "endmodule\n";
@@ -761,7 +753,24 @@ TEST_CASE("virtual interface: a null handle in an event list term is a located f
     CHECK(test::design_exit_code(run) != 0);
     CHECK(run.err.find("fatal: use of a null virtual interface") != std::string::npos);
     CHECK(run.err.find("the handle names no interface instance at 1 s") != std::string::npos);
-    CHECK(run.err.find("source:8:14") != std::string::npos);
+    CHECK(run.err.find("source:7:14") != std::string::npos);
+}
+
+// Refused for now (docs/TODO.md): a list mixing a virtual-interface member expression with a
+// signal or an event, and `->> @(m) e` / `x <= @(m) y` over a member. Both used to be
+// accepted: the list never woke on the member, the others never woke at all.
+TEST_CASE("virtual interface: a member mixed with a signal in a list, or over a detached control, is refused") {
+    const std::string decls = "interface ifc; logic a, b; endinterface\n"
+                              "module top; ifc i(); virtual ifc vi = i; logic d; event e; int x, y;\n";
+    const auto refused = [&](std::string_view body, std::string_view message) {
+        const LowerResult r = lower_text(decls + "initial begin " + std::string(body) + " end endmodule");
+        INFO(body);
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find(message) != std::string::npos);
+    };
+    refused("@(vi.a & vi.b or d);", "an event list mixing a class-property or virtual-interface member");
+    refused("->> @(vi.a) e;", "over a class-property or virtual-interface member is not supported yet");
+    refused("x <= @(vi.a & vi.b) y;", "over a class-property or virtual-interface member is not supported yet");
 }
 
 // Table 9-2 on the least significant bit of a member expression, x and z included: a

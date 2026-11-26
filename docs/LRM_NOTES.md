@@ -775,16 +775,18 @@ expression. However, an edge event shall be detected only on the LSB of the expr
 "This type of expression is evaluated when a changes and not when enable changes." A term
 that reaches a class property or a virtual-interface member names its storage only once its
 handle is read, so the wait cannot be a static subscription or a net driven from time zero.
-Clotho waits in a loop that samples every term of the list, parks on everything the terms
-read (a member's waiter list in the instance a handle names, a property's any-change
-notifier in the object, a signal's bucket, an event's object) and, on each wake, compares
+Clotho waits in a loop that samples every term of a list made only of such terms, parks on
+everything the terms read (a member's waiter list in the instance a handle names, a
+property's any-change notifier in the object, a signal's bucket) and, on each wake, compares
 every term with its sample: a change of value, or for `posedge`, `negedge` and `edge` the
 Table 9-2 edge of bit 0, with the term's own `iff` evaluated at that point. The list resumes
-when any term fires. A wake does not say which source woke it, so the terms that could be
-waited on exactly are tested the same way, and a change that reverts before the waiter runs
-is missed (docs/design/scheduler-rules.md R9; R8 for a plain signal's edge). An event term
-counts `e.triggered` against the tick of the last trigger it counted, so a trigger earlier
-in the step the wait began in is no occurrence of it and a second one in that step is missed.
+when any term fires. A wake does not say which source woke it, so a change that reverts
+before the waiter runs is missed (docs/design/scheduler-rules.md R9). That is why a list
+mixing such a term with a signal or an event is refused for now: the signal's and the event's
+own waits catch what the comparison loses (a pulse that reverts, a second trigger in the step
+the wait began in), and keeping that needs a per-registration fired marker in the wait node.
+`->> @(m) e` and `x <= @(m) y` over such a member are refused for the same reason: they
+register a detached subscription on a signal and edge.
 
 8.4 makes an access through a null object handle illegal, with an indeterminate result that
 "implementations may issue an error", and 25.9 says "Attempting to use a null virtual

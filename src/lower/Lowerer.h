@@ -198,6 +198,10 @@ bool event_term_needs_loop(const Expression& e);
 // The same for a whole event control: true when any term of it, in a list or alone, does.
 bool control_needs_loop(const TimingControl& tc);
 
+// Whether an event term reads a non-static class property or a virtual-interface member
+// (an event is not one: it has its own wait object).
+bool event_term_reads_member(const Expression& e);
+
 // The terms of an event control in source order: its one term, or every term of its list.
 void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out);
 
@@ -2409,6 +2413,8 @@ private:
                                std::vector<ir::WaitEvent>&            out);
 
     void refuse_container_event_control(const SignalEventControl& ev);
+
+    void refuse_detached_member_event(const TimingControl& tc);
 
     ir::Index prop_notifier_handle(const Expression&                      e,
                                    const slang::ast::ClassPropertySymbol& prop,

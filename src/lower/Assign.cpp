@@ -1626,6 +1626,7 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_event(const Assign
     if (!is_event_control(*evt)) {
         fail("nonblocking intra-assignment requires a delay or event control");
     }
+    refuse_detached_member_event(*evt);
     std::vector<ir::WaitEvent> events;
     if (collect_wait_events(*evt, events) != nullptr) {
         // TODO: `iff` on a nonblocking intra-assignment event trigger —
