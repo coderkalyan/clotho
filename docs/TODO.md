@@ -130,6 +130,9 @@ Milestones, in order; lower ones unblock higher ones:
     change notifier.
   - [ ] **`process::status()` in the expression** (9.7) — a thread's state has no
     change notifier.
+  - [ ] **`wait` or `@` on a covergroup-handle class property** (9.4.2, 9.4.3) — it has no
+    change notifier: refused when nothing else wakes the wait, never woken by it otherwise
+    (`wait (c.h != null)`).
 - [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
   multi-top design binds such a body at the first top, so the wait stays never-bound.
 - [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
@@ -238,6 +241,10 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **`$fgets`, `$sformat`, `$swrite` and `$ferror` into a part-select or non-byte-multiple
   target** (21.3) — refused.
 - [ ] **`$fread` into a part-select** (21.3.4.4) — refused.
+- [ ] **`$readmemb` / `$readmemh` / `$fread` into an array of dynamic arrays, queues or
+  associative arrays** (21.4, 21.3.4.4) — refused.
+- [ ] **`$fread` into an unpacked struct** (21.3.4.4) — members load in declaration order; a
+  struct target and an array of structs are refused.
 - [~] **`$fscanf` / `$sscanf`** (21.3.4.3) — missing pieces:
   - [ ] **Bit-select or part-select target** — `$sscanf(s, "%h", v[7:0])` is refused.
   - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination**.
@@ -551,7 +558,8 @@ Milestones, in order; lower ones unblock higher ones:
     one trigger; only `nexttime[n]` and `always [m:n]` operands lower.
   - [ ] **Non-packed sampled variable** (16.5, 16.6) — aggregate, container, string and
     event operands of an assertion expression are refused.
-  - [ ] **Abort operator below `not`** (16.12.14) — `not accept_on(c) p` is refused.
+  - [ ] **Abort operator below `not`, a property `and`, `always [m:n]` or a followed-by**
+    (16.12.14) — `not accept_on(c) p` and `accept_on(c) p and q` are refused.
   - [ ] **`first_match` past the automaton state limit** (16.9.8) — its operand is
     determinised, so a large one is refused.
   - [ ] **`case` property over a non-integral selector or label** (16.12.16) — refused.
@@ -627,6 +635,9 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
     `max(at_least)` across instances; `option.get_inst_coverage` then decides what
     `get_inst_coverage()` returns.
+  - [ ] **Procedural read or assignment of `type_option`** (19.7.1) — through a handle it is
+    refused; `gc::type_option.w` and `gc::cp::type_option.w` are accepted but always read 0 and
+    a write to them is dropped.
 - [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
   floats.
 - [ ] **`covergroup extends`** (19.4.1) — slang hides an inherited coverpoint behind a
