@@ -4,6 +4,9 @@
 
 #include <slang/diagnostics/AllDiags.h>
 #include <slang/diagnostics/JsonDiagnosticClient.h>
+#include <slang/parsing/Lexer.h>
+#include <slang/parsing/Parser.h>
+#include <slang/parsing/Preprocessor.h>
 
 #include "ir/Verify.h"
 namespace clotho {
@@ -867,10 +870,15 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     // first reference anywhere under any top, which can precede the `@` that needs
     // the notifier. A design that waits on no property gets an empty table and every
     // class body, every store and every descriptor stays byte-identical.
-    WaitedProps  waited_props;
+    WaitedProps waited_props;
+    // What a virtual call can run, for the scan to follow one (CalleeReadScan).
+    collect_method_overrides(comp, root, waited_props.overrides);
     WaitPropScan wait_prop_scan;
     wait_prop_scan.out = &waited_props;
     root.visit(wait_prop_scan);
+    // The design-wide change notifiers the scan asked for: declared by `globals`
+    // below, read by every Lowerer.
+    SharedNotifiers shared_notifiers;
     UnitOwners unit_owners;
     ForeignCalls foreign_calls;
     // Every variable a force / procedural assign targets, before anything lowers:
@@ -888,6 +896,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_vif_defs(&vif_defs);
         globals.set_pca_targets(&pca_targets);
         globals.set_waited_props(&waited_props);
+        globals.set_shared_notifiers(&shared_notifiers);
         globals.set_unit_owners(&unit_owners);
         globals.set_foreign_calls(&foreign_calls);
         globals.lower_globals(comp, root);
@@ -904,6 +913,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_pca_targets(&pca_targets);
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
+            lw.set_shared_notifiers(&shared_notifiers);
             lw.set_unit_owners(&unit_owners);
             lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);
@@ -1320,6 +1330,31 @@ void twin_check_design(slang::ast::Compilation& comp, ir::SystemAccess allow_sys
     }
 }
 
+// The language version of a design whose command line names none: IEEE 1800-2023,
+// the standard Clotho implements (docs/TODO.md). slang's own default is 1800-2017,
+// under which a 2023 construct such as std::weak_reference is an error.
+constexpr slang::LanguageVersion kLanguageVersion = slang::LanguageVersion::v1800_2023;
+
+// The options of an entry point that has no Driver to build them, as a Driver
+// with no `--std` builds them here.
+slang::Bag source_options(slang::bitmask<slang::ast::CompilationFlags> flags = slang::ast::CompilationFlags::None) {
+    slang::parsing::PreprocessorOptions pre;
+    pre.languageVersion = kLanguageVersion;
+    slang::parsing::LexerOptions lex;
+    lex.languageVersion = kLanguageVersion;
+    slang::parsing::ParserOptions parse;
+    parse.languageVersion = kLanguageVersion;
+    slang::ast::CompilationOptions comp;
+    comp.languageVersion = kLanguageVersion;
+    comp.flags |= flags;
+    slang::Bag options;
+    options.set(pre);
+    options.set(lex);
+    options.set(parse);
+    options.set(comp);
+    return options;
+}
+
 } // namespace
 
 LowerResult lower_files(std::span<const std::string_view> paths,
@@ -1341,9 +1376,10 @@ LowerResult lower_files(std::span<const std::string_view> paths,
     // `comp` stays on the stack: it holds the syntax trees, which reference the
     // manager, so it must die BEFORE the context that owns the manager. Returning
     // from this function destroys it first, which is the order we need.
-    slang::ast::Compilation comp;
+    const slang::Bag        options = source_options();
+    slang::ast::Compilation comp(options);
     for (const std::string_view path : paths) {
-        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm_ref);
+        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm_ref, options);
         if (!tree) {
             LowerResult result;
             result.sources = ctx;
@@ -1386,6 +1422,10 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     auto ctx = std::make_shared<SourceContext>();
     ctx->set_path_prefix_map(std::move(path_prefix_map));
     slang::driver::Driver& dr  = *driver;
+
+    // `--std` overrides this in processOptions; without it slang would take its own
+    // default.
+    dr.languageVersion = kLanguageVersion;
 
     LowerResult result;
     if (!dr.processOptions()) {
@@ -1498,9 +1538,10 @@ LowerResult lower_text(std::string_view source,
     // there is nothing to own here — the context borrows it. The Compilation is
     // still adopted so its syntax trees outlive the call alongside it.
     auto                     ctx  = std::make_shared<SourceContext>();
-    auto                     comp = std::make_unique<slang::ast::Compilation>();
-    slang::ast::Compilation& cr   = *comp;
-    cr.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source));
+    const slang::Bag         options = source_options();
+    auto                     comp    = std::make_unique<slang::ast::Compilation>(options);
+    slang::ast::Compilation& cr      = *comp;
+    cr.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source, options));
     ctx->borrow_source_manager(cr.getSourceManager());
     ctx->adopt_compilation(std::move(comp));
     if (timings != nullptr) {
@@ -1539,10 +1580,7 @@ LowerResult lower_buffer(std::string_view path,
     // code -- which silently deletes the whole unused/unassigned family, the
     // findings an editor most wants. Measured: with LintMode, `wire [2:0] foo`
     // assigned and never read reported nothing at all.
-    slang::ast::CompilationOptions copts;
-    copts.flags |= slang::ast::CompilationFlags::IgnoreUnknownModules;
-    slang::Bag options;
-    options.set(copts);
+    const slang::Bag options = source_options(slang::ast::CompilationFlags::IgnoreUnknownModules);
 
     auto                     comp = std::make_unique<slang::ast::Compilation>(options);
     slang::ast::Compilation& cr   = *comp;

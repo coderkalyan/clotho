@@ -238,6 +238,14 @@ bool is_weak_reference_class(const slang::ast::ClassType& clt) {
     return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
 }
 
+bool is_sync_builtin_class(const slang::ast::ClassType& clt) {
+    if (clt.name != "semaphore" && clt.name != "mailbox") {
+        return false;
+    }
+    const slang::ast::Scope* pkg = clt.getParentScope();
+    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+}
+
 const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt) {
     // Bounded by the inheritance depth, which slang has already found finite.
     for (const slang::ast::ClassType* k = &clt; k != nullptr;) {
@@ -382,7 +390,222 @@ bool WaitedProps::is_container(const slang::ast::ClassPropertySymbol& prop) cons
     return it != props.end() && it->second.container;
 }
 
+void WaitedProps::add_shared(const slang::ast::Symbol& sym) {
+    if (shared.insert(&sym).second) {
+        shared_order.push_back(&sym);
+    }
+}
+
+// The methods a call bound to each virtual or interface-class method can run.
+// Every class of the design is looked at, a specialization named by nothing but a
+// typedef included (collect_class_types).
+void collect_method_overrides(const slang::ast::Compilation& comp,
+                              const slang::ast::RootSymbol&  root,
+                              MethodOverrides&               out) {
+    std::vector<const ClassType*> classes;
+    for (const PackageSymbol* pkg : comp.getPackages()) {
+        collect_class_types(*pkg, classes);
+    }
+    for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+        collect_class_types(*unit, classes);
+    }
+    for (const InstanceSymbol* top : root.topInstances) {
+        collect_class_types(top->body, classes);
+    }
+    // A method of `cls` by name, its own or inherited. Bounded by the inheritance
+    // depth, which slang has found finite.
+    const auto method_named = [](const ClassType& cls, std::string_view name) -> const SubroutineSymbol* {
+        for (const ClassType* k = &cls; k != nullptr;) {
+            if (const slang::ast::Symbol* m = k->find(name); m != nullptr) {
+                if (m->kind == SymbolKind::Subroutine) {
+                    return &m->as<SubroutineSymbol>();
+                }
+                if (m->kind == SymbolKind::MethodPrototype) {
+                    return m->as<slang::ast::MethodPrototypeSymbol>().getSubroutine();
+                }
+            }
+            const slang::ast::Type* base = k->getBaseClass();
+            k                            = base != nullptr ? base->getCanonicalType().as_if<ClassType>() : nullptr;
+        }
+        return nullptr;
+    };
+    const auto add = [&](const SubroutineSymbol& key, const SubroutineSymbol& impl) {
+        std::vector<const SubroutineSymbol*>& list = out.of[&key];
+        if (&key != &impl && std::ranges::find(list, &impl) == list.end()) {
+            list.push_back(&impl);
+        }
+    };
+    const auto method_of = [](const slang::ast::Symbol& m) -> const SubroutineSymbol* {
+        if (m.kind == SymbolKind::Subroutine) {
+            return &m.as<SubroutineSymbol>();
+        }
+        if (m.kind == SymbolKind::MethodPrototype) {
+            return m.as<slang::ast::MethodPrototypeSymbol>().getSubroutine();
+        }
+        return nullptr;
+    };
+    for (const ClassType* cls : classes) {
+        for (const slang::ast::Symbol& m : cls->members()) {
+            const SubroutineSymbol* sub = method_of(m);
+            if (sub == nullptr) {
+                continue;
+            }
+            if (const SubroutineSymbol* base = sub->getOverride(); base != nullptr) {
+                add(*base, *sub);
+            }
+        }
+        if (cls->isInterface) {
+            continue;
+        }
+        // A call through an interface class handle runs the implementing class's
+        // method of that name (LRM 8.26), which overrides nothing.
+        for (const slang::ast::Type* iface : cls->getImplementedInterfaces()) {
+            const ClassType* ic = iface->getCanonicalType().as_if<ClassType>();
+            if (ic == nullptr) {
+                continue;
+            }
+            for (const slang::ast::Symbol& m : ic->members()) {
+                const SubroutineSymbol* proto = method_of(m);
+                if (proto == nullptr) {
+                    continue;
+                }
+                if (const SubroutineSymbol* impl = method_named(*cls, proto->name); impl != nullptr) {
+                    add(*proto, *impl);
+                }
+            }
+        }
+    }
+}
+
+void CalleeReadScan::take(const slang::ast::Symbol& sym) {
+    if (depth == 0 || !seen.insert(&sym).second) {
+        return;
+    }
+    if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>();
+        prop != nullptr && prop->lifetime != slang::ast::VariableLifetime::Static) {
+        out->props.push_back(prop);
+        return;
+    }
+    if (ValueSymbol::isKind(sym.kind) && sym.kind != SymbolKind::Parameter && sym.kind != SymbolKind::Specparam) {
+        out->values.push_back(&sym.as<ValueSymbol>());
+    }
+}
+
+void CalleeReadScan::enter(const SubroutineSymbol& sub) {
+    if (!entered.insert(&sub).second) {
+        return;
+    }
+    // A DPI import and a pure virtual prototype have no body here. What a DPI import
+    // reads is not SystemVerilog state.
+    if (sub.subroutineKind == SubroutineKind::Function &&
+        !sub.flags.has(slang::ast::MethodFlags::DPIImport | slang::ast::MethodFlags::Pure)) {
+        ++depth;
+        sub.getBody().visit(*this);
+        --depth;
+    }
+    if (overrides == nullptr) {
+        return;
+    }
+    if (const auto it = overrides->of.find(&sub); it != overrides->of.end()) {
+        for (const SubroutineSymbol* impl : it->second) {
+            enter(*impl);
+        }
+    }
+}
+
+void CalleeReadScan::handle(const CallExpression& call) {
+    // The receiver and the arguments belong to the expression the call sits in.
+    visitDefault(call);
+    if (call.isSystemCall() || call.subroutine.index() != 0) {
+        return;
+    }
+    const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+    if (!sub.flags.has(slang::ast::MethodFlags::Static) &&
+        (call.thisClass() != nullptr ? call.thisClass()->type->getCanonicalType().isClass() : sub.thisVar != nullptr)) {
+        out->method_call = true;
+    }
+    if (!sub.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+        enter(sub);
+        return;
+    }
+    const slang::ast::Scope* owner = sub.getParentScope();
+    if (owner == nullptr || owner->asSymbol().kind != SymbolKind::ClassType) {
+        return;
+    }
+    const ClassType& cls = owner->asSymbol().as<ClassType>();
+    // `put`, `get` and `peek` are tasks and cannot be in an expression; every
+    // function of the two classes reads the FIFO or the key count.
+    const bool sync = is_sync_builtin_class(cls);
+    const bool weak = depth != 0 && sub.name == "get" && is_weak_reference_class(cls);
+    if ((sync || weak) && seen.insert(&cls).second) {
+        out->builtins.push_back(&cls);
+    }
+}
+
+void CalleeReadScan::handle(const slang::ast::NamedValueExpression& e) {
+    take(e.symbol);
+}
+
+void CalleeReadScan::handle(const slang::ast::HierarchicalValueExpression& e) {
+    take(e.symbol);
+}
+
+void CalleeReadScan::handle(const MemberAccessExpression& ma) {
+    take(ma.member);
+    visitDefault(ma);
+}
+
+CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides) {
+    CalleeReads    reads;
+    CalleeReadScan scan;
+    scan.out       = &reads;
+    scan.overrides = &overrides;
+    e.visit(scan);
+    return reads;
+}
+
+// The design-wide notifiers `e` needs: one per instance property and per built-in
+// class that a subroutine it calls reads.
+void WaitPropScan::note_callees(const Expression& e) {
+    const CalleeReads reads = callee_reads(e, out->overrides);
+    for (const slang::ast::ClassPropertySymbol* prop : reads.props) {
+        // A property of a type that has no notifier (an unpacked struct or union,
+        // a fixed unpacked array) has no design-wide one either.
+        if (box_can_notify(prop->getType())) {
+            out->add_shared(*prop);
+        }
+    }
+    for (const ClassType* cls : reads.builtins) {
+        out->add_shared(*cls);
+    }
+}
+
 void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
+    note_callees(ev.expr);
+    // A sampled event control (Lowerer::lower_sampled_event_wait) parks as a wait
+    // does: on the any-change notifier of each property its expression reads, of
+    // each fork-captured automatic, and of each weak reference it reads get() of.
+    // Which controls are sampled is the lowering's to say, with what this pass has
+    // not got; a notifier laid out for one that is not is a field nothing parks on.
+    if (waited_class_prop(ev.expr) == nullptr && weak_get_call(ev.expr) == nullptr) {
+        ClassPropReadScan scan;
+        ev.expr.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
+        }
+        for (const CallExpression* get : scan.weak_gets) {
+            out->weak_classes.insert(
+              &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
+        }
+        WaitLocalScan locals;
+        locals.out = &out->locals;
+        ev.expr.visit(locals);
+    }
     if (const auto* prop = waited_class_prop(ev.expr); prop != nullptr) {
         // An edge on a property whose type has no LSB lattice mints no notifier.
         // slang rejects such a design outright ("expression type 'T' is not
@@ -426,6 +649,7 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
 }
 
 void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
+    note_callees(w.cond);
     // A level wait re-tests its condition on every wake, so any change in any
     // property the condition reads is enough: the any-change notifier only.
     ClassPropReadScan scan;

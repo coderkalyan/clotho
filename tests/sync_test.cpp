@@ -792,3 +792,135 @@ TEST_CASE("mailbox: an event message is the handle that was put") {
     )");
     CHECK(out == "same=1 num=0\nwoke=1\n");
 }
+
+// -- derivation (LRM 8.13 over 15.3 and 15.4) ------------------------------------
+
+// A class derived from `mailbox #(T)` is a mailbox with more in it: the built-in
+// methods reach the same FIFO through a handle of either class, unqualified and
+// through `super` from the derived class's own methods. A method of the same name
+// hides the built-in one for a derived-typed handle and not for a base-typed one,
+// since none of the built-in methods is virtual.
+TEST_CASE("mailbox: a derived class is a mailbox, through either handle") {
+    const std::string out = run_capture(R"(
+        module t;
+          class Counted extends mailbox #(int);
+            int    puts;
+            string name;
+            function new(string name, int bound = 0);
+              super.new(bound);
+              this.name = name;
+            endfunction
+            task put(int v);
+              puts++;
+              super.put(v);
+            endtask
+            function int pending();
+              return num();
+            endfunction
+          endclass
+          class Plain extends mailbox #(int);
+          endclass
+          Counted        c, back;
+          Plain          p;
+          mailbox #(int) base;
+          int            v, held, ok;
+          initial begin
+            c = new("c", 2);
+            c.put(10);
+            c.put(11);
+            base = c;
+            $display("%s %0d %0d %0d", c.name, c.puts, c.pending(), base.num());
+            $display("%0d", base.try_put(12));
+            fork
+              begin
+                #5 base.get(v);
+                $display("got %0d at %0t", v, $time);
+              end
+            join_none
+            c.put(13);
+            $display("put done at %0t puts=%0d num=%0d", $time, c.puts, c.num());
+            base.put(14);
+            $display("blocked put done at %0t", $time);
+          end
+          initial begin
+            #8 base.get(v);
+            #1 p = new;
+            held = p.num();
+            ok   = p.try_put(1);
+            $display("%0d %0d %0d", held, ok, p.num());
+            ok = $cast(back, base);
+            $display("%0d %s", ok, back.name);
+          end
+        endmodule
+    )");
+    CHECK(out == "c 2 2 2\n0\ngot 10 at 5\nput done at 5 puts=3 num=2\n"
+                 "blocked put done at 8\n0 1 1\n1 c\n");
+}
+
+// The same for `semaphore`. `Gate::get` hides the built-in `get` and reaches it
+// through `super`; `grab` calls a built-in method on `this` with no receiver named.
+TEST_CASE("semaphore: a derived class is a semaphore, through either handle") {
+    const std::string out = run_capture(R"(
+        module t;
+          class Gate extends semaphore;
+            int taken;
+            function new(int keys);
+              super.new(keys);
+            endfunction
+            task get(int n = 1);
+              taken += n;
+              super.get(n);
+            endtask
+            function int grab();
+              return try_get(1);
+            endfunction
+          endclass
+          class Open extends semaphore;
+          endclass
+          Gate      g;
+          Open      o;
+          semaphore s;
+          int       first, second;
+          initial begin
+            g = new(2);
+            s = g;
+            g.get(1);
+            first  = g.grab();
+            second = g.grab();
+            $display("%0d %0d %0d", g.taken, first, second);
+            fork
+              #3 s.put(2);
+            join_none
+            g.get(2);
+            $display("got 2 at %0t taken=%0d", $time, g.taken);
+            o = new;
+            $display("%0d", o.try_get(1));
+            o.put(1);
+            $display("%0d", o.try_get(1));
+          end
+        endmodule
+    )");
+    CHECK(out == "1 1 0\ngot 2 at 3 taken=3\n0\n1\n");
+}
+
+// The bound a derived class hands to `super.new` is checked like any other.
+TEST_CASE("mailbox: a negative bound from a derived class's constructor is a located fatal") {
+    const char* src = "module t;\n"
+                      "  class Box extends mailbox #(int);\n"
+                      "    function new(int bound);\n"
+                      "      super.new(bound);\n"
+                      "    endfunction\n"
+                      "  endclass\n"
+                      "  Box b;\n"
+                      "  initial begin\n"
+                      "    $display(\"before\");\n"
+                      "    b = new(-2);\n"
+                      "    $display(\"after\");\n"
+                      "  end\n"
+                      "endmodule\n";
+    const test::DesignRun run = test::run_design_captured(src);
+    CHECK(run.out.find("before") != std::string::npos);
+    CHECK(run.out.find("after") == std::string::npos);
+    CHECK(run.err.find("mailbox bound is negative") != std::string::npos);
+    CHECK(run.err.find(":4:") != std::string::npos);
+}

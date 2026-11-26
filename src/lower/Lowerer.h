@@ -183,6 +183,9 @@ bool is_weak_reference_class(const slang::ast::ClassType& clt);
 
 const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& clt);
 
+// Whether `clt` is `std::semaphore` or a `std::mailbox #(T)` (LRM 15.3, 15.4).
+bool is_sync_builtin_class(const slang::ast::ClassType& clt);
+
 // Whether `sub` is one of weak_reference's four built-in methods.
 bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 
@@ -232,6 +235,61 @@ struct WaitLocalScan : slang::ast::ASTVisitor<WaitLocalScan, VisitFlags::AllGood
     void handle(const slang::ast::HierarchicalValueExpression& e);
 };
 
+// The methods that override each virtual method of the design, and the methods that
+// implement each method of an interface class: what a call bound to the key can run
+// (LRM 8.20, 8.26). One step only; the override of an override is under its own key.
+struct MethodOverrides {
+    ankerl::unordered_dense::map<const SubroutineSymbol*, std::vector<const SubroutineSymbol*>> of;
+};
+
+void collect_method_overrides(const slang::ast::Compilation& comp,
+                              const slang::ast::RootSymbol&  root,
+                              MethodOverrides&               out);
+
+// What an `@` or `wait` expression depends on through the subroutines it calls. LRM
+// 9.4.2: "Changing the value of object data members, aggregate elements, or the size
+// of a dynamically sized array referenced by a method or function shall cause the
+// event expression to be reevaluated." The body of each function the expression
+// calls is walked, and of each function those call, and for a virtual method the
+// bodies of every method that can stand in for it.
+struct CalleeReads {
+    // Instance class properties named in a callee body. The body can reach them
+    // through any object, so each is waited on by its design-wide notifier
+    // (ir::ChangeNotify::shared), not by an object's.
+    std::vector<const slang::ast::ClassPropertySymbol*> props;
+    // The built-in classes whose own state a built-in method reads: `mailbox #(T)`
+    // (num, try_get, try_peek, try_put), `semaphore` (try_get), and in a callee body
+    // `weak_reference #(T)` (get; at the top of the expression that one has the weak
+    // reference's own notifier, weak_get_call).
+    std::vector<const slang::ast::ClassType*> builtins;
+    // Every other value a callee body names: a static property, a module or package
+    // variable. Those that are signals are waited on as signals.
+    std::vector<const slang::ast::ValueSymbol*> values;
+    // The expression calls a method on an object, at its top or in a callee. Such an
+    // expression cannot be evaluated outside the process that waits on it.
+    bool method_call = false;
+};
+
+struct CalleeReadScan : slang::ast::ASTVisitor<CalleeReadScan, VisitFlags::AllGood> {
+    CalleeReads*           out       = nullptr;
+    const MethodOverrides* overrides = nullptr;
+    // 0 in the expression itself, one more in each callee body.
+    uint32_t depth = 0;
+    // Bodies walked, so that one is walked once and recursion ends.
+    ankerl::unordered_dense::set<const SubroutineSymbol*>   entered;
+    ankerl::unordered_dense::set<const slang::ast::Symbol*> seen;
+
+    void enter(const SubroutineSymbol& sub);
+    void take(const slang::ast::Symbol& sym);
+
+    void handle(const CallExpression& call);
+    void handle(const slang::ast::NamedValueExpression& e);
+    void handle(const slang::ast::HierarchicalValueExpression& e);
+    void handle(const MemberAccessExpression& ma);
+};
+
+CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides);
+
 // Which (class property, edge) pairs the whole design waits on. Design-wide because
 // a class's object body must carry the notifiers BEFORE it is laid out, and
 // lower_class_type runs on demand from the first reference under any top -- which
@@ -255,6 +313,15 @@ struct WaitedProps {
     // The `std::weak_reference` specializations whose `get()` some `@` or `wait`
     // reads. Each lays out a change notifier beside its referent.
     ankerl::unordered_dense::set<const slang::ast::ClassType*> weak_classes;
+    // The instance properties and built-in classes some `@` or `wait` reaches through
+    // a subroutine it calls (CalleeReads::props, ::builtins). Each has a design-wide
+    // notifier, numbered in the order met, which is `shared_order`.
+    std::vector<const slang::ast::Symbol*>                  shared_order;
+    ankerl::unordered_dense::set<const slang::ast::Symbol*> shared;
+    // Filled before the scan, which follows virtual calls through it.
+    MethodOverrides overrides;
+
+    void add_shared(const slang::ast::Symbol& sym);
 
     bool waits_local(const slang::ast::ValueSymbol& vs) const;
 
@@ -279,6 +346,19 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
     void handle(const slang::ast::SignalEventControl& ev);
 
     void handle(const slang::ast::WaitStatement& w);
+
+    void note_callees(const Expression& e);
+};
+
+// The design-wide change notifiers (ir::ChangeNotify::shared): one hidden event per
+// entry of WaitedProps::shared_order, declared by the globals Lowerer before any
+// class is laid out and read by every Lowerer.
+struct SharedNotifiers {
+    struct Entry {
+        uint32_t   index = ir::kNoNotify;
+        ir::Signal signal{};
+    };
+    ankerl::unordered_dense::map<const slang::ast::Symbol*, Entry> of;
 };
 
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out);
@@ -1190,6 +1270,12 @@ public:
         waited_props_ = wp;
     }
 
+    // Point this Lowerer at the design-wide change notifiers. The globals Lowerer
+    // fills the table (declare_shared_notifiers); every other one reads it.
+    void set_shared_notifiers(SharedNotifiers* sn) {
+        shared_notifiers_ = sn;
+    }
+
     void set_class_ids(ClassIds* ids) {
         class_ids_ = ids;
     }
@@ -1456,11 +1542,25 @@ private:
 
     ir::Ref lower_semaphore_class(const slang::ast::ClassType& clt);
 
+    void register_sync_notifier(const slang::ast::ClassType& sync, ir::Ref class_ref);
+
     static bool is_sync_method(const slang::ast::SubroutineSymbol& sub);
 
     static bool is_sync_class(const slang::ast::ClassType& clt);
 
     ir::Ref lower_mailbox_class(const slang::ast::ClassType& clt);
+
+    static uint32_t sync_body_fields(const slang::ast::ClassType& sync);
+
+    void push_sync_body(const slang::ast::ClassType& sync, std::vector<ir::FieldRow>& fields);
+
+    void emit_sync_ctor(const slang::ast::ClassType&       sync,
+                        std::span<const Expression* const> actuals,
+                        ir::Index                          handle,
+                        ir::Ref                            class_ref,
+                        slang::SourceLocation              where,
+                        ir::Builder&                       b,
+                        ir::SourceLoc                      l);
 
     ir::Ref lower_weak_class(const slang::ast::ClassType& clt);
 
@@ -1474,7 +1574,7 @@ private:
                         ir::Builder&                       b,
                         ir::SourceLoc                      l);
 
-    std::pair<ir::Index, ir::Ref> weak_receiver(const CallExpression& call, ir::Builder& b);
+    std::pair<ir::Index, ir::Ref> builtin_receiver(const CallExpression& call, ir::Builder& b);
 
     ir::Index weak_notifier_handle(const CallExpression& get, ir::Builder& b);
 
@@ -2419,6 +2519,53 @@ private:
     uint32_t anon_local(ir::Ref type);
 
     void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l);
+
+    // What a process waiting on an expression parks on (LRM 9.4.2, 9.4.3): `wait`'s
+    // condition, and an event expression that is sampled (lower_sampled_event_wait).
+    struct ExprWaitDeps {
+        // Signals, each an any-change wait: those the expression names and those the
+        // subroutines it calls name.
+        std::vector<ir::WaitEvent> reads;
+        // Members read through a virtual interface handle.
+        std::vector<const MemberAccessExpression*> vif_reads;
+        // Class properties the expression names, by kind.
+        ClassPropReadScan props;
+        // Fork-captured automatics it names, each in a box with a notifier.
+        std::vector<const ValueSymbol*> boxed;
+        // A fork-captured automatic it names whose type has no notifier, or null.
+        const ValueSymbol* unnotified_box = nullptr;
+        // The expression names a property of a type with no notifier (an unpacked
+        // struct or union, a fixed unpacked array) and nothing else that can wake a
+        // process waiting on it.
+        bool unwakeable = false;
+    };
+
+    ExprWaitDeps expr_wait_deps(const Expression& e);
+
+    void add_callee_wait_events(const Expression& e, std::vector<ir::WaitEvent>& reads);
+
+    void push_wait_edges(const ExprWaitDeps& deps, ir::Builder& b, ir::SourceLoc l, std::vector<ir::WaitEdge>& edges);
+
+    bool event_expr_sampled(const Expression& e);
+
+    bool event_member_sampled(const SignalEventControl& ev);
+
+    bool event_control_sampled(const TimingControl& tc, std::vector<const SignalEventControl*>* members = nullptr);
+
+    ir::Index sampled_event_hit(ir::Index            old,
+                                ir::Index            cur,
+                                ir::Ref              ty,
+                                slang::ast::EdgeKind edge,
+                                ir::Builder&         b,
+                                ir::SourceLoc        l);
+
+    void lower_sampled_event_wait(std::span<const SignalEventControl* const> members, ir::Builder& b, ir::SourceLoc l);
+
+    void declare_shared_notifiers(const RootSymbol& root);
+
+    const SharedNotifiers::Entry* shared_notifier(const slang::ast::Symbol& sym) const;
+
+    void register_shared_notifier(const slang::ast::Symbol& sym, ir::Ref class_ref, uint32_t field, bool container);
 
     void lower_vif_clocking_drive(const MemberAccessExpression& ma, const AssignmentExpression& a,
                                   ir::Builder& b);
@@ -6071,6 +6218,8 @@ private:
     // Lowerer with no pre-pass -- which then lays out no notifier, so `@p` / `wait(p)`
     // fails loudly rather than parking on nothing.
     const WaitedProps* waited_props_ = nullptr;
+    // The design-wide change notifiers, or null on a standalone Lowerer.
+    SharedNotifiers* shared_notifiers_ = nullptr;
     // (waited-on class property, ir::Edge) -> the object-body field index of its
     // hidden change-notifier event property (ir::ChangeNotify). Filled by
     // lower_class_type at the same time as class_prop_index_, and read by the wait

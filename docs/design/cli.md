@@ -122,7 +122,8 @@ same namespace as slang's `-D`, `-I`, `-y`,
 values both take effect); a name no top-level module has is not reported, so a
 typo simulates the design with its defaults. `--libmap <file>` reads library maps,
 which assign source files to libraries; `-L` sets the library priority order and a
-`config` can name its own.
+`config` can name its own. With no `--std`, the language is IEEE 1800-2023, the
+standard Clotho implements, where slang's own default is 1800-2017.
 
 "both" in the table means `build` and `run`. The options in it that steer code
 generation or what the artifact does when it runs -- `-O`, `--stat`, `--sanitize`,

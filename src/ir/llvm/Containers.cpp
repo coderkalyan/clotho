@@ -508,7 +508,7 @@ void Backend::notify_container_mutation(const LValueInfo& lv) {
     if (!lv.chg->container) {
         return;
     }
-    if (lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
+    if (!lv.chg->wants(Edge::Any)) {
         throw BackendError{ "internal: container change notifier with no any-change field" };
     }
     fire_prop_notifier(lv, Edge::Any);
@@ -546,11 +546,25 @@ void Backend::service_signal_container_mutation(Signal sig) {
 // it is minted by emit_class_body_init at `new`, so the handle is always live
 // and needs no null guard (as a plain `-> e` on a declared event needs none).
 void Backend::fire_prop_notifier(const LValueInfo& lv, Edge edge) {
-    const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)];
-    llvm::Value*   slot =
-      b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
-    llvm::Value* obj = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot));
-    emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
+    if (const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)]; at != kNoNotify) {
+        llvm::Value* slot = b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
+        llvm::Value* obj  = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), slot));
+        emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
+    }
+    if (edge == Edge::Any && lv.chg->shared != kNoNotify) {
+        // The property's design-wide notifier (ir::ChangeNotify::shared): what waits
+        // on it reached the property through a method and re-evaluates on waking.
+        llvm::Value* obj = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), chg_shared_slot(lv.chg->shared)));
+        emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
+    }
+}
+
+llvm::Constant* Backend::chg_shared_slot(uint32_t k) {
+    if (chg_shared_gv_ == nullptr || k >= chg_shared_ty_->getNumElements()) {
+        throw BackendError{ "internal: a design-wide change notifier with no event signal" };
+    }
+    return llvm::ConstantExpr::getInBoundsGetElementPtr(
+      chg_shared_ty_, sym(chg_shared_gv_), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
 }
 
 // Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on
@@ -572,7 +586,7 @@ llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
     if (lv.chg == nullptr && lv.ref_wake_fn == nullptr) {
         return nullptr;
     }
-    if (lv.chg != nullptr && lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
+    if (lv.chg != nullptr && !lv.chg->wants(Edge::Any)) {
         // `@(posedge s)` is refused in the frontend (no LSB lattice, Table 9-2),
         // so a notified string property carries the any-change field and nothing
         // else. A gap means the two sides disagreed.

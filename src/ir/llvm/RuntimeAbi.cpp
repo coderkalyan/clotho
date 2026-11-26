@@ -1363,7 +1363,7 @@ llvm::StructType* Backend::rt_svopen_ty() {
 
 // rt_gc_map (Gc.h):
 // { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize,
-//   i32 weak_referent, i32 weak_notify }.
+//   i32 weak_referent, i32 weak_notify, ptr weak_shared }.
 llvm::StructType* Backend::gc_map_ty() {
     if (gc_map_ty_ == nullptr) {
         gc_map_ty_ = llvm::StructType::create(ctx_,
@@ -1374,7 +1374,8 @@ llvm::StructType* Backend::gc_map_ty() {
                                                 raw_ptr_ty(),
                                                 raw_ptr_ty(),
                                                 b_.getInt32Ty(),
-                                                b_.getInt32Ty() },
+                                                b_.getInt32Ty(),
+                                                raw_ptr_ty() },
                                               "clotho.gcmap");
     }
     return gc_map_ty_;

@@ -222,11 +222,14 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // Owns the composed change-notifier field names; see
     // emit_change_notifier_fields for why the rows cannot hold a temporary.
     std::deque<std::string> chg_names;
-    // A class derived from `std::weak_reference` starts with that class's synthetic
-    // body (push_weak_body), which has no property symbols for the two passes below
-    // to find, so its fields are counted here and pushed ahead of the second pass.
-    const slang::ast::ClassType* weak_root = is_weak_reference_class(*chain.front()) ? chain.front() : nullptr;
-    uint32_t                     idx       = weak_root != nullptr ? weak_body_fields(*weak_root) : 0;
+    // A class derived from a built-in class with a synthetic body
+    // (`std::weak_reference`, `semaphore`, `mailbox`) starts with that body, which
+    // has no property symbols for the two passes below to find, so its fields are
+    // counted here and pushed ahead of the second pass.
+    const slang::ast::ClassType& root      = *chain.front();
+    const bool                   weak_root = is_weak_reference_class(root);
+    const bool                   sync_root = is_sync_class(root);
+    uint32_t idx = weak_root ? weak_body_fields(root) : sync_root ? sync_body_fields(root) : 0;
     ClassRand               rand;
     for (const slang::ast::ClassType* k : chain) {
         if (rand.unsupported.empty() && has_constraint_blocks(*k)) {
@@ -299,8 +302,11 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     }
     class_rand_.emplace(&clt, rand);
 
-    if (weak_root != nullptr) {
-        push_weak_body(*weak_root, ref, fields);
+    if (weak_root) {
+        push_weak_body(root, ref, fields);
+    } else if (sync_root) {
+        push_sync_body(root, fields);
+        register_sync_notifier(root, ref);
     }
     for (const slang::ast::ClassType* k : chain) {
         for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
@@ -346,6 +352,9 @@ uint32_t Lowerer::reserve_change_notifiers(const slang::ast::ClassPropertySymbol
                                            ir::Ref                                class_ref,
                                            uint32_t                               prop_field,
                                            uint32_t                               next) {
+    // The property's design-wide notifier, if a subroutine some wait calls reads
+    // it. It is an event of the design, not a field, so it takes no index.
+    register_shared_notifier(prop, class_ref, prop_field, is_notified_container(prop.getType().getCanonicalType()));
     if (waited_props_ == nullptr || !waited_props_->contains(prop)) {
         return 0;
     }
@@ -975,46 +984,11 @@ ir::Index Lowerer::lower_new_class(const slang::ast::NewClassExpression& nc, ir:
     const ir::Ref   class_ref = lower_type(*nc.type);
     const ir::Index handle    = b.class_new(class_ref, l);
     if (is_sync_class(clt)) {
-        // `semaphore::new(int keyCount = 0)` is a BODYLESS built-in constructor
-        // (LRM 15.3.1): emit_ctor_call would lower slang's empty prototype and
-        // die on an out-of-range formal index, so the argument is stored into the
-        // synthetic body here instead. The rest of the body powers on all-zero,
-        // which is exactly an empty wait queue.
-        const ir::Ref i64 = make_int_type(64, false);
-        ir::Index     arg = b.constant(module_.pool.put_int(i64, 0), l);
+        std::span<const Expression* const> bound;
         if (const Expression* cc = nc.constructorCall()) {
-            const CallExpression& call = cc->as<CallExpression>();
-            if (call.arguments().size() == 1) {
-                const Expression& a = *call.arguments()[0];
-                // coerce, not resize: the actual is a signed `int`, and a
-                // negative bound / key count must sign-extend to be seen as one.
-                arg = coerce(lower_expr(a, b), *a.type, i64, b, l);
-            }
+            bound = cc->as<CallExpression>().arguments();
         }
-        const bool is_mbx = clt.name == "mailbox";
-        if (is_mbx) {
-            // LRM 15.4.1: "The bound shall be positive. Negative bounds are
-            // illegal and can result in indeterminate behavior, but
-            // implementations can issue a warning." Clotho never silently
-            // accepts, so it reports -- at run time, because the argument need
-            // not be constant.
-            const ir::Index bad = b.binary(ir::Inst::Tag::SLt, arg, b.constant(module_.pool.put_int(i64, 0), l), l);
-            b.open_region();
-            {
-                const std::string banner = banner_at(nc.sourceRange.start());
-                emit_report(b, static_cast<uint32_t>(ir::Severity::Fatal), banner_at(nc.sourceRange.start()),
-                           "mailbox bound is negative (LRM 15.4.1)", {}, l);
-                b.finish(banner + "mailbox", 1, l);
-            }
-            const ir::ExtraSlice then_r = b.close_region();
-            b.open_region();
-            const ir::ExtraSlice else_r = b.close_region();
-            b.cond(bad, then_r, else_r, l, /*unlikely=*/true);
-        }
-        b.binary(ir::Inst::Tag::Store,
-                 b.member_select(b.handle_deref(handle, class_ref, l),
-                                 is_mbx ? kMbxBound : kSemKeys, class_ref, l),
-                 arg, l);
+        emit_sync_ctor(clt, bound, handle, class_ref, nc.sourceRange.start(), b, l);
         return handle;
     }
     emit_object_rng_seed(clt, handle, class_ref, b, l);
@@ -1190,6 +1164,14 @@ void Lowerer::emit_ctor_call(const slang::ast::ClassType&       clt,
         // constructing a weak reference, `super.new` from a derived class included,
         // arrives here.
         emit_weak_ctor(actuals, handle, lower_type(clt), b, l);
+        return;
+    }
+    if (is_sync_class(clt)) {
+        // So are `semaphore::new` and `mailbox::new`. Reached for a class derived
+        // from one; `new` of the built-in class itself is lower_new_class's.
+        const slang::SourceLocation where =
+          actuals.empty() ? slang::SourceLocation::NoLocation : actuals[0]->sourceRange.start();
+        emit_sync_ctor(clt, actuals, handle, lower_type(clt), where, b, l);
         return;
     }
     if (ctor == nullptr) {
