@@ -5945,6 +5945,8 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).
     ankerl::unordered_dense::map<uint32_t, llvm::StructType*> class_body_ty_;
+    // Memoized unpacked-struct storage mirror per field-type list (see agg_storage_ty).
+    std::map<std::vector<llvm::Type*>, llvm::StructType*> agg_struct_tys_;
     // Memoized reaches_class_handle() per type Ref. Design-wide, not per module: the
     // answer depends only on the intern pool.
     ankerl::unordered_dense::map<uint32_t, bool> reaches_class_handle_;

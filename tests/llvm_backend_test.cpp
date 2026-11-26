@@ -2461,7 +2461,7 @@ TEST_CASE("unsplit emission verifies the code instances share against root's for
 // instance that shares it, into scratch modules, and must leave nothing behind:
 // the emitted modules and the run are the same with it on and off. The design
 // has what the lowering registers or names besides code: nonblocking blocks, an
-// array and a struct (types made at each use), a string constant, a function
+// array and a struct, a string constant, a function
 // copy and a name per instance (which keep their groups per instance).
 TEST_CASE("verifying shared code changes nothing in the emitted modules or the run") {
     constexpr std::string_view src = R"(
