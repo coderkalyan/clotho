@@ -2347,8 +2347,19 @@ private:
     llvm::Constant* trace_nba_site(llvm::Module& m, const TraceNba& t, uint32_t path);
 
     // Report the update: created now (`rec` null, `path` RT_TRACE_NBA_BLOCK ... RT_TRACE_NBA_ZERO), or
-    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT).
-    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path);
+    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT);
+    // a timer's delay is `ticks` (an i64).
+    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path, llvm::Value* ticks = nullptr);
+
+    // One event a `<= @e` record waits for: the storage of a signal (`edge` RT_TRACE_POS ...) or an event
+    // object (RT_TRACE_OBJ).
+    struct TraceTrigger {
+        llvm::Value* x;
+        uint32_t     edge;
+    };
+
+    // The events of the `<= @e` record `rec` just armed, and its repeat count `count` (an i32).
+    void emit_trace_nba_events(llvm::Value* rec, llvm::Value* count, llvm::ArrayRef<TraceTrigger> trigs);
 
     // The scheduler enters `region` (RT_TRACE_REG_*).
     void emit_trace_region(uint32_t region);
@@ -4004,7 +4015,7 @@ private:
     void emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
 
     void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count,
-                              llvm::ArrayRef<llvm::Value*> trig_ids);
+                              llvm::ArrayRef<llvm::Value*> trig_ids, llvm::ArrayRef<TraceTrigger> traced);
 
     void emit_intra_commit(Signal sig);
 

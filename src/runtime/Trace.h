@@ -491,9 +491,17 @@ void rt_trace_nba_create(const rt_trace_nba_site* site, void* dst0, void* dst1, 
 
 // A timed update is armed: `rec` is the record that will release it, `<= #d` for a timer and
 // `<= @e` for an event, and the planes are those of rt_trace_nba_create. The update is
-// created when the record is released (rt_trace_nba_release).
-void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* site, void* dst0, void* dst1,
+// created when the record is released (rt_trace_nba_release): `ticks` from now by the timer of a
+// `<= #d` (zero for an event), and by the occurrence of its control that completes its count for a
+// `<= @e` (rt_trace_nba_event).
+void rt_trace_nba_stage(const void* rec, uint64_t ticks, const rt_trace_nba_site* site, void* dst0, void* dst1,
                         const void* val0, const void* mask0, const void* val1, const void* mask1);
+
+// An event the `<= @e` record `rec`, just armed, waits for: `x` is a signal's storage (`edge`
+// RT_TRACE_POS, _NEG or _ANY) or an event object (RT_TRACE_OBJ), one call for each event the control
+// lists, and `count` the repeat count: how many occurrences release the record. A record the trace is
+// told no event of is not asked.
+void rt_trace_nba_event(const void* rec, uint32_t count, const void* x, uint32_t edge);
 
 // A timer or an occurrence of an event releases `rec`: `path` is RT_TRACE_NBA_TIMER or
 // RT_TRACE_NBA_EVENT, and `moment` the scheduler's number for the occurrences that released

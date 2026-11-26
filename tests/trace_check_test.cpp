@@ -101,7 +101,7 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
                               "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
                               "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member", "rt_trace_inertial_arm", "rt_trace_inertial_decide",
-                              "rt_trace_inertial_fire", "rt_trace_inertial_applied" }) {
+                              "rt_trace_inertial_fire", "rt_trace_inertial_applied", "rt_trace_nba_event" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -482,10 +482,15 @@ void nba_put(const rt_trace_nba_site& s, uint32_t* dst, uint32_t value, uint32_t
     rt_trace_nba_create(&s, dst, nullptr, &v, mask == 0xffffffffu ? nullptr : &m, nullptr, nullptr);
 }
 
-// A statement arms a record, which a timer or an event releases later.
-void nba_arm(const void* rec, const rt_trace_nba_site& s, uint32_t* dst, uint32_t value) {
+// A statement arms a record, which a timer (`ticks` from now) or an event releases later.
+void nba_arm(const void* rec, const rt_trace_nba_site& s, uint32_t* dst, uint32_t value, uint64_t ticks = 1) {
     const uint64_t v = value;
-    rt_trace_nba_stage(rec, &s, dst, nullptr, &v, nullptr, nullptr, nullptr);
+    rt_trace_nba_stage(rec, ticks, &s, dst, nullptr, &v, nullptr, nullptr, nullptr);
+}
+
+// The event of a `<= @e` record's control that it counts `count` occurrences of.
+void nba_waits(const void* rec, uint32_t count, const void* x, uint32_t edge) {
+    rt_trace_nba_event(rec, count, x, edge);
 }
 
 // The NBA region of a slot, once the Active region has drained.
@@ -2889,5 +2894,149 @@ TEST_CASE("trace check: an inertial record fires at its deadline and its update 
     rt_trace_slot_end();
     CHECK(rule() == "R16.5");
     CHECK(has(rt_trace_report(), "still unapplied"));
+}
+
+// R11: a timed nonblocking update is created when its delay elapses (`<= #d`) or when its event occurs the number of
+// times it counts (`<= @e`, `<= repeat(n) @e`), and not before (B23: a `<= @e` on a declared event was never counted
+// down, so it was never created).
+
+TEST_CASE("trace check: a `<= #d` update is created when its delay elapses and not before (R11)") {
+    // Armed for 5 ticks at tick 0: the timer releases it at tick 5, and the NBA region applies it.
+    rt_trace_begin();
+    q = 0;
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(5);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_TIMER, 0);
+    nba_begin();
+    q = 1;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // Released a tick early.
+    rt_trace_begin();
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(4);
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_TIMER, 0);
+    CHECK(rule() == "R11.1");
+    CHECK(has(rt_trace_report(), "created at tick 4"));
+    CHECK(has(rt_trace_report(), "ends at tick 5"));
+
+    // Never released: found when the slot of its deadline is over.
+    rt_trace_begin();
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(5);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.1");
+    CHECK(has(rt_trace_report(), "no update was created"));
+
+    // A record armed for a later tick is not owed at the end of an earlier slot.
+    rt_trace_begin();
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(2);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a `<= @e` update is created at the n-th occurrence of its control, and only then (R11, B23)") {
+    // `q <= repeat(2) @(posedge clk) v`: the first posedge counts one, a negedge none, the second creates it.
+    rt_trace_begin();
+    q = 0;
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &clk, RT_TRACE_POS);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_change(&kStore, &clk, seen_for(1, 0, false));
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 3);
+    nba_begin();
+    q = 1;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // Created at the first occurrence of two.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &clk, RT_TRACE_POS);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 1);
+    CHECK(rule() == "R11.2");
+    CHECK(has(rt_trace_report(), "1 of the 2 occurrences"));
+
+    // The second occurrence comes and nothing creates the update: the next event shows it.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &clk, RT_TRACE_POS);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
+    CHECK(has(rt_trace_report(), "was not created"));
+
+    // B23: the record waits on a declared event, and `-> e` fires the object's own waiters, never the record.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &ev1, RT_TRACE_OBJ);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
+    // ... and with the release the trigger owes, it is clean.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &ev1, RT_TRACE_OBJ);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    nba_begin();
+    q = 1;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a `<= @(a or b)` update counts an occurrence of either, and an event listed twice counts one (R11, R21)") {
+    // Either entry matures a count of one; an event that is not listed does not.
+    for (const void* occurs : { static_cast<const void*>(&clk), static_cast<const void*>(&done) }) {
+        rt_trace_begin();
+        nba_arm(&rec1, kEvent, &q, 1, 0);
+        nba_waits(&rec1, 1, &clk, RT_TRACE_POS);
+        nba_waits(&rec1, 1, &done, RT_TRACE_POS);
+        rt_trace_change(&kStore, occurs, seen_for(0, 1, false));
+        rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 1);
+        CHECK(rt_trace_halted() == 0);
+    }
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &clk, RT_TRACE_POS);
+    rt_trace_change(&kStore, &done, seen_for(0, 1, false));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // One occurrence of an event listed under two names counts once: a count of two is not reached.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &ev1, RT_TRACE_OBJ);
+    nba_waits(&rec1, 2, &ev1, RT_TRACE_OBJ);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
+
+    // A change entry counts any write that changed the value; a record armed on a slot the trace was not told the wait
+    // of (an old hand-built sequence) is not asked.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &clk, RT_TRACE_ANY);
+    rt_trace_change(&kStore, &clk, seen_for(1, 1, false));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_change(&kStore, &clk, seen_for(1, 0, false));
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
 }
 #endif // CLOTHO_EXTRA_ASSERTS

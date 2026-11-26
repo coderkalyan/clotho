@@ -1258,8 +1258,18 @@ void Backend::lower_inst(Index i) {
             for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
                 ids.push_back(trigger_id_value(tr.signal, tr.edge));
             }
+            // The events the checker is told the record waits for: an event object the variable names now, or
+            // the storage of a signal.
+            llvm::SmallVector<TraceTrigger, 4> traced;
+            if (trace_on()) {
+                for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
+                    const bool is_event = mod_.signal(tr.signal).is_event;
+                    traced.push_back({ is_event ? event_obj_for(tr.signal) : storage_ptr(slot_of(tr.signal)),
+                                       is_event ? static_cast<uint32_t>(RT_TRACE_OBJ) : static_cast<uint32_t>(tr.edge) });
+                }
+            }
             // Out-of-range variable index: register nothing (see StoreNbDelay).
-            lv.when_valid(b_, [&](const LValue& v) { emit_intra_event_arm(v, rhs, count, ids); });
+            lv.when_valid(b_, [&](const LValue& v) { emit_intra_event_arm(v, rhs, count, ids, traced); });
             return;
         }
 

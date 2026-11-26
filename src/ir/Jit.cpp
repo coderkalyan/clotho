@@ -550,6 +550,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_trace_region", &rt_trace_region);
     expose("rt_trace_nba_create", &rt_trace_nba_create);
     expose("rt_trace_nba_stage", &rt_trace_nba_stage);
+    expose("rt_trace_nba_event", &rt_trace_nba_event);
     expose("rt_trace_nba_pass", &rt_trace_nba_pass);
     expose("rt_trace_pend", &rt_trace_pend);
     expose("rt_trace_trigger", &rt_trace_trigger);

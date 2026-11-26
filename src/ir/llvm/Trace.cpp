@@ -702,7 +702,7 @@ Backend::TraceNba Backend::trace_nba_of(const LValue& lv, Plane rhs, bool gated)
     return t;
 }
 
-void Backend::emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path) {
+void Backend::emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path, llvm::Value* ticks) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     if (!t.on) {
         return;
@@ -716,12 +716,32 @@ void Backend::emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path)
                       { site, t.dst0, or_none(t.dst1), or_none(t.val0), or_none(t.mask0), or_none(t.val1), or_none(t.mask1) });
         return;
     }
-    b_.CreateCall(rt_fn("rt_trace_nba_stage", b_.getVoidTy(), { ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr }),
-                  { rec, site, t.dst0, or_none(t.dst1), or_none(t.val0), or_none(t.mask0), or_none(t.val1), or_none(t.mask1) });
+    b_.CreateCall(rt_fn("rt_trace_nba_stage", b_.getVoidTy(), { ptr, b_.getInt64Ty(), ptr, ptr, ptr, ptr, ptr, ptr, ptr }),
+                  { rec, ticks != nullptr ? ticks : b_.getInt64(0), site, t.dst0, or_none(t.dst1), or_none(t.val0),
+                    or_none(t.mask0), or_none(t.val1), or_none(t.mask1) });
 #else
     (void)rec;
     (void)t;
     (void)path;
+    (void)ticks;
+#endif
+}
+
+void Backend::emit_trace_nba_events(llvm::Value* rec, llvm::Value* count, llvm::ArrayRef<TraceTrigger> trigs) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32 = b_.getInt32Ty();
+    for (const TraceTrigger& t : trigs) {
+        b_.CreateCall(rt_fn("rt_trace_nba_event", b_.getVoidTy(), { ptr, i32, ptr, i32 }),
+                      { rec, count, t.x, b_.getInt32(t.edge) });
+    }
+#else
+    (void)rec;
+    (void)count;
+    (void)trigs;
 #endif
 }
 

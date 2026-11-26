@@ -2187,7 +2187,7 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     // A compile-time-constant delay emits only the taken path; a runtime delay
     // that happens to be zero branches to the same immediate path.
     auto  schedule  = [&] {
-        emit_trace_nba(rec, traced, RT_TRACE_NBA_TIMER);
+        emit_trace_nba(rec, traced, RT_TRACE_NBA_TIMER, ticks);
         b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, intra_cb_trampoline() });
     };
     auto immediate = [&] {
@@ -2392,7 +2392,8 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
 void Backend::emit_intra_event_arm(const LValue&                lv,
                                    Plane                        rhs,
                                    llvm::Value*                 count,
-                                   llvm::ArrayRef<llvm::Value*> trig_ids) {
+                                   llvm::ArrayRef<llvm::Value*> trig_ids,
+                                   llvm::ArrayRef<TraceTrigger> traced) {
     const SignalSlot& s      = slot_of(lv.sig);
     llvm::StructType* rt     = intra_rec_ty(s);
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
@@ -2404,6 +2405,8 @@ void Backend::emit_intra_event_arm(const LValue&                lv,
     b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
     fill_intra_payload(lv, rhs, rt, rec);
     emit_trace_nba(rec, trace_nba_of(lv, rhs, false), RT_TRACE_NBA_EVENT);
+    // The events the record waits for, and how many occurrences release it (R11).
+    emit_trace_nba_events(rec, cast(count, 32, false), traced);
     if (trig_ids.size() == 1) {
         b_.CreateCall(intra_event_register_fn(), { trig_ids[0], rec });
         return;

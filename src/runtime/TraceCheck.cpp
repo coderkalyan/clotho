@@ -279,6 +279,12 @@ constexpr uint32_t words_of(uint32_t bits) {
     return (bits + 63) / 64;
 }
 
+// An event a `<= @e` record waits for (R11): a signal's storage and an edge, or an event object.
+struct EWait {
+    uintptr_t x;
+    uint32_t  edge;
+};
+
 // One nonblocking update from its creation until a pass applies it: where it goes and the bits it
 // writes, as the code stores them. Updates are applied in the order they were created.
 struct Upd {
@@ -296,6 +302,12 @@ struct Upd {
     uint32_t                 region = 0;
     // Plane 0's value, then its mask, then plane 1's: each `words_of` the plane's bits.
     std::vector<uint64_t>    w;
+    // A `<= #d` record's deadline; a `<= @e` record's count, the occurrences of its control seen since it
+    // was armed, and the events it waits for (R11).
+    uint64_t                 deadline = 0;
+    uint32_t                 count    = 0;
+    uint32_t                 occ      = 0;
+    std::vector<EWait>       waits;
 
     uint32_t        bits(int p) const { return p == 0 ? site->bits0 : site->bits1; }
     const uint64_t* val(int p) const { return w.data() + (p == 0 ? 0 : 2 * words_of(site->bits0)); }
@@ -310,6 +322,13 @@ struct Key {
     // A forced target, or one whose bits the trace does not know: not compared.
     bool                  skip;
     std::vector<uint64_t> base;
+};
+
+// A `<= @e` record that waits for occurrences of one event: its address, and the arm that made it (the
+// address is reused by the next arm of its site).
+struct EWatch {
+    uintptr_t rec;
+    uint64_t  arm;
 };
 
 // A `->>` linked onto the pend chain and not yet triggered.
@@ -404,6 +423,10 @@ struct Checker {
     // armed in.
     AddrMap<Upd>         armed;
     uint64_t             arm_seq = 0;
+    // R11: the armed `<= @e` records that wait for each event or signal, by its address, and the records the
+    // last occurrence of whose control has come and that nothing has created yet.
+    AddrMap<std::vector<EWatch>> ewatch;
+    std::vector<EWatch>          rel_owed;
     // The `->>` linked and not yet triggered, oldest first.
     std::deque<Pend>     pends;
     // The word buffers of retired updates, so that a design that stages an update every cycle
@@ -688,6 +711,8 @@ const char* rule_title(const char* rule) {
         { "R16.3", "inertial fire" },
         { "R16.4", "inertial supersede" },
         { "R16.5", "inertial apply" },
+        { "R11.1", "timed update" },
+        { "R11.2", "event update" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -1706,10 +1731,75 @@ void settle_aborts() {
          "the list at " + address_text(o.target) + " held it, and the walk of that list marked no such activation");
 }
 
+// An occurrence of the control of the armed `<= @e` records that wait for `x`: a write that satisfies the
+// edge of an entry, or a trigger of the event object (R11.2). A record counts an occurrence once, however
+// many of its entries it satisfies, and the one that completes its count is owed its release at once.
+void count_occurrence(uintptr_t x, bool pos, bool neg, bool any, bool obj) {
+    const auto* v = g.finished ? nullptr : g.ewatch.find(x);
+    if (v == nullptr) {
+        return;
+    }
+    for (const EWatch& w : *v) {
+        Upd* u = g.armed.find(w.rec);
+        if (u == nullptr || u->site == nullptr || u->arm != w.arm || u->count == 0 || u->occ >= u->count) {
+            continue;
+        }
+        bool hit = false;
+        for (const EWait& e : u->waits) {
+            hit = hit || (e.x == x && (obj ? e.edge == RT_TRACE_OBJ
+                                           : ((e.edge == RT_TRACE_ANY && any) || (e.edge == RT_TRACE_POS && pos) ||
+                                              (e.edge == RT_TRACE_NEG && neg))));
+        }
+        if (hit && ++u->occ == u->count) {
+            g.rel_owed.push_back(w);
+        }
+    }
+}
+
+// R11.1: at the end of a slot, a `<= #d` record whose delay ended in it or before has been released by its
+// timer. Returns whether it failed.
+bool poll_timers() {
+    if (g.finished) {
+        return false;
+    }
+    bool failed = false;
+    g.armed.for_each([&](uintptr_t, Upd& u) {
+        if (failed || u.site == nullptr || u.path != RT_TRACE_NBA_TIMER || u.deadline == UINT64_MAX || u.deadline > g.now) {
+            return;
+        }
+        std::string text = "armed: " + upd_text(u);
+        appendf(text, "; its delay ends at tick %llu, and the slot of tick %llu is over", static_cast<unsigned long long>(u.deadline),
+                static_cast<unsigned long long>(g.now));
+        fail("R11.1", "the delay of a `<= #d` update elapsed and no update was created: its timer never released it", 0, text);
+        failed = true;
+    });
+    return failed;
+}
+
+// The point a `<= @e` record whose count an occurrence completed must have been created by: the next
+// dispatch, park or region (R11.2).
+void settle_releases() {
+    for (const EWatch& o : g.rel_owed) {
+        const Upd* u = g.armed.find(o.rec);
+        if (u != nullptr && u->site != nullptr && u->arm == o.arm) {
+            std::string what;
+            appendf(what, "the last of the %u occurrences a `<= @e` update counts came, and the update was not created", u->count);
+            g.rel_owed.clear();
+            fail("R11.2", what, 0, "armed: " + upd_text(*u));
+            return;
+        }
+    }
+    g.rel_owed.clear();
+}
+
 // The point a write's wakes must have been made by: every activation still parked as it was is a
 // violation.
 void settle_owed() {
     settle_aborts();
+    if (g.halted) {
+        return;
+    }
+    settle_releases();
     if (g.halted || g.owed.empty()) {
         return;
     }
@@ -1891,6 +1981,8 @@ extern "C" void rt_trace_begin(void) {
     g.acts.clear();
     g.names.clear();
     g.armed.clear();
+    g.ewatch.clear();
+    g.rel_owed.clear();
     g.now     = 0;
     g.halted  = false;
     g.seq     = 0;
@@ -2880,7 +2972,7 @@ extern "C" void rt_trace_slot_end(void) {
     if (closure("the slot ends", false)) {
         return;
     }
-    if (poll_inertial()) {
+    if (poll_inertial() || poll_timers()) {
         return;
     }
     // Time advances only when every region is empty (R1.2). A slot with no region reported (a hand-built
@@ -3056,8 +3148,8 @@ extern "C" void rt_trace_nba_create(const rt_trace_nba_site* site, void* dst0, v
     g.pending.push_back(std::move(u));
 }
 
-extern "C" void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* site, void* dst0, void* dst1, const void* val0,
-                                   const void* mask0, const void* val1, const void* mask1) {
+extern "C" void rt_trace_nba_stage(const void* rec, uint64_t ticks, const rt_trace_nba_site* site, void* dst0, void* dst1,
+                                   const void* val0, const void* mask0, const void* val1, const void* mask1) {
     if (g.halted) {
         return;
     }
@@ -3075,6 +3167,8 @@ extern "C" void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* sit
     u.tick   = g.now;
     u.region = g.region;
     u.arm    = ++g.arm_seq;
+    // A timer releases the update when its delay ends (R11.1).
+    u.deadline = path == RT_TRACE_NBA_TIMER ? (ticks > UINT64_MAX - g.now ? UINT64_MAX : g.now + ticks) : 0;
     if (g.finished) {
         fail("R24.1", "an NBA statement ran after $finish: code of the finishing thread, or of something it woke, ran on", 0,
              "armed: " + upd_text(u));
@@ -3088,6 +3182,47 @@ extern "C" void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* sit
     Upd& slot = g.armed.at(reinterpret_cast<uintptr_t>(rec));
     retire(slot);
     slot = std::move(u);
+}
+
+extern "C" void rt_trace_nba_event(const void* rec_, uint32_t count, const void* x_, uint32_t edge) {
+    if (g.halted || g.finished) {
+        return;
+    }
+    touch_run();
+    const uintptr_t rec = reinterpret_cast<uintptr_t>(rec_);
+    const uintptr_t x   = reinterpret_cast<uintptr_t>(x_);
+    Upd*            u   = g.armed.find(rec);
+    if (u == nullptr || u->site == nullptr || u->path != RT_TRACE_NBA_EVENT) {
+        fail("R11.2", "an event was reported for a record that no `<= @e` statement armed", 0, "the record at " + address_text(rec));
+        return;
+    }
+    u->count    = count == 0 ? 1 : count;
+    bool listed = false;
+    for (const EWait& w : u->waits) {
+        listed = listed || (w.x == x && w.edge == edge);
+    }
+    if (!listed) {
+        u->waits.push_back(EWait{ x, edge });
+    }
+    std::vector<EWatch>& v = g.ewatch.at(x);
+    for (const EWatch& w : v) {
+        if (w.rec == rec && w.arm == u->arm) {
+            return;
+        }
+    }
+    // Watchers whose record has been released since are dropped as the list grows.
+    const size_t n = v.size();
+    if (n >= 16 && (n & (n - 1)) == 0) {
+        size_t kept = 0;
+        for (const EWatch& w : v) {
+            const Upd* o = g.armed.find(w.rec);
+            if (o != nullptr && o->site != nullptr && o->arm == w.arm) {
+                v[kept++] = w;
+            }
+        }
+        v.resize(kept);
+    }
+    v.push_back(EWatch{ rec, u->arm });
 }
 
 extern "C" void rt_trace_nba_release(const void* rec, uint32_t path, uint32_t moment) {
@@ -3106,6 +3241,24 @@ extern "C" void rt_trace_nba_release(const void* rec, uint32_t path, uint32_t mo
              std::string("a record armed for ") + path_name(armed->path) + " was released as " + path_name(path), 0,
              "armed: " + upd_text(*armed));
         return;
+    }
+    // The timer releases it at the tick its delay ends, and an event when the last occurrence it counts
+    // comes (R11); a record the trace was told no event of is not asked.
+    if (!g.finished) {
+        if (path == RT_TRACE_NBA_TIMER && armed->deadline != UINT64_MAX && g.now != armed->deadline) {
+            std::string what;
+            appendf(what, "a `<= #d` update was created at tick %llu, and its delay ends at tick %llu",
+                    static_cast<unsigned long long>(g.now), static_cast<unsigned long long>(armed->deadline));
+            fail("R11.1", what, 0, "armed: " + upd_text(*armed));
+            return;
+        }
+        if (path == RT_TRACE_NBA_EVENT && !armed->waits.empty() && armed->occ < armed->count) {
+            std::string what;
+            appendf(what, "a `<= @e` update was created before the last occurrence of its control that it counts: %u of the %u occurrences had come",
+                    armed->occ, armed->count);
+            fail("R11.2", what, 0, "armed: " + upd_text(*armed));
+            return;
+        }
     }
     Upd u = std::move(*armed);
     armed->site = nullptr;
@@ -3222,6 +3375,7 @@ extern "C" void rt_trace_trigger(const void* obj, uint32_t kind) {
              "event " + signal_text(obj));
         return;
     }
+    count_occurrence(o, false, false, false, true);
     owe(obj, false, false, false, true);
     if (kind != RT_TRACE_TRIGGER_NB) {
         return;
@@ -3317,6 +3471,7 @@ extern "C" void rt_trace_change(const rt_trace_change_site* site, const void* x,
     }
     if (x != nullptr) {
         g.chg.at(reinterpret_cast<uintptr_t>(x)) = ChgFacts{ g.step, pos, neg, any };
+        count_occurrence(reinterpret_cast<uintptr_t>(x), pos, neg, any, false);
         owe(x, pos, neg, any, false);
     }
 }
