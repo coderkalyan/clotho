@@ -1131,8 +1131,8 @@ std::pair<llvm::Value*, uint32_t> Backend::mem_inner_dims(Ref array_type) {
 // type's highest dimension, so an address is an index into the array the task names.
 // An indexed slice `target[base +: n]` / `[base -: n]` is not an lvalue (its first
 // word is at a runtime position): `slice` says so, `slice_base` is its base and
-// `base_type` the type of `target`. slang types it [0:n-1] (declared direction), so
-// its addresses do not depend on the base, and only the words that lie in `target`'s
+// `base_type` the type of `target`. Its addresses are the indices it selects, as for
+// `target[a:b]` (21.4: `a[2 +: 4]` is `a[2:5]`), and only the words that lie in `target`'s
 // array exist: 7.4.5 makes writing an array through an invalid index a no-operation,
 // which Clotho applies to each word, as it does to a write of a slice
 // (emit_indexed_slice_copy), so a slice that hangs off the array keeps the alignment
@@ -1320,6 +1320,11 @@ Backend::MemTarget Backend::resolve_mem_target(Index       target,
         // declared direction), and its position in `target`'s array is counted from
         // the array's left bound.
         llvm::Value* low = slice == kMemSliceUp ? at : b_.CreateSub(at, b_.getInt64(words - 1));
+        // The slice's own addresses are the indices it selects, whichever way it is written:
+        // `a[2 +: 4]` is `a[2:5]` (LRM 21.4: start and finish lie within the slice's range).
+        llvm::Value* high = b_.CreateAdd(low, b_.getInt64(words - 1));
+        left_addr         = ascending ? low : high;
+        right_addr        = ascending ? high : low;
         llvm::Value* pos = ascending ? b_.CreateSub(low, b_.getInt64(left))
                                      : b_.CreateSub(b_.getInt64(left), b_.CreateAdd(low, b_.getInt64(words - 1)));
         // The slice's words at positions [wlo, whi) are in `target`'s array.

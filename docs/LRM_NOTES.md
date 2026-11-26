@@ -807,8 +807,9 @@ of the slice's range". Clotho takes the array the argument names as the memory t
 with its own bounds as addresses: `a[2:5]` has addresses 2 to 5, `m[1]` those of its
 dimension, and the default start is the lowest of them, whichever way they are declared
 (note 59 gives the rows of an array of several dimensions). An indexed slice
-`a[i +: n]` / `a[i -: n]` has the bounds slang gives it, `[0:n-1]` or `[n-1:0]` by the
-direction of `a`, so its addresses do not depend on `i`.
+`a[i +: n]` / `a[i -: n]` is the slice `a[i:i+n-1]` / `a[i-n+1:i]` (11.5.1) and has the
+same addresses, the indices it selects: `a[2 +: 4]` and `a[2:5]` are addressed 2 to 5, whatever
+range slang types the slice with. Decided reading (with the user).
 
 7.4.5 makes writing an array through an invalid index a no-operation, and says nothing of
 a slice that is partly outside its array, or of a load. Clotho applies the rule to each
@@ -850,9 +851,9 @@ fills those of a slice of a fixed array, never resizing `q` (21.4.1). Decided re
 the user): the addresses are the indices of `q`, so `q[2:$]` of six elements has the
 addresses 2 to 5 and its default start is 2, and `start`, `finish` and the `@` addresses of
 the file name indices of `q` that lie in what is left of the slice once the queue has
-clipped it (`q[3:9]` of six is [3:5], note 62). The indexed slice of an array takes the
-addresses slang gives it, `[0:n-1]` (note 60), because slang types it; a queue slice has no
-declared range, so `q[i +: n]` keeps the addresses of `q[i:i+n-1]`. A slice that selects no
+clipped it (`q[3:9]` of six is [3:5], note 62). Every slice has one rule (note 60): an
+indexed slice of a fixed or dynamic array and of a queue is addressed by the indices it
+selects, as `[a:b]` is. A slice that selects no
 element names no word, as an empty queue does below: nothing is opened or read.
 
 A dynamic array or queue with no element has `$right` -1, which is no address at all: the

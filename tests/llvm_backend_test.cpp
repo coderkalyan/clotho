@@ -4179,8 +4179,8 @@ TEST_CASE("$readmemh into an element or a slice of an element of a multi-dimensi
 }
 
 // A slice whose position is a variable, `a[i +: n]` and `a[i -: n]` (LRM 7.4.5, 11.5.1),
-// is an array of n words, which slang types [0:n-1] or [n-1:0] like the array it
-// slices, so its addresses do not depend on i. Its words that lie outside the array
+// is the slice `a[i:i+n-1]`, whose addresses are the indices it selects (21.4), so `start`
+// is 3 for its second word at i = 2. Its words that lie outside the array
 // are dropped where they are, not the rest shifted into them, as a write of a slice
 // does (7.4.5: writing through an invalid index is a no-operation), and a load whose
 // index has an x or z bit, or whose slice is wholly outside the array, loads nothing.
@@ -4201,7 +4201,7 @@ TEST_CASE("$readmemh into a slice at a variable position") {
                 i = 5;  $readmemh(")" + w6 + R"(", b[i -: 3]);
                 i = 2;  $readmemh(")" + w6 + R"(", q[i +: 3]);
                 i = 6;  $readmemh(")" + w6 + R"(", c[i +: 4]);
-                i = 2;  $readmemh(")" + w6 + R"(", d[i +: 3], 1);
+                i = 2;  $readmemh(")" + w6 + R"(", d[i +: 3], 3);
                 i = 1;  $readmemh(")" + w6 + R"(", h[i -: 3]);
                         $readmemh(")" + w6 + R"(", z[xi +: 3]);
                 i = 20; $readmemh(")" + w6 + R"(", u[i +: 3]);
@@ -5535,7 +5535,7 @@ TEST_CASE("$readmem into a slice with a start or finish outside its range loads 
                 fresh; $readmemh("@S@", a[2:5], 6); show;
                 fresh; $readmemh("@S@", a[2:5], 1, 4); show;
                 fresh; $readmemh("@S@", a[2:5], 2, 6); show;
-                fresh; k = 1; $readmemh("@S@", a[k +: 3], 3); show;
+                fresh; k = 1; $readmemh("@S@", a[k +: 3], 4); show;
                 fresh; $readmemh("@S@", b[5:2], 6); show;
                 fresh; $readmemh("@S@", d[2:5], 6); show;
                 fresh; $readmemh("@S@", a[2:5], 3, 4); $readmemh("@S@", b[5:2], 4, 3); $readmemh("@S@", d[2:5], 3, 4);
@@ -5551,10 +5551,55 @@ TEST_CASE("$readmem into a slice with a start or finish outside its range loads 
     CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [2:5]") == 2);
     CHECK(count_substr(err, "error: $readmemh: start address 1 is outside the slice range [2:5]") == 1);
     CHECK(count_substr(err, "error: $readmemh: finish address 6 is outside the slice range [2:5]") == 1);
-    CHECK(count_substr(err, "error: $readmemh: start address 3 is outside the slice range [0:2]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: start address 4 is outside the slice range [1:3]") == 1);
     CHECK(count_substr(err, "error: $readmemh: start address 6 is outside the slice range [5:2]") == 1);
     CHECK(count_substr(err, "error:") == 6);
     std::remove("clotho_readmem_sl1.hex");
+}
+
+// One rule for the addresses of a slice: `a[2 +: 4]` is `a[2:5]` (LRM 11.5.1) and 21.4 has start
+// and finish "fall within the bounds of the slice's range", so both spellings are addressed 2 to 5
+// (for a descending array `b[5 -: 4]` is `b[5:2]`), for a fixed array and a dynamic array alike.
+// Oracle: iverilog 13 has no slice; each case is the load of the whole memory with the same start
+// and finish, and a start or finish outside the range is derived from 21.4.
+TEST_CASE("$readmem into an indexed slice is addressed by the indices it selects") {
+    write_file("clotho_readmem_ix_test.hex", "01 02 03 04 05 06\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] a [0:7];
+            logic [7:0] b [7:0];
+            logic [7:0] d [];
+            integer i, k;
+            task automatic fresh;
+                d = new[8];
+                for (i = 0; i < 8; i = i + 1) begin a[i] = 8'hxx; b[i] = 8'hxx; d[i] = 8'hxx; end
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h%h%h ", a[i], b[i], d[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; k = 2; $readmemh("@F@", a[k +: 4], 4);    show;
+                fresh; k = 2; $readmemh("@F@", a[k +: 4], 5, 3); show;
+                fresh; k = 5; $readmemh("@F@", b[k -: 4], 3);    show;
+                fresh; k = 2; $readmemh("@F@", d[k +: 4], 4);    show;
+                fresh; k = 2; $readmemh("@F@", a[k +: 4], 1);    show;
+                fresh; k = 2; $readmemh("@F@", d[k +: 4], 2, 6); show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@F@", "clotho_readmem_ix_test.hex");
+    const std::string none = "xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx xxxxxx \n";
+    CHECK(run_capture(design) == "xxxxxx xxxxxx xxxxxx xxxxxx 01xxxx 02xxxx xxxxxx xxxxxx \n"
+                                 "xxxxxx xxxxxx xxxxxx 03xxxx 02xxxx 01xxxx xxxxxx xxxxxx \n"
+                                 "xxxxxx xxxxxx xxxxxx xx01xx xx02xx xx03xx xxxxxx xxxxxx \n"
+                                 "xxxxxx xxxxxx xxxxxx xxxxxx xxxx01 xxxx02 xxxxxx xxxxxx \n" +
+                                   none + none);
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: start address 1 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error: $readmemh: finish address 6 is outside the slice range [2:5]") == 1);
+    CHECK(count_substr(err, "error:") == 2);
+    std::remove("clotho_readmem_ix_test.hex");
 }
 
 // A warning "shall be issued if the number of data words in the file differs from the number
