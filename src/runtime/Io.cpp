@@ -1677,8 +1677,9 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
     const std::string task = hex ? "$readmemh" : "$readmemb";
 
     // LRM 21.4: with slice syntax, start and finish "shall fall within the bounds of the
-    // slice's range". An address outside it names nothing to load, so nothing is loaded.
-    if (slice) {
+    // slice's range". An address outside it names nothing to load, so nothing is loaded. A whole
+    // memory takes the same rule by analogy (docs/LRM_NOTES.md note 66; iverilog 13 agrees).
+    {
         const int64_t slice_lo = std::min(decl_left, decl_right);
         const int64_t slice_hi = std::max(decl_left, decl_right);
         const auto    outside  = [&](bool given, int64_t at, const char* which) {
@@ -1686,8 +1687,8 @@ extern "C" uint32_t rt_readmem(const char* path_buf, uint32_t path_len, uint8_t*
                 return false;
             }
             mem_load_report(site, true,
-                            fmt::format("{}: {} address {} is outside the slice range [{}:{}]", task, which, at,
-                                        decl_left, decl_right),
+                            fmt::format("{}: {} address {} is outside the {} range [{}:{}]", task, which, at,
+                                        slice ? "slice" : "memory", decl_left, decl_right),
                             "nothing was loaded");
             return true;
         };

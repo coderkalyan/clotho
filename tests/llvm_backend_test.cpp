@@ -5602,6 +5602,48 @@ TEST_CASE("$readmem into an indexed slice is addressed by the indices it selects
     std::remove("clotho_readmem_ix_test.hex");
 }
 
+// 21.4 has start and finish within the range of a slice; a whole memory takes the rule by analogy
+// (docs/LRM_NOTES.md note 66): a start or finish outside its bounds, in either direction, is a located
+// error, nothing is loaded and the simulation goes on. Oracle: iverilog 13 ("Start|Finish address N is
+// out of bounds") for the memory, and the same words for a dynamic array. `$fread` keeps note 55.
+TEST_CASE("$readmem with a start or finish outside a whole memory loads nothing") {
+    write_file("clotho_readmem_wm_test.hex", "11 22 33 44 55 66\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] s [0:7];
+            logic [7:0] d [];
+            integer i;
+            task automatic fresh;
+                d = new[8];
+                for (i = 0; i < 8; i = i + 1) begin s[i] = 8'bx; d[i] = 8'bx; end
+            endtask
+            task automatic show;
+                for (i = 0; i < 8; i = i + 1) $write("%h%h ", s[i], d[i]);
+                $display("");
+            endtask
+            initial begin
+                fresh; $readmemh("@F@", s, 2, 10); $readmemh("@F@", d, 2, 10); show;
+                fresh; $readmemh("@F@", s, -1, 3); $readmemh("@F@", d, -1, 3); show;
+                fresh; $readmemh("@F@", s, 10, 2); $readmemh("@F@", d, 10, 2); show;
+                fresh; $readmemh("@F@", s, 3, -1); $readmemh("@F@", d, 3, -1); show;
+                fresh; $readmemh("@F@", s, 9);     $readmemh("@F@", d, 9);     show;
+                fresh; $readmemh("@F@", s, 2, 4);  $readmemh("@F@", d, 2, 4);  show;
+            end
+        endmodule
+    )";
+    const std::string design = with_path(src, "@F@", "clotho_readmem_wm_test.hex");
+    const std::string none   = "xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx \n";
+    CHECK(run_capture(design) == none + none + none + none + none +
+                                   "xxxx xxxx 1111 2222 3333 xxxx xxxx xxxx \n");
+    const std::string err = run_capture_stderr(design);
+    CHECK(count_substr(err, "error: $readmemh: finish address 10 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address -1 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address 10 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: finish address -1 is outside the memory range [0:7]") == 2);
+    CHECK(count_substr(err, "error: $readmemh: start address 9 is outside the memory range [0:7]") == 2);
+    std::remove("clotho_readmem_wm_test.hex");
+}
+
 // A warning "shall be issued if the number of data words in the file differs from the number
 // of words in the range implied by the start through finish addresses and no address
 // specifications appear within the data file" (LRM 21.4). Oracle: iverilog 13 warns in the same

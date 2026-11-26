@@ -993,3 +993,16 @@ makes the slice empty). iverilog 13 gets an x bound (all the elements up to the 
 unsigned narrow bound (read as negative) wrong, so the test is derived from the clauses.
 
 Code: `src/lower/SystemTasks.cpp` (`lower_queue_bounds`), `src/ir/llvm/Containers.cpp` (`lower_queue_append_range`). Tests: `tests/queue_test.cpp` ("queue slice read: x/z bound is empty and a bound keeps its own signedness").
+
+## 66. `$readmem*` start or finish outside a whole memory (21.4)
+
+21.4 has start and finish "fall within the bounds of the slice's range" when the memory is a
+slice and is silent for a whole memory. Decided reading (with the user): a whole memory takes the
+same rule by analogy. A start or finish outside its bounds, in either direction (`mem[0:7]` with
+2, 10 or -1, 3 or 10, 2), is a located error, nothing is loaded and the simulation goes on
+(`start address 10 is outside the memory range [0:7]`). This holds for a dynamic array or queue
+(`[0:size-1]`) too. iverilog 13 agrees ("Start|Finish address N is out of bounds"). `$fread`
+keeps note 55 (a start outside reads nothing and warns). Reading before this: the load went
+on from the clipped address and loaded the words that fell inside.
+
+Code: `src/runtime/Io.cpp` (`rt_readmem`). Tests: `tests/llvm_backend_test.cpp` ("$readmem with a start or finish outside a whole memory loads nothing").
