@@ -169,6 +169,9 @@ void Backend::vcd_touch_lvalue(const LValueInfo& lv) {
     if (!design_uses_vcd_ || silent_stores_ || !lv.is_signal) {
         return;
     }
+    if (vcd_touch_bound(lv.sig)) {
+        return;
+    }
     const int32_t base = vcd_index_[static_cast<uint32_t>(lv.sig)];
     if (base < 0) {
         return;
@@ -209,6 +212,26 @@ void Backend::vcd_touch_signal(Signal sig) {
     }
 }
 
+// The touch of bound storage written through a binding: whether that instance's
+// signal is dumped is its port's dump-var index, -1 when not, so the writer's
+// code is the same for every instance. False, emitting nothing, for any other
+// write.
+bool Backend::vcd_touch_bound(Signal sig) {
+    const SignalSlot& s = slot_of(sig);
+    if (!uniform(sig) || s.is_array) {
+        return false;
+    }
+    llvm::Value* const port = bound_port(s);
+    if (port == nullptr) {
+        return false;
+    }
+    llvm::Value* const index = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(port_of(s)->ty, port, port_of(s)->vcd));
+    emit_guarded_vcd_touch(
+      vcd_touch_fn(), [&] { return llvm::SmallVector<llvm::Value*, 2>{ index }; },
+      b_.CreateICmpNE(index, b_.getInt32(~0u)));
+    return true;
+}
+
 // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
 // Used at the array-NBA commit, where the runtime queue does not carry the
 // per-element index, and after $readmem / $fread bulk writes.
@@ -241,6 +264,9 @@ void Backend::vcd_touch_event_obj(llvm::Value* obj) {
 
 void Backend::vcd_touch_event_unused(Signal sig) {
     if (!design_uses_vcd_) {
+        return;
+    }
+    if (vcd_touch_bound(sig)) {
         return;
     }
     const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];

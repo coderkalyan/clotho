@@ -2877,9 +2877,11 @@ private:
                                llvm::Value*  new_z);
 
     void fire_event_trigger(Signal sig, uint32_t edge);
+    void fire_port_trigger(Signal sig, uint32_t edge);
+    llvm::Value* port_trigger_id(Signal sig, uint32_t edge);
     void emit_trigger_fire(llvm::Value* trig_id);
 
-    void emit_release_moment(Signal sig, const EdgeFacts& f);
+    void emit_release_moment(Signal sig, const EdgeFacts& f, bool canon);
 
     // The pieces of a (signal, edge) wake bucket a writer addresses: the static
     // subscribers' base, the dynamic waiters' base and their length cell.
@@ -4440,6 +4442,7 @@ private:
     void vcd_touch_lvalue(const LValueInfo& lv);
 
     void vcd_touch_signal(Signal sig);
+    bool vcd_touch_bound(Signal sig);
 
     void vcd_touch_array(Signal sig);
 
@@ -5194,6 +5197,14 @@ private:
     // every signal of every instance of an interface definition some `virtual`
     // handle names. They keep the canonical type-derived shape.
     std::vector<bool> vif_sig_;
+    // Signals a child's port is bound to (Module::port_bound) with a scalar slot,
+    // set by build_state_types: the code of every unit that reaches one, its
+    // owner's and the bound children's alike, sees one shape and one port layout
+    // (the canonical z word, every wake bucket, every id, see build_ports) and
+    // tests at run time what the design has there, so no unit's code depends on
+    // which signal another unit binds or what waits on it.
+    std::vector<uint8_t> uniform_;
+    bool                 uniform(Signal sig) const;
     // Per (signal, edge): does some `@(edge vif.sig)` park on this member? Set by
     // collect_vif_waits over the representative each such wait names, then spread
     // to every instance of the definition so the state layout stays def-uniform.

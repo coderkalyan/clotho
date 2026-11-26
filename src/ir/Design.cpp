@@ -646,8 +646,12 @@ private:
             for (uint32_t h = 0; h < u.signals.size(); ++h) {
                 const uint32_t imp = u.signals[h].import;
                 if (imp != kLocal) {
-                    s.externs.push_back(u.imports[imp].kind == Import::Kind::Representative ? InstanceScope::no_extern
-                                                                                            : fi.signals[h]);
+                    const Import::Kind kind = u.imports[imp].kind;
+                    s.externs.push_back(kind == Import::Kind::Representative ? InstanceScope::no_extern : fi.signals[h]);
+                    if (kind == Import::Kind::Port) {
+                        m_.port_bound.resize(m_.signals().size(), 0);
+                        m_.port_bound[static_cast<uint32_t>(fi.signals[h])] = 1;
+                    }
                     continue;
                 }
                 if (u.signals[h].alias != kLocal) {

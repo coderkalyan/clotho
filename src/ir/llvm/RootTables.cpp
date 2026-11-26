@@ -179,13 +179,21 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
             // densely from 0, so its own scan needs no padding) and vif waiter heads.
             const uint32_t rank = port_field_[si];
             const auto     put  = [&](uint32_t elem, llvm::Constant* v) { set_port(ai, rank, elem, v); };
+            // A canonical port (uniform) holds every id and the dump-var index
+            // whether or not this instance has them, and its readers test for
+            // no_id and -1 at run time.
+            const bool canon = uniform(sj);
             for (uint32_t f = 0; f < kIdFamilies; ++f) {
                 if (pl->id[f] != no_port_elem && id_val_[si][f] != no_id) {
                     put(pl->id[f], b_.getInt32(id_val_[si][f]));
+                } else if (pl->id[f] != no_port_elem && canon) {
+                    put(pl->id[f], b_.getInt32(no_id));
                 }
             }
             if (pl->vcd != no_port_elem && vcd_index_[si] >= 0) {
                 put(pl->vcd, b_.getInt32(static_cast<uint32_t>(vcd_index_[si])));
+            } else if (pl->vcd != no_port_elem && canon) {
+                put(pl->vcd, b_.getInt32(~0u));
             }
             for (uint32_t k = 0; k < s.sh_count && k < pl->n_shadow; ++k) {
                 put(pl->shadow + k, gep(a.shadow_ty, sym(a.shadow_gv), { 0, s.sh_first + k }));

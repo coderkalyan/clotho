@@ -1022,6 +1022,12 @@ public:
     // through a handle is emitted once for the definition. Empty when the design
     // declares no virtual interface.
     std::vector<uint32_t> vif_scopes;
+    // Per flat signal, 1 when it is the storage a child's port is bound to
+    // (Import::Kind::Port: a bound value port, an inout): code of the child's unit
+    // reaches it through a binding in every instance, so it takes one shape and
+    // one port layout whatever binds it (docs/design/modular-compilation.md,
+    // "Bound value ports"). Empty for a module built without units.
+    std::vector<uint8_t> port_bound;
     // Default %t time-unit exponent (10^n seconds): the smallest time precision
     // across all design timescales (LRM Table 20-3). Seeds the runtime's
     // $timeformat default at startup.
