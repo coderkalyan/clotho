@@ -66,6 +66,7 @@ ir::Ref Lowerer::lower_semaphore_class(const slang::ast::ClassType& clt) {
     std::vector<ir::FieldRow> fields;
     push_sync_body(clt, fields);
     module_.pool.set_struct_fields(fid, std::move(fields));
+    register_sync_notifier(clt, ref);
     // Same two obligations lower_process_class has: the reserved randomization
     // slots need an (empty) rand block for the generated bodies to read, and the
     // outermost frame drains the ids compute_vtable reserved.
@@ -80,6 +81,16 @@ ir::Ref Lowerer::lower_semaphore_class(const slang::ast::ClassType& clt) {
 // How many body fields the built-in synchronization class `sync` takes.
 uint32_t Lowerer::sync_body_fields(const slang::ast::ClassType& sync) {
     return sync.name == "mailbox" ? kMbxPeekTail + 1 : kSemQTail + 1;
+}
+
+// Give `class_ref`, which is `sync` or a class derived from it, the design-wide
+// notifier of the state a function of `sync` reads: a mailbox's FIFO, a semaphore's
+// key count. One exists when some `@` or `wait` calls such a function, at its top
+// (`wait (mb.num() != 0)`) or through a subroutine (CalleeReads::builtins), and
+// then every `put`, `get` and `try_*` fires it by storing where it stores.
+void Lowerer::register_sync_notifier(const slang::ast::ClassType& sync, ir::Ref class_ref) {
+    const bool mailbox = sync.name == "mailbox";
+    register_shared_notifier(sync, class_ref, mailbox ? kMbxFifo : kSemKeys, /*container=*/mailbox);
 }
 
 // Append the synthetic body of `semaphore` or of one `mailbox #(T)` to `fields`:
@@ -193,11 +204,7 @@ bool Lowerer::is_sync_method(const slang::ast::SubroutineSymbol& sub) {
 
 // Whether `clt` is a built-in synchronization class of the `std` package.
 bool Lowerer::is_sync_class(const slang::ast::ClassType& clt) {
-    if (clt.name != "semaphore" && clt.name != "mailbox") {
-        return false;
-    }
-    const slang::ast::Scope* pkg = clt.getParentScope();
-    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+    return is_sync_builtin_class(clt);
 }
 
 // Lower one `mailbox #(T)` specialization (LRM 15.4). slang monomorphizes the
@@ -226,6 +233,7 @@ ir::Ref Lowerer::lower_mailbox_class(const slang::ast::ClassType& clt) {
     const ir::Ref ref = module_.pool.put(ir::Item{ t });
     bind_class_type(clt, ref);
     module_.pool.set_struct_fields(fid, std::move(fields));
+    register_sync_notifier(clt, ref);
     class_rand_.emplace(&clt, ClassRand{});
     compute_vtable(clt, ref);
     if (class_depth_ == 1) {
@@ -265,6 +273,9 @@ void Lowerer::push_weak_body(const slang::ast::ClassType& weak, ir::Ref class_re
     const slang::ast::Type& referent = tsym->as<slang::ast::TypeParameterSymbol>().targetType.getType();
     fields.push_back({ kWeakReferentField, lower_type(referent), kWeakReferent });
     module_.set_weak_class(class_ref, kWeakReferent);
+    // The referents' design-wide notifier, when a subroutine some wait calls reads
+    // get() (CalleeReads::builtins).
+    register_shared_notifier(weak, class_ref, kWeakReferent, /*container=*/false);
     if (weak_body_fields(weak) > 1) {
         fields.push_back({ kWeakNotifyField, module_.pool.event_type, kWeakNotify });
         module_.set_change_notify(class_ref, kWeakReferent, ir::Edge::Any, kWeakNotify, /*container=*/false);

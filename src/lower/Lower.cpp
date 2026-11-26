@@ -870,10 +870,15 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     // first reference anywhere under any top, which can precede the `@` that needs
     // the notifier. A design that waits on no property gets an empty table and every
     // class body, every store and every descriptor stays byte-identical.
-    WaitedProps  waited_props;
+    WaitedProps waited_props;
+    // What a virtual call can run, for the scan to follow one (CalleeReadScan).
+    collect_method_overrides(comp, root, waited_props.overrides);
     WaitPropScan wait_prop_scan;
     wait_prop_scan.out = &waited_props;
     root.visit(wait_prop_scan);
+    // The design-wide change notifiers the scan asked for: declared by `globals`
+    // below, read by every Lowerer.
+    SharedNotifiers shared_notifiers;
     UnitOwners unit_owners;
     ForeignCalls foreign_calls;
     // Every variable a force / procedural assign targets, before anything lowers:
@@ -891,6 +896,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         globals.set_vif_defs(&vif_defs);
         globals.set_pca_targets(&pca_targets);
         globals.set_waited_props(&waited_props);
+        globals.set_shared_notifiers(&shared_notifiers);
         globals.set_unit_owners(&unit_owners);
         globals.set_foreign_calls(&foreign_calls);
         globals.lower_globals(comp, root);
@@ -907,6 +913,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             lw.set_pca_targets(&pca_targets);
             lw.set_events_merge(events_merge);
             lw.set_waited_props(&waited_props);
+            lw.set_shared_notifiers(&shared_notifiers);
             lw.set_unit_owners(&unit_owners);
             lw.set_foreign_calls(&foreign_calls);
             lw.set_inferred_clocks(&inferred_clocks);

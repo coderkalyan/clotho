@@ -493,6 +493,64 @@ TEST_CASE("weak_reference: a wait on get() wakes when the collector clears the r
     }
 }
 
+// get() read inside a method that a wait calls (LRM 9.4.2: what "a method or
+// function" references re-evaluates the expression). The waiter names no weak
+// reference, so it parks on the notifier the design shares for the referents of
+// that class, which clear() fires by its store and the collector pends when it
+// clears one.
+TEST_CASE("weak_reference: a wait that reaches get() through a method wakes when the reference is cleared") {
+    constexpr std::string_view src = R"(
+        module m;
+          class C; int v; endclass
+          class Junk; int v; string tag; endclass
+          typedef std::weak_reference #(C) cref;
+          class Cache;
+            cref w;
+            function bit gone(); return w.get() == null; endfunction
+          endclass
+          Cache collected, cleared;
+          C     held;
+          Junk  sink;
+          function automatic void make();
+            C c;
+            c = new;
+            collected   = new;
+            collected.w = new(c);
+            held        = new;
+            cleared     = new;
+            cleared.w   = new(held);
+          endfunction
+          function automatic void churn();
+            for (int i = 0; i < 1500; i++) begin
+              sink = new; sink.v = 32'h5A5A5A5A; sink.tag = "junk";
+            end
+          endfunction
+          initial begin
+            make();
+            fork
+              begin wait (collected.gone()); $display("collected"); end
+              begin wait (cleared.gone()); $display("cleared %0t", $time); end
+            join_none
+            repeat (4) begin churn(); #1; end
+            $display("clearing");
+            cleared.w.clear();
+            repeat (4) begin churn(); #1; end
+            $display("end %0d %0d", collected.gone(), cleared.gone());
+          end
+        endmodule
+    )";
+    SUBCASE("never: only clear() clears") {
+        CHECK(run(src, never()).out == "clearing\ncleared 4\nend 0 1\n");
+    }
+    // The collector's wake comes before clear() runs: clear() fires the same
+    // notifier, and a waiter it woke would print after "clearing".
+    SUBCASE("stress") {
+        const Result r = run(src, stress());
+        CHECK(r.out == "collected\nclearing\ncleared 4\nend 1 1\n");
+        CHECK(r.stats.weak_cleared == 1u);
+    }
+}
+
 // A collection run from inside an allocation is in the middle of a statement, and
 // keeps every referent: a weak reference changes only between time steps, so two
 // reads in one time step agree whatever was allocated between them. The referent

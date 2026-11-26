@@ -246,22 +246,20 @@ void Lowerer::push_prop_wait_events(const SignalEventControl&              ev,
     park(to_edge(ev.edge));
 }
 
-// Refuse `@` over an expression that reads a CONTAINER class property, loudly.
+// Refuse an event control that reads a CONTAINER class property where it cannot be
+// sampled, loudly.
 //
 // LRM 9.4.2: "a non-edge implicit event shall be detected on any CHANGE in the
 // value of the expression". A container property's notifier fires on MUTATION,
 // and the two are different predicates -- `q.push_back(x); q.pop_back();`
 // mutates twice and leaves `q.size()` exactly where it started -- so handing
-// `@` the mutation notifier would be an observable wrong wake, not a harmless
-// extra one. `wait` (9.4.3) is level-sensitive: it re-tests the condition and
-// parks again, so the same fire costs it one re-test. That asymmetry is the
-// whole reason `wait` is supported here and `@` is not.
+// the control the mutation notifier as its event would be an observable wrong
+// wake. A procedural `@` samples the expression and compares on each wake
+// (lower_sampled_event_wait) and never comes here.
 //
-// TODO: `@` over a container-dependent expression (LRM 9.4.2). It needs the
-// expression's value snapshotted in the WAITER's own frame and compared on
-// every wake, since the value is computed rather than stored and the write
-// side has nothing to classify. That is a different mechanism from the
-// classify-at-the-store one this file implements, not an extension of it.
+// TODO: what is left is a control no process can sample for: one in a list with
+// events that are not sampled (the woken process cannot tell which member woke
+// it), and the control of `<= @(...)` or `->> @(...)`, which is a record.
 void Lowerer::refuse_container_event_control(const SignalEventControl& ev) {
     ClassPropReadScan scan;
     ev.expr.visit(scan);
@@ -269,7 +267,8 @@ void Lowerer::refuse_container_event_control(const SignalEventControl& ev) {
         return;
     }
     fail("an event control on a container class property (queue / dynamic array / "
-         "associative array) is not supported; only `wait` can park on one");
+         "associative array) is not supported in a list with other events, nor as the "
+         "control of a nonblocking assignment or trigger; alone in a procedural `@` it is");
 }
 
 // Load the handle of one change notifier of a class property, dereferencing the
@@ -509,7 +508,11 @@ ir::Signal Lowerer::synth_event_net(const Expression& e) {
     const ir::Index dst = b.signal(tmp, l);
     const ir::Index rhs = b.convert(lower_expr(e, b), ty, e.type->isSigned(), l);
     b.binary(ir::Inst::Tag::Store, dst, rhs, l);
-    add_continuous_process(continuous_events(e), l, b);
+    // What the functions the expression calls read re-evaluates it too (LRM 9.4.2),
+    // which a continuous assignment's own rule leaves out (continuous_events).
+    std::vector<ir::WaitEvent> events = continuous_events(e);
+    add_callee_wait_events(e, events);
+    add_continuous_process(std::move(events), l, b);
     return tmp;
 }
 
@@ -665,6 +668,11 @@ void Lowerer::lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::Sour
             flush_deferred_on_resume(b, l);
             return;
         }
+    }
+    if (std::vector<const SignalEventControl*> sampled; event_control_sampled(tc, &sampled)) {
+        lower_sampled_event_wait(sampled, b, l);
+        flush_deferred_on_resume(b, l);
+        return;
     }
     std::vector<ir::WaitEvent> events;
     // Handle expressions in this list lower into `b`, immediately before the
@@ -1686,6 +1694,436 @@ const Lowerer::ClockingBlockState& Lowerer::clocking_state(const ClockingBlockSy
     return it->second;
 }
 
+// Everything a process waiting on `e` has to be woken by (LRM 9.4.2, 9.4.3).
+//
+// The signals `e` reads, each as an any-change (level) event; collect_expr_reads
+// fails loudly on a string one, which the wait queues do not serve.
+//
+// A member read through a virtual interface is not one of those signals: the
+// collector sees the handle variable, not the member. They are gathered apart and
+// each is parked on in the instance its handle names when the park runs (LRM 25.9).
+//
+// Class properties are not signals either -- a property is heap storage inside an
+// object -- so each one parks on its own hidden any-change notifier, whose object
+// handle is lowered at the park like a virtual interface's, so a reassigned handle
+// is re-read on every pass.
+//
+// Fork-captured automatics each live in a GC box (a one-field synthetic class,
+// docs/design/fork-join.md V4), not a signal, so the signal collector sees none of
+// them; each parks on its box's hidden change notifier instead, minted by
+// box_class_for because the design-wide pre-pass (WaitPropScan) saw this
+// expression.
+//
+// What the subroutines `e` calls read is the last part (LRM 9.4.2: a change of
+// what "a method or function" references re-evaluates the expression). A callee
+// can reach a property through any object, so a property it reads is waited on
+// through the notifier the whole design shares for it (ir::ChangeNotify::shared),
+// which a change of that property on any object fires; the clause allows the
+// extra re-evaluations by name. The module, package and static variables a callee
+// reads are signals like any other.
+Lowerer::ExprWaitDeps Lowerer::expr_wait_deps(const Expression& e) {
+    ExprWaitDeps deps;
+    collect_expr_reads(e, deps.reads);
+    deps.vif_reads = vif_member_reads(e);
+    e.visit(deps.props);
+    {
+        ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+        WaitLocalScan                                                scan;
+        scan.out = &named;
+        e.visit(scan);
+        for (const ValueSymbol* vs : named) {
+            if (is_boxed_symbol(*vs)) {
+                deps.boxed.push_back(vs);
+            }
+        }
+        // Set iteration order is hash-dependent; sort by name then location so
+        // the emitted IR is deterministic.
+        std::ranges::sort(deps.boxed, [](const ValueSymbol* a, const ValueSymbol* c) {
+            if (a->name != c->name) {
+                return a->name < c->name;
+            }
+            return a->location < c->location;
+        });
+        for (const ValueSymbol* vs : deps.boxed) {
+            if (!box_can_notify(vs->getType().getCanonicalType())) {
+                deps.unnotified_box = vs;
+                break;
+            }
+        }
+    }
+    add_callee_wait_events(e, deps.reads);
+    deps.unwakeable = deps.reads.empty() && deps.vif_reads.empty() && deps.props.notifiable.empty() &&
+                      deps.props.event_props.empty() && deps.boxed.empty() && deps.props.any_prop;
+    return deps;
+}
+
+// Append to `reads` what the subroutines `e` calls depend on: the design-wide
+// notifier of each instance property and built-in class a callee reads, and each
+// signal a callee names (expr_wait_deps says why).
+void Lowerer::add_callee_wait_events(const Expression& e, std::vector<ir::WaitEvent>& reads) {
+    if (waited_props_ == nullptr) {
+        return;
+    }
+    const CalleeReads                      called = callee_reads(e, waited_props_->overrides);
+    ankerl::unordered_dense::set<uint32_t> have;
+    for (const ir::WaitEvent& r : reads) {
+        have.insert(static_cast<uint32_t>(r.signal));
+    }
+    const auto add = [&](ir::Signal sig) {
+        if (have.insert(static_cast<uint32_t>(sig)).second) {
+            reads.push_back(ir::WaitEvent{ .signal = sig, .edge = ir::Edge::Any });
+        }
+    };
+    const auto shared = [&](const slang::ast::Symbol& sym) {
+        const SharedNotifiers::Entry* entry = shared_notifier(sym);
+        if (entry == nullptr) {
+            // The pre-pass decides which design-wide notifiers exist and this
+            // decides which are used; both run callee_reads on the expression.
+            fail("internal: no design-wide change notifier for '" + std::string(sym.name) + "'");
+        }
+        add(entry->signal);
+    };
+    for (const slang::ast::ClassPropertySymbol* prop : called.props) {
+        // As the pre-pass: a property of a type that has no notifier has no
+        // design-wide one (WaitPropScan::note_callees).
+        if (box_can_notify(prop->getType())) {
+            shared(*prop);
+        }
+    }
+    for (const ClassType* cls : called.builtins) {
+        shared(*cls);
+    }
+    const auto declare_static = [this](const slang::ast::ClassPropertySymbol& p) { return declare_static_prop(p); };
+    SensitivityCollector signals(sigmap_, SensitivityMode::ImplicitEvent, declare_static);
+    for (const ValueSymbol* vs : called.values) {
+        signals.record_read(*vs);
+    }
+    for (const ir::Signal sig : signals.reads) {
+        // A string signal has no wait queue to park on (collect_expr_reads
+        // refuses one the expression itself reads).
+        if (!is_string_ref(module_.signal(sig).type)) {
+            add(sig);
+        }
+    }
+}
+
+// The edges of `deps`, lowered where the caller has its region open: a handle is
+// evaluated at the park, so a reassigned one is re-read on every pass.
+void Lowerer::push_wait_edges(const ExprWaitDeps&        deps,
+                              ir::Builder&               b,
+                              ir::SourceLoc              l,
+                              std::vector<ir::WaitEdge>& edges) {
+    for (const ir::WaitEvent& e : deps.reads) {
+        edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+    }
+    for (const MemberAccessExpression* ma : deps.vif_reads) {
+        const std::optional<ir::Signal> rep =
+          vif_member_signal(ma->member, vif_named_body(ma->value()), "'" + std::string(ma->member.name) + "'");
+        const ir::Index inst = lower_expr(ma->value(), b);
+        if (rep) {
+            edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any), ir::kNoWaitHandle, inst });
+        }
+    }
+    for (const Expression* pe : deps.props.notifiable) {
+        edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                      static_cast<uint32_t>(ir::Edge::Any),
+                                      prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
+    }
+    for (const CallExpression* get : deps.props.weak_gets) {
+        // `w.get()` (LRM 8.30.3) reads w's referent, which clear() and the
+        // collector change; park on that referent's notifier.
+        edges.push_back(
+          ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), weak_notifier_handle(*get, b) });
+    }
+    for (const Expression* pe : deps.props.event_props) {
+        // Park on the event OBJECT the property holds right now, exactly
+        // what `-> e` fires (LRM 9.4.3 re-tests the condition on wake, so
+        // a trigger that leaves it false costs one re-test). The handle is
+        // loaded at the park, so a reassigned property is re-read on every
+        // pass, like a vif handle above.
+        edges.push_back(ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), lower_expr(*pe, b) });
+    }
+    for (const ValueSymbol* vs : deps.boxed) {
+        // Park on the box's notifier event, dereferencing the box handle AT
+        // THIS POINT in the body: a fresh iteration of an enclosing loop can
+        // re-box (install_fork_decl_box allocates per entry), so the handle
+        // is re-read on every pass, like a vif handle above.
+        edges.push_back(
+          ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), boxed_notifier_handle(*vs, b, l) });
+    }
+}
+
+// The design-wide change notifier of `sym`, an instance class property or a
+// built-in class, or null when no `@` or `wait` reaches it through a subroutine.
+const SharedNotifiers::Entry* Lowerer::shared_notifier(const slang::ast::Symbol& sym) const {
+    if (shared_notifiers_ == nullptr) {
+        return nullptr;
+    }
+    const auto it = shared_notifiers_->of.find(&sym);
+    return it != shared_notifiers_->of.end() ? &it->second : nullptr;
+}
+
+// Give field `field` of class `class_ref` the design-wide notifier of `sym`, if
+// `sym` has one. Called wherever a class is laid out, for each class Ref the field
+// belongs to, as its own notifiers are registered (reserve_change_notifiers).
+void Lowerer::register_shared_notifier(const slang::ast::Symbol& sym,
+                                       ir::Ref                   class_ref,
+                                       uint32_t                  field,
+                                       bool                      container) {
+    if (const SharedNotifiers::Entry* entry = shared_notifier(sym); entry != nullptr) {
+        module_.set_change_notify_shared(class_ref, field, entry->index, container);
+    }
+}
+
+// Declare the design-wide change notifiers: one hidden event for each property and
+// built-in class the pre-pass found a subroutine reading on behalf of an `@` or a
+// `wait` (WaitedProps::shared_order). Run by the globals Lowerer before anything is
+// laid out. The events are state of the first compilation unit's static unit: they
+// belong to the design, and a design is at least one compilation unit.
+void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
+    if (waited_props_ == nullptr || shared_notifiers_ == nullptr || waited_props_->shared_order.empty()) {
+        return;
+    }
+    if (root.compilationUnits.empty()) {
+        fail("internal: a wait in a design with no compilation unit");
+    }
+    const Restore<const Scope*> scope(scope_, root.compilationUnits.front());
+    uint32_t                    next = 0;
+    for (const slang::ast::Symbol* sym : waited_props_->shared_order) {
+        ir::SignalInfo info;
+        info.name            = "$chg." + std::to_string(next) + "." + std::string(sym->name);
+        info.type            = module_.pool.event_type;
+        info.is_event        = true;
+        info.dir             = ir::SignalInfo::Direction::Internal;
+        info.shared_notify   = next;
+        const ir::Signal sig = register_signal(std::move(info));
+        shared_notifiers_->of.emplace(sym, SharedNotifiers::Entry{ .index = next, .signal = sig });
+        ++next;
+    }
+}
+
+// Whether the event expression `e` has to be sampled by the process that waits on
+// it (lower_sampled_event_wait): it reads heap state. A property, a fork-captured
+// automatic, a method called on an object, or anything a subroutine it calls reads
+// from one. Such an expression cannot be handed to a continuous process to drive a
+// net the wait could subscribe to (synth_event_net): that process would evaluate
+// the handles when it is built, before anything has assigned them, and nothing
+// would run it again when the object changes.
+//
+// Not for an expression through a virtual interface, which lower_vif_expr_wait
+// samples itself, nor for one whose dependencies cannot wake anything, which stays
+// on the path it was on.
+bool Lowerer::event_expr_sampled(const Expression& e) {
+    if (e.type->isEvent() || reads_vif(e)) {
+        return false;
+    }
+    ClassPropReadScan props;
+    e.visit(props);
+    bool heap = props.any_prop || !props.weak_gets.empty();
+    if (!heap && waited_props_ != nullptr &&
+        (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue)) {
+        const CalleeReads called = callee_reads(e, waited_props_->overrides);
+        heap                     = called.method_call || !called.props.empty() || !called.builtins.empty();
+    }
+    if (!heap) {
+        ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+        WaitLocalScan                                                scan;
+        scan.out = &named;
+        e.visit(scan);
+        heap = std::ranges::any_of(named, [&](const ValueSymbol* vs) { return is_boxed_symbol(*vs); });
+    }
+    if (!heap) {
+        return false;
+    }
+    const ExprWaitDeps deps = expr_wait_deps(e);
+    return !deps.unwakeable && deps.unnotified_box == nullptr;
+}
+
+// Whether one member of an event control is sampled. A lone class property and a
+// lone `weak_reference::get()` are not: each has a notifier of its own that fires
+// on exactly the change the control names (push_prop_wait_events, weak_get_call).
+bool Lowerer::event_member_sampled(const SignalEventControl& ev) {
+    if (waited_class_prop(ev.expr) != nullptr || weak_get_call(ev.expr) != nullptr) {
+        return false;
+    }
+    return event_expr_sampled(ev.expr);
+}
+
+// Whether `tc` is an event control every member of which is sampled; `members`
+// receives them in source order. A list that mixes sampled members with others is
+// not: a process woken from it cannot tell which member woke it, so it cannot tell
+// an event of an unsampled member from a wake that left every sample unchanged.
+bool Lowerer::event_control_sampled(const TimingControl& tc, std::vector<const SignalEventControl*>* members) {
+    std::vector<const SignalEventControl*> found;
+    std::vector<const TimingControl*>      work{ &tc };
+    while (!work.empty()) {
+        const TimingControl* t = work.back();
+        work.pop_back();
+        if (t->kind == TimingControlKind::SignalEvent) {
+            found.push_back(&t->as<SignalEventControl>());
+        } else if (t->kind == TimingControlKind::EventList) {
+            const auto events = t->as<EventListControl>().events;
+            // Pushed in reverse, so that they come off the stack in source order.
+            for (size_t k = events.size(); k-- > 0;) {
+                work.push_back(events[k]);
+            }
+        } else {
+            return false;
+        }
+    }
+    if (found.empty() ||
+        !std::ranges::all_of(found, [&](const SignalEventControl* ev) { return event_member_sampled(*ev); })) {
+        return false;
+    }
+    if (members != nullptr) {
+        *members = std::move(found);
+    }
+    return true;
+}
+
+// Whether the change from `old` to `cur`, both of type `ty`, is the event `edge`
+// names (LRM 9.4.2). With no edge that is any change in the value; with one it is
+// Table 9-2 on the least significant bit, which only an integral type has (slang
+// refuses an edge on any other).
+ir::Index Lowerer::sampled_event_hit(ir::Index            old,
+                                     ir::Index            cur,
+                                     ir::Ref              ty,
+                                     slang::ast::EdgeKind edge,
+                                     ir::Builder&         b,
+                                     ir::SourceLoc        l) {
+    using T = ir::Inst::Tag;
+    if (edge == slang::ast::EdgeKind::None) {
+        // A real compares as a real and a string by its characters; everything
+        // else, a 4-state vector included, bit for bit.
+        const T same = module_.pool.is_float(ty) ? T::FEq : is_string_ref(ty) ? T::Eq : T::CaseEq;
+        return b.unary(T::Lnot, b.binary(same, cur, old, l), l);
+    }
+    const ir::Ref   bit  = make_int_type(1, module_.pool.layout(ty).domain == ir::Domain::Four);
+    const ir::Index was  = b.convert(old, bit, false, l);
+    const ir::Index now  = b.convert(cur, bit, false, l);
+    const ir::Index one  = b.constant(module_.pool.put_int(bit, 1), l);
+    const ir::Index zero = b.constant(module_.pool.put_int(bit, 0), l);
+    const auto      is   = [&](ir::Index v, ir::Index k) { return b.binary(T::CaseEq, v, k, l); };
+    const auto      isnt = [&](ir::Index v, ir::Index k) { return b.unary(T::Lnot, b.binary(T::CaseEq, v, k, l), l); };
+    // Table 9-2. posedge: 0 to anything else, or anything but 1 to 1. negedge: 1 to
+    // anything else, or anything but 0 to 0. Neither holds between x and z.
+    const auto posedge = [&] {
+        return b.binary(T::Bor,
+                        b.binary(T::Band, is(was, zero), isnt(now, zero), l),
+                        b.binary(T::Band, isnt(was, one), is(now, one), l),
+                        l);
+    };
+    const auto negedge = [&] {
+        return b.binary(T::Bor,
+                        b.binary(T::Band, is(was, one), isnt(now, one), l),
+                        b.binary(T::Band, isnt(was, zero), is(now, zero), l),
+                        l);
+    };
+    switch (edge) {
+        case slang::ast::EdgeKind::PosEdge:
+            return posedge();
+        case slang::ast::EdgeKind::NegEdge:
+            return negedge();
+        default:
+            return b.binary(T::Bor, posedge(), negedge(), l);
+    }
+}
+
+// `@(...)` every member of which reads heap state (event_control_sampled). LRM
+// 9.4.2: the event of a member is a change in the value of its expression, or the
+// named edge of its least significant bit, and "a change of value in any operand
+// of the expression without a change in the result of the expression shall not be
+// detected as an event". So each member's value is sampled, the process parks on
+// everything any member depends on (expr_wait_deps), and each wake compares:
+//
+//   forever begin
+//     s1 = e1; s2 = e2;
+//     @(what e1 and e2 depend on);
+//     if (e1 changed from s1 [and its iff holds]) break;
+//     if (e2 changed from s2 [and its iff holds]) break;
+//   end
+//
+// A wake that changed no member's value parks again, which is what makes the
+// design-wide notifiers of expr_wait_deps sound here: they fire for objects the
+// expression never reads.
+//
+// The samples are values of the loop body, not variables: each pass takes its own
+// before it parks, and nothing runs between a failed compare and the next sample.
+// A value held across a park is the waiting thread's, so several threads forked at
+// one `@` each compare against their own.
+//
+// The value compared is the one the expression has when the woken process runs,
+// which is after the process that changed it has suspended. A change that is
+// undone before then is not seen, as it is not by the net synth_event_net drives
+// for an expression over signals.
+void Lowerer::lower_sampled_event_wait(std::span<const SignalEventControl* const> members,
+                                       ir::Builder&                               b,
+                                       ir::SourceLoc                              l) {
+    struct Member {
+        const SignalEventControl* ev;
+        ir::Ref                   ty;
+        ExprWaitDeps              deps;
+    };
+    std::vector<Member> ms;
+    ms.reserve(members.size());
+    for (const SignalEventControl* ev : members) {
+        ms.push_back(Member{ .ev = ev, .ty = lower_type(*ev->expr.type), .deps = expr_wait_deps(ev->expr) });
+    }
+    // A string and a real are not vectors for convert to resize; an integral value
+    // is brought to the expression's own type, as synth_event_net brings it.
+    const auto value = [&](const Member& m) {
+        const ir::Index v = lower_expr(m.ev->expr, b);
+        return is_string_ref(m.ty) || module_.pool.is_float(m.ty) ? v
+                                                                  : b.convert(v, m.ty, m.ev->expr.type->isSigned(), l);
+    };
+
+    b.open_region();
+    const ir::Index      lpred = true_const(b, l);
+    const ir::ExtraSlice lcond = b.close_region();
+
+    b.open_region();
+    {
+        std::vector<ir::Index> samples;
+        samples.reserve(ms.size());
+        for (const Member& m : ms) {
+            samples.push_back(value(m));
+        }
+        std::vector<ir::WaitEdge> edges;
+        for (const Member& m : ms) {
+            push_wait_edges(m.deps, b, l, edges);
+        }
+        b.wait(edges, l);
+        for (size_t k = 0; k < ms.size(); ++k) {
+            const Member&   m   = ms[k];
+            const ir::Index hit = sampled_event_hit(samples[k], value(m), m.ty, m.ev->edge, b, l);
+            b.open_region();
+            if (m.ev->iffCondition != nullptr) {
+                // LRM 9.4.2.3: the event is detected only if the condition holds
+                // when it occurs.
+                const ir::Index guard = lower_predicate(*m.ev->iffCondition, b);
+                b.open_region();
+                b.break_(l);
+                const ir::ExtraSlice pass = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice skip = b.close_region();
+                b.cond(guard, pass, skip, l);
+            } else {
+                b.break_(l);
+            }
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(hit, then_r, else_r, l);
+        }
+    }
+    const ir::ExtraSlice body = b.close_region();
+
+    b.open_region();
+    const ir::ExtraSlice step = b.close_region();
+
+    b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+}
+
 // Level-sensitive wait (LRM 9.4.3): suspend until `cond` is true, then run
 // the body. Lowered as `forever begin if (cond) break; @(any-change on cond's
 // reads); end` followed by the body. An already-true cond breaks on the first
@@ -1705,61 +2143,15 @@ const Lowerer::ClockingBlockState& Lowerer::clocking_state(const ClockingBlockSy
 // all match.
 void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
     const ir::SourceLoc l = loc(w);
-    // The wait sensitivity: every signal the condition reads, each as an
-    // any-change (level) event. Fails loudly on a string operand (wait
-    // queues are not string-aware — see collect_expr_reads).
-    std::vector<ir::WaitEvent> reads;
-    collect_expr_reads(w.cond, reads);
-    // A member read through a virtual interface is not one of those signals:
-    // the collector sees the handle variable, not the member. Gather the member
-    // accesses separately and park on each one's instance (LRM 25.9). The
-    // handles are evaluated inside the loop body, so a retargeted handle is
-    // re-read on every pass, and so that the values dominate the wait.
-    const std::vector<const MemberAccessExpression*> vif_reads = vif_member_reads(w.cond);
-    // Class properties the condition reads (LRM 9.4.3). They are not signals
-    // either -- a property is heap storage inside an object -- so each one parks
-    // on its own hidden any-change notifier, whose object handle is lowered inside
-    // the loop body like a virtual interface's, so a reassigned handle is re-read
-    // on every pass.
-    ClassPropReadScan prop_reads;
-    w.cond.visit(prop_reads);
-    // Fork-captured automatics the condition reads. Each lives in a GC box (a
-    // one-field synthetic class, docs/design/fork-join.md V4), not a signal, so
-    // the signal collector above sees none of them; each parks on its box's
-    // hidden change notifier instead, minted by box_class_for because the
-    // design-wide pre-pass (WaitPropScan) saw this very statement. A boxed read
-    // whose type can carry no notifier is refused loudly below, exactly like
-    // the class-property case.
-    std::vector<const ValueSymbol*> boxed_reads;
-    {
-        ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
-        WaitLocalScan                                                scan;
-        scan.out = &named;
-        w.cond.visit(scan);
-        for (const ValueSymbol* vs : named) {
-            if (!is_boxed_symbol(*vs)) {
-                continue;
-            }
-            if (!box_can_notify(vs->getType().getCanonicalType())) {
-                // TODO: same aggregate shapes as the property arm below, plus
-                // `event`, whose `.triggered` a capture box cannot notify on yet.
-                fail("wait on the fork-captured automatic '" + std::string(vs->name) + "' of type " +
-                     vs->getType().toString() +
-                     " is not supported: a capture box of this type has no change notifier");
-            }
-            boxed_reads.push_back(vs);
-        }
-        // Set iteration order is hash-dependent; sort by name then location so
-        // the emitted IR is deterministic.
-        std::ranges::sort(boxed_reads, [](const ValueSymbol* a, const ValueSymbol* c) {
-            if (a->name != c->name) {
-                return a->name < c->name;
-            }
-            return a->location < c->location;
-        });
+    const ExprWaitDeps  deps = expr_wait_deps(w.cond);
+    if (deps.unnotified_box != nullptr) {
+        // TODO: same aggregate shapes as the property arm below, plus
+        // `event`, whose `.triggered` a capture box cannot notify on yet.
+        fail("wait on the fork-captured automatic '" + std::string(deps.unnotified_box->name) + "' of type " +
+             deps.unnotified_box->getType().toString() +
+             " is not supported: a capture box of this type has no change notifier");
     }
-    if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() &&
-        prop_reads.event_props.empty() && boxed_reads.empty() && prop_reads.any_prop) {
+    if (deps.unwakeable) {
         // The condition reads a class property that can carry no notifier -- an
         // unpacked struct or union, or a FIXED unpacked array -- and nothing else
         // that can wake this process. Lowering it anyway is what used to happen,
@@ -1778,55 +2170,9 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
              "property cannot be waited on)");
     }
 
-    // The edges to park on, lowered where the caller has its region open: a handle is
-    // evaluated at the park, so a reassigned one is re-read on every pass.
     const auto park = [&] {
         std::vector<ir::WaitEdge> edges;
-        edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size() + prop_reads.event_props.size() +
-                      prop_reads.weak_gets.size());
-        for (const ir::WaitEvent& e : reads) {
-            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
-        }
-        for (const MemberAccessExpression* ma : vif_reads) {
-            const std::optional<ir::Signal> rep =
-              vif_member_signal(ma->member, vif_named_body(ma->value()),
-                                "'" + std::string(ma->member.name) + "'");
-            const ir::Index inst = lower_expr(ma->value(), b);
-            if (rep) {
-                edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
-                                              ir::kNoWaitHandle, inst });
-            }
-        }
-        for (const Expression* pe : prop_reads.notifiable) {
-            edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
-                                          static_cast<uint32_t>(ir::Edge::Any),
-                                          prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
-        }
-        for (const CallExpression* get : prop_reads.weak_gets) {
-            // `w.get()` (LRM 8.30.3) reads w's referent, which clear() and the
-            // collector change; park on that referent's notifier.
-            edges.push_back(
-              ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), weak_notifier_handle(*get, b) });
-        }
-        for (const Expression* pe : prop_reads.event_props) {
-            // Park on the event OBJECT the property holds right now, exactly
-            // what `-> e` fires (LRM 9.4.3 re-tests the condition on wake, so
-            // a trigger that leaves it false costs one re-test). The handle is
-            // loaded inside the loop body, so a reassigned property is re-read
-            // on every pass, like a vif handle above.
-            edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
-                                          static_cast<uint32_t>(ir::Edge::Any),
-                                          lower_expr(*pe, b) });
-        }
-        for (const ValueSymbol* vs : boxed_reads) {
-            // Park on the box's notifier event, dereferencing the box handle AT
-            // THIS POINT in the body: a fresh iteration of an enclosing loop can
-            // re-box (install_fork_decl_box allocates per entry), so the handle
-            // is re-read on every pass, like a vif handle above.
-            edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
-                                          static_cast<uint32_t>(ir::Edge::Any),
-                                          boxed_notifier_handle(*vs, b, l) });
-        }
+        push_wait_edges(deps, b, l, edges);
         // An empty list is legal and meaningful: `wait(0)` reads nothing and
         // parks the process for the rest of the run.
         b.wait(edges, l);

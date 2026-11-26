@@ -306,6 +306,7 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
         push_weak_body(root, ref, fields);
     } else if (sync_root) {
         push_sync_body(root, fields);
+        register_sync_notifier(root, ref);
     }
     for (const slang::ast::ClassType* k : chain) {
         for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
@@ -351,6 +352,9 @@ uint32_t Lowerer::reserve_change_notifiers(const slang::ast::ClassPropertySymbol
                                            ir::Ref                                class_ref,
                                            uint32_t                               prop_field,
                                            uint32_t                               next) {
+    // The property's design-wide notifier, if a subroutine some wait calls reads
+    // it. It is an event of the design, not a field, so it takes no index.
+    register_shared_notifier(prop, class_ref, prop_field, is_notified_container(prop.getType().getCanonicalType()));
     if (waited_props_ == nullptr || !waited_props_->contains(prop)) {
         return 0;
     }

@@ -610,13 +610,10 @@ This is the whole load-bearing argument, so it is worth stating flatly.
   `q.push_back(x); q.pop_back();` is two mutations and leaves `q.size()` exactly
   where it started.
 
-`@` over a container-dependent expression is therefore **refused loudly**
-(`refuse_container_event_control`, "an event control on a container class
-property … is not supported; only `wait` can park on one"), not silently given
-the mutation notifier. Implementing it properly needs the expression's value
-snapshotted in the WAITER's own frame and compared on every wake — a different
-mechanism from this file's, since the write side has nothing to classify. That is
-the `TODO:` on the refusal.
+`@` over a container-dependent expression therefore cannot be given the mutation
+notifier as its event. It is a sampled wait instead ("Waiting through a method",
+below): the process parks on the mutation notifier, and on each wake compares the
+expression's value with the one it had when it parked.
 
 Because only `wait` can reach a container notifier, only `Edge::Any` is ever
 asked for: a container property carries exactly one hidden field, never `.pos` or
@@ -924,12 +921,91 @@ remaining construct (an implicit `@*` inside a procedural body).
 
 - An EDGE qualifier on an event expression: slang rejects it as not integral,
   as for every non-integral type above.
-- `@` over a container property, and the aggregate property shapes: previous
-  rungs' refusals, untouched.
+- The aggregate property shapes: a previous rung's refusal, untouched.
 - A multi-top design still drains the globals queue at the FIRST top, so a $unit
   class body waiting on an interface only a LATER top instantiates keeps the
   never-bound behavior — the same pre-existing cross-top boundary the
   `vif_scopes` computation already documents.
+
+## Waiting through a method, and `@` over a computed value (LRM 9.4.2)
+
+The rungs above wait on a property the expression names. Two shapes they did not
+cover, and both failed without a word: `wait (c.get() == 3)` never woke, and
+`@(c.get())` or `@(c.v == 3)` was handed to the continuous process that drives a
+net for `@(a + b)` over signals, which read `c` when it was built and never ran
+again.
+
+### What a called subroutine reads
+
+9.4.2: "Changing the value of object data members, aggregate elements, or the size
+of a dynamically sized array referenced by a method or function shall cause the
+event expression to be reevaluated. An implementation may cause the event
+expression to be reevaluated when changing the value or size even if the members
+are not referenced by the method or function."
+
+`CalleeReadScan` walks the body of every function the expression calls, and of
+every function those call. A virtual call can run any override, and a call
+through an interface class handle any implementation, so those bodies are walked
+too (`MethodOverrides`, built from every class of the design). It collects three
+things:
+
+- **Instance properties.** A body can reach a property through any object: `this`,
+  a handle it holds, an argument. So there is no object for the waiter to name,
+  and the property gets a notifier for the whole design, an event that a change of
+  that property on *any* object fires (`ir::ChangeNotify::shared`). The second
+  sentence quoted is the licence. It is a hidden event signal, numbered, and the
+  store path fires it where it fires the object's own notifiers
+  (`fire_prop_notifier`), from a table of handles filled at power-on
+  (`clotho.chg_shared`), so a store in any unit reaches it.
+- **Built-in classes.** `mailbox::num` and the `try_*` functions read the FIFO,
+  `semaphore::try_get` the key count, `weak_reference::get` the referent. Each
+  class has one design-wide notifier on that field, which `put` and `get` fire by
+  storing where they store and the collector pends when it clears a referent
+  (`rt_gc_map::weak_shared`). `wait (mb.num() != 0)` is this case at the top of the
+  expression.
+- **Signals.** A static property, a module or package variable. They join the
+  expression's own signals.
+
+A property nothing reaches through a call has no design-wide notifier and its
+stores are as they were.
+
+### `@` as a sampled wait
+
+An event expression that reads heap state (a property inside a larger expression,
+a container, a method call, a fork-captured automatic) is lowered in the process
+that waits (`lower_sampled_event_wait`):
+
+    forever begin
+      s = expr;
+      @(everything expr depends on);
+      if (expr changed from s) break;
+    end
+
+"A change of value in any operand of the expression without a change in the result
+of the expression shall not be detected as an event" is the compare. It is also
+what makes the over-approximate wakes harmless: the design-wide notifiers and a
+container's mutation notifier wake the process more often than its expression
+changes, and each such wake parks again. An edge is Table 9-2 on the sample's and
+the new value's least significant bits. `iff` is tested when a member's event is
+detected, and in a list each member has its own sample.
+
+The sample is a value of the loop body, so each thread forked at one `@` has its
+own.
+
+A lone property (`@(c.p)`) and a lone `w.get()` are not sampled: each has an
+object notifier that fires on exactly the named change.
+
+### Not done
+
+- A list that mixes a sampled member with an unsampled one (`@(c.get() or posedge
+  clk)`). A woken process cannot tell which member woke it, so it cannot tell the
+  clock's edge from a wake that changed no sample.
+- An event control of a nonblocking intra-assignment or of `->>`, and a clocking
+  event of an assertion, a covergroup or a clocking block, over such an
+  expression. Those are records and clocks, not a process that could sample.
+- A callee that reads a property of a type with no notifier (an unpacked struct or
+  union, a fixed unpacked array, an `event`), a string variable, or
+  `process::status()`.
 
 ## Implementation deviations from the scope-out below
 
