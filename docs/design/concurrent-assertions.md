@@ -577,56 +577,48 @@ list. The fix:
 1. `register_signal` now also fills `signal_scope_`, its own inverse (Signal
    id -> declaring `InstanceScope::id`), alongside the forward attachment it
    already did.
-2. `sampled_shadow_of` looks `live` up in `signal_scope_`. Found: the
-   declaring scope is `find_scope_node(top_scope_, id)` — the SAME lookup
-   `alloc_assert_control` already used to attach a different piece of
-   per-assertion state (LRM 20.12 control masks) to an arbitrary scope, safe
-   for the same reason: Collect has already finished and frozen the scope
-   tree by the time either pass runs (`alloc_assert_control`'s own comment;
-   `sampled_shadow_of` runs later still, during Emit). Not found: `live` was
-   registered with `scope_stack_` empty, which only the standalone globals
-   Lowerer does — a package / `$unit` variable.
-3. The shadow is registered by temporarily pushing the declaring scope (or,
-   for the package / `$unit` case, calling `module_.add_signal` directly, so
-   it stays unscoped exactly as `live` itself is). A null declaring scope
-   therefore does not need a synthetic home: `build_state_types` already
-   treats a signal claimed by no `InstanceScope` as a flat root-level field,
-   which is exactly where a package / `$unit` live signal already lives.
+2. `sampled_shadow_of` registers the shadow in the SAMPLING scope
+   (`scope_stack_.back()`), keyed by (sampling scope, `live`), when `live` is
+   in `signal_scope_`. A shadow is then state of the unit whose assertion or
+   clocking block reads it, whichever instance owns `live`: its own, a parent
+   whose signal a port is bound to (modular-compilation.md "The boundary"), or
+   one a hierarchical reference names. Placing it in `live`'s declaring scope
+   instead made one unit's assertions part of another unit's state, so an edit
+   to the asserting module changed the declaring unit, and a bound port's
+   shadow named a different parent signal in every instance, splitting the
+   asserting definition into one unit per instance. A shadow of another
+   instance's signal is named `sva.shadow.$<n>` by its ordinal in the sampling
+   scope, which every instance of the unit numbers alike. Not found in
+   `signal_scope_`: `live` was registered with `scope_stack_` empty, which only
+   the standalone globals Lowerer does — a package / `$unit` variable.
+3. A package / `$unit` shadow is added with `module_.add_signal` directly, so
+   it stays unscoped exactly as `live` itself is, and one shadow serves every
+   sampling scope: `build_state_types` treats a signal claimed by no
+   `InstanceScope` as a flat root-level field, which is exactly where a
+   package / `$unit` live signal already lives.
 
 No change was needed to how a shadow is READ. Atom lowering, `$sampled`, and
 the `$past` ring all resolve a shadow through `sva_shadow_of` and then emit an
 ordinary `Load`, exactly as before; the relocation is invisible to them
 because addressing was never about the reader's scope to begin with.
 
-**Both invariants from §4's design hold, and neither needed new machinery to
-keep holding:**
+**Both invariants from §4's design hold:**
 
-- **One shadow per live signal, shared across every asserting scope.** The
-  `sva_shadows_` memoization at the top of `sampled_shadow_of` was always
-  keyed on `live` alone, never on the asserting scope — it simply could not
-  be exercised across scopes before, because a second asserting scope could
-  never get past the guard to ask a second time. Pinned by a fixture with two
-  different instances of one module (so this also exercises the shadow
-  surviving state-type deduplication, since both instances have structurally
-  identical monitors), both sampling one interface's `sig`: `shadow_count`
-  reads 1, not 2.
-- **The Preponed copy still runs exactly once per timestep.** No declaring
-  scope needed a Preponed process of its own to attach a copy to, because
-  there is only ever ONE — `finalize_preponed` builds a single,
-  per-top process tagged `Activation::Preponed` with `scope = Process::no_scope`
-  (never a specific instance), iterating `sva_shadow_pairs_` and emitting one
-  `Store(shadow, Load(live))` per PAIR, in creation order — which the
-  `sva_shadows_` memoization already keeps to one entry per live signal. The
-  interface-instance and package/`$unit` cases needed no new Preponed
-  process because the existing one was already unscoped and already
-  addressed arbitrary signals directly, never relative to "the asserting
-  scope". The same two-instance fixture above counts exactly one `Store` in
-  the whole module's one Preponed process.
+- **One shadow per (sampling instance, live signal).** Every assertion and
+  clocking block of one instance shares it; two instances sampling one
+  interface's `sig` hold one shadow each, the price of keeping each unit's
+  sampled state its own.
+- **Each shadow is copied exactly once per timestep.** `finalize_preponed`
+  emits one `Activation::Preponed` process per scope holding a shadow (or a
+  per-step latch), owned by that instance, plus one unscoped process for the
+  package / `$unit` shadows; each iterates its `sva_shadow_pairs_` entries
+  and emits one `Store(shadow, Load(live))` per pair, in creation order.
+  `live` may be another instance's signal: a load addresses a signal through
+  its own declaring scope's anchor, never the reader's.
 
-**Depth is not narrowed.** `find_scope_node` walks the whole scope tree from
-`top_scope_`, not one level from the asserting scope, so a second hierarchy
-hop (`assert` in `A` sampling a signal inside `A.b.c`, where `b` instantiates
-`c`) costs nothing extra — verified with exactly that fixture.
+**Depth is not narrowed.** `signal_scope_` names any instance's signal, so a
+second hierarchy hop (`assert` in `A` sampling a signal inside `A.b.c`, where
+`b` instantiates `c`) costs nothing extra — verified with exactly that fixture.
 
 **One more, narrower gap sat behind this one.** `$past`/`$rose`/`$fell`/
 `$stable`/`$changed`'s own "plain variable" operand check (§4.1) tested only
@@ -994,7 +986,7 @@ layout, per-instance addressing and zero-init:
 | `sva.<n>.pass` | `bit [A-1:0]` | Attempts all of whose obligations have passed, waiting to go quiet |
 | `sva.<n>.fired` | `bit` | Trigger matched last cycle, for `\|=>` |
 | `sva.<n>.cnt` | `int` | Match count, `cover` only |
-| `sva.shadow.<sig>` | same as `<sig>` | Preponed shadow, one per sampled variable, shared by every assertion (§4) |
+| `sva.shadow.<sig>`, `sva.shadow.$<n>` | same as `<sig>` | Preponed shadow, one per (sampling instance, sampled variable), shared by that instance's assertions; `$<n>` for another instance's variable (§4) |
 | `sva.<n>.past.<sig>.<k>` | same as `<sig>` | History ring entry, the shadow from `k + 1` ticks ago; per monitor, only as deep as `$past` asks for (§4.1) |
 
 ---

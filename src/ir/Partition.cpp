@@ -160,6 +160,7 @@ private:
         };
         for (const Attribution::PortAlias& pa : a_.port_aliases) {
             const auto [u, k] = add(pa.scope, pa.port, BoundPort::Kind::Signal, static_cast<uint32_t>(pa.target));
+            d_.units[u].bound_ports[k].declared = true;
             alias_[u].try_emplace(static_cast<uint32_t>(pa.target), k);
         }
         for (const Attribution::IfacePort& ip : a_.iface_ports) {

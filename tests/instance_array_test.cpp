@@ -85,7 +85,7 @@ TEST_CASE("descending instance array elements flatten under <name>[<index>]") {
             wire [2:0] o;
             inv u[2:0](.a(g_in), .y(o));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
@@ -110,7 +110,7 @@ TEST_CASE("ascending instance array keeps declared indices in element names") {
             wire [2:0] o;
             inv u[0:2](.a(g_in), .y(o));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
@@ -131,7 +131,7 @@ TEST_CASE("non-zero-based instance array range keeps declared bounds in names") 
             wire [3:0] o;
             inv u[5:2](.a(g_in), .y(o));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
@@ -155,7 +155,7 @@ TEST_CASE("multidimensional instance array flattens each leaf with all indices")
             wire g_in;
             inv u[1:0][1:0](.a(g_in));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);

@@ -232,7 +232,7 @@ TEST_CASE("a module instance inside a for-generate flattens under the block") {
                 end
             endgenerate
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
@@ -258,7 +258,7 @@ TEST_CASE("an instance array inside a generate block flattens under both prefixe
                 end
             endgenerate
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);

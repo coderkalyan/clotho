@@ -152,6 +152,18 @@ struct InstanceScope {
     // no_unit.
     uint32_t monitor_base  = 0;
     uint32_t monitor_count = 0;
+    // Declared signals with no storage of their own, each a second name for the
+    // signal `target` and equal to it at every instant: a copy alias
+    // (alias_copies in Design.h) or a port whose parent supplies its storage. No
+    // body names one, so only consumers of declared names (the VCD dump) read
+    // this. `pos` is how many entries of `signals` the alias was declared after,
+    // so a consumer can list both in declaration order.
+    struct Alias {
+        SignalInfo info;
+        Signal     target{ 0 };
+        uint32_t   pos = 0;
+    };
+    std::vector<Alias> aliases;
 };
 
 // How a process is scheduled. The fine-grained trigger condition lives in the
@@ -1030,6 +1042,12 @@ public:
     // through a handle is emitted once for the definition. Empty when the design
     // declares no virtual interface.
     std::vector<uint32_t> vif_scopes;
+    // Per flat signal, 1 when it is the storage a child's port is bound to
+    // (Import::Kind::Port: a bound value port, an inout): code of the child's unit
+    // reaches it through a binding in every instance, so it takes one shape and
+    // one port layout whatever binds it (docs/design/modular-compilation.md,
+    // "Bound value ports"). Empty for a module built without units.
+    std::vector<uint8_t> port_bound;
     // Default %t time-unit exponent (10^n seconds): the smallest time precision
     // across all design timescales (LRM Table 20-3). Seeds the runtime's
     // $timeformat default at startup.

@@ -958,6 +958,7 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
           needs_port_coercion(*pc, p);
         if (!event_port && !coerced && p.direction != slang::ast::ArgumentDirection::InOut &&
             p.direction != slang::ast::ArgumentDirection::Ref) {
+            bind_value_port(inst, *pc, p);
             continue;
         }
         if (expr == nullptr) {
@@ -1050,6 +1051,162 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
             alias_syms_.try_emplace(p.internalSymbol, AliasSymbol{ scope, std::string(p.internalSymbol->name) });
         }
     }
+}
+
+// An input or output port is a continuous assignment between two nets or
+// variables (LRM 23.3.3), and when the two can be one storage they are made one
+// (23.3.3.7: "it shall be permissible to merge"): the child holds no storage
+// for the port and its body names a signal its parent supplies, through a bound
+// port as for an inout. Whether a port is bound is a fact of the child's
+// definition alone (value_port_bindable), so every instance of it is bound
+// alike and the definition stays one unit, however its parents connect it.
+// The parent binds its own signal when the connection is that whole signal
+// of the port's type (direct_port_target), and otherwise a temporary of its
+// own that the copy wire_ports emits writes or reads, so the copy is kept
+// exactly where the two cannot be one storage. See
+// docs/design/modular-compilation.md, "The boundary".
+void Lowerer::bind_value_port(const InstanceSymbol& inst, const PortConnection& pc, const PortSymbol& p) {
+    if (!merge_ports_ || !value_port_bindable(inst, p)) {
+        return;
+    }
+    const ValueSymbol* direct = direct_port_target(pc, p);
+    const ir::Signal   target = direct != nullptr ? signal_of(*direct) : port_temp(p);
+    if (direct != nullptr) {
+        bound_value_ports_.insert(&p);
+    }
+    inout_alias_[p.internalSymbol] = target;
+    owners_->attribution.port_aliases.push_back(
+      { .scope = cur_scope_id(), .port = std::string(p.internalSymbol->name), .target = target });
+}
+
+// Whether input or output port `p` of `inst`'s definition holds no storage of
+// its own. Every test reads the definition only, never the connection, so the
+// answer is the same for every instance. A port stays storage of its own,
+// copied as before, where one storage could not stand for both sides:
+//  - a program's port, whose copy runs in the Reactive region (LRM 24.3.2), and
+//    an interface's, which a virtual interface reaches by layout;
+//  - a select port (23.2.2.1), a non-integral type, a net of a kind that
+//    resolves or pulls or a net with a delay, two ports naming one net;
+//  - an input the child or anything else drives besides its port;
+//  - a forced or procedurally assigned port variable (LRM 10.6): a forced input
+//    must not reach the parent, and the force state lives with the storage;
+//  - an output net with more than one driver, which resolves in the child.
+bool Lowerer::value_port_bindable(const InstanceSymbol& inst, const PortSymbol& p) {
+    const bool input = p.direction == slang::ast::ArgumentDirection::In;
+    if ((!input && p.direction != slang::ast::ArgumentDirection::Out) ||
+        inst.getDefinition().definitionKind != slang::ast::DefinitionKind::Module || top_inst_ == nullptr) {
+        return false;
+    }
+    if (p.internalSymbol == nullptr || p.getInternalExpr() != nullptr ||
+        (p.internalSymbol->kind != SymbolKind::Net && p.internalSymbol->kind != SymbolKind::Variable)) {
+        return false;
+    }
+    const ValueSymbol&      v = p.internalSymbol->as<ValueSymbol>();
+    const slang::ast::Type& t = p.getType();
+    if (!t.isIntegral() || v.getType().isEvent() || lower_type(v.getType()) != lower_type(t)) {
+        return false;
+    }
+    if (v.kind == SymbolKind::Net) {
+        const NetSymbol& n = v.as<NetSymbol>();
+        if ((n.netType.netKind != NetType::Wire && n.netType.netKind != NetType::Tri) || n.getDelay() != nullptr) {
+            return false;
+        }
+    }
+    size_t uses = 0;
+    for (const PortConnection* other : inst.getPortConnections()) {
+        if (other->port.kind == SymbolKind::Port && other->port.as<PortSymbol>().internalSymbol == p.internalSymbol) {
+            ++uses;
+        }
+    }
+    if (uses != 1) {
+        return false;
+    }
+    // A forced variable's force state is a signal of the instance that owns the
+    // storage (join_pca_targets): bound, it would be the parent's, named by each
+    // instance differently, and the definition would be two units.
+    if (v.kind == SymbolKind::Variable && forced_member(v)) {
+        return false;
+    }
+    scan_net_uses();
+    const auto writes = writes_.find(&canonical_value_symbol(v));
+    if (input) {
+        return writes == writes_.end();
+    }
+    return v.kind == SymbolKind::Variable || writes == writes_.end() || writes->second.size() <= 1;
+}
+
+// The parent's own signal a bindable port can name directly: the connection is
+// that whole signal, of the port's type and already registered, and a net
+// exactly when the port is. 23.3.3.7 lets two NETS merge, so a `force` of either
+// may reach the other; a variable has no collapse, and a force of a net cannot be
+// seen here (net force sites are found after the ports are bound), so a net and
+// a variable keep the copy between them. For an output, the child then writes the
+// signal, so it must have no other driver, no forced state of a variable (the
+// copy is gated, the child's own writes are not) and, as a net, none of the
+// resolution or delay its own drivers would go through. Null when the parent
+// binds a temporary instead.
+const ValueSymbol* Lowerer::direct_port_target(const PortConnection& pc, const PortSymbol& p) {
+    const Expression* expr = pc.getExpression();
+    if (expr == nullptr) {
+        return nullptr;
+    }
+    const bool input = p.direction == slang::ast::ArgumentDirection::In;
+    if (!input && expr->kind != ExpressionKind::Assignment) {
+        return nullptr;
+    }
+    const Expression& conn = input ? *expr : expr->as<AssignmentExpression>().left();
+    if (conn.kind != ExpressionKind::NamedValue && conn.kind != ExpressionKind::HierarchicalValue) {
+        return nullptr;
+    }
+    const ValueSymbol& c = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
+    if (c.kind != p.internalSymbol->kind || !sigmap_.contains(&c) ||
+        lower_type(*conn.type) != lower_type(p.getType())) {
+        return nullptr;
+    }
+    if (input) {
+        return &c;
+    }
+    if (c.kind == SymbolKind::Net) {
+        const NetSymbol& n = c.as<NetSymbol>();
+        if ((n.netType.netKind != NetType::Wire && n.netType.netKind != NetType::Tri) || n.getDelay() != nullptr) {
+            return nullptr;
+        }
+    } else if (forced_member(c)) {
+        return nullptr;
+    }
+    return other_driver_of(conn) ? nullptr : &c;
+}
+
+// The parent's storage for a bound port it cannot name directly: a signal of the
+// parent's unit that no scope lists, of the port's type, a net exactly when the
+// port is (so it powers on as the child's own storage would).
+ir::Signal Lowerer::port_temp(const PortSymbol& p) {
+    ir::InstanceScope& parent = *scope_stack_[scope_stack_.size() - 2];
+    ir::SignalInfo     info;
+    info.name                 = prefix_ + std::string(p.internalSymbol->name) + "$port";
+    info.type                 = lower_type(p.getType());
+    info.is_net               = p.internalSymbol->kind == SymbolKind::Net;
+    const ir::Signal sig      = module_.add_signal(std::move(info));
+    own_signal(sig, ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = parent.id });
+    signal_scope_[static_cast<uint32_t>(sig)] = parent.id;
+    return sig;
+}
+
+// Whether some procedural block forces or procedurally assigns the variable
+// `sym` (scan_pca_targets): by its body's type and position for a member of an
+// instance, by symbol otherwise.
+bool Lowerer::forced_member(const ValueSymbol& sym) {
+    const Scope* owner = sym.getParentScope();
+    while (owner != nullptr && owner->asSymbol().kind != SymbolKind::InstanceBody) {
+        owner = owner->asSymbol().getParentScope();
+    }
+    if (owner == nullptr) {
+        return std::ranges::any_of(pca_->unscoped, [&](const auto& u) { return u.first == &sym; });
+    }
+    const auto&                 body = owner->asSymbol().as<slang::ast::InstanceBodySymbol>();
+    const std::vector<uint32_t> path = member_ordinal_path(sym, body);
+    return std::ranges::any_of(pca_->members,
+                               [&](const PcaTargets::Member& m) { return m.path == path && m.body->hasSameType(body); });
 }
 
 // Whether coercing the net port `p` of one instance to inout (LRM 23.3.3.1: "A port

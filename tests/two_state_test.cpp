@@ -18,9 +18,10 @@ namespace {
 
 // Emit unoptimized LLVM IR: these tests assert the backend's own emission
 // structure (native iW ops, slot types), which the optimization pipeline is
-// free to rewrite or constant-fold.
+// free to rewrite or constant-fold. The design is lowered as written, logic
+// nothing reads included, which is what most of these designs are.
 std::string emit(std::string_view source) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(result.ok, result.diagnostic_text());
     REQUIRE(result.module != nullptr);
     std::string              text;

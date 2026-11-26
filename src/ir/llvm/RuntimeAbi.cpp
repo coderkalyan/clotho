@@ -504,6 +504,12 @@ llvm::FunctionCallee Backend::vcd_array_fn() {
     return rt_fn("rt_vcd_array", b_.getVoidTy(), { ptr, i32, i32, i32, i32, ptr, ptr, i32, i64, i64 });
 }
 
+// void rt_vcd_alias(i8* name, i32 len, i32 width, i32 flags, i32 target)
+llvm::FunctionCallee Backend::vcd_alias_fn() {
+    auto* i32 = b_.getInt32Ty();
+    return rt_fn("rt_vcd_alias", b_.getVoidTy(), { raw_ptr_ty(), i32, i32, i32, i32 });
+}
+
 llvm::FunctionCallee Backend::vcd_start_fn() {
     return rt_fn("rt_vcd_start", b_.getVoidTy(), {});
 }

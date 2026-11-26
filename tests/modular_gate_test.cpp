@@ -181,6 +181,7 @@ module leaf #(parameter int N = 1) (input logic clk, input logic [7:0] d, output
     @(posedge clk);
     expect (@(posedge clk) d != 8'hff ##1 r != 8'hff) ok = 1; else ok = 0;
   end
+@LEAFX@
 endmodule
 
 module pair (input logic clk, input logic [7:0] d, output logic [7:0] q);
@@ -213,6 +214,7 @@ endmodule
 struct RichEdit {
     std::string_view bump = "v + 8'(K)";
     std::string_view leaf;
+    std::string_view leaf_extra;
     std::string_view pair;
     std::string_view pair_extra;
     std::string_view top_insts;
@@ -228,6 +230,7 @@ std::string rich(const RichEdit& e) {
     };
     put("@BUMP@", e.bump);
     put("@LEAF@", e.leaf);
+    put("@LEAFX@", e.leaf_extra);
     put("@PAIR@", e.pair);
     put("@PAIRX@", e.pair_extra);
     put("@TOPI@", e.top_insts);
@@ -237,10 +240,7 @@ std::string rich(const RichEdit& e) {
 
 // What an edit adds that the rest of the design numbers: a block, an event, a
 // covergroup, a process. Written on one line, triggered and reading only by the
-// module's own signals, so it moves no source line of another module and adds no
-// waiter to a signal another unit declares: that changes the declaring unit's code
-// (an edge of the parent's `clk` here), a fact the declaring unit still joins over
-// until step 4 (summaries).
+// module's own signals and ports, so it moves no source line of another module.
 constexpr std::string_view kPairExtra =
   "logic extra; event ex; always_ff @(posedge s0) begin extra <= ~t0[0]; -> ex; end "
   "covergroup cg2 @(posedge s0); coverpoint t0; endgroup cg2 cgi2 = new;";
@@ -299,8 +299,28 @@ TEST_CASE("a rich design: what an edit adds to the design's numbering changes no
     SUBCASE("a process in a middle module") {
         only_unit_changed(base, rich({ .pair_extra = "logic [7:0] pc = 0; always #7 pc = pc + 1;" }), "pair", 1);
     }
-    SUBCASE("a new instance is an edit of its parent (it owns the port copies) and of nothing else") {
+    SUBCASE("a new instance is an edit of its parent (it owns the port bindings) and of nothing else") {
         only_unit_changed(base, rich({ .top_insts = "  pair inst3 (.clk, .d, .q());" }), "top", 1);
+    }
+}
+
+// A port's storage is its parent's, and every writer of it services all three edges
+// through its port whatever waits there (modular-compilation.md, "The boundary"),
+// so a wait on a port's edge, from either side of the port, changes the waiting
+// unit's code and no writer's.
+TEST_CASE("a rich design: a new wait on a port's edge changes only the waiting unit") {
+    // Each waiting process prints, so unread-logic removal keeps it.
+    const std::string base = rich({});
+    SUBCASE("a leaf waits on an edge of its input, which the top writes") {
+        only_unit_changed(base, rich({ .leaf_extra = "always @(negedge clk) if (d == 8'hff) $display(\"d\");" }),
+                          "leaf", 2);
+    }
+    SUBCASE("a middle module waits on an edge of a signal a leaf's output writes") {
+        only_unit_changed(base, rich({ .pair_extra = "always @(negedge s0) $display(\"s0\");" }), "pair", 1);
+    }
+    SUBCASE("a middle module waits on an edge of its input, which the top writes") {
+        only_unit_changed(base, rich({ .pair_extra = "always @(negedge clk) if (t0 == 8'hff) $display(\"t0\");" }),
+                          "pair", 1);
     }
 }
 

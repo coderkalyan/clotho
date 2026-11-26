@@ -105,20 +105,28 @@ LowerResult lower_sources(std::span<const std::string_view> args,
 // the returned `sources` keeps the Driver (hence its SourceManager) alive so a
 // `SourceLoc` stays resolvable. `path_prefix_map` changes how the simulation's
 // messages show source paths (SourceContext::shown_file). `stats` selects the
-// frontend's `--stat` reports (ir::Stat).
+// frontend's `--stat` reports (ir::Stat). `as_written` lowers the design as
+// written: the processes whose results nothing reads are kept, and every input
+// and output port keeps storage of its own, where otherwise the first are
+// removed and the second merged with what they connect to; `lint`, `synth` and a
+// debugger (`--as-written`) want every signal there is.
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          Timings*                               timings             = nullptr,
                          ir::SystemAccess                       allow_system        = ir::SystemAccess::Off,
                          PathPrefixMap                          path_prefix_map     = {},
                          bool                                   allow_port_coercion = false,
-                         uint32_t                               stats               = 0);
+                         uint32_t                               stats               = 0,
+                         bool                                   as_written          = false);
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.
+// `as_written` as for lower_driver: a test that inspects how a construct lowers,
+// rather than what a design does, lowers the design as written.
 LowerResult lower_text(std::string_view source,
                        Timings*         timings             = nullptr,
                        ir::SystemAccess allow_system        = ir::SystemAccess::Off,
-                       bool             allow_port_coercion = false);
+                       bool             allow_port_coercion = false,
+                       bool             as_written          = false);
 
 // Lower an editor's in-memory buffer, named `path` so its diagnostics can be
 // attributed back to the file the client has open.

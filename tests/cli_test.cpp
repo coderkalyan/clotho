@@ -432,6 +432,7 @@ TEST_CASE("cli: --help-all lists every option, tagged with the commands that tak
                                                  "--gc-heap-max",
                                                  "--gc-full-every",
                                                  "--loose-stale-ref",
+                                                 "--as-written",
                                                  "--perf-jitdump" });
     // Whatever a command's own help lists, `--help-all` lists too, and
     // `--help-all` after a command is the same list.
@@ -609,7 +610,10 @@ TEST_CASE("cli: --stat=unit-code counts the functions emitted for the groups of 
             initial #1 bus.clk = 1;
         endmodule
     )");
-    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    // Nothing reads `n`, so the design is simulated as written for there to be
+    // groups to count.
+    const Result r =
+      s.run(std::format("build --emit=llvm --stat=unit-code --as-written -o /dev/null \"{}\"", design.string()));
     CHECK(r.code == 0);
     CHECK(contains(r.err, "2 groups of multi-instance units over 6 instances' groups, 2 functions emitted (3 of the groups are coroutines"));
     CHECK(contains(r.err, "1 schedule groups run several groups (3 rows)"));

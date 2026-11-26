@@ -1438,7 +1438,7 @@ TEST_CASE("hierarchical emission preserves the instance tree and signal names") 
           child u1(.clk(clk), .d(a),   .q(mid));
           child u2(.clk(clk), .d(mid), .q(y));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(r.ok);
     const std::string text = legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Instances });
     CAPTURE(text);
@@ -1447,7 +1447,7 @@ TEST_CASE("hierarchical emission preserves the instance tree and signal names") 
     CHECK(text.find(".clk(clk)") != std::string::npos);
     CHECK(text.find(".q(mid)") != std::string::npos);
 
-    const LowerResult again = lower_text(text);
+    const LowerResult again = lower_text(text, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(again.ok, again.diagnostic_text());
     CHECK(paths_of(*r.module) == paths_of(*again.module));
 }
@@ -1460,7 +1460,7 @@ TEST_CASE("hierarchical emission is valid Verilog-2005") {
         module top(input clk, input [7:0] a, output [7:0] y);
           child u1(.clk(clk), .d(a), .q(y));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(r.ok);
     const std::string text = legalize::materialize(
       *r.module, nullptr, { .target = legalize::Target::V2005, .hierarchy = legalize::Hierarchy::Instances });
@@ -1666,7 +1666,7 @@ TEST_CASE("a port with no hardware form is dropped from the header and named") {
           real gain;
           sub s(gain, z);
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     const std::string text = legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Instances });
     CAPTURE(text);

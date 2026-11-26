@@ -52,9 +52,10 @@ std::vector<std::string> define_params(const std::string& ir, std::string_view n
     return out;
 }
 
-// Lower SystemVerilog text to a Module and emit LLVM IR as a string.
+// Lower SystemVerilog text to a Module and emit LLVM IR as a string. The emit
+// helpers lower the design as written: they inspect how a construct lowers.
 std::string emit(std::string_view source) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
@@ -67,7 +68,7 @@ std::string emit(std::string_view source) {
 // Emit with an explicit config (e.g. {.thunk = false} to force the coroutine
 // form for structural assertions on both lowerings).
 std::string emit(std::string_view source, ir::SimulationConfig config) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
@@ -81,7 +82,7 @@ std::string emit(std::string_view source, ir::SimulationConfig config) {
 // emission structure (block labels, typed GEPs), which the pipeline is free to
 // rewrite.
 std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .lower_coro = false }) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
@@ -341,7 +342,7 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
         module leaf(input logic a, output logic [7:0] q);
             logic [7:0] cnt;
             always @(posedge a) cnt <= cnt + 8'd1;
-            assign q = cnt;
+            assign q = ~cnt;
         endmodule
         module top;
             logic clk;
