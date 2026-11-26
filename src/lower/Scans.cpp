@@ -1920,30 +1920,20 @@ void BoxCandidateScan::handle(const BlockStatement& blk) {
         ValueRefScan rs;
         rs.out           = &candidates;
         rs.implicit_this = &implicit_this;
-        // NEITHER HALF of one of the fork's own declarations is a capture, because
-        // LRM 9.3.2 initializes such a variable "before any processes are spawned":
-        // lower_fork materializes it in the PARENT at the fork and gives it a fresh
-        // box per ENTRY, not the per-activation box install_capture_boxes hands out.
-        // Two consequences, and the clause's example turns on both:
+        // The INITIALIZER of one of the fork's own declarations is no child's
+        // reference: LRM 9.3.2 initializes such a variable "before any processes are
+        // spawned", so lower_fork evaluates it in the parent. That is what makes the
+        // clause's own carve-out implementable -- referring to a formal passed by
+        // reference is legal there even under join_any / join_none, precisely
+        // because no child-side access is involved.
         //
-        //   - the variable itself must not be boxed per activation, or one box
-        //     would be shared by every iteration's children and the clause's
-        //     example would print 333 instead of 123;
-        //   - its INITIALIZER is evaluated in the parent, so what that initializer
-        //     reads is not captured at all. That is what makes the clause's own
-        //     carve-out implementable -- referring to a formal passed by reference
-        //     is legal there even under join_any / join_none, precisely because no
-        //     child-side access is involved.
-        //
-        // A `begin ... end` nested inside the fork is a DIFFERENT block, so its
-        // declarations are none of this and keep the ordinary late path: the
-        // clause's own example says the nested `automatic int m = j` "is 4".
+        // A `begin ... end` nested inside the fork is a DIFFERENT block, a child,
+        // and its declarations are the child's own: the clause's example says the
+        // nested `automatic int m = j` "is 4".
         for_each_fork_stmt(blk, [&](const Statement& s) {
-            if (const auto* d = s.as_if<VariableDeclStatement>()) {
-                fork_scope_decls.insert(&d->symbol);
-                return;
+            if (s.kind != StatementKind::VariableDeclaration) {
+                s.visit(rs);
             }
-            s.visit(rs);
         });
     }
     visitDefault(blk);

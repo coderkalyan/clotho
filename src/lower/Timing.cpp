@@ -1846,7 +1846,7 @@ void Lowerer::push_wait_edges(const ExprWaitDeps&        deps,
     for (const ValueSymbol* vs : deps.boxed) {
         // Park on the box's notifier event, dereferencing the box handle AT
         // THIS POINT in the body: a fresh iteration of an enclosing loop can
-        // re-box (install_fork_decl_box allocates per entry), so the handle
+        // re-box (emit_decl_box allocates per entry), so the handle
         // is re-read on every pass, like a vif handle above.
         edges.push_back(
           ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), boxed_notifier_handle(*vs, b, l) });

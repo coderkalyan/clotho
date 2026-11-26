@@ -1139,7 +1139,7 @@ TEST_CASE("a fork child's wait wakes on a sibling child's write") {
 }
 
 // A fork-scope declaration in a PROCESS body boxes per entry
-// (install_fork_decl_box, design-state home): same hole, same fix.
+// (emit_decl_box, design-state home): same hole, same fix.
 TEST_CASE("wait on a fork-scope declaration wakes across sibling children") {
     constexpr std::string_view src = R"(
         module m;

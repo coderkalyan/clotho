@@ -161,6 +161,12 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
         return;
     }
 
+    // What the body's fork children reference: an automatic of the body among them
+    // is boxed at its declaration (box_if_captured).
+    BoxCandidateScan forks;
+    sym.getBody().visit(forks);
+    proc_fork_refs_ = std::move(forks.candidates);
+
     ir::Activation             activation = ir::Activation::Always;
     std::vector<ir::WaitEvent> wait_events;
     const Expression*          iff_guard = nullptr;
@@ -655,11 +661,12 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
         return; // `fork join` with no children: a no-op.
     }
 
-    // Inside a task or a function, a child body gets its OWN frame, so a
-    // reference to the enclosing formals or automatics cannot resolve the way it
-    // does in a process (where every parent variable is a module signal). Each
-    // such variable lives in a GC box for the whole activation, and the child
-    // receives the box HANDLE by value (docs/design/fork-join.md V4).
+    // A child body gets its OWN frame, and may outlive both the activation that
+    // forked it and the next entry to the block it was forked in. So an automatic
+    // or a formal of the enclosing body that a child references lives in a GC box,
+    // and the child receives the box HANDLE by value (docs/design/fork-join.md
+    // V4): of the formal's one box in a subroutine, of the box made at the
+    // variable's declaration otherwise (box_if_captured).
     //
     // One rule for all three join kinds. The predecessor passed a fat
     // `ArgDir::Ref` -- a raw pointer into the enclosing frame -- under `join`
@@ -669,7 +676,6 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
     // and a `kill` on a joining parent frees the frame under children that abort
     // later (docs/design/process-class.md §11), so even `join` did not really
     // guarantee the lifetime the pointer needed. The box has reference semantics,
-    // which is what LRM 9.3.2 asks for (an enclosing automatic is ONE variable),
     // and a live coroutine frame is a conservative GC root, so it outlives the
     // parent activation with no refcount and no ownership surgery.
     const ir::SourceLoc             l = loc(blk);
@@ -693,12 +699,12 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
     // their initialization value expression whenever execution enters their scope
     // and before any processes are spawned").
     //
-    // Declaration order is load-bearing rather than incidental: each box is
-    // registered before its own initializer is lowered and before the next
-    // declaration is reached, so `automatic int a = j; automatic int b = a + 1;`
-    // resolves `a` through the box just written. Once the variable is parent-side
-    // storage a child referencing it is an ORDINARY CAPTURE, which is why the rest
-    // of this function needs nothing new for it.
+    // Declaration order is load-bearing rather than incidental: each declaration
+    // is lowered, and boxed if a child references it, before the next is reached,
+    // so `automatic int a = j; automatic int b = a + 1;` resolves `a` through the
+    // box just written. Once the variable is parent-side storage a child
+    // referencing it is an ORDINARY CAPTURE, which is why the rest of this
+    // function needs nothing new for it.
     for (const VariableDeclStatement* d : decls) {
         if (d->symbol.lifetime != slang::ast::VariableLifetime::Automatic) {
             // A STATIC declaration is precisely the one that opts OUT of the
@@ -722,13 +728,39 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
             lower_var_decl(d->symbol, b);
             continue;
         }
-        install_fork_decl_box(d->symbol, b, l);
-        captures.push_back(&d->symbol);
-        // Ordinary declaration lowering, which routes the store through the box just
-        // installed (value_lvalue) and so covers an aggregate, a field default and
-        // the no-initializer type default (LRM Table 6-7) exactly as anywhere else.
+        // Ordinary declaration lowering: a fresh box on every entry to the fork if
+        // a child references the variable (LRM 9.3.2's "local copy, k, for each
+        // value of j"), and the initializer, a field default or the type default
+        // (LRM Table 6-7) stored exactly as anywhere else.
         lower_var_decl(d->symbol, b);
     }
+
+    // What the children take: the boxed symbols of this body they reference, in
+    // first-reference order, which IS a child's formal order.
+    ForkCaptureDetector                                              d;
+    ankerl::unordered_dense::set<const ValueSymbol*>                 boxed_syms;
+    const ankerl::unordered_dense::map<const ValueSymbol*, uint32_t> no_locals;
+    if (fn_ctx_ != nullptr) {
+        d.locals = &fn_ctx_->localmap;
+        for (const auto& [sym, bx] : fn_ctx_->boxed) {
+            boxed_syms.insert(sym);
+        }
+        d.this_var = fn_ctx_->this_var;
+    } else {
+        // A process body's other variables are module signals, which a child
+        // reaches as the body does.
+        d.locals = &no_locals;
+        for (const ValueSymbol* sym : proc_fork_refs_) {
+            if (proc_fork_boxes_.contains(sym)) {
+                boxed_syms.insert(sym);
+            }
+        }
+    }
+    d.boxed = &boxed_syms;
+    for (const Statement* c : children) {
+        c->visit(d);
+    }
+    captures = std::move(d.captured);
 
     if (fn_ctx_ != nullptr) {
         // LRM 13.4.4 allows `fork … join_none` in a function -- it schedules
@@ -747,39 +779,16 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
         // that matter are its own formals -- which is exactly the shape of LRM
         // 13.4.4's own `watch_for_zero` example.
         const char* enclosing = fn_ctx_->is_task ? "task" : "function";
-        ForkCaptureDetector d;
-        d.locals = &fn_ctx_->localmap;
-        ankerl::unordered_dense::set<const ValueSymbol*> boxed_syms;
-        for (const auto& [sym, bx] : fn_ctx_->boxed) {
-            boxed_syms.insert(sym);
-        }
-        d.boxed    = &boxed_syms;
-        d.this_var = fn_ctx_->this_var;
-        // Seeded with the fork's own declarations so the detector's dedupe keeps
-        // them at the front (their box is already installed) while appending
-        // everything else in first-reference order -- which IS the child's formal
-        // order.
-        d.captured = captures;
-        for (const Statement* c : children) {
-            c->visit(d);
-        }
-        // Every capture rides a GC box: installed at body entry for an enclosing
-        // automatic (BoxCandidateScan, which ran over this fork before the frame was
-        // laid out), or at the fork for one of the fork's own declarations. A miss is
-        // therefore a lowering bug -- the two walks disagreed -- not a source-level
-        // refusal, and it is reported as one.
-        for (const ValueSymbol* sym : d.captured) {
+        // Every capture rides a GC box: made at body entry for a formal, at its
+        // declaration for an automatic the body declares. A frame symbol with
+        // neither is one nothing boxes (a function's return variable, a
+        // randsequence production's formal).
+        for (const ValueSymbol* sym : captures) {
             if (!fn_ctx_->boxed.contains(sym)) {
                 fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
                      std::string(sym->name) + "' is not supported (internal: no capture box)");
             }
         }
-        captures = std::move(d.captured);
-        // No spawn-time-initialization guard any more: the fork's own declarations
-        // are evaluated above, in the parent, before any child exists. A
-        // declaration inside a child's `begin ... end` is a different block and
-        // keeps the ordinary late path, which is what 9.3.2's own example asks for
-        // ("automatic int m = j; // the value of m is 4").
     }
 
     if (children.empty()) {
@@ -1017,6 +1026,7 @@ void Lowerer::lower_if_chain(const ConditionalStatement& c,
 // process) and, if it has an initializer, store it. `force_frame` marks a loop
 // control variable, which is per-call regardless of the function's lifetime.
 void Lowerer::lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool force_frame) {
+    box_if_captured(vs, force_frame, b);
     declare_storage(vs, force_frame);
     if (is_static_local(vs, force_frame) &&
         (vs.getInitializer() != nullptr || aggregate_has_field_defaults(vs.getType()))) {
@@ -1418,6 +1428,13 @@ void Lowerer::lower_foreach(const ForeachLoopStatement& f, ir::Builder& b) {
         return;
     }
     const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
+    // The loop variables are one set for this execution of the statement, whichever
+    // dimension's loop declares each one's storage.
+    for (const ForeachLoopStatement::LoopDim& d : f.loopDims) {
+        if (d.loopVar != nullptr) {
+            box_if_captured(*d.loopVar, /*force_frame=*/true, b);
+        }
+    }
     lower_foreach_dim(f, 0, b);
 }
 

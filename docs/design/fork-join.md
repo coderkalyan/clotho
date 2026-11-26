@@ -5,13 +5,15 @@ Target: `fork … join` / `join_any` / `join_none`, plus `disable fork` /
 block or task. This is the last core testbench primitive missing after
 cross-hierarchy refs, `wait(expr)`, severity tasks, and immediate assertions.
 
-Status: **V1–V5 landed, plus V4b.** `fork … join` / `join_any` / `join_none`, in a
-process body, a task body and (for `join_none`) a function body; children capture the
-enclosing frame's automatics as GC-box handles for every join kind, and a fork's own
-`block_item_declaration`s are initialized in the parent before any child is spawned.
+Status: **V1–V5 landed, plus V4b and V4c.** `fork … join` / `join_any` / `join_none`,
+in a process body, a task body and (for `join_none`) a function body; children capture
+the enclosing body's automatics as GC-box handles for every join kind, each automatic
+boxed anew on every entry to its scope, and a fork's own `block_item_declaration`s are
+initialized in the parent before any child is spawned.
 Phased: V1 = `fork … join`; V2 = `join_any` / `join_none` (§V2 scope);
 V3 = `wait fork` / `disable fork`; V4 = captured-automatic lifetime, as GC boxes;
 V4b = spawn-time initialization of a fork's own declarations (§V4b scope);
+V4c = one instance of an automatic per entry to its scope (§V4c scope);
 V5 = `fork … join_none` inside a function (§V5 scope).
 
 V1 shipped with two statically-sized structures that a fork child reaches sized as
@@ -921,6 +923,91 @@ positions in one test so the distinction cannot decay: `444|123|444`. Worth reco
 precisely, since the V4 table below measured only the process-body shape: Verilator's
 `1 2 3` deviation on a bare capture is process-body-specific — in a TASK body it prints
 `444` and agrees with clotho.
+
+## V4c scope: one instance of an automatic per entry to its scope (LRM 6.21)
+
+V4 boxed a captured automatic once per activation, at body entry, on the reading
+that an enclosing automatic "stays one variable". In a process body it was not boxed
+at all: the variable was a module signal the children read in place. Both are one
+variable too few. 6.21:
+
+> Variables declared in an automatic task, function, or block are local in scope,
+> default to the lifetime of the call or block, and are initialized on each entry to
+> the call or block.
+>
+> The lifetime of a fork-join block shall encompass the execution of all processes
+> spawned by the block. The lifetime of a scope enclosing any fork-join block
+> includes the lifetime of the fork-join block.
+
+So a block that is entered again while children of its last entry still run has two
+instances of its automatics alive, and each child keeps the one it was forked
+beside. The idiom this exists for:
+
+    for (int i = 0; i < 3; i++) begin
+      automatic int id = i;
+      fork #1 $display(id); join_none
+    end
+
+prints 0, 1 and 2. It printed 2 three times, in a process body and in a task alike.
+The same mistake had a second face in a task: an automatic a fork CHILD declares for
+itself was boxed in the parent, because the child's own references to it made it a
+candidate, so every child of the activation shared it.
+
+### The rule
+
+An automatic that a fork child references lives in a box made **each time its
+declaration executes**, in the body that declares it. A child takes the handle by
+value when it is spawned, so it holds the box of the entry that forked it, and the
+declaring body goes on to a fresh box at the next entry. One rule covers:
+
+| declaration | boxed at |
+|---|---|
+| a declaration statement, in any block | the statement (`lower_var_decl`) |
+| a fork's own `block_item_declaration` (V4b) | the fork, in the parent (the same call) |
+| a `for` loop's variable | the loop header, once per execution of the loop |
+| a `foreach` loop variable | the `foreach`, once per execution, all dimensions |
+| a pattern variable (12.6) | the pattern that binds it |
+
+A formal and `this` are one variable for the activation and keep their box at body
+entry. A static variable is one for the run and is never boxed.
+
+### Which body
+
+`BoxCandidateScan` runs once per body before it is lowered and records every symbol
+a fork child in it references: `FnCtx::fork_refs` for a subroutine, a fork child or
+a randsequence production, `proc_fork_refs_` for a procedural block. It
+over-approximates on purpose (a signal, a static, a variable the child declares
+itself). What makes the result exact is that the box is made where the declaration
+is *lowered*: a child's own automatic is lowered in the child's body, against the
+child's set, so it boxes only if one of the child's own fork children reads it, and
+the parent never sees it. That is also what lets a fork child's automatics be
+captured by a nested fork, which was refused.
+
+The home of the handle is a frame slot in a subroutine and a design-state signal in
+a process body (`emit_decl_box`), as V4b had it for a fork's own declarations. A
+process body's fork now passes captures exactly as a subroutine's does; its other
+variables are still module signals the child reaches directly.
+
+### Cost
+
+One `ClassNew` per execution of the declaration of a captured automatic, where there
+was one per activation (subroutine) or none (process). A declaration no fork child
+references is not boxed, and a fork's own declaration that no child references is
+now a plain local where V4b always boxed it.
+
+### Not covered
+
+A function's implicit return variable and a randsequence production's formals have
+no box, and a fork child that reads one is still refused.
+
+### Verification
+
+`tests/fork_test.cpp`, "One instance of an automatic per entry to its scope". No
+oracle covers all of it: iverilog 13 refuses `automatic` in a static block and its
+`vvp` aborts on a detached child of an automatic task. Verilator 5.052 `--timing`
+agrees on the block-automatic cases and on a child's own automatic; it copies a
+bare loop variable at the fork, the deviation V4b already declined, so the loop
+variable case is the clause's.
 
 ## Hard parts (V1)
 
