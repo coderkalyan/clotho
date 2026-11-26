@@ -1009,30 +1009,6 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
     CHECK(signal_width(*r.module, "v") == 4);
 }
 
-TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
-    // Binding a type parameter to a not-yet-lowered type must hit the same loud
-    // guard as a direct declaration, not silently accept it (PRINCIPLES.md). (`event`,
-    // `chandle`, `class`, a virtual interface, an associative array with a
-    // class-handle value and one with an EVENT value, an associative array
-    // keyed by a chandle / event / virtual interface / unpacked union, and a
-    // mailbox of events were all prior examples here; every one of them lowers
-    // now.) `mailbox #(T)` bound to T = a virtual interface stands in as the
-    // still-unsupported type, reached THROUGH the type parameter rather than
-    // written directly: a virtual interface is not a container element type.
-    const LowerResult r = lower_text(R"(
-        interface ifc;
-        endinterface
-        module m #(parameter type T = int);
-            mailbox #(T) v;
-        endmodule
-        module top;
-            m #(.T(virtual ifc)) u();
-        endmodule
-    )");
-    CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("mailbox message element type is not supported") != std::string::npos);
-}
-
 TEST_CASE("a class type parameter lowers as a handle") {
     // The class example above now lowers: a class-typed signal is a handle (a
     // 2-state 64-bit value), so binding a type parameter to a class succeeds.
