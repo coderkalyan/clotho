@@ -52,12 +52,6 @@ void count_writes(const Ir& ir, std::vector<uint32_t>& writes) {
         const auto      i = static_cast<Index>(k);
         const Inst::Tag t = ir.tag(i);
         switch (t) {
-            case Inst::Tag::ReadMem:
-                bump(writes, static_cast<uint32_t>(ir.extra_data<ReadMemInfo>(ir.payload(i).op_extra.extra).target), kMany);
-                break;
-            case Inst::Tag::FreadMem:
-                bump(writes, static_cast<uint32_t>(ir.extra_data<FreadMemInfo>(ir.payload(i).op_extra.extra).target), kMany);
-                break;
             case Inst::Tag::IfaceSignal:
                 bump(writes, static_cast<uint32_t>(ir.extra_data<IfaceMember>(ir.payload(i).op_extra.extra).signal), kMany);
                 break;
