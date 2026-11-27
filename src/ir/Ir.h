@@ -3407,6 +3407,52 @@ public:
     virtual uint32_t map(HandleFamily family, uint32_t handle) = 0;
 };
 
+// What the scheduler trace needs to know about a store that belongs to a force or a
+// procedural `assign` (LRM 10.6; docs/design/scheduler-trace.md §2.4, rule R14). The state
+// of an override lives in hidden signals the frontend lowers (a variable's `<var>$force_site`
+// and `<var>$assign_site`, the `active` flag of a net's force site), and the value it gives
+// is stored by plain stores, so the backend cannot tell the stores that begin, end and apply
+// an override from any other store. The frontend marks them, by instruction index in a
+// sparse table of the body (Ir::override_mark), the way a construct's end is recorded.
+//
+// A mark changes nothing about its store and names only instructions the body has anyway
+// (lvalues the lowering emitted for the statement), never a signal handle: no analysis reads
+// it, and a design's generated code is what it was without it. Only a backend that plants the
+// trace (a build with CLOTHO_EXTRA_ASSERTS, SimulationConfig::trace_check) looks at one, to
+// report an event after the store.
+enum class OverrideKind : uint8_t {
+    // The store writes the state signal that is its lvalue: a variable's `force_site` (a
+    // `force` site's id, zero for `release`), its `assign_site` (an `assign` site's id, zero
+    // for `deassign`), or the `active` flag of one force site of a net (1, zero for `release`).
+    ForceState,
+    AssignState,
+    SiteState,
+    // The store gives its lvalue the value the override holds: the statement that began it,
+    // or the process that re-evaluates its right-hand side while it stays in force. A
+    // ForceApply and an AssignApply target a variable and name the layer's state signal in
+    // `state`; a SiteApply is the force statement's immediate store of its value into the net,
+    // names the site's `active` flag in `state` and the signal that holds its forced value in
+    // `shadow`.
+    ForceApply,
+    AssignApply,
+    SiteApply,
+    // The store is the net resolver's one store of a net that has force sites: the fold of
+    // its drivers with every active site laid over it.
+    Resolve,
+};
+
+struct OverrideMark {
+    OverrideKind kind = OverrideKind::ForceState;
+    // The lvalue of a state signal, an instruction before the store: ForceApply, AssignApply
+    // and SiteApply. kNoIndex for the other kinds.
+    Index state = kNoIndex;
+    // The lvalue of the signal that holds the forced value, an instruction before the store:
+    // SiteApply. kNoIndex for the other kinds.
+    Index shadow = kNoIndex;
+
+    bool operator==(const OverrideMark&) const = default;
+};
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -3452,6 +3498,23 @@ public:
     SourceLoc end(Index i) const {
         const auto it = ends_.find(static_cast<uint32_t>(i));
         return it == ends_.end() ? SourceLoc{ 0 } : it->second;
+    }
+
+    // The override fact recorded for the store `i`, or null. Sparse like `end`: only the
+    // stores of a force or a procedural `assign` have one, so a design without either has
+    // an empty table and the backend never looks.
+    const OverrideMark* override_mark(Index i) const {
+        const auto it = override_marks_.find(static_cast<uint32_t>(i));
+        return it == override_marks_.end() ? nullptr : &it->second;
+    }
+
+    bool has_override_marks() const {
+        return !override_marks_.empty();
+    }
+
+    // Every recorded fact, for the verifier and the printer.
+    const ankerl::unordered_dense::map<uint32_t, OverrideMark>& override_marks() const {
+        return override_marks_;
     }
 
     Inst::Tag tag(Index i) const {
@@ -3651,18 +3714,20 @@ private:
     }
 
     // Constructed atomically by Builder::finish().
-    Ir(const InternPool&                                 pool,
-       std::vector<Inst::Tag>                            tags,
-       std::vector<Inst::Payload>                        payloads,
-       std::vector<SourceLoc>                            locs,
-       ankerl::unordered_dense::map<uint32_t, SourceLoc> ends,
-       std::vector<uint32_t>                             extra,
-       ExtraSlice                                        root)
+    Ir(const InternPool&                                       pool,
+       std::vector<Inst::Tag>                                  tags,
+       std::vector<Inst::Payload>                              payloads,
+       std::vector<SourceLoc>                                  locs,
+       ankerl::unordered_dense::map<uint32_t, SourceLoc>       ends,
+       ankerl::unordered_dense::map<uint32_t, OverrideMark>    override_marks,
+       std::vector<uint32_t>                                   extra,
+       ExtraSlice                                              root)
       : pool_(&pool)
       , tags_(std::move(tags))
       , payloads_(std::move(payloads))
       , locs_(std::move(locs))
       , ends_(std::move(ends))
+      , override_marks_(std::move(override_marks))
       , extra_(std::move(extra))
       , root_(root) {}
 
@@ -3677,6 +3742,9 @@ private:
     // Construct ends, keyed by instruction index; see `end`. Empty unless the
     // frontend recorded an extent, which it does only for index expressions.
     ankerl::unordered_dense::map<uint32_t, SourceLoc> ends_;
+    // The facts of the stores of a force or a procedural `assign`, keyed by instruction
+    // index; see `override_mark`.
+    ankerl::unordered_dense::map<uint32_t, OverrideMark> override_marks_;
     // Flat u32 side-table for region bodies, operand slices, and extra structs.
     Array<uint32_t> extra_;
     // Top-level region: the process body (empty when default-constructed).

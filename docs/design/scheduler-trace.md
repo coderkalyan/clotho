@@ -78,6 +78,7 @@ that first emits it.
 | `nba_event` | the `<= @e` record, its repeat count, and one signal storage and edge or event object for each event it lists; `nba_stage` also carries a `<= #d` delay | `Stores.cpp:emit_intra_event_arm`, after the stage; `emit_intra_nba_arm` | 4 |
 | `members`, `member` | the guarded group's activation, each member's own list (storage, edge, member) from the IR, the number of members, and whether no two events of the group share a trigger bit; the activation and the member that starts | `RootTables.cpp:emit_seed` and `Trace.cpp:emit_trace_seed_row`, once per guarded group; `Subroutines.cpp:lower_group`, at the start of every member of a guarded group (thunk row and coroutine), after its guard. An event object is not listed | 4 |
 | `inertial_decide`, `inertial_arm`, `inertial_fire`, `inertial_applied` | decide: the site (the dense id of the target), whether the value equals the pending record's and the target's current one, and the epoch of the new record the runtime asked for (zero: none); arm: the site, the record, its delay and its epoch; fire: the record and whether the runtime takes it for the latest of its site; applied: the record | decide and fire: `runtime/Scheduler.cpp:rt_inertial_decide` and `rt_inertial_cb` (a zero delay calls the second at once, not through the wheel); arm: `Stores.cpp:emit_inertial_arm`, once the record is filled and before it is armed; applied: `rt_intra_release`, for each record a commit released (every intra-assignment site comes through it: the checker ignores the records that are not inertial) | 4 |
+| `override_state`, `override_apply`, `override_resolve` | state: the storage of the state signal written (a variable's `force_site` or `assign_site`, the `active` flag of a net's force site), which the checker reads; apply: the storage, shape and name of the target, the bits `lo` and `n` it was stored, the layer's state signal, and for a net's force statement the signal that holds the forced value; resolve: the storage, shape and name of a net its resolver stored | after each store that the IR marks (§2.4): `Inst.cpp:lower_inst` (`Store`), through `Trace.cpp:emit_trace_override`. A store that cannot be reported as a plain scalar place (a guarded select) reports an apply with no target, which only settles what its statement owes | 4 |
 
 A fork is a `fork` event, a `spawn` per child (tied to the record by its creator's latest `fork`) and the
 parent's join park (`join_none` has none); each child's completion is a `child_done` and, at the one the join
@@ -111,6 +112,46 @@ All 22 ungated speedups of `scheduler-rules.md` §2.2 appear.
 Gated: S6 is `dispatch` plus a park at the entry; S7 and S8 give a group one list; S9 shows as
 `member` events against each member's own list (R5.5, R6.4: phase 4); S11 makes every identity per
 instance; S20 shows as R7 on a slot with no z word.
+
+### 2.4 Overrides: `force`, `release`, `assign`, `deassign` (R14)
+
+**The rule** (`scheduler-rules.md` R14; LRM 10.6.1, 10.6.2 and 4.9.2 as `force-release.md` and `LRM_NOTES.md` note 49
+cite them). From its statement on, a `force` of a variable or a net and a procedural `assign` of a variable own their
+target. While one does, no ordinary write (procedural, continuous, a port copy, an NBA when it commits) and no driver change
+changes the target, and what waiters see is the forced value, not a transient of the drivers. A `release` of a variable
+ends the force and the value holds, until an active `assign` or a continuous driver, woken by the release, gives it theirs
+in a later step. A `release` of a net gives it "immediately" the value its drivers determine, past a net delay too (note
+49: the delay is the drivers', the force is the net's). A force by a constant part of a net is supported, one of a
+variable's select or of a concatenation is refused by the frontend, so the trace never meets one.
+
+**What the backend cannot see.** Clotho lowers this as hidden signals (`force-release.md`): a variable's
+`<var>$force_site` and `<var>$assign_site`, and the `active` flag and `val` of each force site of a net. The writers
+of a variable are gated on the state, a net's resolver lays its active sites over the fold of its drivers, and the value an
+override gives is stored by plain `Store`s. Nothing in the IR tells such a store from any other, so no event could be
+planted at one, and no test of the trace could say which change of a forced target is the override's.
+
+**The mark.** The frontend marks the stores that begin, end and apply an override, in a sparse table of the body, by
+instruction index (`ir::OverrideMark`: `Ir::override_mark`, set with `Builder::mark_override`), as it records the end of a
+construct. A mark is neither an instruction nor a bit of the store's payload. It names only lvalues the statement emitted
+anyway, so no analysis reads it and no pass, hash or dedup of a body differs: the generated code is what it was. `Ir::operator==`
+compares it, `rebased` copies it (instruction indices do not move), `Builder::rollback` drops the marks of an abandoned
+run, the verifier checks that each names a `Store` and lvalues of signals before it (`override-mark`) and the dump prints it
+after the store (`; override force_apply state=%3`). Without trace the marks cost a few table entries per force
+statement and the backend never looks at them: `--emit llvm-raw`, `--emit llvm` and `--emit ir` (marks aside) of a design with
+variable, assign, net, part and net-delay forces are byte-identical to the ones before the marks, with
+`CLOTHO_NO_TRACE_CHECK=1`.
+
+| Mark | The store | Marked in `lower/Nets.cpp` |
+|---|---|---|
+| `ForceState`, `AssignState` | a variable's `force_site` or `assign_site`: a site's id, zero for `release` and `deassign` | `lower_proc_assign`, `lower_proc_deassign` |
+| `SiteState` | the `active` flag of a net's force site: 1, zero for `release` | `lower_proc_assign`, `release_net` |
+| `ForceApply`, `AssignApply` | the variable, by the statement and by the process that re-evaluates its right-hand side (`state`: the layer's state) | `lower_proc_assign`, `add_pca_reeval` |
+| `SiteApply` | the net's bits, by the `force` statement itself, at once (`state`: the site's flag; `shadow`: its value signal) | `lower_proc_assign` |
+| `Resolve` | the net, by its resolver: the one store of the fold with every active site laid over it | `emit_wire_resolvers` |
+
+**Events.** One after each marked store (`override_state`, `override_apply`, `override_resolve`, §2.2), planted by
+`Backend::emit_trace_override` from the `Store` case of `lower_inst`, and never otherwise: shipped builds emit and link
+none (§4.1).
 
 ## 3. Rules
 

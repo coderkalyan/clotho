@@ -69,6 +69,7 @@ enum class Ev : uint8_t {
     ChildDone,
     Join,
     Member,
+    Override,
 };
 
 struct Entry {
@@ -535,6 +536,13 @@ const char* control_name(uint32_t kind) {
         case RT_TRACE_ORG_OBSERVED: return "Observed body";
         case RT_TRACE_ORG_RE_NBA: return "Re-NBA body";
         case RT_TRACE_ORG_FINAL: return "final block";
+        case RT_TRACE_OVR_FORCE_STATE: return "store of a variable's force state";
+        case RT_TRACE_OVR_ASSIGN_STATE: return "store of a variable's assign state";
+        case RT_TRACE_OVR_SITE_STATE: return "store of a net force site's flag";
+        case RT_TRACE_OVR_FORCE_APPLY: return "store of a forced value into a variable";
+        case RT_TRACE_OVR_ASSIGN_APPLY: return "store of an assigned value into a variable";
+        case RT_TRACE_OVR_SITE_APPLY: return "store of a forced value into a net";
+        case RT_TRACE_OVR_RESOLVE: return "store of a forced net by its resolver";
     }
     return "?";
 }
@@ -598,6 +606,7 @@ const char* ev_name(Ev ev) {
         case Ev::ChildDone: return "child done";
         case Ev::Join: return "join";
         case Ev::Member: return "member";
+        case Ev::Override: return "override";
     }
     return "?";
 }
@@ -858,6 +867,14 @@ std::string rec_text(const Rec& r) {
         case Ev::ChildDone: out += " into the record at " + address_text(r.x); break;
         case Ev::Join: out += " past the join of the record at " + address_text(r.x); break;
         case Ev::Member: appendf(out, ": member %llu starts", static_cast<unsigned long long>(r.x)); break;
+        case Ev::Override:
+            out += ": " + control_text(r.c);
+            if (r.cause == RT_TRACE_OVR_FORCE_STATE || r.cause == RT_TRACE_OVR_ASSIGN_STATE || r.cause == RT_TRACE_OVR_SITE_STATE) {
+                appendf(out, ", the state at 0x%llx now %llu", static_cast<unsigned long long>(r.a), static_cast<unsigned long long>(r.x));
+            } else {
+                out += ", target " + signal_text(reinterpret_cast<const void*>(r.a));
+            }
+            break;
         default: break;
     }
     return out;
@@ -3471,6 +3488,54 @@ extern "C" void rt_trace_change(const rt_trace_change_site* site, const void* x,
         g.chg.at(reinterpret_cast<uintptr_t>(x)) = ChgFacts{ g.step, pos, neg, any };
         count_occurrence(reinterpret_cast<uintptr_t>(x), pos, neg, any, false);
         owe(x, pos, neg, any, false);
+    }
+}
+
+extern "C" void rt_trace_override_state(const rt_trace_control* site, const void* state) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.override_states;
+    ++g.total.override_states;
+    uint32_t now = 0;
+    std::memcpy(&now, state, sizeof(now));
+    record(Ev::Override, reinterpret_cast<uintptr_t>(state), now, site, static_cast<uint8_t>(site->kind), 0);
+}
+
+extern "C" void rt_trace_override_apply(const rt_trace_control* site, const void* state, const void* x, const char* name,
+                                        const rt_trace_shape* shape, uint32_t lo, uint32_t n, const void* val,
+                                        const rt_trace_shape* val_shape) {
+    (void)state;
+    (void)shape;
+    (void)lo;
+    (void)n;
+    (void)val;
+    (void)val_shape;
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.override_applies;
+    ++g.total.override_applies;
+    record(Ev::Override, reinterpret_cast<uintptr_t>(x), 0, site, static_cast<uint8_t>(site->kind), 0);
+    if (name != nullptr && x != nullptr) {
+        g.names.at(reinterpret_cast<uintptr_t>(x)) = name;
+    }
+}
+
+extern "C" void rt_trace_override_resolve(const rt_trace_control* site, const void* x, const char* name,
+                                          const rt_trace_shape* shape) {
+    (void)shape;
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.override_resolves;
+    ++g.total.override_resolves;
+    record(Ev::Override, reinterpret_cast<uintptr_t>(x), 0, site, static_cast<uint8_t>(site->kind), 0);
+    if (name != nullptr && x != nullptr) {
+        g.names.at(reinterpret_cast<uintptr_t>(x)) = name;
     }
 }
 

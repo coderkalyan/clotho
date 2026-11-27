@@ -101,7 +101,8 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
                               "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
                               "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member", "rt_trace_inertial_arm", "rt_trace_inertial_decide",
-                              "rt_trace_inertial_fire", "rt_trace_inertial_applied", "rt_trace_nba_event" }) {
+                              "rt_trace_inertial_fire", "rt_trace_inertial_applied", "rt_trace_nba_event",
+                              "rt_trace_override_state", "rt_trace_override_apply", "rt_trace_override_resolve" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else

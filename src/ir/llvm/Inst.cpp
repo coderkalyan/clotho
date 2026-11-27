@@ -1046,6 +1046,12 @@ void Backend::lower_inst(Index i) {
             // change to that element rather than always reading element 0. An
             // invalid element is a no-op (LRM 7.5.1), wait servicing included.
             store_guarded(lv, value_of(p.binary.r));
+            // A store of a force or a procedural `assign` is reported after it, when the trace is planted.
+            if (ir_->has_override_marks()) {
+                if (const OverrideMark* mark = ir_->override_mark(i)) {
+                    emit_trace_override(i, *mark, lv);
+                }
+            }
             return;
         }
         // A nonblocking assignment samples its RHS now but defers the write: it

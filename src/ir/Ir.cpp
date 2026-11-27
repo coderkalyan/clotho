@@ -418,7 +418,7 @@ bool Ir::operator==(const Ir& other) const {
     return pool_ == other.pool_ && static_cast<uint32_t>(root_.start) == static_cast<uint32_t>(other.root_.start) &&
            static_cast<uint32_t>(root_.end) == static_cast<uint32_t>(other.root_.end) &&
            same_bytes(tags_, other.tags_) && same_bytes(payloads_, other.payloads_) && same_bytes(locs_, other.locs_) &&
-           same_bytes(extra_, other.extra_) && ends_ == other.ends_;
+           same_bytes(extra_, other.extra_) && ends_ == other.ends_ && override_marks_ == other.override_marks_;
 }
 
 LvalueRoot lvalue_root(const Ir& ir, Index lv) {
@@ -836,7 +836,8 @@ Ir Ir::rebased(HandleMapper& m) const {
         }
     }
 
-    return Ir(*pool_, std::move(tags), std::move(payloads), std::move(locs), ends_, std::move(extra), root_);
+    // The marks name instructions of this body, which a rebased copy keeps at the same indices.
+    return Ir(*pool_, std::move(tags), std::move(payloads), std::move(locs), ends_, override_marks_, std::move(extra), root_);
 }
 
 } // namespace clotho::ir

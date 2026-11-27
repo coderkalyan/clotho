@@ -60,6 +60,24 @@ enum {
     RT_TRACE_ORG_FINAL = 43,
 };
 
+// What a store of a force or a procedural `assign` is: rt_trace_control::kind of the site of
+// rt_trace_override_state, _apply and _resolve, in the order of ir::OverrideKind (Trace.cpp
+// checks it).
+enum {
+    // A variable's `force_site`, its `assign_site` and the `active` flag of a net's force site
+    // written: a force or an assign began, or a release or a deassign ended it.
+    RT_TRACE_OVR_FORCE_STATE = 64,
+    RT_TRACE_OVR_ASSIGN_STATE = 65,
+    RT_TRACE_OVR_SITE_STATE = 66,
+    // A store gave the target the value of the override: a variable's (force or assign layer),
+    // or a net's, by the force statement itself.
+    RT_TRACE_OVR_FORCE_APPLY = 67,
+    RT_TRACE_OVR_ASSIGN_APPLY = 68,
+    RT_TRACE_OVR_SITE_APPLY = 69,
+    // The net resolver stored a net that has force sites.
+    RT_TRACE_OVR_RESOLVE = 70,
+};
+
 // The facts of a seed row's processes, ORed into the kind of its origin (RT_TRACE_ORG_PROCESS)
 // above RT_TRACE_KIND, which is the kind proper.
 enum {
@@ -380,6 +398,11 @@ typedef struct rt_trace_counts {
     uint64_t member_runs;
     // Inertial records armed (S26).
     uint64_t inertial_arms;
+    // Override events (R14): a store of an override's state, of the value an override gives,
+    // and of a forced net by its resolver.
+    uint64_t override_states;
+    uint64_t override_applies;
+    uint64_t override_resolves;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -535,6 +558,26 @@ void rt_trace_inertial_fire(const void* rec, uint32_t current);
 // The commit of the record's site applies `rec`, a record the site's ready list held (any record of any
 // intra-assignment site comes through here; the ones that are not inertial are none of this event's).
 void rt_trace_inertial_applied(const void* rec);
+
+// A store wrote the state signal of an override: a variable's `force_site` or `assign_site`, or the
+// `active` flag of a net's force site (`site->kind` RT_TRACE_OVR_FORCE_STATE, _ASSIGN_STATE or
+// _SITE_STATE). `state` is the storage of that 32-bit signal, which the checker reads: the id of
+// the site now in force, or zero once it is released (a `release`, a `deassign`).
+void rt_trace_override_state(const rt_trace_control* site, const void* state);
+
+// A store gave the target at `x` (the address of the signal's storage, `shape` how to read it,
+// `name` its declared name or null) the value of an override: `site->kind` is RT_TRACE_OVR_FORCE_APPLY
+// or _ASSIGN_APPLY (a variable: its force or assign layer, whose state is at `state`) or _SITE_APPLY (a
+// net: the force statement's own store into bits `lo` to `lo + n - 1`, `state` the site's flag, `val` the
+// signal that holds its forced value and `val_shape` how to read it). It follows the store, and so the
+// target holds the value.
+void rt_trace_override_apply(const rt_trace_control* site, const void* state, const void* x, const char* name,
+                             const rt_trace_shape* shape, uint32_t lo, uint32_t n, const void* val,
+                             const rt_trace_shape* val_shape);
+
+// The resolver of a net that has force sites stored the net at `x` (RT_TRACE_OVR_RESOLVE), with every active
+// site laid over the fold of its drivers. It follows the store.
+void rt_trace_override_resolve(const rt_trace_control* site, const void* x, const char* name, const rt_trace_shape* shape);
 
 // -- Events of the scheduler (runtime/Scheduler.cpp) --
 

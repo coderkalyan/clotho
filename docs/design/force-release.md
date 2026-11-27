@@ -154,11 +154,16 @@ read-modify-write's read all still run, so their side effects stand and `x++` st
 yields the forced value. A select's store is narrowing over storage that already holds
 the forced value, so dropping it leaves that value exactly in place.
 
-The override writes bypass the gate simply by being emitted directly (not through the
-gated `lower_assign` path), so no dedicated `OverrideStore` op is needed — a plain
-`Store` the backend already services suffices. State-signal writes (`force_site = k`,
-`assign_site = k`) are plain stores to non-forceable hidden signals, so they are never
-gated.
+The override writes bypass the gate simply by being emitted directly (not through the gated
+`lower_assign` path), so no dedicated `OverrideStore` op is needed — a plain `Store` the backend
+already services suffices. State-signal writes (`force_site = k`, `assign_site = k`) are plain
+stores to non-forceable hidden signals, so they are never gated.
+
+The scheduler trace checker (`docs/design/scheduler-trace.md` §2.4, rule R14) has to tell these
+stores from ordinary ones, so the lowering marks them in the body: the state stores, the stores
+that apply an override and the net resolver's store (`ir::OverrideMark`, a sparse table beside
+the instructions, set with `Builder::mark_override`). A mark is no instruction and changes no
+generated code; only a build with `CLOTHO_EXTRA_ASSERTS` reads it.
 
 ### Where the gate lives
 

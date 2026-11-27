@@ -94,6 +94,14 @@ public:
     // of the target's state signals (Signal, or IfaceSignal through a handle).
     Index store_nb_gated(Index lvalue, Index value, Index force_site, Index assign_site, SourceLoc loc);
 
+    // Record that the store `store` (a Store, as binary returns it) is one of the stores of
+    // a force or a procedural `assign`, with the lvalues the mark names (OverrideMark). A
+    // fact about the store for the scheduler trace, not an instruction: it adds nothing to
+    // the body, and the lvalues it names are ones the statement emitted anyway.
+    void mark_override(Index store, OverrideMark mark) {
+        override_marks_.emplace(static_cast<uint32_t>(store), mark);
+    }
+
     // Pack a run of (signal, edge) triggers into the extra buffer for
     // store_nb_event. Packed ONCE per statement and shared by every leaf a
     // decomposing target expands to, so an N-leaf `{a,b} <= @(x or y) v` interns
@@ -829,6 +837,9 @@ private:
     std::vector<SourceLoc>     locs_;
     // Sparse construct ends, keyed by instruction index; see set_end.
     ankerl::unordered_dense::map<uint32_t, SourceLoc> ends_;
+    // The marks of the stores of a force or a procedural `assign`, keyed by instruction
+    // index; see mark_override.
+    ankerl::unordered_dense::map<uint32_t, OverrideMark> override_marks_;
     // Flat u32 side-table under construction.
     std::vector<uint32_t> extra_;
     // Instruction indices of all open regions, innermost segment last.

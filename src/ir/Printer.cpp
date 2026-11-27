@@ -717,8 +717,48 @@ private:
         }
     }
 
-    // Render one instruction line (and, for cond / loop, its nested region blocks).
+    // The name of an override mark's kind, as the dump shows it.
+    static const char* override_name(OverrideKind kind) {
+        switch (kind) {
+            case OverrideKind::ForceState:
+                return "force_state";
+            case OverrideKind::AssignState:
+                return "assign_state";
+            case OverrideKind::SiteState:
+                return "site_state";
+            case OverrideKind::ForceApply:
+                return "force_apply";
+            case OverrideKind::AssignApply:
+                return "assign_apply";
+            case OverrideKind::SiteApply:
+                return "site_apply";
+            case OverrideKind::Resolve:
+                return "resolve";
+        }
+        return "?";
+    }
+
+    // Render one instruction (and, for cond / loop, its nested region blocks), then the
+    // override mark of a store of a force or a procedural `assign`, on a line of its own.
     void render_inst(Index i, int depth) {
+        render_op(i, depth);
+        if (const OverrideMark* mark = ir_.override_mark(i)) {
+            indent(depth + 1);
+            os_ << "; override " << override_name(mark->kind);
+            if (mark->state != kNoIndex) {
+                os_ << " state=";
+                ref(mark->state);
+            }
+            if (mark->shadow != kNoIndex) {
+                os_ << " shadow=";
+                ref(mark->shadow);
+            }
+            os_ << "\n";
+        }
+    }
+
+    // Render one instruction line (and, for cond / loop, its nested region blocks).
+    void render_op(Index i, int depth) {
         indent(depth);
         ref(i);
         os_ << " = " << tag_name(ir_.tag(i)) << "(";
