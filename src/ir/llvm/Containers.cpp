@@ -526,7 +526,7 @@ void Backend::service_signal_container_mutation(Signal sig) {
         t.level = true;
         emit_trace_change(RT_TRACE_CHG_LEVEL, sig, storage_ptr(slot_of(sig)), t);
     }
-    if (wait_sta_gv_[i][e] != nullptr) {
+    if (sta_has_[i][e]) {
         service_static_queue(sig, e);
     }
     if (wait_dyn_gv_[i][e] != nullptr) {

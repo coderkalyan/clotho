@@ -127,7 +127,7 @@ enum {
     RT_TRACE_SPAWN = 1,
     // An assertion queues the action block it ramped.
     RT_TRACE_PEND = 2,
-    // A store's scan of a static bucket, of a dynamic bucket, and of a virtual
+    // A store's scan of a static waiter list, of a dynamic bucket, and of a virtual
     // interface member's waiter list: `x` is the signal, `fact` the change.
     RT_TRACE_STATIC = 3,
     RT_TRACE_DYNAMIC = 4,
@@ -390,7 +390,7 @@ extern "C" {
 
 // -- Events of the generated code --
 //
-// An activation `a` is a coroutine handle, or the address of a thunk group's wake pair
+// An activation `a` is a coroutine handle, or the address of a thunk group's wake slot
 // with bit 0 set; the home tag bits a parked handle carries (bits 1 and 2) are ignored.
 
 // A new activation, created by `parent` (null for the seed and the schedulers' own

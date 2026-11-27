@@ -1583,7 +1583,15 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // straight resume path (no per-pop tag test).
     const bool has_thunk = std::any_of(sched_.begin(), sched_.end(),
                                         [](const SchedGroup& sg) { return sg.thunk; });
-    auto* thunk_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
+    auto* thunk_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty, ptr_ty }, false);
+    // Run the thunk group whose tagged handle is `addr`: the handle is its wake
+    // slot's address, and the slot holds its entry and record beside its word.
+    const auto call_thunk = [&](llvm::Value* addr) {
+        auto* const wake  = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
+        auto* const entry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), wake, 2));
+        auto* const rec   = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), wake, 3));
+        b_.CreateCall(thunk_fnty, entry, { wake, rec, wheel });
+    };
     // NBA region: only when the design has nonblocking assignments. Entered when
     // the active queue drains; if any update is staged it commits them all and
     // re-drains the active queue at the SAME instant; otherwise it falls through
@@ -1672,9 +1680,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         b_.CreateCondBr(b_.CreateTrunc(addr, b_.getInt1Ty()), thunk_bb, coro_bb);
 
         b_.SetInsertPoint(thunk_bb);
-        auto* wake  = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
-        auto* entry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), wake, 1));
-        b_.CreateCall(thunk_fnty, entry, { wake, wheel });
+        call_thunk(addr);
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(coro_bb);
@@ -1906,9 +1912,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             b_.CreateCondBr(b_.CreateTrunc(raddr, b_.getInt1Ty()), rthunk, rcoro);
 
             b_.SetInsertPoint(rthunk);
-            auto* rwake  = b_.CreateIntToPtr(b_.CreateAnd(raddr, ~static_cast<uint64_t>(1)), ptr_ty);
-            auto* rentry = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(wake_ty(), rwake, 1));
-            b_.CreateCall(thunk_fnty, rentry, { rwake, wheel });
+            call_thunk(raddr);
             b_.CreateBr(rcont);
 
             b_.SetInsertPoint(rcoro);
